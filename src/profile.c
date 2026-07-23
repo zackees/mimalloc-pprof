@@ -5,6 +5,8 @@
 #include "mimalloc/internal.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <limits.h>
 
 #if MI_PPROF
 
@@ -45,10 +47,49 @@ static size_t prof_rate = 524288;
 static uint64_t prof_seed;
 static uint64_t prof_generation;
 static char prof_dump_at_exit[1024];
+/* Budget (bytes) for profiler-internal *persistent* arena memory (see
+   mi_prof_config_t.max_profiler_bytes in profile.h); cached at start from
+   mi_option_prof_max_bytes so _mi_prof_arena_alloc need not re-resolve the
+   option (and any env var / mi_option_set precedence) on every call. Always
+   read/written while `prof_lock` is held (mirrors prof_rate/prof_seed above). */
+static size_t prof_max_bytes;
+/* 0 = MI_PROF_FORMAT_TEXT (the default). Set either by mi_prof_start_ex's
+   dump_format field or, for pure-env users, prof_auto_start reading
+   MIMALLOC_PROF_DUMP_FORMAT; consumed by _mi_prof_process_done. */
+static int prof_dump_at_exit_format;
 static mi_decl_thread int prof_callback_depth;
 static mi_decl_thread bool prof_lock_owner;
 static inline size_t prof_min(size_t x, size_t y) { return (x < y ? x : y); }
 static inline size_t prof_max(size_t x, size_t y) { return (x > y ? x : y); }
+
+/* ---- small helpers shared by mi_prof_start_ex's env/struct precedence resolution -----------
+   (see mi_prof_config_t's mode documentation in profile.h for the FALLBACK/OVERRIDE contract). */
+static bool prof_env_present(const char* name) {
+  char buf[64];
+  return (_mi_getenv(name, buf, sizeof(buf)) == 0);
+}
+/* Tiny local decimal parser (mirrors options.c's mi_option_init, minus the KiB-suffix and
+   boolean-string handling those don't apply to a raw byte count like MIMALLOC_PROF_SAMPLE_INTERVAL). */
+static bool prof_env_get_size(const char* name, size_t* out) {
+  char buf[64];
+  if (_mi_getenv(name, buf, sizeof(buf)) != 0) return false;
+  if (buf[0] == 0) return false;
+  char* end = buf;
+  unsigned long long value = strtoull(buf, &end, 10);
+  if (end == buf || *end != 0) return false;
+  *out = (size_t)value;
+  return true;
+}
+/* "proto"/"1" (case-insensitive) => MI_PROF_FORMAT_PROTO, anything else => MI_PROF_FORMAT_TEXT;
+   mirrors mi_option_init's uppercase-then-compare idiom in options.c. */
+static int prof_parse_dump_format(const char* s) {
+  char buf[16];
+  size_t len = _mi_strnlen(s, sizeof(buf) - 1);
+  for (size_t i = 0; i < len; i++) buf[i] = _mi_toupper(s[i]);
+  buf[len] = 0;
+  if (_mi_streq(buf, "PROTO") || _mi_streq(buf, "1")) return MI_PROF_FORMAT_PROTO;
+  return MI_PROF_FORMAT_TEXT;
+}
 
 typedef struct prof_dump_chunk_s {
   struct prof_dump_chunk_s* next;
@@ -140,6 +181,10 @@ void* _mi_prof_arena_alloc(size_t size) {
   if (chunk == NULL || chunk->used + size + align > chunk->size) {
     if (size > SIZE_MAX - sizeof(*chunk) - align) return NULL;
     const size_t chunk_size = prof_max((size_t)MI_PROF_CHUNK_SIZE, sizeof(*chunk) + size + align);
+    /* Budget only gates growing the arena with a *new* chunk (mi_prof_config_t.max_profiler_bytes);
+       callers (prof_record_alloc, stack_init/stack_grow, _mi_prof_stack_intern) already treat a
+       NULL return here as "drop this sample" and recycle/no-op rather than leak or crash. */
+    if (prof_max_bytes != 0 && mi_atomic_load_relaxed(&prof_arena_committed) + chunk_size > prof_max_bytes) return NULL;
     mi_memid_t memid;
     void* p = _mi_os_alloc(chunk_size, &memid);
     if (p == NULL) return NULL;
@@ -181,15 +226,108 @@ static void prof_free_record(mi_page_t* page, void* p) {
 
 bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept {
   if (prof_callback_depth > 0) return false;
-  if (sample_rate == 0) sample_rate = (size_t)mi_option_get(mi_option_prof_sample_rate);
+  if (sample_rate == 0) {
+    /* MIMALLOC_PROF_SAMPLE_INTERVAL is the honest name for this env var (it is an average
+       byte interval, not a rate); MIMALLOC_PROF_SAMPLE_RATE (-> mi_option_prof_sample_rate)
+       stays as a compat alias. When both are set, INTERVAL wins. */
+    size_t interval;
+    if (prof_env_get_size("MIMALLOC_PROF_SAMPLE_INTERVAL", &interval) && interval != 0) sample_rate = interval;
+    else sample_rate = (size_t)mi_option_get(mi_option_prof_sample_rate);
+  }
   if (sample_rate == 0) sample_rate = 524288;
   mi_lock_acquire(&prof_lock);
   bool started = !mi_atomic_load_relaxed(&prof_enabled);
-  if (started) { prof_rate = sample_rate; prof_seed = seed; prof_generation++; mi_atomic_store_release(&prof_enabled, true); }
+  if (started) {
+    prof_rate = sample_rate; prof_seed = seed; prof_generation++;
+    prof_max_bytes = (size_t)mi_option_get(mi_option_prof_max_bytes);
+    mi_atomic_store_release(&prof_enabled, true);
+  }
   mi_lock_release(&prof_lock);
   return started;
 }
 bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { return mi_prof_start_seeded(sample_rate, (uint64_t)mi_option_get(mi_option_prof_seed)); }
+
+/* mi_prof_start_ex: see mi_prof_config_t's mode documentation in profile.h for the full
+   FALLBACK/OVERRIDE precedence contract. Per-field resolution below is the same shape
+   throughout: OVERRIDE with a non-zero/non-NULL field always wins; otherwise, if the
+   field's env var is present, the env/option value wins (struct field ignored); otherwise
+   a non-zero/non-NULL struct field wins; otherwise the existing default applies. accum,
+   max_stack_depth, and max_profiler_bytes are applied via mi_option_set so the profiler's
+   normal (already env-aware) option-reading paths pick them up; sample_interval and seed
+   are fed directly as mi_prof_start_seeded's parameters since nothing re-reads them as
+   options after start; dump_at_exit/dump_format have no backing mi_option and are resolved
+   by hand against the same env vars prof_auto_start uses. */
+bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept {
+  if (config == NULL) return mi_prof_start(0);
+  if (config->size != sizeof(mi_prof_config_t) || config->version != MI_PROF_CONFIG_VERSION) return false;
+  if (prof_callback_depth > 0) return false;
+  const bool is_override = (config->mode == MI_PROF_CONFIG_OVERRIDE);
+
+  if (config->accum) {
+    if (is_override || !prof_env_present("MIMALLOC_PROF_ACCUM")) mi_option_set_enabled(mi_option_prof_accum, true);
+  }
+  if (config->max_stack_depth != 0) {
+    if (is_override || !prof_env_present("MIMALLOC_PROF_BT_MAX")) {
+      size_t depth = config->max_stack_depth;
+      if (depth > 128) depth = 128;  // compile cap; mirrors MI_PROF_BT_MAX_LIMIT in profile-stack.c.
+      mi_option_set(mi_option_prof_bt_max, (long)depth);
+    }
+  }
+  if (config->max_profiler_bytes != 0) {
+    if (is_override || !prof_env_present("MIMALLOC_PROF_MAX_BYTES")) {
+      const size_t bytes = config->max_profiler_bytes;
+      mi_option_set(mi_option_prof_max_bytes, (bytes > (size_t)LONG_MAX ? LONG_MAX : (long)bytes));
+    }
+  }
+  {
+    const bool env_present = prof_env_present("MIMALLOC_PROF_DUMP_AT_EXIT");
+    if (config->dump_at_exit != NULL && (is_override || !env_present)) {
+      _mi_strlcpy(prof_dump_at_exit, config->dump_at_exit, sizeof(prof_dump_at_exit));
+    }
+    else if (env_present) {
+      (void)_mi_getenv("MIMALLOC_PROF_DUMP_AT_EXIT", prof_dump_at_exit, sizeof(prof_dump_at_exit));
+    }
+    // else: field NULL and no env -> leave prof_dump_at_exit untouched, matching mi_prof_start(0).
+  }
+  {
+    const bool env_present = prof_env_present("MIMALLOC_PROF_DUMP_FORMAT");
+    if (config->dump_format != MI_PROF_FORMAT_TEXT && (is_override || !env_present)) {
+      prof_dump_at_exit_format = config->dump_format;
+    }
+    else if (env_present) {
+      char fmt_buf[32];
+      if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
+    }
+  }
+
+  size_t resolved_interval;
+  if (is_override && config->sample_interval != 0) {
+    resolved_interval = config->sample_interval;
+  }
+  else if (prof_env_present("MIMALLOC_PROF_SAMPLE_INTERVAL") || prof_env_present("MIMALLOC_PROF_SAMPLE_RATE")) {
+    resolved_interval = 0;  // defer to mi_prof_start_seeded's default chain, which resolves these same two names.
+  }
+  else {
+    resolved_interval = config->sample_interval;  // 0 here also defers to the default chain.
+  }
+
+  uint64_t resolved_seed;
+  if (is_override && config->seed != 0) {
+    resolved_seed = config->seed;
+  }
+  else if (prof_env_present("MIMALLOC_PROF_SEED")) {
+    resolved_seed = (uint64_t)mi_option_get(mi_option_prof_seed);
+  }
+  else if (config->seed != 0) {
+    resolved_seed = config->seed;
+  }
+  else {
+    resolved_seed = (uint64_t)mi_option_get(mi_option_prof_seed);
+  }
+
+  return mi_prof_start_seeded(resolved_interval, resolved_seed);
+}
+
 bool mi_prof_is_enabled(void) mi_attr_noexcept { return mi_atomic_load_relaxed(&prof_enabled); }
 bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept {
   if (stats == NULL || stats->size != sizeof(mi_prof_stats_t) || stats->version != MI_PROF_STAT_VERSION) return false;
@@ -568,12 +706,20 @@ static void prof_auto_start(void) {
   mi_atomic_do_once {
     if (mi_option_is_enabled(mi_option_prof)) { const bool started = mi_prof_start(0); MI_UNUSED(started); }
     (void)_mi_getenv("MIMALLOC_PROF_DUMP_AT_EXIT", prof_dump_at_exit, sizeof(prof_dump_at_exit));
+    /* So pure-env users (no mi_prof_start_ex call at all) still get profile.proto exit dumps. */
+    char fmt_buf[32];
+    if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
   }
 }
 void _mi_prof_process_init(void) {
   prof_auto_start();
 }
-void _mi_prof_process_done(void) { if (prof_dump_at_exit[0] != 0) { const bool dumped = mi_prof_dump(prof_dump_at_exit); MI_UNUSED(dumped); } }
+void _mi_prof_process_done(void) {
+  if (prof_dump_at_exit[0] != 0) {
+    const bool dumped = (prof_dump_at_exit_format == MI_PROF_FORMAT_PROTO) ? mi_prof_dump_proto(prof_dump_at_exit) : mi_prof_dump(prof_dump_at_exit);
+    MI_UNUSED(dumped);
+  }
+}
 void _mi_prof_on_alloc(mi_heap_t* heap, mi_page_t* page, void* p, size_t size) {
   prof_auto_start();
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;
@@ -623,6 +769,7 @@ void _mi_prof_on_realloc_in_place(mi_page_t* page, void* p, size_t size) {
 #else
 bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { MI_UNUSED(sample_rate); return false; }
 bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept { MI_UNUSED(sample_rate); MI_UNUSED(seed); return false; }
+bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept { MI_UNUSED(config); return false; }
 void mi_prof_stop(void) mi_attr_noexcept { }
 bool mi_prof_is_enabled(void) mi_attr_noexcept { return false; }
 void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept { if (records) *records=0; if (bytes) *bytes=0; if (unique_stacks) *unique_stacks=0; }

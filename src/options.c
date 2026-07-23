@@ -175,6 +175,7 @@ static mi_option_desc_t options[_mi_option_last] =
   ,{ 32, UNINIT, MI_OPTION(prof_bt_max) }
   ,{ 0, UNINIT, MI_OPTION(prof_accum) }
   ,{ 0, UNINIT, MI_OPTION(prof_seed) }
+  ,{ 0, UNINIT, MI_OPTION(prof_max_bytes) }   // budget for profiler-internal arena memory; 0 = unbudgeted
 };
 
 static void mi_option_init(mi_option_desc_t* desc);

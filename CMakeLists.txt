@@ -74,6 +74,7 @@ set(mi_sources
     src/os.c
     src/page.c
     src/profile.c
+    $<$<BOOL:${MI_PPROF}>:src/profile-stack.c>
     src/random.c
     src/segment.c
     src/segment-map.c
@@ -93,6 +94,9 @@ endif()
 
 if(MI_PPROF)
   list(APPEND mi_defines MI_PPROF=1)
+  if(NOT WIN32)
+    list(APPEND mi_cflags -fno-omit-frame-pointer)
+  endif()
 else()
   list(APPEND mi_defines MI_PPROF=0)
 endif()

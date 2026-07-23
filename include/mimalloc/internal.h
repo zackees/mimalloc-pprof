@@ -290,6 +290,12 @@ void        _mi_prof_on_alloc(mi_heap_t* heap, mi_page_t* page, void* p, size_t 
 void        _mi_prof_on_free(mi_page_t* page, void* p);
 void        _mi_prof_on_free_collect(mi_page_t* page, mi_block_t* head);
 void        _mi_prof_on_realloc_in_place(mi_page_t* page, void* p, size_t size);
+size_t      _mi_prof_stack_capture(void** pcs, size_t capacity);
+void*       _mi_prof_arena_alloc(size_t size);
+typedef struct mi_prof_stack_s mi_prof_stack_t;
+mi_prof_stack_t* _mi_prof_stack_intern(void);
+void        _mi_prof_stack_release(mi_prof_stack_t* stack);
+size_t      _mi_prof_stack_count(void);
 #endif
 void*       _mi_heap_malloc_zero(mi_heap_t* heap, size_t size, bool zero) mi_attr_noexcept;
 void*       _mi_heap_malloc_zero_ex(mi_heap_t* heap, size_t size, bool zero, size_t huge_alignment, size_t* usable) mi_attr_noexcept;     // called from `_mi_heap_malloc_aligned`

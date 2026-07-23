@@ -22,6 +22,12 @@ jobs:
   build-linux:
     name: build (${{ matrix.target }})
     runs-on: ubuntu-latest
+    env:
+      # The profiler walks frame pointers on non-Windows platforms.  Keep both
+      # the Rust callers and the bundled C allocator unwindable in release.
+      RUSTFLAGS: -Cforce-frame-pointers=yes
+      CFLAGS: -fno-omit-frame-pointer
+      CXXFLAGS: -fno-omit-frame-pointer
     strategy:
       fail-fast: false
       matrix:

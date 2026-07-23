@@ -25,8 +25,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             command: soldr cargo test --no-run
+            cflags: ""
           - target: aarch64-unknown-linux-gnu
             command: soldr cargo zigbuild --tests
+            cflags: -Wno-error=date-time
     defaults:
       run:
         working-directory: rust
@@ -43,6 +45,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           BUILD_COMMAND: ${{ matrix.command }}
+          CFLAGS_aarch64_unknown_linux_gnu: ${{ matrix.cflags }}
         run: |
           eval "$BUILD_COMMAND --target $TARGET --release --message-format=json" \
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' > bins.txt

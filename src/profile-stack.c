@@ -3,7 +3,6 @@
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 #include <string.h>
-#include <stdio.h>
 
 #if MI_PPROF
 
@@ -12,8 +11,8 @@
 struct mi_prof_stack_s { uint64_t hash; uint32_t depth; uint32_t refcount; uint32_t pin; size_t slot; size_t curobjs, curbytes, accumobjs, accumbytes; void* pcs[]; };
 static mi_prof_stack_t** stack_table;
 static size_t stack_capacity;
-static size_t stack_count;
-static inline size_t stack_min(size_t x, size_t y) { return (x < y ? x : y); }
+static _Atomic(size_t) stack_count;
+static _Atomic(size_t) stack_overflows;
 
 static uint64_t stack_hash(void* const* pcs, size_t depth) {
   uint64_t hash = UINT64_C(1469598103934665603);
@@ -43,7 +42,7 @@ static void stack_place(mi_prof_stack_t* stack) {
 }
 
 static bool stack_grow(void) {
-  if (stack_count * 4 < stack_capacity * 3) return true;
+  if (mi_atomic_load_relaxed(&stack_count) * 4 < stack_capacity * 3) return true;
   size_t old_capacity=stack_capacity; mi_prof_stack_t** old=stack_table;
   stack_capacity *= 2;
   stack_table = (mi_prof_stack_t**)_mi_prof_arena_alloc(stack_capacity*sizeof(*stack_table));
@@ -86,43 +85,46 @@ mi_prof_stack_t* _mi_prof_stack_intern(void) {
   uint64_t hash = stack_hash(pcs, depth);
   size_t index = (size_t)hash & (stack_capacity - 1);
   while (stack_table[index] != NULL) { if (stack_equal(stack_table[index],hash,pcs,depth)) { stack_table[index]->refcount++; return stack_table[index]; } index=(index+1)&(stack_capacity-1); }
-  if (stack_count >= MI_PROF_STACK_CAP) return NULL;
+  if (mi_atomic_load_relaxed(&stack_count) >= MI_PROF_STACK_CAP) { mi_atomic_increment_relaxed(&stack_overflows); return NULL; }
   mi_prof_stack_t* stack = (mi_prof_stack_t*)_mi_prof_arena_alloc(sizeof(*stack) + depth*sizeof(void*));
   if (stack == NULL) return NULL;
   stack->hash=hash; stack->depth=(uint32_t)depth; stack->refcount=1; stack->pin=0; stack->curobjs=stack->curbytes=stack->accumobjs=stack->accumbytes=0;
   for (size_t i=0;i<depth;i++) stack->pcs[i]=pcs[i];
-  stack_table[index]=stack; stack->slot=index; stack_count++;
+  stack_table[index]=stack; stack->slot=index; mi_atomic_increment_relaxed(&stack_count);
   return stack;
 }
 void _mi_prof_stack_release(mi_prof_stack_t* stack) {
   if (stack == NULL || stack->refcount == 0) return;
   if (--stack->refcount != 0 || stack->pin != 0 || mi_option_is_enabled(mi_option_prof_accum)) return;
-  size_t index=stack->slot; stack_table[index]=NULL; stack_count--;
+  size_t index=stack->slot; stack_table[index]=NULL; mi_atomic_decrement_relaxed(&stack_count);
   for (index=(index+1)&(stack_capacity-1); stack_table[index] != NULL; index=(index+1)&(stack_capacity-1)) {
     mi_prof_stack_t* moved=stack_table[index]; stack_table[index]=NULL; stack_place(moved);
   }
 }
-size_t _mi_prof_stack_count(void) { return stack_count; }
-void _mi_prof_stack_visit(_mi_prof_stack_visit_fun* visit, void* arg) { if (visit != NULL) for (size_t i=0;i<stack_capacity;i++) if (stack_table[i] != NULL) visit(stack_table[i],arg); }
-void _mi_prof_stack_counts(const mi_prof_stack_t* stack, size_t* curobjs, size_t* curbytes, size_t* accumobjs, size_t* accumbytes) {
-  if (curobjs) *curobjs = (stack == NULL ? 0 : stack->curobjs);
-  if (curbytes) *curbytes = (stack == NULL ? 0 : stack->curbytes);
-  if (accumobjs) *accumobjs = (stack == NULL ? 0 : stack->accumobjs);
-  if (accumbytes) *accumbytes = (stack == NULL ? 0 : stack->accumbytes);
-}
-void _mi_prof_stack_reset(void) {
-  if (stack_table == NULL) return;
+size_t _mi_prof_stack_count(void) { return mi_atomic_load_relaxed(&stack_count); }
+size_t _mi_prof_stack_overflows(void) { return mi_atomic_load_relaxed(&stack_overflows); }
+bool _mi_prof_stack_visit_info(mi_prof_visit_fun* fn, void* arg) {
+  if (fn == NULL) return true;
   for (size_t i = 0; i < stack_capacity; i++) {
     mi_prof_stack_t* stack = stack_table[i];
-    if (stack != NULL) { stack->accumobjs = 0; stack->accumbytes = 0; }
+    if (stack == NULL) continue;
+    mi_prof_sample_info_t info;
+    info.stack = (const void* const*)stack->pcs; info.depth = stack->depth;
+    info.live_objects = stack->curobjs; info.live_bytes = stack->curbytes;
+    info.accum_objects = stack->accumobjs; info.accum_bytes = stack->accumbytes;
+    if (!fn(&info, arg)) return false;
   }
+  return true;
+}
+void _mi_prof_stack_pin_all(void) { for (size_t i=0;i<stack_capacity;i++) if (stack_table[i] != NULL) stack_table[i]->pin++; }
+static void stack_sweep(void) {
   bool removed = true;
   while (removed) {
     removed = false;
     for (size_t i = 0; i < stack_capacity; i++) {
       mi_prof_stack_t* stack = stack_table[i];
       if (stack != NULL && stack->refcount == 0 && stack->pin == 0) {
-        stack_table[i] = NULL; stack_count--;
+        stack_table[i] = NULL; mi_atomic_decrement_relaxed(&stack_count);
         for (size_t j = (i + 1) & (stack_capacity - 1); stack_table[j] != NULL; j = (j + 1) & (stack_capacity - 1)) {
           mi_prof_stack_t* moved = stack_table[j]; stack_table[j] = NULL; stack_place(moved);
         }
@@ -132,16 +134,20 @@ void _mi_prof_stack_reset(void) {
     }
   }
 }
-void _mi_prof_stack_done(void) { stack_table = NULL; stack_capacity = 0; stack_count = 0; }
-void _mi_prof_stack_format(const mi_prof_stack_t* stack, char* buf, size_t capacity, size_t* written) {
-  if (stack == NULL || buf == NULL || capacity == 0) { if (written) *written=0; return; }
-  int n = snprintf(buf, capacity, "%7llu: %llu [%7llu: %llu] @", (unsigned long long)stack->curobjs, (unsigned long long)stack->curbytes, (unsigned long long)stack->accumobjs, (unsigned long long)stack->accumbytes);
-  size_t used = (n > 0 ? stack_min((size_t)n, capacity - 1) : 0);
-  for (size_t i=0; i<stack->depth && used < capacity - 1; i++) { n=snprintf(buf+used,capacity-used," 0x%llx",(unsigned long long)(uintptr_t)stack->pcs[i]); used += (n>0 ? stack_min((size_t)n,capacity-used-1) : 0); }
-  if (used < capacity - 1) { buf[used++]='\n'; }
-  buf[used] = 0;
-  if (written) *written=used;
+void _mi_prof_stack_unpin_all_and_sweep(void) {
+  for (size_t i=0;i<stack_capacity;i++) if (stack_table[i] != NULL) stack_table[i]->pin--;
+  /* accum mode keeps refcount-0 entries until mi_prof_reset; only reset may sweep them. */
+  if (!mi_option_is_enabled(mi_option_prof_accum)) stack_sweep();
 }
+void _mi_prof_stack_reset(void) {
+  if (stack_table == NULL) return;
+  for (size_t i = 0; i < stack_capacity; i++) {
+    mi_prof_stack_t* stack = stack_table[i];
+    if (stack != NULL) { stack->accumobjs = 0; stack->accumbytes = 0; }
+  }
+  stack_sweep();
+}
+void _mi_prof_stack_done(void) { stack_table = NULL; stack_capacity = 0; mi_atomic_store_relaxed(&stack_count, (size_t)0); mi_atomic_store_relaxed(&stack_overflows, (size_t)0); }
 void _mi_prof_stack_alloc(mi_prof_stack_t* stack, size_t size) { if (stack) { stack->curobjs++; stack->curbytes += size; if (mi_option_is_enabled(mi_option_prof_accum)) { stack->accumobjs++; stack->accumbytes += size; } } }
 void _mi_prof_stack_free(mi_prof_stack_t* stack, size_t size) { if (stack) { stack->curobjs--; stack->curbytes -= size; } }
 void _mi_prof_stack_resize(mi_prof_stack_t* stack, size_t oldsize, size_t newsize) { if (stack) { stack->curbytes = stack->curbytes - oldsize + newsize; if (mi_option_is_enabled(mi_option_prof_accum) && newsize > oldsize) stack->accumbytes += newsize - oldsize; } }

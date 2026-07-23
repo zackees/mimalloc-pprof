@@ -199,7 +199,7 @@ jobs:
         run: |
           generator=$(find dist/${{ matrix.target }} -maxdepth 1 -type f -name 't3_stats-*' | head -n 1)
           test -n "$generator"
-          MIMALLOC_PROF=1 MIMALLOC_PROF_DUMP_AT_EXIT="$PWD/heap.prof" "$generator"
+          MIMALLOC_PPROF_CI_DUMP="$PWD/heap.prof" "$generator"
           "$(go env GOPATH)/bin/pprof" -raw heap.prof > raw.txt
           grep -Eq 'PeriodType: space|heap_v2|inuse_space' raw.txt
       - name: Prove pprof parses a native dump
@@ -208,8 +208,7 @@ jobs:
         run: |
           $generator = Get-ChildItem dist/${{ matrix.target }} -Filter 't3_stats-*' | Select-Object -First 1
           if (-not $generator) { throw 't3_stats test binary was not staged' }
-          $env:MIMALLOC_PROF = '1'
-          $env:MIMALLOC_PROF_DUMP_AT_EXIT = Join-Path $PWD 'heap.prof'
+          $env:MIMALLOC_PPROF_CI_DUMP = Join-Path $PWD 'heap.prof'
           & $generator.FullName
           if ($LASTEXITCODE -ne 0) { throw 'profile generator failed' }
           & (Join-Path (go env GOPATH) 'bin/pprof.exe') -raw heap.prof | Tee-Object raw.txt

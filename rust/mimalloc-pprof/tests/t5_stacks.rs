@@ -1,27 +1,28 @@
 mod common;
 
 #[inline(never)]
-fn a() {
-    b()
+fn a() -> usize {
+    std::hint::black_box(b())
 }
 #[inline(never)]
-fn b() {
-    c()
+fn b() -> usize {
+    std::hint::black_box(c())
 }
 #[inline(never)]
-fn c() {
+fn c() -> usize {
     let mut values = Vec::<u8>::with_capacity(4096);
     values.push(7);
     assert_eq!(values[0], 7);
     let values = std::hint::black_box(values);
     std::mem::forget(values);
+    7
 }
 
 #[test]
 fn samples_include_multiple_caller_pcs() {
     common::start(1, 59);
     for _ in 0..128 {
-        a();
+        std::hint::black_box(a());
     }
     let text = common::dump();
     let sample = common::sample_lines(&text)

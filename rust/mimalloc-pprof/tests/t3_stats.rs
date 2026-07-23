@@ -1,10 +1,14 @@
 mod common;
+use mimalloc_pprof::prof;
 
 #[test]
 fn sampled_stream_estimates_one_hundred_mib() {
     common::start(524_288, 43);
     let blocks: Vec<_> = (0..25_600).map(|_| Box::new([0_u8; 4096])).collect();
     let text = common::dump();
+    if let Some(path) = std::env::var_os("MIMALLOC_PPROF_CI_DUMP") {
+        prof::dump_file(std::path::Path::new(&path)).expect("write CI heap profile");
+    }
     let (objects, _, _, _, rate) = common::header(&text);
     assert_eq!(rate, 524_288);
     assert!((100..=400).contains(&objects));

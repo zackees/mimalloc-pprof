@@ -38,6 +38,31 @@ unsafe impl GlobalAlloc for MiMalloc {
     }
 }
 
+/// Turn on sampled heap profiling at the default sample rate.
+///
+/// Convenience entry point for wiring profiling to a command-line flag:
+///
+/// ```no_run
+/// # let args_profile_heap = true;
+/// if args_profile_heap {
+///     mimalloc_pprof::enable_heap_profiling();
+/// }
+/// ```
+///
+/// Uses the built-in default rate (one sample per ~512 KiB allocated;
+/// `MIMALLOC_PROF_SAMPLE_RATE` still overrides it). Call [`prof::start`]
+/// instead to pick a rate programmatically. Allocations made before this
+/// call — including process-startup and static initialization — are not
+/// tracked; profiles reflect steady-state behavior from this point on,
+/// which is the usual intent for an opt-in CLI switch. To capture startup
+/// as well, set `MIMALLOC_PROF=1` in the environment instead.
+///
+/// Returns `false` if profiling was already enabled (the earlier session,
+/// and its sample rate, stay active).
+pub fn enable_heap_profiling() -> bool {
+    prof::start(0)
+}
+
 /// Safe controls for mimalloc's sampled heap profiler.
 pub mod prof {
     use core::ffi::{c_char, c_void};

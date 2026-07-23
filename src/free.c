@@ -33,6 +33,9 @@ static inline void mi_free_block_local(mi_page_t* page, mi_block_t* block, bool 
   MI_UNUSED(was_guarded);
   // checks  
   if mi_unlikely(mi_check_is_double_free(page, block)) return;
+  #if MI_PPROF
+  _mi_prof_on_free(page, block);
+  #endif
   if (!was_guarded) { mi_check_padding(page, block); }
   if (track_stats) { mi_stat_free(page, block); }
   #if (MI_DEBUG>0) && !MI_TRACK_ENABLED  && !MI_TSAN

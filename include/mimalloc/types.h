@@ -317,6 +317,7 @@ typedef uintptr_t mi_thread_free_t;
 //   at least one block that will be added, or as already been added, to
 //   the owning heap `thread_delayed_free` list. This guarantees that pages
 //   will be freed correctly even if only other threads free blocks.
+struct mi_prof_record_s;
 typedef struct mi_page_s {
   // "owned" by the segment
   uint32_t              slice_count;       // slices in this page (0 if not a page)
@@ -330,7 +331,8 @@ typedef struct mi_page_s {
   uint16_t              reserved;          // number of blocks reserved in memory
   mi_page_flags_t       flags;             // `in_full` and `has_aligned` flags (8 bits)
   uint8_t               free_is_zero:1;    // `true` if the blocks in the free list are zero initialized
-  uint8_t               retire_expire:7;   // expiration count for retired blocks
+  uint8_t               has_metadata:1;    // `true` if profiler records are attached to this page
+  uint8_t               retire_expire:6;   // expiration count for retired blocks
 
   mi_block_t*           free;              // list of available free blocks (`malloc` allocates from this list)
   mi_block_t*           local_free;        // list of deferred free blocks by this thread (migrates to `free`)
@@ -352,7 +354,7 @@ typedef struct mi_page_s {
   struct mi_page_s*     prev;              // previous page owned by this thread with the same `block_size`
 
   // 64-bit 11 words, 32-bit 13 words, (+2 for secure)
-  void* padding[1];
+  struct mi_prof_record_s* metadata;       // sampled live allocation records, or NULL
 } mi_page_t;
 
 
@@ -623,6 +625,13 @@ typedef struct mi_segments_tld_s {
   mi_stats_t*         stats;        // points to tld stats
 } mi_segments_tld_t;
 
+typedef struct mi_profiler_tld_s {
+  size_t   bytes_since_sample;
+  size_t   next_threshold;
+  uint64_t random;
+  uint64_t generation;
+} mi_profiler_tld_t;
+
 // Thread local data
 struct mi_tld_s {
   unsigned long long  heartbeat;     // monotonic heartbeat count
@@ -631,6 +640,7 @@ struct mi_tld_s {
   mi_heap_t*          heaps;         // list of heaps in this thread (so we can abandon all when the thread terminates)
   mi_segments_tld_t   segments;      // segment tld
   mi_stats_t          stats;         // statistics
+  mi_profiler_tld_t   profiler;      // allocation sampling profiler state
 };
 
 

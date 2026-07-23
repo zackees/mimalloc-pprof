@@ -111,6 +111,9 @@ extern inline void* _mi_page_malloc_zero(mi_heap_t* heap, mi_page_t* page, size_
     #endif
   #endif
 
+  #if MI_PPROF
+  _mi_prof_on_alloc(heap, page, block, size - MI_PADDING_SIZE);
+  #endif
   return block;
 }
 
@@ -277,6 +280,9 @@ void* mi_expand(void* p, size_t newsize) mi_attr_noexcept {
   const mi_page_t* const page = mi_validate_ptr_page(p,"mi_expand");  
   const size_t size = _mi_usable_size(p,page);
   if (newsize > size) return NULL;
+  #if MI_PPROF
+  _mi_prof_on_realloc_in_place((mi_page_t*)page, p, newsize);
+  #endif
   return p; // it fits
   #endif
 }
@@ -303,6 +309,9 @@ void* _mi_heap_realloc_zero(mi_heap_t* heap, void* p, size_t newsize, bool zero,
     // mi_track_resize(p,size,newsize)
     // if (newsize < size) { mi_track_mem_noaccess((uint8_t*)p + newsize, size - newsize); }
     if (usable_post!=NULL) { *usable_post = mi_page_usable_block_size(page); }
+    #if MI_PPROF
+    _mi_prof_on_realloc_in_place((mi_page_t*)page, p, newsize);
+    #endif
     return p;  // reallocation still fits and not more than 50% waste
   }
   void* newp = mi_heap_umalloc(heap,newsize,usable_post);

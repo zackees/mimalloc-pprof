@@ -170,6 +170,11 @@ static mi_option_desc_t options[_mi_option_last] =
   { 10000, UNINIT, MI_OPTION(generic_collect) },          // collect heaps every N (=10000) generic allocation calls
   { MI_DEFAULT_ALLOW_THP,
          UNINIT, MI_OPTION(allow_thp) }                 // allow transparent huge pages?
+  ,{ 0, UNINIT, MI_OPTION(prof) }
+  ,{ 524288, UNINIT, MI_OPTION(prof_sample_rate) }
+  ,{ 32, UNINIT, MI_OPTION(prof_bt_max) }
+  ,{ 0, UNINIT, MI_OPTION(prof_accum) }
+  ,{ 0, UNINIT, MI_OPTION(prof_seed) }
 };
 
 static void mi_option_init(mi_option_desc_t* desc);

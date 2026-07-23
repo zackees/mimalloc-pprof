@@ -2,6 +2,7 @@
    nothing: the caller supplies its profiler-arena backed PC buffer. */
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
+#include <string.h>
 
 #if MI_PPROF
 
@@ -29,7 +30,7 @@ static bool stack_init(void) {
   stack_capacity = 1024;
   stack_table = (mi_prof_stack_t**)_mi_prof_arena_alloc(stack_capacity * sizeof(*stack_table));
   if (stack_table == NULL) return false;
-  _mi_memzero(stack_table, stack_capacity * sizeof(*stack_table));
+  memset(stack_table, 0, stack_capacity * sizeof(*stack_table));
   return true;
 }
 
@@ -45,7 +46,7 @@ static bool stack_grow(void) {
   stack_capacity *= 2;
   stack_table = (mi_prof_stack_t**)_mi_prof_arena_alloc(stack_capacity*sizeof(*stack_table));
   if (stack_table == NULL) { stack_table=old; stack_capacity=old_capacity; return false; }
-  _mi_memzero(stack_table, stack_capacity*sizeof(*stack_table));
+  memset(stack_table, 0, stack_capacity*sizeof(*stack_table));
   for (size_t i=0;i<old_capacity;i++) if (old[i] != NULL) stack_place(old[i]);
   return true;
 }

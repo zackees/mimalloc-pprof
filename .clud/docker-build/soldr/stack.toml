@@ -1,0 +1,19 @@
+# managed-by: clud (docker_build_soldr.py)
+[stack]
+name = "soldr"
+image_tag_base = "clud-docker-build-soldr"
+
+[volumes]
+target = "/target"
+cargo_home = "/cargo-home"
+rustup_home = "/rustup-home"
+cargo_chef = "/cargo-chef"
+soldr_home = "/root/.soldr"
+
+[env]
+HOME = "/root"
+CARGO_HOME = "/cargo-home"
+CARGO_TARGET_DIR = "/target"
+RUSTUP_HOME = "/rustup-home"
+CARGO_CHEF_LOCAL_DIR = "/cargo-chef"
+SOLDR_TRUST_MODE = "permissive"

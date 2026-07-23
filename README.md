@@ -86,6 +86,9 @@ Notes:
 
 ## Building
 
+For a fast Windows-hosted Linux C/Rust development loop using Docker named
+volumes, see [docs/dev-loop.md](docs/dev-loop.md).
+
 The C library builds exactly like upstream mimalloc:
 
 ```

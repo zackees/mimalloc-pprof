@@ -7,3 +7,6 @@ description = "mimalloc global allocator with pprof support"
 
 [dependencies]
 libmimalloc-pprof-sys = { path = "../libmimalloc-pprof-sys" }
+
+[dev-dependencies]
+regex = "1"

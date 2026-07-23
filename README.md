@@ -10,7 +10,7 @@ Profiles are analyzed with the standard [google/pprof](https://github.com/google
 tooling (`pprof -http`, flamegraphs, `-base` diffs).
 
 > **Status: design phase.** The architecture and phased implementation plan live in
-> [issue #1](https://github.com/zackees/mimalloc-pprof/issues/1). Nothing is implemented yet.
+> [issue #2](https://github.com/zackees/mimalloc-pprof/issues/2). Nothing is implemented yet.
 
 ## What this adds on top of mimalloc
 
@@ -31,7 +31,7 @@ tooling (`pprof -http`, flamegraphs, `-base` diffs).
 /                      # the C library — a real fork of microsoft/mimalloc (shared git history)
 ├── include/ src/ test/ CMakeLists.txt
 ├── readme-upstream.md # upstream's readme.md (renamed so this file can exist on Windows)
-└── rust/              # cargo workspace (planned, see issue #1)
+└── rust/              # cargo workspace (planned, see issue #2)
     ├── libmimalloc-pprof-sys/
     └── mimalloc-pprof/
 ```
@@ -59,7 +59,7 @@ cmake -B build && cmake --build build && ctest --test-dir build
 ```
 
 See `readme-upstream.md` for the full upstream documentation. The Rust workspace and the
-soldr-based cross-compile CI are specified in issue #1.
+soldr-based cross-compile CI are specified in issue #2.
 
 ## Prior art & credits
 

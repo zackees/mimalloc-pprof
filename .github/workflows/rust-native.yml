@@ -1,0 +1,23 @@
+name: rust-native
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/rust-native.yml'
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked

@@ -269,6 +269,114 @@ static void test_modules_visit(void) {
   mi_prof_stop();
 }
 
+/* ---- T15: mi_prof_start_ex / mi_prof_config_t -----------------------------------------------
+   Covers issue #32's struct-based sibling of mi_prof_start: default-equivalence, the
+   FALLBACK/OVERRIDE env precedence contract, version/size rejection, and the
+   max_profiler_bytes arena budget. */
+#ifdef _WIN32
+static void test_setenv(const char* name, const char* value) { _putenv_s(name, value); }
+static void test_unsetenv(const char* name) { _putenv_s(name, ""); }
+#else
+static void test_setenv(const char* name, const char* value) { setenv(name, value, 1); }
+static void test_unsetenv(const char* name) { unsetenv(name); }
+#endif
+
+/* T15a: a fully zeroed mi_prof_config_t (mi_prof_config_t_decl's initial state) must behave
+   identically to mi_prof_start(0). */
+static void test_start_ex_default(void) {
+  test_unsetenv("MIMALLOC_PROF_SAMPLE_INTERVAL");
+  test_unsetenv("MIMALLOC_PROF_SAMPLE_RATE");
+
+  mi_prof_config_t_decl(cfg);
+  assert(mi_prof_start_ex(&cfg));
+  assert(mi_prof_is_enabled());
+  mi_prof_stats_t_decl(ex_stats);
+  assert(mi_prof_stats_get(&ex_stats));
+  mi_prof_stop();
+  assert(!mi_prof_is_enabled());
+
+  assert(mi_prof_start(0));
+  mi_prof_stats_t_decl(plain_stats);
+  assert(mi_prof_stats_get(&plain_stats));
+  mi_prof_stop();
+
+  assert(ex_stats.enabled && plain_stats.enabled);
+  assert(ex_stats.accum == plain_stats.accum);
+  assert(ex_stats.sample_rate == plain_stats.sample_rate);
+  assert(ex_stats.sample_rate == 524288);  /* documented default (profile.h). */
+}
+
+/* T15b: MI_PROF_CONFIG_OVERRIDE -- a non-zero struct field wins even though the matching
+   env var is also set (explicit CLI/struct flags are authoritative). */
+static void test_start_ex_override(void) {
+  test_setenv("MIMALLOC_PROF_SAMPLE_INTERVAL", "1000");
+  mi_prof_config_t_decl(cfg);
+  cfg.mode = MI_PROF_CONFIG_OVERRIDE;
+  cfg.sample_interval = 2000;
+  assert(mi_prof_start_ex(&cfg));
+  mi_prof_stats_t_decl(stats);
+  assert(mi_prof_stats_get(&stats));
+  assert(stats.sample_rate == 2000);  /* struct wins over env in OVERRIDE mode. */
+  mi_prof_stop();
+  test_unsetenv("MIMALLOC_PROF_SAMPLE_INTERVAL");
+}
+
+/* T15c: MI_PROF_CONFIG_FALLBACK (the default, mode == 0) -- the env var wins over the
+   struct field; the struct only fills gaps where env is silent (ops can tune a shipped
+   binary without a rebuild). */
+static void test_start_ex_fallback(void) {
+  test_setenv("MIMALLOC_PROF_SAMPLE_INTERVAL", "1000");
+  mi_prof_config_t_decl(cfg);
+  cfg.mode = MI_PROF_CONFIG_FALLBACK;
+  cfg.sample_interval = 2000;
+  assert(mi_prof_start_ex(&cfg));
+  mi_prof_stats_t_decl(stats);
+  assert(mi_prof_stats_get(&stats));
+  assert(stats.sample_rate == 1000);  /* env wins over struct in FALLBACK mode. */
+  mi_prof_stop();
+  test_unsetenv("MIMALLOC_PROF_SAMPLE_INTERVAL");
+}
+
+/* T15d: a version or size mismatch must be rejected (false), not crash or silently start
+   with defaults/garbage. */
+static void test_start_ex_bad_version(void) {
+  mi_prof_config_t_decl(bad_version);
+  bad_version.version = 999;
+  assert(!mi_prof_start_ex(&bad_version));
+  assert(!mi_prof_is_enabled());
+
+  mi_prof_config_t_decl(bad_size);
+  bad_size.size = sizeof(mi_prof_config_t) - 1;
+  assert(!mi_prof_start_ex(&bad_size));
+  assert(!mi_prof_is_enabled());
+}
+
+/* T15e: max_profiler_bytes budgets the profiler's own persistent arena (records + stack
+   intern table). Once the budget is exhausted, _mi_prof_arena_alloc refuses to grow with a
+   new chunk and new samples are silently dropped -- the underlying mi_malloc/mi_free calls
+   always still succeed; only profiler bookkeeping is skipped. This must be the last T15 test:
+   mi_option_prof_max_bytes has no "unset" and stays budgeted for the rest of the process. */
+static void test_start_ex_max_bytes(void) {
+  mi_prof_config_t_decl(cfg);
+  cfg.sample_interval = 1;                 /* sample every allocation so the budget fills fast. */
+  cfg.max_profiler_bytes = 3 * 64 * 1024;  /* a few chunks; MI_PROF_CHUNK_SIZE is 64KiB. */
+  assert(mi_prof_start_ex(&cfg));
+
+  enum { count = 20000, size = 64 };
+  void* blocks[count];
+  for (size_t i = 0; i < count; i++) { blocks[i] = mi_malloc(size); assert(blocks[i] != NULL); }
+
+  mi_prof_stats_t_decl(stats);
+  assert(mi_prof_stats_get(&stats));
+  assert(stats.arena_committed <= cfg.max_profiler_bytes);  /* budget never exceeded. */
+  assert(stats.live_samples < count);                       /* budget forced drops -- not every
+                                                                  allocation could be recorded. */
+
+  for (size_t i = 0; i < count; i++) mi_free(blocks[i]);  /* frees must not crash even for
+                                                               allocations whose sample was dropped. */
+  mi_prof_stop();
+}
+
 int main(void) {
   enum { count = 1000, size = 512 };
   void* blocks[count];
@@ -346,6 +454,11 @@ int main(void) {
   test_visit_reentrancy();
   test_proto_dump();
   test_modules_visit();
+  test_start_ex_default();
+  test_start_ex_override();
+  test_start_ex_fallback();
+  test_start_ex_bad_version();
+  test_start_ex_max_bytes();
   if (getenv("MIMALLOC_PROF_DUMP_AT_EXIT") != NULL) {
     assert(mi_prof_start_seeded(1, 47));
     assert(mi_malloc(4096) != NULL);  /* Preserve one real sample for pprof validation. */

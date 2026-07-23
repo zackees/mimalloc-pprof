@@ -20,4 +20,34 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      - run: cargo test --locked
+      - uses: zackees/setup-soldr@v0
+        with:
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+          build-cache-mode: full
+      - run: soldr cargo test --locked
+
+  test-win-gnu:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          release: true
+          install: mingw-w64-x86_64-gcc
+      - uses: zackees/setup-soldr@v0
+        with:
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+          build-cache-mode: full
+      - run: rustup target add x86_64-pc-windows-gnu
+      - shell: pwsh
+        run: |
+          $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "x86_64-w64-mingw32-gcc"
+          soldr cargo test --locked --target x86_64-pc-windows-gnu

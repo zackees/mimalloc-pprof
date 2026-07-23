@@ -53,7 +53,8 @@ fn accumulation_modes() {
     if accum {
         assert!(before_reset > 0);
         prof::reset();
-        assert_eq!(stack_count(), 0);
+        let (_, _, upper, upper_bytes, _) = common::header(&common::dump());
+        assert_eq!((upper, upper_bytes), (0, 0));
     } else {
         assert_eq!(before_reset, 0);
     }

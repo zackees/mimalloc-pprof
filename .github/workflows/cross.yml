@@ -220,3 +220,24 @@ jobs:
           & (Join-Path (go env GOPATH) 'bin/pprof.exe') -raw heap.prof | Tee-Object raw.txt
           if ($LASTEXITCODE -ne 0) { throw 'pprof could not parse heap.prof' }
           if (-not (Select-String -Path raw.txt -Pattern 'PeriodType: space|heap_v2|inuse_space')) { throw 'pprof output did not contain a heap profile' }
+      - name: Prove pprof parses a proto dump
+        if: matrix.pprof && runner.os != 'Windows'
+        shell: bash
+        run: |
+          generator=$(find dist/${{ matrix.target }} -maxdepth 1 -type f -name 't12_proto-*' | head -n 1)
+          test -n "$generator"
+          MIMALLOC_PROF_PROTO_PATH="$PWD/heap.pb" "$generator"
+          "$(go env GOPATH)/bin/pprof" -raw heap.pb > raw-pb.txt
+          grep -Eq 'inuse_space|alloc_space' raw-pb.txt
+      - name: Prove pprof parses a proto dump
+        if: matrix.pprof && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $generator = Get-ChildItem dist/${{ matrix.target }} -Filter 't12_proto-*' | Select-Object -First 1
+          if (-not $generator) { throw 't12_proto test binary was not staged' }
+          $env:MIMALLOC_PROF_PROTO_PATH = Join-Path $PWD 'heap.pb'
+          & $generator.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'proto profile generator failed' }
+          & (Join-Path (go env GOPATH) 'bin/pprof.exe') -raw heap.pb | Tee-Object raw-pb.txt
+          if ($LASTEXITCODE -ne 0) { throw 'pprof could not parse heap.pb' }
+          if (-not (Select-String -Path raw-pb.txt -Pattern 'inuse_space|alloc_space')) { throw 'pprof output did not contain heap sample types' }

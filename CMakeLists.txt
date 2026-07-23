@@ -75,6 +75,7 @@ set(mi_sources
     src/page.c
     src/profile.c
     $<$<BOOL:${MI_PPROF}>:src/profile-stack.c>
+    $<$<BOOL:${MI_PPROF}>:src/profile-maps.c>
     src/random.c
     src/segment.c
     src/segment-map.c
@@ -693,6 +694,7 @@ install(FILES include/mimalloc.h DESTINATION ${mi_install_incdir})
 install(FILES include/mimalloc-override.h DESTINATION ${mi_install_incdir})
 install(FILES include/mimalloc-new-delete.h DESTINATION ${mi_install_incdir})
 install(FILES include/mimalloc-stats.h DESTINATION ${mi_install_incdir})
+install(FILES include/mimalloc/profile.h DESTINATION ${mi_install_incdir})
 install(FILES cmake/mimalloc-config.cmake DESTINATION ${mi_install_cmakedir})
 install(FILES cmake/mimalloc-config-version.cmake DESTINATION ${mi_install_cmakedir})
 
@@ -780,6 +782,10 @@ if (MI_BUILD_TESTS)
     target_include_directories(mimalloc-test-profile PRIVATE include)
     target_link_libraries(mimalloc-test-profile PRIVATE mimalloc-static ${mi_libraries})
     add_test(NAME test-profile COMMAND mimalloc-test-profile)
+    add_test(NAME test-profile-accum COMMAND mimalloc-test-profile)
+    set_tests_properties(test-profile-accum PROPERTIES ENVIRONMENT "MIMALLOC_PROF_ACCUM=1")
+    add_test(NAME test-profile-auto COMMAND mimalloc-test-profile)
+    set_tests_properties(test-profile-auto PROPERTIES ENVIRONMENT "MIMALLOC_PROF=1")
   endif()
 
   # dynamic override test

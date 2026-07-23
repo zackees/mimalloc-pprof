@@ -34,6 +34,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "profile.c"
 #if MI_PPROF
 #include "profile-stack.c"
+#include "profile-maps.c"
 #endif
 #include "random.c"
 #include "segment.c"

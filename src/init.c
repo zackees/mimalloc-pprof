@@ -648,6 +648,9 @@ static void mi_process_init_once(void) mi_attr_noexcept {
 
   mi_stats_reset();  // only call stat reset *after* thread init (or the heap tld == NULL)
   mi_track_init();
+  #if MI_PPROF
+  _mi_prof_process_init();
+  #endif
 
   if (mi_option_is_enabled(mi_option_reserve_huge_os_pages)) {
     size_t pages = mi_option_get_clamp(mi_option_reserve_huge_os_pages, 0, 128*1024);
@@ -705,6 +708,9 @@ static void mi_process_done_once(void) {
 
   // done with tracking tools
   mi_track_done();
+  #if MI_PPROF
+  _mi_prof_process_done();
+  #endif
 
   // Forcefully release all retained memory; this can be dangerous in general if overriding regular malloc/free
   // since after process_done there might still be other code running that calls `free` (like at_exit routines,

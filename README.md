@@ -50,6 +50,40 @@ matrix proves Windows + cross-compilation on every change.
   `upstream/main` and submitted to microsoft/mimalloc. Keeping C-core and `rust/` changes
   in separate commits is a repo rule for exactly this reason.
 
+## Rust integration guide (profiling builds)
+
+The profiler records **raw program counters** at sample time; function names and types
+appear only when pprof symbolizes them offline against your binary. Because the
+`GlobalAlloc` shim (`__rust_alloc`) is shared, untyped code, your object types come from
+the **monomorphized caller frames** — `RawVec<MyStruct>::grow_amortized`,
+`Box::new::<MyStruct>`, `Arc<MyStruct>::new`, and so on. The capture skips the allocator's
+own frames, so stored frames start at your call site. Two build settings make those caller
+frames actually recoverable in release builds:
+
+```toml
+# Cargo.toml — keep line tables so pprof can expand inlined monomorphized frames
+[profile.release]
+debug = "line-tables-only"   # Cargo >= 1.71 ("debug = 1" also works)
+strip = false                # pprof symbolizes from the on-disk binary
+```
+
+```toml
+# .cargo/config.toml — reliable stack capture on Linux/macOS (frame-pointer walker).
+# Not needed on Windows x64, where RtlCaptureStackBackTrace uses unwind tables.
+[build]
+rustflags = ["-Cforce-frame-pointers=yes"]
+```
+
+Notes:
+
+- Frame pointers cost ≲1% on x86-64/aarch64 and are becoming the distro default anyway
+  (Fedora, Ubuntu 24.04+ build system packages with them).
+- Without line tables, inlined frames collapse into their caller: profiles still work, but
+  a `Vec<T>::push` that was inlined into your function won't appear as its own frame.
+- On MSVC targets, keep the `.pdb` produced alongside the binary; `llvm-symbolizer` (which
+  pprof can use) reads PE/PDB natively. Runtime dbghelp symbolization is a planned option
+  (issue #2, Phase 5) that removes the PDB-at-analysis-time requirement entirely.
+
 ## Building
 
 The C library builds exactly like upstream mimalloc:

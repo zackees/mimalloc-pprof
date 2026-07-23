@@ -10,6 +10,9 @@ import sys
 import time
 from pathlib import Path
 
+if os.name != "nt":
+    import signal
+
 ROOT = Path(__file__).resolve().parents[1]
 DOCKER_BUILD = ["clud", "tool", "run", "docker/docker-build.py", "soldr", str(ROOT)]
 C_TEST = (
@@ -22,17 +25,56 @@ C_TEST = (
 )
 
 
-def run_tool(args: list[str], *, capture: bool = False) -> str:
+def soldr_timeout_diagnostics() -> None:
+    """Print enough state to investigate a fail-fast development-loop timeout."""
+    print("soldr command exceeded 60 seconds; collecting Docker diagnostics:", file=sys.stderr)
+    for command in (
+        ["docker", "ps", "--filter", "name=clud-docker-build-soldr", "--format", "table {{.Names}}\\t{{.Status}}"],
+        ["docker", "stats", "--no-stream"],
+        ["docker", "ps", "-a", "--filter", "name=clud-docker-build-soldr"],
+    ):
+        try:
+            subprocess.run(command, cwd=ROOT, check=False, timeout=10)
+        except subprocess.TimeoutExpired:
+            print(f"diagnostic also timed out: {' '.join(command)}", file=sys.stderr)
+
+
+def run_tool(args: list[str], *, capture: bool = False,
+             timeout_seconds: int | None = None) -> str:
     env = os.environ.copy()
     env["MSYS_NO_PATHCONV"] = "1"
-    completed = subprocess.run(DOCKER_BUILD + args, cwd=ROOT, env=env, text=True,
-                               stdout=subprocess.PIPE if capture else None,
-                               stderr=subprocess.STDOUT if capture else None)
-    if completed.returncode:
-        if capture and completed.stdout:
-            print(completed.stdout, end="", file=sys.stderr)
-        raise subprocess.CalledProcessError(completed.returncode, completed.args)
-    return completed.stdout or ""
+    popen_args: dict[str, object] = {}
+    if os.name == "nt":
+        popen_args["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_args["start_new_session"] = True
+    process = subprocess.Popen(
+        DOCKER_BUILD + args, cwd=ROOT, env=env, text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+        **popen_args,
+    )
+    try:
+        output, _ = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        # `subprocess.run(..., timeout=...)` kills only its direct child on
+        # Windows.  `clud tool run` has a Python and Docker child tree; leave
+        # none of it behind or its delayed container start races the next run.
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           check=False, capture_output=True)
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+        output, _ = process.communicate()
+        if output:
+            print(output, end="", file=sys.stderr)
+        soldr_timeout_diagnostics()
+        raise SystemExit("soldr development command timed out after 60 seconds") from error
+    if process.returncode:
+        if capture and output:
+            print(output, end="", file=sys.stderr)
+        raise subprocess.CalledProcessError(process.returncode, process.args)
+    return output or ""
 
 
 def c_test(extra: list[str], *, capture: bool = False) -> str:
@@ -41,7 +83,8 @@ def c_test(extra: list[str], *, capture: bool = False) -> str:
         command += " " + " ".join(extra)
     # `clud tool run` consumes a standalone `--`; docker-build's `run`
     # parser accepts the command directly as its remainder instead.
-    return run_tool(["run", "bash", "-lc", command], capture=capture)
+    return run_tool(["run", "bash", "-lc", command], capture=capture,
+                    timeout_seconds=60)
 
 
 def rust_test(extra: list[str]) -> None:
@@ -51,7 +94,7 @@ def rust_test(extra: list[str]) -> None:
     command = "cd /src/rust && soldr cargo test"
     if extra:
         command += " " + " ".join(extra)
-    run_tool(["run", "bash", "-lc", command])
+    run_tool(["run", "bash", "-lc", command], timeout_seconds=60)
 
 
 def timed(label: str, action):
@@ -89,7 +132,8 @@ def bench(reuse: bool = False) -> None:
     if (ROOT / "rust" / "Cargo.toml").is_file():
         rust_test([])
         results.append(timed("rust warm no-op", lambda: run_tool(
-            ["run", "bash", "-lc", "cd /src/rust && soldr cargo test"], capture=True)))
+            ["run", "bash", "-lc", "cd /src/rust && soldr cargo test"], capture=True,
+            timeout_seconds=60)))
 
     warm = [seconds for name, seconds, _ in results if name.startswith("warm no-op")]
     checks = {

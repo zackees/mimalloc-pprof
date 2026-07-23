@@ -43,6 +43,7 @@ pub mod prof {
     use core::ffi::{c_char, c_void};
     use std::ffi::CString;
     use std::io;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::path::Path;
 
     use crate::sys;
@@ -93,5 +94,135 @@ pub mod prof {
         } else {
             Vec::new()
         }
+    }
+
+    /// Snapshot of `mi_prof_stats_get`'s counters, translated from the raw
+    /// sys struct into plain Rust types.
+    #[derive(Debug, Clone, Default)]
+    pub struct ProfStats {
+        pub enabled: bool,
+        pub accum: bool,
+        pub sample_rate: usize,
+        pub live_samples: usize,
+        pub live_bytes: usize,
+        pub accum_samples: usize,
+        pub accum_bytes: usize,
+        pub unique_stacks: usize,
+        pub arena_committed: usize,
+        pub stack_table_overflows: usize,
+    }
+
+    /// Read the profiler's current counters via `mi_prof_stats_get`.
+    ///
+    /// Returns `ProfStats::default()` (all zero/false) if the call fails,
+    /// e.g. because the sys struct's `size`/`version` header does not match
+    /// what the linked mimalloc build expects.
+    pub fn stats() -> ProfStats {
+        let mut raw: sys::mi_prof_stats_t = unsafe { core::mem::zeroed() };
+        raw.size = core::mem::size_of::<sys::mi_prof_stats_t>();
+        raw.version = sys::MI_PROF_STAT_VERSION;
+        if unsafe { sys::mi_prof_stats_get(&mut raw) } {
+            ProfStats {
+                enabled: raw.enabled,
+                accum: raw.accum,
+                sample_rate: raw.sample_rate,
+                live_samples: raw.live_samples,
+                live_bytes: raw.live_bytes,
+                accum_samples: raw.accum_samples,
+                accum_bytes: raw.accum_bytes,
+                unique_stacks: raw.unique_stacks,
+                arena_committed: raw.arena_committed,
+                stack_table_overflows: raw.stack_table_overflows,
+            }
+        } else {
+            ProfStats::default()
+        }
+    }
+
+    /// One sampled call stack, copied out of the profiler by [`samples`].
+    #[derive(Debug, Clone)]
+    pub struct Sample {
+        pub stack: Vec<usize>,
+        pub live_objects: usize,
+        pub live_bytes: usize,
+        pub accum_objects: usize,
+        pub accum_bytes: usize,
+    }
+
+    impl Sample {
+        /// Estimate the un-sampled byte volume behind this sample.
+        ///
+        /// Mirrors pprof's legacy heap-sample scaling formula
+        /// (`scaleHeapSample` in pprof's `profile/legacy_profile.go`),
+        /// which corrects for the bias a Poisson sampling process with mean
+        /// interval `sample_rate` introduces toward larger allocations.
+        pub fn estimated_bytes(&self, sample_rate: usize) -> u64 {
+            if self.live_objects == 0 || self.live_bytes == 0 {
+                return 0;
+            }
+            if sample_rate <= 1 {
+                return self.live_bytes as u64;
+            }
+            let avg = self.live_bytes as f64 / self.live_objects as f64;
+            let scale = 1.0 / (1.0 - (-avg / sample_rate as f64).exp());
+            (self.live_bytes as f64 * scale) as u64
+        }
+    }
+
+    /// Frees the snapshot handle on drop, including on unwind, so a panic
+    /// partway through collection never leaks profiler-arena memory.
+    struct SnapshotGuard(*mut sys::mi_prof_snapshot_t);
+
+    impl Drop for SnapshotGuard {
+        fn drop(&mut self) {
+            unsafe { sys::mi_prof_snapshot_free(self.0) }
+        }
+    }
+
+    unsafe extern "C" fn collect_visitor(
+        info: *const sys::mi_prof_sample_info_t,
+        arg: *mut c_void,
+    ) -> bool {
+        let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+            let out = &mut *(arg as *mut Vec<Sample>);
+            let info = &*info;
+            let stack = (0..info.depth)
+                .map(|i| *info.stack.add(i) as usize)
+                .collect();
+            out.push(Sample {
+                stack,
+                live_objects: info.live_objects,
+                live_bytes: info.live_bytes,
+                accum_objects: info.accum_objects,
+                accum_bytes: info.accum_bytes,
+            });
+        }));
+        result.is_ok()
+    }
+
+    /// Collect a point-in-time copy of every live sampled stack.
+    ///
+    /// This snapshots under the profiler lock via `mi_prof_snapshot_new`,
+    /// then walks and frees the snapshot outside that lock. Using
+    /// `mi_prof_visit` directly here would run the (allocating) collection
+    /// below from inside the visitor while the profiler lock is held,
+    /// risking reentrant profiler-hook allocation and deadlock — the
+    /// reentrancy hazard the snapshot API exists to avoid (issue #2,
+    /// decisions 11-13).
+    pub fn samples() -> Vec<Sample> {
+        let snap = unsafe { sys::mi_prof_snapshot_new() };
+        if snap.is_null() {
+            return Vec::new();
+        }
+        let guard = SnapshotGuard(snap);
+        let mut out: Vec<Sample> = Vec::new();
+        unsafe {
+            sys::mi_prof_snapshot_visit(
+                guard.0,
+                collect_visitor,
+                (&mut out as *mut Vec<Sample>).cast(),
+            );
+        }
+        out
     }
 }

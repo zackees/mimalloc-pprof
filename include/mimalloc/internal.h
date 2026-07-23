@@ -298,7 +298,20 @@ void*       _mi_prof_arena_alloc(size_t size);
 typedef struct mi_prof_stack_s mi_prof_stack_t;
 mi_prof_stack_t* _mi_prof_stack_intern(void);
 void        _mi_prof_stack_release(mi_prof_stack_t* stack);
+void        _mi_prof_stack_alloc(mi_prof_stack_t* stack, size_t size);
+void        _mi_prof_stack_free(mi_prof_stack_t* stack, size_t size);
+void        _mi_prof_stack_resize(mi_prof_stack_t* stack, size_t oldsize, size_t newsize);
+typedef void (_mi_prof_stack_visit_fun)(const mi_prof_stack_t* stack, void* arg);
+void        _mi_prof_stack_visit(_mi_prof_stack_visit_fun* visit, void* arg);
+void        _mi_prof_stack_format(const mi_prof_stack_t* stack, char* buf, size_t capacity, size_t* written);
+void        _mi_prof_stack_counts(const mi_prof_stack_t* stack, size_t* curobjs, size_t* curbytes, size_t* accumobjs, size_t* accumbytes);
+void        _mi_prof_stack_reset(void);
+void        _mi_prof_stack_done(void);
 size_t      _mi_prof_stack_count(void);
+typedef bool (_mi_prof_dump_append_fun)(void* arg, const char* buf, size_t len);
+bool        _mi_prof_maps_append(_mi_prof_dump_append_fun* append, void* arg);
+void        _mi_prof_process_init(void);
+void        _mi_prof_process_done(void);
 #ifdef __cplusplus
 }
 #endif

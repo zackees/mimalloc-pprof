@@ -85,7 +85,7 @@ static void prof_free_record(mi_page_t* page, void* p) {
   rec->next = prof_free; prof_free = rec;
 }
 
-bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) {
+bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept {
   if (sample_rate == 0) sample_rate = (size_t)mi_option_get(mi_option_prof_sample_rate);
   if (sample_rate == 0) sample_rate = 524288;
   mi_lock_acquire(&prof_lock);
@@ -94,10 +94,10 @@ bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) {
   mi_lock_release(&prof_lock);
   return started;
 }
-bool mi_prof_start(size_t sample_rate) { return mi_prof_start_seeded(sample_rate, (uint64_t)mi_option_get(mi_option_prof_seed)); }
-bool mi_prof_is_enabled(void) { return mi_atomic_load_relaxed(&prof_enabled); }
-void mi_prof_debug_stats(size_t* records, size_t* bytes) { mi_lock_acquire(&prof_lock); if (records) *records=prof_records; if (bytes) *bytes=prof_bytes; mi_lock_release(&prof_lock); }
-void mi_prof_stop(void) {
+bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { return mi_prof_start_seeded(sample_rate, (uint64_t)mi_option_get(mi_option_prof_seed)); }
+bool mi_prof_is_enabled(void) mi_attr_noexcept { return mi_atomic_load_relaxed(&prof_enabled); }
+void mi_prof_debug_stats(size_t* records, size_t* bytes) mi_attr_noexcept { mi_lock_acquire(&prof_lock); if (records) *records=prof_records; if (bytes) *bytes=prof_bytes; mi_lock_release(&prof_lock); }
+void mi_prof_stop(void) mi_attr_noexcept {
   mi_lock_acquire(&prof_lock);
   mi_atomic_store_release(&prof_enabled, false);
   for (mi_prof_record_t* rec = prof_all; rec != NULL; rec = rec->all_next) { rec->page->metadata = NULL; rec->page->has_metadata = false; }
@@ -132,9 +132,9 @@ void _mi_prof_on_realloc_in_place(mi_page_t* page, void* p, size_t size) {
 }
 
 #else
-bool mi_prof_start(size_t sample_rate) { MI_UNUSED(sample_rate); return false; }
-bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) { MI_UNUSED(sample_rate); MI_UNUSED(seed); return false; }
-void mi_prof_stop(void) { }
-bool mi_prof_is_enabled(void) { return false; }
-void mi_prof_debug_stats(size_t* records, size_t* bytes) { if (records) *records=0; if (bytes) *bytes=0; }
+bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { MI_UNUSED(sample_rate); return false; }
+bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept { MI_UNUSED(sample_rate); MI_UNUSED(seed); return false; }
+void mi_prof_stop(void) mi_attr_noexcept { }
+bool mi_prof_is_enabled(void) mi_attr_noexcept { return false; }
+void mi_prof_debug_stats(size_t* records, size_t* bytes) mi_attr_noexcept { if (records) *records=0; if (bytes) *bytes=0; }
 #endif

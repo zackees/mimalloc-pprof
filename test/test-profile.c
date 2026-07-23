@@ -58,6 +58,100 @@ static void profile_threads(void) {
 }
 #endif
 
+typedef struct sum_info_s { size_t objs; size_t bytes; } sum_info_t;
+static bool sum_visitor(const mi_prof_sample_info_t* info, void* arg) {
+  sum_info_t* s = (sum_info_t*)arg;
+  s->objs += info->live_objects; s->bytes += info->live_bytes;
+  return true;
+}
+
+static void test_visit_and_snapshot(void) {
+  enum { count = 200, size = 4096 };
+  void* blocks[count];
+  assert(mi_prof_start_seeded(4096, 53));
+  for (size_t i = 0; i < count; i++) blocks[i] = mi_malloc(size);
+  sum_info_t visit_sum = { 0, 0 };
+  assert(mi_prof_visit(sum_visitor, &visit_sum));
+  mi_prof_snapshot_t* snap = mi_prof_snapshot_new();
+  assert(snap != NULL);
+  sum_info_t snap_sum = { 0, 0 };
+  assert(mi_prof_snapshot_visit(snap, sum_visitor, &snap_sum));
+  dump_profile();
+  unsigned long long dump_objs, dump_bytes, dump_accum_objs, dump_accum_bytes;
+  assert(sscanf(dump_text, "heap profile: %llu: %llu [%llu: %llu]", &dump_objs, &dump_bytes, &dump_accum_objs, &dump_accum_bytes) == 4);
+  assert(visit_sum.objs == snap_sum.objs && visit_sum.bytes == snap_sum.bytes);
+  assert(visit_sum.objs == dump_objs && visit_sum.bytes == dump_bytes);
+  mi_prof_snapshot_free(snap);
+  for (size_t i = 0; i < count; i++) mi_free(blocks[i]);
+  mi_prof_stop();
+}
+
+static void test_stats_get(void) {
+  mi_prof_stats_t_decl(idle);
+  assert(mi_prof_stats_get(&idle));
+  assert(!idle.enabled);
+  assert(mi_prof_start_seeded(4096, 59));
+  enum { count = 100, size = 4096 };
+  void* blocks[count];
+  for (size_t i = 0; i < count; i++) blocks[i] = mi_malloc(size);
+  mi_prof_stats_t_decl(running);
+  assert(mi_prof_stats_get(&running));
+  assert(running.enabled);
+  assert(running.sample_rate == 4096);
+  assert(running.live_samples > 0);
+  assert(running.live_bytes >= running.live_samples * size);
+  for (size_t i = 0; i < count; i++) mi_free(blocks[i]);
+  mi_prof_stats_t_decl(freed);
+  assert(mi_prof_stats_get(&freed));
+  assert(freed.live_samples == 0 && freed.live_bytes == 0);
+  mi_prof_stop();
+  mi_prof_stats_t_decl(stopped);
+  assert(mi_prof_stats_get(&stopped));
+  assert(!stopped.enabled);
+  mi_prof_stats_t_decl(bad_version);
+  bad_version.version = 99;
+  assert(!mi_prof_stats_get(&bad_version));
+  mi_prof_stats_t_decl(bad_size);
+  bad_size.size = sizeof(mi_prof_stats_t) - 1;
+  assert(!mi_prof_stats_get(&bad_size));
+}
+
+static void noop_writer(void* arg, const char* buf, size_t len) { (void)arg; (void)buf; (void)len; }
+typedef struct t10_ctx_s { void* p; bool done; bool dump_ok; } t10_ctx_t;
+static bool t10_callback(const mi_prof_sample_info_t* info, void* arg) {
+  (void)info;
+  t10_ctx_t* ctx = (t10_ctx_t*)arg;
+  void* tmp = mi_malloc(1024); assert(tmp != NULL); mi_free(tmp);
+  if (!ctx->done) { mi_free(ctx->p); ctx->dump_ok = mi_prof_dump_writer(noop_writer, NULL); ctx->done = true; }
+  return true;
+}
+
+static void test_visit_reentrancy(void) {
+  assert(mi_prof_start_seeded(4096, 61));
+  mi_prof_stats_t_decl(before);
+  assert(mi_prof_stats_get(&before));
+  void* p = mi_malloc(65536);
+  assert(p != NULL);
+  mi_prof_stats_t_decl(after_alloc);
+  assert(mi_prof_stats_get(&after_alloc));
+  assert(after_alloc.live_samples > before.live_samples);  /* 64KiB is almost certainly sampled at rate 4096. */
+  t10_ctx_t ctx = { p, false, true };
+  assert(mi_prof_visit(t10_callback, &ctx));
+  assert(!ctx.dump_ok);  /* mi_prof_dump_writer must fail fast from inside a visitor callback. */
+  mi_prof_stats_t_decl(after_visit);
+  assert(mi_prof_stats_get(&after_visit));
+  assert(after_visit.live_samples == before.live_samples);
+  mi_prof_snapshot_t* snap = mi_prof_snapshot_new();
+  assert(snap != NULL);
+  sum_info_t snap_sum_before = { 0, 0 };
+  assert(mi_prof_snapshot_visit(snap, sum_visitor, &snap_sum_before));
+  mi_prof_stop();
+  sum_info_t snap_sum_after = { 0, 0 };
+  assert(mi_prof_snapshot_visit(snap, sum_visitor, &snap_sum_after));
+  assert(snap_sum_before.objs == snap_sum_after.objs && snap_sum_before.bytes == snap_sum_after.bytes);
+  mi_prof_snapshot_free(snap);
+}
+
 int main(void) {
   enum { count = 1000, size = 512 };
   void* blocks[count];
@@ -130,6 +224,9 @@ int main(void) {
   if (mi_option_is_enabled(mi_option_prof_accum)) { assert(stacks > 0); mi_prof_reset(); mi_prof_debug_stats(NULL, NULL, &stacks); assert(stacks == 0); }
   else { assert(stacks == 0); }
   mi_prof_stop();
+  test_visit_and_snapshot();
+  test_stats_get();
+  test_visit_reentrancy();
   if (getenv("MIMALLOC_PROF_DUMP_AT_EXIT") != NULL) {
     assert(mi_prof_start_seeded(1, 47));
     assert(mi_malloc(4096) != NULL);  /* Preserve one real sample for pprof validation. */

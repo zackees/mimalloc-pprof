@@ -431,6 +431,11 @@ typedef enum mi_option_e {
   mi_option_target_segments_per_thread, // experimental (=0)
   mi_option_generic_collect,            // collect heaps every N (=10000) generic allocation calls
   mi_option_allow_thp,                  // allow transparent huge pages? (=1) (on Android =0 by default). Set to 0 to disable THP for the process.
+  mi_option_prof,
+  mi_option_prof_sample_rate,
+  mi_option_prof_bt_max,
+  mi_option_prof_accum,
+  mi_option_prof_seed,
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -504,6 +509,8 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_heap_alloc_new_n(mi_h
 #ifdef __cplusplus
 }
 #endif
+
+#include "mimalloc/profile.h"
 
 // ---------------------------------------------------------------------------------------------
 // Implement the C++ std::allocator interface for use in STL containers.

@@ -214,6 +214,9 @@ static void _mi_page_thread_free_collect(mi_page_t* page)
 
   // return if the list is empty
   if (head == NULL) return;
+  #if MI_PPROF
+  _mi_prof_on_free_collect(page, head);
+  #endif
 
   // find the tail -- also to get a proper count (without data races)
   size_t max_count = page->capacity; // cannot collect more than capacity

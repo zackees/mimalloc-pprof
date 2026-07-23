@@ -31,6 +31,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "options.c"
 #include "os.c"
 #include "page.c"           // includes page-queue.c
+#include "profile.c"
 #include "random.c"
 #include "segment.c"
 #include "segment-map.c"

@@ -285,6 +285,12 @@ mi_msecs_t  _mi_clock_start(void);
 void*       _mi_page_malloc_zero(mi_heap_t* heap, mi_page_t* page, size_t size, bool zero, size_t* usable) mi_attr_noexcept;  // called from `_mi_malloc_generic`
 void*       _mi_page_malloc(mi_heap_t* heap, mi_page_t* page, size_t size) mi_attr_noexcept;                  // called from `_mi_heap_malloc_aligned`
 void*       _mi_page_malloc_zeroed(mi_heap_t* heap, mi_page_t* page, size_t size) mi_attr_noexcept;           // called from `_mi_heap_malloc_aligned`
+#if MI_PPROF
+void        _mi_prof_on_alloc(mi_heap_t* heap, mi_page_t* page, void* p, size_t size);
+void        _mi_prof_on_free(mi_page_t* page, void* p);
+void        _mi_prof_on_free_collect(mi_page_t* page, mi_block_t* head);
+void        _mi_prof_on_realloc_in_place(mi_page_t* page, void* p, size_t size);
+#endif
 void*       _mi_heap_malloc_zero(mi_heap_t* heap, size_t size, bool zero) mi_attr_noexcept;
 void*       _mi_heap_malloc_zero_ex(mi_heap_t* heap, size_t size, bool zero, size_t huge_alignment, size_t* usable) mi_attr_noexcept;     // called from `_mi_heap_malloc_aligned`
 void*       _mi_heap_realloc_zero(mi_heap_t* heap, void* p, size_t newsize, bool zero, size_t* usable_pre, size_t* usable_post) mi_attr_noexcept;

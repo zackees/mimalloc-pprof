@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD 17)
 option(MI_SECURE            "Use security mitigations (like meta data guard pages, allocation randomization, double-free mitigation, and free-list corruption detection)" OFF)
 option(MI_SECURE_FULL       "Use full security mitigations including guard pages at the end of each mimalloc page (may be expensive)" OFF)
 option(MI_PADDING           "Enable padding to detect heap block overflow (always on in DEBUG or SECURE mode, or with Valgrind/ASAN)" OFF)
+option(MI_PPROF             "Enable the allocation sampling profiler" ON)
 option(MI_OVERRIDE          "Override the standard malloc interface (i.e. define entry points for 'malloc', 'free', etc)" ON)
 option(MI_XMALLOC           "Enable abort() call on memory allocation failure by default" OFF)
 option(MI_SHOW_ERRORS       "Show error and warning messages by default (only enabled by default in DEBUG mode)" OFF)
@@ -72,6 +73,7 @@ set(mi_sources
     src/options.c
     src/os.c
     src/page.c
+    src/profile.c
     src/random.c
     src/segment.c
     src/segment-map.c
@@ -87,6 +89,12 @@ if(MI_EXTRA_CPPDEFS)
  set(mi_defines ${MI_EXTRA_CPPDEFS})
 else()
  set(mi_defines "")
+endif()
+
+if(MI_PPROF)
+  list(APPEND mi_defines MI_PPROF=1)
+else()
+  list(APPEND mi_defines MI_PPROF=0)
 endif()
 
 # pass git revision as a define
@@ -760,6 +768,15 @@ if (MI_BUILD_TESTS)
     endif()
     add_test(NAME test-${TEST_NAME} COMMAND mimalloc-test-${TEST_NAME})
   endforeach()
+
+  if(MI_PPROF)
+    add_executable(mimalloc-test-profile test/test-profile.c)
+    target_compile_definitions(mimalloc-test-profile PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-profile PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-profile PRIVATE include)
+    target_link_libraries(mimalloc-test-profile PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-profile COMMAND mimalloc-test-profile)
+  endif()
 
   # dynamic override test
   if(MI_BUILD_SHARED AND NOT (MI_TRACK_ASAN OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN) AND NOT (APPLE AND MI_USE_CXX))

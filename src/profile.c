@@ -21,6 +21,7 @@ typedef struct mi_prof_record_s {
   void* ptr;
   mi_page_t* page;
   size_t size;
+  mi_prof_stack_t* stack;
 } mi_prof_record_t;
 
 static mi_lock_t prof_lock = MI_LOCK_INITIALIZER;
@@ -50,11 +51,10 @@ static size_t prof_threshold(mi_profiler_tld_t* tld) {
   return value;
 }
 
-static mi_prof_record_t* prof_record_alloc(void) {
-  if (prof_free != NULL) { mi_prof_record_t* rec = prof_free; prof_free = rec->next; return rec; }
+void* _mi_prof_arena_alloc(size_t size) {
   mi_prof_chunk_t* chunk = prof_chunks;
   const size_t align = sizeof(void*) - 1;
-  if (chunk == NULL || chunk->used + sizeof(mi_prof_record_t) + align > chunk->size) {
+  if (chunk == NULL || chunk->used + size + align > chunk->size) {
     mi_memid_t memid;
     void* p = _mi_os_alloc(MI_PROF_CHUNK_SIZE, &memid);
     if (p == NULL) return NULL;
@@ -63,8 +63,13 @@ static mi_prof_record_t* prof_record_alloc(void) {
     prof_chunks = chunk;
   }
   uintptr_t start = ((uintptr_t)chunk + chunk->used + align) & ~(uintptr_t)align;
-  chunk->used = start - (uintptr_t)chunk + sizeof(mi_prof_record_t);
-  return (mi_prof_record_t*)start;
+  chunk->used = start - (uintptr_t)chunk + size;
+  return (void*)start;
+}
+
+static mi_prof_record_t* prof_record_alloc(void) {
+  if (prof_free != NULL) { mi_prof_record_t* rec = prof_free; prof_free = rec->next; return rec; }
+  return (mi_prof_record_t*)_mi_prof_arena_alloc(sizeof(mi_prof_record_t));
 }
 
 static void prof_remove_all(mi_prof_record_t* rec) {
@@ -82,6 +87,7 @@ static void prof_free_record(mi_page_t* page, void* p) {
   if (page->metadata == NULL) page->has_metadata = false;
   prof_remove_all(rec);
   prof_records--; prof_bytes -= rec->size;
+  _mi_prof_stack_release(rec->stack);
   rec->next = prof_free; prof_free = rec;
 }
 
@@ -96,7 +102,7 @@ bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept {
 }
 bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { return mi_prof_start_seeded(sample_rate, (uint64_t)mi_option_get(mi_option_prof_seed)); }
 bool mi_prof_is_enabled(void) mi_attr_noexcept { return mi_atomic_load_relaxed(&prof_enabled); }
-void mi_prof_debug_stats(size_t* records, size_t* bytes) mi_attr_noexcept { mi_lock_acquire(&prof_lock); if (records) *records=prof_records; if (bytes) *bytes=prof_bytes; mi_lock_release(&prof_lock); }
+void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept { mi_lock_acquire(&prof_lock); if (records) *records=prof_records; if (bytes) *bytes=prof_bytes; if (unique_stacks) *unique_stacks=_mi_prof_stack_count(); mi_lock_release(&prof_lock); }
 void mi_prof_stop(void) mi_attr_noexcept {
   mi_lock_acquire(&prof_lock);
   mi_atomic_store_release(&prof_enabled, false);
@@ -117,7 +123,7 @@ void _mi_prof_on_alloc(mi_heap_t* heap, mi_page_t* page, void* p, size_t size) {
   if (tld->bytes_since_sample < tld->next_threshold) { mi_lock_release(&prof_lock); return; }
   tld->bytes_since_sample = 0; tld->next_threshold = prof_threshold(tld);
   mi_prof_record_t* rec = prof_record_alloc();
-  if (rec != NULL) { rec->ptr=p; rec->page=page; rec->size=size; rec->next=(mi_prof_record_t*)page->metadata; rec->all_next=prof_all; page->metadata=(struct mi_prof_record_s*)rec; page->has_metadata=true; prof_all=rec; prof_records++; prof_bytes+=size; }
+  if (rec != NULL) { rec->stack = _mi_prof_stack_intern(); rec->ptr=p; rec->page=page; rec->size=size; rec->next=(mi_prof_record_t*)page->metadata; rec->all_next=prof_all; page->metadata=(struct mi_prof_record_s*)rec; page->has_metadata=true; prof_all=rec; prof_records++; prof_bytes+=size; }
   mi_lock_release(&prof_lock);
 }
 void _mi_prof_on_free(mi_page_t* page, void* p) { if mi_likely(!page->has_metadata) return; mi_lock_acquire(&prof_lock); prof_free_record(page,p); mi_lock_release(&prof_lock); }
@@ -136,5 +142,5 @@ bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { MI_UNUSED(sample_rate)
 bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept { MI_UNUSED(sample_rate); MI_UNUSED(seed); return false; }
 void mi_prof_stop(void) mi_attr_noexcept { }
 bool mi_prof_is_enabled(void) mi_attr_noexcept { return false; }
-void mi_prof_debug_stats(size_t* records, size_t* bytes) mi_attr_noexcept { if (records) *records=0; if (bytes) *bytes=0; }
+void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept { if (records) *records=0; if (bytes) *bytes=0; if (unique_stacks) *unique_stacks=0; }
 #endif

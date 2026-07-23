@@ -13,6 +13,7 @@ fn c() {
     let mut values = Vec::<u8>::with_capacity(4096);
     values.push(7);
     assert_eq!(values[0], 7);
+    std::hint::black_box(&values);
     std::mem::forget(values);
 }
 

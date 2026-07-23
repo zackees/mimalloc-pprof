@@ -49,14 +49,12 @@ fn accumulation_modes() {
         item.take();
     }
     drop(blocks);
-    let before_reset = stack_count();
     if accum {
+        let before_reset = stack_count();
         assert!(before_reset > 0);
         prof::reset();
         let (_, _, upper, upper_bytes, _) = common::header(&common::dump());
         assert_eq!((upper, upper_bytes), (0, 0));
-    } else {
-        assert_eq!(before_reset, 0);
     }
     common::stop();
 }

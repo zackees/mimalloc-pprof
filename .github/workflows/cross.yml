@@ -1,5 +1,8 @@
 name: cross
 
+env:
+  SOLDR_GITHUB_TOKEN: ${{ github.token }}
+
 on:
   pull_request:
     paths:

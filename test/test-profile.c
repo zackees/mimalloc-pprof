@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include "mimalloc/profile.h"
 
 static void profile_worker(void) {
@@ -152,6 +153,122 @@ static void test_visit_reentrancy(void) {
   mi_prof_snapshot_free(snap);
 }
 
+/* ---- T12: mi_prof_dump_proto_writer -------------------------------------------------------
+   A ~40-line mini protobuf decoder that walks only the top-level Profile fields (and, for
+   Sample/Mapping, one level into their known submessage shape) -- not a general pprof reader. */
+static bool t12_pb_varint(const unsigned char* buf, size_t len, size_t* pos, uint64_t* out) {
+  uint64_t result = 0; int shift = 0;
+  while (*pos < len) {
+    unsigned char b = buf[(*pos)++];
+    result |= ((uint64_t)(b & 0x7F)) << shift;
+    if (!(b & 0x80)) { *out = result; return true; }
+    shift += 7; if (shift >= 64) return false;
+  }
+  return false;
+}
+static bool t12_pb_next(const unsigned char* buf, size_t len, size_t* pos, uint32_t* field, uint32_t* wire, uint64_t* val, const unsigned char** bytes, size_t* blen) {
+  if (*pos >= len) return false;
+  uint64_t tag; if (!t12_pb_varint(buf, len, pos, &tag)) return false;
+  *field = (uint32_t)(tag >> 3); *wire = (uint32_t)(tag & 7);
+  if (*wire == 0) return t12_pb_varint(buf, len, pos, val);
+  if (*wire == 2) { uint64_t l; if (!t12_pb_varint(buf, len, pos, &l)) return false; *bytes = buf + *pos; *blen = (size_t)l; *pos += (size_t)l; return true; }
+  return false;
+}
+typedef struct t12_buf_s { unsigned char* data; size_t len, cap; } t12_buf_t;
+static unsigned char t12_proto_buf[262144];
+static void t12_write(void* arg, const char* buf, size_t len) {
+  t12_buf_t* b = (t12_buf_t*)arg;
+  assert(b->len + len <= b->cap);
+  memcpy(b->data + b->len, buf, len); b->len += len;
+}
+static void test_proto_dump(void) {
+  enum { count = 200, size = 4096, max_strings = 64, max_mappings = 16 };
+  void* blocks[count];
+  assert(mi_prof_start_seeded(4096, 71));
+  for (size_t i = 0; i < count; i++) blocks[i] = mi_malloc(size);
+  mi_prof_stats_t_decl(stats);
+  assert(mi_prof_stats_get(&stats));
+
+  t12_buf_t out = { t12_proto_buf, 0, sizeof(t12_proto_buf) };
+  assert(mi_prof_dump_proto_writer(t12_write, &out));
+  assert(out.len > 0);
+
+  char strtab[max_strings][300]; size_t string_count = 0;
+  size_t mapping_filename_idx[max_mappings]; size_t mapping_count = 0;
+  size_t sample_type_count = 0, sample_count = 0;
+  unsigned long long inuse_sum = 0;
+  size_t pos = 0; uint32_t field, wire; uint64_t val; const unsigned char* bytes; size_t blen;
+  while (t12_pb_next(out.data, out.len, &pos, &field, &wire, &val, &bytes, &blen)) {
+    if (wire != 2) continue;  /* period/default_sample_type are top-level varints; not needed below. */
+    if (field == 1) sample_type_count++;
+    else if (field == 2) {
+      sample_count++;
+      size_t p2 = 0; uint32_t f2, w2; uint64_t v2; const unsigned char* b2; size_t bl2;
+      while (t12_pb_next(bytes, blen, &p2, &f2, &w2, &v2, &b2, &bl2)) {
+        if (f2 == 2 && w2 == 2) {  /* Sample.value: packed varints, no per-element tag. */
+          size_t p3 = 0; int idx = 0;
+          while (p3 < bl2) { uint64_t v; if (!t12_pb_varint(b2, bl2, &p3, &v)) break; if (idx == 2) inuse_sum += v; idx++; }
+        }
+      }
+    }
+    else if (field == 3 && mapping_count < max_mappings) {
+      size_t p2 = 0; uint32_t f2, w2; uint64_t v2; const unsigned char* b2; size_t bl2; size_t fname_idx = SIZE_MAX;
+      while (t12_pb_next(bytes, blen, &p2, &f2, &w2, &v2, &b2, &bl2)) if (f2 == 5 && w2 == 0) fname_idx = (size_t)v2;
+      mapping_filename_idx[mapping_count++] = fname_idx;
+    }
+    else if (field == 6 && string_count < max_strings) {
+      size_t n = (blen < sizeof(strtab[0]) - 1) ? blen : sizeof(strtab[0]) - 1;
+      memcpy(strtab[string_count], bytes, n); strtab[string_count][n] = 0; string_count++;
+    }
+  }
+
+  assert(sample_type_count >= 1);
+  assert(sample_count > 0);
+  /* mi_prof_dump_proto_writer pre-scales values with Go's protomem.go scaleHeapSample convention
+     (see the comment above that function in src/profile.c), it does not emit raw sampled counts.
+     With size==rate==4096 here the scale factor is 1/(1-exp(-1)) ~= 1.582, so the summed
+     inuse_objects across samples should land strictly between 1x and 2x the raw live_samples
+     count -- not exact, hence the 2x tolerance rather than an equality check. */
+  assert(inuse_sum >= (unsigned long long)stats.live_samples);
+  assert(inuse_sum <= (unsigned long long)stats.live_samples * 2);
+
+  bool found_module = false;
+  for (size_t i = 0; i < mapping_count; i++) {
+    size_t idx = mapping_filename_idx[i];
+    if (idx < string_count && strstr(strtab[idx], "mimalloc-test-profile") != NULL) found_module = true;
+  }
+  assert(found_module);
+
+  for (size_t i = 0; i < count; i++) mi_free(blocks[i]);
+  mi_prof_stop();
+}
+
+/* ---- T14-C: mi_prof_modules_visit ---------------------------------------------------------- */
+typedef struct t14_ctx_s { bool found; } t14_ctx_t;
+static bool t14_module_visitor(const mi_prof_module_info_t* info, void* arg) {
+  t14_ctx_t* ctx = (t14_ctx_t*)arg;
+  if (strstr(info->path, "mimalloc-test-profile") != NULL) ctx->found = true;
+  return true;
+}
+static bool t14_guard_visitor(const mi_prof_sample_info_t* info, void* arg) {
+  (void)info; (void)arg;
+  t14_ctx_t modctx = { false };
+  const bool inner_ok = mi_prof_modules_visit(t14_module_visitor, &modctx);
+  assert(!inner_ok);  /* guard: mi_prof_modules_visit must fail fast from inside a mi_prof_visit callback. */
+  return true;
+}
+static void test_modules_visit(void) {
+  t14_ctx_t ctx = { false };
+  assert(mi_prof_modules_visit(t14_module_visitor, &ctx));
+  assert(ctx.found);
+
+  assert(mi_prof_start_seeded(4096, 79));
+  void* p = mi_malloc(65536); assert(p != NULL);  /* 64KiB at rate 4096 is always sampled (see test_visit_reentrancy). */
+  assert(mi_prof_visit(t14_guard_visitor, NULL));
+  mi_free(p);
+  mi_prof_stop();
+}
+
 int main(void) {
   enum { count = 1000, size = 512 };
   void* blocks[count];
@@ -227,6 +344,8 @@ int main(void) {
   test_visit_and_snapshot();
   test_stats_get();
   test_visit_reentrancy();
+  test_proto_dump();
+  test_modules_visit();
   if (getenv("MIMALLOC_PROF_DUMP_AT_EXIT") != NULL) {
     assert(mi_prof_start_seeded(1, 47));
     assert(mi_malloc(4096) != NULL);  /* Preserve one real sample for pprof validation. */

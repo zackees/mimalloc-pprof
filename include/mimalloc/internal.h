@@ -311,6 +311,9 @@ void        _mi_prof_stack_unpin_all_and_sweep(void);
 bool        _mi_prof_stack_visit_info(mi_prof_visit_fun* fn, void* arg);
 typedef bool (_mi_prof_dump_append_fun)(void* arg, const char* buf, size_t len);
 bool        _mi_prof_maps_append(_mi_prof_dump_append_fun* append, void* arg);
+// structured module enumerator backing mi_prof_modules_visit and the profile.proto Mapping table;
+// unlike _mi_prof_maps_append (verbatim text) this yields one {path,base,size} per module.
+bool        _mi_prof_maps_visit(mi_prof_module_visit_fun* visitor, void* arg);
 void        _mi_prof_process_init(void);
 void        _mi_prof_process_done(void);
 #ifdef __cplusplus

@@ -66,7 +66,7 @@ pub fn enable_heap_profiling() -> bool {
 /// Safe controls for mimalloc's sampled heap profiler.
 pub mod prof {
     use core::ffi::{c_char, c_void};
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
     use std::io;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::path::Path;
@@ -118,6 +118,51 @@ pub mod prof {
             out
         } else {
             Vec::new()
+        }
+    }
+
+    /// Serialize the current heap profile as a binary pprof `profile.proto`
+    /// `Profile` message (see [google/pprof's `profile.proto`][proto]),
+    /// without holding the profiler lock.
+    ///
+    /// Sample values are pre-scaled the same way Go's `runtime/pprof` scales
+    /// legacy heap samples (the `protomem.go` convention: `alloc_objects`,
+    /// `alloc_space`, `inuse_objects`, `inuse_space`, each already corrected
+    /// for Poisson sampling bias rather than left for a downstream tool to
+    /// rescale). The `Mapping` table is included, so external symbolizers
+    /// need only the binary — no text parsing of a "heap profile:" header or
+    /// a `MAPPED_LIBRARIES:` section. This is the compact, machine-oriented
+    /// counterpart to [`dump_to_vec`]'s text format, intended for API and
+    /// transport use (issue #23) where a `pprof`-compatible tool consumes
+    /// the bytes directly.
+    ///
+    /// [proto]: https://github.com/google/pprof/blob/main/proto/profile.proto
+    pub fn dump_proto_to_vec() -> Vec<u8> {
+        let mut out = Vec::new();
+        let ok = unsafe {
+            sys::mi_prof_dump_proto_writer(Some(write_cb), (&mut out as *mut Vec<u8>).cast())
+        };
+        if ok {
+            out
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Write the current heap profile to `path` in `profile.proto` format.
+    ///
+    /// See [`dump_proto_to_vec`] for the format details.
+    pub fn dump_proto_file(path: &Path) -> io::Result<()> {
+        let path = path.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "profile path is not UTF-8")
+        })?;
+        let path = CString::new(path).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "profile path contains NUL")
+        })?;
+        if unsafe { sys::mi_prof_dump_proto(path.as_ptr()) } {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 
@@ -246,6 +291,53 @@ pub mod prof {
                 guard.0,
                 collect_visitor,
                 (&mut out as *mut Vec<Sample>).cast(),
+            );
+        }
+        out
+    }
+
+    /// One loaded module (shared library or the main executable), copied out
+    /// of the OS module list by [`modules`].
+    #[derive(Debug, Clone)]
+    pub struct ModuleInfo {
+        pub path: String,
+        pub base: usize,
+        pub size: usize,
+    }
+
+    unsafe extern "C" fn modules_visitor(
+        info: *const sys::mi_prof_module_info_t,
+        arg: *mut c_void,
+    ) -> bool {
+        let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+            let out = &mut *(arg as *mut Vec<ModuleInfo>);
+            let info = &*info;
+            // `info.path` is only valid for the duration of this callback (it
+            // points into OS-owned module-list storage), so it must be copied
+            // into an owned `String` right here rather than stashed for later.
+            let path = CStr::from_ptr(info.path).to_string_lossy().into_owned();
+            out.push(ModuleInfo {
+                path,
+                base: info.base,
+                size: info.size,
+            });
+        }));
+        result.is_ok()
+    }
+
+    /// Enumerate the process's loaded modules (shared libraries and the main
+    /// executable), e.g. to build pprof `Mapping` entries yourself.
+    ///
+    /// Unlike [`samples`]'s `collect_visitor`, this callback is free to
+    /// allocate: `mi_prof_modules_visit` never takes the profiler lock (the
+    /// module list is OS-owned, not part of the sampled-allocation table), so
+    /// there is no reentrant-allocation-under-the-lock hazard here.
+    pub fn modules() -> Vec<ModuleInfo> {
+        let mut out: Vec<ModuleInfo> = Vec::new();
+        unsafe {
+            sys::mi_prof_modules_visit(
+                modules_visitor,
+                (&mut out as *mut Vec<ModuleInfo>).cast(),
             );
         }
         out

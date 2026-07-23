@@ -329,6 +329,239 @@ bool mi_prof_snapshot_visit(const mi_prof_snapshot_t* snap, mi_prof_visit_fun* v
   return true;
 }
 void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { if (snap != NULL) _mi_os_free(snap, snap->total_size, snap->memid); }
+
+bool mi_prof_modules_visit(mi_prof_module_visit_fun* visitor, void* arg) mi_attr_noexcept {
+  if (visitor == NULL) return false;
+  if (prof_callback_depth > 0) return false;
+  return _mi_prof_maps_visit(visitor, arg);  // OS-owned module list: no profiler lock needed.
+}
+
+/* ---------------------------------------------------------------------------------------------
+   profile.proto (google/pprof) writer.
+
+   Minimal hand-written protobuf encoder: varint(), a tag+varint field writer, and a tag+length
+   "bytes" field writer (used for both length-delimited strings/submessages and, with a
+   pre-concatenated-varint payload, PACKED repeated scalar fields -- proto3 packs repeated
+   numeric fields by default, and this is exactly how Go's own hand-rolled encoder for pprof
+   builds Sample.location_id/Sample.value too, via `b.pb.uint64s`/`b.pb.int64s`
+   (go/src/runtime/pprof/proto.go)). Submessages (ValueType/Mapping/Location/Sample) are built
+   into small stack scratch buffers first (their max size is bounded: <=128 stack frames per
+   sample, module paths capped below) so no first pass is needed to size them; the buffer holding
+   them is then written to the top-level Profile message as one length-delimited field. All
+   scratch memory here is transient stack space or _mi_os_alloc (never mi_malloc), consistent
+   with the rest of the profiler.
+
+   Field numbers verified against https://github.com/google/pprof/blob/main/proto/profile.proto:
+     Profile:   sample_type=1 sample=2 mapping=3 location=4 string_table=6
+                period_type=11 period=12 default_sample_type=14
+     ValueType: type=1 unit=2                      (both string_table indices)
+     Sample:    location_id=1 (packed uint64)  value=2 (packed int64)
+     Mapping:   id=1 memory_start=2 memory_limit=3  filename=5 (string_table index)
+     Location:  id=1 mapping_id=2 address=3
+   No Function/Line tables are written (id-less: consumers resolve symbols via the Mapping's
+   filename, same as any pprof profile with has_functions=false on its mappings). */
+
+static size_t pb_varint(uint8_t* buf, uint64_t v) {
+  size_t n = 0;
+  do { uint8_t b = (uint8_t)(v & 0x7F); v >>= 7; if (v != 0) b |= 0x80; buf[n++] = b; } while (v != 0);
+  return n;
+}
+static size_t pb_field_varint(uint8_t* buf, size_t pos, uint32_t field, uint64_t value) {
+  pos += pb_varint(buf + pos, ((uint64_t)field << 3) | 0);
+  pos += pb_varint(buf + pos, value);
+  return pos;
+}
+static size_t pb_field_bytes(uint8_t* buf, size_t pos, uint32_t field, const void* data, size_t len) {
+  pos += pb_varint(buf + pos, ((uint64_t)field << 3) | 2);
+  pos += pb_varint(buf + pos, (uint64_t)len);
+  if (len > 0) memcpy(buf + pos, data, len);
+  return pos + len;
+}
+static bool pb_emit_bytes_field(prof_dump_buffer_t* out, uint32_t field, const void* data, size_t len) {
+  uint8_t hdr[16]; size_t n = pb_varint(hdr, ((uint64_t)field << 3) | 2); n += pb_varint(hdr + n, (uint64_t)len);
+  if (!prof_dump_append(out, (const char*)hdr, n)) return false;
+  return (len == 0) || prof_dump_append(out, (const char*)data, len);
+}
+static bool pb_emit_varint_field(prof_dump_buffer_t* out, uint32_t field, uint64_t value) {
+  uint8_t buf[20]; size_t n = pb_varint(buf, ((uint64_t)field << 3) | 0); n += pb_varint(buf + n, value);
+  return prof_dump_append(out, (const char*)buf, n);
+}
+static bool pb_emit_valuetype(prof_dump_buffer_t* out, uint32_t field, int64_t type_idx, int64_t unit_idx) {
+  uint8_t vt[24]; size_t n = 0;
+  n = pb_field_varint(vt, n, 1, (uint64_t)type_idx);
+  n = pb_field_varint(vt, n, 2, (uint64_t)unit_idx);
+  return pb_emit_bytes_field(out, field, vt, n);
+}
+
+/* Mirrors go/src/runtime/pprof/protomem.go's scaleHeapSample, which this comment quotes from
+   memory (verified against the live file on github.com/golang/go):
+     // scaleHeapSample adjusts the data from a heap Sample to account for its probability of
+     // appearing in the collected data. heap profiles are a sampling of the memory allocation
+     // requests... we estimate the unsampled value by dividing the sampled value by the
+     // probability of a sample.
+     func scaleHeapSample(count, size, rate int64) (int64, int64) {
+       if count == 0 || size == 0 { return 0, 0 }
+       if rate <= 1 { return count, size }              // rate<=1: everything was sampled.
+       avgSize := float64(size) / float64(count)
+       scale := 1 / (1 - math.Exp(-avgSize/float64(rate)))
+       return int64(float64(count) * scale), int64(float64(size) * scale)
+     }
+   Go calls this twice per record -- once for the Alloc* totals, once for the InUse* totals --
+   each with that record's own (count,bytes,rate). We do the same per unique stack below: once
+   for (accum_objects,accum_bytes) -> alloc_*, once for (live_objects,live_bytes) -> inuse_*.
+   When MIMALLOC_PROF_ACCUM is off, accum_objects/accum_bytes are always 0 (profile-stack.c's
+   _mi_prof_stack_alloc only updates them when mi_option_prof_accum is enabled), so alloc_* comes
+   out (0,0) via the count==0||size==0 shortcut above -- this is the "accum-off => alloc_* zero"
+   behavior called for in the work order. */
+/* Self-contained exp(), avoiding a new libm link dependency for this one call site: this
+   profiler has no other transcendental-math usage today, CMakeLists.txt (out of scope for this
+   change) does not link `m` on Unix, and "no new required dependencies" is a hard rule for this
+   fork's C build. Textbook range reduction + Taylor series: exp(x) = 2^k * exp(r) with
+   k = round(x/ln2) so |r| <= ln2/2 ~= 0.3466, which a 17-term Taylor series resolves to full
+   double precision (error ~ r^18/18!, negligible). Only ever called below with x <= 0. */
+static double prof_exp(double x) {
+  if (x > 700.0) return 1e308;   // saturate; unreachable from prof_scale_heap_sample (x = -avg_size/rate <= 0)
+  if (x < -700.0) return 0.0;    // underflows to 0 well before double's actual limit
+  const double ln2 = 0.69314718055994530942;
+  const long k = (long)(x / ln2 + (x >= 0.0 ? 0.5 : -0.5));  // round(x/ln2) to nearest, ties away from zero
+  const double r = x - (double)k * ln2;
+  double term = 1.0, sum = 1.0;
+  for (int i = 1; i <= 17; i++) { term *= r / (double)i; sum += term; }
+  double result = sum;
+  if (k >= 0) { for (long i = 0; i < k; i++) result *= 2.0; }
+  else        { for (long i = 0; i < -k; i++) result *= 0.5; }
+  return result;
+}
+static void prof_scale_heap_sample(size_t count, size_t bytes, size_t rate, size_t* out_count, size_t* out_bytes) {
+  if (count == 0 || bytes == 0) { *out_count = 0; *out_bytes = 0; return; }
+  if (rate <= 1) { *out_count = count; *out_bytes = bytes; return; }
+  const double avg_size = (double)bytes / (double)count;
+  const double scale = 1.0 / (1.0 - prof_exp(-avg_size / (double)rate));
+  *out_count = (size_t)((double)count * scale);
+  *out_bytes = (size_t)((double)bytes * scale);
+}
+
+enum { PROF_PROTO_MAX_MODULES = 512 };   // dense fixed cap, mirrors the HMODULE[1024] cap in profile-maps.c
+enum { PROF_PROTO_MAX_DEPTH = 128 };     // mirrors MI_PROF_BT_MAX_LIMIT in profile-stack.c
+typedef struct proto_module_s { uintptr_t base; size_t size; char path[512]; } proto_module_t;
+typedef struct proto_module_ctx_s { proto_module_t* modules; size_t count; } proto_module_ctx_t;
+static bool proto_collect_module(const mi_prof_module_info_t* info, void* arg) {
+  proto_module_ctx_t* ctx = (proto_module_ctx_t*)arg;
+  if (ctx->count >= PROF_PROTO_MAX_MODULES) return true;  // table full: keep visiting, just stop recording.
+  proto_module_t* m = &ctx->modules[ctx->count++];
+  m->base = info->base; m->size = info->size;
+  const size_t plen = prof_min(strlen(info->path), sizeof(m->path) - 1);
+  memcpy(m->path, info->path, plen); m->path[plen] = 0;
+  return true;
+}
+static uint32_t proto_module_for_pc(const proto_module_t* modules, size_t count, const void* pc) {
+  const uintptr_t addr = (uintptr_t)pc;
+  for (size_t i = 0; i < count; i++) if (addr >= modules[i].base && addr < modules[i].base + modules[i].size) return (uint32_t)(i + 1);
+  return 0;
+}
+
+typedef struct proto_pc_slot_s { const void* pc; uint32_t id; } proto_pc_slot_t;
+static uint32_t proto_pc_intern(proto_pc_slot_t* table, size_t capacity, const void* pc, uint32_t* next_id) {
+  size_t index = (size_t)(((uintptr_t)pc >> 4) * (uintptr_t)2654435761u) & (capacity - 1);
+  while (table[index].pc != NULL) { if (table[index].pc == pc) return table[index].id; index = (index + 1) & (capacity - 1); }
+  table[index].pc = pc; table[index].id = (*next_id)++;
+  return table[index].id;
+}
+
+enum { PB_STR_EMPTY = 0, PB_STR_ALLOC_OBJECTS, PB_STR_COUNT, PB_STR_ALLOC_SPACE, PB_STR_BYTES, PB_STR_INUSE_OBJECTS, PB_STR_INUSE_SPACE, PB_STR_SPACE, PB_STR_FIXED_COUNT };
+static const char* const prof_proto_fixed_strings[PB_STR_FIXED_COUNT] = { "", "alloc_objects", "count", "alloc_space", "bytes", "inuse_objects", "inuse_space", "space" };
+
+bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
+  if (write == NULL) return false;
+  if (prof_callback_depth > 0) return false;
+  mi_prof_snapshot_t* snap = mi_prof_snapshot_new();  // deep-copies stacks+counts under prof_lock, then releases it.
+  if (snap == NULL) return false;
+
+  mi_memid_t mods_memid;
+  proto_module_t* modules = (proto_module_t*)_mi_os_alloc(PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), &mods_memid);
+  if (modules == NULL) { mi_prof_snapshot_free(snap); return false; }
+  proto_module_ctx_t mod_ctx = { modules, 0 };
+  const bool maps_ok = _mi_prof_maps_visit(proto_collect_module, &mod_ctx);
+  const size_t module_count = mod_ctx.count;
+
+  // Unique-PC table (Location ids start at 1), sized once from the total PC count so no growth
+  // logic is needed (upper bound is unique_stacks * max depth, the same bound the snapshot's
+  // pcpool above is already sized to).
+  size_t total_pcs = 0;
+  for (size_t i = 0; i < snap->count; i++) total_pcs += snap->entries[i].depth;
+  size_t pc_capacity = 16;
+  while (pc_capacity < total_pcs * 2 + 1) pc_capacity *= 2;
+  mi_memid_t pc_memid;
+  proto_pc_slot_t* pc_table = (proto_pc_slot_t*)_mi_os_alloc(pc_capacity * sizeof(proto_pc_slot_t), &pc_memid);
+  if (pc_table == NULL) { _mi_os_free(modules, PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), mods_memid); mi_prof_snapshot_free(snap); return false; }
+  memset(pc_table, 0, pc_capacity * sizeof(proto_pc_slot_t));
+  uint32_t next_location_id = 1;
+
+  prof_dump_buffer_t out = { NULL, NULL, true };
+  bool ok = maps_ok;  // parity with mi_prof_dump_writer, which also fails the whole dump if maps enumeration fails.
+
+  ok = ok && pb_emit_valuetype(&out, 1, PB_STR_ALLOC_OBJECTS, PB_STR_COUNT);
+  ok = ok && pb_emit_valuetype(&out, 1, PB_STR_ALLOC_SPACE, PB_STR_BYTES);
+  ok = ok && pb_emit_valuetype(&out, 1, PB_STR_INUSE_OBJECTS, PB_STR_COUNT);
+  ok = ok && pb_emit_valuetype(&out, 1, PB_STR_INUSE_SPACE, PB_STR_BYTES);
+
+  for (size_t i = 0; ok && i < snap->count; i++) {
+    const mi_prof_snapshot_entry_t* e = &snap->entries[i];
+    if (e->live_objects == 0 && e->live_bytes == 0 && e->accum_objects == 0 && e->accum_bytes == 0) continue;  // parity with the TEXT emitter's zero-filter.
+    uint32_t location_ids[PROF_PROTO_MAX_DEPTH];
+    const size_t depth = prof_min(e->depth, (size_t)PROF_PROTO_MAX_DEPTH);
+    for (size_t f = 0; f < depth; f++) location_ids[f] = proto_pc_intern(pc_table, pc_capacity, e->pcs[f], &next_location_id);  // pcs[] is already callee-first (innermost frame first).
+    size_t alloc_objs, alloc_bytes, live_objs, live_bytes;
+    prof_scale_heap_sample(e->accum_objects, e->accum_bytes, prof_rate, &alloc_objs, &alloc_bytes);
+    prof_scale_heap_sample(e->live_objects, e->live_bytes, prof_rate, &live_objs, &live_bytes);
+    uint8_t sm[1536]; size_t sn = 0;
+    { uint8_t packed[PROF_PROTO_MAX_DEPTH * 10]; size_t pn = 0; for (size_t f = 0; f < depth; f++) pn += pb_varint(packed + pn, (uint64_t)location_ids[f]); sn = pb_field_bytes(sm, sn, 1, packed, pn); }
+    { uint8_t packed[64]; size_t pn = 0; const uint64_t vals[4] = { (uint64_t)alloc_objs, (uint64_t)alloc_bytes, (uint64_t)live_objs, (uint64_t)live_bytes }; for (int k = 0; k < 4; k++) pn += pb_varint(packed + pn, vals[k]); sn = pb_field_bytes(sm, sn, 2, packed, pn); }
+    ok = pb_emit_bytes_field(&out, 2, sm, sn);
+  }
+
+  for (size_t i = 0; ok && i < module_count; i++) {
+    uint8_t mp[64]; size_t mn = 0;
+    mn = pb_field_varint(mp, mn, 1, (uint64_t)(i + 1));
+    mn = pb_field_varint(mp, mn, 2, (uint64_t)modules[i].base);
+    mn = pb_field_varint(mp, mn, 3, (uint64_t)(modules[i].base + modules[i].size));
+    mn = pb_field_varint(mp, mn, 5, (uint64_t)(PB_STR_FIXED_COUNT + i));
+    ok = pb_emit_bytes_field(&out, 3, mp, mn);
+  }
+
+  for (size_t i = 0; ok && i < pc_capacity; i++) {
+    if (pc_table[i].pc == NULL) continue;
+    const uint32_t mapping_id = proto_module_for_pc(modules, module_count, pc_table[i].pc);
+    uint8_t lc[48]; size_t ln = 0;
+    ln = pb_field_varint(lc, ln, 1, (uint64_t)pc_table[i].id);
+    if (mapping_id != 0) ln = pb_field_varint(lc, ln, 2, (uint64_t)mapping_id);
+    ln = pb_field_varint(lc, ln, 3, (uint64_t)(uintptr_t)pc_table[i].pc);
+    ok = pb_emit_bytes_field(&out, 4, lc, ln);
+  }
+
+  for (size_t i = 0; ok && i < PB_STR_FIXED_COUNT; i++) ok = pb_emit_bytes_field(&out, 6, prof_proto_fixed_strings[i], strlen(prof_proto_fixed_strings[i]));
+  for (size_t i = 0; ok && i < module_count; i++) ok = pb_emit_bytes_field(&out, 6, modules[i].path, strlen(modules[i].path));
+
+  ok = ok && pb_emit_valuetype(&out, 11, PB_STR_SPACE, PB_STR_BYTES);              // period_type: space/bytes.
+  ok = ok && pb_emit_varint_field(&out, 12, (uint64_t)prof_rate);                  // period: the configured sample rate.
+  ok = ok && pb_emit_varint_field(&out, 14, (uint64_t)PB_STR_INUSE_SPACE);         // default_sample_type: inuse_space.
+
+  if (ok) for (prof_dump_chunk_t* chunk = out.first; chunk != NULL; chunk = chunk->next) write(arg, chunk->data, chunk->used);
+  prof_dump_dispose(&out);
+  _mi_os_free(pc_table, pc_capacity * sizeof(proto_pc_slot_t), pc_memid);
+  _mi_os_free(modules, PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), mods_memid);
+  mi_prof_snapshot_free(snap);
+  return ok;
+}
+bool mi_prof_dump_proto(const char* path) mi_attr_noexcept {
+  if (prof_callback_depth > 0) return false;
+  if (path == NULL) return false;
+  FILE* f = fopen(path, "wb"); if (f == NULL) return false;
+  const bool ok = mi_prof_dump_proto_writer(prof_file_write, f);
+  fclose(f);
+  return ok;
+}
+
 static void prof_auto_start(void) {
   /* Some statically linked MinGW programs do not retain the CRT/TLS startup
      callback. Fall back to the first allocation so MIMALLOC_PROF still works. */
@@ -361,6 +594,7 @@ void _mi_prof_on_alloc(mi_heap_t* heap, mi_page_t* page, void* p, size_t size) {
       mi_atomic_increment_relaxed(&prof_records); mi_atomic_add_relaxed(&prof_bytes, size);
       if (mi_option_is_enabled(mi_option_prof_accum)) { mi_atomic_increment_relaxed(&prof_accum_records); mi_atomic_add_relaxed(&prof_accum_bytes, size); }
     }
+    else { rec->next = prof_free; prof_free = rec; }  /* dropped sample: recycle the record or every post-overflow sample leaks arena memory */
   }
   mi_lock_release(&prof_lock);
 }
@@ -394,9 +628,12 @@ bool mi_prof_is_enabled(void) mi_attr_noexcept { return false; }
 void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept { if (records) *records=0; if (bytes) *bytes=0; if (unique_stacks) *unique_stacks=0; }
 bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept { MI_UNUSED(write); MI_UNUSED(arg); return false; }
 bool mi_prof_dump(const char* path) mi_attr_noexcept { MI_UNUSED(path); return false; }
+bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept { MI_UNUSED(write); MI_UNUSED(arg); return false; }
+bool mi_prof_dump_proto(const char* path) mi_attr_noexcept { MI_UNUSED(path); return false; }
 void mi_prof_reset(void) mi_attr_noexcept { }
 bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept { MI_UNUSED(stats); return false; }
 bool mi_prof_visit(mi_prof_visit_fun* visitor, void* arg) mi_attr_noexcept { MI_UNUSED(visitor); MI_UNUSED(arg); return false; }
+bool mi_prof_modules_visit(mi_prof_module_visit_fun* visitor, void* arg) mi_attr_noexcept { MI_UNUSED(visitor); MI_UNUSED(arg); return false; }
 mi_prof_snapshot_t* mi_prof_snapshot_new(void) mi_attr_noexcept { return NULL; }
 bool mi_prof_snapshot_visit(const mi_prof_snapshot_t* snap, mi_prof_visit_fun* visitor, void* arg) mi_attr_noexcept { MI_UNUSED(snap); MI_UNUSED(visitor); MI_UNUSED(arg); return false; }
 void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { MI_UNUSED(snap); }

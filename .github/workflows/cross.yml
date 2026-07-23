@@ -1,0 +1,222 @@
+name: cross
+
+env:
+  SOLDR_GITHUB_TOKEN: ${{ github.token }}
+
+on:
+  pull_request:
+    paths:
+      - src/**
+      - include/**
+      - rust/**
+      - .github/workflows/cross.yml
+  push:
+    branches: [main]
+    paths:
+      - src/**
+      - include/**
+      - rust/**
+      - .github/workflows/cross.yml
+
+jobs:
+  build-linux:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    env:
+      # The profiler walks frame pointers on non-Windows platforms.  Keep both
+      # the Rust callers and the bundled C allocator unwindable in release.
+      RUSTFLAGS: -Cforce-frame-pointers=yes
+      CFLAGS: -fno-omit-frame-pointer
+      CXXFLAGS: -fno-omit-frame-pointer
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            command: soldr cargo test --no-run
+            cflags: ""
+          - target: aarch64-unknown-linux-gnu
+            command: soldr cargo zigbuild --tests
+            cflags: -Wno-error=date-time
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: zackees/setup-soldr@v0
+        with:
+          cache: true
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+          build-cache-mode: full
+      - name: Build test binaries through Soldr
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILD_COMMAND: ${{ matrix.command }}
+          CFLAGS_aarch64_unknown_linux_gnu: ${{ matrix.cflags }}
+        run: |
+          eval "$BUILD_COMMAND --target $TARGET --release --message-format=json" \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' > bins.txt
+          test -s bins.txt
+          mkdir -p "dist/$TARGET"
+          xargs -r -a bins.txt -I{} cp {} "dist/$TARGET/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-bins-${{ matrix.target }}
+          path: rust/dist/${{ matrix.target }}
+          if-no-files-found: error
+
+  build-cross:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: zackees/setup-soldr@v0
+        with:
+          cache: true
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+          build-cache-mode: full
+      - name: Prepare blessed cross toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: soldr prepare --target "$TARGET" --github-env "$GITHUB_ENV"
+      - name: Build test binaries through Soldr
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          soldr cargo test --no-run --target "$TARGET" --release --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' > bins.txt
+          test -s bins.txt
+          mkdir -p "dist/$TARGET"
+          xargs -r -a bins.txt -I{} cp {} "dist/$TARGET/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-bins-${{ matrix.target }}
+          path: rust/dist/${{ matrix.target }}
+          if-no-files-found: error
+
+  build-win-gnu:
+    name: build (x86_64-pc-windows-gnu)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: zackees/setup-soldr@v0
+        with:
+          cache: true
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+          build-cache-mode: full
+      - name: Prepare managed MinGW through Soldr
+        shell: pwsh
+        run: soldr prepare --target x86_64-pc-windows-gnu --github-env $env:GITHUB_ENV
+      - name: Build test binaries through Soldr
+        shell: pwsh
+        run: |
+          $metadata = Join-Path $PWD 'bins.jsonl'
+          soldr cargo test --no-run --target x86_64-pc-windows-gnu --release --message-format=json | Tee-Object -FilePath $metadata
+          if ($LASTEXITCODE -ne 0) { throw 'Soldr test build failed' }
+          $bins = Get-Content $metadata | ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+          } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable } | ForEach-Object executable
+          if (-not $bins) { throw 'No test executables were produced' }
+          $dist = Join-Path $PWD 'dist/x86_64-pc-windows-gnu'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $bins | ForEach-Object { Copy-Item $_ -Destination $dist }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-bins-x86_64-pc-windows-gnu
+          path: rust/dist/x86_64-pc-windows-gnu
+          if-no-files-found: error
+
+  test-binaries:
+    name: test (${{ matrix.target }})
+    needs: [build-linux, build-cross, build-win-gnu]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            pprof: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            pprof: false
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            pprof: true
+          - target: x86_64-pc-windows-gnu
+            runner: windows-latest
+            pprof: true
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            pprof: false
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            pprof: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-bins-${{ matrix.target }}
+          path: dist/${{ matrix.target }}
+      - name: Run every staged test binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          chmod +x dist/${{ matrix.target }}/*
+          for test_binary in dist/${{ matrix.target }}/*; do
+            "$test_binary" --test-threads=4
+          done
+      - name: Run every staged test binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem dist/${{ matrix.target }} | ForEach-Object {
+            & $_.FullName --test-threads=4
+            if ($LASTEXITCODE -ne 0) { throw "test failed: $($_.Name)" }
+          }
+      - uses: actions/setup-go@v5
+        if: matrix.pprof
+        with:
+          go-version: stable
+      - name: Install pprof
+        if: matrix.pprof
+        run: go install github.com/google/pprof@latest
+      - name: Prove pprof parses a native dump
+        if: matrix.pprof && runner.os != 'Windows'
+        shell: bash
+        run: |
+          generator=$(find dist/${{ matrix.target }} -maxdepth 1 -type f -name 't3_stats-*' | head -n 1)
+          test -n "$generator"
+          MIMALLOC_PPROF_CI_DUMP="$PWD/heap.prof" "$generator"
+          "$(go env GOPATH)/bin/pprof" -raw heap.prof > raw.txt
+          grep -Eq 'PeriodType: space|heap_v2|inuse_space' raw.txt
+      - name: Prove pprof parses a native dump
+        if: matrix.pprof && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $generator = Get-ChildItem dist/${{ matrix.target }} -Filter 't3_stats-*' | Select-Object -First 1
+          if (-not $generator) { throw 't3_stats test binary was not staged' }
+          $env:MIMALLOC_PPROF_CI_DUMP = Join-Path $PWD 'heap.prof'
+          & $generator.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'profile generator failed' }
+          & (Join-Path (go env GOPATH) 'bin/pprof.exe') -raw heap.prof | Tee-Object raw.txt
+          if ($LASTEXITCODE -ne 0) { throw 'pprof could not parse heap.prof' }
+          if (-not (Select-String -Path raw.txt -Pattern 'PeriodType: space|heap_v2|inuse_space')) { throw 'pprof output did not contain a heap profile' }

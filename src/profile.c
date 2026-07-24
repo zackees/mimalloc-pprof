@@ -118,7 +118,7 @@ static bool prof_dump_append(void* arg, const char* buf, size_t len) {
     if (chunk == NULL || chunk->used == chunk->capacity) {
       const size_t capacity = prof_max(MI_PROF_CHUNK_SIZE, len);
       mi_memid_t memid;
-      chunk = (prof_dump_chunk_t*)_mi_os_alloc(sizeof(*chunk) + capacity, &memid);
+      chunk = (prof_dump_chunk_t*)_mi_os_alloc(_mi_subproc_main(), sizeof(*chunk) + capacity, &memid);
       if (chunk == NULL) { out->ok = false; return false; }
       chunk->next = NULL; chunk->memid = memid; chunk->capacity = capacity; chunk->used = 0;
       if (out->last != NULL) out->last->next = chunk; else out->first = chunk;
@@ -134,7 +134,7 @@ static bool prof_dump_append(void* arg, const char* buf, size_t len) {
 static void prof_dump_dispose(prof_dump_buffer_t* out) {
   for (prof_dump_chunk_t* chunk = out->first; chunk != NULL; ) {
     prof_dump_chunk_t* next = chunk->next;
-    _mi_os_free(chunk, sizeof(*chunk) + chunk->capacity, chunk->memid);
+    _mi_os_free(_mi_subproc_main(), chunk, sizeof(*chunk) + chunk->capacity, chunk->memid);
     chunk = next;
   }
   out->first = out->last = NULL;
@@ -192,7 +192,7 @@ void* _mi_prof_arena_alloc(size_t size) {
        NULL return here as "drop this sample" and recycle/no-op rather than leak or crash. */
     if (prof_max_bytes != 0 && mi_atomic_load_relaxed(&prof_arena_committed) + chunk_size > prof_max_bytes) return NULL;
     mi_memid_t memid;
-    void* p = _mi_os_alloc(chunk_size, &memid);
+    void* p = _mi_os_alloc(_mi_subproc_main(), chunk_size, &memid);
     if (p == NULL) return NULL;
     chunk = (mi_prof_chunk_t*)p;
     chunk->next = prof_chunks; chunk->memid = memid; chunk->size = chunk_size; chunk->used = sizeof(*chunk);
@@ -366,7 +366,7 @@ void mi_prof_stop(void) mi_attr_noexcept {
   for (mi_prof_record_t* rec = prof_all; rec != NULL; rec = rec->all_next) { rec->page->metadata = NULL; rec->page->has_metadata = false; }
   _mi_prof_stack_done();
   mi_prof_chunk_t* chunk = prof_chunks;
-  while (chunk != NULL) { mi_prof_chunk_t* next = chunk->next; _mi_os_free(chunk, chunk->size, chunk->memid); chunk = next; }
+  while (chunk != NULL) { mi_prof_chunk_t* next = chunk->next; _mi_os_free(_mi_subproc_main(), chunk, chunk->size, chunk->memid); chunk = next; }
   prof_chunks=NULL; prof_all=NULL; prof_free=NULL;
   mi_atomic_store_relaxed(&prof_records, (size_t)0); mi_atomic_store_relaxed(&prof_bytes, (size_t)0);
   mi_atomic_store_relaxed(&prof_accum_records, (size_t)0); mi_atomic_store_relaxed(&prof_accum_bytes, (size_t)0);
@@ -461,7 +461,7 @@ mi_prof_snapshot_t* mi_prof_snapshot_new(void) mi_attr_noexcept {
   const size_t pcs_size = counted.pcs * sizeof(void*);
   const size_t total_size = sizeof(mi_prof_snapshot_t) + entries_size + pcs_size;
   mi_memid_t memid;
-  void* p = _mi_os_alloc(total_size, &memid);
+  void* p = _mi_os_alloc(_mi_subproc_main(), total_size, &memid);
   if (p == NULL) { mi_lock_release(&prof_lock); return NULL; }
   mi_prof_snapshot_t* snap = (mi_prof_snapshot_t*)p;
   snap->memid = memid; snap->total_size = total_size; snap->count = counted.count;
@@ -482,7 +482,7 @@ bool mi_prof_snapshot_visit(const mi_prof_snapshot_t* snap, mi_prof_visit_fun* v
   }
   return true;
 }
-void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { if (snap != NULL) _mi_os_free(snap, snap->total_size, snap->memid); }
+void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { if (snap != NULL) _mi_os_free(_mi_subproc_main(), snap, snap->total_size, snap->memid); }
 
 bool mi_prof_modules_visit(mi_prof_module_visit_fun* visitor, void* arg) mi_attr_noexcept {
   if (visitor == NULL) return false;
@@ -632,7 +632,7 @@ bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noex
   if (snap == NULL) return false;
 
   mi_memid_t mods_memid;
-  proto_module_t* modules = (proto_module_t*)_mi_os_alloc(PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), &mods_memid);
+  proto_module_t* modules = (proto_module_t*)_mi_os_alloc(_mi_subproc_main(), PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), &mods_memid);
   if (modules == NULL) { mi_prof_snapshot_free(snap); return false; }
   proto_module_ctx_t mod_ctx = { modules, 0 };
   const bool maps_ok = _mi_prof_maps_visit(proto_collect_module, &mod_ctx);
@@ -646,8 +646,8 @@ bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noex
   size_t pc_capacity = 16;
   while (pc_capacity < total_pcs * 2 + 1) pc_capacity *= 2;
   mi_memid_t pc_memid;
-  proto_pc_slot_t* pc_table = (proto_pc_slot_t*)_mi_os_alloc(pc_capacity * sizeof(proto_pc_slot_t), &pc_memid);
-  if (pc_table == NULL) { _mi_os_free(modules, PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), mods_memid); mi_prof_snapshot_free(snap); return false; }
+  proto_pc_slot_t* pc_table = (proto_pc_slot_t*)_mi_os_alloc(_mi_subproc_main(), pc_capacity * sizeof(proto_pc_slot_t), &pc_memid);
+  if (pc_table == NULL) { _mi_os_free(_mi_subproc_main(), modules, PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), mods_memid); mi_prof_snapshot_free(snap); return false; }
   memset(pc_table, 0, pc_capacity * sizeof(proto_pc_slot_t));
   uint32_t next_location_id = 1;
 
@@ -718,8 +718,8 @@ bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noex
 
   if (ok) for (prof_dump_chunk_t* chunk = out.first; chunk != NULL; chunk = chunk->next) write(arg, chunk->data, chunk->used);
   prof_dump_dispose(&out);
-  _mi_os_free(pc_table, pc_capacity * sizeof(proto_pc_slot_t), pc_memid);
-  _mi_os_free(modules, PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), mods_memid);
+  _mi_os_free(_mi_subproc_main(), pc_table, pc_capacity * sizeof(proto_pc_slot_t), pc_memid);
+  _mi_os_free(_mi_subproc_main(), modules, PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), mods_memid);
   mi_prof_snapshot_free(snap);
   return ok;
 }
@@ -752,13 +752,13 @@ void _mi_prof_process_done(void) {
     MI_UNUSED(dumped);
   }
 }
-void _mi_prof_on_alloc(mi_heap_t* heap, mi_page_t* page, void* p, size_t size) {
+void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size) {
   prof_auto_start();
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;
   if (prof_callback_depth > 0) return;
   mi_lock_acquire(&prof_lock);
   if (!mi_atomic_load_relaxed(&prof_enabled)) { mi_lock_release(&prof_lock); return; }
-  mi_profiler_tld_t* tld = &heap->tld->profiler;
+  mi_profiler_tld_t* tld = &theap->tld->profiler;
   if (tld->generation != prof_generation) { tld->bytes_since_sample = 0; tld->next_threshold = 0; tld->random = 0; tld->generation = prof_generation; }
   tld->bytes_since_sample += size;
   if (tld->next_threshold == 0) tld->next_threshold = prof_threshold(tld);

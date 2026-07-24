@@ -40,6 +40,85 @@ unsafe impl GlobalAlloc for MiMalloc {
     }
 }
 
+/// Allocate `size` bytes from mimalloc's raw-OS-layer "unwrapped" path.
+///
+/// Thin wrapper around `mi_unwrapped_malloc` (include/mimalloc/memory-events.h):
+/// backed directly by `_mi_os_alloc_aligned`, never by the hooked `mi_malloc`
+/// family. Page granular, so this is not meant for hot-path/small allocations
+/// — it exists for low-level instrumentation and recursion avoidance (e.g.
+/// scratch storage for a memory-change callback that must not recursively
+/// enter mimalloc). Excluded from normal mimalloc allocation stats and from
+/// the memory-change accounting.
+///
+/// Returns a null pointer on failure (including invalid `alignment`; see
+/// `# Safety` below).
+///
+/// # Safety
+///
+/// - `alignment` must be `0` (treated as `align_of::<*const ()>()`, i.e.
+///   pointer size) or a power of two. A non-power-of-two, non-zero alignment
+///   is a validated input on the C side: `mi_unwrapped_malloc` returns a null
+///   pointer rather than invoking undefined behavior, but callers should not
+///   rely on that as anything other than a defined-failure contract — treat
+///   the alignment argument as a precondition to get right, not a value to
+///   probe.
+/// - The returned pointer, if non-null, must be passed only to
+///   [`unwrapped_free`] or [`unwrapped_realloc`] — never to `mi_free`, this
+///   crate's [`MiMalloc`] allocator, or Rust's global allocator, and vice
+///   versa (a pointer from `mi_malloc`/the Rust global allocator must never
+///   be passed to [`unwrapped_free`]/[`unwrapped_realloc`]). Mixing these
+///   families corrupts allocator-internal bookkeeping.
+/// - The memory is uninitialized; reading it before writing is undefined
+///   behavior, as with any raw allocation.
+pub unsafe fn unwrapped_malloc(size: usize, alignment: usize) -> *mut u8 {
+    unsafe { sys::mi_unwrapped_malloc(size, alignment).cast() }
+}
+
+/// Free a pointer returned by [`unwrapped_malloc`] or [`unwrapped_realloc`].
+///
+/// Thin wrapper around `mi_unwrapped_free` (include/mimalloc/memory-events.h).
+///
+/// # Safety
+///
+/// - `p` must be either a null pointer (a documented, safe no-op on the C
+///   side) or a pointer previously returned by [`unwrapped_malloc`] or
+///   [`unwrapped_realloc`] that has not already been freed.
+/// - `p` must never have come from `mi_malloc`, this crate's [`MiMalloc`]
+///   allocator, or Rust's global allocator — passing such a pointer here is
+///   undefined behavior (the "unwrapped" and normal allocation families use
+///   incompatible header layouts and are validated by a magic-number check
+///   that a foreign pointer will not satisfy).
+pub unsafe fn unwrapped_free(p: *mut u8) {
+    unsafe { sys::mi_unwrapped_free(p.cast()) }
+}
+
+/// Resize a pointer returned by [`unwrapped_malloc`] or [`unwrapped_realloc`].
+///
+/// Thin wrapper around `mi_unwrapped_realloc` (include/mimalloc/memory-events.h).
+/// If `p` is null, this behaves like [`unwrapped_malloc`]. If `new_size` is
+/// `0`, this frees `p` (like [`unwrapped_free`]) and returns a null pointer.
+/// Otherwise the existing contents are copied into a freshly allocated
+/// unwrapped block (up to `min(old payload size, new_size)` bytes) and `p` is
+/// freed; `p` must not be used again after this call, whether or not it
+/// returns null.
+///
+/// Returns a null pointer on failure (including invalid `alignment`; see
+/// [`unwrapped_malloc`]'s `# Safety` section), in which case `p` is left
+/// valid and unfreed.
+///
+/// # Safety
+///
+/// - `p` must be either a null pointer or a pointer previously returned by
+///   [`unwrapped_malloc`] or [`unwrapped_realloc`] that has not already been
+///   freed, per the same family-isolation rule as [`unwrapped_free`].
+/// - `alignment` has the same power-of-two-or-zero contract as
+///   [`unwrapped_malloc`].
+/// - After this call, `p` must not be read, written, or freed again — treat
+///   it as consumed regardless of whether the return value is null.
+pub unsafe fn unwrapped_realloc(p: *mut u8, new_size: usize, alignment: usize) -> *mut u8 {
+    unsafe { sys::mi_unwrapped_realloc(p.cast(), new_size, alignment).cast() }
+}
+
 /// Turn on sampled heap profiling at the default sample rate.
 ///
 /// Convenience entry point for wiring profiling to a command-line flag:
@@ -513,5 +592,62 @@ mod tests {
         assert_eq!(prof::stats().sample_rate, 4096);
 
         prof::stop();
+    }
+
+    #[test]
+    fn unwrapped_malloc_write_realloc_grow_verify_free() {
+        unsafe {
+            let size = 64usize;
+            let p = unwrapped_malloc(size, 0);
+            assert!(!p.is_null());
+
+            for i in 0..size {
+                *p.add(i) = (i % 256) as u8;
+            }
+
+            let new_size = 256usize;
+            let p2 = unwrapped_realloc(p, new_size, 0);
+            assert!(!p2.is_null());
+
+            for i in 0..size {
+                assert_eq!(*p2.add(i), (i % 256) as u8);
+            }
+
+            unwrapped_free(p2);
+        }
+    }
+
+    #[test]
+    fn unwrapped_free_null_is_noop() {
+        unsafe {
+            unwrapped_free(core::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn unwrapped_malloc_rejects_non_power_of_two_alignment() {
+        unsafe {
+            let p = unwrapped_malloc(16, 3);
+            assert!(p.is_null());
+        }
+    }
+
+    #[test]
+    fn unwrapped_realloc_with_null_ptr_behaves_like_malloc() {
+        unsafe {
+            let p = unwrapped_realloc(core::ptr::null_mut(), 32, 0);
+            assert!(!p.is_null());
+            unwrapped_free(p);
+        }
+    }
+
+    #[test]
+    fn unwrapped_realloc_with_zero_size_frees_and_returns_null() {
+        unsafe {
+            let p = unwrapped_malloc(32, 0);
+            assert!(!p.is_null());
+            let p2 = unwrapped_realloc(p, 0, 0);
+            assert!(p2.is_null());
+        }
     }
 }

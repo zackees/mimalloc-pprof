@@ -132,4 +132,14 @@ unsafe extern "C" {
     /// the sampled-allocation table. `info` (and `info->path`) are valid only for
     /// the duration of the callback.
     pub fn mi_prof_modules_visit(visitor: mi_prof_module_visit_fun, arg: *mut c_void) -> bool;
+
+    /// Mirrors `mi_unwrapped_malloc` (include/mimalloc/memory-events.h): backed
+    /// directly by the raw OS layer, never by the hooked `mi_malloc` family.
+    /// See that header's "Stable public unwrapped instrumentation allocation
+    /// path" comment for the full contract.
+    pub fn mi_unwrapped_malloc(size: usize, alignment: usize) -> *mut c_void;
+    /// Mirrors `mi_unwrapped_free` (include/mimalloc/memory-events.h).
+    pub fn mi_unwrapped_free(p: *mut c_void);
+    /// Mirrors `mi_unwrapped_realloc` (include/mimalloc/memory-events.h).
+    pub fn mi_unwrapped_realloc(p: *mut c_void, new_size: usize, alignment: usize) -> *mut c_void;
 }

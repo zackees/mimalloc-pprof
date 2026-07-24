@@ -287,6 +287,65 @@ static void test_modules_visit(void) {
   mi_prof_stop();
 }
 
+#ifdef __APPLE__
+/* ---- T15 (macOS only): every captured PC resolves to a real module range ------------------
+   Issue #35: on Apple Silicon, pointer-authentication (PAC) bits signed into a return address
+   by arm64e system-library code pollute a captured PC so it falls outside every loaded
+   module's [base, base+size) range -- pprof can't symbolize it, and stack interning treats
+   PAC-signature variants of the same logical stack as distinct entries. This is exactly the
+   check that fails under PAC pollution and passes once _mi_prof_stack_capture strips it (see
+   src/profile-stack.c's __APPLE__ branch, which uses backtrace() instead of a raw
+   frame-pointer walk). mi_prof_modules_visit enumerates every loaded dyld image (not just the
+   main executable), including system frameworks, via _dyld_image_count/_dyld_get_image_header
+   (src/profile-maps.c), so a legitimately-captured PC should always resolve to something. */
+enum { T15_MAX_MODULES = 512 };
+typedef struct t15_module_s { uintptr_t base; size_t size; } t15_module_t;
+typedef struct t15_module_ctx_s { t15_module_t modules[T15_MAX_MODULES]; size_t count; } t15_module_ctx_t;
+static bool t15_collect_module(const mi_prof_module_info_t* info, void* arg) {
+  t15_module_ctx_t* ctx = (t15_module_ctx_t*)arg;
+  if (ctx->count < T15_MAX_MODULES) { ctx->modules[ctx->count].base = info->base; ctx->modules[ctx->count].size = info->size; ctx->count++; }
+  return true;  // keep visiting even past the cap, so ctx->count only ever reflects what we kept.
+}
+static bool t15_pc_in_modules(const t15_module_ctx_t* ctx, const void* pc) {
+  const uintptr_t addr = (uintptr_t)pc;
+  for (size_t i = 0; i < ctx->count; i++) {
+    if (addr >= ctx->modules[i].base && addr < ctx->modules[i].base + ctx->modules[i].size) return true;
+  }
+  return false;
+}
+typedef struct t15_visit_ctx_s { const t15_module_ctx_t* modules; size_t checked; size_t out_of_range; } t15_visit_ctx_t;
+static bool t15_stack_visitor(const mi_prof_sample_info_t* info, void* arg) {
+  t15_visit_ctx_t* ctx = (t15_visit_ctx_t*)arg;
+  for (size_t i = 0; i < info->depth; i++) {
+    ctx->checked++;
+    if (!t15_pc_in_modules(ctx->modules, info->stack[i])) ctx->out_of_range++;
+  }
+  return true;
+}
+static void test_macos_stack_pcs_resolve_to_modules(void) {
+  t15_module_ctx_t modules;
+  modules.count = 0;
+  assert(mi_prof_modules_visit(t15_collect_module, &modules));
+  assert(modules.count > 0);
+
+  /* sample_interval=1: sample (almost) every allocation, forcing many distinct call sites and
+     depths so any PAC-polluted frame is very likely to show up if stripping isn't working. */
+  assert(mi_prof_start_seeded(1, 83));
+  enum { count = 500 };
+  void* blocks[count];
+  for (size_t i = 0; i < count; i++) blocks[i] = mi_malloc(64 + (i % 16) * 8);
+
+  t15_visit_ctx_t visit_ctx;
+  visit_ctx.modules = &modules; visit_ctx.checked = 0; visit_ctx.out_of_range = 0;
+  assert(mi_prof_visit(t15_stack_visitor, &visit_ctx));
+  assert(visit_ctx.checked > 0);          /* sanity: we actually captured and visited stacks. */
+  assert(visit_ctx.out_of_range == 0);    /* the actual PAC-pollution check. */
+
+  for (size_t i = 0; i < count; i++) mi_free(blocks[i]);
+  mi_prof_stop();
+}
+#endif
+
 /* ---- T15: mi_prof_start_ex / mi_prof_config_t -----------------------------------------------
    Covers issue #32's struct-based sibling of mi_prof_start: default-equivalence, the
    FALLBACK/OVERRIDE env precedence contract, version/size rejection, and the
@@ -585,6 +644,9 @@ int main(void) {
   test_visit_reentrancy();
   test_proto_dump();
   test_modules_visit();
+#ifdef __APPLE__
+  test_macos_stack_pcs_resolve_to_modules();
+#endif
   test_start_ex_default();
   test_start_ex_override();
   test_start_ex_fallback();

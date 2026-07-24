@@ -70,6 +70,7 @@ set(mi_sources
     src/heap.c
     src/init.c
     src/libc.c
+    src/memory-events.c
     src/options.c
     src/os.c
     src/page.c
@@ -695,6 +696,7 @@ install(FILES include/mimalloc-override.h DESTINATION ${mi_install_incdir})
 install(FILES include/mimalloc-new-delete.h DESTINATION ${mi_install_incdir})
 install(FILES include/mimalloc-stats.h DESTINATION ${mi_install_incdir})
 install(FILES include/mimalloc/profile.h DESTINATION ${mi_install_incdir})
+install(FILES include/mimalloc/memory-events.h DESTINATION ${mi_install_incdir})
 install(FILES cmake/mimalloc-config.cmake DESTINATION ${mi_install_cmakedir})
 install(FILES cmake/mimalloc-config-version.cmake DESTINATION ${mi_install_cmakedir})
 
@@ -787,6 +789,16 @@ if (MI_BUILD_TESTS)
     add_test(NAME test-profile-auto COMMAND mimalloc-test-profile)
     set_tests_properties(test-profile-auto PROPERTIES ENVIRONMENT "MIMALLOC_PROF=1")
   endif()
+
+  # memory-events (issue #20): independent of MI_PPROF, always built/registered.
+  add_executable(mimalloc-test-memory-events test/test-memory-events.c)
+  target_compile_definitions(mimalloc-test-memory-events PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-memory-events PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-memory-events PRIVATE include)
+  target_link_libraries(mimalloc-test-memory-events PRIVATE mimalloc-static ${mi_libraries})
+  add_test(NAME test-memory-events COMMAND mimalloc-test-memory-events)
+  add_test(NAME test-memory-events-env-enabled COMMAND mimalloc-test-memory-events --env-enabled-check)
+  set_tests_properties(test-memory-events-env-enabled PROPERTIES ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
 
   # dynamic override test
   if(MI_BUILD_SHARED AND NOT (MI_TRACK_ASAN OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN) AND NOT (APPLE AND MI_USE_CXX))

@@ -217,6 +217,16 @@ static void _mi_page_thread_free_collect(mi_page_t* page)
   #if MI_PPROF
   _mi_prof_on_free_collect(page, head);
   #endif
+  // memory-events (issue #20): deliberately NOT hooked here. page->xthread_free (the
+  // `head` list collected below) is populated exclusively by mi_free_block_delayed_mt,
+  // which is only ever called from mi_free_block_mt in free.c -- i.e. every block
+  // reaching this function was already counted by the _mi_memevt_on_free hook added to
+  // mi_free_block_mt. Hooking again here would double-count every remote free (this
+  // collect is deferred *reclamation* of an already-freed block onto the local free
+  // list, not a new free event). This intentionally differs from the profiler, which
+  // hooks here instead of in mi_free_block_mt (its only counting point for remote
+  // frees, since it does not hook mi_free_block_mt at all) -- see the profiler's own
+  // documented gap in that function.
 
   // find the tail -- also to get a proper count (without data races)
   size_t max_count = page->capacity; // cannot collect more than capacity

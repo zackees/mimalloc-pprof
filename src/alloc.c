@@ -114,6 +114,7 @@ extern inline void* _mi_page_malloc_zero(mi_heap_t* heap, mi_page_t* page, size_
   #if MI_PPROF
   _mi_prof_on_alloc(heap, page, block, size - MI_PADDING_SIZE);
   #endif
+  _mi_memevt_on_alloc(page, block, size - MI_PADDING_SIZE);
   return block;
 }
 
@@ -283,6 +284,7 @@ void* mi_expand(void* p, size_t newsize) mi_attr_noexcept {
   #if MI_PPROF
   _mi_prof_on_realloc_in_place((mi_page_t*)page, p, newsize);
   #endif
+  _mi_memevt_on_realloc_in_place((mi_page_t*)page, p, newsize);
   return p; // it fits
   #endif
 }
@@ -312,9 +314,25 @@ void* _mi_heap_realloc_zero(mi_heap_t* heap, void* p, size_t newsize, bool zero,
     #if MI_PPROF
     _mi_prof_on_realloc_in_place((mi_page_t*)page, p, newsize);
     #endif
+    _mi_memevt_on_realloc_in_place((mi_page_t*)page, p, newsize);
     return p;  // reallocation still fits and not more than 50% waste
   }
-  void* newp = mi_heap_umalloc(heap,newsize,usable_post);
+  // memory-events (issue #20): a moving realloc below is internally an unrelated
+  // mi_heap_umalloc (new block) + mi_free (old block); those two calls funnel through
+  // the normal ALLOCATE/FREE hooks and would otherwise leak an internal allocate/free
+  // pair to consumers instead of one RESIZE. When p != NULL this really is a resize, so
+  // suppress those two internal hook calls and synthesize exactly one RESIZE afterwards
+  // (delta computed from mi_page_usable_block_size on both sides, the same usable-size
+  // notion the ALLOCATE/FREE hooks use, so accounting stays exact and symmetric).
+  // When p == NULL this call behaves as a plain malloc (documented above), not a
+  // resize: leave it unsuppressed so it naturally emits ALLOCATE like any other malloc.
+  const bool memevt_is_resize = (p != NULL);
+  const size_t memevt_usable_pre = (memevt_is_resize ? mi_page_usable_block_size(page) : 0);
+  size_t memevt_local_usable_post = 0;
+  size_t* const memevt_up = (memevt_is_resize && usable_post == NULL ? &memevt_local_usable_post : usable_post);
+  if (memevt_is_resize) _mi_memevt_suppress_begin();
+  void* newp = mi_heap_umalloc(heap,newsize,memevt_up);
+  const size_t memevt_usable_post = (memevt_up != NULL ? *memevt_up : 0);
   if mi_likely(newp != NULL) {
     if (zero && newsize > size) {
       // also set last word in the previous allocation to zero to ensure any padding is zero-initialized
@@ -330,6 +348,13 @@ void* _mi_heap_realloc_zero(mi_heap_t* heap, void* p, size_t newsize, bool zero,
       _mi_memcpy(newp, p, copysize);
       mi_free(p); // only free the original pointer if successful
     }
+  }
+  if (memevt_is_resize) {
+    _mi_memevt_suppress_end();
+    // Suppression is lifted: this call is not suppressed and dispatches normally.
+    // On failure (newp == NULL) usable_post stays 0 == usable_pre, delta 0 -- but per
+    // spec a failed realloc must emit no event at all, so only call this on success.
+    if (newp != NULL) { _mi_memevt_on_resize(memevt_usable_pre, memevt_usable_post, newsize); }
   }
   return newp;
 }

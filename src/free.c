@@ -36,6 +36,7 @@ static inline void mi_free_block_local(mi_page_t* page, mi_block_t* block, bool 
   #if MI_PPROF
   _mi_prof_on_free(page, block);
   #endif
+  _mi_memevt_on_free(page, block);
   if (!was_guarded) { mi_check_padding(page, block); }
   if (track_stats) { mi_stat_free(page, block); }
   #if (MI_DEBUG>0) && !MI_TRACK_ENABLED  && !MI_TSAN
@@ -297,10 +298,17 @@ static void mi_decl_noinline mi_free_block_mt(mi_page_t* page, mi_segment_t* seg
     if (_mi_segment_attempt_reclaim(mi_heap_get_default(), segment)) {
       mi_assert_internal(_mi_thread_id() == mi_atomic_load_relaxed(&segment->thread_id));
       mi_assert_internal(mi_heap_get_default()->tld->segments.subproc == segment->subproc);
-      mi_free(p);  // recursively free as now it will be a local free in our heap
+      mi_free(p);  // recursively free as now it will be a local free in our heap (hooked there; do not double-hook here)
       return;
     }
   }
+
+  // memory-events (issue #20): from here on this is a genuine remote (cross-thread)
+  // free that will actually complete below -- the profiler currently has no equivalent
+  // hook on this path (a documented gap), but the acceptance criteria for this feature
+  // explicitly require remote frees to be tracked, so hook here, mirroring
+  // mi_free_block_local's placement (definitely-freeing, page/block still valid).
+  _mi_memevt_on_free(page, block);
 
   // The padding check may access the non-thread-owned page for the key values.
   // that is safe as these are constant and the page won't be freed (as the block is not freed yet).

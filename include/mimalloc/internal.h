@@ -320,6 +320,34 @@ void        _mi_prof_process_done(void);
 }
 #endif
 #endif
+
+// "memory-events.c" -- opt-in allocation-change accounting/callbacks. Independent of
+// MI_PPROF (always declared/defined). Hook sites: alloc.c (successful allocate and
+// in-place realloc), free.c (successful local free and remote/mt free), and the moving
+// realloc path in alloc.c's _mi_heap_realloc_zero (which suppresses the internal
+// allocate+free pair via _mi_memevt_suppress_begin/end and instead synthesizes exactly
+// one RESIZE via _mi_memevt_on_resize). Every hook itself performs the single
+// disabled-hot-path flag check (mi_memory_events.h's "Activation" contract); callers do
+// not need to guard the call site.
+#ifdef __cplusplus
+extern "C" {
+#endif
+void        _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size);
+void        _mi_memevt_on_free(mi_page_t* page, void* p);
+void        _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size);
+// Called after _mi_memevt_suppress_end, with suppression already lifted, to emit the
+// single synthesized RESIZE event for a moving realloc.
+void        _mi_memevt_on_resize(size_t usable_pre, size_t usable_post, size_t request_size);
+// Reentrancy/internal-op suppression (thread-local depth counter): while suppressed,
+// hooks above perform no accounting and no dispatch. Used around the internal
+// mi_heap_umalloc+mi_free pair inside a moving realloc so it does not leak an
+// ALLOCATE/FREE pair to consumers.
+void        _mi_memevt_suppress_begin(void);
+void        _mi_memevt_suppress_end(void);
+#ifdef __cplusplus
+}
+#endif
+
 void*       _mi_heap_malloc_zero(mi_heap_t* heap, size_t size, bool zero) mi_attr_noexcept;
 void*       _mi_heap_malloc_zero_ex(mi_heap_t* heap, size_t size, bool zero, size_t huge_alignment, size_t* usable) mi_attr_noexcept;     // called from `_mi_heap_malloc_aligned`
 void*       _mi_heap_realloc_zero(mi_heap_t* heap, void* p, size_t newsize, bool zero, size_t* usable_pre, size_t* usable_post) mi_attr_noexcept;

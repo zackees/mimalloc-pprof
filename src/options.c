@@ -176,6 +176,7 @@ static mi_option_desc_t options[_mi_option_last] =
   ,{ 0, UNINIT, MI_OPTION(prof_accum) }
   ,{ 0, UNINIT, MI_OPTION(prof_seed) }
   ,{ 0, UNINIT, MI_OPTION(prof_max_bytes) }   // budget for profiler-internal arena memory; 0 = unbudgeted
+  ,{ 0, UNINIT, MI_OPTION(memory_events) }    // opt-in allocation-change accounting/callbacks; read lazily by memory-events.c, not at startup
 };
 
 static void mi_option_init(mi_option_desc_t* desc);

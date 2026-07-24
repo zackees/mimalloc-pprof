@@ -58,6 +58,35 @@ size_t _mi_prof_stack_capture(void** pcs, size_t capacity) {
   if (capacity > 128) capacity = 128;
   return (size_t)RtlCaptureStackBackTrace(2, (ULONG)capacity, pcs, NULL);
 }
+#elif defined(__APPLE__)
+/* Issue #35: on Apple Silicon (arm64e), system-library functions sign their return
+   address (paciasp) before spilling it to the stack; a raw frame-pointer walk (as
+   used on other Unix platforms below) reads that signed value verbatim, and the
+   pointer-authentication bits it carries push the "PC" outside every real module
+   range -- pprof can't symbolize it, and stack interning treats PAC-signature
+   variants of the same logical stack as distinct entries, inflating the intern
+   table. `backtrace()` (<execinfo.h>, part of libSystem -- no new dependency,
+   satisfies this repo's no-new-deps rule) strips PAC bits from return addresses
+   internally before returning them, requires no manual VA-width masking (fragile
+   to hand-derive and get right without real arm64e hardware to test against), and
+   allocates nothing given a caller-supplied buffer, matching this capture path's
+   "no allocation" constraint. Frame 0 of backtrace()'s output is the PC inside
+   this function itself; skip it so pcs[0] is the caller's return address, matching
+   the semantics of RtlCaptureStackBackTrace(2, ...) above and the frame-pointer
+   walk below (both of which also start at the caller, not this function). */
+#include <execinfo.h>
+size_t _mi_prof_stack_capture(void** pcs, size_t capacity) {
+  if (capacity > 128) capacity = 128;
+  if (capacity == 0) return 0;
+  void* buf[130];  // capacity (<=128) + 1 extra for this function's own frame.
+  const int want = (int)(capacity + 1);
+  const int got = backtrace(buf, want);
+  if (got <= 1) return 0;
+  size_t n = (size_t)(got - 1);
+  if (n > capacity) n = capacity;
+  for (size_t i = 0; i < n; i++) pcs[i] = buf[i + 1];
+  return n;
+}
 #else
 size_t _mi_prof_stack_capture(void** pcs, size_t capacity) {
   void** fp = (void**)__builtin_frame_address(0);

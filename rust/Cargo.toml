@@ -1,3 +1,0 @@
-[workspace]
-members = ["mimalloc-pprof", "xtask"]
-resolver = "2"

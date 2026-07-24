@@ -15,7 +15,7 @@
    scratch storage; this module does not need to consume its own API for that purpose. */
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
-#include "mimalloc/prim.h"   // mi_prim_get_default_heap
+#include "mimalloc/prim-tls.h"   // _mi_theap_default
 #include <string.h>
 #include <stdint.h>
 
@@ -239,17 +239,38 @@ void _mi_memevt_on_resize(size_t usable_pre, size_t usable_post, size_t request_
 }
 
 // ---------------------------------------------------------------------------------------
-// Best-effort live-allocation visitor. Built on the existing per-heap block-visitation
-// facility (mi_heap_visit_blocks / mi_block_visit_fun), per the issue's explicit
-// instruction to use that as the basis rather than new page-walking logic.
+// Best-effort live-allocation visitor.
 //
-// Scope note (deviation from a literal "global" reading -- see final report): this
-// walks every heap on the *calling thread* (mi_tld_t::heaps, the same list the runtime
-// itself uses to abandon all of a thread's heaps on thread exit). mimalloc keeps no
-// process-wide registry of every thread's heaps (unlike the segment/arena layer, heaps
-// are pure thread-local structures with no cross-thread linkage), and building one would
-// mean new cross-thread bookkeeping infrastructure -- out of scope for "the existing
-// per-heap visitation facilities are the basis". The API is already documented as
+// NOT built on the public mi_heap_visit_blocks(): that call walks the owning mi_heap_t's
+// ARENA-registered page bitmap (heap->arena_pages[]) plus heap->os_abandoned_pages (see
+// _mi_heap_visit_blocks in src/arena.c). Both of those are populated only for (a)
+// arena-backed pages (memid.memkind == MI_MEM_ARENA) and (b) pages abandoned by a thread
+// that has since exited. A page that a still-live theap owns but that was allocated
+// directly from the OS (memid.memkind == MI_MEM_OS -- the routine fallback whenever arena
+// space/reservation isn't available, e.g. before this process's first arena reservation
+// has happened) is in neither structure, so mi_heap_visit_blocks silently skips it. That
+// was the actual bug in the previous version of this function: it correctly found this
+// thread's one theap (tld->theaps via tnext) and the theap's owning heap, but then handed
+// off to mi_heap_visit_blocks, which can only ever see arena-backed pages -- so on a build
+// where nothing ever got arena-allocated (confirmed via instrumentation: MinGW static
+// EXEs never flip `_mi_preloading()` false because the MSVC-only `#pragma data_seg`/
+// `#pragma const_seg` TLS-callback trick in src/prim/windows/prim.c silently does nothing
+// under GCC, so `mi_arenas_try_alloc`'s reserve-a-new-arena path is permanently gated off
+// by the `if (_mi_preloading()) return NULL;` check in that function -- see src/arena.c),
+// every single test page was MI_MEM_OS and mi_heap_visit_blocks visited zero blocks.
+//
+// The theap's own per-bin page queues (mi_theap_t::pages[MI_BIN_COUNT], the same lists
+// _mi_malloc_generic/page.c/theap.c use) are populated for every page the theap owns
+// regardless of memkind, so walking those directly (via the already-internal
+// _mi_theap_area_visit_blocks, the same per-page block walker mi_heap_visit_blocks itself
+// bottoms out on) is both simpler and correct for the "still-live, this-thread" scope this
+// API documents, independent of whether arena allocation ever kicked in.
+//
+// Scope note (deviation from a literal "global" reading -- see final report): this walks
+// every theap on the *calling thread* (mi_tld_t::theaps, the same list the runtime uses to
+// abandon all of a thread's theaps on thread exit). mimalloc keeps no process-wide registry
+// of every thread's theaps, and building one would mean new cross-thread bookkeeping
+// infrastructure -- out of scope here. The API is already documented as
 // best-effort/non-consistent, and single-threaded or per-thread-tracked callers (the
 // common case for this kind of diagnostic) get full coverage; multi-threaded callers get
 // their own thread's live allocations only.
@@ -270,11 +291,21 @@ static bool mi_cdecl memevt_visit_adapter(const mi_heap_t* heap, const mi_heap_a
 bool mi_memory_visit_live_allocations(mi_memory_allocation_visit_fun* visitor, void* arg) mi_attr_noexcept {
   if (visitor == NULL) return false;
   if (memevt_suppress_depth > 0) return false; // do not reenter while a callback/internal-op is in flight on this thread.
-  mi_heap_t* heap = mi_prim_get_default_heap();
-  if (heap == NULL || !mi_heap_is_initialized(heap)) return true; // nothing to visit yet on this thread.
+  mi_theap_t* theap = _mi_theap_default();
+  if (theap == NULL || !mi_theap_is_initialized(theap)) return true; // nothing to visit yet on this thread.
   memevt_visit_ctx_t ctx = { visitor, arg };
-  for (mi_heap_t* h = heap->tld->heaps; h != NULL; h = h->next) {
-    if (!mi_heap_visit_blocks(h, true /* visit_blocks */, &memevt_visit_adapter, &ctx)) break;
+  // Walk every theap on this thread (tld->theaps, via tnext), and for each, walk its own
+  // page queues directly -- see the comment block above for why mi_heap_visit_blocks is
+  // not used here.
+  for (mi_theap_t* t = theap->tld->theaps; t != NULL; t = t->tnext) {
+    for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+      mi_page_queue_t* pq = &t->pages[bin];
+      for (mi_page_t* page = pq->first; page != NULL; page = page->next) {
+        mi_heap_area_t area;
+        _mi_heap_area_init(&area, page);
+        if (!_mi_theap_area_visit_blocks(&area, page, &memevt_visit_adapter, &ctx)) return true; // early stop, matching mi_heap_visit_blocks' contract
+      }
+    }
   }
   return true;
 }
@@ -335,7 +366,7 @@ void* mi_unwrapped_malloc(size_t size, size_t alignment) mi_attr_noexcept {
   if (size > SIZE_MAX - hdr_reserved) return NULL; // overflow guard
   const size_t total = hdr_reserved + size;
   mi_memid_t memid;
-  uint8_t* base = (uint8_t*)_mi_os_alloc_aligned(total, alignment, true /* commit */, false /* allow_large */, &memid);
+  uint8_t* base = (uint8_t*)_mi_os_alloc_aligned(_mi_subproc_main(), total, alignment, true /* commit */, false /* allow_large */, &memid);
   if (base == NULL) return NULL;
   uint8_t* user = base + hdr_reserved;
   mi_unwrapped_header_t* hdr = (mi_unwrapped_header_t*)(user - sizeof(mi_unwrapped_header_t));
@@ -360,7 +391,7 @@ void mi_unwrapped_free(void* p) mi_attr_noexcept {
   if (p == NULL) return;
   mi_unwrapped_header_t* hdr = mi_unwrapped_header_of(p, "mi_unwrapped_free");
   if (hdr == NULL) return;
-  _mi_os_free(hdr->base, hdr->total_size, hdr->memid);
+  _mi_os_free(_mi_subproc_main(), hdr->base, hdr->total_size, hdr->memid);
 }
 
 void* mi_unwrapped_realloc(void* p, size_t new_size, size_t alignment) mi_attr_noexcept {

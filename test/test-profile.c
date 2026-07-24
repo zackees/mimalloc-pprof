@@ -197,8 +197,15 @@ static void test_proto_dump(void) {
   size_t mapping_filename_idx[max_mappings]; size_t mapping_count = 0;
   size_t sample_type_count = 0, sample_count = 0;
   unsigned long long inuse_sum = 0;
+  size_t comment_str_idx = SIZE_MAX; bool have_comment = false;
   size_t pos = 0; uint32_t field, wire; uint64_t val; const unsigned char* bytes; size_t blen;
   while (t12_pb_next(out.data, out.len, &pos, &field, &wire, &val, &bytes, &blen)) {
+    if (field == 13 && wire == 2) {
+      /* comment: packed repeated int64 of string_table indices (we only ever emit one). */
+      size_t p3 = 0; uint64_t v;
+      if (t12_pb_varint(bytes, blen, &p3, &v)) { comment_str_idx = (size_t)v; have_comment = true; }
+      continue;
+    }
     if (wire != 2) continue;  /* period/default_sample_type are top-level varints; not needed below. */
     if (field == 1) sample_type_count++;
     else if (field == 2) {
@@ -238,6 +245,17 @@ static void test_proto_dump(void) {
     if (idx < string_count && strstr(strtab[idx], "mimalloc-test-profile") != NULL) found_module = true;
   }
   assert(found_module);
+
+  /* field 13 (comment): self-describing validity signal, issue #33 finding #3. */
+  assert(have_comment);
+  assert(comment_str_idx < string_count);
+  const char* comment = strtab[comment_str_idx];
+  assert(strstr(comment, "dropped_samples=") != NULL);
+  assert(strstr(comment, "stack_table_overflows=") != NULL);
+  unsigned long long comment_dropped = 0, comment_overflows = 0;
+  assert(sscanf(comment, "dropped_samples=%llu stack_table_overflows=%llu", &comment_dropped, &comment_overflows) == 2);
+  assert(comment_dropped == (unsigned long long)stats.dropped_samples);
+  assert(comment_overflows == (unsigned long long)stats.stack_table_overflows);
 
   for (size_t i = 0; i < count; i++) mi_free(blocks[i]);
   mi_prof_stop();
@@ -377,6 +395,119 @@ static void test_start_ex_max_bytes(void) {
   mi_prof_stop();
 }
 
+/* ---- T16: dropped_samples / mi_prof_stats_t v2 --------------------------------------------
+   Issue #33: dropped_samples must count ALL drop causes (record-alloc failure AND
+   stack-intern failure), not just the MI_PROF_STACK_CAP overflow already tracked by
+   stack_table_overflows. MI_PROF_STACK_CAP (65536, src/profile-stack.c) has no test-only
+   override, and forcing the real 65536-entry cap in a unit test is impractical (that many
+   distinct call stacks would dominate test time/memory for no extra coverage). Instead this
+   drives drops via the already-implemented max_profiler_bytes budget (#32) with a tiny
+   budget and sample_interval=1: distinct allocation sites and sizes force both record-alloc
+   failures (budget exhausted) and intern-alloc failures (new stack, budget exhausted), which
+   is the same code path stack_table_overflows normally guards -- just reached through the
+   byte budget instead of the entry-count cap. This is a pragmatic substitution for the
+   literal cap test; it still exercises both NULL-return branches in _mi_prof_on_alloc. */
+static void* volatile t16_sink;  /* volatile: defeat any dead-store elimination of the recursive-site trick below. */
+#define T16_ALLOC_SITE(n) static void t16_alloc_site_##n(size_t sz) { t16_sink = mi_malloc(sz); }
+T16_ALLOC_SITE(0) T16_ALLOC_SITE(1) T16_ALLOC_SITE(2) T16_ALLOC_SITE(3) T16_ALLOC_SITE(4)
+T16_ALLOC_SITE(5) T16_ALLOC_SITE(6) T16_ALLOC_SITE(7) T16_ALLOC_SITE(8) T16_ALLOC_SITE(9)
+T16_ALLOC_SITE(10) T16_ALLOC_SITE(11) T16_ALLOC_SITE(12) T16_ALLOC_SITE(13) T16_ALLOC_SITE(14)
+T16_ALLOC_SITE(15)
+typedef void (*t16_site_fn)(size_t);
+static const t16_site_fn t16_sites[16] = {
+  t16_alloc_site_0, t16_alloc_site_1, t16_alloc_site_2, t16_alloc_site_3,
+  t16_alloc_site_4, t16_alloc_site_5, t16_alloc_site_6, t16_alloc_site_7,
+  t16_alloc_site_8, t16_alloc_site_9, t16_alloc_site_10, t16_alloc_site_11,
+  t16_alloc_site_12, t16_alloc_site_13, t16_alloc_site_14, t16_alloc_site_15,
+};
+
+static void test_dropped_samples_and_stats_v2(void) {
+  mi_prof_config_t_decl(cfg);
+  cfg.sample_interval = 1;                 /* sample (almost) every allocation. */
+  cfg.max_profiler_bytes = 64 * 1024;      /* one chunk: exhausts fast under varied stacks. */
+  assert(mi_prof_start_ex(&cfg));
+
+  enum { rounds = 4000 };
+  for (size_t i = 0; i < rounds; i++) {
+    t16_sites[i % 16]((i % 8 + 1) * 16);  /* vary call site AND size to force many distinct stacks. */
+  }
+
+  mi_prof_stats_t_decl(stats);
+  assert(mi_prof_stats_get(&stats));
+  assert(stats.dropped_samples > 0);                          /* budget forced drops. */
+  assert(stats.dropped_samples >= stats.stack_table_overflows);/* cap overflows are a subset of all drops. */
+  assert(stats.arena_committed <= cfg.max_profiler_bytes);     /* budget honored. */
+
+  /* Re-run the same workload: arena_committed must stay bounded/stable, proving the PR #34
+     record-recycle fix holds under repeated post-budget drops (no unbounded leak growth). */
+  const size_t committed_before = stats.arena_committed;
+  for (size_t i = 0; i < rounds; i++) {
+    t16_sites[i % 16]((i % 8 + 1) * 16);
+  }
+  mi_prof_stats_t_decl(stats2);
+  assert(mi_prof_stats_get(&stats2));
+  assert(stats2.dropped_samples > stats.dropped_samples);      /* more drops accumulated. */
+  assert(stats2.arena_committed <= cfg.max_profiler_bytes);
+  assert(stats2.arena_committed <= committed_before + 64 * 1024);  /* at most a little headroom, not unbounded growth. */
+
+  mi_prof_stop();
+}
+
+/* T16b: a v1-sized mi_prof_stats_t (size == offsetof(dropped_samples), version == 1) must
+   still succeed and populate every pre-v2 field; dropped_samples itself must be left
+   untouched (still 0 from the enum-brace zero-init) rather than written past the "v1 bound". */
+static void test_stats_v1_compat(void) {
+  typedef struct { size_t size; int version; bool enabled; bool accum; size_t sample_rate;
+    size_t live_samples; size_t live_bytes; size_t accum_samples; size_t accum_bytes;
+    size_t unique_stacks; size_t arena_committed; size_t stack_table_overflows; } t16_stats_v1_t;
+  /* Layout must mirror mi_prof_stats_t's pre-v2 prefix exactly (same field order/types). */
+  assert(offsetof(t16_stats_v1_t, stack_table_overflows) + sizeof(size_t) == offsetof(mi_prof_stats_t, dropped_samples));
+
+  assert(mi_prof_start_seeded(4096, 89));
+  enum { count = 64, size = 4096 };
+  void* blocks[count];
+  for (size_t i = 0; i < count; i++) blocks[i] = mi_malloc(size);
+
+  mi_prof_stats_t full;
+  memset(&full, 0xAB, sizeof(full));  /* poison, so an accidental v2 write into dropped_samples would be visible. */
+  full.size = offsetof(mi_prof_stats_t, dropped_samples);
+  full.version = 1;
+  assert(mi_prof_stats_get(&full));
+  assert(full.enabled);
+  assert(full.sample_rate == 4096);
+  assert(full.live_samples > 0);
+  assert(full.live_bytes >= full.live_samples * size);
+  assert(full.unique_stacks > 0);
+  /* dropped_samples lives past the v1 struct's declared size; the implementation must not
+     have written there. It stays poisoned. */
+  unsigned char* poison_bytes = (unsigned char*)&full.dropped_samples;
+  bool still_poisoned = true;
+  for (size_t i = 0; i < sizeof(full.dropped_samples); i++) if (poison_bytes[i] != 0xAB) still_poisoned = false;
+  assert(still_poisoned);
+
+  for (size_t i = 0; i < count; i++) mi_free(blocks[i]);
+  mi_prof_stop();
+}
+
+/* T16c: the full v2 struct correctly reports dropped_samples for a fresh, non-budgeted
+   session (no drops expected -- proves v2 doesn't spuriously report drops). */
+static void test_stats_v2_full(void) {
+  assert(mi_prof_start_seeded(4096, 97));
+  enum { count = 64, size = 4096 };
+  void* blocks[count];
+  for (size_t i = 0; i < count; i++) blocks[i] = mi_malloc(size);
+
+  mi_prof_stats_t_decl(stats);
+  assert(stats.version == 2);
+  assert(stats.size == sizeof(mi_prof_stats_t));
+  assert(mi_prof_stats_get(&stats));
+  assert(stats.dropped_samples == 0);  /* unbudgeted session: nothing should have been dropped. */
+  assert(stats.dropped_samples >= stats.stack_table_overflows);
+
+  for (size_t i = 0; i < count; i++) mi_free(blocks[i]);
+  mi_prof_stop();
+}
+
 int main(void) {
   enum { count = 1000, size = 512 };
   void* blocks[count];
@@ -459,6 +590,9 @@ int main(void) {
   test_start_ex_fallback();
   test_start_ex_bad_version();
   test_start_ex_max_bytes();
+  test_dropped_samples_and_stats_v2();
+  test_stats_v1_compat();
+  test_stats_v2_full();
   if (getenv("MIMALLOC_PROF_DUMP_AT_EXIT") != NULL) {
     assert(mi_prof_start_seeded(1, 47));
     assert(mi_malloc(4096) != NULL);  /* Preserve one real sample for pprof validation. */

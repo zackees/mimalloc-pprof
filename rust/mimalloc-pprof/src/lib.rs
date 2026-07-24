@@ -17,7 +17,7 @@ use core::ffi::c_void;
 use std::ffi::CString;
 use std::path::PathBuf;
 
-pub use libmimalloc_pprof_sys as sys;
+pub mod sys;
 
 /// A `#[global_allocator]` implementation backed by mimalloc.
 pub struct MiMalloc;

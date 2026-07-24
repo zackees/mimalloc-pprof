@@ -26,7 +26,11 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
+      - name: xtask check (vendored C amalgamation must match src/include/)
+        run: soldr cargo run -p xtask -- check
       - run: soldr cargo test --locked
+      - name: cargo publish --dry-run (mimalloc-pprof)
+        run: soldr cargo publish --dry-run -p mimalloc-pprof --locked
 
   test-win-gnu:
     runs-on: windows-latest

@@ -27,8 +27,11 @@ tooling (`pprof -http`, flamegraphs, `-base` diffs).
 - **Heap profile dumps** in the gperftools `heap_v2` text format (accepted by pprof), with
   the module map (`MAPPED_LIBRARIES`) emitted per-OS so pprof can symbolize offline.
   A binary `profile.proto` encoder and optional dbghelp runtime symbolization come later.
-- **Rust crates** (`rust/` workspace): `libmimalloc-pprof-sys` and `mimalloc-pprof`
-  (a `#[global_allocator]` plus a safe profiling-control API).
+- **Rust crate** (`rust/` workspace): `mimalloc-pprof` — a `#[global_allocator]` plus a
+  safe profiling-control API, with the raw FFI bindings available as `mimalloc_pprof::sys`.
+  It builds against a single vendored, amalgamated C translation unit
+  (`rust/mimalloc-pprof/vendor/mimalloc-pprof-amalgamated.c`) regenerated from `src/`/`include/`
+  by the `xtask` dev-tool (`cargo run -p xtask -- amalgamate-c` / `amalgamate-h` / `check`).
 
 ## Repository layout
 
@@ -36,9 +39,10 @@ tooling (`pprof -http`, flamegraphs, `-base` diffs).
 /                      # the C library — a real fork of microsoft/mimalloc (shared git history)
 ├── include/ src/ test/ CMakeLists.txt
 ├── readme-upstream.md # upstream's readme.md (renamed so this file can exist on Windows)
-└── rust/              # cargo workspace (planned, see issue #2)
-    ├── libmimalloc-pprof-sys/
-    └── mimalloc-pprof/
+└── rust/              # cargo workspace
+    ├── mimalloc-pprof/    # the crate: #[global_allocator] + safe profiling API + raw `sys` bindings
+    │   └── vendor/        # generated: single-file C amalgamation compiled by build.rs
+    └── xtask/             # dev-tool: regenerates vendor/ from src/ + include/
 ```
 
 This is a **mono-repo on purpose**: the profiling feature spans the C core (sampling hooks)

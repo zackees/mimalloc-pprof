@@ -4,9 +4,13 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "mimalloc global allocator with pprof support"
+links = "mimalloc"
+build = "build.rs"
 
 [dependencies]
-libmimalloc-pprof-sys = { path = "../libmimalloc-pprof-sys" }
+
+[build-dependencies]
+cc = "1.2"
 
 [dev-dependencies]
 regex = "1"

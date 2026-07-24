@@ -193,11 +193,28 @@ fn git_short_sha(repo_root: &Path) -> String {
 fn inline_file(path: &Path, paths: &Paths, visited: &mut HashSet<PathBuf>, out: &mut String) {
     let canon = fs::canonicalize(path)
         .unwrap_or_else(|e| panic!("cannot resolve include path {}: {e}", path.display()));
-    if !visited.insert(canon.clone()) {
-        // Already inlined from an earlier #include elsewhere; this file's own
-        // #pragma once / #ifndef guard would neutralize a second physical
-        // inclusion anyway, but we dedup here too so the amalgamated output
-        // doesn't carry duplicate copies of the same source text.
+    // Only dedup header files. Headers carry their own #pragma once / #ifndef
+    // guard, so re-inlining their full text a second time is harmless (the
+    // guard neutralizes the second physical copy at real-compile time) --
+    // skipping it here just keeps the amalgamated output smaller.
+    //
+    // `.c` files must NOT be deduped this way: mimalloc's own prim dispatch
+    // relies on the SAME file being `#include`d from multiple *mutually
+    // exclusive* `#if`/`#elif`/`#else` branches (e.g. `prim/osx/prim.c`
+    // `#include`s `../unix/prim.c` under `#elif defined(__APPLE__)`, and
+    // `prim/prim.c` also `#include`s `unix/prim.c` directly under its final
+    // `#else` for Linux/BSD/etc.). Since this inliner does not track
+    // `#if` state, a global dedup-by-canonical-path would (and did) silently
+    // drop the second occurrence's content -- even though the two
+    // occurrences sit in branches that can never both be compiled, so only
+    // one is ever "real" for a given platform. Dropping either one breaks
+    // the platform whose branch lost its content: on Linux the `#else`
+    // branch that should define `_mi_prim_alloc`/`_mi_prim_free`/etc. was
+    // left completely empty, producing undefined-symbol link errors even
+    // though the amalgamated file textually mentions `unix/prim.c` twice.
+    let is_header = canon.extension().and_then(|e| e.to_str()) == Some("h");
+    let newly_visited = visited.insert(canon.clone());
+    if is_header && !newly_visited {
         return;
     }
 

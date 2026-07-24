@@ -1,4 +1,23 @@
-/* Public, allocation-only sampling profiler API. */
+/* Public, allocation-only sampling profiler API.
+
+   ## Bounds (all profiler-internal memory; see rule 4 below)
+
+   | Vector | Bound | Worst case |
+   |---|---|---|
+   | Live sample records (~48-64 B, freelist-recycled) | live_heap / sample_interval | 10 GiB heap @ 512 KiB -> ~20k records ~= 1 MiB |
+   | Intern table entries (hdr + 8 B/frame, purge-at-zero) | hard cap MI_PROF_STACK_CAP = 65536 | ~20-25 MiB at cap with deep stacks; normally = live unique stacks |
+   | Accum mode | pins entries until mi_prof_reset | same cap; documented cost of accum |
+   | Arena chunks | high-water retention (never shrinks until mi_prof_stop) | by design; superseded rehash arrays <= 2x final table size |
+   | Snapshots / dump buffers / proto scratch | transient _mi_os_alloc, freed per call; failure -> NULL/false | graceful |
+
+   ## Failure policy: the app never pays
+
+   When the raw-OS-layer arena refuses memory in the sampling path, the sample is dropped
+   and the application's allocation succeeds normally. Profiling degrades; the app does not.
+   Same policy as Go/tcmalloc. Every drop cause (record-alloc failure, stack-intern failure,
+   including the MI_PROF_STACK_CAP cap) is counted in mi_prof_stats_t.dropped_samples (v2);
+   cap overflows are additionally broken out in stack_table_overflows, so
+   dropped_samples >= stack_table_overflows always. */
 #pragma once
 #ifndef MIMALLOC_PROFILE_H
 #define MIMALLOC_PROFILE_H
@@ -69,7 +88,7 @@ mi_decl_nodiscard mi_decl_export bool mi_prof_dump_proto(const char* path) mi_at
 mi_decl_nodiscard mi_decl_export bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept;
 mi_decl_export void mi_prof_reset(void) mi_attr_noexcept;
 
-#define MI_PROF_STAT_VERSION 1
+#define MI_PROF_STAT_VERSION 2
 typedef struct mi_prof_stats_s {
   size_t size; int version;
   bool   enabled; bool accum;
@@ -79,6 +98,14 @@ typedef struct mi_prof_stats_s {
   size_t unique_stacks;
   size_t arena_committed;
   size_t stack_table_overflows;
+  /* v2. Count of ALL dropped samples: record-alloc failure, stack-intern failure
+     (capture failure, arena-alloc failure inside intern, or the intern table hitting
+     MI_PROF_STACK_CAP -- the latter is a subset also counted separately above in
+     stack_table_overflows, so dropped_samples >= stack_table_overflows always).
+     mi_prof_stats_get accepts a v1-sized struct (size == offsetof(mi_prof_stats_t,
+     dropped_samples), version == 1) for old callers; this field is left untouched
+     in that case. */
+  size_t dropped_samples;
 } mi_prof_stats_t;
 #define mi_prof_stats_t_decl(name) mi_prof_stats_t name = { 0 }; name.size = sizeof(mi_prof_stats_t); name.version = MI_PROF_STAT_VERSION
 mi_decl_nodiscard mi_decl_export bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept;

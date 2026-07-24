@@ -5,6 +5,7 @@ ide/vs20??/*.user
 ide/vs20??/.vs
 ide/vs20??/VTune*
 out/
+rust/target/
 docs/
 *.zip
 *.tar

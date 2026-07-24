@@ -23,7 +23,6 @@
 #define MIMALLOC_PROFILE_H
 
 #include "mimalloc.h"
-#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

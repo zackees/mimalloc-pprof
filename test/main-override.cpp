@@ -23,22 +23,24 @@ static void msleep(unsigned long msecs) { Sleep(msecs); }
 static void msleep(unsigned long msecs) { usleep(msecs * 1000UL); }
 #endif
 
-static void theap_thread_free_large(); // issue #221
-static void theap_no_delete();         // issue #202
-static void theap_late_free();         // issue #204
+static void heap_thread_free_large(); // issue #221
+static void heap_no_delete();         // issue #202
+static void heap_late_free();         // issue #204
 static void padding_shrink();         // issue #209
 static void various_tests();
 static void test_mt_shutdown();
+static void large_alloc(void);        // issue #363
 static void fail_aslr();              // issue #372
 static void tsan_numa_test();         // issue #414
 static void strdup_test();            // issue #445
-static void theap_thread_free_huge();
+static void bench_alloc_large(void);  // issue #xxx
+//static void test_large_migrate(void); // issue #691
+static void heap_thread_free_huge();
 static void test_std_string();        // issue #697
 static void test_thread_local();      // issue #944
 // static void test_mixed0();             // issue #942
 static void test_mixed1();             // issue #942
 static void test_stl_allocators();
-static void test_join();              // issue #1177
 static void test_thread_leak(void);   // issue #1104
 static void test_perf(void);          // issue #1104
 static void test_perf2(void);         // issue #1104
@@ -55,11 +57,9 @@ static void test_dep() { };
 
 int main() {
   mi_stats_reset();  // ignore earlier allocations
-  //various_tests();
-  //test_mixed1();
-
+  // various_tests();
+  // test_mixed1();
   // test_dep();
-  // test_join();
 
   // test_thread_leak();
   // test_perf();
@@ -70,20 +70,22 @@ int main() {
 
   //test_std_string();
   //test_thread_local();
-  // theap_thread_free_huge();
+  // heap_thread_free_huge();
   /*
-  theap_thread_free_large();
-  theap_no_delete();
-  theap_late_free();
-  padding_shrink();
+   heap_thread_free_huge();
+   heap_thread_free_large();
+   heap_no_delete();
+   heap_late_free();
+   padding_shrink();
+   various_tests();
+   large_alloc();
+   tsan_numa_test();
+   strdup_test();
+  */
+  // test_stl_allocators();
+  // test_mt_shutdown();
+  // test_large_migrate();
 
-  tsan_numa_test();
-  */
-  /*
-  strdup_test();
-  test_stl_allocators();
-  test_mt_shutdown();
-  */
   //fail_aslr();
   mi_stats_print(NULL);
   return 0;
@@ -168,7 +170,6 @@ static void test_dep()
   TestAllocInDll t;
   std::string s = t.GetString();
   std::cout << "test_dep GetString: " << s << "\n";
-  t.TestHeapAlloc();
 }
 #endif
 
@@ -345,7 +346,7 @@ static void t1main() {
   mi_heap_delete(heap);
 }
 
-static void theap_late_free() {
+static void heap_late_free() {
   auto t1 = std::thread(t1main);
 
   msleep(2000);
@@ -371,35 +372,36 @@ static void padding_shrink(void)
 
 
 // Issue #221
-static void theap_thread_free_large_worker() {
+static void heap_thread_free_large_worker() {
   mi_free(shared_p);
 }
 
-static void theap_thread_free_large() {
+static void heap_thread_free_large() {
   for (int i = 0; i < 100; i++) {
-    shared_p = mi_malloc_aligned(2*1024*1024 + 1, 8);
-    auto t1 = std::thread(theap_thread_free_large_worker);
+    shared_p = mi_malloc_aligned(2 * 1024 * 1024 + 1, 8);
+    auto t1 = std::thread(heap_thread_free_large_worker);
     t1.join();
   }
 }
 
-static void theap_thread_free_huge_worker() {
+static void heap_thread_free_huge_worker() {
   mi_free(shared_p);
 }
 
-static void theap_thread_free_huge() {
-  for (int i = 0; i < 10; i++) {
+static void heap_thread_free_huge() {
+  for (int i = 0; i < 100; i++) {
     shared_p = mi_malloc(1024 * 1024 * 1024);
-    auto t1 = std::thread(theap_thread_free_huge_worker);
+    auto t1 = std::thread(heap_thread_free_huge_worker);
     t1.join();
   }
 }
+
 
 static std::atomic<long> xgsum;
 
 static void local_alloc() {
   long sum = 0;
-  for(int i = 0; i < 1000000; i++) {
+  for (int i = 0; i < 1000000; i++) {
     const int n = 1 + std::rand() % 1000;
     uint8_t* p = (uint8_t*)calloc(n, 1);
     p[0] = 1;
@@ -411,15 +413,16 @@ static void local_alloc() {
   xgsum += sum;
 }
 
-static void test_thread_leak() {
+static void test_thread_leak(void) {
   std::vector<std::thread> threads;
-  for (int i=1; i<=100; ++i) {
+  for (int i = 1; i<=100; ++i) {
     threads.emplace_back(std::thread(&local_alloc));
   }
   for (auto& th : threads) {
     th.join();
   }
 }
+
 
 static void test_mt_shutdown()
 {
@@ -445,6 +448,18 @@ static void test_mt_shutdown()
   std::cout << "done" << std::endl;
 }
 
+// issue #363
+using namespace std;
+
+void large_alloc(void)
+{
+  char* a = new char[1ull << 25];
+  thread th([&] {
+    delete[] a;
+    });
+  th.join();
+}
+
 // issue #372
 static void fail_aslr() {
   size_t sz = (size_t)(4ULL << 40); // 4TiB
@@ -463,6 +478,36 @@ static void tsan_numa_test() {
   auto t1 = std::thread(dummy_worker);
   dummy_worker();
   t1.join();
+}
+
+// issue #?
+#include <chrono>
+#include <random>
+#include <iostream>
+
+static void bench_alloc_large(void) {
+  static constexpr int kNumBuffers = 20;
+  static constexpr size_t kMinBufferSize = 5 * 1024 * 1024;
+  static constexpr size_t kMaxBufferSize = 25 * 1024 * 1024;
+  std::unique_ptr<char[]> buffers[kNumBuffers];
+
+  std::random_device rd;  (void)rd;
+  std::mt19937 gen(42); //rd());
+  std::uniform_int_distribution<> size_distribution(kMinBufferSize, kMaxBufferSize);
+  std::uniform_int_distribution<> buf_number_distribution(0, kNumBuffers - 1);
+
+  static constexpr int kNumIterations = 2000;
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < kNumIterations; ++i) {
+    int buffer_idx = buf_number_distribution(gen);
+    size_t new_size = size_distribution(gen);
+    buffers[buffer_idx] = std::make_unique<char[]>(new_size);
+  }
+  const auto end = std::chrono::steady_clock::now();
+  const auto num_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+  const auto us_per_allocation = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / kNumIterations;
+  std::cout << kNumIterations << " allocations Done in " << num_ms << "ms." << std::endl;
+  std::cout << "Avg " << us_per_allocation << " us per allocation" << std::endl;
 }
 
 
@@ -492,16 +537,6 @@ void test_thread_local()
     }
     return;
 }
-
-// issue #1177
-thread_local void* s_ptr = mi_malloc(1);
-
-void test_join() {
-  std::thread thread([]() { mi_free(s_ptr); });
-  thread.join();
-  mi_free(s_ptr);
-}
-
 
 static std::atomic<long> gsum;
 
@@ -548,7 +583,6 @@ void test_perf(void)
   std::cout << "gsum: " << gsum.load() << "\n";
 }
 
-
 static int sum2;
 
 static void escape(uint8_t* p, size_t n) { 
@@ -568,7 +602,7 @@ void test_perf2(void) {
 
 void test_perf3(void) {
   for (size_t i = 0; i < 5; i++) {
-    const size_t n = (size_t)1*1024*1024*1024;
+    const size_t n = (size_t)16*1024*1024*1024;
     uint8_t* p = (uint8_t*)calloc(1, n);
     escape(p, n);
     free(p);

@@ -17,6 +17,11 @@ tooling (`pprof -http`, flamegraphs, `-base` diffs).
 - Byte-interval **allocation sampling** (tcmalloc-style, ~512 KiB default rate) with
   near-zero cost when disabled and bounded cost when enabled. Allocator-side design based on
   Datadog's draft [microsoft/mimalloc#1266](https://github.com/microsoft/mimalloc/pull/1266).
+  Profiler-internal memory (records, the stack intern table, dump buffers) is bounded and
+  never taken from the app's own allocations — see the Bounds table and failure policy in
+  `include/mimalloc/profile.h`'s top-of-file comment; under memory pressure samples are
+  dropped (counted in `mi_prof_stats_t.dropped_samples`), the app never fails an allocation
+  because of the profiler.
 - **Stack capture** per sample: `RtlCaptureStackBackTrace` on Windows, frame-pointer /
   libunwind on Linux and macOS.
 - **Heap profile dumps** in the gperftools `heap_v2` text format (accepted by pprof), with

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <stddef.h>
 
 #if MI_PPROF
 
@@ -43,6 +44,11 @@ static _Atomic(size_t) prof_bytes;
 static _Atomic(size_t) prof_accum_records;
 static _Atomic(size_t) prof_accum_bytes;
 static _Atomic(size_t) prof_arena_committed;
+/* All dropped-sample causes (record-alloc failure, stack-intern failure -- capture
+   failure, arena-alloc failure, or the MI_PROF_STACK_CAP cap already tracked
+   separately by _mi_prof_stack_overflows()). See profile.h's Bounds/failure-policy
+   comment and mi_prof_stats_t.dropped_samples. */
+static _Atomic(size_t) prof_dropped_samples;
 static size_t prof_rate = 524288;
 static uint64_t prof_seed;
 static uint64_t prof_generation;
@@ -330,7 +336,15 @@ bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept {
 
 bool mi_prof_is_enabled(void) mi_attr_noexcept { return mi_atomic_load_relaxed(&prof_enabled); }
 bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept {
-  if (stats == NULL || stats->size != sizeof(mi_prof_stats_t) || stats->version != MI_PROF_STAT_VERSION) return false;
+  if (stats == NULL) return false;
+  /* v2 callers (current mi_prof_stats_t_decl) pass the full struct/version 2; v1 callers
+     (built against the pre-dropped_samples header) pass the struct truncated right before
+     dropped_samples and version 1 -- accept both, reject anything else. Writing into
+     dropped_samples for a v1-sized struct would be an out-of-bounds write, so that field
+     is only touched in the v2 branch. */
+  const bool is_v2 = (stats->size == sizeof(mi_prof_stats_t) && stats->version == 2);
+  const bool is_v1 = (stats->size == offsetof(mi_prof_stats_t, dropped_samples) && stats->version == 1);
+  if (!is_v2 && !is_v1) return false;
   stats->enabled = mi_atomic_load_relaxed(&prof_enabled);
   stats->accum = mi_option_is_enabled(mi_option_prof_accum);
   stats->sample_rate = prof_rate;
@@ -341,6 +355,7 @@ bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept {
   stats->unique_stacks = _mi_prof_stack_count();
   stats->arena_committed = _mi_prof_arena_committed();
   stats->stack_table_overflows = _mi_prof_stack_overflows();
+  if (is_v2) stats->dropped_samples = mi_atomic_load_relaxed(&prof_dropped_samples);
   return true;
 }
 void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept { mi_prof_stats_t_decl(stats); const bool ok = mi_prof_stats_get(&stats); MI_UNUSED(ok); if (records) *records=stats.live_samples; if (bytes) *bytes=stats.live_bytes; if (unique_stacks) *unique_stacks=stats.unique_stacks; }
@@ -356,6 +371,7 @@ void mi_prof_stop(void) mi_attr_noexcept {
   mi_atomic_store_relaxed(&prof_records, (size_t)0); mi_atomic_store_relaxed(&prof_bytes, (size_t)0);
   mi_atomic_store_relaxed(&prof_accum_records, (size_t)0); mi_atomic_store_relaxed(&prof_accum_bytes, (size_t)0);
   mi_atomic_store_relaxed(&prof_arena_committed, (size_t)0);
+  mi_atomic_store_relaxed(&prof_dropped_samples, (size_t)0);
   mi_lock_release(&prof_lock);
 }
 bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
@@ -680,6 +696,22 @@ bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noex
   for (size_t i = 0; ok && i < PB_STR_FIXED_COUNT; i++) ok = pb_emit_bytes_field(&out, 6, prof_proto_fixed_strings[i], strlen(prof_proto_fixed_strings[i]));
   for (size_t i = 0; ok && i < module_count; i++) ok = pb_emit_bytes_field(&out, 6, modules[i].path, strlen(modules[i].path));
 
+  /* Self-describing validity signal (issue #33 finding #3): a shipped profile discloses its
+     own sampling bias without a separate mi_prof_stats_get call. Read the atomics directly
+     without prof_lock -- this function doesn't hold the lock across its body (see
+     mi_prof_snapshot_new above), same as the unguarded prof_rate read a few lines below. */
+  const size_t comment_str_idx = PB_STR_FIXED_COUNT + module_count;
+  if (ok) {
+    char comment_buf[128];
+    const unsigned long long dropped = (unsigned long long)mi_atomic_load_relaxed(&prof_dropped_samples);
+    const unsigned long long overflows = (unsigned long long)_mi_prof_stack_overflows();
+    int clen = _mi_snprintf(comment_buf, sizeof(comment_buf), "dropped_samples=%llu stack_table_overflows=%llu", dropped, overflows);
+    if (clen < 0) clen = 0;
+    if ((size_t)clen >= sizeof(comment_buf)) clen = (int)sizeof(comment_buf) - 1;
+    ok = pb_emit_bytes_field(&out, 6, comment_buf, (size_t)clen);
+  }
+  if (ok) { uint8_t packed[10]; size_t pn = pb_varint(packed, (uint64_t)comment_str_idx); ok = pb_emit_bytes_field(&out, 13, packed, pn); } // comment: packed repeated int64 of string_table indices (one entry).
+
   ok = ok && pb_emit_valuetype(&out, 11, PB_STR_SPACE, PB_STR_BYTES);              // period_type: space/bytes.
   ok = ok && pb_emit_varint_field(&out, 12, (uint64_t)prof_rate);                  // period: the configured sample rate.
   ok = ok && pb_emit_varint_field(&out, 14, (uint64_t)PB_STR_INUSE_SPACE);         // default_sample_type: inuse_space.
@@ -740,8 +772,9 @@ void _mi_prof_on_alloc(mi_heap_t* heap, mi_page_t* page, void* p, size_t size) {
       mi_atomic_increment_relaxed(&prof_records); mi_atomic_add_relaxed(&prof_bytes, size);
       if (mi_option_is_enabled(mi_option_prof_accum)) { mi_atomic_increment_relaxed(&prof_accum_records); mi_atomic_add_relaxed(&prof_accum_bytes, size); }
     }
-    else { rec->next = prof_free; prof_free = rec; }  /* dropped sample: recycle the record or every post-overflow sample leaks arena memory */
+    else { rec->next = prof_free; prof_free = rec; mi_atomic_increment_relaxed(&prof_dropped_samples); }  /* dropped sample: recycle the record or every post-overflow sample leaks arena memory */
   }
+  else { mi_atomic_increment_relaxed(&prof_dropped_samples); }  /* dropped sample: record-alloc itself failed (budget/arena exhausted). */
   mi_lock_release(&prof_lock);
 }
 static void prof_free_collect(mi_page_t* page, mi_block_t* head) { for (mi_block_t* b=head; b != NULL && page->has_metadata; b=mi_block_next(page,b)) prof_free_record(page,b); }

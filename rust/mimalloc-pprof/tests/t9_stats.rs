@@ -7,6 +7,7 @@ fn stats_track_start_alloc_drop_stop_lifecycle() {
     // never fires and the profiler starts out disabled.
     let before = prof::stats();
     assert!(!before.enabled);
+    assert_eq!(before.dropped_samples, 0);
 
     common::start(4096, 101);
     let after_start = prof::stats();
@@ -16,6 +17,7 @@ fn stats_track_start_alloc_drop_stop_lifecycle() {
     let blocks: Vec<_> = (0..200).map(|_| vec![0_u8; 4096]).collect();
     let after_alloc = prof::stats();
     assert!(after_alloc.live_samples > 0);
+    assert!(after_alloc.dropped_samples >= after_alloc.stack_table_overflows);
 
     drop(blocks);
     let after_drop = prof::stats();

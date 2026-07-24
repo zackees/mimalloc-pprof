@@ -7,7 +7,7 @@ use core::ffi::c_void;
 pub type MiProfWriteFun = unsafe extern "C" fn(*mut c_void, *const c_char, usize);
 
 /// Mirrors `MI_PROF_STAT_VERSION` in `include/mimalloc/profile.h`.
-pub const MI_PROF_STAT_VERSION: c_int = 1;
+pub const MI_PROF_STAT_VERSION: c_int = 2;
 
 /// Mirrors `mi_prof_stats_t` (include/mimalloc/profile.h) field-for-field.
 #[repr(C)]
@@ -25,6 +25,11 @@ pub struct mi_prof_stats_t {
     pub unique_stacks: usize,
     pub arena_committed: usize,
     pub stack_table_overflows: usize,
+    /// v2. Mirrors `mi_prof_stats_t.dropped_samples`: count of ALL dropped
+    /// samples (record-alloc failure, stack-intern failure, including the
+    /// `MI_PROF_STACK_CAP` cap); `stack_table_overflows` is a subset, so
+    /// `dropped_samples >= stack_table_overflows` always.
+    pub dropped_samples: usize,
 }
 
 /// Mirrors `MI_PROF_CONFIG_VERSION` in `include/mimalloc/profile.h`.

@@ -299,6 +299,11 @@ pub mod prof {
         pub unique_stacks: usize,
         pub arena_committed: usize,
         pub stack_table_overflows: usize,
+        /// Count of ALL dropped samples (record-alloc failure, stack-intern
+        /// failure, including the stack-table cap); a superset of
+        /// `stack_table_overflows`, so `dropped_samples >=
+        /// stack_table_overflows` always.
+        pub dropped_samples: usize,
     }
 
     /// Read the profiler's current counters via `mi_prof_stats_get`.
@@ -322,6 +327,7 @@ pub mod prof {
                 unique_stacks: raw.unique_stacks,
                 arena_committed: raw.arena_committed,
                 stack_table_overflows: raw.stack_table_overflows,
+                dropped_samples: raw.dropped_samples,
             }
         } else {
             ProfStats::default()

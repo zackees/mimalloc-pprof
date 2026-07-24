@@ -303,21 +303,32 @@ static size_t memevt_align_up(size_t sz, size_t alignment) {
 }
 
 void* mi_unwrapped_malloc(size_t size, size_t alignment) mi_attr_noexcept {
-  // Ensure the OS layer is initialized before touching it directly. Every other path into
-  // _mi_os_alloc_aligned (mi_malloc's slow path, the profiler's arena, etc.) goes through
-  // mi_thread_init/mi_process_init first, which populates the process-global
-  // mi_os_mem_config_t (page size, allocation granularity, has_partial_free, ...) exactly
-  // once under mi_atomic_do_once -- and that guard makes every other caller *block* until
-  // the write is complete, not just skip it (see _mi_atomic_once_enter's contract). This
-  // unwrapped path is the only public entry point that calls _mi_os_alloc_aligned without
-  // first going through that guard, so if it is a process's very first allocation call --
-  // plausible for a caller reaching it on a freshly spawned thread before any mi_malloc --
-  // it could otherwise read mi_os_mem_config while another thread is concurrently mid-write
-  // via its own first mi_malloc/mi_prof_start call, i.e. a torn read of a not-yet-initialized
-  // (or partially initialized) struct. mi_process_init() is cheap and idempotent once the
-  // once-guard has resolved, so this is a no-op on the (overwhelmingly common) already-
-  // initialized path.
-  mi_process_init();
+  // Ensure THIS thread is initialized before touching the OS layer directly -- not just the
+  // process. A prior fix here called mi_process_init(), reasoning that every other path into
+  // _mi_os_alloc_aligned goes through process init first so the process-global
+  // mi_os_mem_config_t is never read torn. That part is true but incomplete: mi_process_init()
+  // only runs mi_thread_init() for the *one* thread that wins its internal mi_atomic_do_once
+  // race (see mi_process_init_once in init.c); every other thread that calls mi_process_init()
+  // concurrently just blocks on the once-guard and returns *without* mi_thread_init() ever
+  // running for itself. That matters because _mi_os_alloc_aligned's callees read per-thread
+  // heap state, not just the process-global config: mi_os_prim_alloc_at -> _mi_os_get_aligned_hint
+  // calls _mi_heap_random_next(mi_prim_get_default_heap()) in release builds (the address-hint
+  // randomization is compiled out under MI_DEBUG>0, which is exactly why this never reproduced
+  // in a debug build). A thread that never ran mi_thread_init() still has its TLS default-heap
+  // pointer at its process-start value, `&_mi_heap_empty` -- a `const`, read-only-mapped sentinel
+  // (see _mi_heap_empty/_mi_heap_default in init.c). _mi_heap_random_next mutates the chacha
+  // state it is given (chacha_next32/chacha_block regenerate the block in place), so calling it
+  // on `_mi_heap_empty.random` is a write into read-only memory: an immediate, near-deterministic
+  // SIGSEGV inside chacha_block, reproduced (~100% of runs) via gdb backtrace:
+  //   mi_unwrapped_malloc -> _mi_os_alloc_aligned -> mi_os_prim_alloc_at -> _mi_prim_alloc ->
+  //   _mi_os_get_aligned_hint -> _mi_random_next -> chacha_block (SIGSEGV, all GP regs zeroed)
+  // mi_thread_init() is the right call here, not mi_process_init(): it calls mi_process_init()
+  // itself first (unconditionally, cheap once the once-guard has resolved), and then -- for
+  // *every* calling thread, not just the process-init winner -- calls _mi_thread_heap_init(),
+  // which is itself a cheap already-initialized check-and-return once this thread has a real
+  // heap. This guarantees mi_prim_get_default_heap() never points at the const empty sentinel
+  // by the time anything below reads or mutates per-thread heap state.
+  mi_thread_init();
   if (alignment == 0) alignment = sizeof(void*);
   if ((alignment & (alignment - 1)) != 0) return NULL; // must be a power of two
   const size_t hdr_reserved = memevt_align_up(sizeof(mi_unwrapped_header_t), alignment);

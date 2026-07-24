@@ -1,6 +1,6 @@
 [package]
 name = "mimalloc-pprof"
-version = "0.1.0"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 description = "mimalloc global allocator with pprof support"

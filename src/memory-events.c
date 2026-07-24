@@ -303,6 +303,21 @@ static size_t memevt_align_up(size_t sz, size_t alignment) {
 }
 
 void* mi_unwrapped_malloc(size_t size, size_t alignment) mi_attr_noexcept {
+  // Ensure the OS layer is initialized before touching it directly. Every other path into
+  // _mi_os_alloc_aligned (mi_malloc's slow path, the profiler's arena, etc.) goes through
+  // mi_thread_init/mi_process_init first, which populates the process-global
+  // mi_os_mem_config_t (page size, allocation granularity, has_partial_free, ...) exactly
+  // once under mi_atomic_do_once -- and that guard makes every other caller *block* until
+  // the write is complete, not just skip it (see _mi_atomic_once_enter's contract). This
+  // unwrapped path is the only public entry point that calls _mi_os_alloc_aligned without
+  // first going through that guard, so if it is a process's very first allocation call --
+  // plausible for a caller reaching it on a freshly spawned thread before any mi_malloc --
+  // it could otherwise read mi_os_mem_config while another thread is concurrently mid-write
+  // via its own first mi_malloc/mi_prof_start call, i.e. a torn read of a not-yet-initialized
+  // (or partially initialized) struct. mi_process_init() is cheap and idempotent once the
+  // once-guard has resolved, so this is a no-op on the (overwhelmingly common) already-
+  // initialized path.
+  mi_process_init();
   if (alignment == 0) alignment = sizeof(void*);
   if ((alignment & (alignment - 1)) != 0) return NULL; // must be a power of two
   const size_t hdr_reserved = memevt_align_up(sizeof(mi_unwrapped_header_t), alignment);

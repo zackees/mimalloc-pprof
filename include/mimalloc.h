@@ -437,6 +437,7 @@ typedef enum mi_option_e {
   mi_option_prof_accum,
   mi_option_prof_seed,
   mi_option_prof_max_bytes,             // budget (in bytes) for profiler-internal arena memory; 0 = unbudgeted (=0)
+  mi_option_memory_events,              // enable opt-in allocation-change accounting/callbacks (MIMALLOC_MEMORY_EVENTS) (=0)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -512,6 +513,7 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_heap_alloc_new_n(mi_h
 #endif
 
 #include "mimalloc/profile.h"
+#include "mimalloc/memory-events.h"
 
 // ---------------------------------------------------------------------------------------------
 // Implement the C++ std::allocator interface for use in STL containers.

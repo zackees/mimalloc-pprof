@@ -14,6 +14,8 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
+use std::ffi::CString;
+use std::path::PathBuf;
 
 pub use libmimalloc_pprof_sys as sys;
 
@@ -61,6 +63,123 @@ unsafe impl GlobalAlloc for MiMalloc {
 /// and its sample rate, stay active).
 pub fn enable_heap_profiling() -> bool {
     prof::start(0)
+}
+
+/// How [`ProfConfig`] fields interact with the profiler's environment
+/// variables and `mi_option_*` settings.
+///
+/// Mirrors `mi_prof_config_mode_t` (include/mimalloc/profile.h); see that
+/// header for the full FALLBACK/OVERRIDE semantics, including the caveat
+/// that in `Override` mode `accum == false`, `dump_format == Text`, and
+/// `max_profiler_bytes == None` cannot be distinguished from "unset" and so
+/// always fall back to env-then-default rather than forcing the off/default
+/// value.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ProfConfigMode {
+    /// Struct fields are used only where the corresponding env var / option is absent.
+    #[default]
+    Fallback,
+    /// Non-default struct fields win over env vars / options (see the caveat above).
+    Override,
+}
+
+/// Output format for [`ProfConfig::dump_at_exit`].
+///
+/// Mirrors `MI_PROF_FORMAT_TEXT` / `MI_PROF_FORMAT_PROTO` (include/mimalloc/profile.h).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DumpFormat {
+    /// Legacy "heap profile:" text format (see [`prof::dump_to_vec`]).
+    #[default]
+    Text,
+    /// Binary pprof `profile.proto` format (see [`prof::dump_proto_to_vec`]).
+    Proto,
+}
+
+/// Ergonomic, Rust-facing sibling of `mi_prof_config_t`
+/// (include/mimalloc/profile.h) for [`enable_heap_profiling_with`].
+///
+/// Fields mirror the C struct one-for-one, but trade its 0/NULL-means-unset
+/// raw-integer conventions for `Option<T>` and enums where that reads
+/// better. `#[non_exhaustive]` + `Default` keeps future fields additive:
+/// build from `Default::default()` and set the fields you need, e.g.
+///
+/// ```
+/// use mimalloc_pprof::ProfConfig;
+/// let mut config = ProfConfig::default();
+/// config.sample_interval = Some(4096);
+/// ```
+///
+/// (Within this crate, struct-update syntax like
+/// `ProfConfig { sample_interval: Some(4096), ..Default::default() }` also
+/// works; `#[non_exhaustive]` only blocks struct-literal construction from
+/// *other* crates, so new fields stay non-breaking for them.)
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct ProfConfig {
+    /// See [`ProfConfigMode`].
+    pub mode: ProfConfigMode,
+    /// Average bytes between samples. `None` = env/default (512 KiB).
+    pub sample_interval: Option<usize>,
+    /// Budget (bytes) for profiler-internal persistent sampling state
+    /// (sample records, the stack intern table, interned stack entries).
+    /// `None` = unbudgeted (cap-bounded only).
+    pub max_profiler_bytes: Option<usize>,
+    /// `None` = nondeterministic.
+    pub seed: Option<u64>,
+    pub accum: bool,
+    /// `None` = default (32); compile cap 128.
+    pub max_stack_depth: Option<usize>,
+    /// Path to dump the profile to at process exit. `None` = no exit dump.
+    pub dump_at_exit: Option<PathBuf>,
+    /// Format used for the exit dump. Ignored if `dump_at_exit` is `None`.
+    pub dump_format: DumpFormat,
+}
+
+/// Turn on sampled heap profiling using a struct-based configuration.
+///
+/// Sibling of [`enable_heap_profiling`] for callers that need more than a
+/// single sample rate -- e.g. seeding the sampler, capping profiler-arena
+/// memory, or registering an exit-time dump path/format. See [`ProfConfig`]
+/// and, for the full FALLBACK/OVERRIDE semantics, `mi_prof_config_mode_t` in
+/// `include/mimalloc/profile.h`.
+///
+/// Returns `false` if profiling was already enabled (the earlier session
+/// stays active), or if `config.dump_at_exit` is set but is not
+/// representable as a NUL-free C string (non-UTF-8 or an embedded NUL byte)
+/// -- in that case `mi_prof_start_ex` is never called.
+pub fn enable_heap_profiling_with(config: &ProfConfig) -> bool {
+    // `dump_at_exit_c` must outlive the `mi_prof_start_ex` call below since
+    // `raw.dump_at_exit` borrows its bytes; it does, as both live to the end
+    // of this function.
+    let dump_at_exit_c: Option<CString> = match &config.dump_at_exit {
+        Some(path) => match path.to_str().and_then(|s| CString::new(s).ok()) {
+            Some(c) => Some(c),
+            None => return false,
+        },
+        None => None,
+    };
+
+    let mut raw: sys::mi_prof_config_t = unsafe { core::mem::zeroed() };
+    raw.size = core::mem::size_of::<sys::mi_prof_config_t>();
+    raw.version = sys::MI_PROF_CONFIG_VERSION;
+    raw.mode = match config.mode {
+        ProfConfigMode::Fallback => sys::MI_PROF_CONFIG_FALLBACK,
+        ProfConfigMode::Override => sys::MI_PROF_CONFIG_OVERRIDE,
+    };
+    raw.sample_interval = config.sample_interval.unwrap_or(0);
+    raw.max_profiler_bytes = config.max_profiler_bytes.unwrap_or(0);
+    raw.seed = config.seed.unwrap_or(0);
+    raw.accum = config.accum;
+    raw.max_stack_depth = config.max_stack_depth.unwrap_or(0);
+    raw.dump_at_exit = dump_at_exit_c
+        .as_ref()
+        .map_or(core::ptr::null(), |c| c.as_ptr());
+    raw.dump_format = match config.dump_format {
+        DumpFormat::Text => sys::MI_PROF_FORMAT_TEXT,
+        DumpFormat::Proto => sys::MI_PROF_FORMAT_PROTO,
+    };
+
+    unsafe { sys::mi_prof_start_ex(&raw) }
 }
 
 /// Safe controls for mimalloc's sampled heap profiler.
@@ -341,5 +460,52 @@ pub mod prof {
             );
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // The profiler is process-global state, and unit tests within this
+    // binary may run concurrently by default, so serialize everything that
+    // starts/stops it. `unwrap_or_else` rides through a poisoned lock rather
+    // than cascading a single panicking test into every other one.
+    static PROF_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reset_profiler() {
+        if prof::is_enabled() {
+            prof::stop();
+        }
+    }
+
+    #[test]
+    fn enable_heap_profiling_with_default_config_starts_profiler() {
+        let _guard = PROF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_profiler();
+
+        let config = ProfConfig::default();
+        assert!(enable_heap_profiling_with(&config));
+        assert!(prof::is_enabled());
+
+        prof::stop();
+    }
+
+    #[test]
+    fn enable_heap_profiling_with_override_mode_sets_sample_interval() {
+        let _guard = PROF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_profiler();
+
+        let config = ProfConfig {
+            mode: ProfConfigMode::Override,
+            sample_interval: Some(4096),
+            ..Default::default()
+        };
+        assert!(enable_heap_profiling_with(&config));
+        assert!(prof::is_enabled());
+        assert_eq!(prof::stats().sample_rate, 4096);
+
+        prof::stop();
     }
 }

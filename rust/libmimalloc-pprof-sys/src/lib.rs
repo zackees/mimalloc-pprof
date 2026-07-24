@@ -27,6 +27,34 @@ pub struct mi_prof_stats_t {
     pub stack_table_overflows: usize,
 }
 
+/// Mirrors `MI_PROF_CONFIG_VERSION` in `include/mimalloc/profile.h`.
+pub const MI_PROF_CONFIG_VERSION: c_int = 1;
+
+/// Mirrors `MI_PROF_FORMAT_TEXT` / `MI_PROF_FORMAT_PROTO` (include/mimalloc/profile.h).
+pub const MI_PROF_FORMAT_TEXT: c_int = 0;
+pub const MI_PROF_FORMAT_PROTO: c_int = 1;
+
+/// Mirrors `mi_prof_config_mode_t`'s `MI_PROF_CONFIG_FALLBACK` /
+/// `MI_PROF_CONFIG_OVERRIDE` (include/mimalloc/profile.h).
+pub const MI_PROF_CONFIG_FALLBACK: c_int = 0;
+pub const MI_PROF_CONFIG_OVERRIDE: c_int = 1;
+
+/// Mirrors `mi_prof_config_t` (include/mimalloc/profile.h) field-for-field.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct mi_prof_config_t {
+    pub size: usize,
+    pub version: c_int,
+    pub mode: c_int, // mi_prof_config_mode_t
+    pub sample_interval: usize,
+    pub max_profiler_bytes: usize,
+    pub seed: u64,
+    pub accum: bool,
+    pub max_stack_depth: usize,
+    pub dump_at_exit: *const c_char,
+    pub dump_format: c_int,
+}
+
 /// Mirrors `mi_prof_sample_info_t` (include/mimalloc/profile.h) field-for-field.
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -73,6 +101,7 @@ unsafe extern "C" {
     pub fn mi_usable_size(p: *const c_void) -> usize;
     pub fn mi_prof_start(sample_rate: usize) -> bool;
     pub fn mi_prof_start_seeded(sample_rate: usize, seed: u64) -> bool;
+    pub fn mi_prof_start_ex(config: *const mi_prof_config_t) -> bool;
     pub fn mi_prof_stop();
     pub fn mi_prof_is_enabled() -> bool;
     pub fn mi_prof_dump(path: *const c_char) -> bool;

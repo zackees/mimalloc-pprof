@@ -12,6 +12,46 @@ extern "C" {
 mi_decl_nodiscard mi_decl_export bool mi_prof_start(size_t sample_rate) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept;
 mi_decl_export void mi_prof_stop(void) mi_attr_noexcept;
+
+/* Structured start configuration (see mi_prof_start_ex below). `mode` selects how
+   non-default (non-zero/non-NULL) struct fields interact with the environment:
+     MI_PROF_CONFIG_FALLBACK (=0): the struct is a fallback -- if the corresponding
+       env var (or, for accum/max_stack_depth/max_profiler_bytes, its mi_option_*)
+       is present, the env/option value wins and the struct field is ignored; the
+       struct field only applies where the env var is absent.
+     MI_PROF_CONFIG_OVERRIDE (=1): non-zero/non-NULL struct fields always win
+       (applied via mi_option_set where applicable), regardless of env; zeroed
+       fields fall back to env-then-default, same as FALLBACK.
+   In both modes a fully zeroed config (mi_prof_config_t_decl's initial state)
+   behaves exactly like mi_prof_start(0). Note that because 0/NULL doubles as
+   "field not set", `accum == false`, `dump_format == MI_PROF_FORMAT_TEXT`, and
+   `max_profiler_bytes == 0` cannot be distinguished from "unset" in OVERRIDE
+   mode -- they always fall back to env-then-default rather than forcing the
+   off/default value. This matches their existing defaults, so it only matters
+   if you need OVERRIDE to force off a value enabled via the environment. */
+#define MI_PROF_FORMAT_TEXT  0
+#define MI_PROF_FORMAT_PROTO 1
+#define MI_PROF_CONFIG_VERSION 1
+typedef enum mi_prof_config_mode_e { MI_PROF_CONFIG_FALLBACK = 0, MI_PROF_CONFIG_OVERRIDE = 1 } mi_prof_config_mode_t;
+typedef struct mi_prof_config_s {
+  size_t size; int version;
+  int mode;                     // mi_prof_config_mode_t
+  size_t sample_interval;       // avg bytes between samples; 0 = env/default (512 KiB)
+  /* Budget (bytes) for profiler-internal *persistent sampling state* only (sample
+     records, the stack intern table, and interned stack entries -- everything
+     backed by _mi_prof_arena_alloc). 0 = unbudgeted (cap-bounded only). Dump,
+     snapshot, and profile.proto scratch buffers are transient and always use
+     _mi_os_alloc directly, never this arena, so they are never counted here. */
+  size_t max_profiler_bytes;
+  uint64_t seed;                // 0 = nondeterministic
+  bool accum;
+  size_t max_stack_depth;       // 0 = default (32); compile cap 128
+  const char* dump_at_exit;     // NULL = none; copied into the internal buffer
+  int dump_format;              // MI_PROF_FORMAT_TEXT / _PROTO, for the exit dump
+} mi_prof_config_t;
+#define mi_prof_config_t_decl(name)  mi_prof_config_t name = { 0 }; name.size = sizeof(mi_prof_config_t); name.version = MI_PROF_CONFIG_VERSION
+mi_decl_nodiscard mi_decl_export bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept;
+
 mi_decl_nodiscard mi_decl_export bool mi_prof_is_enabled(void) mi_attr_noexcept;
 /* deprecated: use mi_prof_stats_get */
 mi_decl_export void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept;

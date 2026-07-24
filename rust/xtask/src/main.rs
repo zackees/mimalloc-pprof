@@ -36,6 +36,14 @@ impl Paths {
             .and_then(Path::parent) // repo root
             .expect("rust/xtask is expected to live at <repo_root>/rust/xtask")
             .to_path_buf();
+        // Canonicalize repo_root too, not just the paths passed to display_rel: on
+        // Windows, fs::canonicalize prefixes paths with the extended-length \\?\
+        // marker, which repo_root (straight from CARGO_MANIFEST_DIR) does not have.
+        // strip_prefix requires an exact component-wise match, so without this the
+        // prefix silently fails to strip and display_rel falls back to embedding
+        // the full absolute, machine-specific path in the generated output --
+        // exactly the non-portable content `check` exists to catch as drift.
+        let repo_root = fs::canonicalize(&repo_root).unwrap_or(repo_root);
         let include_root = repo_root.join("include");
         let src_root = repo_root.join("src");
         let vendor_dir = repo_root.join("rust").join("mimalloc-pprof").join("vendor");

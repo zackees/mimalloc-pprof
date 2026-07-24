@@ -1,6 +1,6 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 0d8b944f of the three public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 554f99c3 of the three public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc.h ---- */
+/* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -515,7 +515,7 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_heap_alloc_new_n(mi_h
 }
 #endif
 
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/profile.h ---- */
+/* ---- begin inlined: include/mimalloc/profile.h ---- */
 /* Public, allocation-only sampling profiler API.
 
    ## Bounds (all profiler-internal memory; see rule 4 below)
@@ -653,8 +653,8 @@ mi_decl_nodiscard mi_decl_export bool mi_prof_modules_visit(mi_prof_module_visit
 }
 #endif
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/profile.h ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/memory-events.h ---- */
+/* ---- end inlined: include/mimalloc/profile.h ---- */
+/* ---- begin inlined: include/mimalloc/memory-events.h ---- */
 /* Public, allocation-change accounting/monitoring API. Independent of MI_PPROF: this
    module (src/memory-events.c) is always compiled in, opt-in only via the
    `MIMALLOC_MEMORY_EVENTS` environment variable or the `mi_memory_tracking_set_enabled`
@@ -795,7 +795,7 @@ mi_decl_export void* mi_unwrapped_realloc(void* p, size_t new_size, size_t align
 }
 #endif
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/memory-events.h ---- */
+/* ---- end inlined: include/mimalloc/memory-events.h ---- */
 
 // ---------------------------------------------------------------------------------------------
 // Implement the C++ std::allocator interface for use in STL containers.
@@ -943,4 +943,4 @@ template<class T1, class T2> bool operator!=(const mi_heap_destroy_stl_allocator
 #endif // __cplusplus
 
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc.h ---- */
+/* ---- end inlined: include/mimalloc.h ---- */

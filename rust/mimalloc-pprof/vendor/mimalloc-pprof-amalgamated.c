@@ -1,6 +1,6 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 0d8b944f of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 554f99c3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/static.c ---- */
+/* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2020, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -16,7 +16,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #undef _POSIX_C_SOURCE
 #endif
 
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc.h ---- */
+/* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -531,7 +531,7 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_heap_alloc_new_n(mi_h
 }
 #endif
 
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/profile.h ---- */
+/* ---- begin inlined: include/mimalloc/profile.h ---- */
 /* Public, allocation-only sampling profiler API.
 
    ## Bounds (all profiler-internal memory; see rule 4 below)
@@ -669,8 +669,8 @@ mi_decl_nodiscard mi_decl_export bool mi_prof_modules_visit(mi_prof_module_visit
 }
 #endif
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/profile.h ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/memory-events.h ---- */
+/* ---- end inlined: include/mimalloc/profile.h ---- */
+/* ---- begin inlined: include/mimalloc/memory-events.h ---- */
 /* Public, allocation-change accounting/monitoring API. Independent of MI_PPROF: this
    module (src/memory-events.c) is always compiled in, opt-in only via the
    `MIMALLOC_MEMORY_EVENTS` environment variable or the `mi_memory_tracking_set_enabled`
@@ -811,7 +811,7 @@ mi_decl_export void* mi_unwrapped_realloc(void* p, size_t new_size, size_t align
 }
 #endif
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/memory-events.h ---- */
+/* ---- end inlined: include/mimalloc/memory-events.h ---- */
 
 // ---------------------------------------------------------------------------------------------
 // Implement the C++ std::allocator interface for use in STL containers.
@@ -959,8 +959,8 @@ template<class T1, class T2> bool operator!=(const mi_heap_destroy_stl_allocator
 #endif // __cplusplus
 
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc.h ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/internal.h ---- */
+/* ---- end inlined: include/mimalloc.h ---- */
+/* ---- begin inlined: include/mimalloc/internal.h ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2023, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -976,7 +976,7 @@ terms of the MIT license. A copy of the license can be found in the file
 // functions and macros.
 // --------------------------------------------------------------------------
 
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/types.h ---- */
+/* ---- begin inlined: include/mimalloc/types.h ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2024, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -1005,7 +1005,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <stddef.h>   // ptrdiff_t
 #include <stdint.h>   // uintptr_t, uint16_t, etc
 #include <stdbool.h>  // bool
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/atomic.h ---- */
+/* ---- begin inlined: include/mimalloc/atomic.h ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2024 Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -1671,7 +1671,7 @@ void _mi_atomic_once_release(mi_atomic_once_t* once);      // defined in `libc.c
 
 
 #endif // __MIMALLOC_ATOMIC_H
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/atomic.h ---- */
+/* ---- end inlined: include/mimalloc/atomic.h ---- */
 
 #ifdef _MSC_VER
 #pragma warning(disable:4214) // bitfield is not int
@@ -2340,8 +2340,8 @@ void _mi_stat_counter_increase(mi_stat_counter_t* stat, size_t amount);
 #define mi_heap_stat_adjust_decrease(heap,stat,amount)  mi_stat_adjust_decrease( (heap)->tld->stats.stat, amount)
 
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/types.h ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/track.h ---- */
+/* ---- end inlined: include/mimalloc/types.h ---- */
+/* ---- begin inlined: include/mimalloc/track.h ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2023, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -2426,7 +2426,7 @@ defined, undefined, or not accessible at all:
 #define MI_TRACK_HEAP_DESTROY 1
 #define MI_TRACK_TOOL         "ETW"
 
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/windows/etw.h ---- */
+/* ---- begin inlined: src/prim/windows/etw.h ---- */
 //**********************************************************************`
 //* This is an include file generated by Message Compiler.             *`
 //*                                                                    *`
@@ -3332,7 +3332,7 @@ _mcgen_PASTE2(McTemplateU0xx_, MCGEN_EVENTWRITETRANSFER)(
 #if defined(__cplusplus)
 }
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/windows/etw.h ---- */
+/* ---- end inlined: src/prim/windows/etw.h ---- */
 
 #define mi_track_init()                           EventRegistermicrosoft_windows_mimalloc()
 #define mi_track_done()                           EventUnregistermicrosoft_windows_mimalloc()
@@ -3398,7 +3398,7 @@ _mcgen_PASTE2(McTemplateU0xx_, MCGEN_EVENTWRITETRANSFER)(
 #endif
 
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/track.h ---- */
+/* ---- end inlined: include/mimalloc/track.h ---- */
 
 
 // --------------------------------------------------------------------------
@@ -4613,13 +4613,13 @@ static inline void _mi_memzero_aligned(void* dst, size_t n) {
 
 
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/internal.h ---- */
+/* ---- end inlined: include/mimalloc/internal.h ---- */
 
 // For a static override we create a single object file
 // containing the whole library. If it is linked first
 // it will override all the standard library allocation
 // functions (on Unix's).
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/alloc.c ---- */
+/* ---- begin inlined: src/alloc.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2024, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -4630,7 +4630,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #define _DEFAULT_SOURCE   // for realpath() on Linux
 #endif
 
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/prim.h ---- */
+/* ---- begin inlined: include/mimalloc/prim.h ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2024, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -5066,13 +5066,13 @@ static inline mi_heap_t* mi_prim_get_default_heap(void) {
 
 
 #endif  // MIMALLOC_PRIM_H
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/include/mimalloc/prim.h ---- */
+/* ---- end inlined: include/mimalloc/prim.h ---- */
 
 #include <string.h>      // memset, strlen (for mi_strdup)
 #include <stdlib.h>      // malloc, abort
 
 #define MI_IN_ALLOC_C
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/alloc-override.c ---- */
+/* ---- begin inlined: src/alloc-override.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -5470,8 +5470,8 @@ mi_decl_weak int reallocarr(void* p, size_t count, size_t size)    { return mi_r
 #endif
 
 #endif // MI_MALLOC_OVERRIDE
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/alloc-override.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/free.c ---- */
+/* ---- end inlined: src/alloc-override.c ---- */
+/* ---- begin inlined: src/free.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2024, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -6089,7 +6089,7 @@ static void mi_block_unguard(mi_page_t* page, mi_block_t* block, void* p) {
   _mi_os_unprotect(gpage, psize);
 }
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/free.c ---- */
+/* ---- end inlined: src/free.c ---- */
 #undef MI_IN_ALLOC_C
 
 // ------------------------------------------------------
@@ -6856,8 +6856,8 @@ void* _mi_externs[] = {
   // (void*)&mi_heap_alloc_new_n
 };
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/alloc.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/alloc-aligned.c ---- */
+/* ---- end inlined: src/alloc.c ---- */
+/* ---- begin inlined: src/alloc-aligned.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2021, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -7228,8 +7228,8 @@ mi_decl_nodiscard void* mi_recalloc_aligned(void* p, size_t newcount, size_t siz
 }
 
 
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/alloc-aligned.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/alloc-posix.c ---- */
+/* ---- end inlined: src/alloc-aligned.c ---- */
+/* ---- begin inlined: src/alloc-posix.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2021, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -7430,8 +7430,8 @@ mi_decl_nodiscard void* mi_aligned_offset_recalloc(void* p, size_t newcount, siz
 mi_decl_nodiscard void* mi_aligned_recalloc(void* p, size_t newcount, size_t size, size_t alignment) mi_attr_noexcept { // Microsoft
   return mi_recalloc_aligned(p, newcount, size, alignment);
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/alloc-posix.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/arena.c ---- */
+/* ---- end inlined: src/alloc-posix.c ---- */
+/* ---- begin inlined: src/arena.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2019-2024, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -7453,7 +7453,7 @@ to reserve large arenas upfront and be able to reuse the memory more effectively
 The arena allocation needs to be thread safe and we use an atomic bitmap to allocate.
 -----------------------------------------------------------------------------*/
 
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/bitmap.h ---- */
+/* ---- begin inlined: src/bitmap.h ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2019-2023 Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -7573,7 +7573,7 @@ bool _mi_bitmap_is_claimed_across(mi_bitmap_t bitmap, size_t bitmap_fields, size
 bool _mi_bitmap_is_any_claimed_across(mi_bitmap_t bitmap, size_t bitmap_fields, size_t count, mi_bitmap_index_t bitmap_idx);
 
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/bitmap.h ---- */
+/* ---- end inlined: src/bitmap.h ---- */
 
 
 /* -----------------------------------------------------------
@@ -7615,7 +7615,7 @@ static mi_decl_cache_align _Atomic(size_t)      mi_arena_count; // = 0
 static mi_decl_cache_align _Atomic(int64_t)     mi_arenas_purge_expire; // set if there exist purgeable arenas
 
 #define MI_IN_ARENA_C
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/arena-abandon.c ---- */
+/* ---- begin inlined: src/arena-abandon.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2019-2024, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -7959,7 +7959,7 @@ bool mi_abandoned_visit_blocks(mi_subproc_id_t subproc_id, int heap_tag, bool vi
   _mi_arena_field_cursor_done(&current);
   return ok;
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/arena-abandon.c ---- */
+/* ---- end inlined: src/arena-abandon.c ---- */
 #undef MI_IN_ARENA_C
 
 /* -----------------------------------------------------------
@@ -8951,8 +8951,8 @@ int mi_reserve_huge_os_pages(size_t pages, double max_secs, size_t* pages_reserv
   if (err==0 && pages_reserved!=NULL) *pages_reserved = pages;
   return err;
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/arena.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/bitmap.c ---- */
+/* ---- end inlined: src/arena.c ---- */
+/* ---- begin inlined: src/bitmap.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2019-2023 Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -9389,8 +9389,8 @@ bool _mi_bitmap_is_any_claimed_across(mi_bitmap_t bitmap, size_t bitmap_fields, 
   mi_bitmap_is_claimedx_across(bitmap, bitmap_fields, count, bitmap_idx, &any_ones, NULL);
   return any_ones;
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/bitmap.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/heap.c ---- */
+/* ---- end inlined: src/bitmap.c ---- */
+/* ---- begin inlined: src/heap.c ---- */
 /*----------------------------------------------------------------------------
 Copyright (c) 2018-2021, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -10166,8 +10166,8 @@ bool mi_unsafe_heap_page_is_under_utilized(mi_heap_t* heap, void* p, size_t perc
   if (perc_threshold>=100) return true;
   return (perc_threshold >= ((100UL*page->used) / page->capacity));
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/heap.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/init.c ---- */
+/* ---- end inlined: src/heap.c ---- */
+/* ---- begin inlined: src/init.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2022, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -10909,8 +10909,8 @@ void mi_cdecl _mi_auto_process_done(void) mi_attr_noexcept {
   if (_mi_option_get_fast(mi_option_destroy_on_exit)>1) return;
   mi_process_done();
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/init.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/libc.c ---- */
+/* ---- end inlined: src/init.c ---- */
+/* ---- begin inlined: src/libc.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2023, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -11289,8 +11289,8 @@ mi_decl_noinline size_t _mi_popcount_generic(size_t x) {
 }
 #endif
 
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/libc.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/memory-events.c ---- */
+/* ---- end inlined: src/libc.c ---- */
+/* ---- begin inlined: src/memory-events.c ---- */
 /* Opt-in global-heap allocation-change accounting and callbacks (issue #20).
 
    Independent of MI_PPROF: always compiled in (see src/static.c), gated only by the
@@ -11665,8 +11665,8 @@ void* mi_unwrapped_realloc(void* p, size_t new_size, size_t alignment) mi_attr_n
   mi_unwrapped_free(p);
   return newp;
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/memory-events.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/options.c ---- */
+/* ---- end inlined: src/memory-events.c ---- */
+/* ---- begin inlined: src/options.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2021, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -12350,8 +12350,8 @@ static void mi_option_init(mi_option_desc_t* desc) {
   }
   // and on another error, keep unitialized to try again (can happen during preloading if getenv is not available)
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/options.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/os.c ---- */
+/* ---- end inlined: src/options.c ---- */
+/* ---- begin inlined: src/os.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -13129,8 +13129,8 @@ int _mi_os_numa_node(void) {
     return mi_os_numa_node_get();
   }
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/os.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/page.c ---- */
+/* ---- end inlined: src/os.c ---- */
+/* ---- begin inlined: src/page.c ---- */
 /*----------------------------------------------------------------------------
 Copyright (c) 2018-2024, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -13150,7 +13150,7 @@ terms of the MIT license. A copy of the license can be found in the file
 ----------------------------------------------------------- */
 
 #define MI_IN_PAGE_C
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/page-queue.c ---- */
+/* ---- begin inlined: src/page-queue.c ---- */
 /*----------------------------------------------------------------------------
 Copyright (c) 2018-2024, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -13579,7 +13579,7 @@ size_t _mi_page_queue_append(mi_heap_t* heap, mi_page_queue_t* pq, mi_page_queue
   }
   return count;
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/page-queue.c ---- */
+/* ---- end inlined: src/page-queue.c ---- */
 #undef MI_IN_PAGE_C
 
 
@@ -14647,8 +14647,8 @@ void* _mi_malloc_generic(mi_heap_t* heap, size_t size, bool zero, size_t huge_al
   }
   return p;
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/page.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/profile.c ---- */
+/* ---- end inlined: src/page.c ---- */
+/* ---- begin inlined: src/profile.c ---- */
 /* Allocation sampling profiler.  Its records never use mimalloc: the arena
    below is backed directly by _mi_os_alloc so profiler bookkeeping cannot
    recursively enter the allocator. */
@@ -15469,9 +15469,9 @@ void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { MI_UNUSE
 void _mi_prof_process_init(void) { }
 void _mi_prof_process_done(void) { }
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/profile.c ---- */
+/* ---- end inlined: src/profile.c ---- */
 #if MI_PPROF
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/profile-stack.c ---- */
+/* ---- begin inlined: src/profile-stack.c ---- */
 /* Platform stack capture for sampled allocations.  This routine allocates
    nothing: the caller supplies its profiler-arena backed PC buffer. */
 #include <string.h>
@@ -15626,8 +15626,8 @@ void _mi_prof_stack_resize(mi_prof_stack_t* stack, size_t oldsize, size_t newsiz
 #else
 size_t _mi_prof_stack_capture(void** pcs, size_t capacity) { MI_UNUSED(pcs); MI_UNUSED(capacity); return 0; }
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/profile-stack.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/profile-maps.c ---- */
+/* ---- end inlined: src/profile-stack.c ---- */
+/* ---- begin inlined: src/profile-maps.c ---- */
 /* Module-map serialization for heap_v2 profiles. This deliberately uses
    platform and raw file APIs only; callers invoke it after releasing the
    profiler table lock. */
@@ -15798,9 +15798,9 @@ bool _mi_prof_maps_visit(mi_prof_module_visit_fun* visitor, void* arg) {
 }
 
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/profile-maps.c ---- */
+/* ---- end inlined: src/profile-maps.c ---- */
 #endif
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/random.c ---- */
+/* ---- begin inlined: src/random.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2019-2021, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -16061,8 +16061,8 @@ static void chacha_test(void)
   mi_assert_internal(array_equals(r.output, r_out, 16));
 }
 */
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/random.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/segment.c ---- */
+/* ---- end inlined: src/random.c ---- */
+/* ---- begin inlined: src/segment.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2024, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -17777,8 +17777,8 @@ bool _mi_segment_visit_blocks(mi_segment_t* segment, int heap_tag, bool visit_bl
   }
   return true;
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/segment.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/segment-map.c ---- */
+/* ---- end inlined: src/segment.c ---- */
+/* ---- begin inlined: src/segment-map.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2019-2023, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -17923,8 +17923,8 @@ void _mi_segment_map_unsafe_destroy(void) {
     }
   }
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/segment-map.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/stats.c ---- */
+/* ---- end inlined: src/segment-map.c ---- */
+/* ---- begin inlined: src/stats.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2021, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -18563,8 +18563,8 @@ char* mi_stats_get_json(size_t output_size, char* output_buf) mi_attr_noexcept {
     return hbuf.buf;
   }
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/stats.c ---- */
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/prim.c ---- */
+/* ---- end inlined: src/stats.c ---- */
+/* ---- begin inlined: src/prim/prim.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2023, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -18576,7 +18576,7 @@ terms of the MIT license. A copy of the license can be found in the file
 // depending on the OS.
 
 #if defined(_WIN32)
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/windows/prim.c ---- */
+/* ---- begin inlined: src/prim/windows/prim.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2023, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -19682,10 +19682,10 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     mi_allocator_done();
   }
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/windows/prim.c ---- */
+/* ---- end inlined: src/prim/windows/prim.c ---- */
 
 #elif defined(__APPLE__)
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/osx/prim.c ---- */
+/* ---- begin inlined: src/prim/osx/prim.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2023, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -19694,7 +19694,7 @@ terms of the MIT license. A copy of the license can be found in the file
 -----------------------------------------------------------------------------*/
 
 // We use the unix/prim.c with the mmap API on macOSX
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/unix/prim.c ---- */
+/* ---- begin inlined: src/prim/unix/prim.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -20662,12 +20662,12 @@ void _mi_prim_thread_associate_default_heap(mi_heap_t* heap) {
 }
 
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/unix/prim.c ---- */
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/osx/prim.c ---- */
+/* ---- end inlined: src/prim/unix/prim.c ---- */
+/* ---- end inlined: src/prim/osx/prim.c ---- */
 
 #elif defined(__wasi__)
 #define MI_USE_SBRK
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/wasi/prim.c ---- */
+/* ---- begin inlined: src/prim/wasi/prim.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2023, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -20955,10 +20955,10 @@ void _mi_prim_thread_done_auto_done(void) {
 void _mi_prim_thread_associate_default_heap(mi_heap_t* heap) {
   MI_UNUSED(heap);
 }
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/wasi/prim.c ---- */
+/* ---- end inlined: src/prim/wasi/prim.c ---- */
 
 #elif defined(__EMSCRIPTEN__)
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/emscripten/prim.c ---- */
+/* ---- begin inlined: src/prim/emscripten/prim.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2025, Microsoft Research, Daan Leijen, Alon Zakai
 This is free software; you can redistribute it and/or modify it under the
@@ -21208,7 +21208,7 @@ void _mi_prim_thread_associate_default_heap(mi_heap_t* heap) {
 
 }
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/emscripten/prim.c ---- */
+/* ---- end inlined: src/prim/emscripten/prim.c ---- */
 
 #else
 
@@ -21262,9 +21262,9 @@ void _mi_allocator_done(void) {
   // nothing to do
 }
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/prim.c ---- */
+/* ---- end inlined: src/prim/prim.c ---- */
 #if MI_OSX_ZONE
-/* ---- begin inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/osx/alloc-override-zone.c ---- */
+/* ---- begin inlined: src/prim/osx/alloc-override-zone.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2022, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
@@ -21757,6 +21757,6 @@ static void _mi_macos_override_malloc(void) {
 #endif  // MI_OSX_INTERPOSE
 
 #endif // MI_MALLOC_OVERRIDE
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/prim/osx/alloc-override-zone.c ---- */
+/* ---- end inlined: src/prim/osx/alloc-override-zone.c ---- */
 #endif
-/* ---- end inlined: //?/C:/Users/niteris/dev/mimalloc-pprof/src/static.c ---- */
+/* ---- end inlined: src/static.c ---- */

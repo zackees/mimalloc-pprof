@@ -234,12 +234,15 @@ When changing or embedding this fork, preserve all of the following:
 1. Profiler-internal allocations must use the raw OS-layer arena
    (`_mi_os_alloc`), never `mi_malloc`, C++ `new`, or Rust `GlobalAlloc`.
 2. Every new C source file must be added to the normal CMake source list and to
-   `src/static.c`; profiler-only files must be guarded by `MI_PPROF`.
-3. `MI_PPROF=OFF` must remain an upstream-equivalent build. Memory-events hooks
-   remain unconditional, tiny calls whose runtime work is opt-in.
-4. Public profiler and memory-events structs stay size/version tagged. Extend
-   them additively rather than changing existing fields or function
-   signatures.
+   `src/static.c`. `src/profile.c` remains compiled to provide the OFF stubs and
+   gates its implementation internally; profiler helper files and engine hook
+   call sites must be guarded by `MI_PPROF`.
+3. `MI_PPROF=OFF` must remove the profiler hooks and preserve upstream allocator
+   behavior when independent memory-events tracking remains runtime-disabled.
+   The memory-events API, hooks, and tests remain available in the OFF build.
+4. `mi_prof_config_t`, `mi_prof_stats_t`, and `mi_memory_snapshot_t` stay
+   size/version tagged and must be extended compatibly. Other public structs
+   and function signatures must not be changed incompatibly.
 5. Validate C changes on Ubuntu, Windows MSVC, Windows MinGW, and macOS with
    `MI_PPROF=ON`, plus an `MI_PPROF=OFF` build and the Rust workspace.
 6. Never mix root C-core paths and `rust/` paths in one commit.

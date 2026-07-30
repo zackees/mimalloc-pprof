@@ -40,8 +40,8 @@ lines are published, as two version ranges of the same `mimalloc-pprof` crate:
 
 | | **v2 engine** | **v3 engine** |
 |---|---|---|
-| Crate | [`mimalloc-pprof` 0.8.x](https://crates.io/crates/mimalloc-pprof/0.8.0) | [`mimalloc-pprof` 0.9.x](https://crates.io/crates/mimalloc-pprof/0.9.0) |
-| Docs | [docs.rs 0.8.0](https://docs.rs/mimalloc-pprof/0.8.0) | [docs.rs 0.9.0](https://docs.rs/mimalloc-pprof/0.9.0) |
+| Crate | [`mimalloc-pprof` 0.8.x](https://crates.io/crates/mimalloc-pprof) — [crates.io](https://crates.io/crates/mimalloc-pprof/0.8.0), [docs.rs](https://docs.rs/mimalloc-pprof/0.8.0) | 0.9.x — **not yet published to crates.io** |
+| Where it lives | `main` | the [`v3`](https://github.com/zackees/mimalloc-pprof/tree/v3) branch |
 | Upstream base | mimalloc v2 (`upstream/main`) | mimalloc v3 (`upstream/dev3`) |
 | Maturity | **Stable.** The default choice. | **Beta.** Upstream v3 is itself pre-release. |
 | Allocator design | segment allocator | arena-of-slices + page-map; `mi_heap_t`/`mi_theap_t` split |
@@ -49,16 +49,20 @@ lines are published, as two version ranges of the same `mimalloc-pprof` crate:
 | Profiler API | identical | identical, plus the v3 `mi_prof_stats_t` fields below |
 
 ```toml
-# Stable v2 engine
+# Stable v2 engine, from crates.io
 mimalloc-pprof = "0.8"
 
-# Beta v3 engine
-mimalloc-pprof = "0.9"
+# Beta v3 engine -- not on crates.io yet, so take it from the v3 branch
+mimalloc-pprof = { git = "https://github.com/zackees/mimalloc-pprof", branch = "v3" }
 ```
 
 **Pick v2 (0.8.x) unless you specifically want v3.** The profiler API, the
 environment variables, and the pprof output format are the same in both, so
 moving between them is a version bump rather than a code change.
+
+The v3 line carries the crate version 0.9.0 in-tree so it is ready to publish,
+but it is deliberately **not** on crates.io while upstream v3 is pre-release and
+the known stress failures below are open.
 
 Choose v3 (0.9.x) when you want upstream v3's allocator improvements or the
 richer allocator statistics described in
@@ -104,8 +108,20 @@ profile meaningful in tests and in production monitoring.
 
 `mi_prof_stats_get` still accepts v1- and v2-sized structs from older callers and
 leaves the newer fields untouched, so upgrading the header does not break an
-existing binary. Note that `theap_count` does not count the main thread's
-statically-initialized theap, so a single-threaded process reports 0.
+existing binary.
+
+Two counters need a caveat:
+
+- **`heap_malloc_requested` requires `MI_STAT >= 2`.** Upstream enables that level
+  by default only for debug builds (`MI_DEBUG > 0`); a default **release** build
+  has `MI_STAT == 0` and reports 0 for this field. Because 0 is also a legitimate
+  value, `mi_prof_stats_t.heap_stats_detailed` (Rust: `HeapStats::detailed`)
+  reports which case you are in, and the text dump records it as
+  `# detailed_stats = 0|1` so a saved profile is self-describing. Build with
+  `-DMI_STAT=2` to enable it in release, at some allocation-path cost.
+- **`theap_count` does not count the main thread's statically-initialized theap**,
+  so a single-threaded process reports 0. It also lags thread exit, since v3
+  reference-counts theaps for cached thread-locals.
 
 ## Choose an integration path
 
@@ -210,13 +226,15 @@ On Windows, replace `./my_app` with the path to the matching `.exe`.
 
 ## Rust integration
 
-From crates.io — pick the engine line you want (see
+Pick the engine line you want (see
 [Which version: v2 or v3?](#which-version-v2-or-v3)):
 
 ```toml
 [dependencies]
-mimalloc-pprof = "0.8"   # stable v2 engine
-# mimalloc-pprof = "0.9" # beta v3 engine
+# Stable v2 engine, from crates.io
+mimalloc-pprof = "0.8"
+# Beta v3 engine (not yet on crates.io):
+# mimalloc-pprof = { git = "https://github.com/zackees/mimalloc-pprof", branch = "v3" }
 
 [profile.release]
 debug = "line-tables-only"

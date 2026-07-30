@@ -33,6 +33,80 @@ behavior changes.
 The design history and milestone decisions are recorded in
 [issue #2](https://github.com/zackees/mimalloc-pprof/issues/2).
 
+## Which version: v2 or v3?
+
+The allocator engine underneath this fork tracks upstream mimalloc. Two engine
+lines are published, as two version ranges of the same `mimalloc-pprof` crate:
+
+| | **v2 engine** | **v3 engine** |
+|---|---|---|
+| Crate | [`mimalloc-pprof` 0.8.x](https://crates.io/crates/mimalloc-pprof/0.8.0) | [`mimalloc-pprof` 0.9.x](https://crates.io/crates/mimalloc-pprof/0.9.0) |
+| Docs | [docs.rs 0.8.0](https://docs.rs/mimalloc-pprof/0.8.0) | [docs.rs 0.9.0](https://docs.rs/mimalloc-pprof/0.9.0) |
+| Upstream base | mimalloc v2 (`upstream/main`) | mimalloc v3 (`upstream/dev3`) |
+| Maturity | **Stable.** The default choice. | **Beta.** Upstream v3 is itself pre-release. |
+| Allocator design | segment allocator | arena-of-slices + page-map; `mi_heap_t`/`mi_theap_t` split |
+| Allocator statistics | process-wide totals only | **per-heap and per-subprocess** (see below) |
+| Profiler API | identical | identical, plus the v3 `mi_prof_stats_t` fields below |
+
+```toml
+# Stable v2 engine
+mimalloc-pprof = "0.8"
+
+# Beta v3 engine
+mimalloc-pprof = "0.9"
+```
+
+**Pick v2 (0.8.x) unless you specifically want v3.** The profiler API, the
+environment variables, and the pprof output format are the same in both, so
+moving between them is a version bump rather than a code change.
+
+Choose v3 (0.9.x) when you want upstream v3's allocator improvements or the
+richer allocator statistics described in
+[Allocator statistics in the profile](#allocator-statistics-in-the-profile).
+Because upstream v3 is pre-release, the v3 line carries extra test coverage in
+this fork — a dedicated concurrency suite (`test/test-profile-race.c` and
+`rust/mimalloc-pprof/tests/t15_heap_stats.rs`) exercises the thread-bootstrap
+race, cross-thread frees, and snapshot stability against the reorganized v3
+engine, on top of the shared profiler tests.
+
+Two known upstream `dev3` test failures (`test-stress-heaps`,
+`test-stress-subprocs`) reproduce on stock unmodified `upstream/dev3` and are
+not caused by the profiler; they are tracked upstream, not here.
+
+### Allocator statistics in the profile
+
+v3 exposes per-heap and per-subprocess allocator counters (`mi_heap_stats_get`,
+`mi_subproc_stats_get`) that the v2 engine had no API for. The profiler surfaces
+them in two places, both v3-only:
+
+1. **`mi_prof_stats_t` v3 fields** (`MI_PROF_STAT_VERSION` 3) — `heap_committed`,
+   `heap_reserved`, `heap_malloc_requested`, `heap_pages`,
+   `heap_pages_abandoned`, `heap_count`, `theap_count`, `heap_purged`. In Rust
+   these are `ProfStats::heap`, a `HeapStats` struct.
+2. **A comment block in the text dump**, emitted after the samples and before
+   `MAPPED_LIBRARIES:`. google/pprof's legacy heap parser skips `#` lines, so
+   existing tooling reads the profile unchanged:
+
+   ```text
+   # mimalloc heap stats
+   # committed = 3080192
+   # reserved = 5308416
+   # malloc_requested = 2097152
+   # pages = 43
+   ...
+   ```
+
+Everything else in `mi_prof_stats_t` is *sampled*; these fields are **exact**.
+That difference is the point: a sampled profile alone cannot tell you whether it
+under-counted, but comparing `heap_malloc_requested` against `live_bytes`
+measures the sampling error directly. This is what makes assertions on a sampled
+profile meaningful in tests and in production monitoring.
+
+`mi_prof_stats_get` still accepts v1- and v2-sized structs from older callers and
+leaves the newer fields untouched, so upgrading the header does not break an
+existing binary. Note that `theap_count` does not count the main thread's
+statically-initialized theap, so a single-threaded process reports 0.
+
 ## Choose an integration path
 
 - C or C++ application: build this repository with CMake, link one mimalloc
@@ -136,15 +210,24 @@ On Windows, replace `./my_app` with the path to the matching `.exe`.
 
 ## Rust integration
 
-For a checkout-to-checkout integration:
+From crates.io — pick the engine line you want (see
+[Which version: v2 or v3?](#which-version-v2-or-v3)):
 
 ```toml
 [dependencies]
-mimalloc-pprof = { path = "../mimalloc-pprof/rust/mimalloc-pprof" }
+mimalloc-pprof = "0.8"   # stable v2 engine
+# mimalloc-pprof = "0.9" # beta v3 engine
 
 [profile.release]
 debug = "line-tables-only"
 strip = false
+```
+
+Or for a checkout-to-checkout integration:
+
+```toml
+[dependencies]
+mimalloc-pprof = { path = "../mimalloc-pprof/rust/mimalloc-pprof" }
 ```
 
 Install the allocator once, start profiling before the workload, and dump while
@@ -171,6 +254,17 @@ fn main() -> std::io::Result<()> {
     prof::stop();
     Ok(())
 }
+```
+
+On the v3 engine (0.9.x), `prof::stats()` also carries the exact allocator
+counters alongside the sampled ones:
+
+```rust
+let s = mimalloc_pprof::prof::stats();
+println!(
+    "sampled live: {} bytes in {} samples; allocator committed: {} bytes, requested: {}",
+    s.live_bytes, s.live_samples, s.heap.committed, s.heap.malloc_requested,
+);
 ```
 
 On Linux and macOS, retain frame pointers for reliable stack walking:

@@ -54,18 +54,22 @@ jobs:
       # TEMPORARY (debug/v3-stress-heaps): capture a backtrace for the win-gnu-only
       # test-stress-heaps segfault. Not for merge.
       - name: stress-heaps under gdb
+        # NOTE: the msys2 shell runs with -e, so every failing command must be
+        # guarded or the step dies before printing anything.
         run: |
+          set +e
+          which gdb; gdb --version | head -1
           for i in 1 2 3 4 5 6; do
             echo "=========== ATTEMPT $i ==========="
             gdb -batch -ex run -ex "thread apply all bt" --args ./build/mimalloc-test-stress-heaps.exe > gdb-$i.log 2>&1
-            code=$?
-            echo "gdb exit=$code"
+            echo "gdb exit=$?"
             if grep -qiE "SIGSEGV|Segmentation|access violation|unknown target exception|Assertion" gdb-$i.log; then
               echo "!!!!!!! CRASH REPRODUCED on attempt $i !!!!!!!"
               cat gdb-$i.log
               exit 1
             fi
-            tail -3 gdb-$i.log
+            echo "--- tail of attempt $i ---"
+            tail -20 gdb-$i.log
           done
           echo "no crash in 6 attempts"
       - run: ctest --test-dir build --output-on-failure

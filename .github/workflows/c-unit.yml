@@ -55,21 +55,24 @@ jobs:
           gcc --version | head -1
           git clone --no-checkout https://github.com/microsoft/mimalloc.git stock
           cd stock
-          git fetch origin 579f8c0e93a0468a20dd20fac861bc3580b1735e --depth 1
-          git checkout 579f8c0e93a0468a20dd20fac861bc3580b1735e
-          echo "=== stock dev3 HEAD: $(git rev-parse HEAD) ==="
-          cmake -B build -G Ninja
-          cmake --build build
-          fails=0
-          for i in 1 2 3 4 5 6; do
-            ./build/mimalloc-test-stress-heaps.exe > out-$i.log 2>&1
-            code=$?
-            echo "STOCK attempt $i exit=$code"
-            if [ $code -ne 0 ]; then fails=$((fails+1)); tail -5 out-$i.log; fi
+          git fetch origin dev3
+          # Compare the pinned base against the CURRENT dev3 tip: dev3 has landed
+          # "fix heap delete for OS allocated pages" (c8c65741) and "fix
+          # mi_heap_delete_pages with a NULL theap target" (cb0c26e4) since 579f8c0e,
+          # and test-stress-heaps is exactly the rolling-heaps/mi_heap_delete test.
+          for rev in 579f8c0e93a0468a20dd20fac861bc3580b1735e origin/dev3; do
+            git checkout -q --detach $rev
+            echo "######## STOCK dev3 @ $rev ($(git rev-parse --short HEAD)) ########"
+            rm -rf build
+            cmake -B build -G Ninja > /dev/null 2>&1
+            cmake --build build > /dev/null 2>&1 || { echo "BUILD FAILED"; continue; }
+            fails=0
+            for i in 1 2 3 4 5 6; do
+              ./build/mimalloc-test-stress-heaps.exe > /dev/null 2>&1
+              [ $? -ne 0 ] && fails=$((fails+1))
+            done
+            echo ">>>> STOCK $rev: $fails failures / 6 runs"
           done
-          echo "=========================================="
-          echo "STOCK upstream/dev3 test-stress-heaps: $fails failures / 6 runs"
-          echo "=========================================="
 
   ctest-win-gnu:
     runs-on: windows-latest

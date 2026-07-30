@@ -90,8 +90,9 @@ jobs:
       - run: cmake -B build -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS=-g
       - run: cmake --build build
       # Separate steps so a step that times out cannot swallow the other's log.
-      # Smaller ITER (20 vs the default 50) keeps each run short; the crash happens
-      # well within that.
+      # NOTE: run with DEFAULT arguments. A previous attempt passed "32 50 20" to keep
+      # runs short, and the control stopped reproducing too (0/4 both configs) -- the
+      # reduced iteration count destroys the repro, making the comparison meaningless.
       - name: probe A - strict aliasing ON (control)
         timeout-minutes: 15
         run: |
@@ -99,12 +100,12 @@ jobs:
           cmake -B b-alias -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS="-O2" > /dev/null 2>&1
           cmake --build b-alias > /dev/null 2>&1 || { echo "BUILD FAILED"; exit 0; }
           f=0
-          for i in 1 2 3 4; do
-            ./b-alias/mimalloc-test-stress-heaps.exe 32 50 20 > /dev/null 2>&1
+          for i in 1 2 3; do
+            ./b-alias/mimalloc-test-stress-heaps.exe > /dev/null 2>&1
             c=$?; echo "  alias attempt $i exit=$c"
             [ $c -ne 0 ] && f=$((f+1))
           done
-          echo ">>>> RESULT alias(default): $f failures / 4"
+          echo ">>>> RESULT alias(default): $f failures / 3"
       - name: probe B - strict aliasing OFF
         timeout-minutes: 15
         run: |
@@ -112,10 +113,10 @@ jobs:
           cmake -B b-noalias -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS="-O2 -fno-strict-aliasing" > /dev/null 2>&1
           cmake --build b-noalias > /dev/null 2>&1 || { echo "BUILD FAILED"; exit 0; }
           f=0
-          for i in 1 2 3 4; do
-            ./b-noalias/mimalloc-test-stress-heaps.exe 32 50 20 > /dev/null 2>&1
+          for i in 1 2 3; do
+            ./b-noalias/mimalloc-test-stress-heaps.exe > /dev/null 2>&1
             c=$?; echo "  noalias attempt $i exit=$c"
             [ $c -ne 0 ] && f=$((f+1))
           done
-          echo ">>>> RESULT noalias: $f failures / 4"
+          echo ">>>> RESULT noalias: $f failures / 3"
       - run: ctest --test-dir build --output-on-failure

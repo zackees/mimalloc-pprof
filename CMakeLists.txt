@@ -879,6 +879,20 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-profile-accum PROPERTIES ENVIRONMENT "MIMALLOC_PROF_ACCUM=1")
     add_test(NAME test-profile-auto COMMAND mimalloc-test-profile)
     set_tests_properties(test-profile-auto PROPERTIES ENVIRONMENT "MIMALLOC_PROF=1")
+
+    # Adversarial concurrency coverage for the v3 engine (issue #43): thread
+    # bootstrap race, cross-thread free, snapshot stability under mutation.
+    add_executable(mimalloc-test-profile-race test/test-profile-race.c)
+    target_compile_definitions(mimalloc-test-profile-race PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-profile-race PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-profile-race PRIVATE include)
+    target_link_libraries(mimalloc-test-profile-race PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-profile-race PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-profile-race COMMAND mimalloc-test-profile-race)
+    set_tests_properties(test-profile-race PROPERTIES TIMEOUT 300)
   endif()
 
   # memory-events (issue #20): independent of MI_PPROF, always built/registered.

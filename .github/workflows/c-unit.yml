@@ -86,25 +86,35 @@ jobs:
       # and only add -g, so debugging does not change what is being debugged.
       - run: cmake -B build -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS=-g
       - run: cmake --build build
-      # TEMPORARY (debug/v3-stress-heaps): capture a backtrace for the win-gnu-only
-      # test-stress-heaps segfault. Not for merge.
-      - name: stress-heaps under gdb
-        # NOTE: the msys2 shell runs with -e, so every failing command must be
-        # guarded or the step dies before printing anything.
+      - name: diagnose (opt level / aliasing / backtrace)
         run: |
           set +e
-          which gdb; gdb --version | head -1
+          probe() {
+            name="$1"; shift
+            echo "############ CONFIG: $name  ($*) ############"
+            rm -rf b-$name
+            cmake -B b-$name -G Ninja -DMI_PPROF=ON "$@" > /dev/null 2>&1
+            cmake --build b-$name > /dev/null 2>&1 || { echo "BUILD FAILED"; return; }
+            f=0
+            for i in 1 2 3 4; do
+              ./b-$name/mimalloc-test-stress-heaps.exe > /dev/null 2>&1
+              c=$?
+              [ $c -ne 0 ] && f=$((f+1))
+            done
+            echo ">>>> $name: $f failures / 4 runs"
+          }
+          probe O0  -DCMAKE_C_FLAGS="-O0 -g"
+          probe O1  -DCMAKE_C_FLAGS="-O1 -g"
+          probe O2  -DCMAKE_C_FLAGS="-O2 -g"
+          probe O2noalias -DCMAKE_C_FLAGS="-O2 -g -fno-strict-aliasing"
+          echo "############ BACKTRACE at -O0 ############"
           for i in 1 2 3 4 5 6; do
-            echo "=========== ATTEMPT $i ==========="
-            gdb -batch -ex run -ex "thread apply all bt" --args ./build/mimalloc-test-stress-heaps.exe > gdb-$i.log 2>&1
-            echo "gdb exit=$?"
-            if grep -qiE "SIGSEGV|Segmentation|access violation|unknown target exception|Assertion" gdb-$i.log; then
-              echo "!!!!!!! CRASH REPRODUCED on attempt $i !!!!!!!"
-              cat gdb-$i.log
-              exit 1
+            gdb -batch -ex run -ex "bt 30" -ex "info threads" --args ./b-O0/mimalloc-test-stress-heaps.exe > bt.log 2>&1
+            if grep -qiE "SIGSEGV|Segmentation" bt.log; then
+              echo "reproduced at -O0 on attempt $i"
+              grep -vE "^\[New Thread|^\[Thread" bt.log | tail -45
+              break
             fi
-            echo "--- tail of attempt $i ---"
-            tail -20 gdb-$i.log
+            echo "attempt $i: no crash at -O0"
           done
-          echo "no crash in 6 attempts"
       - run: ctest --test-dir build --output-on-failure

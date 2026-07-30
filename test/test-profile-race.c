@@ -108,15 +108,14 @@ static void test_bootstrap_race(void) {
     for (size_t i = 0; i < 40; i++) {
       mi_prof_stats_t_decl(st);
       assert(mi_prof_stats_get(&st));
-      assert(st.live_bytes >= st.live_samples);  /* every sample is >= 1 byte */
-      /* v3 allocator ground truth stays coherent while threads bootstrap: with
-         RACE_THREADS workers running, the engine must have created theaps, and
-         reserved memory always covers committed. */
-      /* (heap_committed may still be 0 very early -- the counters start at zero and
-         only grow once the engine commits, so only ordering invariants hold here.) */
-      assert(st.heap_reserved >= st.heap_committed);
-      /* No upper bound is asserted on theap_count: v3 reference-counts theaps for
-         cached thread-locals, so the live count legitimately lags thread exit. */
+      /* Deliberately NO cross-field assertions here (live_bytes vs live_samples,
+         heap_reserved vs heap_committed, a bound on theap_count). None of them are
+         consistent snapshots while other threads run: the sampler counters are separate
+         atomic reads, and mi_stats_get memcpy's the engine's stats while they are being
+         updated. live_samples can be read before a burst of frees and live_bytes after
+         it. Those invariants hold only on a quiescent heap, which test-profile asserts.
+         What this loop is for is exercising mi_prof_stats_get -- which walks the subproc
+         heap list -- concurrently with thread bootstrap and profiler lifecycle churn. */
       if (i == 20) { mi_prof_reset(); }
     }
     for (size_t i = 0; i < RACE_THREADS; i++) { thread_join(threads[i]); }

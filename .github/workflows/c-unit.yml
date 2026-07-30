@@ -47,7 +47,9 @@ jobs:
         with:
           msystem: MINGW64
           install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-gdb
-      - run: cmake -B build -G Ninja -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=Debug
+      # Keep the EXACT failing configuration (no CMAKE_BUILD_TYPE, as in the real job)
+      # and only add -g, so debugging does not change what is being debugged.
+      - run: cmake -B build -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS=-g
       - run: cmake --build build
       # TEMPORARY (debug/v3-stress-heaps): capture a backtrace for the win-gnu-only
       # test-stress-heaps segfault. Not for merge.

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f30a8444 of the three public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4e18afa7 of the three public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------

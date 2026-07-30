@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f30a8444 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4e18afa7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -13683,6 +13683,13 @@ mi_heap_t* _mi_heap_new_for_subproc(mi_subproc_t* subproc, mi_arena_id_t exclusi
 }
 
 mi_heap_t* mi_heap_new_in_arena(mi_arena_id_t exclusive_arena_id) {
+  // `mi_heap_new` may be the very first mimalloc call in a process, in which case the
+  // main heap does not exist yet and `_mi_heap_new_for_subproc` would allocate from a
+  // NULL `subproc->heap_main`. On platforms with a library constructor something has
+  // always initialized it earlier, which is why this only showed up on Windows.
+  // `mi_thread_init` is the same idempotent bootstrap the allocation path performs
+  // (it calls `mi_process_init` in turn).
+  mi_thread_init();
   return _mi_heap_new_for_subproc(_mi_subproc(), exclusive_arena_id, false);
 }
 
@@ -14299,6 +14306,9 @@ mi_subproc_id_t mi_subproc_current(void) {
 
 mi_subproc_id_t mi_subproc_new(void) {
   static _Atomic(size_t) subproc_total_count;
+  // As in `mi_heap_new_in_arena`: this can be the first mimalloc call in a process, and
+  // `_mi_meta_zalloc` below allocates out of the parent's main heap, which must exist.
+  mi_thread_init();
   mi_subproc_t* const parent = _mi_subproc();
   mi_memid_t memid;
   mi_subproc_t* subproc = (mi_subproc_t*)_mi_meta_zalloc(parent, sizeof(mi_subproc_t),&memid);

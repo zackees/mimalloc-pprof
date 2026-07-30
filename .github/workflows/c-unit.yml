@@ -89,23 +89,33 @@ jobs:
       # and only add -g, so debugging does not change what is being debugged.
       - run: cmake -B build -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS=-g
       - run: cmake --build build
-      - name: diagnose aliasing hypothesis
-        timeout-minutes: 25
+      # Separate steps so a step that times out cannot swallow the other's log.
+      # Smaller ITER (20 vs the default 50) keeps each run short; the crash happens
+      # well within that.
+      - name: probe A - strict aliasing ON (control)
+        timeout-minutes: 15
         run: |
           set +e
-          # Same -O2 release codegen as the failing job; only strict aliasing differs.
-          probe() {
-            name="$1"; shift
-            echo "############ $name ($*) ############"
-            cmake -B b-$name -G Ninja -DMI_PPROF=ON "$@" > /dev/null 2>&1
-            cmake --build b-$name > /dev/null 2>&1 || { echo "BUILD FAILED"; return; }
-            f=0
-            for i in 1 2 3 4 5 6; do
-              ./b-$name/mimalloc-test-stress-heaps.exe > /dev/null 2>&1
-              [ $? -ne 0 ] && f=$((f+1))
-            done
-            echo ">>>> $name: $f failures / 6 runs"
-          }
-          probe alias   -DCMAKE_C_FLAGS="-O2"
-          probe noalias -DCMAKE_C_FLAGS="-O2 -fno-strict-aliasing"
+          cmake -B b-alias -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS="-O2" > /dev/null 2>&1
+          cmake --build b-alias > /dev/null 2>&1 || { echo "BUILD FAILED"; exit 0; }
+          f=0
+          for i in 1 2 3 4; do
+            ./b-alias/mimalloc-test-stress-heaps.exe 32 50 20 > /dev/null 2>&1
+            c=$?; echo "  alias attempt $i exit=$c"
+            [ $c -ne 0 ] && f=$((f+1))
+          done
+          echo ">>>> RESULT alias(default): $f failures / 4"
+      - name: probe B - strict aliasing OFF
+        timeout-minutes: 15
+        run: |
+          set +e
+          cmake -B b-noalias -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS="-O2 -fno-strict-aliasing" > /dev/null 2>&1
+          cmake --build b-noalias > /dev/null 2>&1 || { echo "BUILD FAILED"; exit 0; }
+          f=0
+          for i in 1 2 3 4; do
+            ./b-noalias/mimalloc-test-stress-heaps.exe 32 50 20 > /dev/null 2>&1
+            c=$?; echo "  noalias attempt $i exit=$c"
+            [ $c -ne 0 ] && f=$((f+1))
+          done
+          echo ">>>> RESULT noalias: $f failures / 4"
       - run: ctest --test-dir build --output-on-failure

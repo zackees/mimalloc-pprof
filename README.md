@@ -61,8 +61,8 @@ environment variables, and the pprof output format are the same in both, so
 moving between them is a version bump rather than a code change.
 
 The v3 line carries the crate version 0.9.0 in-tree so it is ready to publish,
-but it is deliberately **not** on crates.io while upstream v3 is pre-release and
-the known stress failures below are open.
+but it is deliberately **not** on crates.io while upstream v3 is itself
+pre-release.
 
 Choose v3 (0.9.x) when you want upstream v3's allocator improvements or the
 richer allocator statistics described in
@@ -73,9 +73,12 @@ this fork — a dedicated concurrency suite (`test/test-profile-race.c` and
 race, cross-thread frees, and snapshot stability against the reorganized v3
 engine, on top of the shared profiler tests.
 
-Two known upstream `dev3` test failures (`test-stress-heaps`,
-`test-stress-subprocs`) reproduce on stock unmodified `upstream/dev3` and are
-not caused by the profiler; they are tracked upstream, not here.
+The full `ctest` suite passes 12/12 on Windows (MSVC and MinGW), Linux, and
+macOS, in both Debug and Release. Two stress tests (`test-stress-heaps`,
+`test-stress-subprocs`) used to abort on Windows; that turned out to be a real
+initialization-order bug rather than pre-existing upstream breakage, and is
+fixed here — see `mi_heap_new_in_arena` in `src/heap.c` and `mi_subproc_new` in
+`src/init.c`. Both are candidates for upstreaming to microsoft/mimalloc.
 
 ### Allocator statistics in the profile
 

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8f555bbf of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4c4e5ce3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -674,7 +674,7 @@ mi_decl_nodiscard mi_decl_export bool mi_prof_dump_proto(const char* path) mi_at
 mi_decl_nodiscard mi_decl_export bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept;
 mi_decl_export void mi_prof_reset(void) mi_attr_noexcept;
 
-#define MI_PROF_STAT_VERSION 2
+#define MI_PROF_STAT_VERSION 3
 typedef struct mi_prof_stats_s {
   size_t size; int version;
   bool   enabled; bool accum;
@@ -692,6 +692,27 @@ typedef struct mi_prof_stats_s {
      dropped_samples), version == 1) for old callers; this field is left untouched
      in that case. */
   size_t dropped_samples;
+  /* v3. Allocator-level ("ground truth") counters, read from mi_stats_get() at the
+     time of the call. Everything above this point is *sampled* profiler state; these
+     fields are exact, so the ratio between them and live_bytes is a direct measure of
+     sampling error -- useful in tests and in monitoring, where a sampled profile alone
+     cannot tell you whether it under-counted.
+
+     These come from the mimalloc v3 engine's per-heap statistics (mi_heap_stats_get /
+     mi_subproc_stats_get), which the v2 engine did not expose; heap_count/theap_count in
+     particular are v3-only concepts. mi_prof_stats_get accepts a v1- or v2-sized struct
+     from older callers (see above), leaving these fields untouched in that case. */
+  size_t heap_committed;          /* current bytes committed from the OS */
+  size_t heap_reserved;           /* current bytes reserved from the OS */
+  size_t heap_malloc_requested;   /* current bytes the application actually asked for */
+  size_t heap_pages;              /* current live mimalloc pages */
+  size_t heap_pages_abandoned;    /* current pages abandoned by exited threads */
+  size_t heap_count;              /* live first-class heaps (v3 only) */
+  /* Live thread-local heaps (v3 only). Counts theaps the engine actually created; the
+     main thread's statically-initialized theap is not counted, so a purely
+     single-threaded process reports 0 here. */
+  size_t theap_count;
+  size_t heap_purged;             /* cumulative bytes purged back to the OS */
 } mi_prof_stats_t;
 #define mi_prof_stats_t_decl(name) mi_prof_stats_t name = { 0 }; name.size = sizeof(mi_prof_stats_t); name.version = MI_PROF_STAT_VERSION
 mi_decl_nodiscard mi_decl_export bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept;
@@ -19508,6 +19529,176 @@ mi_decl_nodiscard mi_decl_export bool mi_is_in_heap_region(const void* p) mi_att
 /* Allocation sampling profiler.  Its records never use mimalloc: the arena
    below is backed directly by _mi_os_alloc so profiler bookkeeping cannot
    recursively enter the allocator. */
+/* ---- begin inlined: include/mimalloc-stats.h ---- */
+/* ----------------------------------------------------------------------------
+Copyright (c) 2024-2026, Microsoft Research, Daan Leijen
+This is free software; you can redistribute it and/or modify it under the
+terms of the MIT license. A copy of the license can be found in the file
+"LICENSE" at the root of this distribution.
+-----------------------------------------------------------------------------*/
+#pragma once
+#ifndef MIMALLOC_STATS_H
+#define MIMALLOC_STATS_H
+
+#include <mimalloc.h>
+#include <string.h>   // memset
+#include <stdint.h>   // int64_t
+
+#define MI_STAT_VERSION   5  // increased on every backward incompatible change
+
+// alignment for atomic fields
+#if defined(_MSC_VER)
+#define mi_decl_align(a)        __declspec(align(a))
+#elif defined(__GNUC__)
+#define mi_decl_align(a)        __attribute__((aligned(a)))
+#elif __cplusplus >= 201103L
+#define mi_decl_align(a)        alignas(a)
+#else
+#define mi_decl_align(a)
+#endif
+
+
+// count allocation over time
+typedef struct mi_stat_count_s {
+  int64_t total;                              // total allocated
+  int64_t peak;                               // peak allocation
+  int64_t current;                            // current allocation
+} mi_stat_count_t;
+
+// counters only increase
+typedef struct mi_stat_counter_s {
+  int64_t total;                              // total count
+} mi_stat_counter_t;
+
+#define MI_STAT_FIELDS() \
+  MI_STAT_COUNT(pages)                      /* count of mimalloc pages */ \
+  MI_STAT_COUNT(reserved)                   /* reserved memory bytes */ \
+  MI_STAT_COUNT(committed)                  /* committed bytes */ \
+  MI_STAT_COUNTER(reset)                    /* reset bytes */ \
+  MI_STAT_COUNTER(purged)                   /* purged bytes */ \
+  MI_STAT_COUNT(page_committed)             /* committed memory inside pages */ \
+  MI_STAT_COUNT(pages_abandoned)            /* abandoned pages count */ \
+  MI_STAT_COUNT(threads)                    /* number of threads */ \
+  MI_STAT_COUNT(malloc_normal)              /* allocated bytes <= MI_LARGE_OBJ_SIZE_MAX */ \
+  MI_STAT_COUNT(malloc_huge)                /* allocated bytes in huge pages */ \
+  MI_STAT_COUNT(malloc_requested)           /* malloc requested bytes */ \
+  \
+  MI_STAT_COUNTER(mmap_calls) \
+  MI_STAT_COUNTER(commit_calls) \
+  MI_STAT_COUNTER(reset_calls) \
+  MI_STAT_COUNTER(purge_calls) \
+  MI_STAT_COUNTER(arena_count)              /* number of memory arena's */ \
+  MI_STAT_COUNTER(malloc_normal_count)      /* number of blocks <= MI_LARGE_OBJ_SIZE_MAX */ \
+  MI_STAT_COUNTER(malloc_huge_count)        /* number of huge bloks */ \
+  MI_STAT_COUNTER(malloc_guarded_count)     /* number of allocations with guard pages */ \
+  \
+  /* internal statistics */ \
+  MI_STAT_COUNTER(arena_rollback_count) \
+  MI_STAT_COUNTER(arena_purges) \
+  MI_STAT_COUNTER(pages_extended)           /* number of page extensions */ \
+  MI_STAT_COUNTER(pages_retire)             /* number of pages that are retired */ \
+  MI_STAT_COUNTER(page_searches)            /* total pages searched for a fresh page */ \
+  MI_STAT_COUNTER(page_searches_count)      /* searched count for a fresh page */ \
+  /* only on v1 and v2 */ \
+  MI_STAT_COUNT(segments) \
+  MI_STAT_COUNT(segments_abandoned) \
+  MI_STAT_COUNT(segments_cache) \
+  MI_STAT_COUNT(_segments_reserved) \
+  /* only on v3 */ \
+  MI_STAT_COUNT(heaps) \
+  MI_STAT_COUNT(theaps) \
+  MI_STAT_COUNTER(pages_reclaim_on_alloc) \
+  MI_STAT_COUNTER(pages_reclaim_on_free) \
+  MI_STAT_COUNTER(pages_reabandon_full) \
+  MI_STAT_COUNTER(pages_unabandon_busy_wait) \
+  MI_STAT_COUNTER(heaps_delete_wait)
+
+// Size bins for chunks
+typedef enum mi_chunkbin_e {
+  MI_CBIN_SMALL,    // slice_count == 1
+  MI_CBIN_OTHER,    // slice_count: any other from the other bins, and 1 <= slice_count <= MI_BCHUNK_BITS
+  MI_CBIN_MEDIUM,   // slice_count == 8
+  MI_CBIN_LARGE,    // slice_count == MI_SIZE_BITS  (only used if MI_ENABLE_LARGE_PAGES is 1)
+  MI_CBIN_HUGE,     // slice_count > MI_BCHUNK_BITS
+  MI_CBIN_NONE,     // no bin assigned yet (the chunk is completely free)
+  MI_CBIN_COUNT
+} mi_chunkbin_t;
+
+
+// Define the statistics structure
+#define MI_BIN_HUGE             (73U)   // see types.h
+#define MI_STAT_COUNT(stat)     mi_stat_count_t stat;
+#define MI_STAT_COUNTER(stat)   mi_stat_counter_t stat;
+
+typedef struct mi_stats_s
+{
+  size_t size;          // size of the mi_stats_t structure 
+  size_t version;       
+
+  mi_decl_align(8)  MI_STAT_FIELDS()
+
+  // future extension
+  mi_stat_count_t   _stat_reserved[4];
+  mi_stat_counter_t _stat_counter_reserved[4];
+
+  // size segregated statistics
+  mi_stat_count_t   malloc_bins[MI_BIN_HUGE+1];   // allocation per size bin
+  mi_stat_count_t   page_bins[MI_BIN_HUGE+1];     // pages allocated per size bin
+  mi_stat_count_t   chunk_bins[MI_CBIN_COUNT];    // chunks per page sizes
+} mi_stats_t;
+
+#undef MI_STAT_COUNT
+#undef MI_STAT_COUNTER
+
+// Initialization
+static inline void mi_stats_header_init(mi_stats_t* stats) {
+  stats->size = sizeof(*stats);
+  stats->version = MI_STAT_VERSION;
+}
+static inline void mi_stats_init(mi_stats_t* stats) {
+  memset(stats,0,sizeof(*stats));
+  mi_stats_header_init(stats);
+}
+
+#define mi_stats_t_decl(name)  mi_stats_t name; mi_stats_init(&name);
+
+// Exported definitions
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// stats from a heap
+mi_decl_export bool    mi_heap_stats_get(mi_heap_t* heap, mi_stats_t* stats) mi_attr_noexcept;
+mi_decl_export char*   mi_heap_stats_get_json(mi_heap_t* heap, size_t buf_size, char* buf) mi_attr_noexcept;      // use mi_free to free the result if the input buf == NULL
+mi_decl_export void    mi_heap_stats_print_out(mi_heap_t* heap, mi_output_fun* out, void* arg) mi_attr_noexcept;
+
+// stats from a subprocess and its heaps aggregated
+mi_decl_export bool    mi_subproc_stats_get(mi_subproc_id_t subproc_id, mi_stats_t* stats) mi_attr_noexcept;
+mi_decl_export char*   mi_subproc_stats_get_json(mi_subproc_id_t subproc_id, size_t buf_size, char* buf) mi_attr_noexcept;      // use mi_free to free the result if the input buf == NULL
+mi_decl_export void    mi_subproc_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, void* arg) mi_attr_noexcept;
+// print subprocess and all its heap stats segregated
+mi_decl_export void    mi_subproc_heap_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, void* arg) mi_attr_noexcept;
+
+// stats aggregated for the current subprocess and all its heaps.
+mi_decl_export bool    mi_stats_get(mi_stats_t* stats) mi_attr_noexcept;
+mi_decl_export char*   mi_stats_get_json(size_t buf_size, char* buf) mi_attr_noexcept;      // use mi_free to free the result if the input buf == NULL
+mi_decl_export void    mi_stats_print_out(mi_output_fun* out, void* arg) mi_attr_noexcept;
+
+// add the stats of the heap to the subprocess and clear the heap stats
+mi_decl_export void    mi_heap_stats_merge_to_subproc(mi_heap_t* heap);
+
+// stats from the subprocess without aggregating its heaps
+mi_decl_export bool    mi_subproc_stats_get_exclusive(mi_subproc_id_t subproc_id, mi_stats_t* stats) mi_attr_noexcept;
+
+mi_decl_export char*   mi_stats_as_json(mi_stats_t* stats, size_t buf_size, char* buf) mi_attr_noexcept;      // use mi_free to free the result if the input buf == NULL
+mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // MIMALLOC_STATS_H
+/* ---- end inlined: include/mimalloc-stats.h ---- */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -19840,6 +20031,25 @@ bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept {
 }
 
 bool mi_prof_is_enabled(void) mi_attr_noexcept { return mi_atomic_load_relaxed(&prof_enabled); }
+
+/* Allocator-level counters (mi_prof_stats_t v3). mi_stats_get only copies and folds
+   already-maintained counters -- it never allocates -- but it does walk the subproc's
+   heap list under the engine's own lock, so it must not be called while prof_lock is
+   held. Every caller here gathers stats before acquiring prof_lock. */
+static size_t mi_prof_clamp_stat(int64_t v) { return (v <= 0 ? 0 : (size_t)v); }
+
+static void mi_prof_fill_heap_stats(mi_prof_stats_t* stats) {
+  mi_stats_t_decl(s);
+  if (!mi_stats_get(&s)) return;   /* leave the v3 fields zeroed on refusal */
+  stats->heap_committed        = mi_prof_clamp_stat(s.committed.current);
+  stats->heap_reserved         = mi_prof_clamp_stat(s.reserved.current);
+  stats->heap_malloc_requested = mi_prof_clamp_stat(s.malloc_requested.current);
+  stats->heap_pages            = mi_prof_clamp_stat(s.pages.current);
+  stats->heap_pages_abandoned  = mi_prof_clamp_stat(s.pages_abandoned.current);
+  stats->heap_count            = mi_prof_clamp_stat(s.heaps.current);
+  stats->theap_count           = mi_prof_clamp_stat(s.theaps.current);
+  stats->heap_purged           = mi_prof_clamp_stat(s.purged.total);
+}
 bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept {
   if (stats == NULL) return false;
   /* v2 callers (current mi_prof_stats_t_decl) pass the full struct/version 2; v1 callers
@@ -19847,9 +20057,10 @@ bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept {
      dropped_samples and version 1 -- accept both, reject anything else. Writing into
      dropped_samples for a v1-sized struct would be an out-of-bounds write, so that field
      is only touched in the v2 branch. */
-  const bool is_v2 = (stats->size == sizeof(mi_prof_stats_t) && stats->version == 2);
+  const bool is_v3 = (stats->size == sizeof(mi_prof_stats_t) && stats->version == 3);
+  const bool is_v2 = (stats->size == offsetof(mi_prof_stats_t, heap_committed) && stats->version == 2);
   const bool is_v1 = (stats->size == offsetof(mi_prof_stats_t, dropped_samples) && stats->version == 1);
-  if (!is_v2 && !is_v1) return false;
+  if (!is_v3 && !is_v2 && !is_v1) return false;
   stats->enabled = mi_atomic_load_relaxed(&prof_enabled);
   stats->accum = mi_option_is_enabled(mi_option_prof_accum);
   stats->sample_rate = prof_rate;
@@ -19860,10 +20071,13 @@ bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept {
   stats->unique_stacks = _mi_prof_stack_count();
   stats->arena_committed = _mi_prof_arena_committed();
   stats->stack_table_overflows = _mi_prof_stack_overflows();
-  if (is_v2) stats->dropped_samples = mi_atomic_load_relaxed(&prof_dropped_samples);
+  if (is_v2 || is_v3) stats->dropped_samples = mi_atomic_load_relaxed(&prof_dropped_samples);
+  if (is_v3) mi_prof_fill_heap_stats(stats);
   return true;
 }
-void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept { mi_prof_stats_t_decl(stats); const bool ok = mi_prof_stats_get(&stats); MI_UNUSED(ok); if (records) *records=stats.live_samples; if (bytes) *bytes=stats.live_bytes; if (unique_stacks) *unique_stacks=stats.unique_stacks; }
+/* Deliberately requests the v1 shape: it only reads pre-v2 fields, and asking for v3
+   would make every call walk the subproc's heap list for stats it then discards. */
+void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept { mi_prof_stats_t stats; _mi_memzero(&stats, sizeof(stats)); stats.size = offsetof(mi_prof_stats_t, dropped_samples); stats.version = 1; const bool ok = mi_prof_stats_get(&stats); MI_UNUSED(ok); if (records) *records=stats.live_samples; if (bytes) *bytes=stats.live_bytes; if (unique_stacks) *unique_stacks=stats.unique_stacks; }
 void mi_prof_stop(void) mi_attr_noexcept {
   if (prof_callback_depth > 0) return;
   mi_lock_acquire(&prof_lock);
@@ -19886,6 +20100,10 @@ bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
 #if MI_DEBUG
   bool lock_held = true;
 #endif
+  /* Gather allocator ground-truth counters BEFORE taking prof_lock (see
+     mi_prof_fill_heap_stats): they are emitted as a comment block below. */
+  mi_prof_stats_t_decl(heap_stats);
+  const bool have_heap_stats = mi_prof_stats_get(&heap_stats);
   mi_lock_acquire(&prof_lock);
   prof_dump_totals_t totals = { 0, 0, 0, 0 };
   _mi_prof_stack_visit_info(prof_dump_total_stack, &totals);
@@ -19897,6 +20115,29 @@ bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
 #if MI_DEBUG
   lock_held = false;
 #endif
+  /* Allocator stats as '#'-prefixed comment lines. google/pprof's legacy heap parser
+     ignores comment lines, so this is additive: existing tooling reads the profile
+     unchanged, while a human or a test can compare the sampled totals above against
+     the allocator's exact numbers. Mirrors where Go puts its '# runtime.MemStats'
+     block -- after the samples, before MAPPED_LIBRARIES. */
+  if (out.ok && have_heap_stats) {
+    char stat_line[256];
+    int sn = _mi_snprintf(stat_line, sizeof(stat_line),
+      "# mimalloc heap stats\n"
+      "# committed = %llu\n# reserved = %llu\n# malloc_requested = %llu\n"
+      "# pages = %llu\n# pages_abandoned = %llu\n# heaps = %llu\n# theaps = %llu\n"
+      "# purged = %llu\n# profiler_dropped_samples = %llu\n",
+      (unsigned long long)heap_stats.heap_committed,
+      (unsigned long long)heap_stats.heap_reserved,
+      (unsigned long long)heap_stats.heap_malloc_requested,
+      (unsigned long long)heap_stats.heap_pages,
+      (unsigned long long)heap_stats.heap_pages_abandoned,
+      (unsigned long long)heap_stats.heap_count,
+      (unsigned long long)heap_stats.theap_count,
+      (unsigned long long)heap_stats.heap_purged,
+      (unsigned long long)heap_stats.dropped_samples);
+    if (sn < 0 || !prof_dump_append(&out, stat_line, prof_min((size_t)sn, sizeof(stat_line) - 1))) out.ok = false;
+  }
   if (out.ok && !prof_dump_append(&out, "MAPPED_LIBRARIES:\n", 18)) out.ok = false;
   if (out.ok && !_mi_prof_maps_append(prof_dump_append, &out)) out.ok = false;
 #if MI_DEBUG
@@ -20949,176 +21190,6 @@ This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
-/* ---- begin inlined: include/mimalloc-stats.h ---- */
-/* ----------------------------------------------------------------------------
-Copyright (c) 2024-2026, Microsoft Research, Daan Leijen
-This is free software; you can redistribute it and/or modify it under the
-terms of the MIT license. A copy of the license can be found in the file
-"LICENSE" at the root of this distribution.
------------------------------------------------------------------------------*/
-#pragma once
-#ifndef MIMALLOC_STATS_H
-#define MIMALLOC_STATS_H
-
-#include <mimalloc.h>
-#include <string.h>   // memset
-#include <stdint.h>   // int64_t
-
-#define MI_STAT_VERSION   5  // increased on every backward incompatible change
-
-// alignment for atomic fields
-#if defined(_MSC_VER)
-#define mi_decl_align(a)        __declspec(align(a))
-#elif defined(__GNUC__)
-#define mi_decl_align(a)        __attribute__((aligned(a)))
-#elif __cplusplus >= 201103L
-#define mi_decl_align(a)        alignas(a)
-#else
-#define mi_decl_align(a)
-#endif
-
-
-// count allocation over time
-typedef struct mi_stat_count_s {
-  int64_t total;                              // total allocated
-  int64_t peak;                               // peak allocation
-  int64_t current;                            // current allocation
-} mi_stat_count_t;
-
-// counters only increase
-typedef struct mi_stat_counter_s {
-  int64_t total;                              // total count
-} mi_stat_counter_t;
-
-#define MI_STAT_FIELDS() \
-  MI_STAT_COUNT(pages)                      /* count of mimalloc pages */ \
-  MI_STAT_COUNT(reserved)                   /* reserved memory bytes */ \
-  MI_STAT_COUNT(committed)                  /* committed bytes */ \
-  MI_STAT_COUNTER(reset)                    /* reset bytes */ \
-  MI_STAT_COUNTER(purged)                   /* purged bytes */ \
-  MI_STAT_COUNT(page_committed)             /* committed memory inside pages */ \
-  MI_STAT_COUNT(pages_abandoned)            /* abandoned pages count */ \
-  MI_STAT_COUNT(threads)                    /* number of threads */ \
-  MI_STAT_COUNT(malloc_normal)              /* allocated bytes <= MI_LARGE_OBJ_SIZE_MAX */ \
-  MI_STAT_COUNT(malloc_huge)                /* allocated bytes in huge pages */ \
-  MI_STAT_COUNT(malloc_requested)           /* malloc requested bytes */ \
-  \
-  MI_STAT_COUNTER(mmap_calls) \
-  MI_STAT_COUNTER(commit_calls) \
-  MI_STAT_COUNTER(reset_calls) \
-  MI_STAT_COUNTER(purge_calls) \
-  MI_STAT_COUNTER(arena_count)              /* number of memory arena's */ \
-  MI_STAT_COUNTER(malloc_normal_count)      /* number of blocks <= MI_LARGE_OBJ_SIZE_MAX */ \
-  MI_STAT_COUNTER(malloc_huge_count)        /* number of huge bloks */ \
-  MI_STAT_COUNTER(malloc_guarded_count)     /* number of allocations with guard pages */ \
-  \
-  /* internal statistics */ \
-  MI_STAT_COUNTER(arena_rollback_count) \
-  MI_STAT_COUNTER(arena_purges) \
-  MI_STAT_COUNTER(pages_extended)           /* number of page extensions */ \
-  MI_STAT_COUNTER(pages_retire)             /* number of pages that are retired */ \
-  MI_STAT_COUNTER(page_searches)            /* total pages searched for a fresh page */ \
-  MI_STAT_COUNTER(page_searches_count)      /* searched count for a fresh page */ \
-  /* only on v1 and v2 */ \
-  MI_STAT_COUNT(segments) \
-  MI_STAT_COUNT(segments_abandoned) \
-  MI_STAT_COUNT(segments_cache) \
-  MI_STAT_COUNT(_segments_reserved) \
-  /* only on v3 */ \
-  MI_STAT_COUNT(heaps) \
-  MI_STAT_COUNT(theaps) \
-  MI_STAT_COUNTER(pages_reclaim_on_alloc) \
-  MI_STAT_COUNTER(pages_reclaim_on_free) \
-  MI_STAT_COUNTER(pages_reabandon_full) \
-  MI_STAT_COUNTER(pages_unabandon_busy_wait) \
-  MI_STAT_COUNTER(heaps_delete_wait)
-
-// Size bins for chunks
-typedef enum mi_chunkbin_e {
-  MI_CBIN_SMALL,    // slice_count == 1
-  MI_CBIN_OTHER,    // slice_count: any other from the other bins, and 1 <= slice_count <= MI_BCHUNK_BITS
-  MI_CBIN_MEDIUM,   // slice_count == 8
-  MI_CBIN_LARGE,    // slice_count == MI_SIZE_BITS  (only used if MI_ENABLE_LARGE_PAGES is 1)
-  MI_CBIN_HUGE,     // slice_count > MI_BCHUNK_BITS
-  MI_CBIN_NONE,     // no bin assigned yet (the chunk is completely free)
-  MI_CBIN_COUNT
-} mi_chunkbin_t;
-
-
-// Define the statistics structure
-#define MI_BIN_HUGE             (73U)   // see types.h
-#define MI_STAT_COUNT(stat)     mi_stat_count_t stat;
-#define MI_STAT_COUNTER(stat)   mi_stat_counter_t stat;
-
-typedef struct mi_stats_s
-{
-  size_t size;          // size of the mi_stats_t structure 
-  size_t version;       
-
-  mi_decl_align(8)  MI_STAT_FIELDS()
-
-  // future extension
-  mi_stat_count_t   _stat_reserved[4];
-  mi_stat_counter_t _stat_counter_reserved[4];
-
-  // size segregated statistics
-  mi_stat_count_t   malloc_bins[MI_BIN_HUGE+1];   // allocation per size bin
-  mi_stat_count_t   page_bins[MI_BIN_HUGE+1];     // pages allocated per size bin
-  mi_stat_count_t   chunk_bins[MI_CBIN_COUNT];    // chunks per page sizes
-} mi_stats_t;
-
-#undef MI_STAT_COUNT
-#undef MI_STAT_COUNTER
-
-// Initialization
-static inline void mi_stats_header_init(mi_stats_t* stats) {
-  stats->size = sizeof(*stats);
-  stats->version = MI_STAT_VERSION;
-}
-static inline void mi_stats_init(mi_stats_t* stats) {
-  memset(stats,0,sizeof(*stats));
-  mi_stats_header_init(stats);
-}
-
-#define mi_stats_t_decl(name)  mi_stats_t name; mi_stats_init(&name);
-
-// Exported definitions
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// stats from a heap
-mi_decl_export bool    mi_heap_stats_get(mi_heap_t* heap, mi_stats_t* stats) mi_attr_noexcept;
-mi_decl_export char*   mi_heap_stats_get_json(mi_heap_t* heap, size_t buf_size, char* buf) mi_attr_noexcept;      // use mi_free to free the result if the input buf == NULL
-mi_decl_export void    mi_heap_stats_print_out(mi_heap_t* heap, mi_output_fun* out, void* arg) mi_attr_noexcept;
-
-// stats from a subprocess and its heaps aggregated
-mi_decl_export bool    mi_subproc_stats_get(mi_subproc_id_t subproc_id, mi_stats_t* stats) mi_attr_noexcept;
-mi_decl_export char*   mi_subproc_stats_get_json(mi_subproc_id_t subproc_id, size_t buf_size, char* buf) mi_attr_noexcept;      // use mi_free to free the result if the input buf == NULL
-mi_decl_export void    mi_subproc_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, void* arg) mi_attr_noexcept;
-// print subprocess and all its heap stats segregated
-mi_decl_export void    mi_subproc_heap_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, void* arg) mi_attr_noexcept;
-
-// stats aggregated for the current subprocess and all its heaps.
-mi_decl_export bool    mi_stats_get(mi_stats_t* stats) mi_attr_noexcept;
-mi_decl_export char*   mi_stats_get_json(size_t buf_size, char* buf) mi_attr_noexcept;      // use mi_free to free the result if the input buf == NULL
-mi_decl_export void    mi_stats_print_out(mi_output_fun* out, void* arg) mi_attr_noexcept;
-
-// add the stats of the heap to the subprocess and clear the heap stats
-mi_decl_export void    mi_heap_stats_merge_to_subproc(mi_heap_t* heap);
-
-// stats from the subprocess without aggregating its heaps
-mi_decl_export bool    mi_subproc_stats_get_exclusive(mi_subproc_id_t subproc_id, mi_stats_t* stats) mi_attr_noexcept;
-
-mi_decl_export char*   mi_stats_as_json(mi_stats_t* stats, size_t buf_size, char* buf) mi_attr_noexcept;      // use mi_free to free the result if the input buf == NULL
-mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif // MIMALLOC_STATS_H
-/* ---- end inlined: include/mimalloc-stats.h ---- */
 
 #include <string.h> // memset
 

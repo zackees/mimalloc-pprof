@@ -600,8 +600,13 @@ static void test_stats_v3_heap_stats(void) {
   assert(during.enabled);
   /* ~2 MiB of live blocks. malloc_requested is exact (unsampled), so it must account for
      at least everything we just allocated -- this is the check that catches the sampler
-     silently under-counting. */
-  assert(during.heap_malloc_requested >= (size_t)count * size);
+     silently under-counting. It is only maintained at MI_STAT >= 2 though (debug builds
+     by default), so a release build reports 0 and must assert the opposite. */
+  if (during.heap_stats_detailed) {
+    assert(during.heap_malloc_requested >= (size_t)count * size);
+  } else {
+    assert(during.heap_malloc_requested == 0);
+  }
   assert(during.heap_committed > 0);
   assert(during.heap_reserved >= during.heap_committed);
   assert(during.heap_pages > 0);
@@ -614,6 +619,10 @@ static void test_stats_v3_heap_stats(void) {
   assert(strstr(dump_text, "# mimalloc heap stats\n") != NULL);
   assert(strstr(dump_text, "# committed = ") != NULL);
   assert(strstr(dump_text, "# theaps = ") != NULL);
+  /* The profile records whether this build tracks the MI_STAT>=2 counters, so a reader
+     can tell a real 0 from an untracked one. */
+  assert(strstr(dump_text, during.heap_stats_detailed ? "# detailed_stats = 1\n"
+                                                      : "# detailed_stats = 0\n") != NULL);
   /* Comment block sits between the samples and MAPPED_LIBRARIES. */
   assert(strstr(dump_text, "# mimalloc heap stats\n") < strstr(dump_text, "MAPPED_LIBRARIES:\n"));
 

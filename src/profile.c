@@ -344,6 +344,8 @@ bool mi_prof_is_enabled(void) mi_attr_noexcept { return mi_atomic_load_relaxed(&
 static size_t mi_prof_clamp_stat(int64_t v) { return (v <= 0 ? 0 : (size_t)v); }
 
 static void mi_prof_fill_heap_stats(mi_prof_stats_t* stats) {
+  /* Set before the early return: it describes the build, not the reading. */
+  stats->heap_stats_detailed = (MI_STAT > 1);
   mi_stats_t_decl(s);
   if (!mi_stats_get(&s)) return;   /* leave the v3 fields zeroed on refusal */
   stats->heap_committed        = mi_prof_clamp_stat(s.committed.current);
@@ -431,7 +433,10 @@ bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
       "# mimalloc heap stats\n"
       "# committed = %llu\n# reserved = %llu\n# malloc_requested = %llu\n"
       "# pages = %llu\n# pages_abandoned = %llu\n# heaps = %llu\n# theaps = %llu\n"
-      "# purged = %llu\n# profiler_dropped_samples = %llu\n",
+      "# purged = %llu\n# profiler_dropped_samples = %llu\n"
+      /* malloc_requested above is only tracked at MI_STAT >= 2; record which it is so
+         the profile is self-describing rather than silently reporting 0. */
+      "# detailed_stats = %d\n",
       (unsigned long long)heap_stats.heap_committed,
       (unsigned long long)heap_stats.heap_reserved,
       (unsigned long long)heap_stats.heap_malloc_requested,
@@ -440,7 +445,8 @@ bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
       (unsigned long long)heap_stats.heap_count,
       (unsigned long long)heap_stats.theap_count,
       (unsigned long long)heap_stats.heap_purged,
-      (unsigned long long)heap_stats.dropped_samples);
+      (unsigned long long)heap_stats.dropped_samples,
+      (heap_stats.heap_stats_detailed ? 1 : 0));
     if (sn < 0 || !prof_dump_append(&out, stat_line, prof_min((size_t)sn, sizeof(stat_line) - 1))) out.ok = false;
   }
   if (out.ok && !prof_dump_append(&out, "MAPPED_LIBRARIES:\n", 18)) out.ok = false;

@@ -36,6 +36,41 @@ jobs:
       - uses: actions/checkout@v4
       - run: cmake -B build -DMI_DEBUG_FULL=ON && cmake --build build && ctest --test-dir build --output-on-failure
 
+  # TEMPORARY (debug/v3-stress-heaps): does STOCK upstream/dev3 also segfault in
+  # test-stress-heaps under the same MinGW/GCC-16 toolchain? This isolates whether the
+  # failure belongs to the fork's port or to upstream. Not for merge.
+  upstream-dev3-control:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja git
+      - name: build and run STOCK upstream/dev3
+        run: |
+          set +e
+          gcc --version | head -1
+          git clone --no-checkout https://github.com/microsoft/mimalloc.git stock
+          cd stock
+          git fetch origin 579f8c0e93a0468a20dd20fac861bc3580b1735e --depth 1
+          git checkout 579f8c0e93a0468a20dd20fac861bc3580b1735e
+          echo "=== stock dev3 HEAD: $(git rev-parse HEAD) ==="
+          cmake -B build -G Ninja
+          cmake --build build
+          fails=0
+          for i in 1 2 3 4 5 6; do
+            ./build/mimalloc-test-stress-heaps.exe > out-$i.log 2>&1
+            code=$?
+            echo "STOCK attempt $i exit=$code"
+            if [ $code -ne 0 ]; then fails=$((fails+1)); tail -5 out-$i.log; fi
+          done
+          echo "=========================================="
+          echo "STOCK upstream/dev3 test-stress-heaps: $fails failures / 6 runs"
+          echo "=========================================="
+
   ctest-win-gnu:
     runs-on: windows-latest
     defaults:

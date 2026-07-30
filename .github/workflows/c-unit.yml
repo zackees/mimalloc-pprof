@@ -86,35 +86,23 @@ jobs:
       # and only add -g, so debugging does not change what is being debugged.
       - run: cmake -B build -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS=-g
       - run: cmake --build build
-      - name: diagnose (opt level / aliasing / backtrace)
+      - name: diagnose aliasing hypothesis
+        timeout-minutes: 25
         run: |
           set +e
+          # Same -O2 release codegen as the failing job; only strict aliasing differs.
           probe() {
             name="$1"; shift
-            echo "############ CONFIG: $name  ($*) ############"
-            rm -rf b-$name
+            echo "############ $name ($*) ############"
             cmake -B b-$name -G Ninja -DMI_PPROF=ON "$@" > /dev/null 2>&1
             cmake --build b-$name > /dev/null 2>&1 || { echo "BUILD FAILED"; return; }
             f=0
-            for i in 1 2 3 4; do
+            for i in 1 2 3 4 5 6; do
               ./b-$name/mimalloc-test-stress-heaps.exe > /dev/null 2>&1
-              c=$?
-              [ $c -ne 0 ] && f=$((f+1))
+              [ $? -ne 0 ] && f=$((f+1))
             done
-            echo ">>>> $name: $f failures / 4 runs"
+            echo ">>>> $name: $f failures / 6 runs"
           }
-          probe O0  -DCMAKE_C_FLAGS="-O0 -g"
-          probe O1  -DCMAKE_C_FLAGS="-O1 -g"
-          probe O2  -DCMAKE_C_FLAGS="-O2 -g"
-          probe O2noalias -DCMAKE_C_FLAGS="-O2 -g -fno-strict-aliasing"
-          echo "############ BACKTRACE at -O0 ############"
-          for i in 1 2 3 4 5 6; do
-            gdb -batch -ex run -ex "bt 30" -ex "info threads" --args ./b-O0/mimalloc-test-stress-heaps.exe > bt.log 2>&1
-            if grep -qiE "SIGSEGV|Segmentation" bt.log; then
-              echo "reproduced at -O0 on attempt $i"
-              grep -vE "^\[New Thread|^\[Thread" bt.log | tail -45
-              break
-            fi
-            echo "attempt $i: no crash at -O0"
-          done
+          probe alias   -DCMAKE_C_FLAGS="-O2"
+          probe noalias -DCMAKE_C_FLAGS="-O2 -fno-strict-aliasing"
       - run: ctest --test-dir build --output-on-failure

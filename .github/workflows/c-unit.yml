@@ -46,7 +46,24 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
-      - run: cmake -B build -G Ninja -DMI_PPROF=ON
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-gdb
+      - run: cmake -B build -G Ninja -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=Debug
       - run: cmake --build build
+      # TEMPORARY (debug/v3-stress-heaps): capture a backtrace for the win-gnu-only
+      # test-stress-heaps segfault. Not for merge.
+      - name: stress-heaps under gdb
+        run: |
+          for i in 1 2 3 4 5 6; do
+            echo "=========== ATTEMPT $i ==========="
+            gdb -batch -ex run -ex "thread apply all bt" --args ./build/mimalloc-test-stress-heaps.exe > gdb-$i.log 2>&1
+            code=$?
+            echo "gdb exit=$code"
+            if grep -qiE "SIGSEGV|Segmentation|access violation|unknown target exception|Assertion" gdb-$i.log; then
+              echo "!!!!!!! CRASH REPRODUCED on attempt $i !!!!!!!"
+              cat gdb-$i.log
+              exit 1
+            fi
+            tail -3 gdb-$i.log
+          done
+          echo "no crash in 6 attempts"
       - run: ctest --test-dir build --output-on-failure

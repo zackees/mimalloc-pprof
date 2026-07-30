@@ -42,6 +42,9 @@ pub struct mi_prof_stats_t {
     /// is not counted, so a single-threaded process reports 0.
     pub theap_count: usize,
     pub heap_purged: usize,
+    /// True when the C library was built with `MI_STAT >= 2`. `heap_malloc_requested`
+    /// is only maintained at that level; a default release build reports 0.
+    pub heap_stats_detailed: bool,
 }
 
 /// Mirrors `MI_PROF_CONFIG_VERSION` in `include/mimalloc/profile.h`.

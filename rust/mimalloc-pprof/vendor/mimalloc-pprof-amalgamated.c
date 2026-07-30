@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4c4e5ce3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f30a8444 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -704,7 +704,9 @@ typedef struct mi_prof_stats_s {
      from older callers (see above), leaving these fields untouched in that case. */
   size_t heap_committed;          /* current bytes committed from the OS */
   size_t heap_reserved;           /* current bytes reserved from the OS */
-  size_t heap_malloc_requested;   /* current bytes the application actually asked for */
+  /* Current bytes the application actually asked for. ONLY maintained when the library
+     was built with MI_STAT >= 2 -- check heap_stats_detailed below before using it. */
+  size_t heap_malloc_requested;
   size_t heap_pages;              /* current live mimalloc pages */
   size_t heap_pages_abandoned;    /* current pages abandoned by exited threads */
   size_t heap_count;              /* live first-class heaps (v3 only) */
@@ -713,6 +715,16 @@ typedef struct mi_prof_stats_s {
      single-threaded process reports 0 here. */
   size_t theap_count;
   size_t heap_purged;             /* cumulative bytes purged back to the OS */
+  /* True when the library was built with MI_STAT >= 2 ("detailed" statistics), which
+     upstream enables by default only for debug builds (MI_DEBUG > 0); a default release
+     build has MI_STAT == 0. heap_malloc_requested is maintained ONLY at that level and
+     otherwise stays 0. Every other heap_* field is maintained at any MI_STAT level.
+
+     Without this flag a caller cannot tell "the application allocated nothing" from
+     "this build does not track that counter", so check it before treating
+     heap_malloc_requested as meaningful. Define MI_STAT=2 at build time to enable it in
+     a release build (it costs some allocation-path performance). */
+  bool heap_stats_detailed;
 } mi_prof_stats_t;
 #define mi_prof_stats_t_decl(name) mi_prof_stats_t name = { 0 }; name.size = sizeof(mi_prof_stats_t); name.version = MI_PROF_STAT_VERSION
 mi_decl_nodiscard mi_decl_export bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept;
@@ -20039,6 +20051,8 @@ bool mi_prof_is_enabled(void) mi_attr_noexcept { return mi_atomic_load_relaxed(&
 static size_t mi_prof_clamp_stat(int64_t v) { return (v <= 0 ? 0 : (size_t)v); }
 
 static void mi_prof_fill_heap_stats(mi_prof_stats_t* stats) {
+  /* Set before the early return: it describes the build, not the reading. */
+  stats->heap_stats_detailed = (MI_STAT > 1);
   mi_stats_t_decl(s);
   if (!mi_stats_get(&s)) return;   /* leave the v3 fields zeroed on refusal */
   stats->heap_committed        = mi_prof_clamp_stat(s.committed.current);
@@ -20126,7 +20140,10 @@ bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
       "# mimalloc heap stats\n"
       "# committed = %llu\n# reserved = %llu\n# malloc_requested = %llu\n"
       "# pages = %llu\n# pages_abandoned = %llu\n# heaps = %llu\n# theaps = %llu\n"
-      "# purged = %llu\n# profiler_dropped_samples = %llu\n",
+      "# purged = %llu\n# profiler_dropped_samples = %llu\n"
+      /* malloc_requested above is only tracked at MI_STAT >= 2; record which it is so
+         the profile is self-describing rather than silently reporting 0. */
+      "# detailed_stats = %d\n",
       (unsigned long long)heap_stats.heap_committed,
       (unsigned long long)heap_stats.heap_reserved,
       (unsigned long long)heap_stats.heap_malloc_requested,
@@ -20135,7 +20152,8 @@ bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
       (unsigned long long)heap_stats.heap_count,
       (unsigned long long)heap_stats.theap_count,
       (unsigned long long)heap_stats.heap_purged,
-      (unsigned long long)heap_stats.dropped_samples);
+      (unsigned long long)heap_stats.dropped_samples,
+      (heap_stats.heap_stats_detailed ? 1 : 0));
     if (sn < 0 || !prof_dump_append(&out, stat_line, prof_min((size_t)sn, sizeof(stat_line) - 1))) out.ok = false;
   }
   if (out.ok && !prof_dump_append(&out, "MAPPED_LIBRARIES:\n", 18)) out.ok = false;

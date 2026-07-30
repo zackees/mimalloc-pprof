@@ -35,13 +35,22 @@ fn heap_stats_are_populated_and_exact() {
 
     // malloc_requested is exact and unsampled, so it must account for at least
     // everything just allocated. This is the assertion a sampled profile alone
-    // cannot make.
-    assert!(
-        during.heap.malloc_requested >= COUNT * SIZE,
-        "malloc_requested ({}) must cover the {} bytes just allocated",
-        during.heap.malloc_requested,
-        COUNT * SIZE
-    );
+    // cannot make -- but it is only tracked at MI_STAT >= 2, which upstream
+    // enables by default only for debug builds, so a release build must assert
+    // the opposite rather than skipping the check.
+    if during.heap.detailed {
+        assert!(
+            during.heap.malloc_requested >= COUNT * SIZE,
+            "malloc_requested ({}) must cover the {} bytes just allocated",
+            during.heap.malloc_requested,
+            COUNT * SIZE
+        );
+    } else {
+        assert_eq!(
+            during.heap.malloc_requested, 0,
+            "malloc_requested must be 0 when the build does not track it"
+        );
+    }
     assert!(during.heap.committed > 0, "heap.committed must be populated");
     assert!(during.heap.reserved >= during.heap.committed);
     assert!(during.heap.pages > 0, "heap.pages must be populated");
@@ -62,6 +71,13 @@ fn heap_stats_are_populated_and_exact() {
     );
     assert!(dump.contains("# committed = "));
     assert!(dump.contains("# theaps = "));
+    // The profile records whether the build tracks the MI_STAT>=2 counters, so a
+    // reader can tell a real 0 from an untracked one.
+    assert!(dump.contains(if during.heap.detailed {
+        "# detailed_stats = 1\n"
+    } else {
+        "# detailed_stats = 0\n"
+    }));
 
     // The block is a pprof comment section: it must sit after the samples and
     // before MAPPED_LIBRARIES so google/pprof's legacy heap parser skips it.

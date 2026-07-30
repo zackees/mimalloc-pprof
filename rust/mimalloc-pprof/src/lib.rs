@@ -403,6 +403,9 @@ pub mod prof {
         /// Bytes currently reserved from the OS (always `>= committed`).
         pub reserved: usize,
         /// Bytes the application actually requested and still holds.
+        ///
+        /// Only maintained when the C library was built with `MI_STAT >= 2`;
+        /// otherwise this is 0. Check [`HeapStats::detailed`] before using it.
         pub malloc_requested: usize,
         /// Live mimalloc pages.
         pub pages: usize,
@@ -415,6 +418,14 @@ pub mod prof {
         pub theaps: usize,
         /// Cumulative bytes purged back to the OS.
         pub purged: usize,
+        /// Whether the C library was built with `MI_STAT >= 2` ("detailed"
+        /// statistics), which upstream enables by default only for debug
+        /// builds. [`HeapStats::malloc_requested`] is maintained only at that
+        /// level; every other field here is maintained at any level.
+        ///
+        /// Without this flag you cannot tell "the application allocated
+        /// nothing" from "this build does not track that counter".
+        pub detailed: bool,
     }
 
     /// Read the profiler's current counters via `mi_prof_stats_get`.
@@ -448,6 +459,7 @@ pub mod prof {
                     heaps: raw.heap_count,
                     theaps: raw.theap_count,
                     purged: raw.heap_purged,
+                    detailed: raw.heap_stats_detailed,
                 },
             }
         } else {

@@ -535,7 +535,9 @@ The repository root is mimalloc and retains upstream git history. The
 
 For upstream mimalloc build modes, overrides, options, and platform notes, see
 [readme-upstream.md](readme-upstream.md). For the fast local development loop, see
-[docs/dev-loop.md](docs/dev-loop.md). Design history and milestone decisions are in
+[docs/dev-loop.md](docs/dev-loop.md). The fixes prepared for submission back to
+microsoft/mimalloc, with their validation evidence, are in
+[docs/upstreaming.md](docs/upstreaming.md). Design history and milestone decisions are in
 [issue #2](https://github.com/zackees/mimalloc-pprof/issues/2); the survey of other
 mimalloc v3 forks is in
 [issue #50](https://github.com/zackees/mimalloc-pprof/issues/50).

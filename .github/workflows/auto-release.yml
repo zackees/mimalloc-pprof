@@ -53,7 +53,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Retried on purpose: this action has failed with a transient `write EPIPE`
+      # during cache restore (issue #55), which skipped the publish job and turned a
+      # tagged release into a silent no-op. A `uses:` step cannot be wrapped by a
+      # retry action, so attempt it twice explicitly.
       - uses: zackees/setup-soldr@v0
+        id: setup_soldr
+        continue-on-error: true
+        with:
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+          build-cache-mode: full
+
+      - name: Retry toolchain setup (first attempt failed)
+        if: steps.setup_soldr.outcome == 'failure'
+        uses: zackees/setup-soldr@v0
         with:
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
@@ -101,7 +116,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Retried on purpose: this action has failed with a transient `write EPIPE`
+      # during cache restore (issue #55), which skipped the publish job and turned a
+      # tagged release into a silent no-op. A `uses:` step cannot be wrapped by a
+      # retry action, so attempt it twice explicitly.
       - uses: zackees/setup-soldr@v0
+        id: setup_soldr
+        continue-on-error: true
+        with:
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+          build-cache-mode: full
+
+      - name: Retry toolchain setup (first attempt failed)
+        if: steps.setup_soldr.outcome == 'failure'
+        uses: zackees/setup-soldr@v0
         with:
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
@@ -155,6 +185,34 @@ jobs:
         working-directory: rust
         run: soldr cargo publish --dry-run -p mimalloc-pprof --locked
 
+      # Trust the registry, not the exit code. `cargo publish` returning 0 is not the
+      # same as the version being live and installable, and after issue #55 the whole
+      # point is that a green-looking pipeline had published nothing.
+      - name: Verify the version is live on crates.io
+        if: env.IS_DRY_RUN != 'true'
+        shell: bash
+        run: |
+          set -uo pipefail
+          version="$(grep -m1 '^version' rust/mimalloc-pprof/Cargo.toml | cut -d'"' -f2)"
+          url="https://crates.io/api/v1/crates/mimalloc-pprof/${version}"
+          echo "checking ${url}"
+          # The index can lag the publish by a few seconds; poll rather than fail fast.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            code="$(curl -sS -o /tmp/crate.json -w '%{http_code}'                       -H 'User-Agent: mimalloc-pprof release verification' "$url" || echo 000)"
+            if [ "$code" = "200" ]; then
+              if grep -q '"yanked":true' /tmp/crate.json; then
+                echo "::error::mimalloc-pprof ${version} is on crates.io but YANKED."
+                exit 1
+              fi
+              echo "confirmed: mimalloc-pprof ${version} is live on crates.io"
+              exit 0
+            fi
+            echo "attempt ${attempt}: HTTP ${code}, retrying in 15s"
+            sleep 15
+          done
+          echo "::error::mimalloc-pprof ${version} is NOT on crates.io after publishing. The tag exists but the release did not land -- do not assume this release succeeded."
+          exit 1
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -162,3 +220,26 @@ jobs:
           name: mimalloc-pprof ${{ steps.tag.outputs.tag }}
           draft: ${{ env.IS_DRY_RUN == 'true' }}
           files: dist/mimalloc-pprof-c-${{ steps.tag.outputs.tag }}.zip
+
+  # Issue #55: the publish job is gated on all three OS builds, so a single transient
+  # runner failure silently turns a tagged release into a no-op. This job makes that
+  # outcome impossible to miss and says exactly how to recover.
+  release-outcome:
+    name: Release outcome check
+    needs: [build-and-package, release]
+    if: always() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail loudly if the tag did not produce a release
+        shell: bash
+        run: |
+          build='${{ needs.build-and-package.result }}'
+          release='${{ needs.release.result }}'
+          echo "build-and-package: ${build}"
+          echo "release: ${release}"
+          if [ "$release" = "success" ]; then
+            echo "tag ${GITHUB_REF_NAME} released successfully"
+            exit 0
+          fi
+          echo "::error::Tag ${GITHUB_REF_NAME} was pushed but NOT released (build=${build}, release=${release}). Nothing was published to crates.io. If this was a transient runner failure, recover with: gh run rerun ${GITHUB_RUN_ID} --failed"
+          exit 1

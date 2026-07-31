@@ -91,16 +91,20 @@ jobs:
       - run: cmake --build build
       # MI_DEBUG_FULL turns on mimalloc's internal invariant assertions, so we learn
       # WHICH invariant breaks instead of only seeing the later segfault victim.
+      # Each run is wrapped in `timeout` so this step ALWAYS completes -- a step that
+      # gets cancelled makes the whole job's logs undownloadable, which has already
+      # cost several cycles here.
       - name: probe - MI_DEBUG_FULL on win-gnu
-        timeout-minutes: 20
+        timeout-minutes: 45
         run: |
           set +e
           cmake -B b-dbgfull -G Ninja -DMI_PPROF=ON -DMI_DEBUG_FULL=ON > /dev/null 2>&1
           cmake --build b-dbgfull > /dev/null 2>&1 || { echo "BUILD FAILED"; exit 0; }
-          for i in 1 2 3; do
-            echo "===== attempt $i ====="
-            ./b-dbgfull/mimalloc-test-stress-heaps.exe > out.log 2>&1
-            echo "exit=$?"
-            echo "--- last 25 lines ---"
-            tail -25 out.log
-          done
+          echo "===== full workload (bounded to 10 min) ====="
+          timeout 600 ./b-dbgfull/mimalloc-test-stress-heaps.exe > out1.log 2>&1
+          echo "exit=$?  (124 = hit the time bound, not a crash)"
+          tail -30 out1.log
+          echo "===== reduced workload 16 threads / scale 25 / 15 iters (bounded to 8 min) ====="
+          timeout 480 ./b-dbgfull/mimalloc-test-stress-heaps.exe 16 25 15 > out2.log 2>&1
+          echo "exit=$?  (124 = hit the time bound, not a crash)"
+          tail -30 out2.log

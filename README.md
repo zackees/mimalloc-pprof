@@ -228,6 +228,32 @@ a full size-class sweep with ±1 boundary probes, realloc ping-pong across the
 small/large boundary, huge-allocation churn, and degenerate arguments
 (zero-size, `free(NULL)`, alignments, `SIZE_MAX`, `calloc` overflow).
 
+### CI gates
+
+Every gate below runs on each PR and is a **hard failure**. Each one also runs a
+*positive control* — a deliberately broken input that the gate must catch — because a
+gate that has never been observed to fire proves nothing. That is not a hypothetical
+standard: two of these gates were silently doing nothing when first written, and the
+controls are what caught them.
+
+| Gate | What it catches | Positive control |
+|---|---|---|
+| **memory-gate** (`ci/memory_gate.py`) | peak memory or thread-count regressions vs a committed per-platform baseline | builds a copy with an injected leak; the gate must fail — verified at +212% / +98% / +27% on linux/windows/macos |
+| **isa-baseline** (`ci/check_isa_baseline.py`) | binaries containing instructions above the CPU baseline, which SIGILL on older hardware | builds with `MI_OPT_ARCH=ON`; the scanner must fire |
+| **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, plus shared-library and `MI_DEBUG_FULL` builds | — |
+| **python-lint** | the gate scripts themselves — `ruff` + `pyright --strict` | — |
+
+Two details worth stating, because both were assumptions that measurement overturned:
+
+- **Peak memory is not a low-variance signal.** Repeated runs of the same unchanged
+  binary span 6–12% on CI runners. The memory gate therefore compares the **minimum of
+  four runs** and prints the observed spread every time, warning if it ever approaches
+  the tolerance. A gate that flakes gets ignored, and an ignored gate is worse than none.
+- **The gate scripts are gating code.** Both silent failures above were Python bugs, not
+  C bugs — the arm64 instruction scanner matched nothing at all and reported "clean".
+  Hence `pyright --strict` over `ci/`, with the result schema declared rather than
+  indexed by hope.
+
 ### How v3 was validated
 
 v3 was held to the same bar as v2 before it became the mainline — identical

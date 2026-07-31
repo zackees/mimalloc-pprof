@@ -1,9 +1,15 @@
 [package]
 name = "mimalloc-pprof"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 license = "MIT"
-description = "mimalloc global allocator with pprof support"
+description = "mimalloc global allocator with pprof-compatible sampled heap profiling (mimalloc v2 engine)"
+repository = "https://github.com/zackees/mimalloc-pprof"
+homepage = "https://github.com/zackees/mimalloc-pprof"
+documentation = "https://docs.rs/mimalloc-pprof"
+readme = "README.md"
+keywords = ["mimalloc", "allocator", "pprof", "profiling", "heap"]
+categories = ["memory-management", "development-tools::profiling"]
 links = "mimalloc"
 build = "build.rs"
 

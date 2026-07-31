@@ -1,0 +1,23 @@
+{
+  "baseline_runs": 4,
+  "baseline_spread_pct": 9.9,
+  "counters": {
+    "pages_end": 1,
+    "pages_start": 0,
+    "theaps_end": 1,
+    "theaps_start": 0,
+    "threads_end": 1,
+    "threads_start": 1
+  },
+  "gated_metric": "peak_commit",
+  "inject_leak": 0,
+  "mi_pprof": 1,
+  "peak_commit_mb": 52.5,
+  "peak_mb": 52.5,
+  "peak_minus_profiler_mb": 52.5,
+  "peak_rss_mb": 16.2,
+  "platform": "windows",
+  "profiler_arena_mb": 0.0,
+  "purged_gb": 0.06,
+  "schema": 1
+}

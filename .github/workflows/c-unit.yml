@@ -113,6 +113,72 @@ jobs:
       - run: cmake --build build
       - run: ctest --test-dir build --output-on-failure
 
+  # Memory + counter regression gate (issue #63). The test's own inline assertions are
+  # self-relative and gate on every runner unconditionally. The committed baselines add
+  # cross-COMMIT drift detection, which a per-run ratio cannot see: a leak introduced
+  # 3% at a time over ten PRs passes every self-relative check and still doubles memory.
+  #
+  # Baselines are per platform AND per MI_PPROF setting, never shared: lazy zeroing makes
+  # Linux RSS and Windows commit incomparable for identical behavior, and rule 4 puts the
+  # profiler's own arena in process memory so an ON build legitimately peaks higher.
+  memory-gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DMI_PPROF=ON
+      - run: cmake --build build --config Release
+      - name: Run the gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -C Release -R test-memory-gate --output-on-failure
+      - name: Emit JSON and compare against baseline
+        shell: bash
+        run: |
+          # NOTE: GitHub invokes `bash -e`, so a plain `set -uo pipefail` does NOT
+          # disable errexit -- the script would die on the gate's non-zero exit before
+          # the rc check could run. `set +e` is required, not decorative.
+          set +e
+          set -uo pipefail
+          exe=$(find build -name 'mimalloc-test-memory-gate*' -type f -perm -u+x | head -1)
+          # Peak memory is noisy; the gate compares the minimum of several runs. Four
+          # is what the committed baselines are built from.
+          for i in 1 2 3 4; do
+            MI_BENCH_JSON="result-$i.json" "$exe" > /dev/null
+          done
+          cat result-1.json
+          python3 ci/memory_gate.py check result-*.json
+          rc=$?
+          if [ $rc -eq 2 ]; then
+            echo "::warning::No committed baseline for this platform yet -- bootstrap it from this run's artifact."
+            exit 0
+          fi
+          exit $rc
+      # A gate that has never been observed to fire proves nothing -- it can be broken
+      # for months while every run stays green. Build a deliberately leaky copy and
+      # require the same comparison to catch it. This step failing means the gate above
+      # is decoration, so it is a hard failure, not a warning.
+      - name: Positive control -- the gate must catch an injected leak
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -B build-leak -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
+          cmake --build build-leak --config Release --target mimalloc-test-memory-gate
+          exe=$(find build-leak -name 'mimalloc-test-memory-gate*' -type f -perm -u+x | head -1)
+          for i in 1 2 3 4; do
+            MI_BENCH_JSON="leak-$i.json" "$exe" > /dev/null || true
+          done
+          python3 ci/memory_gate.py control leak-*.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memory-gate-${{ matrix.os }}
+          path: result-*.json
+          if-no-files-found: error
+
   ctest-win-gnu:
     runs-on: windows-latest
     defaults:

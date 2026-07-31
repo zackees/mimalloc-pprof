@@ -721,7 +721,25 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
    both static and dynamic linkage (`MI_WIN_INIT_USE_CRT_TLS`).
 ------------------------------------------------------------------------- */
 #if !defined(MI_WIN_INIT_USE_CRT_TLS) && !defined(MI_WIN_INIT_USE_RAW_DLLMAIN) && !defined(MI_WIN_INIT_USE_TLS_DLLMAIN) && !defined(MI_WIN_INIT_USE_FLS)
-  #if !defined(__INTEL_LLVM_COMPILER) && !defined(__INTEL_COMPILER)
+  #if defined(__GNUC__) && !defined(_MSC_VER)
+    /* MinGW/GCC: CRT_TLS does not work here and silently leaks every exiting thread.
+       Two independent reasons:
+         1. Its loader TLS callbacks are registered with MSVC-only pragmas
+            (`#pragma comment(linker, "/INCLUDE:...")`, `const_seg`/`data_seg`) which GCC
+            ignores, so the `.CRT$XL*` entries are never emitted at all.
+         2. Even when they ARE emitted (via GCC section attributes), the thread's default
+            heap lives in a `mi_decl_thread` variable which GCC implements with emutls on
+            MinGW. emutls is torn down before any PE TLS callback runs, so at
+            DLL_THREAD_DETACH `mi_prim_get_default_heap()` already returns the *empty* heap
+            and `_mi_thread_done` early-returns on `!mi_heap_is_initialized(heap)` --
+            the thread's heap is never abandoned.
+       FLS does not have this problem: the Fls callback receives the stored value as an
+       argument, so it never has to read a thread-local that may already be gone.
+       Measured on test-stress (32 threads x N iterations): CRT_TLS grows ~0.24 GB per
+       iteration unbounded (23.5 GB at 100 iterations) with `threads` never decrementing;
+       FLS is flat at ~0.1 GB with `threads` returning to 0. */
+    #define MI_WIN_INIT_USE_FLS          1
+  #elif !defined(__INTEL_LLVM_COMPILER) && !defined(__INTEL_COMPILER)
     #define MI_WIN_INIT_USE_CRT_TLS      1
   #else
     #define MI_WIN_INIT_USE_TLS_DLLMAIN  1  /* default for Intel ICX, see issue #1268 */

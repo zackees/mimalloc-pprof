@@ -81,7 +81,14 @@ def find_objdump() -> list[str]:
 def disassemble(target: str) -> str:
     tool = find_objdump()
     proc = subprocess.run(
-        tool + ["-d", target], capture_output=True, text=True, errors="replace"
+        # --no-show-raw-insn drops the encoding column. Without it the layout is
+        # architecture-specific -- x86 prints space-separated byte pairs ("48 89 e5")
+        # while arm64 prints one 8-hex-digit word ("d503201f") -- and a regex tuned to
+        # one silently matches nothing on the other, turning a broken scan into a
+        # "clean" PASS. (That is not hypothetical: it is exactly what the arm64
+        # positive control caught the first time this ran in CI.)
+        tool + ["-d", "--no-show-raw-insn", target],
+        capture_output=True, text=True, errors="replace",
     )
     # objdump exits nonzero on archives whose members it cannot read, while still
     # emitting usable output for the rest.  Only bail if we got nothing at all.
@@ -92,9 +99,11 @@ def disassemble(target: str) -> str:
 
 def scan(disasm: str, arch: str) -> dict[str, int]:
     table = ABOVE_BASELINE[arch]
-    # Match the mnemonic column only: `  4011a0: c4 e3 ... rorx $0x3f,%rax,%rax`.
-    # Matching anywhere on the line would hit symbol names and operand text.
-    pattern = re.compile(r"^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2} )+\s*([a-z][a-z0-9._]*)", re.M)
+    # With the encoding column suppressed every instruction line is
+    # `<hex-addr>:	<mnemonic> <operands>`, identically on x86 and arm64. Anchoring on
+    # that shape keeps symbol names and operand text (which can contain register names
+    # that look like mnemonics) out of the match.
+    pattern = re.compile(r"^\s*[0-9a-f]+:\s+([a-z][a-z0-9._]*)", re.M)
     hits: dict[str, int] = {}
     for mnemonic in pattern.findall(disasm):
         base = mnemonic.split(".")[0]
@@ -103,10 +112,54 @@ def scan(disasm: str, arch: str) -> dict[str, int]:
     return hits
 
 
+# Sample `objdump -d --no-show-raw-insn` output, one fixture per architecture. The x86
+# regex silently matched nothing on arm64 the first time this ran, which made a broken
+# scan report "clean" -- only the positive control caught it, and only because CI has an
+# arm64 runner. These fixtures make the parser testable on any host.
+SELFTEST_FIXTURES = {
+    "x64": ("""
+0000000000000000 <mi_test>:
+   0:	push   %rbp
+   4:	rorx   $0x10,%ecx,%ecx
+   a:	popcnt %rax,%rdx
+  10:	mov    %rsp,%rbp
+  13:	andn   %eax,%ebx,%ecx
+  17:	retq
+""", {"rorx": 1, "popcnt": 1, "andn": 1}),
+    "arm64": ("""
+0000000000000000 <mi_test>:
+   0:	stp	x29, x30, [sp, #-16]!
+   4:	casal	w0, w1, [x2]
+   8:	ldaddal	w3, w4, [x5]
+   c:	add	x0, x1, x2
+  10:	swpa	w6, w7, [x8]
+  14:	ret
+""", {"casal": 1, "ldaddal": 1, "swpa": 1}),
+}
+
+
+def selftest() -> int:
+    ok = True
+    for arch, (fixture, expected) in SELFTEST_FIXTURES.items():
+        got = scan(fixture, arch)
+        if got != expected:
+            print(f"FAIL selftest[{arch}]: expected {expected}, got {got}")
+            ok = False
+        else:
+            print(f"PASS selftest[{arch}]: {sum(got.values())} instructions parsed")
+    if ok:
+        # `add` is a valid arm64 mnemonic made entirely of hex digits, and `cas`/`swp`
+        # prefixes appear inside operand text; both are ways a looser regex goes wrong.
+        print("PASS selftest: parser handles x86 and arm64 disassembly layouts")
+    return 0 if ok else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("target", help="library or executable to inspect")
+    ap.add_argument("target", nargs="?", help="library or executable to inspect")
+    ap.add_argument("--selftest", action="store_true",
+                    help="check the disassembly parser against built-in fixtures and exit")
     ap.add_argument("--arch", choices=sorted(ABOVE_BASELINE), default=None)
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--expect-clean", action="store_true", default=True,
@@ -114,6 +167,11 @@ def main() -> int:
     mode.add_argument("--expect-dirty", action="store_true",
                       help="positive control: fail if the scan finds NOTHING")
     args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
+    if args.target is None:
+        ap.error("a target is required unless --selftest is given")
 
     arch = args.arch or host_arch()
     hits = scan(disassemble(args.target), arch)

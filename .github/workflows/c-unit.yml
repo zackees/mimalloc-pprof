@@ -42,6 +42,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # The disassembly parser is itself a thing that can silently break (it did, on
+      # arm64). Fixtures for both layouts, checked on every runner.
+      - name: Disassembly parser selftest
+        run: python3 ci/check_isa_baseline.py --selftest
       - name: Portable build must contain no above-baseline instructions
         run: |
           cmake -B build-portable -DMI_PPROF=ON -DMI_NO_OPT_ARCH=ON

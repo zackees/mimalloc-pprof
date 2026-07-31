@@ -1,0 +1,36 @@
+name: python-lint
+
+# The Python here is small but load-bearing: it is the CI gating layer. A bug in
+# ci/memory_gate.py or ci/check_isa_baseline.py silently disables a gate rather than
+# failing loudly, which has already happened twice (the arm64 scanner matched nothing
+# and reported "clean"; the memory gate returned before printing its diagnostics).
+# Neither was a C bug. Both were Python. Hence: hard failure, not advisory.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'ci/**'
+      - 'pyproject.toml'
+      - '.github/workflows/python-lint.yml'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # Pinned so a tool release cannot turn a green PR red (or a red one green)
+      # without a commit that says so.
+      - run: pip install ruff==0.12.10 pyright==1.1.411
+      - run: ruff check ci/
+      - run: ruff format --check ci/
+      - run: pyright
+      # The linters must not have changed behavior. These are the same checks the
+      # isa-baseline job runs, minus the compile: parser fixtures for both
+      # architectures, which is what caught the arm64 breakage in the first place.
+      - name: Gate scripts still work
+        run: python3 ci/check_isa_baseline.py --selftest

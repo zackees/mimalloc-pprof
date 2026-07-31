@@ -36,6 +36,38 @@ jobs:
       - uses: actions/checkout@v4
       - run: cmake -B build -DMI_DEBUG_FULL=ON && cmake --build build && ctest --test-dir build --output-on-failure
 
+  # Shared-library build (issue #62). Our src/static.c amalgamation compiles
+  # everything as one TU, which hides link errors that only appear when the library
+  # is built as a real DLL/so -- conda-forge carries a patch making
+  # `_mi_theap_malloc_zero` extern inline for exactly this reason on v3.4.1.
+  # Runs on both Windows toolchains because that is where the reported failure was.
+  ctest-shared:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
+      - run: cmake --build build --config Release
+      - run: ctest --test-dir build -C Release --output-on-failure
+
+  ctest-shared-win-gnu:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+      - run: cmake -B build -G Ninja -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+
   ctest-win-gnu:
     runs-on: windows-latest
     defaults:

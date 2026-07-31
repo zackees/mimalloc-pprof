@@ -115,10 +115,10 @@ jobs:
             echo "===== attempt $i ====="
             timeout 300 gdb -batch -x cmds.gdb --args ./b-bt/mimalloc-test-stress-heaps.exe > bt.log 2>&1
             echo "gdb exit=$?"
-            if grep -qiE "SIGSEGV|Segmentation" bt.log; then
+            echo "--- log tail (always shown; abort() raises SIGABRT, not SIGSEGV) ---"
+            grep -avE 'New Thread|^.Thread ' bt.log | tail -50
+            if grep -qiE "SIGSEGV|SIGABRT|Segmentation|Aborted|DIAG:" bt.log; then
               echo "*** reproduced on attempt $i ***"
-              grep -avE 'New Thread|^.Thread ' bt.log | tail -60
               exit 0
             fi
-            echo "no crash on attempt $i"
           done

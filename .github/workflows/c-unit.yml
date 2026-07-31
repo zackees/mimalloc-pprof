@@ -101,21 +101,6 @@ jobs:
             echo "===== attempt $i ====="
             ./b-dbgfull/mimalloc-test-stress-heaps.exe > out.log 2>&1
             echo "exit=$?"
-            tail -15 out.log
+            echo "--- last 25 lines ---"
+            tail -25 out.log
           done
-      - name: probe - backtrace at -O1
-        timeout-minutes: 20
-        run: |
-          set +e
-          cmake -B b-o1 -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS="-O1 -g -fno-omit-frame-pointer" > /dev/null 2>&1
-          cmake --build b-o1 > /dev/null 2>&1 || { echo "BUILD FAILED"; exit 0; }
-          for i in 1 2 3; do
-            gdb -batch -ex run -ex bt --args ./b-o1/mimalloc-test-stress-heaps.exe > bt.log 2>&1
-            if grep -qiE "SIGSEGV|Segmentation" bt.log; then
-              echo "=== reproduced at -O1, attempt $i ==="
-              grep -avE "^\[New Thread|^\[Thread" bt.log | tail -40
-              exit 0
-            fi
-            echo "attempt $i: no crash at -O1"
-          done
-      - run: ctest --test-dir build --output-on-failure

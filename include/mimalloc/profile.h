@@ -23,6 +23,7 @@
 #define MIMALLOC_PROFILE_H
 
 #include "mimalloc.h"
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -88,7 +89,7 @@ mi_decl_nodiscard mi_decl_export bool mi_prof_dump_proto(const char* path) mi_at
 mi_decl_nodiscard mi_decl_export bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept;
 mi_decl_export void mi_prof_reset(void) mi_attr_noexcept;
 
-#define MI_PROF_STAT_VERSION 2
+#define MI_PROF_STAT_VERSION 3
 typedef struct mi_prof_stats_s {
   size_t size; int version;
   bool   enabled; bool accum;
@@ -106,6 +107,39 @@ typedef struct mi_prof_stats_s {
      dropped_samples), version == 1) for old callers; this field is left untouched
      in that case. */
   size_t dropped_samples;
+  /* v3. Allocator-level ("ground truth") counters, read from mi_stats_get() at the
+     time of the call. Everything above this point is *sampled* profiler state; these
+     fields are exact, so the ratio between them and live_bytes is a direct measure of
+     sampling error -- useful in tests and in monitoring, where a sampled profile alone
+     cannot tell you whether it under-counted.
+
+     These come from the mimalloc v3 engine's per-heap statistics (mi_heap_stats_get /
+     mi_subproc_stats_get), which the v2 engine did not expose; heap_count/theap_count in
+     particular are v3-only concepts. mi_prof_stats_get accepts a v1- or v2-sized struct
+     from older callers (see above), leaving these fields untouched in that case. */
+  size_t heap_committed;          /* current bytes committed from the OS */
+  size_t heap_reserved;           /* current bytes reserved from the OS */
+  /* Current bytes the application actually asked for. ONLY maintained when the library
+     was built with MI_STAT >= 2 -- check heap_stats_detailed below before using it. */
+  size_t heap_malloc_requested;
+  size_t heap_pages;              /* current live mimalloc pages */
+  size_t heap_pages_abandoned;    /* current pages abandoned by exited threads */
+  size_t heap_count;              /* live first-class heaps (v3 only) */
+  /* Live thread-local heaps (v3 only). Counts theaps the engine actually created; the
+     main thread's statically-initialized theap is not counted, so a purely
+     single-threaded process reports 0 here. */
+  size_t theap_count;
+  size_t heap_purged;             /* cumulative bytes purged back to the OS */
+  /* True when the library was built with MI_STAT >= 2 ("detailed" statistics), which
+     upstream enables by default only for debug builds (MI_DEBUG > 0); a default release
+     build has MI_STAT == 0. heap_malloc_requested is maintained ONLY at that level and
+     otherwise stays 0. Every other heap_* field is maintained at any MI_STAT level.
+
+     Without this flag a caller cannot tell "the application allocated nothing" from
+     "this build does not track that counter", so check it before treating
+     heap_malloc_requested as meaningful. Define MI_STAT=2 at build time to enable it in
+     a release build (it costs some allocation-path performance). */
+  bool heap_stats_detailed;
 } mi_prof_stats_t;
 #define mi_prof_stats_t_decl(name) mi_prof_stats_t name = { 0 }; name.size = sizeof(mi_prof_stats_t); name.version = MI_PROF_STAT_VERSION
 mi_decl_nodiscard mi_decl_export bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept;

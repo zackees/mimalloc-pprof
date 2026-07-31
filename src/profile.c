@@ -3,6 +3,7 @@
    recursively enter the allocator. */
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
+#include "mimalloc-stats.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -118,7 +119,7 @@ static bool prof_dump_append(void* arg, const char* buf, size_t len) {
     if (chunk == NULL || chunk->used == chunk->capacity) {
       const size_t capacity = prof_max(MI_PROF_CHUNK_SIZE, len);
       mi_memid_t memid;
-      chunk = (prof_dump_chunk_t*)_mi_os_alloc(sizeof(*chunk) + capacity, &memid);
+      chunk = (prof_dump_chunk_t*)_mi_os_alloc(_mi_subproc_main(), sizeof(*chunk) + capacity, &memid);
       if (chunk == NULL) { out->ok = false; return false; }
       chunk->next = NULL; chunk->memid = memid; chunk->capacity = capacity; chunk->used = 0;
       if (out->last != NULL) out->last->next = chunk; else out->first = chunk;
@@ -134,7 +135,7 @@ static bool prof_dump_append(void* arg, const char* buf, size_t len) {
 static void prof_dump_dispose(prof_dump_buffer_t* out) {
   for (prof_dump_chunk_t* chunk = out->first; chunk != NULL; ) {
     prof_dump_chunk_t* next = chunk->next;
-    _mi_os_free(chunk, sizeof(*chunk) + chunk->capacity, chunk->memid);
+    _mi_os_free(_mi_subproc_main(), chunk, sizeof(*chunk) + chunk->capacity, chunk->memid);
     chunk = next;
   }
   out->first = out->last = NULL;
@@ -192,7 +193,7 @@ void* _mi_prof_arena_alloc(size_t size) {
        NULL return here as "drop this sample" and recycle/no-op rather than leak or crash. */
     if (prof_max_bytes != 0 && mi_atomic_load_relaxed(&prof_arena_committed) + chunk_size > prof_max_bytes) return NULL;
     mi_memid_t memid;
-    void* p = _mi_os_alloc(chunk_size, &memid);
+    void* p = _mi_os_alloc(_mi_subproc_main(), chunk_size, &memid);
     if (p == NULL) return NULL;
     chunk = (mi_prof_chunk_t*)p;
     chunk->next = prof_chunks; chunk->memid = memid; chunk->size = chunk_size; chunk->used = sizeof(*chunk);
@@ -335,6 +336,27 @@ bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept {
 }
 
 bool mi_prof_is_enabled(void) mi_attr_noexcept { return mi_atomic_load_relaxed(&prof_enabled); }
+
+/* Allocator-level counters (mi_prof_stats_t v3). mi_stats_get only copies and folds
+   already-maintained counters -- it never allocates -- but it does walk the subproc's
+   heap list under the engine's own lock, so it must not be called while prof_lock is
+   held. Every caller here gathers stats before acquiring prof_lock. */
+static size_t mi_prof_clamp_stat(int64_t v) { return (v <= 0 ? 0 : (size_t)v); }
+
+static void mi_prof_fill_heap_stats(mi_prof_stats_t* stats) {
+  /* Set before the early return: it describes the build, not the reading. */
+  stats->heap_stats_detailed = (MI_STAT > 1);
+  mi_stats_t_decl(s);
+  if (!mi_stats_get(&s)) return;   /* leave the v3 fields zeroed on refusal */
+  stats->heap_committed        = mi_prof_clamp_stat(s.committed.current);
+  stats->heap_reserved         = mi_prof_clamp_stat(s.reserved.current);
+  stats->heap_malloc_requested = mi_prof_clamp_stat(s.malloc_requested.current);
+  stats->heap_pages            = mi_prof_clamp_stat(s.pages.current);
+  stats->heap_pages_abandoned  = mi_prof_clamp_stat(s.pages_abandoned.current);
+  stats->heap_count            = mi_prof_clamp_stat(s.heaps.current);
+  stats->theap_count           = mi_prof_clamp_stat(s.theaps.current);
+  stats->heap_purged           = mi_prof_clamp_stat(s.purged.total);
+}
 bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept {
   if (stats == NULL) return false;
   /* v2 callers (current mi_prof_stats_t_decl) pass the full struct/version 2; v1 callers
@@ -342,9 +364,10 @@ bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept {
      dropped_samples and version 1 -- accept both, reject anything else. Writing into
      dropped_samples for a v1-sized struct would be an out-of-bounds write, so that field
      is only touched in the v2 branch. */
-  const bool is_v2 = (stats->size == sizeof(mi_prof_stats_t) && stats->version == 2);
+  const bool is_v3 = (stats->size == sizeof(mi_prof_stats_t) && stats->version == 3);
+  const bool is_v2 = (stats->size == offsetof(mi_prof_stats_t, heap_committed) && stats->version == 2);
   const bool is_v1 = (stats->size == offsetof(mi_prof_stats_t, dropped_samples) && stats->version == 1);
-  if (!is_v2 && !is_v1) return false;
+  if (!is_v3 && !is_v2 && !is_v1) return false;
   stats->enabled = mi_atomic_load_relaxed(&prof_enabled);
   stats->accum = mi_option_is_enabled(mi_option_prof_accum);
   stats->sample_rate = prof_rate;
@@ -355,10 +378,13 @@ bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept {
   stats->unique_stacks = _mi_prof_stack_count();
   stats->arena_committed = _mi_prof_arena_committed();
   stats->stack_table_overflows = _mi_prof_stack_overflows();
-  if (is_v2) stats->dropped_samples = mi_atomic_load_relaxed(&prof_dropped_samples);
+  if (is_v2 || is_v3) stats->dropped_samples = mi_atomic_load_relaxed(&prof_dropped_samples);
+  if (is_v3) mi_prof_fill_heap_stats(stats);
   return true;
 }
-void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept { mi_prof_stats_t_decl(stats); const bool ok = mi_prof_stats_get(&stats); MI_UNUSED(ok); if (records) *records=stats.live_samples; if (bytes) *bytes=stats.live_bytes; if (unique_stacks) *unique_stacks=stats.unique_stacks; }
+/* Deliberately requests the v1 shape: it only reads pre-v2 fields, and asking for v3
+   would make every call walk the subproc's heap list for stats it then discards. */
+void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept { mi_prof_stats_t stats; _mi_memzero(&stats, sizeof(stats)); stats.size = offsetof(mi_prof_stats_t, dropped_samples); stats.version = 1; const bool ok = mi_prof_stats_get(&stats); MI_UNUSED(ok); if (records) *records=stats.live_samples; if (bytes) *bytes=stats.live_bytes; if (unique_stacks) *unique_stacks=stats.unique_stacks; }
 void mi_prof_stop(void) mi_attr_noexcept {
   if (prof_callback_depth > 0) return;
   mi_lock_acquire(&prof_lock);
@@ -366,7 +392,7 @@ void mi_prof_stop(void) mi_attr_noexcept {
   for (mi_prof_record_t* rec = prof_all; rec != NULL; rec = rec->all_next) { rec->page->metadata = NULL; rec->page->has_metadata = false; }
   _mi_prof_stack_done();
   mi_prof_chunk_t* chunk = prof_chunks;
-  while (chunk != NULL) { mi_prof_chunk_t* next = chunk->next; _mi_os_free(chunk, chunk->size, chunk->memid); chunk = next; }
+  while (chunk != NULL) { mi_prof_chunk_t* next = chunk->next; _mi_os_free(_mi_subproc_main(), chunk, chunk->size, chunk->memid); chunk = next; }
   prof_chunks=NULL; prof_all=NULL; prof_free=NULL;
   mi_atomic_store_relaxed(&prof_records, (size_t)0); mi_atomic_store_relaxed(&prof_bytes, (size_t)0);
   mi_atomic_store_relaxed(&prof_accum_records, (size_t)0); mi_atomic_store_relaxed(&prof_accum_bytes, (size_t)0);
@@ -381,6 +407,10 @@ bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
 #if MI_DEBUG
   bool lock_held = true;
 #endif
+  /* Gather allocator ground-truth counters BEFORE taking prof_lock (see
+     mi_prof_fill_heap_stats): they are emitted as a comment block below. */
+  mi_prof_stats_t_decl(heap_stats);
+  const bool have_heap_stats = mi_prof_stats_get(&heap_stats);
   mi_lock_acquire(&prof_lock);
   prof_dump_totals_t totals = { 0, 0, 0, 0 };
   _mi_prof_stack_visit_info(prof_dump_total_stack, &totals);
@@ -392,6 +422,33 @@ bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
 #if MI_DEBUG
   lock_held = false;
 #endif
+  /* Allocator stats as '#'-prefixed comment lines. google/pprof's legacy heap parser
+     ignores comment lines, so this is additive: existing tooling reads the profile
+     unchanged, while a human or a test can compare the sampled totals above against
+     the allocator's exact numbers. Mirrors where Go puts its '# runtime.MemStats'
+     block -- after the samples, before MAPPED_LIBRARIES. */
+  if (out.ok && have_heap_stats) {
+    char stat_line[256];
+    int sn = _mi_snprintf(stat_line, sizeof(stat_line),
+      "# mimalloc heap stats\n"
+      "# committed = %llu\n# reserved = %llu\n# malloc_requested = %llu\n"
+      "# pages = %llu\n# pages_abandoned = %llu\n# heaps = %llu\n# theaps = %llu\n"
+      "# purged = %llu\n# profiler_dropped_samples = %llu\n"
+      /* malloc_requested above is only tracked at MI_STAT >= 2; record which it is so
+         the profile is self-describing rather than silently reporting 0. */
+      "# detailed_stats = %d\n",
+      (unsigned long long)heap_stats.heap_committed,
+      (unsigned long long)heap_stats.heap_reserved,
+      (unsigned long long)heap_stats.heap_malloc_requested,
+      (unsigned long long)heap_stats.heap_pages,
+      (unsigned long long)heap_stats.heap_pages_abandoned,
+      (unsigned long long)heap_stats.heap_count,
+      (unsigned long long)heap_stats.theap_count,
+      (unsigned long long)heap_stats.heap_purged,
+      (unsigned long long)heap_stats.dropped_samples,
+      (heap_stats.heap_stats_detailed ? 1 : 0));
+    if (sn < 0 || !prof_dump_append(&out, stat_line, prof_min((size_t)sn, sizeof(stat_line) - 1))) out.ok = false;
+  }
   if (out.ok && !prof_dump_append(&out, "MAPPED_LIBRARIES:\n", 18)) out.ok = false;
   if (out.ok && !_mi_prof_maps_append(prof_dump_append, &out)) out.ok = false;
 #if MI_DEBUG
@@ -461,7 +518,7 @@ mi_prof_snapshot_t* mi_prof_snapshot_new(void) mi_attr_noexcept {
   const size_t pcs_size = counted.pcs * sizeof(void*);
   const size_t total_size = sizeof(mi_prof_snapshot_t) + entries_size + pcs_size;
   mi_memid_t memid;
-  void* p = _mi_os_alloc(total_size, &memid);
+  void* p = _mi_os_alloc(_mi_subproc_main(), total_size, &memid);
   if (p == NULL) { mi_lock_release(&prof_lock); return NULL; }
   mi_prof_snapshot_t* snap = (mi_prof_snapshot_t*)p;
   snap->memid = memid; snap->total_size = total_size; snap->count = counted.count;
@@ -482,7 +539,7 @@ bool mi_prof_snapshot_visit(const mi_prof_snapshot_t* snap, mi_prof_visit_fun* v
   }
   return true;
 }
-void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { if (snap != NULL) _mi_os_free(snap, snap->total_size, snap->memid); }
+void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { if (snap != NULL) _mi_os_free(_mi_subproc_main(), snap, snap->total_size, snap->memid); }
 
 bool mi_prof_modules_visit(mi_prof_module_visit_fun* visitor, void* arg) mi_attr_noexcept {
   if (visitor == NULL) return false;
@@ -632,7 +689,7 @@ bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noex
   if (snap == NULL) return false;
 
   mi_memid_t mods_memid;
-  proto_module_t* modules = (proto_module_t*)_mi_os_alloc(PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), &mods_memid);
+  proto_module_t* modules = (proto_module_t*)_mi_os_alloc(_mi_subproc_main(), PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), &mods_memid);
   if (modules == NULL) { mi_prof_snapshot_free(snap); return false; }
   proto_module_ctx_t mod_ctx = { modules, 0 };
   const bool maps_ok = _mi_prof_maps_visit(proto_collect_module, &mod_ctx);
@@ -646,8 +703,8 @@ bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noex
   size_t pc_capacity = 16;
   while (pc_capacity < total_pcs * 2 + 1) pc_capacity *= 2;
   mi_memid_t pc_memid;
-  proto_pc_slot_t* pc_table = (proto_pc_slot_t*)_mi_os_alloc(pc_capacity * sizeof(proto_pc_slot_t), &pc_memid);
-  if (pc_table == NULL) { _mi_os_free(modules, PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), mods_memid); mi_prof_snapshot_free(snap); return false; }
+  proto_pc_slot_t* pc_table = (proto_pc_slot_t*)_mi_os_alloc(_mi_subproc_main(), pc_capacity * sizeof(proto_pc_slot_t), &pc_memid);
+  if (pc_table == NULL) { _mi_os_free(_mi_subproc_main(), modules, PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), mods_memid); mi_prof_snapshot_free(snap); return false; }
   memset(pc_table, 0, pc_capacity * sizeof(proto_pc_slot_t));
   uint32_t next_location_id = 1;
 
@@ -718,8 +775,8 @@ bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noex
 
   if (ok) for (prof_dump_chunk_t* chunk = out.first; chunk != NULL; chunk = chunk->next) write(arg, chunk->data, chunk->used);
   prof_dump_dispose(&out);
-  _mi_os_free(pc_table, pc_capacity * sizeof(proto_pc_slot_t), pc_memid);
-  _mi_os_free(modules, PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), mods_memid);
+  _mi_os_free(_mi_subproc_main(), pc_table, pc_capacity * sizeof(proto_pc_slot_t), pc_memid);
+  _mi_os_free(_mi_subproc_main(), modules, PROF_PROTO_MAX_MODULES * sizeof(proto_module_t), mods_memid);
   mi_prof_snapshot_free(snap);
   return ok;
 }
@@ -752,13 +809,13 @@ void _mi_prof_process_done(void) {
     MI_UNUSED(dumped);
   }
 }
-void _mi_prof_on_alloc(mi_heap_t* heap, mi_page_t* page, void* p, size_t size) {
+void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size) {
   prof_auto_start();
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;
   if (prof_callback_depth > 0) return;
   mi_lock_acquire(&prof_lock);
   if (!mi_atomic_load_relaxed(&prof_enabled)) { mi_lock_release(&prof_lock); return; }
-  mi_profiler_tld_t* tld = &heap->tld->profiler;
+  mi_profiler_tld_t* tld = &theap->tld->profiler;
   if (tld->generation != prof_generation) { tld->bytes_since_sample = 0; tld->next_threshold = 0; tld->random = 0; tld->generation = prof_generation; }
   tld->bytes_since_sample += size;
   if (tld->next_threshold == 0) tld->next_threshold = prof_threshold(tld);

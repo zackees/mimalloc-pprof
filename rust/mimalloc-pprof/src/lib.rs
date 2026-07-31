@@ -383,6 +383,49 @@ pub mod prof {
         /// `stack_table_overflows`, so `dropped_samples >=
         /// stack_table_overflows` always.
         pub dropped_samples: usize,
+        /// Allocator-level ("ground truth") counters, read from the mimalloc v3
+        /// engine's per-heap statistics at the time of the call. Every field
+        /// above is *sampled*; these are exact, so comparing them against
+        /// `live_bytes` measures the sampler's error directly -- which is what
+        /// makes an assertion on a sampled profile meaningful in a test.
+        pub heap: HeapStats,
+    }
+
+    /// Exact allocator counters accompanying a [`ProfStats`] reading.
+    ///
+    /// These come from mimalloc v3's per-heap statistics
+    /// (`mi_heap_stats_get`/`mi_subproc_stats_get`), which the v2 engine did not
+    /// expose. They are valid even when the profiler is stopped.
+    #[derive(Debug, Clone, Default)]
+    pub struct HeapStats {
+        /// Bytes currently committed from the OS.
+        pub committed: usize,
+        /// Bytes currently reserved from the OS (always `>= committed`).
+        pub reserved: usize,
+        /// Bytes the application actually requested and still holds.
+        ///
+        /// Only maintained when the C library was built with `MI_STAT >= 2`;
+        /// otherwise this is 0. Check [`HeapStats::detailed`] before using it.
+        pub malloc_requested: usize,
+        /// Live mimalloc pages.
+        pub pages: usize,
+        /// Pages abandoned by exited threads.
+        pub pages_abandoned: usize,
+        /// Live first-class heaps.
+        pub heaps: usize,
+        /// Live thread-local heaps. The main thread's statically-initialized
+        /// theap is not counted, so a single-threaded process reports 0.
+        pub theaps: usize,
+        /// Cumulative bytes purged back to the OS.
+        pub purged: usize,
+        /// Whether the C library was built with `MI_STAT >= 2` ("detailed"
+        /// statistics), which upstream enables by default only for debug
+        /// builds. [`HeapStats::malloc_requested`] is maintained only at that
+        /// level; every other field here is maintained at any level.
+        ///
+        /// Without this flag you cannot tell "the application allocated
+        /// nothing" from "this build does not track that counter".
+        pub detailed: bool,
     }
 
     /// Read the profiler's current counters via `mi_prof_stats_get`.
@@ -407,6 +450,17 @@ pub mod prof {
                 arena_committed: raw.arena_committed,
                 stack_table_overflows: raw.stack_table_overflows,
                 dropped_samples: raw.dropped_samples,
+                heap: HeapStats {
+                    committed: raw.heap_committed,
+                    reserved: raw.heap_reserved,
+                    malloc_requested: raw.heap_malloc_requested,
+                    pages: raw.heap_pages,
+                    pages_abandoned: raw.heap_pages_abandoned,
+                    heaps: raw.heap_count,
+                    theaps: raw.theap_count,
+                    purged: raw.heap_purged,
+                    detailed: raw.heap_stats_detailed,
+                },
             }
         } else {
             ProfStats::default()

@@ -41,6 +41,7 @@
 #define MIMALLOC_MEMORY_EVENTS_H
 
 #include "mimalloc.h"
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

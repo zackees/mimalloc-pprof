@@ -62,8 +62,19 @@ jobs:
           # binaries, this step passed, a partial dist/ was uploaded, and the downstream
           # job failed with a bare `test -n "$generator"` and no output at all.
           set -euo pipefail
-          eval "$BUILD_COMMAND --target $TARGET --release --message-format=json" \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' > bins.txt
+          # soldr#1969: an intermediate can be reclaimed while a slow link is still
+          # reading it, killing individual test binaries. The tool's own advice is to
+          # retry, and to bypass the cache if that fails -- reruns alone do NOT help,
+          # because the restored cache carries the same poisoned entry back in.
+          run_build() {
+            eval "$1 --target $TARGET --release --message-format=json" \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' > bins.txt
+          }
+          cmd="$BUILD_COMMAND"
+          if ! run_build "$cmd"; then
+            echo "::warning::build failed; retrying with the soldr compile cache bypassed (soldr#1969)"
+            run_build "${cmd/soldr/soldr --no-cache}"
+          fi
           test -s bins.txt
           mkdir -p "dist/$TARGET"
           xargs -r -a bins.txt -I{} cp {} "dist/$TARGET/"
@@ -116,8 +127,19 @@ jobs:
           # binaries, this step passed, a partial dist/ was uploaded, and the downstream
           # job failed with a bare `test -n "$generator"` and no output at all.
           set -euo pipefail
-          soldr cargo test --no-run --target "$TARGET" --release --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' > bins.txt
+          # soldr#1969: an intermediate can be reclaimed while a slow link is still
+          # reading it, killing individual test binaries. The tool's own advice is to
+          # retry, and to bypass the cache if that fails -- reruns alone do NOT help,
+          # because the restored cache carries the same poisoned entry back in.
+          run_build() {
+            eval "$1 --target $TARGET --release --message-format=json" \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' > bins.txt
+          }
+          cmd="soldr cargo test --no-run"
+          if ! run_build "$cmd"; then
+            echo "::warning::build failed; retrying with the soldr compile cache bypassed (soldr#1969)"
+            run_build "${cmd/soldr/soldr --no-cache}"
+          fi
           test -s bins.txt
           mkdir -p "dist/$TARGET"
           xargs -r -a bins.txt -I{} cp {} "dist/$TARGET/"

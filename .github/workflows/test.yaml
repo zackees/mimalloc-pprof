@@ -191,3 +191,81 @@ jobs:
           ctest --test-dir out/release-guarded --verbose --timeout 240 -C Release
         env:
           MIMALLOC_GUARDED_SAMPLE_RATE: 100
+
+  # MinGW is currently untested. It is a real deployment target -- MSYS2 ships
+  # mimalloc and the mingw-w64 toolchain is widely used on Windows -- but nothing in
+  # this workflow builds with it, and the Windows init/TLS code has no non-MSVC path:
+  # `src/prim/windows/prim.c` registers its loader TLS callbacks entirely with
+  # `#pragma comment(linker, "/INCLUDE:...")` and `const_seg`/`data_seg`, all of which
+  # GCC silently ignores. The only mode with a documented clang/gcc path is the
+  # deprecated FLS one.
+  #
+  # That gap allowed a thread-exit leak to go unnoticed on both v2 and v3: every
+  # exiting thread leaked its heap and pages, and RSS grew without bound while the
+  # process still exited 0. Because it never crashes, a build-and-run job alone is not
+  # enough to catch it -- so this job also asserts that memory stays bounded.
+  build-mingw:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Debug
+        run: |
+          cmake . -B out/debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          cmake --build out/debug --parallel 8
+          ctest --test-dir out/debug --timeout 240
+
+      - name: Release
+        run: |
+          cmake . -B out/release -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build out/release --parallel 8
+          ctest --test-dir out/release --timeout 240
+
+      # Thread-exit cleanup failures do not crash -- they leak. Run the thread-churning
+      # stress test at two iteration counts and fail if peak memory scales with the
+      # iteration count instead of staying flat. Without the thread-exit fix this shows
+      # roughly 0.24 GB per iteration; with it, memory is flat.
+      #
+      # Uses PowerShell rather than the msys2 shell on purpose: MSYS2's `ps` is the
+      # minimal Cygwin one and does not support `-o rss=`, so peak RSS has to come from
+      # the Win32 process object.
+      - name: Memory must not grow with thread churn
+        shell: pwsh
+        run: |
+          function Get-PeakMB([string]$exe, [int]$iters) {
+            $p = Start-Process -FilePath $exe -ArgumentList "32","50","$iters" `
+                   -PassThru -NoNewWindow -RedirectStandardOutput $env:TEMP\so.txt `
+                   -RedirectStandardError $env:TEMP\se.txt
+            $null = $p.Handle       # cache the handle so ExitCode/PeakWorkingSet64 populate
+            $max = 0
+            while (-not $p.HasExited) {
+              try { $p.Refresh(); if ($p.PeakWorkingSet64 -gt $max) { $max = $p.PeakWorkingSet64 } } catch {}
+              Start-Sleep -Milliseconds 200
+            }
+            $p.WaitForExit()
+            if ($p.ExitCode -ne 0) { throw "$exe exited $($p.ExitCode)" }
+            return [math]::Round($max / 1MB, 1)
+          }
+          $exe = "./out/release/mimalloc-test-stress.exe"
+          $low  = Get-PeakMB $exe 15
+          $high = Get-PeakMB $exe 60
+          Write-Host "peak RSS: 15 iterations = $low MB, 60 iterations = $high MB"
+          # 4x the iterations must not mean anything close to 4x the memory. Allow a
+          # generous 2.5x so this is a leak detector, not a fragile high-water check.
+          $limit = [math]::Round($low * 2.5, 1)
+          if ($high -gt $limit) {
+            Write-Host "::error::Peak RSS scaled with iteration count ($low MB -> $high MB, limit $limit MB). Thread-exit cleanup is likely not running."
+            exit 1
+          }
+          Write-Host "memory is bounded across a 4x increase in thread churn"

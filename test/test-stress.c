@@ -211,7 +211,15 @@ static void stress(intptr_t tid, void* vtransfers) {
       allocs--;
       if (data_top >= data_size) {
         data_size += 100000;
-        data = (void**)custom_realloc(data, data_size * sizeof(void*));
+        void** newdata = (void**)custom_realloc(data, data_size * sizeof(void*));
+        if (newdata == NULL) {
+          fprintf(stderr, "DIAG: custom_realloc(%p, %zu) returned NULL (tid=%d, data_top=%zu, current_heap=%p)
+",
+                  (void*)data, data_size * sizeof(void*), tid, data_top, (void*)current_heap);
+          fflush(stderr);
+          abort();
+        }
+        data = newdata;
       }
       data[data_top++] = alloc_items(1ULL << (pick(&r) % max_item_shift), &r);
     }
@@ -281,6 +289,12 @@ static void test_stress(mi_subproc_id_t subproc) {
     }
     prev_heaps[0] = current_heap;
     current_heap = mi_heap_new();
+    if (current_heap == NULL) {
+      fprintf(stderr, "DIAG: mi_heap_new() returned NULL at iteration %d
+", n);
+      fflush(stderr);
+      abort();
+    }
     #endif
 
     run_os_threads(subproc, THREADS, &stress, transfers);

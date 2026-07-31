@@ -398,6 +398,41 @@ static void test_start_ex_override(void) {
   test_unsetenv("MIMALLOC_PROF_SAMPLE_INTERVAL");
 }
 
+/* T15b2: OVERRIDE must hold for *every* env-backed field, not just sample_interval.
+   This is the documented escape hatch for the shared-namespace hazard (issue #65):
+   MIMALLOC_* is process-global and other libraries embed mimalloc (NVIDIA's display
+   driver ships 3.1.6), so an embedder needs a way to be immune to whatever
+   MIMALLOC_PROF* the ambient environment happens to hold. If OVERRIDE only covered
+   some fields, that guarantee would be quietly false for the rest -- so set every var
+   to a hostile value at once and require the struct to win across the board. */
+static void test_start_ex_override_all_fields(void) {
+  test_setenv("MIMALLOC_PROF_SAMPLE_INTERVAL", "1000");
+  test_setenv("MIMALLOC_PROF_BT_MAX", "7");
+  test_setenv("MIMALLOC_PROF_MAX_BYTES", "65536");
+  test_setenv("MIMALLOC_PROF_ACCUM", "0");
+
+  mi_prof_config_t_decl(cfg);
+  cfg.mode = MI_PROF_CONFIG_OVERRIDE;
+  cfg.sample_interval = 2048;
+  cfg.max_stack_depth = 21;
+  cfg.max_profiler_bytes = 1u << 20;
+  cfg.accum = true;
+  assert(mi_prof_start_ex(&cfg));
+
+  mi_prof_stats_t_decl(stats);
+  assert(mi_prof_stats_get(&stats));
+  assert(stats.sample_rate == 2048);
+  assert(stats.accum);                                          /* env said 0, struct said true */
+  assert(mi_option_get(mi_option_prof_bt_max) == 21);           /* env said 7 */
+  assert(mi_option_get(mi_option_prof_max_bytes) == (1 << 20)); /* env said 65536 */
+
+  mi_prof_stop();
+  test_unsetenv("MIMALLOC_PROF_SAMPLE_INTERVAL");
+  test_unsetenv("MIMALLOC_PROF_BT_MAX");
+  test_unsetenv("MIMALLOC_PROF_MAX_BYTES");
+  test_unsetenv("MIMALLOC_PROF_ACCUM");
+}
+
 /* T15c: MI_PROF_CONFIG_FALLBACK (the default, mode == 0) -- the env var wins over the
    struct field; the struct only fills gaps where env is silent (ops can tune a shipped
    binary without a rebuild). */
@@ -794,6 +829,7 @@ int main(void) {
 #endif
   test_start_ex_default();
   test_start_ex_override();
+  test_start_ex_override_all_fields();
   test_start_ex_fallback();
   test_start_ex_bad_version();
   test_start_ex_max_bytes();

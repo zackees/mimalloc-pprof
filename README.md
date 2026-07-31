@@ -402,6 +402,38 @@ MIMALLOC_PROF_SAMPLE_INTERVAL=524288 \
 `MIMALLOC_PROF_SAMPLE_RATE` remains a compatibility alias for
 `MIMALLOC_PROF_SAMPLE_INTERVAL`; when both are set, `..._INTERVAL` wins.
 
+#### A caution about the shared `MIMALLOC_*` namespace
+
+Environment variables are process-global, and **mimalloc is often embedded in
+libraries you did not choose to load** — NVIDIA's display driver ships mimalloc 3.1.6,
+for instance. Every `MIMALLOC_*` variable is therefore seen by every mimalloc instance
+in the process.
+
+That is inherent to mimalloc's option mechanism rather than something this fork
+introduced: `mi_option_init` hardcodes the `mimalloc_` prefix, and the profiler's
+options are registered in mimalloc's own option table, so their env names follow from
+that. It applies equally to upstream's `MIMALLOC_SHOW_STATS`, `MIMALLOC_VERBOSE`, and
+friends. Renaming ours to a private prefix would not fix the shared-namespace problem;
+it would only move our share of it, at the cost of the published 0.9.0 API.
+
+**If you are embedding this library and need to be immune to the ambient environment,
+do not rely on the variable names — use `MI_PROF_CONFIG_OVERRIDE`:**
+
+```c
+mi_prof_config_t_decl(cfg);           /* zeroed, with size + version filled in */
+cfg.mode = MI_PROF_CONFIG_OVERRIDE;   /* struct wins over env, field by field */
+cfg.sample_interval = 2048;
+if (!mi_prof_start_ex(&cfg)) return 1;
+```
+
+The default mode, `MI_PROF_CONFIG_FALLBACK`, is the opposite: env wins and the struct
+only fills gaps, so ops can tune a shipped binary without a rebuild. Both directions are
+covered by the test suite for every env-backed field, not just some of them.
+
+One asymmetry to know about: because `0`/`NULL` doubles as "field not set", `OVERRIDE`
+cannot force `accum` *off* or `max_profiler_bytes` back to unbudgeted — those fall
+through to env-then-default. It can force them on.
+
 ### Allocator statistics in the profile (v3 only)
 
 v3 exposes per-heap and per-subprocess counters (`mi_heap_stats_get`,

@@ -89,22 +89,35 @@ jobs:
       # and only add -g, so debugging does not change what is being debugged.
       - run: cmake -B build -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS=-g
       - run: cmake --build build
-      # MI_DEBUG_FULL turns on mimalloc's internal invariant assertions, so we learn
-      # WHICH invariant breaks instead of only seeing the later segfault victim.
-      # Each run is wrapped in `timeout` so this step ALWAYS completes -- a step that
-      # gets cancelled makes the whole job's logs undownloadable, which has already
-      # cost several cycles here.
-      - name: probe - MI_DEBUG_FULL on win-gnu
-        timeout-minutes: 45
+      # MI_DEBUG_FULL (MI_DEBUG=3, full internal invariant checking -- note mimalloc
+      # uses its own _mi_assert_fail gated on MI_DEBUG, so NDEBUG is irrelevant) did
+      # NOT trip any assertion; it segfaults outright. So this is not allocator
+      # metadata corruption that mimalloc's own invariants can see. Get the exact
+      # faulting instruction instead.
+      #
+      # -g1 (line tables only) keeps debug info small: full -g produced a
+      # ".debug_loclists is too large" BFD error that made gdb useless.
+      # Every run is bounded so the step always completes and the log survives.
+      - name: probe - faulting instruction at -O2 -g1
+        timeout-minutes: 30
         run: |
           set +e
-          cmake -B b-dbgfull -G Ninja -DMI_PPROF=ON -DMI_DEBUG_FULL=ON > /dev/null 2>&1
-          cmake --build b-dbgfull > /dev/null 2>&1 || { echo "BUILD FAILED"; exit 0; }
-          echo "===== full workload (bounded to 10 min) ====="
-          timeout 600 ./b-dbgfull/mimalloc-test-stress-heaps.exe > out1.log 2>&1
-          echo "exit=$?  (124 = hit the time bound, not a crash)"
-          tail -30 out1.log
-          echo "===== reduced workload 16 threads / scale 25 / 15 iters (bounded to 8 min) ====="
-          timeout 480 ./b-dbgfull/mimalloc-test-stress-heaps.exe 16 25 15 > out2.log 2>&1
-          echo "exit=$?  (124 = hit the time bound, not a crash)"
-          tail -30 out2.log
+          cmake -B b-bt -G Ninja -DMI_PPROF=ON -DCMAKE_C_FLAGS="-O2 -g1 -fno-omit-frame-pointer" > /dev/null 2>&1
+          cmake --build b-bt > /dev/null 2>&1 || { echo "BUILD FAILED"; exit 0; }
+          for i in 1 2 3; do
+            echo "===== attempt $i ====="
+            timeout 300 gdb -batch               -ex run               -ex "echo 
+==== FRAME ====
+" -ex "bt 40"               -ex "echo 
+==== FAULTING INSN ====
+" -ex "x/i \$rip"               -ex "echo 
+==== REGS ====
+" -ex "info registers rip rsp rbp rax rbx"               --args ./b-bt/mimalloc-test-stress-heaps.exe > bt.log 2>&1
+            echo "gdb exit=$?"
+            if grep -qiE "SIGSEGV|Segmentation" bt.log; then
+              echo "*** reproduced on attempt $i ***"
+              grep -avE "^\[New Thread|^\[Thread" bt.log | tail -60
+              exit 0
+            fi
+            echo "no crash on attempt $i"
+          done

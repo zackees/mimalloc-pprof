@@ -118,6 +118,21 @@ jobs:
             exit 0
           fi
           exit $rc
+      # A gate that has never been observed to fire proves nothing -- it can be broken
+      # for months while every run stays green. Build a deliberately leaky copy and
+      # require the same comparison to catch it. This step failing means the gate above
+      # is decoration, so it is a hard failure, not a warning.
+      - name: Positive control -- the gate must catch an injected leak
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -B build-leak -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
+          cmake --build build-leak --config Release --target mimalloc-test-memory-gate
+          exe=$(find build-leak -name 'mimalloc-test-memory-gate*' -type f -perm -u+x | head -1)
+          for i in 1 2 3 4; do
+            MI_BENCH_JSON="leak-$i.json" "$exe" > /dev/null || true
+          done
+          python3 ci/memory_gate.py control leak-*.json
       - uses: actions/upload-artifact@v4
         with:
           name: memory-gate-${{ matrix.os }}

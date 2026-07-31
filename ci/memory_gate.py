@@ -20,6 +20,7 @@ ever approaches the tolerance, the tolerance is wrong and the printout says so.
 Usage:
     memory_gate.py check   <result.json> [more.json ...]
     memory_gate.py update  <result.json> [more.json ...]   # deliberate, reviewed act
+    memory_gate.py control <result.json> [more.json ...]   # positive control: must FAIL
 
 Exit codes: 0 pass, 1 regression, 2 usage/IO error.
 """
@@ -98,19 +99,49 @@ def report_runs(peaks, spread):
               "justification.".format(spread, 100.0 * PEAK_TOLERANCE))
 
 
-def check(result_paths):
+def control(result_paths):
+    """Positive control: require the gate to FAIL on a deliberately leaky build.
+
+    A gate that has never been observed to fire proves nothing -- it can be silently
+    broken for months and every run still looks green. So CI builds a copy with
+    MI_BENCH_INJECT_LEAK, runs it through the very same comparison, and this command
+    inverts the verdict: exit 0 only if `check` would have failed.
+
+    Requiring inject_leak to be *set* is what keeps this from being usable as an escape
+    hatch -- it cannot be pointed at a real regression to turn it green.
+    """
+    result, _, _ = load_runs(result_paths)
+    if not result.get("inject_leak", 0):
+        print("REFUSING: positive control requires a build with MI_BENCH_INJECT_LEAK "
+              "set. This run has none, so a failure here would mean a real regression, "
+              "not a working control.")
+        return 2
+
+    print("=== positive control: the gate is expected to FAIL below ===")
+    rc = check(result_paths, _control=True)
+    if rc == 1:
+        print("\nPASS (control): the gate detected the injected leak.")
+        return 0
+    print("\nFAIL (control): the gate did NOT detect an injected leak (rc={}).".format(rc))
+    print("The gate is not working. A green `check` on a real build means nothing")
+    print("until this passes.")
+    return 1
+
+
+def check(result_paths, _control=False):
     result, peaks, spread = load_runs(result_paths)
 
-    if result.get("inject_leak", 0):
+    if result.get("inject_leak", 0) and not _control:
         # An injected-leak run is a positive control; it is expected to fail and must
         # never be mistaken for a real result or used to re-baseline.
         print("REFUSING: this run has MI_BENCH_INJECT_LEAK set and is a positive "
-              "control, not a measurement.")
+              "control, not a measurement. Use `memory_gate.py control` for that.")
         return 2
 
     bpath = baseline_path(result)
     if not os.path.exists(bpath):
         print("No baseline at {}.".format(bpath))
+        report_runs(peaks, spread)
         print("This platform/config has never been recorded. Create it with:")
         print("    python ci/memory_gate.py update {}".format(" ".join(result_paths)))
         return 2
@@ -183,11 +214,12 @@ def update(result_paths):
 
 
 def main(argv):
-    if len(argv) < 3 or argv[1] not in ("check", "update"):
+    if len(argv) < 3 or argv[1] not in ("check", "update", "control"):
         print(__doc__)
         return 2
     try:
-        return check(argv[2:]) if argv[1] == "check" else update(argv[2:])
+        cmd = {"check": check, "update": update, "control": control}[argv[1]]
+        return cmd(argv[2:])
     except (OSError, ValueError, KeyError) as e:
         print("error: {}".format(e))
         return 2

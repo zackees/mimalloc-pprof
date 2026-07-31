@@ -254,6 +254,29 @@ Two details worth stating, because both were assumptions that measurement overtu
   Hence `pyright --strict` over `ci/`, with the result schema declared rather than
   indexed by hope.
 
+### What the hardening pass changed
+
+A hardening pass over v3 ([#61](https://github.com/zackees/mimalloc-pprof/issues/61))
+landed the following. Each row says where it came from, because "is this ours, upstream's,
+or someone else's?" should not require reading git history.
+
+| Change | Source | Why |
+|---|---|---|
+| Memory + counter regression gate, per-platform baselines | this fork | The two leaks below passed every existing test. Nothing asked whether memory stayed bounded. |
+| ISA baseline check (x64 + arm64) | prompted by Debian #1094881 / Fedora #2342055 | Above-baseline instructions SIGILL on older CPUs. Debian and Fedora independently found `MI_OPT_ARCH=OFF` is a no-op on arm64 — confirmed here. |
+| Shared-library CI (ubuntu + win-gnu) | prompted by conda-forge's `extern inline` patch | Our single-TU amalgamation hides link errors that only appear in a real DLL/so. Found 4 test targets that broke shared-only builds. |
+| `MI_PROF_CONFIG_OVERRIDE` tested on every env-backed field | this fork | `MIMALLOC_*` is process-global and other libraries embed mimalloc. This is the documented way to be immune to the ambient environment. |
+| `ruff` + `pyright --strict` over `ci/` | this fork | The gating layer was itself unchecked; two silent gate failures were Python bugs. |
+| `-Wmaybe-uninitialized` fix in `src/profile.c` | this fork | Noise in every build log is where a real warning hides. |
+
+**Not adopted, deliberately:** a background purge thread and hole purging (both from
+[Bun's fork](https://github.com/oven-sh/mimalloc)) — the first can decommit a page while a
+live sample record still points into it, the second adds ~1000 lines to the file we already
+patch most. Two Bun correctness fixes were evaluated and **rejected as already fixed
+upstream** (`b6dc592b`, `66fd7a99`); Bun themselves dropped both in favour of upstream's
+versions. Reasoning and per-change ratings are in
+[`MIMALLOC_FORKS.md`](MIMALLOC_FORKS.md).
+
 ### How v3 was validated
 
 v3 was held to the same bar as v2 before it became the mainline — identical

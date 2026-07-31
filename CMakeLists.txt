@@ -895,6 +895,20 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-profile-race PROPERTIES TIMEOUT 300)
   endif()
 
+  # Degenerate memory patterns and memory-bound regression guards (issue #47).
+  # Independent of MI_PPROF: it guards allocator behavior, not the profiler.
+  add_executable(mimalloc-test-degenerate test/test-degenerate.c)
+  target_compile_definitions(mimalloc-test-degenerate PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-degenerate PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-degenerate PRIVATE include)
+  target_link_libraries(mimalloc-test-degenerate PRIVATE mimalloc-static ${mi_libraries})
+  if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(mimalloc-test-degenerate PRIVATE Threads::Threads)
+  endif()
+  add_test(NAME test-degenerate COMMAND mimalloc-test-degenerate)
+  set_tests_properties(test-degenerate PROPERTIES TIMEOUT 600)
+
   # memory-events (issue #20): independent of MI_PPROF, always built/registered.
   add_executable(mimalloc-test-memory-events test/test-memory-events.c)
   target_compile_definitions(mimalloc-test-memory-events PRIVATE ${mi_defines})

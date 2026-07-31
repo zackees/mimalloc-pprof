@@ -213,8 +213,12 @@ static void stress(intptr_t tid, void* vtransfers) {
         data_size += 100000;
         void** newdata = (void**)custom_realloc(data, data_size * sizeof(void*));
         if (newdata == NULL) {
+          void* diag_heap = NULL;
+          #ifdef MI_USE_HEAPS
+          diag_heap = (void*)current_heap;   /* only declared in the rolling-heaps config */
+          #endif
           fprintf(stderr, "DIAG: custom_realloc(%p, %zu) returned NULL (tid=%d, data_top=%zu, current_heap=%p)\n",
-                  (void*)data, data_size * sizeof(void*), tid, data_top, (void*)current_heap);
+                  (void*)data, data_size * sizeof(void*), tid, data_top, diag_heap);
           fflush(stderr);
           abort();
         }

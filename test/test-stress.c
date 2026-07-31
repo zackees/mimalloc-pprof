@@ -213,8 +213,7 @@ static void stress(intptr_t tid, void* vtransfers) {
         data_size += 100000;
         void** newdata = (void**)custom_realloc(data, data_size * sizeof(void*));
         if (newdata == NULL) {
-          fprintf(stderr, "DIAG: custom_realloc(%p, %zu) returned NULL (tid=%d, data_top=%zu, current_heap=%p)
-",
+          fprintf(stderr, "DIAG: custom_realloc(%p, %zu) returned NULL (tid=%d, data_top=%zu, current_heap=%p)\n",
                   (void*)data, data_size * sizeof(void*), tid, data_top, (void*)current_heap);
           fflush(stderr);
           abort();
@@ -290,8 +289,7 @@ static void test_stress(mi_subproc_id_t subproc) {
     prev_heaps[0] = current_heap;
     current_heap = mi_heap_new();
     if (current_heap == NULL) {
-      fprintf(stderr, "DIAG: mi_heap_new() returned NULL at iteration %d
-", n);
+      fprintf(stderr, "DIAG: mi_heap_new() returned NULL at iteration %d\n", n);
       fflush(stderr);
       abort();
     }

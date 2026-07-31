@@ -635,6 +635,83 @@ static void test_stats_v3_heap_stats(void) {
   assert(after.heap_committed > 0);         /* allocator counters survive prof_stop */
 }
 
+/* T17: aligned allocations must be tracked and released correctly.
+   Gap found by surveying other v3 profiler forks (meta issue #50): the profiler test
+   suite never exercised mi_malloc_aligned at all. mi_malloc_aligned can hand back a
+   pointer that is not the start of the underlying block, so if the free hook fails to
+   resolve it back to its sample the record is never released -- live_samples/live_bytes
+   would drift upward forever for any application that uses aligned allocation. */
+static void test_aligned_allocations_are_tracked(void) {
+  assert(mi_prof_start_seeded(1, 149));   /* rate 1: sample every allocation */
+  mi_prof_stats_t_decl(before);
+  assert(mi_prof_stats_get(&before));
+
+  enum { count = 64 };
+  void* blocks[count];
+  size_t total = 0;
+  for (size_t i = 0; i < count; i++) {
+    const size_t align = (size_t)1 << (3 + (i % 6));   /* 8 .. 256 */
+    const size_t size  = 100 + (i * 13);
+    blocks[i] = mi_malloc_aligned(size, align);
+    assert(blocks[i] != NULL);
+    assert(((uintptr_t)blocks[i] % align) == 0);
+    memset(blocks[i], 0x3C, size);
+    total += size;
+  }
+
+  mi_prof_stats_t_decl(during);
+  assert(mi_prof_stats_get(&during));
+  assert(during.live_samples >= before.live_samples + count);
+  assert(during.live_bytes >= before.live_bytes + total);
+
+  dump_profile();   /* must still be parseable with aligned blocks live */
+
+  for (size_t i = 0; i < count; i++) { mi_free(blocks[i]); }
+
+  /* The real assertion: every aligned block was resolved back to its sample. */
+  mi_prof_stats_t_decl(after);
+  assert(mi_prof_stats_get(&after));
+  assert(after.live_samples == before.live_samples);
+  assert(after.live_bytes == before.live_bytes);
+
+  /* and the same through the aligned realloc/free paths */
+  void* p = mi_malloc_aligned(256, 64);
+  assert(p != NULL && ((uintptr_t)p % 64) == 0);
+  p = mi_realloc_aligned(p, 4096, 64);
+  assert(p != NULL && ((uintptr_t)p % 64) == 0);
+  mi_free(p);
+  mi_prof_stats_t_decl(after2);
+  assert(mi_prof_stats_get(&after2));
+  assert(after2.live_samples == before.live_samples);
+
+  mi_prof_stop();
+}
+
+/* T18: a profile with nothing live must still be well-formed.
+   An empty dump that is truncated or missing its header breaks every downstream pprof
+   reader, and it is the state a process is in if it is profiled but idle. */
+static void test_empty_profile_is_valid(void) {
+  assert(mi_prof_start_seeded(4096, 151));
+
+  /* Confirm we really are exercising the empty case, then assert the dump is still
+     structurally complete. Deliberately not matching the header's exact column widths
+     -- that is formatting, not contract, and it made this assertion fragile. */
+  mi_prof_stats_t_decl(empty);
+  assert(mi_prof_stats_get(&empty));
+  assert(empty.live_samples == 0);
+
+  /* text format: header, format tag and the maps section must all be present even with
+     zero samples (dump_profile asserts exactly that). */
+  dump_profile();
+
+  /* proto format must also be a valid, parseable Profile with zero samples. */
+  t12_buf_t out = { t12_proto_buf, 0, sizeof(t12_proto_buf) };
+  assert(mi_prof_dump_proto_writer(t12_write, &out));
+  assert(out.len > 0);   /* not empty: value types, mappings and string table remain */
+
+  mi_prof_stop();
+}
+
 int main(void) {
   enum { count = 1000, size = 512 };
   void* blocks[count];
@@ -724,6 +801,8 @@ int main(void) {
   test_stats_v1_compat();
   test_stats_v2_full();
   test_stats_v3_heap_stats();
+  test_aligned_allocations_are_tracked();
+  test_empty_profile_is_valid();
   if (getenv("MIMALLOC_PROF_DUMP_AT_EXIT") != NULL) {
     assert(mi_prof_start_seeded(1, 47));
     assert(mi_malloc(4096) != NULL);  /* Preserve one real sample for pprof validation. */

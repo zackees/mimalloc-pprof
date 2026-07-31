@@ -39,10 +39,20 @@ import sys
 ABOVE_BASELINE = {
     # x86-64-v1 baseline (what Debian/RHEL x86_64 targets).  BMI1/BMI2/ABM/AVX2.
     "x64": {
-        "rorx": "BMI2", "mulx": "BMI2", "pdep": "BMI2", "pext": "BMI2",
-        "shlx": "BMI2", "shrx": "BMI2", "sarx": "BMI2", "bzhi": "BMI2",
-        "andn": "BMI1", "blsi": "BMI1", "blsr": "BMI1", "blsmsk": "BMI1",
-        "lzcnt": "ABM", "popcnt": "SSE4.2",
+        "rorx": "BMI2",
+        "mulx": "BMI2",
+        "pdep": "BMI2",
+        "pext": "BMI2",
+        "shlx": "BMI2",
+        "shrx": "BMI2",
+        "sarx": "BMI2",
+        "bzhi": "BMI2",
+        "andn": "BMI1",
+        "blsi": "BMI1",
+        "blsr": "BMI1",
+        "blsmsk": "BMI1",
+        "lzcnt": "ABM",
+        "popcnt": "SSE4.2",
         # NOT listed: `tzcnt`. It is encoded as `rep bsf`, and the F3 prefix is ignored
         # by pre-BMI1 CPUs, which therefore execute it as plain `bsf` -- same result for
         # every non-zero input. GCC consequently emits it at plain `-march=x86-64`
@@ -50,17 +60,40 @@ ABOVE_BASELINE = {
         # `bsr`, not `lzcnt`). Flagging it made the x64 portable build fail on 27 hits
         # that were never a portability problem. `lzcnt` stays: it decodes as `bsr` on
         # old CPUs, which silently returns a *different* value rather than the same one.
-        "vpermd": "AVX2", "vpbroadcastd": "AVX2", "vpbroadcastq": "AVX2",
+        "vpermd": "AVX2",
+        "vpbroadcastd": "AVX2",
+        "vpbroadcastq": "AVX2",
     },
     # armv8.0-a baseline.  LSE atomics (8.1) are the ones mimalloc actually pulls in.
     "arm64": {
-        "ldadd": "LSE", "ldadda": "LSE", "ldaddal": "LSE", "ldaddl": "LSE",
-        "ldclr": "LSE", "ldclra": "LSE", "ldclral": "LSE", "ldclrl": "LSE",
-        "ldeor": "LSE", "ldeora": "LSE", "ldeoral": "LSE", "ldeorl": "LSE",
-        "ldset": "LSE", "ldseta": "LSE", "ldsetal": "LSE", "ldsetl": "LSE",
-        "swp": "LSE", "swpa": "LSE", "swpal": "LSE", "swpl": "LSE",
-        "cas": "LSE", "casa": "LSE", "casal": "LSE", "casl": "LSE",
-        "casp": "LSE", "caspa": "LSE", "caspal": "LSE", "caspl": "LSE",
+        "ldadd": "LSE",
+        "ldadda": "LSE",
+        "ldaddal": "LSE",
+        "ldaddl": "LSE",
+        "ldclr": "LSE",
+        "ldclra": "LSE",
+        "ldclral": "LSE",
+        "ldclrl": "LSE",
+        "ldeor": "LSE",
+        "ldeora": "LSE",
+        "ldeoral": "LSE",
+        "ldeorl": "LSE",
+        "ldset": "LSE",
+        "ldseta": "LSE",
+        "ldsetal": "LSE",
+        "ldsetl": "LSE",
+        "swp": "LSE",
+        "swpa": "LSE",
+        "swpal": "LSE",
+        "swpl": "LSE",
+        "cas": "LSE",
+        "casa": "LSE",
+        "casal": "LSE",
+        "casl": "LSE",
+        "casp": "LSE",
+        "caspa": "LSE",
+        "caspal": "LSE",
+        "caspl": "LSE",
     },
 }
 
@@ -94,8 +127,10 @@ def disassemble(target: str) -> str:
         # one silently matches nothing on the other, turning a broken scan into a
         # "clean" PASS. (That is not hypothetical: it is exactly what the arm64
         # positive control caught the first time this ran in CI.)
-        tool + ["-d", "--no-show-raw-insn", target],
-        capture_output=True, text=True, errors="replace",
+        [*tool, "-d", "--no-show-raw-insn", target],
+        capture_output=True,
+        text=True,
+        errors="replace",
     )
     # objdump exits nonzero on archives whose members it cannot read, while still
     # emitting usable output for the rest.  Only bail if we got nothing at all.
@@ -124,7 +159,8 @@ def scan(disasm: str, arch: str) -> dict[str, int]:
 # scan report "clean" -- only the positive control caught it, and only because CI has an
 # arm64 runner. These fixtures make the parser testable on any host.
 SELFTEST_FIXTURES = {
-    "x64": ("""
+    "x64": (
+        """
 0000000000000000 <mi_test>:
    0:	push   %rbp
    4:	rorx   $0x10,%ecx,%ecx
@@ -133,8 +169,11 @@ SELFTEST_FIXTURES = {
   13:	andn   %eax,%ebx,%ecx
   17:	tzcnt  %ecx,%ecx
   1b:	retq
-""", {"rorx": 1, "popcnt": 1, "andn": 1}),   # tzcnt deliberately absent: see ABOVE_BASELINE
-    "arm64": ("""
+""",
+        {"rorx": 1, "popcnt": 1, "andn": 1},
+    ),  # tzcnt deliberately absent: see ABOVE_BASELINE
+    "arm64": (
+        """
 0000000000000000 <mi_test>:
    0:	stp	x29, x30, [sp, #-16]!
    4:	casal	w0, w1, [x2]
@@ -142,7 +181,9 @@ SELFTEST_FIXTURES = {
    c:	add	x0, x1, x2
   10:	swpa	w6, w7, [x8]
   14:	ret
-""", {"casal": 1, "ldaddal": 1, "swpa": 1}),
+""",
+        {"casal": 1, "ldaddal": 1, "swpa": 1},
+    ),
 }
 
 
@@ -163,17 +204,28 @@ def selftest() -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("target", nargs="?", help="library or executable to inspect")
-    ap.add_argument("--selftest", action="store_true",
-                    help="check the disassembly parser against built-in fixtures and exit")
+    ap.add_argument(
+        "--selftest",
+        action="store_true",
+        help="check the disassembly parser against built-in fixtures and exit",
+    )
     ap.add_argument("--arch", choices=sorted(ABOVE_BASELINE), default=None)
     mode = ap.add_mutually_exclusive_group()
-    mode.add_argument("--expect-clean", action="store_true", default=True,
-                      help="fail if any above-baseline instruction is present (default)")
-    mode.add_argument("--expect-dirty", action="store_true",
-                      help="positive control: fail if the scan finds NOTHING")
+    mode.add_argument(
+        "--expect-clean",
+        action="store_true",
+        default=True,
+        help="fail if any above-baseline instruction is present (default)",
+    )
+    mode.add_argument(
+        "--expect-dirty",
+        action="store_true",
+        help="positive control: fail if the scan finds NOTHING",
+    )
     args = ap.parse_args()
 
     if args.selftest:
@@ -207,8 +259,10 @@ def main() -> int:
         print("     force-sets it back ON unless MI_NO_OPT_ARCH is what you passed.")
         return 1
 
-    print(f"PASS {label}: no above-baseline instructions "
-          f"({len(ABOVE_BASELINE[arch])} mnemonics checked)")
+    print(
+        f"PASS {label}: no above-baseline instructions "
+        f"({len(ABOVE_BASELINE[arch])} mnemonics checked)"
+    )
     return 0
 
 

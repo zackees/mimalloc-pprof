@@ -7,7 +7,7 @@ use core::ffi::c_void;
 pub type MiProfWriteFun = unsafe extern "C" fn(*mut c_void, *const c_char, usize);
 
 /// Mirrors `MI_PROF_STAT_VERSION` in `include/mimalloc/profile.h`.
-pub const MI_PROF_STAT_VERSION: c_int = 2;
+pub const MI_PROF_STAT_VERSION: c_int = 3;
 
 /// Mirrors `mi_prof_stats_t` (include/mimalloc/profile.h) field-for-field.
 #[repr(C)]
@@ -30,6 +30,21 @@ pub struct mi_prof_stats_t {
     /// `MI_PROF_STACK_CAP` cap); `stack_table_overflows` is a subset, so
     /// `dropped_samples >= stack_table_overflows` always.
     pub dropped_samples: usize,
+    /// v3. Allocator-level ("ground truth") counters read from `mi_stats_get()`.
+    /// Unlike every field above, these are exact rather than sampled.
+    pub heap_committed: usize,
+    pub heap_reserved: usize,
+    pub heap_malloc_requested: usize,
+    pub heap_pages: usize,
+    pub heap_pages_abandoned: usize,
+    pub heap_count: usize,
+    /// Live thread-local heaps. The main thread's statically-initialized theap
+    /// is not counted, so a single-threaded process reports 0.
+    pub theap_count: usize,
+    pub heap_purged: usize,
+    /// True when the C library was built with `MI_STAT >= 2`. `heap_malloc_requested`
+    /// is only maintained at that level; a default release build reports 0.
+    pub heap_stats_detailed: bool,
 }
 
 /// Mirrors `MI_PROF_CONFIG_VERSION` in `include/mimalloc/profile.h`.

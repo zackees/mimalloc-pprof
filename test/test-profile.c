@@ -548,23 +548,91 @@ static void test_stats_v1_compat(void) {
   mi_prof_stop();
 }
 
-/* T16c: the full v2 struct correctly reports dropped_samples for a fresh, non-budgeted
-   session (no drops expected -- proves v2 doesn't spuriously report drops). */
+/* T16c: a v2-sized struct (size == offsetof(heap_committed), version == 2) still reports
+   dropped_samples for a fresh, non-budgeted session (no drops expected -- proves v2 doesn't
+   spuriously report drops), and must NOT have the v3 heap-stats fields written past its
+   declared size. */
 static void test_stats_v2_full(void) {
   assert(mi_prof_start_seeded(4096, 97));
   enum { count = 64, size = 4096 };
   void* blocks[count];
   for (size_t i = 0; i < count; i++) blocks[i] = mi_malloc(size);
 
-  mi_prof_stats_t_decl(stats);
-  assert(stats.version == 2);
-  assert(stats.size == sizeof(mi_prof_stats_t));
+  mi_prof_stats_t stats;
+  memset(&stats, 0xAB, sizeof(stats));  /* poison so a stray v3 write is visible */
+  stats.size = offsetof(mi_prof_stats_t, heap_committed);
+  stats.version = 2;
   assert(mi_prof_stats_get(&stats));
   assert(stats.dropped_samples == 0);  /* unbudgeted session: nothing should have been dropped. */
   assert(stats.dropped_samples >= stats.stack_table_overflows);
+  /* Everything from heap_committed onward is past the v2 bound: still poisoned. */
+  unsigned char* tail = (unsigned char*)&stats.heap_committed;
+  const size_t tail_len = sizeof(mi_prof_stats_t) - offsetof(mi_prof_stats_t, heap_committed);
+  bool still_poisoned = true;
+  for (size_t i = 0; i < tail_len; i++) if (tail[i] != 0xAB) still_poisoned = false;
+  assert(still_poisoned);
 
   for (size_t i = 0; i < count; i++) mi_free(blocks[i]);
   mi_prof_stop();
+}
+
+/* T16d (v3): the allocator ground-truth counters must be populated and must be consistent
+   with the sampled numbers. This is the check that catches a sampled profile silently
+   under-counting: the exact committed/requested bytes come straight from the v3 engine's
+   per-heap stats, independent of the sampler. */
+static void test_stats_v3_heap_stats(void) {
+  enum { count = 256, size = 8192 };
+  void* blocks[count];
+
+  mi_prof_stats_t_decl(before);
+  assert(before.version == 3);
+  assert(before.size == sizeof(mi_prof_stats_t));
+  assert(mi_prof_stats_get(&before));
+  /* Valid even with the profiler stopped -- these are allocator counters, not sampler state. */
+  assert(!before.enabled);
+  assert(before.heap_reserved >= before.heap_committed);
+
+  assert(mi_prof_start_seeded(4096, 131));
+  for (size_t i = 0; i < count; i++) { blocks[i] = mi_malloc(size); assert(blocks[i] != NULL); }
+
+  mi_prof_stats_t_decl(during);
+  assert(mi_prof_stats_get(&during));
+  assert(during.enabled);
+  /* ~2 MiB of live blocks. malloc_requested is exact (unsampled), so it must account for
+     at least everything we just allocated -- this is the check that catches the sampler
+     silently under-counting. It is only maintained at MI_STAT >= 2 though (debug builds
+     by default), so a release build reports 0 and must assert the opposite. */
+  if (during.heap_stats_detailed) {
+    assert(during.heap_malloc_requested >= (size_t)count * size);
+  } else {
+    assert(during.heap_malloc_requested == 0);
+  }
+  assert(during.heap_committed > 0);
+  assert(during.heap_reserved >= during.heap_committed);
+  assert(during.heap_pages > 0);
+  assert(during.heap_count > 0);
+  assert(during.heap_committed >= before.heap_committed);   /* allocator grew */
+  assert(during.live_samples > 0);
+
+  /* The dump must carry the same numbers as a comment block. */
+  dump_profile();
+  assert(strstr(dump_text, "# mimalloc heap stats\n") != NULL);
+  assert(strstr(dump_text, "# committed = ") != NULL);
+  assert(strstr(dump_text, "# theaps = ") != NULL);
+  /* The profile records whether this build tracks the MI_STAT>=2 counters, so a reader
+     can tell a real 0 from an untracked one. */
+  assert(strstr(dump_text, during.heap_stats_detailed ? "# detailed_stats = 1\n"
+                                                      : "# detailed_stats = 0\n") != NULL);
+  /* Comment block sits between the samples and MAPPED_LIBRARIES. */
+  assert(strstr(dump_text, "# mimalloc heap stats\n") < strstr(dump_text, "MAPPED_LIBRARIES:\n"));
+
+  for (size_t i = 0; i < count; i++) mi_free(blocks[i]);
+  mi_prof_stop();
+
+  mi_prof_stats_t_decl(after);
+  assert(mi_prof_stats_get(&after));
+  assert(after.live_samples == 0);          /* sampler drained */
+  assert(after.heap_committed > 0);         /* allocator counters survive prof_stop */
 }
 
 int main(void) {
@@ -655,6 +723,7 @@ int main(void) {
   test_dropped_samples_and_stats_v2();
   test_stats_v1_compat();
   test_stats_v2_full();
+  test_stats_v3_heap_stats();
   if (getenv("MIMALLOC_PROF_DUMP_AT_EXIT") != NULL) {
     assert(mi_prof_start_seeded(1, 47));
     assert(mi_malloc(4096) != NULL);  /* Preserve one real sample for pprof validation. */

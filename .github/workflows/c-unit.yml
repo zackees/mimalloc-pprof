@@ -74,6 +74,20 @@ jobs:
             echo ">>>> STOCK $rev: $fails failures / 6 runs"
           done
 
+  # TEMPORARY: is the rolling-heaps memory growth Windows-specific? Same test, Linux.
+  linux-rss-control:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: measure RSS growth on Linux
+        timeout-minutes: 20
+        run: |
+          set +e
+          cmake -B b -G Ninja -DMI_PPROF=ON > /dev/null 2>&1 || cmake -B b -DMI_PPROF=ON > /dev/null 2>&1
+          cmake --build b > /dev/null 2>&1 || { echo "BUILD FAILED"; exit 0; }
+          timeout 600 ./b/mimalloc-test-stress-heaps 2>&1 | grep -E "^ITER" | awk 'NR<=3 || NR%12==0 || NR>=49'
+          echo "exit=$?"
+
   ctest-win-gnu:
     runs-on: windows-latest
     defaults:

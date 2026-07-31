@@ -313,6 +313,12 @@ static void test_stress(mi_subproc_id_t subproc) {
     #endif
 
     run_os_threads(subproc, THREADS, &stress, transfers);
+    {
+      size_t _rss=0,_prss=0,_cm=0,_pcm=0;
+      mi_process_info(NULL,NULL,NULL,&_rss,&_prss,&_cm,&_pcm,NULL);
+      fprintf(stderr, "ITER %2d: rss=%.2f GB commit=%.2f GB\n", n, (double)_rss/1073741824.0, (double)_cm/1073741824.0);
+      fflush(stderr);
+    }
 
     #if !defined(NDEBUG) && !defined(USE_STD_MALLOC)
     // switch between arena and OS allocation for testing

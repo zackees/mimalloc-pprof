@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/niteris/dev/mimalloc-pprof/build-nobt/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

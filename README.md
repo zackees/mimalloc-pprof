@@ -41,28 +41,50 @@ lines are published, as two version ranges of the same `mimalloc-pprof` crate:
 | | **v2 engine** | **v3 engine** |
 |---|---|---|
 | Crate | [`mimalloc-pprof` 0.8.x](https://crates.io/crates/mimalloc-pprof) — [crates.io](https://crates.io/crates/mimalloc-pprof/0.8.0), [docs.rs](https://docs.rs/mimalloc-pprof/0.8.0) | 0.9.x — **not yet published to crates.io** |
-| Where it lives | `main` | the [`v3`](https://github.com/zackees/mimalloc-pprof/tree/v3) branch |
+| Where it lives | the [`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch | `main` |
 | Upstream base | mimalloc v2 (`upstream/main`) | mimalloc v3 (`upstream/dev3`) |
-| Maturity | **Stable.** The default choice. | **Beta.** Upstream v3 is itself pre-release. |
+| Maturity | Previous line; still what crates.io serves. | **Current mainline.** Upstream v3 is still pre-release. |
 | Allocator design | segment allocator | arena-of-slices + page-map; `mi_heap_t`/`mi_theap_t` split |
 | Allocator statistics | process-wide totals only | **per-heap and per-subprocess** (see below) |
 | Profiler API | identical | identical, plus the v3 `mi_prof_stats_t` fields below |
 
 ```toml
-# Stable v2 engine, from crates.io
+# v2 engine, from crates.io (what `cargo add mimalloc-pprof` gives you today)
 mimalloc-pprof = "0.8"
 
-# Beta v3 engine -- not on crates.io yet, so take it from the v3 branch
-mimalloc-pprof = { git = "https://github.com/zackees/mimalloc-pprof", branch = "v3" }
+# v3 engine -- on `main`, not on crates.io yet
+mimalloc-pprof = { git = "https://github.com/zackees/mimalloc-pprof" }
 ```
 
-**Pick v2 (0.8.x) unless you specifically want v3.** The profiler API, the
-environment variables, and the pprof output format are the same in both, so
-moving between them is a version bump rather than a code change.
+The profiler API, the environment variables, and the pprof output format are the
+same in both, so moving between them is a version bump rather than a code change.
 
-The v3 line carries the crate version 0.9.0 in-tree so it is ready to publish,
-but it is deliberately **not** on crates.io while upstream v3 is itself
-pre-release.
+**v3 is now the mainline** and carries crate version 0.9.0 in-tree. It is not yet
+published to crates.io; 0.8.x remains what crates.io serves until 0.9.0 is tagged.
+
+### Why v3 became the mainline
+
+v3 was held to the same bar as v2 before promoting it, on identical workloads and
+the same machine (Windows/MinGW, 32 threads):
+
+| | v2 (0.8.x) | v3 (0.9.x) |
+|---|---|---|
+| `ctest`, Debug and Release, 3 runs each | 9/9 | **12/12** (superset of v2's tests) |
+| `MI_PPROF=OFF` | 6/6 | 8/8 |
+| Rust workspace suite | green | green |
+| `test-stress` peak RSS @ 50 iterations | 11.98 GB | **0.24 GB** |
+| `test-stress` peak RSS @ 100 iterations | 23.50 GB | flat |
+| `test-stress-heaps` @ 25/50/100/200 iterations | (test not present) | flat ~0.82 GB |
+
+v2's memory grows linearly with iteration count on MinGW — an unbounded leak that
+is still present on the `v2` branch and in published 0.8.x. v3's is flat. v3 also
+carries two fixes for upstream bugs that v2 still has: `mi_heap_new`/`mi_subproc_new`
+failing to bootstrap the library, and thread-exit TLS callbacks never being
+registered under MinGW.
+
+The one thing testing cannot retire is that upstream mimalloc v3 (`dev3`) is itself
+a pre-release branch, so it has had less field exposure than v2 regardless of how
+green the suite is. That is the reason 0.9.0 is not auto-published.
 
 Choose v3 (0.9.x) when you want upstream v3's allocator improvements or the
 richer allocator statistics described in
@@ -234,10 +256,10 @@ Pick the engine line you want (see
 
 ```toml
 [dependencies]
-# Stable v2 engine, from crates.io
+# v2 engine, from crates.io
 mimalloc-pprof = "0.8"
-# Beta v3 engine (not yet on crates.io):
-# mimalloc-pprof = { git = "https://github.com/zackees/mimalloc-pprof", branch = "v3" }
+# v3 engine -- current mainline, not yet on crates.io:
+# mimalloc-pprof = { git = "https://github.com/zackees/mimalloc-pprof" }
 
 [profile.release]
 debug = "line-tables-only"

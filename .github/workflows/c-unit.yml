@@ -9,6 +9,7 @@ on:
       - 'include/**'
       - 'test/**'
       - 'CMakeLists.txt'
+      - 'ci/**'
       - '.github/workflows/c-unit.yml'
 
 jobs:
@@ -23,6 +24,41 @@ jobs:
       - run: cmake -B build -DMI_PPROF=ON
       - run: cmake --build build --config Release
       - run: ctest --test-dir build -C Release --output-on-failure
+
+  # Distro packagers build for a generic CPU. Verify a MI_NO_OPT_ARCH=ON build really
+  # is baseline-clean, by scanning the shipped instruction stream rather than trusting
+  # the flags.
+  #
+  # Runners are both Linux on purpose: x64 covers the x86-64-v1 baseline, and
+  # ubuntu-24.04-arm covers Debian's armv8.0-a arm64 baseline -- the case that actually
+  # bites, since CMakeLists.txt force-enables MI_OPT_ARCH on arm64. macOS is NOT used
+  # here: Apple Silicon is the baseline on that platform, so LSE atomics are expected
+  # there and a "clean" result would mean nothing.
+  isa-baseline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Portable build must contain no above-baseline instructions
+        run: |
+          cmake -B build-portable -DMI_PPROF=ON -DMI_NO_OPT_ARCH=ON
+          cmake --build build-portable --target mimalloc-static
+          python3 ci/check_isa_baseline.py "$(ls build-portable/libmimalloc*.a | head -1)"
+      # A check that has never been observed to fail proves nothing. Build with the
+      # optimizations deliberately on and require the same scanner to catch it.
+      - name: Positive control -- scanner must fire on an MI_OPT_ARCH=ON build
+        run: |
+          cmake -B build-arch -DMI_PPROF=ON -DMI_OPT_ARCH=ON
+          cmake --build build-arch --target mimalloc-static
+          python3 ci/check_isa_baseline.py "$(ls build-arch/libmimalloc*.a | head -1)" --expect-dirty
+      - name: Upload portable library
+        uses: actions/upload-artifact@v4
+        with:
+          name: mimalloc-portable-${{ matrix.os }}
+          path: build-portable/libmimalloc*.a
 
   ctest-pprof-off:
     runs-on: ubuntu-latest

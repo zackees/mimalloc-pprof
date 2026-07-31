@@ -148,6 +148,68 @@ Two counters need a caveat:
   so a single-threaded process reports 0. It also lags thread exit, since v3
   reference-counts theaps for cached thread-locals.
 
+## Known bugs in upstream mimalloc, and what this fork does about them
+
+These are defects in **upstream microsoft/mimalloc**, not in the profiler. Each was
+confirmed by building stock upstream at the same commit with the same toolchain and
+reproducing it there with zero fork changes. They are listed because they affect
+anyone using mimalloc on Windows/MinGW, whether or not they use this fork.
+
+### 1. Thread-exit cleanup never runs on MinGW — unbounded memory leak
+
+**Affects:** upstream v2 and v3, Windows/MinGW (GCC) only. MSVC is unaffected.
+**Status in this fork:** fixed on both lines.
+
+Every exiting thread leaked its thread-local heap and all of its pages. Memory grew
+linearly and without bound; on `test-stress` this was ~0.24 GB per iteration, reaching
+23.5 GB at 100 iterations. Processes still exited 0, so it is invisible on a
+large-memory machine and only surfaces as an out-of-memory failure on a smaller one.
+
+The cause is that Windows' default init mode registers its loader TLS callbacks with
+**MSVC-only pragmas** (`#pragma comment(linker, "/INCLUDE:...")`, `const_seg`/`data_seg`)
+which GCC silently ignores, so `DLL_THREAD_DETACH` never fires.
+
+The two lines need *different* fixes, which is worth knowing if you are patching this
+yourself:
+
+- **v3** — register the callbacks with GCC section attributes plus a `_tls_used`
+  reference. v3 keeps its thread state in its own TLS slots, so once the callback fires
+  cleanup works. Peak RSS 34.64 GB → 0.02 GB; live `theaps` 1857 → 5.
+- **v2** — the same registration is *not sufficient*. v2's default heap lives in a
+  `mi_decl_thread` variable, which GCC implements with **emutls** on MinGW, and emutls
+  is torn down before any PE TLS callback runs. The callback then observes an already-
+  empty heap and `_mi_thread_done` early-returns. v2 must use the **FLS** path instead,
+  where the callback receives the stored value as an argument. Peak RSS 23.50 GB → 0.28 GB.
+
+### 2. `mi_heap_new` / `mi_subproc_new` do not bootstrap the library
+
+**Affects:** upstream v3. **Status in this fork:** fixed.
+
+Either can be the first mimalloc call in a process, but neither initialized the library,
+so both allocated from a still-`NULL` `subproc->heap_main`. It presented as Windows-only
+because on Linux/macOS a library constructor has always run first. It is **not**
+debug-only: in a release build the assertions compile out and the code proceeds to
+allocate from a NULL heap. Compare upstream issue #1341, which is the same bug class
+(`free(NULL)` before initialization).
+
+### 3. `test-stress.c` dereferences unchecked allocations
+
+**Affects:** upstream v2 and v3 test suites. **Status:** not fixed here (upstream test code).
+
+`data = custom_realloc(...)` and `mi_heap_new()` are both used without a NULL check, so
+any allocation failure becomes an opaque segfault far from its cause rather than a clear
+error. This is what made bug 1 above present as a mysterious crash.
+
+### What this means for you
+
+If you use **upstream** mimalloc on Windows with MinGW, bug 1 applies to you and is
+worth carrying a patch for. If you use this fork, all of the above are handled on
+`main` (v3); the v2 line carries the v2-specific fix.
+
+The fork guards against regressions here with `test/test-degenerate.c`, which asserts
+that memory stays *bounded* under thread churn rather than only that nothing crashed —
+the check that both leaks above would have failed.
+
 ## Choose an integration path
 
 - C or C++ application: build this repository with CMake, link one mimalloc

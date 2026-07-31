@@ -472,6 +472,9 @@ mi_subproc_id_t mi_subproc_current(void) {
 
 mi_subproc_id_t mi_subproc_new(void) {
   static _Atomic(size_t) subproc_total_count;
+  // As in `mi_heap_new_in_arena`: this can be the first mimalloc call in a process, and
+  // `_mi_meta_zalloc` below allocates out of the parent's main heap, which must exist.
+  mi_thread_init();
   mi_subproc_t* const parent = _mi_subproc();
   mi_memid_t memid;
   mi_subproc_t* subproc = (mi_subproc_t*)_mi_meta_zalloc(parent, sizeof(mi_subproc_t),&memid);

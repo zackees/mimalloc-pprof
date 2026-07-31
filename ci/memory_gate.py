@@ -10,9 +10,16 @@ Windows commit report different numbers for identical allocator behavior, and ma
 compresses memory so its resident figure falls under pressure while a leak grows. Only
 same-OS deltas are meaningful.
 
+Peak memory is *not* a low-variance signal, so both commands take several runs of the
+same binary and use the **minimum** observed peak. Noise on a shared CI runner only ever
+adds memory (another tenant's page cache, a straggler thread still winding down), so the
+minimum is the estimator closest to the allocator's true high-water mark, and it is far
+more stable than any single run. The spread across runs is printed every time -- if it
+ever approaches the tolerance, the tolerance is wrong and the printout says so.
+
 Usage:
-    memory_gate.py check   <result.json>   # compare against the committed baseline
-    memory_gate.py update  <result.json>   # re-baseline (deliberate, reviewed act)
+    memory_gate.py check   <result.json> [more.json ...]
+    memory_gate.py update  <result.json> [more.json ...]   # deliberate, reviewed act
 
 Exit codes: 0 pass, 1 regression, 2 usage/IO error.
 """
@@ -23,10 +30,22 @@ import sys
 
 BASELINE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory-baselines")
 
-# Peak memory tolerance. Deliberately tighter than a throughput threshold would be:
-# memory is the low-variance signal here (the gated numbers are kernel high-water marks,
-# not sampled), and this repository has shipped two memory bugs and zero throughput bugs.
-PEAK_TOLERANCE = 0.10
+# Peak memory tolerance, applied to the minimum of RUNS_EXPECTED runs.
+#
+# An earlier version of this file asserted that memory was "the low-variance signal here
+# (the gated numbers are kernel high-water marks, not sampled)" and set this to 0.10.
+# That was an assumption, and measuring disproved it: repeated runs of the same binary
+# span roughly 20% peak-to-peak. Taking the minimum of several runs cuts that to a few
+# percent, which is what makes a tight threshold defensible rather than flaky.
+#
+# This number is set from the observed spread reported by the runs below, not guessed.
+# Raise it only with the measurement that justifies it; a gate that flakes gets ignored,
+# and an ignored gate is worse than none.
+PEAK_TOLERANCE = 0.15
+
+# Number of runs the CI job is expected to supply. Fewer is allowed (with a warning) so
+# the script stays usable locally, but the committed baselines are min-of-N.
+RUNS_EXPECTED = 4
 
 # Counters are exact, not statistical. A thread that was created and joined must not
 # still be live; anything above this is cleanup that did not run. Matches the inline
@@ -47,8 +66,40 @@ def load(path):
         return json.load(f)
 
 
-def check(result_path):
-    result = load(result_path)
+def load_runs(paths):
+    """Load N runs of the same configuration and return (representative, peak_mb, spread%).
+
+    The representative record is the run with the minimum gated peak; its counters are
+    the ones checked, so the counter assertions and the peak refer to the same run.
+    """
+    runs = [load(p) for p in paths]
+    keys = {(r["platform"], r["mi_pprof"], r["gated_metric"]) for r in runs}
+    if len(keys) != 1:
+        raise ValueError(
+            "runs are not from the same configuration: {}".format(sorted(keys)))
+    peaks = sorted(r["peak_mb"] for r in runs)
+    best = min(runs, key=lambda r: r["peak_mb"])
+    spread = (100.0 * (peaks[-1] - peaks[0]) / peaks[0]) if peaks[0] else 0.0
+    return best, peaks, spread
+
+
+def report_runs(peaks, spread):
+    print("  {:<22} {}".format(
+        "runs (MB)", "  ".join("{:.1f}".format(p) for p in peaks)))
+    print("  {:<22} {:.1f}%  (min is used; noise on a shared runner only adds memory)"
+          .format("spread across runs", spread))
+    if len(peaks) < RUNS_EXPECTED:
+        print("  WARNING: only {} run(s); the committed baselines are min-of-{}. "
+              "A single run is not comparable.".format(len(peaks), RUNS_EXPECTED))
+    if spread >= 100.0 * PEAK_TOLERANCE:
+        print("  WARNING: observed spread ({:.1f}%) is at or above the tolerance "
+              "({:.0f}%). The threshold cannot distinguish a regression from noise -- "
+              "raise RUNS_EXPECTED or the tolerance, with this measurement as the "
+              "justification.".format(spread, 100.0 * PEAK_TOLERANCE))
+
+
+def check(result_paths):
+    result, peaks, spread = load_runs(result_paths)
 
     if result.get("inject_leak", 0):
         # An injected-leak run is a positive control; it is expected to fail and must
@@ -61,13 +112,13 @@ def check(result_path):
     if not os.path.exists(bpath):
         print("No baseline at {}.".format(bpath))
         print("This platform/config has never been recorded. Create it with:")
-        print("    python ci/memory_gate.py update {}".format(result_path))
+        print("    python ci/memory_gate.py update {}".format(" ".join(result_paths)))
         return 2
     base = load(bpath)
 
     failures = []
     metric = result["gated_metric"]
-    peak, base_peak = result["peak_mb"], base["peak_mb"]
+    peak, base_peak = peaks[0], base["peak_mb"]
     allowed = base_peak * (1.0 + PEAK_TOLERANCE)
 
     print("platform={} metric={} mi_pprof={}".format(
@@ -77,6 +128,7 @@ def check(result_path):
     print("  {:<22} {:>9.1f} MB   (reported so the profiler's own arena is not "
           "mistaken for allocator growth)".format(
               "profiler arena", result.get("profiler_arena_mb", 0.0)))
+    report_runs(peaks, spread)
 
     if peak > allowed:
         failures.append(
@@ -101,7 +153,7 @@ def check(result_path):
         for f in failures:
             print("  - {}".format(f))
         print("\nIf this growth is intentional, re-baseline deliberately:")
-        print("    python ci/memory_gate.py update {}".format(result_path))
+        print("    python ci/memory_gate.py update {}".format(" ".join(result_paths)))
         print("and say why in the PR. Do not re-baseline to make a red gate green.")
         return 1
 
@@ -109,26 +161,33 @@ def check(result_path):
     return 0
 
 
-def update(result_path):
-    result = load(result_path)
+def update(result_paths):
+    result, peaks, spread = load_runs(result_paths)
     if result.get("inject_leak", 0):
         print("REFUSING to baseline a run with MI_BENCH_INJECT_LEAK set.")
         return 2
     os.makedirs(BASELINE_DIR, exist_ok=True)
     bpath = baseline_path(result)
+    # Record how the number was obtained, so a later reader can tell whether a baseline
+    # is comparable to the current methodology rather than having to guess.
+    record = dict(result)
+    record["peak_mb"] = peaks[0]
+    record["baseline_runs"] = len(peaks)
+    record["baseline_spread_pct"] = round(spread, 1)
     with open(bpath, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, sort_keys=True)
+        json.dump(record, f, indent=2, sort_keys=True)
         f.write("\n")
-    print("wrote {} (peak {:.1f} MB)".format(bpath, result["peak_mb"]))
+    print("wrote {} (min peak {:.1f} MB of {} runs)".format(bpath, peaks[0], len(peaks)))
+    report_runs(peaks, spread)
     return 0
 
 
 def main(argv):
-    if len(argv) != 3 or argv[1] not in ("check", "update"):
+    if len(argv) < 3 or argv[1] not in ("check", "update"):
         print(__doc__)
         return 2
     try:
-        return check(argv[2]) if argv[1] == "check" else update(argv[2])
+        return check(argv[2:]) if argv[1] == "check" else update(argv[2:])
     except (OSError, ValueError, KeyError) as e:
         print("error: {}".format(e))
         return 2

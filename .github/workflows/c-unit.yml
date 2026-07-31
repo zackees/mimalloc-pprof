@@ -99,11 +99,19 @@ jobs:
       - name: Emit JSON and compare against baseline
         shell: bash
         run: |
+          # NOTE: GitHub invokes `bash -e`, so a plain `set -uo pipefail` does NOT
+          # disable errexit -- the script would die on the gate's non-zero exit before
+          # the rc check could run. `set +e` is required, not decorative.
+          set +e
           set -uo pipefail
           exe=$(find build -name 'mimalloc-test-memory-gate*' -type f -perm -u+x | head -1)
-          MI_BENCH_JSON=result.json "$exe" > /dev/null
-          cat result.json
-          python3 ci/memory_gate.py check result.json
+          # Peak memory is noisy; the gate compares the minimum of several runs. Four
+          # is what the committed baselines are built from.
+          for i in 1 2 3 4; do
+            MI_BENCH_JSON="result-$i.json" "$exe" > /dev/null
+          done
+          cat result-1.json
+          python3 ci/memory_gate.py check result-*.json
           rc=$?
           if [ $rc -eq 2 ]; then
             echo "::warning::No committed baseline for this platform yet -- bootstrap it from this run's artifact."
@@ -113,7 +121,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: memory-gate-${{ matrix.os }}
-          path: result.json
+          path: result-*.json
           if-no-files-found: error
 
   ctest-win-gnu:

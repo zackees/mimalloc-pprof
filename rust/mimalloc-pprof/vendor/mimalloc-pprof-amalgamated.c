@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit e6f47a41 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit be5e067f of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -20019,7 +20019,7 @@ bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept {
       prof_dump_at_exit_format = config->dump_format;
     }
     else if (env_present) {
-      char fmt_buf[32];
+      char fmt_buf[32] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
       if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
     }
   }
@@ -20513,7 +20513,7 @@ static void prof_auto_start(void) {
     if (mi_option_is_enabled(mi_option_prof)) { const bool started = mi_prof_start(0); MI_UNUSED(started); }
     (void)_mi_getenv("MIMALLOC_PROF_DUMP_AT_EXIT", prof_dump_at_exit, sizeof(prof_dump_at_exit));
     /* So pure-env users (no mi_prof_start_ex call at all) still get profile.proto exit dumps. */
-    char fmt_buf[32];
+    char fmt_buf[32] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
     if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
   }
 }

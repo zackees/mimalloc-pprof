@@ -191,11 +191,12 @@ static void test_sawtooth(void) {
    ability to reuse a checkerboarded heap rather than only ever growing. */
 
 static void test_fragmentation_then_large(void) {
-  enum { count = 40000, small = 128 };
+  /* NOTE: do not name a local `small` -- MSVC's rpcndr.h (via windows.h) defines it. */
+  enum { count = 40000, small_sz = 128 };
   void** blocks = (void**)mi_malloc(count * sizeof(void*));
   assert(blocks != NULL);
   for (int i = 0; i < count; i++) {
-    blocks[i] = mi_malloc(small);
+    blocks[i] = mi_malloc(small_sz);
     assert(blocks[i] != NULL);
   }
   for (int i = 0; i < count; i += 2) { mi_free(blocks[i]); blocks[i] = NULL; }

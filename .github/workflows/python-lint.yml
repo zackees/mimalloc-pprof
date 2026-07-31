@@ -33,4 +33,8 @@ jobs:
       # isa-baseline job runs, minus the compile: parser fixtures for both
       # architectures, which is what caught the arm64 breakage in the first place.
       - name: Gate scripts still work
-        run: python3 ci/check_isa_baseline.py --selftest
+        run: |
+          python3 ci/check_isa_baseline.py --selftest
+          # A gate script that imports cleanly but crashes on argv is still broken.
+          python3 ci/memory_gate.py 2>&1 | grep -q "Exit codes"
+          python3 ci/check_isa_baseline.py --help > /dev/null

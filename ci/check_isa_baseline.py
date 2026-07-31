@@ -42,7 +42,14 @@ ABOVE_BASELINE = {
         "rorx": "BMI2", "mulx": "BMI2", "pdep": "BMI2", "pext": "BMI2",
         "shlx": "BMI2", "shrx": "BMI2", "sarx": "BMI2", "bzhi": "BMI2",
         "andn": "BMI1", "blsi": "BMI1", "blsr": "BMI1", "blsmsk": "BMI1",
-        "tzcnt": "BMI1", "lzcnt": "ABM", "popcnt": "SSE4.2",
+        "lzcnt": "ABM", "popcnt": "SSE4.2",
+        # NOT listed: `tzcnt`. It is encoded as `rep bsf`, and the F3 prefix is ignored
+        # by pre-BMI1 CPUs, which therefore execute it as plain `bsf` -- same result for
+        # every non-zero input. GCC consequently emits it at plain `-march=x86-64`
+        # (verified: __builtin_ctz gives `tzcnt` at baseline, while __builtin_clz gives
+        # `bsr`, not `lzcnt`). Flagging it made the x64 portable build fail on 27 hits
+        # that were never a portability problem. `lzcnt` stays: it decodes as `bsr` on
+        # old CPUs, which silently returns a *different* value rather than the same one.
         "vpermd": "AVX2", "vpbroadcastd": "AVX2", "vpbroadcastq": "AVX2",
     },
     # armv8.0-a baseline.  LSE atomics (8.1) are the ones mimalloc actually pulls in.
@@ -124,8 +131,9 @@ SELFTEST_FIXTURES = {
    a:	popcnt %rax,%rdx
   10:	mov    %rsp,%rbp
   13:	andn   %eax,%ebx,%ecx
-  17:	retq
-""", {"rorx": 1, "popcnt": 1, "andn": 1}),
+  17:	tzcnt  %ecx,%ecx
+  1b:	retq
+""", {"rorx": 1, "popcnt": 1, "andn": 1}),   # tzcnt deliberately absent: see ABOVE_BASELINE
     "arm64": ("""
 0000000000000000 <mi_test>:
    0:	stp	x29, x30, [sp, #-16]!

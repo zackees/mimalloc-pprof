@@ -903,6 +903,27 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-profile-race PROPERTIES TIMEOUT 300)
   endif()
 
+  # Memory + counter regression gate (issue #63). Emits JSON for CI baseline
+  # comparison; MI_BENCH_INJECT_LEAK is a build-time-only positive control.
+  add_executable(mimalloc-test-memory-gate test/test-memory-gate.c)
+  target_compile_definitions(mimalloc-test-memory-gate PRIVATE ${mi_defines})
+  if(MI_BENCH_INJECT_LEAK)
+    target_compile_definitions(mimalloc-test-memory-gate PRIVATE MI_BENCH_INJECT_LEAK=${MI_BENCH_INJECT_LEAK})
+  endif()
+  target_compile_options(mimalloc-test-memory-gate PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-memory-gate PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-memory-gate PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-memory-gate PRIVATE mimalloc ${mi_libraries})
+  endif()
+  if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(mimalloc-test-memory-gate PRIVATE Threads::Threads)
+  endif()
+  add_test(NAME test-memory-gate COMMAND mimalloc-test-memory-gate)
+  set_tests_properties(test-memory-gate PROPERTIES TIMEOUT 900)
+
   # Degenerate memory patterns and memory-bound regression guards (issue #47).
   # Independent of MI_PPROF: it guards allocator behavior, not the profiler.
   add_executable(mimalloc-test-degenerate test/test-degenerate.c)

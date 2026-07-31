@@ -818,7 +818,19 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
   #endif
 
   typedef int (mi_cdecl* mi_crt_callback_t)(void);
-  #if defined(_WIN64)
+  #if defined(__GNUC__) && !defined(_MSC_VER)
+    // MinGW/GCC: the MSVC-only `#pragma comment(linker, "/INCLUDE:...")` and
+    // `#pragma const_seg`/`data_seg` used below are silently ignored by GCC, so the TLS
+    // callbacks were never registered and DLL_THREAD_DETACH never fired -- every exiting
+    // thread then leaked its theap and its pages (visible as an unbounded `theaps` count
+    // and linear RSS growth in test-stress-heaps). Register them with section attributes
+    // instead. Referencing `_tls_used` forces the PE TLS directory to be emitted.
+    extern const IMAGE_TLS_DIRECTORY _tls_used;
+    __attribute__((used)) static const void* const mi_tls_used_ref = &_tls_used;
+    __attribute__((used, section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_pre  = &mi_tls_attach;
+    __attribute__((used, section(".CRT$XLY"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_post = &mi_tls_detach;
+    __attribute__((used, section(".CRT$XIB"))) mi_crt_callback_t   _mi_crt_callback_init = &mi_crt_init;
+  #elif defined(_WIN64)
     #pragma comment(linker, "/INCLUDE:_tls_used")
     #pragma comment(linker, "/INCLUDE:_mi_tls_callback_pre")
     #pragma comment(linker, "/INCLUDE:_mi_tls_callback_post")

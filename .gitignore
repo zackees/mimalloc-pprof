@@ -12,3 +12,10 @@ docs/
 *.gz
 .vscode
 .DS_STore
+build-nobt/
+build-probe/
+build-v3/
+build-v3-off/
+build-rel/
+build-dbg/
+build-final/

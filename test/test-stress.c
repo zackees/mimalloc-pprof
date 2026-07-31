@@ -20,6 +20,7 @@ terms of the MIT license.
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <errno.h>
 #include <assert.h>
 
 #include <mimalloc.h>
@@ -217,8 +218,20 @@ static void stress(intptr_t tid, void* vtransfers) {
           #ifdef MI_USE_HEAPS
           diag_heap = (void*)current_heap;   /* only declared in the rolling-heaps config */
           #endif
-          fprintf(stderr, "DIAG: custom_realloc(%p, %zu) returned NULL (tid=%d, data_top=%zu, current_heap=%p)\n",
-                  (void*)data, data_size * sizeof(void*), tid, data_top, diag_heap);
+          const int saved_errno = errno;
+          size_t rss = 0, peak_rss = 0, commit = 0, peak_commit = 0;
+          mi_process_info(NULL, NULL, NULL, &rss, &peak_rss, &commit, &peak_commit, NULL);
+          /* Is this global exhaustion, or only this allocation path? Probe both a
+             small allocation on the same heap and a same-size one on the default heap. */
+          void* small_same_heap = custom_calloc(1, 64);
+          void* big_default_heap = mi_malloc(data_size * sizeof(void*));
+          fprintf(stderr,
+                  "DIAG: custom_realloc(%p, %zu) returned NULL (tid=%d, data_top=%zu, current_heap=%p)\n"
+                  "DIAG:   errno=%d  rss=%zu peak_rss=%zu commit=%zu peak_commit=%zu\n"
+                  "DIAG:   small(64B, same heap)=%p   big(%zu, DEFAULT heap)=%p\n",
+                  (void*)data, data_size * sizeof(void*), tid, data_top, diag_heap,
+                  saved_errno, rss, peak_rss, commit, peak_commit,
+                  small_same_heap, data_size * sizeof(void*), big_default_heap);
           fflush(stderr);
           abort();
         }

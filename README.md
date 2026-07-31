@@ -1,231 +1,255 @@
 # mimalloc-pprof
 
-`mimalloc-pprof` is a fork of
-[microsoft/mimalloc](https://github.com/microsoft/mimalloc) with
-pprof-compatible sampled heap profiling. It supports native Windows as a
-first-class target as well as Linux and macOS.
+A fork of [microsoft/mimalloc](https://github.com/microsoft/mimalloc) that adds
+**pprof-compatible sampled heap profiling**, with native Windows as a first-class
+target alongside Linux and macOS.
 
-The C allocator tracks sampled live allocations and writes either the
-gperftools `heap_v2` text format or an uncompressed pprof `profile.proto`.
-Both formats can be opened with [google/pprof](https://github.com/google/pprof)
-for flame graphs, call graphs, top reports, and profile comparisons.
+The allocator tracks sampled live allocations and writes either the gperftools
+`heap_v2` text format or an uncompressed pprof `profile.proto`. Both open directly
+in [google/pprof](https://github.com/google/pprof) for flame graphs, call graphs,
+top reports, and profile diffs.
 
-## Current status
+Profiling is **opt-in at runtime**: a build with `MI_PPROF=ON` (the default) does
+not sample until you call a start API or set `MIMALLOC_PROF=1`.
 
-| Component | Status |
-|---|---|
-| C allocator | Based on mimalloc v3 (`dev3`) |
-| Sampled heap profiler | Implemented; built when `MI_PPROF=ON` (the default) |
-| Memory-events API | Implemented; always compiled and disabled at runtime by default |
-| Windows | MSVC and MinGW are required CI targets |
-| Rust crate | `rust/mimalloc-pprof`; builds its own checked-in C amalgamation |
+**Platforms.** Linux, macOS, and Windows — with both **MSVC and MinGW** as required
+CI targets, on every commit, in Debug and Release. MinGW being a gate rather than an
+afterthought is how the leaks in [Bugs fixed in older
+versions](#bugs-fixed-in-older-versions) were found; upstream has no MinGW job.
 
-The profiler is opt-in at runtime. A build with `MI_PPROF=ON` does not start
-sampling until the application calls a start API or sets `MIMALLOC_PROF=1`.
-When profiling is disabled, the allocation path only performs the guarded
-hook checks.
+**Contents**
 
-The fork-specific profiler and memory-events function signatures are preserved
-across the v3 port. The underlying allocator follows upstream mimalloc v3, so
-applications moving from mimalloc v2 should still review upstream's v3 API and
-behavior changes.
+- [Quick start](#quick-start)
+- [Choosing a version: v2 or v3](#choosing-a-version-v2-or-v3)
+- [Bugs fixed in older versions](#bugs-fixed-in-older-versions) — including two unbounded memory leaks
+- [C and C++ integration](#c-and-c-integration)
+- [Rust integration](#rust-integration)
+- [Profiler reference](#profiler-reference)
+- [Memory-events API](#memory-events-api)
+- [For maintainers](#for-maintainers)
 
-The design history and milestone decisions are recorded in
-[issue #2](https://github.com/zackees/mimalloc-pprof/issues/2).
+---
 
-## Which version: v2 or v3?
+## Quick start
 
-The allocator engine underneath this fork tracks upstream mimalloc. Two engine
-lines are published, as two version ranges of the same `mimalloc-pprof` crate:
-
-| | **v2 engine** | **v3 engine** |
-|---|---|---|
-| Crate | [`mimalloc-pprof` 0.8.x](https://crates.io/crates/mimalloc-pprof) — [crates.io](https://crates.io/crates/mimalloc-pprof/0.8.0), [docs.rs](https://docs.rs/mimalloc-pprof/0.8.0) | 0.9.x — **not yet published to crates.io** |
-| Where it lives | the [`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch | `main` |
-| Upstream base | mimalloc v2 (`upstream/main`) | mimalloc v3 (`upstream/dev3`) |
-| Maturity | Previous line; still what crates.io serves. | **Current mainline.** Upstream v3 is still pre-release. |
-| Allocator design | segment allocator | arena-of-slices + page-map; `mi_heap_t`/`mi_theap_t` split |
-| Allocator statistics | process-wide totals only | **per-heap and per-subprocess** (see below) |
-| Profiler API | identical | identical, plus the v3 `mi_prof_stats_t` fields below |
+### Rust
 
 ```toml
-# v2 engine, from crates.io (what `cargo add mimalloc-pprof` gives you today)
-mimalloc-pprof = "0.8"
+[dependencies]
+mimalloc-pprof = "0.9"
 
-# v3 engine -- on `main`, not on crates.io yet
-mimalloc-pprof = { git = "https://github.com/zackees/mimalloc-pprof" }
+[profile.release]
+debug = "line-tables-only"
+strip = false
 ```
 
-The profiler API, the environment variables, and the pprof output format are the
-same in both, so moving between them is a version bump rather than a code change.
+```rust
+use mimalloc_pprof::{prof, MiMalloc};
+use std::path::Path;
 
-**v3 is now the mainline** and carries crate version 0.9.0 in-tree. It is not yet
-published to crates.io; 0.8.x remains what crates.io serves until 0.9.0 is tagged.
+#[global_allocator]
+static ALLOCATOR: MiMalloc = MiMalloc;
 
-### Why v3 became the mainline
+fn main() -> std::io::Result<()> {
+    assert!(prof::start(0), "profiler already running"); // 0 = default, ~512 KiB
 
-v3 was held to the same bar as v2 before promoting it, on identical workloads and
-the same machine (Windows/MinGW, 32 threads):
+    let retained = vec![0_u8; 1024 * 1024];
+    prof::dump_file(Path::new("heap.prof"))?;            // dump while still live
+    std::hint::black_box(&retained);
 
-| | v2 (0.8.x) | v3 (0.9.x) |
+    prof::stop();
+    Ok(())
+}
+```
+
+### C
+
+```sh
+cmake -S . -B build -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build --config RelWithDebInfo
+```
+
+```c
+#include <mimalloc.h>
+#include <mimalloc/profile.h>
+
+int main(void) {
+  if (!mi_prof_start(0)) return 1;          /* 0 = default interval, ~512 KiB */
+
+  void* p = mi_malloc(1024 * 1024);
+  if (!mi_prof_dump("heap.prof")) return 2; /* dump while it is still live */
+
+  mi_free(p);
+  mi_prof_stop();
+  return 0;
+}
+```
+
+`mi_prof_start` and `mi_prof_dump` are `nodiscard` — check their results or the
+compiler will warn.
+
+### Or without touching the code at all
+
+```sh
+MIMALLOC_PROF=1 MIMALLOC_PROF_DUMP_AT_EXIT=heap.prof ./my_app
+```
+
+### Then read the profile
+
+```sh
+pprof -http=:0 ./my_app heap.prof     # interactive
+pprof -top ./my_app heap.prof         # text summary
+```
+
+Build with debug info, and on MSVC keep the matching PDB next to the binary.
+
+---
+
+## Choosing a version: v2 or v3
+
+Two engine lines are published as two version ranges of the same crate. The
+profiler API, environment variables, and output formats are **identical** in both,
+so switching is a version bump, not a code change.
+
+| | **v3 — current** | **v2 — previous** |
 |---|---|---|
-| `ctest`, Debug and Release, 3 runs each | 9/9 | **12/12** (superset of v2's tests) |
-| `MI_PPROF=OFF` | 6/6 | 8/8 |
-| Rust workspace suite | green | green |
-| `test-stress` peak RSS @ 50 iterations | 11.98 GB | **0.24 GB** |
-| `test-stress` peak RSS @ 100 iterations | 23.50 GB | flat |
-| `test-stress-heaps` @ 25/50/100/200 iterations | (test not present) | flat ~0.82 GB |
+| Crate | [`mimalloc-pprof` 0.9.x](https://crates.io/crates/mimalloc-pprof) | [0.8.x](https://crates.io/crates/mimalloc-pprof/0.8.0) |
+| Lives on | `main` | the [`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch |
+| Upstream base | mimalloc v3 (`upstream/dev3`) | mimalloc v2 (`upstream/main`) |
+| Allocator design | arena-of-slices + page-map; `mi_heap_t`/`mi_theap_t` split | segment allocator |
+| Allocator statistics | **per-heap and per-subprocess** | process-wide totals only |
+| Memory under thread churn (MinGW) | **flat** | leaked in published 0.8.0; fixed on the `v2` branch — [bug 1](#bug-1-thread-exit-cleanup-never-runs-on-mingw--unbounded-memory-leak) |
 
-v2's memory grows linearly with iteration count on MinGW — an unbounded leak that
-is still present on the `v2` branch and in published 0.8.x. v3's is flat. v3 also
-carries two fixes for upstream bugs that v2 still has: `mi_heap_new`/`mi_subproc_new`
-failing to bootstrap the library, and thread-exit TLS callbacks never being
-registered under MinGW.
+**Use v3 (0.9.x)** unless you have a specific reason not to. It has strictly more
+test coverage, richer statistics, and fixes two upstream bugs that v2 still had.
 
-The one thing testing cannot retire is that upstream mimalloc v3 (`dev3`) is itself
-a pre-release branch, so it has had less field exposure than v2 regardless of how
-green the suite is. That is the reason 0.9.0 is not auto-published.
+**The caveat worth stating plainly:** upstream mimalloc v3 (`dev3`) is still a
+pre-release branch. It has had less field exposure than v2 no matter how green a
+test suite looks. That risk is real and testing cannot retire it — see
+[how v3 was validated](#how-v3-was-validated) for exactly what was measured.
 
-Choose v3 (0.9.x) when you want upstream v3's allocator improvements or the
-richer allocator statistics described in
-[Allocator statistics in the profile](#allocator-statistics-in-the-profile).
-Because upstream v3 is pre-release, the v3 line carries extra test coverage in
-this fork — a dedicated concurrency suite (`test/test-profile-race.c` and
-`rust/mimalloc-pprof/tests/t15_heap_stats.rs`) exercises the thread-bootstrap
-race, cross-thread frees, and snapshot stability against the reorganized v3
-engine, on top of the shared profiler tests.
+---
 
-The full `ctest` suite passes 12/12 on Windows (MSVC and MinGW), Linux, and
-macOS, in both Debug and Release. Two stress tests (`test-stress-heaps`,
-`test-stress-subprocs`) used to abort on Windows; that turned out to be a real
-initialization-order bug rather than pre-existing upstream breakage, and is
-fixed here — see `mi_heap_new_in_arena` in `src/heap.c` and `mi_subproc_new` in
-`src/init.c`. Both are candidates for upstreaming to microsoft/mimalloc.
+## Bugs fixed in older versions
 
-### Allocator statistics in the profile
+This section exists because the bugs below are **defects in upstream
+microsoft/mimalloc**, not in the profiler, and they affect anyone using mimalloc on
+Windows/MinGW whether or not they use this fork.
 
-v3 exposes per-heap and per-subprocess allocator counters (`mi_heap_stats_get`,
-`mi_subproc_stats_get`) that the v2 engine had no API for. The profiler surfaces
-them in two places, both v3-only:
+Every one was confirmed by building **stock upstream at the same commit with the
+same toolchain** and reproducing it there with zero fork changes. Where a fix is
+claimed, the measurement is given.
 
-1. **`mi_prof_stats_t` v3 fields** (`MI_PROF_STAT_VERSION` 3) — `heap_committed`,
-   `heap_reserved`, `heap_malloc_requested`, `heap_pages`,
-   `heap_pages_abandoned`, `heap_count`, `theap_count`, `heap_purged`. In Rust
-   these are `ProfStats::heap`, a `HeapStats` struct.
-2. **A comment block in the text dump**, emitted after the samples and before
-   `MAPPED_LIBRARIES:`. google/pprof's legacy heap parser skips `#` lines, so
-   existing tooling reads the profile unchanged:
+### Bug 1: thread-exit cleanup never runs on MinGW — unbounded memory leak
 
-   ```text
-   # mimalloc heap stats
-   # committed = 3080192
-   # reserved = 5308416
-   # malloc_requested = 2097152
-   # pages = 43
-   ...
-   ```
+|  |  |
+|---|---|
+| **Affects** | upstream **v2 and v3**, Windows/MinGW (GCC) only — MSVC is unaffected |
+| **Symptom** | every exiting thread leaks its thread-local heap and all its pages |
+| **Status** | **fixed on both lines** — v3 in 0.9.0; v2 on the `v2` branch, not yet in a published 0.8.x |
 
-Everything else in `mi_prof_stats_t` is *sampled*; these fields are **exact**.
-That difference is the point: a sampled profile alone cannot tell you whether it
-under-counted, but comparing `heap_malloc_requested` against `live_bytes`
-measures the sampling error directly. This is what makes assertions on a sampled
-profile meaningful in tests and in production monitoring.
+Memory grew linearly and without bound — about **0.24 GB per iteration** of
+`test-stress`, reaching **23.5 GB at 100 iterations**. The process still exited 0,
+so it is invisible on a large-memory machine and only surfaces as an
+out-of-memory failure on a smaller one.
 
-`mi_prof_stats_get` still accepts v1- and v2-sized structs from older callers and
-leaves the newer fields untouched, so upgrading the header does not break an
-existing binary.
+**Root cause.** Windows' default init mode registers its loader TLS callbacks using
+**MSVC-only pragmas** — `#pragma comment(linker, "/INCLUDE:...")` plus
+`const_seg`/`data_seg` — which GCC silently ignores. The `.CRT$XL*` entries are
+never emitted, so `DLL_THREAD_DETACH` never fires and `_mi_thread_done` never runs.
 
-Two counters need a caveat:
-
-- **`heap_malloc_requested` requires `MI_STAT >= 2`.** Upstream enables that level
-  by default only for debug builds (`MI_DEBUG > 0`); a default **release** build
-  has `MI_STAT == 0` and reports 0 for this field. Because 0 is also a legitimate
-  value, `mi_prof_stats_t.heap_stats_detailed` (Rust: `HeapStats::detailed`)
-  reports which case you are in, and the text dump records it as
-  `# detailed_stats = 0|1` so a saved profile is self-describing. Build with
-  `-DMI_STAT=2` to enable it in release, at some allocation-path cost.
-- **`theap_count` does not count the main thread's statically-initialized theap**,
-  so a single-threaded process reports 0. It also lags thread exit, since v3
-  reference-counts theaps for cached thread-locals.
-
-## Known bugs in upstream mimalloc, and what this fork does about them
-
-These are defects in **upstream microsoft/mimalloc**, not in the profiler. Each was
-confirmed by building stock upstream at the same commit with the same toolchain and
-reproducing it there with zero fork changes. They are listed because they affect
-anyone using mimalloc on Windows/MinGW, whether or not they use this fork.
-
-### 1. Thread-exit cleanup never runs on MinGW — unbounded memory leak
-
-**Affects:** upstream v2 and v3, Windows/MinGW (GCC) only. MSVC is unaffected.
-**Status in this fork:** fixed on both lines.
-
-Every exiting thread leaked its thread-local heap and all of its pages. Memory grew
-linearly and without bound; on `test-stress` this was ~0.24 GB per iteration, reaching
-23.5 GB at 100 iterations. Processes still exited 0, so it is invisible on a
-large-memory machine and only surfaces as an out-of-memory failure on a smaller one.
-
-The cause is that Windows' default init mode registers its loader TLS callbacks with
-**MSVC-only pragmas** (`#pragma comment(linker, "/INCLUDE:...")`, `const_seg`/`data_seg`)
-which GCC silently ignores, so `DLL_THREAD_DETACH` never fires.
-
-The two lines need *different* fixes, which is worth knowing if you are patching this
-yourself:
+**The two lines need different fixes.** This is the non-obvious part, and matters if
+you are patching upstream yourself:
 
 - **v3** — register the callbacks with GCC section attributes plus a `_tls_used`
-  reference. v3 keeps its thread state in its own TLS slots, so once the callback fires
-  cleanup works. Peak RSS 34.64 GB → 0.02 GB; live `theaps` 1857 → 5.
-- **v2** — the same registration is *not sufficient*. v2's default heap lives in a
-  `mi_decl_thread` variable, which GCC implements with **emutls** on MinGW, and emutls
-  is torn down before any PE TLS callback runs. The callback then observes an already-
-  empty heap and `_mi_thread_done` early-returns. v2 must use the **FLS** path instead,
-  where the callback receives the stored value as an argument. Peak RSS 23.50 GB → 0.28 GB.
+  reference. That is sufficient, because v3 keeps its thread state in its own TLS
+  slots.
+  *Peak RSS 34.64 GB → 0.02 GB; live `theaps` 1857 → 5.*
+- **v2** — the same registration is **not sufficient**. v2's default heap lives in a
+  `mi_decl_thread` variable, which GCC implements with **emutls** on MinGW, and
+  emutls is torn down *before* any PE TLS callback runs. The callback then observes
+  an already-empty heap and `_mi_thread_done` early-returns. v2 must use the **FLS**
+  path instead, where the callback receives the stored value as an argument.
+  *Peak RSS 23.50 GB → 0.28 GB.*
 
-### 2. `mi_heap_new` / `mi_subproc_new` do not bootstrap the library
+**Why it went unnoticed upstream:** upstream CI has **no MinGW job**, and the only
+Windows init mode with a documented non-MSVC path is the deprecated FLS one.
 
-**Affects:** upstream v3. **Status in this fork:** fixed.
+### Bug 2: `mi_heap_new` / `mi_subproc_new` do not bootstrap the library
 
-Either can be the first mimalloc call in a process, but neither initialized the library,
-so both allocated from a still-`NULL` `subproc->heap_main`. It presented as Windows-only
-because on Linux/macOS a library constructor has always run first. It is **not**
-debug-only: in a release build the assertions compile out and the code proceeds to
-allocate from a NULL heap. Compare upstream issue #1341, which is the same bug class
-(`free(NULL)` before initialization).
+|  |  |
+|---|---|
+| **Affects** | upstream **v3** |
+| **Symptom** | crash when either is the first mimalloc call in a process |
+| **Status** | **fixed** in 0.9.0 |
 
-### 3. `test-stress.c` dereferences unchecked allocations
+Either function can be the first mimalloc call a process makes, but neither
+initialized the library, so both allocated from a still-`NULL` `subproc->heap_main`.
 
-**Affects:** upstream v2 and v3 test suites. **Status:** not fixed here (upstream test code).
+It presented as Windows-only because on Linux and macOS a library constructor has
+always run first. It is **not** debug-only: in a release build the assertions
+compile out and the code proceeds to allocate from a NULL heap.
 
-`data = custom_realloc(...)` and `mi_heap_new()` are both used without a NULL check, so
-any allocation failure becomes an opaque segfault far from its cause rather than a clear
-error. This is what made bug 1 above present as a mysterious crash.
+Upstream issue [#1341](https://github.com/microsoft/mimalloc/issues/1341)
+(`free(NULL)` before initialization) is the same bug class.
+
+### Bug 3: `test-stress.c` dereferences unchecked allocations
+
+|  |  |
+|---|---|
+| **Affects** | upstream **v2 and v3** test suites |
+| **Status** | **not fixed here** — upstream test code |
+
+`data = custom_realloc(...)` and `mi_heap_new()` are both used without a NULL
+check, so any allocation failure becomes an opaque segfault far from its cause.
+This is what made bug 1 present as a mysterious crash rather than an obvious
+out-of-memory.
 
 ### What this means for you
 
-If you use **upstream** mimalloc on Windows with MinGW, bug 1 applies to you and is
-worth carrying a patch for. If you use this fork, all of the above are handled on
-`main` (v3); the v2 line carries the v2-specific fix.
+- **Using upstream mimalloc on Windows/MinGW?** Bug 1 applies to you and is worth
+  carrying a patch for.
+- **Using this fork?** All of the above are handled — v3 on `main`, and the v2 line
+  carries its own variant of the bug 1 fix.
 
-The fork guards against regressions here with `test/test-degenerate.c`, which asserts
-that memory stays *bounded* under thread churn rather than only that nothing crashed —
-the check that both leaks above would have failed.
+### How this is kept fixed
 
-## Choose an integration path
+Both leaks passed the entire existing test suite, because every test only asked
+*"did it crash?"* and never *"did memory stay bounded?"*.
 
-- C or C++ application: build this repository with CMake, link one mimalloc
-  target, and include `mimalloc/profile.h`.
-- Rust application: depend on the `mimalloc-pprof` crate and install
-  `MiMalloc` as the one global allocator.
-- Allocator instrumentation: include `mimalloc/memory-events.h`; this API is
-  independent of `MI_PPROF`.
+[`test/test-degenerate.c`](test/test-degenerate.c) closes that gap. It creates and
+joins 184 threads and asserts the engine's live `threads` counter comes back down
+and RSS has not climbed. It is verified in **both** directions — with the fix
+reverted it fails with `threads.current=184`; with the fix in place it reads `1`.
+A regression test that has never been observed to fail proves nothing.
 
-Do not link a second mimalloc implementation into the same process. In
-particular, a Rust binary using the crate's vendored allocator should not also
-link the root CMake library.
+It also drives patterns the stress tests do not: sawtooth, fragmentation-then-large,
+a full size-class sweep with ±1 boundary probes, realloc ping-pong across the
+small/large boundary, huge-allocation churn, and degenerate arguments
+(zero-size, `free(NULL)`, alignments, `SIZE_MAX`, `calloc` overflow).
+
+### How v3 was validated
+
+v3 was held to the same bar as v2 before it became the mainline — identical
+workloads, same machine, Windows/MinGW, 32 threads:
+
+| | v3 | v2 |
+|---|---|---|
+| `ctest`, Debug and Release, 3 runs each | **13/13** | 9/9 |
+| `MI_PPROF=OFF` | 9/9 | 6/6 |
+| Rust workspace suite | green | green |
+| `test-stress` peak RSS @ 50 iterations | **0.24 GB** | 11.98 GB |
+| `test-stress` peak RSS @ 100 iterations | **flat** | 23.50 GB |
+| `test-stress-heaps` @ 25/50/100/200 iterations | **flat ~0.82 GB** | test not present |
+
+v3's test set is a strict superset of v2's, adding `test-stress-heaps`,
+`test-stress-subprocs`, `test-profile-race`, and `test-degenerate`.
+
+---
 
 ## C and C++ integration
 
-### 1. Build and install the library
+### Build and install
 
 ```sh
 cmake -S . -B build -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -233,19 +257,23 @@ cmake --build build --config RelWithDebInfo
 cmake --install build --config RelWithDebInfo --prefix /path/to/prefix
 ```
 
-Use `MI_PPROF=OFF` when the profiler implementation and allocation hooks must
-be omitted. The public profiler functions remain linkable as no-op stubs, and
-the memory-events API remains fully available.
+Use `MI_PPROF=OFF` to omit the profiler implementation and its allocation hooks.
+The public profiler functions remain linkable as no-op stubs, and the
+memory-events API remains fully available.
 
-In a CMake consumer, link the installed or in-tree `mimalloc` shared target or
-the `mimalloc-static` static target in the same way as upstream mimalloc:
+In a CMake consumer, link the `mimalloc` shared target or the `mimalloc-static`
+static target exactly as with upstream mimalloc:
 
 ```cmake
 add_subdirectory(path/to/mimalloc-pprof)
 target_link_libraries(my_app PRIVATE mimalloc-static)
 ```
 
-### 2. Start, dump, and stop profiling
+> **Do not link two mimalloc implementations into one process.** In particular, a
+> Rust binary using the crate's vendored allocator must not also link the root
+> CMake library.
+
+### Full example
 
 ```c
 #include <mimalloc.h>
@@ -273,65 +301,26 @@ int main(void) {
 
 `mi_prof_start_ex` provides structured configuration for the sample interval,
 sampling seed, cumulative mode, stack depth, profiler-memory budget, and
-exit-time dump. The complete, versioned API contract is in
+exit-time dump. The complete versioned API contract is in
 [`include/mimalloc/profile.h`](include/mimalloc/profile.h).
 
-To include allocations performed during process startup, configure profiling
-before launching the program instead of starting it from `main`:
-
-```sh
-MIMALLOC_PROF=1 \
-MIMALLOC_PROF_DUMP_AT_EXIT=heap.prof \
-MIMALLOC_PROF_SAMPLE_INTERVAL=524288 \
-./my_app
-```
-
-Useful optional settings include:
-
-| Setting | Meaning |
-|---|---|
-| `MIMALLOC_PROF_ACCUM=1` | Keep cumulative allocation counters until `mi_prof_reset` |
-| `MIMALLOC_PROF_BT_MAX=32` | Maximum captured stack depth (compile-time cap: 128) |
-| `MIMALLOC_PROF_MAX_BYTES=N` | Bound persistent profiler arena memory |
-| `MIMALLOC_PROF_SEED=N` | Use deterministic sampling for repeatable tests |
-| `MIMALLOC_PROF_DUMP_FORMAT=proto` | Write pprof `profile.proto` at exit |
-
-`MIMALLOC_PROF_SAMPLE_RATE` remains a compatibility alias for
-`MIMALLOC_PROF_SAMPLE_INTERVAL`; when both are set, `..._INTERVAL` wins.
-
-### 3. Keep symbols and inspect the profile
-
-Build the application with debug information. Keep the executable and, on
-MSVC, its matching PDB next to the profile used for analysis.
-
-```sh
-pprof -http=:0 ./my_app heap.prof
-pprof -top ./my_app heap.prof
-```
-
-On Windows, replace `./my_app` with the path to the matching `.exe`.
+---
 
 ## Rust integration
 
-Pick the engine line you want (see
-[Which version: v2 or v3?](#which-version-v2-or-v3)):
-
 ```toml
 [dependencies]
-# v2 engine, from crates.io
-mimalloc-pprof = "0.8"
-# v3 engine -- current mainline, not yet on crates.io:
-# mimalloc-pprof = { git = "https://github.com/zackees/mimalloc-pprof" }
+mimalloc-pprof = "0.9"          # v3 engine (current)
+# mimalloc-pprof = "0.8"        # v2 engine
 
 [profile.release]
 debug = "line-tables-only"
 strip = false
 ```
 
-Or for a checkout-to-checkout integration:
+Or against a checkout:
 
 ```toml
-[dependencies]
 mimalloc-pprof = { path = "../mimalloc-pprof/rust/mimalloc-pprof" }
 ```
 
@@ -361,13 +350,13 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-On the v3 engine (0.9.x), `prof::stats()` also carries the exact allocator
-counters alongside the sampled ones:
+On v3 (0.9.x), `prof::stats()` carries the exact allocator counters alongside the
+sampled ones:
 
 ```rust
 let s = mimalloc_pprof::prof::stats();
 println!(
-    "sampled live: {} bytes in {} samples; allocator committed: {} bytes, requested: {}",
+    "sampled live: {} bytes in {} samples; allocator committed: {}, requested: {}",
     s.live_bytes, s.live_samples, s.heap.committed, s.heap.malloc_requested,
 );
 ```
@@ -380,34 +369,97 @@ On Linux and macOS, retain frame pointers for reliable stack walking:
 rustflags = ["-Cforce-frame-pointers=yes"]
 ```
 
-Windows x64 stack capture uses unwind information instead; keep the generated
-PDB for symbolization.
+Windows x64 uses unwind information instead; keep the generated PDB for
+symbolization.
 
-Important source-layout rule: the Rust package compiles
-`rust/mimalloc-pprof/vendor/mimalloc-pprof-amalgamated.c`, not the root
-`src/` tree. After an intentional C-core update, maintainers must regenerate
-and validate the vendored source in a separate Rust-only commit:
+---
+
+## Profiler reference
+
+### Environment variables
+
+Set these before process launch to capture allocations made during startup,
+before `main` runs:
 
 ```sh
-cd rust
-soldr cargo run -p xtask -- amalgamate-c
-soldr cargo run -p xtask -- amalgamate-h
-soldr cargo run -p xtask -- check
-soldr cargo test --workspace --locked
+MIMALLOC_PROF=1 \
+MIMALLOC_PROF_DUMP_AT_EXIT=heap.prof \
+MIMALLOC_PROF_SAMPLE_INTERVAL=524288 \
+./my_app
 ```
 
-Keeping C-core and `rust/` changes in separate commits allows the C changes to
-be cherry-picked cleanly upstream.
+| Setting | Meaning |
+|---|---|
+| `MIMALLOC_PROF=1` | Start the profiler automatically at process start |
+| `MIMALLOC_PROF_DUMP_AT_EXIT=path` | Write a profile at exit |
+| `MIMALLOC_PROF_SAMPLE_INTERVAL=N` | Bytes between samples (default ~512 KiB) |
+| `MIMALLOC_PROF_ACCUM=1` | Keep cumulative counters until `mi_prof_reset` |
+| `MIMALLOC_PROF_BT_MAX=32` | Maximum captured stack depth (compile-time cap 128) |
+| `MIMALLOC_PROF_MAX_BYTES=N` | Bound persistent profiler arena memory |
+| `MIMALLOC_PROF_SEED=N` | Deterministic sampling, for repeatable tests |
+| `MIMALLOC_PROF_DUMP_FORMAT=proto` | Write pprof `profile.proto` instead of text |
 
-## Memory-events integration
+`MIMALLOC_PROF_SAMPLE_RATE` remains a compatibility alias for
+`MIMALLOC_PROF_SAMPLE_INTERVAL`; when both are set, `..._INTERVAL` wins.
 
-`include/mimalloc/memory-events.h` exposes opt-in allocation-change counters,
-callbacks, a best-effort live-allocation visitor, and raw-OS-layer
-`mi_unwrapped_*` allocation functions for instrumentation that must avoid
-allocator recursion.
+### Allocator statistics in the profile (v3 only)
 
-Enable tracking before the first allocation when exact lifetime totals are
-required:
+v3 exposes per-heap and per-subprocess counters (`mi_heap_stats_get`,
+`mi_subproc_stats_get`) that v2 had no API for. The profiler surfaces them in two
+places:
+
+**1. `mi_prof_stats_t` v3 fields** (`MI_PROF_STAT_VERSION` 3) — `heap_committed`,
+`heap_reserved`, `heap_malloc_requested`, `heap_pages`, `heap_pages_abandoned`,
+`heap_count`, `theap_count`, `heap_purged`. In Rust these are `ProfStats::heap`,
+a `HeapStats` struct.
+
+**2. A comment block in the text dump**, after the samples and before
+`MAPPED_LIBRARIES:`. google/pprof's legacy heap parser skips `#` lines, so
+existing tooling reads the profile unchanged:
+
+```text
+# mimalloc heap stats
+# committed = 3080192
+# reserved = 5308416
+# malloc_requested = 2097152
+# pages = 43
+...
+```
+
+**Why this matters.** Everything else in `mi_prof_stats_t` is *sampled*; these
+fields are **exact**. A sampled profile alone cannot tell you whether it
+under-counted, but comparing `heap_malloc_requested` against `live_bytes` measures
+the sampling error directly — which is what makes an assertion on a sampled
+profile meaningful in tests and in production monitoring.
+
+`mi_prof_stats_get` still accepts v1- and v2-sized structs from older callers and
+leaves the newer fields untouched, so upgrading the header does not break an
+existing binary.
+
+Two counters carry caveats:
+
+- **`heap_malloc_requested` requires `MI_STAT >= 2`.** Upstream enables that level
+  by default only for debug builds; a default **release** build has `MI_STAT == 0`
+  and reports 0. Because 0 is also a legitimate value,
+  `mi_prof_stats_t.heap_stats_detailed` (Rust: `HeapStats::detailed`) tells you
+  which case you are in, and the dump records `# detailed_stats = 0|1` so a saved
+  profile is self-describing. Build with `-DMI_STAT=2` to enable it in release, at
+  some allocation-path cost.
+- **`theap_count` excludes the main thread's statically-initialized theap**, so a
+  single-threaded process reports 0. It also lags thread exit, since v3
+  reference-counts theaps for cached thread-locals.
+
+---
+
+## Memory-events API
+
+[`include/mimalloc/memory-events.h`](include/mimalloc/memory-events.h) exposes
+opt-in allocation-change counters, callbacks, a best-effort live-allocation
+visitor, and raw-OS-layer `mi_unwrapped_*` functions for instrumentation that must
+avoid allocator recursion. It is **independent of `MI_PPROF`** and remains
+available in an `MI_PPROF=OFF` build.
+
+Enable tracking before the first allocation when exact lifetime totals matter:
 
 ```c
 #include <mimalloc/memory-events.h>
@@ -420,41 +472,57 @@ if (mi_memory_snapshot(&snapshot)) {
 }
 ```
 
-Alternatively, set `MIMALLOC_MEMORY_EVENTS=1` before process launch. Enabling
-tracking later does not reconstruct allocations made while it was disabled.
-Callback reentrancy, pointer lifetime, and live-visitor restrictions are
-documented in
-[`include/mimalloc/memory-events.h`](include/mimalloc/memory-events.h).
+Alternatively set `MIMALLOC_MEMORY_EVENTS=1` before launch. Enabling tracking
+later does not reconstruct allocations made while it was disabled. Callback
+reentrancy, pointer lifetime, and live-visitor restrictions are documented in the
+header.
 
-## Integration contract for maintainers and coding agents
+---
+
+## For maintainers
+
+### Integration contract
 
 When changing or embedding this fork, preserve all of the following:
 
 1. Profiler-internal allocations must use the raw OS-layer arena
-   (`_mi_os_alloc`), never `mi_malloc`, C++ `new`, or Rust `GlobalAlloc`.
-2. Every new C source file must be added to the normal CMake source list and to
-   `src/static.c`. `src/profile.c` remains compiled to provide the OFF stubs and
-   gates its implementation internally; profiler helper files and engine hook
-   call sites must be guarded by `MI_PPROF`.
+   (`_mi_os_alloc`) — never `mi_malloc`, C++ `new`, or Rust `GlobalAlloc`.
+2. Every new C source file must be added to the CMake source list **and** to
+   `src/static.c`. `src/profile.c` stays compiled to provide the OFF stubs and
+   gates its implementation internally; profiler helper files and engine hook call
+   sites must be guarded by `MI_PPROF`.
 3. `MI_PPROF=OFF` must remove the profiler hooks and preserve upstream allocator
-   behavior when independent memory-events tracking remains runtime-disabled.
-   The memory-events API, hooks, and tests remain available in the OFF build.
+   behavior when memory-events tracking remains runtime-disabled. The
+   memory-events API, hooks, and tests remain available in the OFF build.
 4. `mi_prof_config_t`, `mi_prof_stats_t`, and `mi_memory_snapshot_t` stay
-   size/version tagged and must be extended compatibly. Other public structs
-   and function signatures must not be changed incompatibly.
+   size/version tagged and must be extended compatibly. Other public structs and
+   signatures must not change incompatibly.
 5. Validate C changes on Ubuntu, Windows MSVC, Windows MinGW, and macOS with
    `MI_PPROF=ON`, plus an `MI_PPROF=OFF` build and the Rust workspace.
-6. Never mix root C-core paths and `rust/` paths in one commit.
+6. Never mix root C-core paths and `rust/` paths in one commit — it keeps the C
+   changes cherry-pickable upstream.
 
-These rules are also summarized in `AGENTS.md` when that file is present in a
-working checkout.
+### Regenerating the vendored Rust source
 
-## Repository layout
+The Rust package compiles
+`rust/mimalloc-pprof/vendor/mimalloc-pprof-amalgamated.c`, **not** the root `src/`
+tree. After an intentional C-core change, regenerate and validate it in a separate
+Rust-only commit:
+
+```sh
+cd rust
+soldr cargo run -p xtask -- amalgamate-c
+soldr cargo run -p xtask -- amalgamate-h
+soldr cargo run -p xtask -- check
+soldr cargo test --workspace --locked
+```
+
+### Repository layout
 
 ```text
 .
 |-- include/ src/ test/ CMakeLists.txt  # mimalloc v3 C core and profiler
-|-- README.md                           # fork and integration guide
+|-- README.md                           # this file
 |-- readme-upstream.md                  # upstream mimalloc documentation
 `-- rust/
     |-- mimalloc-pprof/                 # allocator crate, safe API, raw FFI
@@ -464,18 +532,23 @@ working checkout.
 
 The repository root is mimalloc and retains upstream git history. The
 `readme-upstream.md` rename avoids a Windows case collision with this file.
+
 For upstream mimalloc build modes, overrides, options, and platform notes, see
-[readme-upstream.md](readme-upstream.md). For the repository's fast local
-development loop, see [docs/dev-loop.md](docs/dev-loop.md).
+[readme-upstream.md](readme-upstream.md). For the fast local development loop, see
+[docs/dev-loop.md](docs/dev-loop.md). Design history and milestone decisions are in
+[issue #2](https://github.com/zackees/mimalloc-pprof/issues/2); the survey of other
+mimalloc v3 forks is in
+[issue #50](https://github.com/zackees/mimalloc-pprof/issues/50).
+
+---
 
 ## Prior art and credits
 
-- [microsoft/mimalloc](https://github.com/microsoft/mimalloc), by Daan Leijen
-  (MIT).
-- [microsoft/mimalloc#1266](https://github.com/microsoft/mimalloc/pull/1266),
-  the sampled-allocation-hook design this fork builds on.
-- [gperftools](https://github.com/gperftools/gperftools), whose `heap_v2`
-  format is accepted by google/pprof.
+- [microsoft/mimalloc](https://github.com/microsoft/mimalloc), by Daan Leijen (MIT).
+- [microsoft/mimalloc#1266](https://github.com/microsoft/mimalloc/pull/1266), the
+  sampled-allocation-hook design this fork builds on.
+- [gperftools](https://github.com/gperftools/gperftools), whose `heap_v2` format is
+  accepted by google/pprof.
 
 ## License
 

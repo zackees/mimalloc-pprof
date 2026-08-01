@@ -83,7 +83,13 @@ jobs:
             echo "::error::the harness failed (rc=$rc) but produced no AddressSanitizer report -- ASan is not the oracle here, so this control proves nothing about the sanitizer."
             exit 1
           fi
-          if ! echo "$out" | grep -qE "AddressSanitizer: heap-use-after-free"; then
+          # "use-after-poison", not "heap-use-after-free": mimalloc's blocks come out of
+          # its own arena and MI_OVERRIDE=OFF, so ASan never saw an allocation it owns --
+          # it knows the block only through mimalloc's manual ASAN_POISON_MEMORY_REGION
+          # in mi_track_free_size. use-after-poison IS the correct verdict here. Both
+          # spellings accepted so this does not turn red if the override setting or the
+          # tracking path changes; either one means ASan saw the freed block.
+          if ! echo "$out" | grep -qE "AddressSanitizer: (heap-)?use-after-(free|poison)"; then
             echo "::error::got an AddressSanitizer report, but not the planted use-after-free; that is a different bug."
             exit 1
           fi

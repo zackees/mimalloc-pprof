@@ -1064,6 +1064,20 @@ if (MI_BUILD_TESTS)
   add_test(NAME test-memory-events-env-enabled COMMAND mimalloc-test-memory-events --env-enabled-check)
   set_tests_properties(test-memory-events-env-enabled PROPERTIES ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
 
+  # thread-local slot array provenance (issue #128 B3): the array must not be
+  # allocated from whatever heap the application happens to have set as its default,
+  # or mi_heap_destroy on that heap frees it while it is still live.
+  add_executable(mimalloc-test-tls-slots-heap test/test-tls-slots-heap.c)
+  target_compile_definitions(mimalloc-test-tls-slots-heap PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-tls-slots-heap PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-tls-slots-heap PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-tls-slots-heap PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-tls-slots-heap PRIVATE mimalloc ${mi_libraries})
+  endif()
+  add_test(NAME test-tls-slots-heap COMMAND mimalloc-test-tls-slots-heap)
+
   # dynamic override test
   if(MI_BUILD_SHARED AND NOT (MI_TRACK_ASAN OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN)) # AND NOT (APPLE AND MI_USE_CXX))
     add_executable(mimalloc-test-stress-dynamic test/test-stress.c)

@@ -375,6 +375,27 @@ static void test_concurrency(void) {
     total_free_count  += t7_results[i].free_count;
     total_free_bytes  += t7_results[i].free_bytes;
   }
+  /* Guarded allocations break this test's scoping premise, not its subject.
+     T7 isolates its own traffic by filtering events to the single block-size class
+     `t7_usable` (see the comment above). With MI_GUARDED active, an allocation of
+     t7_block_size may be served from a guarded block that spans a guard page and
+     therefore reports a DIFFERENT size -- so the filter rejects the test's own events
+     and the tallies come out short. The hooks are fine; the size-based filter is what
+     stops working. Issue #131.
+     Checked at runtime rather than on the MI_GUARDED define, because guarding is
+     additionally gated by the sample rate: a build can have MI_GUARDED=1 and still
+     never guard anything. */
+  const bool guarding_active = (mi_option_get(mi_option_guarded_sample_rate) != 0);
+  if (guarding_active) {
+    /* Still assert the invariant that does survive: allocations and frees must PAIR.
+       That is what T7 exists to check under concurrency, and it holds regardless of
+       which size class each event lands in. */
+    assert(total_alloc_count == total_free_count);
+    assert(total_alloc_bytes == total_free_bytes);
+    fprintf(stderr, "T7: guarding active -- size-class equality skipped, pairing verified\n");
+    return;
+  }
+
   assert(total_alloc_count == (uint64_t)T7_THREADS * T7_PER_THREAD);
   assert(total_free_count == (uint64_t)T7_THREADS * T7_PER_THREAD);
   assert(total_alloc_bytes == (uint64_t)T7_THREADS * T7_PER_THREAD * t7_usable);

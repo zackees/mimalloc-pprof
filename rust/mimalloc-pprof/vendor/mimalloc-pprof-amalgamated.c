@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fba9f8cc of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ccb931da of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -510,7 +510,6 @@ typedef enum mi_option_e {
   mi_option_prof_seed,                  // profiler sampling PRNG seed; 0 = nondeterministic (=0)
   mi_option_prof_max_bytes,             // budget (in bytes) for profiler-internal arena memory; 0 = unbudgeted (=0)
   mi_option_memory_events,              // enable opt-in allocation-change accounting/callbacks (MIMALLOC_MEMORY_EVENTS) (=0)
-  mi_option_purge_zeroes,               // treat decommit-purged slices as zeroed, letting mi_zalloc skip its memset (=0, experimental)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -10796,19 +10795,6 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
   if (needs_recommit) {
     // no longer committed
     mi_bitmap_clearN(arena->slices_committed, slice_index, slice_count);
-    // Experimental (#67, mi_option_purge_zeroes, default off): decommitted memory reads
-    // back zero when it is recommitted, so the slices are no longer dirty. Clearing the
-    // dirty bits lets the next allocation see memid->initially_zero, which in turn lets
-    // mi_zalloc skip its memset (alloc.c: `if (!page->free_is_zero) memset(...)`).
-    //
-    // Reached only on the `needs_recommit` branch, i.e. only when we genuinely
-    // decommitted. A *reset* (MADV_FREE / MEM_RESET) may preserve contents, and a custom
-    // commit_fun makes no zeroing promise at all -- claiming zero in either case would
-    // hand dirty memory to mi_zalloc, which is silent heap corruption rather than a
-    // visible failure. Hence both guards.
-    if (arena->commit_fun == NULL && mi_option_is_enabled(mi_option_purge_zeroes)) {
-      mi_bitmap_clearN(arena->slices_dirty, slice_index, slice_count);
-    }
     // we just counted in the purge to decommit all, but the some part was not committed so adjust that here
     // mi_subproc_stat_decrease(arena->subproc, committed, mi_size_of_slices(slice_count - already_committed));
   }
@@ -16174,7 +16160,6 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(prof_seed) }
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(prof_max_bytes) }        // budget for profiler-internal arena memory; 0 = unbudgeted
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(memory_events) }         // opt-in allocation-change accounting/callbacks; read lazily by memory-events.c, not at startup
-  ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_zeroes) }           // experimental (#67): treat decommit-purged slices as zeroed so mi_zalloc can skip its memset
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
@@ -19898,17 +19883,31 @@ static bool prof_dump_stack(const mi_prof_sample_info_t* info, void* arg) {
   return out->ok;
 }
 
-static uint64_t prof_random(mi_profiler_tld_t* tld) {
+/* Per-thread PRNG for the sampling interval.
+   The initial state mixes a *thread ordinal* into prof_seed, not the address of the
+   tld. Both decorrelate threads -- without some per-thread term, every thread started
+   from the same seed would sample at identical byte offsets -- but an address is
+   randomised by ASLR, which made mi_prof_start_seeded and MIMALLOC_PROF_SEED
+   non-reproducible across processes despite being documented as
+   "deterministic sampling, for repeatable tests" (issue #91).
+   mi_tld_t.thread_seq is the linear count of created threads, so thread K always gets
+   the same stream for a given seed.
+   Caveat worth knowing: this makes a run reproducible when the *thread creation order*
+   is deterministic. It cannot make concurrent interleaving reproducible, so a
+   multi-threaded workload whose threads race to allocate is still only
+   statistically repeatable. */
+static uint64_t prof_random(mi_tld_t* owner) {
+  mi_profiler_tld_t* tld = &owner->profiler;
   uint64_t x = tld->random;
-  if (x == 0) x = prof_seed ^ (uintptr_t)tld ^ UINT64_C(0x9E3779B97F4A7C15);
+  if (x == 0) x = prof_seed ^ (uint64_t)owner->thread_seq ^ UINT64_C(0x9E3779B97F4A7C15);
   x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
   tld->random = x;
   return x * UINT64_C(2685821657736338717);
 }
 
-static size_t prof_threshold(mi_profiler_tld_t* tld) {
+static size_t prof_threshold(mi_tld_t* owner) {
   size_t rate = prof_rate;
-  size_t value = (size_t)(prof_random(tld) % (rate * 2));
+  size_t value = (size_t)(prof_random(owner) % (rate * 2));
   if (value < 1) value = 1;
   if (value > rate * 64) value = rate * 64;
   return value;
@@ -20550,9 +20549,9 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   mi_profiler_tld_t* tld = &theap->tld->profiler;
   if (tld->generation != prof_generation) { tld->bytes_since_sample = 0; tld->next_threshold = 0; tld->random = 0; tld->generation = prof_generation; }
   tld->bytes_since_sample += size;
-  if (tld->next_threshold == 0) tld->next_threshold = prof_threshold(tld);
+  if (tld->next_threshold == 0) tld->next_threshold = prof_threshold(theap->tld);
   if (tld->bytes_since_sample < tld->next_threshold) { mi_lock_release(&prof_lock); return; }
-  tld->bytes_since_sample = 0; tld->next_threshold = prof_threshold(tld);
+  tld->bytes_since_sample = 0; tld->next_threshold = prof_threshold(theap->tld);
   mi_prof_record_t* rec = prof_record_alloc();
   if (rec != NULL) {
     rec->stack = _mi_prof_stack_intern();

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit e22b1663 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 64d299b9 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -23031,7 +23031,15 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
     count = least_idx + 1;
   }
   if (count > MI_TLS_IDX_MAX) { return NULL; }  // too large
-  mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_rezalloc(tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
+  // Allocate from the main heap explicitly, never from the calling thread's default.
+  // Plain `mi_rezalloc` uses whatever heap the application last passed to
+  // `mi_theap_set_default`, so a later `mi_heap_destroy` on that heap frees this array
+  // while `mi_thread_locals` still points at it -- a use-after-free that is silent
+  // rather than fatal, since the clobbered `count` is huge enough to pass every bounds
+  // check and lookups then just return NULL. See test/test-tls-slots-heap.c (#128 B3).
+  // The main heap cannot be destroyed through any public API. Freeing stays plain
+  // `mi_free` in `_mi_thread_locals_thread_done`, which finds the owning page itself.
+  mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_heap_rezalloc(mi_heap_main(), tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
   if mi_unlikely(tls==NULL) return NULL;
   tls->count = count;
   mi_thread_locals_set(tls);

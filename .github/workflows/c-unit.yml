@@ -85,10 +85,16 @@ jobs:
           fi
       - run: cmake --build build-guarded --parallel
       - run: ctest --test-dir build-guarded --output-on-failure --timeout 900
-      # NOT added yet: a run at MIMALLOC_GUARDED_SAMPLE_RATE=1. It is currently RED --
-      # mimalloc reports "double free detected" and test-memory-events' allocation count
-      # goes wrong. Adding it red, or with continue-on-error, is how a gate becomes
-      # decoration; it goes in with the fix. Tracked on #116.
+      # Guard every in-range allocation instead of 1-in-4000, so the guarded path is
+      # actually exercised rather than sampled into. Withheld earlier over two problems,
+      # both now resolved: the count assertion was T7's size-class scoping breaking under
+      # guarding (fixed in #133), and the "double free detected" line turned out to be
+      # EXPECTED output -- test-memory-events deliberately double-frees to verify
+      # mimalloc's detector no-ops before our hook runs (#131).
+      - name: Suite with guarding forced on every allocation
+        env:
+          MIMALLOC_GUARDED_SAMPLE_RATE: "1"
+        run: ctest --test-dir build-guarded --output-on-failure --timeout 900
 
   ctest-pprof-off:
     runs-on: ubuntu-latest

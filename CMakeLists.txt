@@ -50,6 +50,8 @@ option(MI_SEE_ASM           "Generate assembly files" OFF)
 # negated options for vcpkg features
 option(MI_NO_USE_CXX        "Use plain C compilation (has priority over MI_USE_CXX)" OFF)
 option(MI_NO_OPT_ARCH       "Do not use architecture specific optimizations (like '-march=armv8.1-a' for example) (has priority over MI_OPT_ARCH)" OFF)
+option(MI_FUZZ              "Build the libFuzzer harnesses in test/fuzz (requires clang; see issue #87)" OFF)
+option(MI_FUZZ_PLANT_BUG    "Plant a deliberate bug in the fuzz harness so CI can prove the fuzzer finds it" OFF)
 option(MI_NO_DEBUG          "Disable all assertion checks even in debug builds" OFF)
 
 # experimental
@@ -922,6 +924,36 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-memory-gate PRIVATE Threads::Threads)
   endif()
   add_test(NAME test-memory-gate COMMAND mimalloc-test-memory-gate)
+
+  # libFuzzer harnesses (issue #87). Off by default and clang-only: -fsanitize=fuzzer
+  # is a clang feature, and these are driven by the fuzz CI job rather than ctest --
+  # a fuzz run has no fixed duration, so it does not belong in the normal suite.
+  # The oracle is ASan (#86); without a sanitizer, fuzzing an allocator mostly proves
+  # it does not segfault.
+  if(MI_FUZZ)
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+      message(FATAL_ERROR "MI_FUZZ=ON requires clang (-fsanitize=fuzzer); got ${CMAKE_C_COMPILER_ID}")
+    endif()
+    foreach(FUZZ_NAME alloc-ops prof-dump)
+      string(REPLACE "-" "_" FUZZ_SRC ${FUZZ_NAME})
+      add_executable(mimalloc-fuzz-${FUZZ_NAME} test/fuzz/fuzz_${FUZZ_SRC}.c)
+      target_compile_definitions(mimalloc-fuzz-${FUZZ_NAME} PRIVATE ${mi_defines})
+      target_compile_options(mimalloc-fuzz-${FUZZ_NAME} PRIVATE ${mi_cflags} -fsanitize=fuzzer,address)
+      target_link_options(mimalloc-fuzz-${FUZZ_NAME} PRIVATE -fsanitize=fuzzer,address)
+      target_include_directories(mimalloc-fuzz-${FUZZ_NAME} PRIVATE include)
+      if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+        target_link_libraries(mimalloc-fuzz-${FUZZ_NAME} PRIVATE mimalloc-static ${mi_libraries})
+      else()
+        target_link_libraries(mimalloc-fuzz-${FUZZ_NAME} PRIVATE mimalloc ${mi_libraries})
+      endif()
+    endforeach()
+    # Positive control: a planted, easily-reachable bug the fuzzer must find. A fuzz
+    # harness that has never found anything is indistinguishable from one that is not
+    # running the code under test.
+    if(MI_FUZZ_PLANT_BUG)
+      target_compile_definitions(mimalloc-fuzz-alloc-ops PRIVATE MI_FUZZ_PLANT_BUG=1)
+    endif()
+  endif()
 
   # Seeded-sampling determinism across processes (issue #91). Spawns itself, so it
   # cannot be an in-process loop: the bug was ASLR-dependent, and two runs inside one

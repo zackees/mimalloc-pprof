@@ -81,16 +81,39 @@ static size_t rd_align(reader_t* r) {
 }
 
 #if MI_FUZZ_PLANT_BUG
-/* Positive control (CI only, -DMI_FUZZ_PLANT_BUG=ON). A deliberate one-byte overflow
-   on an easily-reachable input, so the fuzz job can demonstrate that the harness
-   actually finds bugs. A fuzzer that has never found anything is indistinguishable
-   from one that is not running the code under test -- and this repository has now
-   shipped six checks that were silently verifying nothing.
+/* Positive control (CI only, -DMI_FUZZ_PLANT_BUG=ON). A deliberate defect on an
+   easily-reachable input, so the fuzz job can demonstrate that the harness actually
+   finds bugs. A fuzzer that has never found anything is indistinguishable from one
+   that is not running the code under test -- and this repository has now shipped
+   several checks that were silently verifying nothing.
    Kept in the harness rather than in src/, so production code is never built with a
-   planted defect and the control cannot escape into a release. */
+   planted defect and the control cannot escape into a release.
+
+   This is a use-after-free, NOT the one-past-the-end overflow it used to be. The
+   overflow could never have proven what the control claims to prove, because
+   AddressSanitizer cannot see it:
+
+     mi_track_malloc_size(p,reqsize,size,zero) -> ASAN_UNPOISON_MEMORY_REGION(p,size)
+
+   unpoisons the whole *block*, not the requested bytes, so in a debug build (where
+   the block carries MI_PADDING) writing at p[requested] lands in memory ASan has
+   been told is valid. Every CI run bore this out: the crash was mimalloc's own
+   mi_check_padding calling abort() at free time, reported by libFuzzer as
+   "deadly signal", with no AddressSanitizer report anywhere.
+
+   A use-after-free is the right shape, because freeing is the one place mimalloc
+   hands ASan a poison call:
+
+     mi_track_free_size(p,size) -> ASAN_POISON_MEMORY_REGION(p,size)
+
+   so touching a freed block must produce a genuine "ERROR: AddressSanitizer:
+   heap-use-after-free". That makes ASan -- the oracle fuzz.yml is built around --
+   the thing being demonstrated, rather than mimalloc's padding check standing in
+   for it. */
 static void plant_bug(void* p, size_t requested) {
   if (p != NULL && requested == 64) {
-    ((unsigned char*)p)[requested] = 0xAA;   /* one past the end -- ASan must catch */
+    mi_free(p);
+    ((volatile unsigned char*)p)[0] = 0xAA;   /* freed block: ASan must report UAF */
   }
 }
 #endif

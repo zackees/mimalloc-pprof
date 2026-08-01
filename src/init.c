@@ -134,7 +134,7 @@ mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   false,                  // allow reclaim
   true,                   // allow abandon
   #if MI_GUARDED
-  0, 0, 0, 1,             // sample count is 1 so we never write to it (see `internal.h:mi_theap_malloc_use_guarded`)
+  0, 0, 0, 1,             // rate is 0 and count is 1 so we never write to it (see `internal.h:mi_heap_malloc_use_guarded`)
   #endif
   MI_SMALL_PAGES_EMPTY,
   MI_PAGE_QUEUES_EMPTY,
@@ -149,7 +149,7 @@ mi_decl_cache_align const mi_theap_t _mi_theap_empty_wrong = {
   MI_ATOMIC_VAR_INIT(1),  // refcount
   MI_ATOMIC_VAR_INIT(0),  // freed
   0,                      // heartbeat
-  0,                      // cookie
+  1,                      // cookie  (see issue #1343)
   { {0}, {0}, 0, true },  // random
   0,                      // page count
   MI_BIN_FULL, 0,         // page retired min/max
@@ -161,7 +161,7 @@ mi_decl_cache_align const mi_theap_t _mi_theap_empty_wrong = {
   false,                  // allow reclaim
   true,                   // allow abandon
   #if MI_GUARDED
-  0, 0, 0, 1,             // sample count is 1 so we never write to it (see `internal.h:mi_theap_malloc_use_guarded`)
+  0, 0, 0, 1,             // rate is 0 and count is 1 so we never write to it (see `internal.h:mi_heap_malloc_use_guarded`)
   #endif
   MI_SMALL_PAGES_EMPTY,
   MI_PAGE_QUEUES_EMPTY,
@@ -327,7 +327,7 @@ static void mi_theap_main_init(void) {
   if mi_unlikely(mi_theap_main.memid.memkind != MI_MEM_STATIC) {
     // theap
     mi_theap_main.memid = _mi_memid_create(MI_MEM_STATIC);
-    #if defined(__APPLE__) || defined(_WIN32) && !defined(MI_SHARED_LIB)
+    #if defined(__APPLE__) || (defined(_WIN32) && !defined(MI_SHARED_LIB))
       _mi_random_init_weak(&mi_theap_main.random);    // prevent allocation failure during bcrypt dll initialization with static linking (issue #1185)
     #else
       _mi_random_init(&mi_theap_main.random);
@@ -446,11 +446,6 @@ bool _mi_is_process_heap_main(const mi_heap_t* heap) {
   return (heap == NULL || heap == &mi_process_heap_main);
 }
 
-bool _mi_is_theap_main(const mi_theap_t* theap) {
-  return (mi_theap_is_initialized(theap) && _mi_is_heap_main(_mi_theap_heap(theap)));
-}
-
-
 
 /* -----------------------------------------------------------
   Sub process
@@ -526,13 +521,18 @@ static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subpro
     mi_heap_t* heap = subproc->heaps;
     while (heap != NULL) {
       mi_heap_t* next = heap->next;
-      if (heap!=subproc->heap_main) { mi_heap_destroy(heap); }
+      if (heap!=subproc->heap_main) { _mi_heap_force_destroy(heap,false /* do not re-acquire the heaps_lock */); }
       heap = next;
     }
     mi_assert_internal(subproc->heap_main==NULL || subproc->heaps == subproc->heap_main);
     if (subproc->heap_main!=NULL) {
-      _mi_heap_force_destroy(subproc->heap_main);  // no warning if destroying the main heap
+      _mi_heap_force_destroy(subproc->heap_main,false /* do not re-acquire the heaps_lock */);  // no warning if destroying the main heap
     }
+  }
+
+  if (subproc==&subproc_main) {
+    // for the main subproc, release the thread locals now (as they may free memory)
+    _mi_thread_locals_done();
   }
 
   // remove associated arenas
@@ -655,7 +655,10 @@ static mi_theap_t* _mi_thread_init_theap_default(mi_heap_t* heap_main) {
 
       // allocate and initialize the theap for the main heap
       theap = _mi_theap_create( heap_main, tld);
-      if (theap==NULL) return NULL;  // out-of-memory on theap allocation
+      if (theap==NULL) {
+        mi_tld_free(tld);
+        return NULL;  // out-of-memory on theap allocation
+      }
     }
   }
   // now initialize the thread
@@ -838,43 +841,50 @@ bool _mi_is_empty_theap(const mi_theap_t* theap) {
 #define MI_TLS_DIRECT_SLOTS             (64)
 #define MI_TLS_EXPANSION_SLOTS          (1024)
 
+#if !MI_WIN_DIRECT_TLS
 // We initially use the last of the expansion slots as the default NULL.
 // note: this will fail if the program allocates exactly 1024+64 slots with TlsAlloc 
 // before we are initialized :-( (but this seems quite unlikely).
 // (todo: another approach could be to use slot 7 (EnvironmentPointer) as the initial slot as that seems to be always NULL)
 #define MI_TLS_INITIAL_SLOT             MI_TLS_EXPANSION_SLOT
 #define MI_TLS_INITIAL_EXPANSION_SLOT   (MI_TLS_EXPANSION_SLOTS-1)
+#else
+// With direct tls we need an initial NULL slot outside the expansion slots
+#define MI_TLS_INITIAL_SLOT             (5)  // Arbitrary user pointer
+#define MI_TLS_INITIAL_EXPANSION_SLOT   (MI_TLS_EXPANSION_SLOTS-1)  // unused
+#endif
 
 // in case of errors assign fixed slots (but since we use EFAULT the program should fail anyways)
 #define MI_TLS_ERROR_SLOT               (5)   // arbitrary user pointer
 #define MI_TLS_ERROR_EXPANSION_SLOT     (7)   // environment pointer (only used for OS/2 emulation)
 
 
-mi_decl_hidden mi_decl_cache_align size_t _mi_theap_default_slot = MI_TLS_INITIAL_SLOT;
-mi_decl_hidden size_t _mi_theap_default_expansion_slot = MI_TLS_INITIAL_EXPANSION_SLOT;
-mi_decl_hidden size_t _mi_theap_cached_slot            = MI_TLS_INITIAL_SLOT;
-mi_decl_hidden size_t _mi_theap_cached_expansion_slot  = MI_TLS_INITIAL_EXPANSION_SLOT;
+mi_decl_hidden mi_decl_cache_align _Atomic(size_t) _mi_theap_default_slot = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_SLOT);
+mi_decl_hidden _Atomic(size_t) _mi_theap_default_expansion_slot = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_EXPANSION_SLOT);
+mi_decl_hidden _Atomic(size_t) _mi_theap_cached_slot            = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_SLOT);
+mi_decl_hidden _Atomic(size_t) _mi_theap_cached_expansion_slot  = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_EXPANSION_SLOT);
 
 static DWORD mi_tls_raw_index_default = TLS_OUT_OF_INDEXES;
 static DWORD mi_tls_raw_index_cached  = TLS_OUT_OF_INDEXES;
 
-static bool mi_win_tls_slot_alloc(size_t* slot, size_t* extended, DWORD* raw_index) {
+static bool mi_win_tls_slot_alloc(_Atomic(size_t)* slot, _Atomic(size_t)* extended, DWORD* raw_index) {
+  // always write slot before extended due to concurrent readers
   const DWORD index = TlsAlloc();
   *raw_index = index;
   if (index==TLS_OUT_OF_INDEXES) {
-    *extended = MI_TLS_ERROR_EXPANSION_SLOT;
-    *slot = MI_TLS_ERROR_SLOT;
+    mi_atomic_store_release(slot,MI_TLS_ERROR_SLOT);
+    mi_atomic_store_release(extended,MI_TLS_ERROR_EXPANSION_SLOT);
     return false;
   }
   else if (index<MI_TLS_DIRECT_SLOTS) {
-    *extended = 0;
-    *slot = index + MI_TLS_DIRECT_FIRST;
+    mi_atomic_store_release(slot,index + MI_TLS_DIRECT_FIRST);
+    mi_atomic_store_release(extended,0);
     return true;
   }
   #if !MI_WIN_DIRECT_TLS
   else if (index < MI_TLS_DIRECT_SLOTS + MI_TLS_EXPANSION_SLOTS - 1) { // check maximum number of expansion slots - 1 (as we use the last one as the default)
-    *extended = index - MI_TLS_DIRECT_SLOTS;
-    *slot = MI_TLS_EXPANSION_SLOT;
+    mi_atomic_store_release(slot, MI_TLS_EXPANSION_SLOT);
+    mi_atomic_store_release(extended,index - MI_TLS_DIRECT_SLOTS);
     return true;
   }
   #endif
@@ -883,14 +893,16 @@ static bool mi_win_tls_slot_alloc(size_t* slot, size_t* extended, DWORD* raw_ind
     _mi_error_message(EFAULT, "returned TLS index was too high (%u)\n", index);
     TlsFree(index);
     *raw_index = TLS_OUT_OF_INDEXES;
-    *extended = MI_TLS_ERROR_EXPANSION_SLOT;
-    *slot = MI_TLS_ERROR_SLOT;
+    mi_atomic_store_release(slot, MI_TLS_ERROR_SLOT);
+    mi_atomic_store_release(extended,MI_TLS_ERROR_EXPANSION_SLOT);
     return false;
   }
 }
 
-static void mi_win_tls_slot_free(DWORD* raw_index) {
+static void mi_win_tls_slot_free(_Atomic(size_t)*slot, _Atomic(size_t)*extended, DWORD* raw_index) {
   if (*raw_index != TLS_OUT_OF_INDEXES) {
+    mi_atomic_store_release(slot, MI_TLS_ERROR_SLOT);
+    mi_atomic_store_release(extended, MI_TLS_ERROR_EXPANSION_SLOT);
     TlsFree(*raw_index);
     *raw_index = TLS_OUT_OF_INDEXES;
   }
@@ -909,8 +921,8 @@ static void mi_tls_slots_init(void) {
 }
 
 static void mi_tls_slots_done(void) {
-  mi_win_tls_slot_free(&mi_tls_raw_index_default);
-  mi_win_tls_slot_free(&mi_tls_raw_index_cached );
+  mi_win_tls_slot_free(&_mi_theap_default_slot, &_mi_theap_default_expansion_slot, &mi_tls_raw_index_default);
+  mi_win_tls_slot_free(&_mi_theap_cached_slot, &_mi_theap_cached_expansion_slot, &mi_tls_raw_index_cached );
 }
 
 static void mi_win_tls_slot_set(size_t slot, size_t extended_slot, void* value) {
@@ -941,13 +953,33 @@ static void mi_tls_slots_init(void) {
   mi_atomic_do_once {
     _mi_pthread_key_create(&_mi_theap_default_key,NULL,NULL);
     _mi_pthread_key_create(&_mi_theap_cached_key,&mi_theap_cached_key_destroy,NULL);
-  }
+  }  
 }
 
 static void mi_tls_slots_done(void) {
   mi_pthread_key_delete(&_mi_theap_default_key);
   mi_pthread_key_delete(&_mi_theap_cached_key);
 }
+
+#elif MI_TLS_MODEL_FIXED 
+
+static void mi_tls_slots_init(void) {
+  mi_atomic_do_once {
+    mi_theap_t* theap = _mi_theap_default();
+    if (theap!=NULL) {
+      _mi_error_message(EINVAL,"fixed TLS slot is already in use (slot %d = %p)", MI_TLS_MODEL_FIXED_DEFAULT, theap);
+    }
+    theap = _mi_theap_cached();
+    if (theap!=NULL) {
+      _mi_error_message(EINVAL,"fixed TLS slot is already in use (slot %d = %p)", MI_TLS_MODEL_FIXED_CACHED, theap);
+    }
+  }
+}
+
+static void mi_tls_slots_done(void) {
+  // nothing
+}
+
 
 #else
 
@@ -1139,7 +1171,7 @@ static void mi_process_init_once(void) mi_attr_noexcept {
   mi_thread_init();
   _mi_process_is_initialized = true;
 
-  #if defined(_WIN32) && defined(MI_WIN_USE_FLS)
+  #if defined(_WIN32) && defined(MI_WIN_INIT_USE_FLS)
   // On windows, when building as a static lib the FLS cleanup happens to early for the main thread.
   // To avoid this, set the FLS value for the main thread to NULL so the fls cleanup
   // will not call _mi_thread_done on the (still executing) main thread. See issue #508.
@@ -1187,10 +1219,7 @@ static void mi_process_done_once(void) {
   static bool process_done = false;
   if (process_done) return;
   process_done = true;
-
-  // free dynamic thread locals (if used at all)
-  _mi_thread_locals_done();
-
+  
   // release any thread specific resources and ensure _mi_thread_done is called on all but the main thread
   _mi_prim_thread_done_auto_done();
 
@@ -1213,10 +1242,14 @@ static void mi_process_done_once(void) {
   // since after process_done there might still be other code running that calls `free` (like at_exit routines,
   // or C-runtime termination code.
   if (mi_option_is_enabled(mi_option_destroy_on_exit)) {
-    mi_subprocs_unsafe_destroy_all(); // destroys all subprocs, arenas, and the page_map!
+    mi_subprocs_unsafe_destroy_all(); // destroys all subprocs, arenas, thread locals, and the page_map!
   }
-  else if (subproc_main.heap_main != NULL) {
-    mi_heap_stats_merge_to_subproc(subproc_main.heap_main);
+  else {
+    // free dynamic thread locals (if used at all)
+    _mi_thread_locals_done();
+    if (subproc_main.heap_main != NULL) {
+      mi_heap_stats_merge_to_subproc(subproc_main.heap_main);
+    }
   }
 
   // careful now to no longer access any allocator functionality

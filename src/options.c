@@ -150,11 +150,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { 1,   MI_OPTION_UNINIT, MI_OPTION_LEGACY(deprecated_purge_extend_delay, decommit_extend_delay) },
   { MI_DEFAULT_DISALLOW_ARENA_ALLOC,   MI_OPTION_UNINIT, MI_OPTION(disallow_arena_alloc) }, // 1 = do not use arena's for allocation (except if using specific arena id's)
   { 400, MI_OPTION_UNINIT, MI_OPTION(retry_on_oom) },             // windows only: retry on out-of-memory for N milli seconds (=400), set to 0 to disable retries.
-#if defined(MI_VISIT_ABANDONED)
-  { 1,   MI_OPTION_INITIALIZED, MI_OPTION(visit_abandoned) },     // allow visiting theap blocks in abandoned segments; requires taking locks during reclaim.
-#else
-  { 0,   MI_OPTION_UNINIT, MI_OPTION(visit_abandoned) },
-#endif
+  { 1,   MI_OPTION_UNINIT, MI_OPTION(deprecated_visit_abandoned) },
   { 0,   MI_OPTION_UNINIT, MI_OPTION(guarded_min) },              // only used when building with MI_GUARDED: minimal rounded object size for guarded objects
   { MI_GiB, MI_OPTION_UNINIT, MI_OPTION(guarded_max) },           // only used when building with MI_GUARDED: maximal rounded object size for guarded objects
   { 0,   MI_OPTION_UNINIT, MI_OPTION(guarded_precise) },          // disregard minimal alignment requirement to always place guarded blocks exactly in front of a guard page (=0)
@@ -186,6 +182,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(prof_seed) }
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(prof_max_bytes) }        // budget for profiler-internal arena memory; 0 = unbudgeted
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(memory_events) }         // opt-in allocation-change accounting/callbacks; read lazily by memory-events.c, not at startup
+  ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_zeroes) }           // experimental (#67): treat decommit-purged slices as zeroed so mi_zalloc can skip its memset
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
@@ -529,13 +526,6 @@ void _mi_raw_message(const char* fmt, ...) {
   va_end(args);
 }
 
-void _mi_message(const char* fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
-  mi_vfprintf_thread(NULL, NULL, "mimalloc: ", fmt, args);
-  va_end(args);
-}
-
 void _mi_trace_message(const char* fmt, ...) {
   if (mi_option_get(mi_option_verbose) <= 1) return;  // only with verbose level 2 or higher
   va_list args;
@@ -588,24 +578,27 @@ static _Atomic(void*) mi_error_arg;     // = NULL
 
 static void mi_error_default(int err) {
   MI_UNUSED(err);
-#if (MI_DEBUG>0)
-  if (err==EFAULT) {
-    #ifdef _MSC_VER
-    __debugbreak();
-    #endif
-    abort();
+  #if (MI_DEBUG>0)
+    if (err==EFAULT) {
+      #ifdef _MSC_VER
+      __debugbreak();
+      #endif
+      abort();
+    }
+  #endif
+  #if (MI_SECURE>0)
+    if (err==EFAULT) {  // abort on serious errors in secure mode (corrupted meta-data)
+      abort();
+    }
+  #endif
+  #if defined(MI_XMALLOC)
+    if (err==ENOMEM || err==EOVERFLOW || err=EINVAL) { // abort on memory allocation fails in xmalloc mode
+      abort();
+    }
+  #endif
+  if (errno==0) {
+    errno = (err==EINVAL ? EINVAL : ENOMEM /* compatibility */ );
   }
-#endif
-#if (MI_SECURE>0)
-  if (err==EFAULT) {  // abort on serious errors in secure mode (corrupted meta-data)
-    abort();
-  }
-#endif
-#if defined(MI_XMALLOC)
-  if (err==ENOMEM || err==EOVERFLOW) { // abort on memory allocation fails in xmalloc mode
-    abort();
-  }
-#endif
 }
 
 void mi_register_error(mi_error_fun* fun, void* arg) {
@@ -619,7 +612,7 @@ void _mi_error_message(int err, const char* fmt, ...) {
   va_start(args, fmt);
   mi_show_error_message(fmt, args);
   va_end(args);
-  // and call the error handler which may abort (or return normally)
+  // and call the error handler which may abort (or return normally, potentially setting errno)
   if (mi_error_handler != NULL) {
     mi_error_handler(err, mi_atomic_load_ptr_acquire(void,&mi_error_arg));
   }
@@ -667,8 +660,9 @@ static void mi_option_init(mi_option_desc_t* desc) {
     }
     else {
       char* end = buf;
+      errno = 0;
       long value = strtol(buf, &end, 10);
-      if (mi_option_has_size_in_kib(desc->option)) {
+      if (errno==0 && mi_option_has_size_in_kib(desc->option)) {
         // this option is interpreted in KiB to prevent overflow of `long` for large allocations
         // (long is 32-bit on 64-bit windows, which allows for 4TiB max.)
         size_t size = (value < 0 ? 0 : (size_t)value);
@@ -683,7 +677,7 @@ static void mi_option_init(mi_option_desc_t* desc) {
         if (overflow || size > (MI_MAX_ALLOC_SIZE / MI_KiB)) { size = (MI_MAX_ALLOC_SIZE / MI_KiB); }
         value = (size > LONG_MAX ? LONG_MAX : (long)size);
       }
-      if (*end == 0) {
+      if (errno==0 && *end == 0) {
         mi_option_set(desc->option, value);
       }
       else {

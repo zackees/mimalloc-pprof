@@ -992,6 +992,26 @@ if (MI_BUILD_TESTS)
   endif()
   set_tests_properties(test-memory-gate PROPERTIES TIMEOUT 900)
 
+  # Zero-tracking bench + correctness harness (issue #67). Registered as a ctest so the
+  # *correctness* half runs on every commit; the timing halves are only meaningful on a
+  # quiet runner and are consumed by the zero-tracking CI job.
+  add_executable(mimalloc-test-zero-tracking test/bench-zero-tracking.c)
+  target_compile_definitions(mimalloc-test-zero-tracking PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-zero-tracking PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-zero-tracking PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-zero-tracking PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-zero-tracking PRIVATE mimalloc ${mi_libraries})
+  endif()
+  add_test(NAME test-zero-tracking COMMAND mimalloc-test-zero-tracking)
+  set_tests_properties(test-zero-tracking PROPERTIES TIMEOUT 900)
+  # The feature is off by default, so the default run would never exercise it. This is
+  # the "any flag that ships must have a job running the suite with it ON" rule from #67.
+  add_test(NAME test-zero-tracking-enabled COMMAND mimalloc-test-zero-tracking)
+  set_tests_properties(test-zero-tracking-enabled PROPERTIES
+    TIMEOUT 900 ENVIRONMENT "MIMALLOC_PURGE_ZEROES=1;MIMALLOC_PURGE_DELAY=0")
+
   # Degenerate memory patterns and memory-bound regression guards (issue #47).
   # Independent of MI_PPROF: it guards allocator behavior, not the profiler.
   add_executable(mimalloc-test-degenerate test/test-degenerate.c)

@@ -46,10 +46,18 @@ jobs:
       - uses: zackees/setup-soldr@v0
         with:
           cache: true
+          # build-cache restores soldr/zccache's compiled artifacts. A degraded
+          # entry there serves a C object with the mi_prof_* symbols missing, and
+          # every link then fails with `undefined reference to mi_prof_is_enabled`.
+          # Confirmed environmental: re-running a previously-GREEN main run on
+          # unchanged content now fails. Reruns cannot clear it, because the restore
+          # brings the same poisoned entry back; `soldr --no-cache` does not help
+          # either, since it bypasses the cargo cache and not zccache.
+          # Toolchain and registry caching stay on -- only the artifact layer goes.
+          build-cache: false
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
-          build-cache-mode: full
       - name: Build test binaries through Soldr
         env:
           TARGET: ${{ matrix.target }}
@@ -118,10 +126,18 @@ jobs:
       - uses: zackees/setup-soldr@v0
         with:
           cache: true
+          # build-cache restores soldr/zccache's compiled artifacts. A degraded
+          # entry there serves a C object with the mi_prof_* symbols missing, and
+          # every link then fails with `undefined reference to mi_prof_is_enabled`.
+          # Confirmed environmental: re-running a previously-GREEN main run on
+          # unchanged content now fails. Reruns cannot clear it, because the restore
+          # brings the same poisoned entry back; `soldr --no-cache` does not help
+          # either, since it bypasses the cargo cache and not zccache.
+          # Toolchain and registry caching stay on -- only the artifact layer goes.
+          build-cache: false
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
-          build-cache-mode: full
       - name: Prepare blessed cross toolchain
         env:
           TARGET: ${{ matrix.target }}
@@ -185,10 +201,18 @@ jobs:
       - uses: zackees/setup-soldr@v0
         with:
           cache: true
+          # build-cache restores soldr/zccache's compiled artifacts. A degraded
+          # entry there serves a C object with the mi_prof_* symbols missing, and
+          # every link then fails with `undefined reference to mi_prof_is_enabled`.
+          # Confirmed environmental: re-running a previously-GREEN main run on
+          # unchanged content now fails. Reruns cannot clear it, because the restore
+          # brings the same poisoned entry back; `soldr --no-cache` does not help
+          # either, since it bypasses the cargo cache and not zccache.
+          # Toolchain and registry caching stay on -- only the artifact layer goes.
+          build-cache: false
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
-          build-cache-mode: full
       - name: Prepare managed MinGW through Soldr
         shell: pwsh
         run: soldr prepare --target x86_64-pc-windows-gnu --github-env $env:GITHUB_ENV

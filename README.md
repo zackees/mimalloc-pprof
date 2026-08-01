@@ -64,6 +64,7 @@ versions](#bugs-fixed-in-older-versions) were found; upstream has no MinGW job.
 - [Quick start](#quick-start)
 - [Choosing a version: v2 or v3](#choosing-a-version-v2-or-v3)
 - [Bugs fixed in older versions](#bugs-fixed-in-older-versions) — including two unbounded memory leaks
+- [What this fork carries](#what-this-fork-carries-and-where-each-piece-came-from) — every divergence, with its source
 - [C and C++ integration](#c-and-c-integration)
 - [Rust integration](#rust-integration)
 - [Profiler reference](#profiler-reference)
@@ -297,6 +298,63 @@ Two details worth stating, because both were assumptions that measurement overtu
   C bugs — the arm64 instruction scanner matched nothing at all and reported "clean".
   Hence `pyright --strict` over `ci/`, with the result schema declared rather than
   indexed by hope.
+
+## What this fork carries, and where each piece came from
+
+Every divergence from upstream mimalloc, with its origin and current upstream status. The
+point is that you should not have to read git history to answer *"is this theirs, ours, or
+someone else's?"* — which matters most when deciding whether to depend on a behaviour.
+
+**Total C-core divergence: ~2,340 lines**, of which ~1,970 are new files. The patches into
+upstream's own files come to about 60 lines across 11 files — deliberately small, because
+every one of them is a line that has to be re-reasoned on each upstream sync.
+
+### Features (new files — none of this exists upstream)
+
+| Feature | Source | Upstream status | Where |
+|---|---|---|---|
+| pprof-compatible sampled heap profiler | this fork | not upstream — but see the note below | `src/profile.c` (893), `src/profile-stack.c` (185), `src/profile-maps.c` (172), `include/mimalloc/profile.h` |
+| Memory-events accounting + callbacks | this fork | not upstream | `src/memory-events.c` (408), `include/mimalloc/memory-events.h` |
+| `mi_unwrapped_*` non-recursive scratch allocator | this fork | not upstream | `src/memory-events.c` |
+| Rust crate + `GlobalAlloc`, incl. the zeroing-realloc family | this fork | n/a | `rust/mimalloc-pprof/` |
+
+> **Not the only pprof profiler for mimalloc.** [Bun's fork](https://github.com/oven-sh/mimalloc)
+> built one independently (`src/prof.c`), and upstream branch `pr-1266` carries a third from
+> Datadog — using the same filenames as ours. What distinguishes this one is **native
+> Windows support**: Bun's stack capture is guarded behind glibc/Apple `<execinfo.h>`.
+> See [`MIMALLOC_FORKS.md`](MIMALLOC_FORKS.md).
+
+### Bug fixes in upstream code
+
+| Fix | Source | Upstream status |
+|---|---|---|
+| MinGW thread-exit cleanup never runs (unbounded leak) | **this fork** | **adopted upstream** in [`60c4f031`](https://github.com/microsoft/mimalloc/commit/60c4f031c9d878da05ffa6066777accd51458b98), crediting [#56](https://github.com/zackees/mimalloc-pprof/issues/56) |
+| …but upstream's copy guards on `__GCC__`, which no compiler defines, so it never compiles | **this fork** | **not upstream** — one-token fix we carry; report tracked in #114 |
+| `mi_heap_new` / `mi_subproc_new` do not bootstrap the library | this fork | not upstream; same class as upstream [#1341](https://github.com/microsoft/mimalloc/issues/1341) |
+| `test-stress.c` dereferences unchecked allocations | this fork | not upstream |
+| Seeded sampling was not reproducible (ASLR in the PRNG seed) | this fork | n/a — our code |
+
+### Adopted from other forks
+
+| Change | Source | Status |
+|---|---|---|
+| Zero-tracking — `zalloc` skips its `memset` after a zeroing purge | idea from [Bun](https://github.com/oven-sh/mimalloc); implementation ours | on `v4` only, **off by default** (`mi_option_purge_zeroes`). −10.8% on the anti-workload on Windows; **no effect on Linux**; macOS unmeasured |
+
+### Deliberately not adopted
+
+| Change | Source | Why not |
+|---|---|---|
+| Background purge thread | Bun | purge can decommit a page a live sample record still points into — use-after-decommit at dump time, as the *default* behaviour |
+| Hole purging | Bun | ~1000 lines in the file we already patch most; changes what `mi_usable_size` and our memory-events counters mean |
+| `mi_theap_merge_stats` NULL guard | Bun | already fixed differently upstream (`b6dc592b`); **Bun dropped it too** |
+| Arena/page-map rollback helper | Bun | already fixed differently upstream (`66fd7a99`); **Bun dropped it too** |
+| MetaSafe liveness bits, `MI_MUSL_BUILTIN`, Arma 3 defaults | various | see [`MIMALLOC_FORKS.md`](MIMALLOC_FORKS.md) |
+
+### Engine
+
+Tracks `upstream/dev3`, pinned at **`bcee5a88`**. The pin is bumped deliberately rather than
+continuously — see [#80](https://github.com/zackees/mimalloc-pprof/issues/80) for the method
+and what the last bump found.
 
 ### What the hardening pass changed
 

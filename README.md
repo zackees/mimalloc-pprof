@@ -1,36 +1,49 @@
 # mimalloc-pprof
 
+> ## mimalloc with native pprof-compatible heap profiling — on Windows, Linux, and macOS alike.
+>
+> **The one mimalloc heap profiler that runs natively on Windows.** Upstream mimalloc
+> has no profiler at all, and the only other known implementation
+> ([Bun's](https://github.com/oven-sh/mimalloc), surveyed in
+> [`MIMALLOC_FORKS.md`](MIMALLOC_FORKS.md)) is POSIX-only — its stack capture is guarded
+> behind glibc/Apple `<execinfo.h>`.
+
 A fork of [microsoft/mimalloc](https://github.com/microsoft/mimalloc) that adds
 **pprof-compatible sampled heap profiling**, with native Windows as a first-class
 target alongside Linux and macOS.
 
 ```
- __  __ ___ __  __    _    _     _     ___   ____      ____  ____  ____   ___  _____
-|  \/  |_ _|  \/  |  / \  | |   | |   / _ \ / ___|    |  _ \|  _ \|  _ \ / _ \|  ___|
-| |\/| || || |\/| | / _ \ | |   | |  | | | | |   _____| |_) | |_) | |_) | | | | |_
-| |  | || || |  | |/ ___ \| |___| |__| |_| | |__|_____|  __/|  __/|  _ <| |_| |  _|
-|_|  |_|___|_|  |_/_/   \_\_____|_____\___/ \____|    |_|   |_|   |_| \_\\___/|_|
+   __  __ ___ __  __    _    _     _     ___   ____
+  |  \/  |_ _|  \/  |  / \  | |   | |   / _ \ / ___|
+  | |\/| || || |\/| | / _ \ | |   | |  | | | | |
+  | |  | || || |  | |/ ___ \| |___| |__| |_| | |___
+  |_|  |_|___|_|  |_/_/   \_\_____|_____\___/ \____|
 
-                  PPROF-COMPATIBLE SAMPLED HEAP PROFILING
+   ____  ____  ____   ___  _____
+  |  _ \|  _ \|  _ \ / _ \|  ___|
+  | |_) | |_) | |_) | | | | |_
+  |  __/|  __/|  _ <| |_| |  _|
+  |_|   |_|   |_| \_\\___/|_|
 
-                  WINDOWS FIRST-CLASS | LINUX | MACOS
+      PPROF-COMPATIBLE SAMPLED HEAP PROFILING
+      WINDOWS FIRST-CLASS | LINUX | MACOS
 
 
-       malloc / free
-             |
-             v
-    +------------------+
-    |     mimalloc     |
-    |                  |
-    |   [ live heap ]  |
-    +---------+--------+
-              |
-              | sampled allocations
-              v
-    +------------------+            +--------------------------+
-    |    heap.prof     | ---------> |      google/pprof        |
-    | heap_v2 / proto  |            | flamegraphs | top | diff |
-    +------------------+            +--------------------------+
+    malloc / free
+          |
+          v
+          +------------------+
+          |     mimalloc     |
+          |       |
+          |   [ live heap ]  |
+          +---------+--------+
+         |
+         | sampled allocations
+         v
++------------------+      +--------------------------+
+|    heap.prof     | ---> |      google/pprof        |
+| heap_v2 / proto  |      | flamegraphs | top | diff |
++------------------+      +--------------------------+
 ```
 
 The allocator tracks sampled live allocations and writes either the gperftools

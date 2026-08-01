@@ -37,9 +37,16 @@
 
 typedef struct {
   void*  ptr;
-  size_t size;   /* requested size */
-  uint8_t tag;   /* pattern written into the block, 0 = untouched */
+  size_t size;    /* requested size */
+  uint8_t tag;    /* pattern written into the block, 0 = untouched */
+  size_t tagged;  /* how many LEADING bytes are known to still hold `tag` */
 } live_t;
+/* `tagged` is tracked separately from `size` because growing a block does not extend
+   the pattern: after realloc(p, bigger) only the original prefix is known, and after
+   rezalloc the grown tail is zero rather than `tag`. An earlier version tracked only
+   (tag, size) and the fuzzer falsified it in ~14k executions -- it reallocated a
+   tagged block larger, then asserted the pattern over the new size and hit the
+   uninitialised tail. */
 
 static live_t live[MAX_LIVE];
 
@@ -126,7 +133,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         const size_t n = rd_size(&r);
         void* p = mi_malloc(n);
         check_block(p, n, 0, 1);
-        live[slot].ptr = p; live[slot].size = n; live[slot].tag = 0;
+        live[slot].ptr = p; live[slot].size = n; live[slot].tag = 0; live[slot].tagged = 0;
         break;
       }
       case 1: {  /* zalloc -- must come back zeroed */
@@ -134,7 +141,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         const size_t n = rd_size(&r);
         void* p = mi_zalloc(n);
         check_block(p, n, 1, 1);
-        live[slot].ptr = p; live[slot].size = n; live[slot].tag = 0;
+        live[slot].ptr = p; live[slot].size = n; live[slot].tag = 0; live[slot].tagged = 0;
         break;
       }
       case 2: {  /* calloc -- must come back zeroed */
@@ -143,7 +150,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         const size_t each  = (rd_size(&r) % 4096) + 1;
         void* p = mi_calloc(count, each);
         check_block(p, count * each, 1, 1);
-        live[slot].ptr = p; live[slot].size = count * each; live[slot].tag = 0;
+        live[slot].ptr = p; live[slot].size = count * each; live[slot].tag = 0; live[slot].tagged = 0;
         break;
       }
       case 3: {  /* aligned_alloc */
@@ -152,23 +159,24 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         const size_t n = rd_size(&r);
         void* p = mi_malloc_aligned(n, a);
         check_block(p, n, 0, a);
-        live[slot].ptr = p; live[slot].size = n; live[slot].tag = 0;
+        live[slot].ptr = p; live[slot].size = n; live[slot].tag = 0; live[slot].tagged = 0;
         break;
       }
       case 4: {  /* realloc -- contents up to min(old,new) must survive a move */
         if (live[slot].ptr == NULL) break;
         const size_t n = rd_size(&r);
-        const size_t old = live[slot].size;
         const uint8_t tag = live[slot].tag;
+        const size_t tagged = live[slot].tagged;
         void* p = mi_realloc(live[slot].ptr, n);
         if (p == NULL) break;             /* original still live on failure */
-        if (tag != 0) {
+        /* Only the tagged PREFIX is guaranteed, and only as far as the new size. */
+        const size_t keep = (tagged < n ? tagged : n);
+        if (tag != 0 && keep > 0) {
           const unsigned char* b = (const unsigned char*)p;
-          const size_t keep = (old < n ? old : n);
           for (size_t i = 0; i < keep; i++) assert(b[i] == tag);
         }
         check_block(p, n, 0, 1);
-        live[slot].ptr = p; live[slot].size = n;
+        live[slot].ptr = p; live[slot].size = n; live[slot].tagged = keep;
         break;
       }
       case 5: {  /* rezalloc -- the region beyond the old USABLE size must be zero */
@@ -190,7 +198,10 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
           for (size_t i = usable_old; i < n; i++) assert(b[i] == 0);
         }
         assert(mi_usable_size(p) >= n);
+        /* The grown tail is now zero, not `tag`, so the tagged prefix shrinks to
+           whatever still fits. */
         live[slot].ptr = p; live[slot].size = n;
+        if (live[slot].tagged > n) live[slot].tagged = n;
         break;
       }
       case 6: {  /* write a pattern, so realloc moves are checkable */
@@ -198,13 +209,13 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         uint8_t tag = rd8(&r);
         if (tag == 0) tag = 1;
         memset(live[slot].ptr, tag, live[slot].size);
-        live[slot].tag = tag;
+        live[slot].tag = tag; live[slot].tagged = live[slot].size;
         break;
       }
       default: {  /* free */
         if (live[slot].ptr == NULL) break;
         mi_free(live[slot].ptr);
-        live[slot].ptr = NULL; live[slot].size = 0; live[slot].tag = 0;
+        live[slot].ptr = NULL; live[slot].size = 0; live[slot].tag = 0; live[slot].tagged = 0;
         break;
       }
     }

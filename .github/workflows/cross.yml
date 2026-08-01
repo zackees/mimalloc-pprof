@@ -45,7 +45,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: zackees/setup-soldr@v0
         with:
-          cache: true
+          # cache:false is the action's documented kill switch -- it "disables every
+          # layer and exports environment variables to skip zccache wrapping entirely".
+          # build-cache:false alone was NOT enough: the C objects are still served by the
+          # in-run zccache daemon, so the missing-symbol object survived.
+          cache: false
           # setup-soldr now defaults to SOLDR_LINKER=fast, injecting mold/rust-lld in
           # place of the toolchain's linker. rust-lld does not pull the archive members
           # GNU ld does for our C static lib, so every test binary failed to link with
@@ -126,7 +130,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: zackees/setup-soldr@v0
         with:
-          cache: true
+          # cache:false is the action's documented kill switch -- it "disables every
+          # layer and exports environment variables to skip zccache wrapping entirely".
+          # build-cache:false alone was NOT enough: the C objects are still served by the
+          # in-run zccache daemon, so the missing-symbol object survived.
+          cache: false
           # setup-soldr now defaults to SOLDR_LINKER=fast, injecting mold/rust-lld in
           # place of the toolchain's linker. rust-lld does not pull the archive members
           # GNU ld does for our C static lib, so every test binary failed to link with
@@ -202,7 +210,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: zackees/setup-soldr@v0
         with:
-          cache: true
+          # cache:false is the action's documented kill switch -- it "disables every
+          # layer and exports environment variables to skip zccache wrapping entirely".
+          # build-cache:false alone was NOT enough: the C objects are still served by the
+          # in-run zccache daemon, so the missing-symbol object survived.
+          cache: false
           # setup-soldr now defaults to SOLDR_LINKER=fast, injecting mold/rust-lld in
           # place of the toolchain's linker. rust-lld does not pull the archive members
           # GNU ld does for our C static lib, so every test binary failed to link with

@@ -70,11 +70,24 @@ jobs:
             echo "::error::the fuzzer did NOT find the planted overflow -- the harness is not exercising the allocator."
             exit 1
           fi
-          if ! echo "$out" | grep -qiE "AddressSanitizer|heap-buffer-overflow"; then
-            echo "::error::the harness failed (rc=$rc) but produced no AddressSanitizer report; that is a different bug."
+          # ANCHORED, and deliberately not case-insensitive. The previous form was
+          #     grep -qiE "AddressSanitizer|heap-buffer-overflow"
+          # which matched libFuzzer's own boilerplate:
+          #     "Combine libFuzzer with AddressSanitizer or similar for better crash reports."
+          # -- i.e. the string that satisfied "ASan is working" was libFuzzer telling us
+          # ASan was NOT the detector. Every run since this control landed passed on a
+          # bare "SUMMARY: libFuzzer: deadly signal" (mimalloc's mi_check_padding calling
+          # abort()), with zero AddressSanitizer reports. Second time this exact control
+          # was fooled by that NOTE, so match only a real report header.
+          if ! echo "$out" | grep -qE "^(==[0-9]+==)?(ERROR|SUMMARY): AddressSanitizer:"; then
+            echo "::error::the harness failed (rc=$rc) but produced no AddressSanitizer report -- ASan is not the oracle here, so this control proves nothing about the sanitizer."
             exit 1
           fi
-          echo "positive control fired: the fuzzer found the planted overflow (rc=$rc)"
+          if ! echo "$out" | grep -qE "AddressSanitizer: heap-use-after-free"; then
+            echo "::error::got an AddressSanitizer report, but not the planted use-after-free; that is a different bug."
+            exit 1
+          fi
+          echo "positive control fired: ASan reported the planted use-after-free (rc=$rc)"
 
       - uses: actions/upload-artifact@v4
         if: failure()

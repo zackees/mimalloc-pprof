@@ -1,5 +1,4 @@
-/* POSITIVE CONTROL for #88 -- reverted in the next commit.
-   Allocation sampling profiler.  Its records never use mimalloc: the arena
+/* Allocation sampling profiler.  Its records never use mimalloc: the arena
    below is backed directly by _mi_os_alloc so profiler bookkeeping cannot
    recursively enter the allocator. */
 #include "mimalloc.h"

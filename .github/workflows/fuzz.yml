@@ -70,8 +70,16 @@ jobs:
             echo "::error::the fuzzer did NOT find the planted overflow -- the harness is not exercising the allocator."
             exit 1
           fi
-          if ! echo "$out" | grep -qiE "AddressSanitizer|heap-buffer-overflow"; then
-            echo "::error::the harness failed (rc=$rc) but produced no AddressSanitizer report; that is a different bug."
+          # Match an ACTUAL overflow report, from either detector. Deliberately NOT a
+          # bare "AddressSanitizer": libFuzzer prints "Combine libFuzzer with
+          # AddressSanitizer..." on *every* crash, so a loose grep would accept any
+          # unrelated crash as proof the control worked.
+          # Either detector is legitimate here: ASan reports it when it owns the
+          # poisoning, and mimalloc's own MI_DEBUG padding check reports it as
+          # "buffer overflow in theap block" -- which is what actually fires today.
+          if ! echo "$out" | grep -qE "ERROR: AddressSanitizer|heap-buffer-overflow|buffer overflow in .* block"; then
+            echo "::error::the harness crashed (rc=$rc) but no overflow was reported, so this is a different bug -- the control proves nothing."
+            echo "$out" | tail -60
             exit 1
           fi
           echo "positive control fired: the fuzzer found the planted overflow (rc=$rc)"

@@ -40,7 +40,6 @@ terms of the MIT license. A copy of the license can be found in the file
 #define mi_decl_weak
 #define mi_decl_hidden
 #define mi_decl_cold
-#define mi_decl_unused
 #elif (defined(__GNUC__) && (__GNUC__ >= 3)) || defined(__clang__) // includes clang and icc
 #if !MI_TRACK_ASAN
 #define mi_decl_forceinline     __attribute__((always_inline)) inline
@@ -52,7 +51,6 @@ terms of the MIT license. A copy of the license can be found in the file
 #define mi_decl_noreturn        __attribute__((noreturn))
 #define mi_decl_weak            __attribute__((weak))
 #define mi_decl_hidden          __attribute__((visibility("hidden")))
-#define mi_decl_unused          __attribute__((unused))
 #if (__GNUC__ >= 4) || defined(__clang__)
 #define mi_decl_cold            __attribute__((cold))
 #else
@@ -66,11 +64,6 @@ terms of the MIT license. A copy of the license can be found in the file
 #define mi_decl_weak
 #define mi_decl_hidden
 #define mi_decl_cold
-#if __cplusplus >= 201703L    // c++17
-#define mi_decl_unused          [[maybe_unused]]
-#else
-#define mi_decl_unused
-#endif
 #else
 #define mi_decl_forceinline     inline
 #define mi_decl_noinline
@@ -79,7 +72,6 @@ terms of the MIT license. A copy of the license can be found in the file
 #define mi_decl_weak
 #define mi_decl_hidden
 #define mi_decl_cold
-#define mi_decl_unused
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -93,6 +85,14 @@ terms of the MIT license. A copy of the license can be found in the file
 #define mi_likely(x)       (x)
 #endif
 
+#if (defined(__GNUC__) && (__GNUC__ >= 7)) || defined(__clang__) // includes clang and icc
+#define mi_decl_maybe_unused    __attribute__((unused))
+#elif __cplusplus >= 201703L    // c++17
+#define mi_decl_maybe_unused    [[maybe_unused]]
+#else
+#define mi_decl_maybe_unused
+#endif
+
 #ifndef __has_builtin
 #define __has_builtin(x)    0
 #endif
@@ -102,21 +102,6 @@ terms of the MIT license. A copy of the license can be found in the file
 #else
 #define mi_decl_externc
 #endif
-
-#if (defined(__GNUC__) && (__GNUC__ >= 7)) || defined(__clang__) // includes clang and icc
-#define mi_decl_maybe_unused    __attribute__((unused))
-#elif __cplusplus >= 201703L    // c++17
-#define mi_decl_maybe_unused    [[maybe_unused]]
-#else
-#define mi_decl_maybe_unused
-#endif
-
-#if defined(__cplusplus)
-#define mi_decl_externc         extern "C"
-#else
-#define mi_decl_externc
-#endif
-
 
 #if defined(__EMSCRIPTEN__) && !defined(__wasi__)
 #define __wasi__
@@ -134,8 +119,8 @@ int           _mi_vsnprintf(char* buf, size_t bufsize, const char* fmt, va_list 
 int           _mi_snprintf(char* buf, size_t buflen, const char* fmt, ...);
 char          _mi_toupper(char c);
 int           _mi_strnicmp(const char* s, const char* t, size_t n);
-void          _mi_strlcpy(char* dest, const char* src, size_t dest_size);
-void          _mi_strlcat(char* dest, const char* src, size_t dest_size);
+bool          _mi_strlcpy(char* dest, const char* src, size_t dest_size); // returns true if the entire src was copied
+bool          _mi_strlcat(char* dest, const char* src, size_t dest_size); // returns true if the entire src was appended
 size_t        _mi_strlen(const char* s);
 size_t        _mi_strnlen(const char* s, size_t max_len);
 char*         _mi_strnstr(char* s, size_t max_len, const char* pat);
@@ -146,7 +131,6 @@ int           _mi_getenv(const char* name, char* result, size_t result_size);
 void          _mi_fputs(mi_output_fun* out, void* arg, const char* prefix, const char* message);
 void          _mi_fprintf(mi_output_fun* out, void* arg, const char* fmt, ...);
 void          _mi_raw_message(const char* fmt, ...);
-void          _mi_message(const char* fmt, ...);
 void          _mi_warning_message(const char* fmt, ...);
 void          _mi_verbose_message(const char* fmt, ...);
 void          _mi_trace_message(const char* fmt, ...);
@@ -185,8 +169,6 @@ mi_heap_t*    _mi_subproc_heap_main(mi_subproc_t* subproc);
 mi_subproc_t* _mi_subproc_from_id(mi_subproc_id_t subproc_id);
 
 mi_threadid_t _mi_thread_id(void) mi_attr_noexcept;
-size_t        _mi_thread_seq_id(void) mi_attr_noexcept;
-bool          _mi_is_theap_main(const mi_theap_t* theap);
 void          _mi_theap_guarded_init(mi_theap_t* theap);
 void          _mi_theap_options_init(mi_theap_t* theap);
 
@@ -251,7 +233,6 @@ bool          _mi_arena_memid_is_suitable(mi_memid_t memid, mi_arena_t* request_
 void*         _mi_arenas_alloc(mi_heap_t* heap, size_t size, bool commit, bool allow_pinned, mi_arena_t* req_arena, size_t tseq, int numa_node, mi_memid_t* memid);
 void*         _mi_arenas_alloc_aligned(mi_heap_t* heap, size_t size, size_t alignment, size_t align_offset, bool commit, bool allow_pinned, mi_arena_t* req_arena, size_t tseq, int numa_node, mi_memid_t* memid);
 void          _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid);
-bool          _mi_arenas_contain(const void* p);
 void          _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld);
 void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 
@@ -281,10 +262,7 @@ void          _mi_page_retire(mi_page_t* page) mi_attr_noexcept;       // free t
 void          _mi_page_unfull(mi_page_t* page);
 void          _mi_page_free(mi_page_t* page, mi_page_queue_t* pq);     // free the page
 void          _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq);  // abandon the page, to be picked up by another thread...
-
-size_t        _mi_page_queue_append(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_queue_t* append);
 void          _mi_deferred_free(mi_theap_t* theap, bool force);
-
 void          _mi_page_free_collect(mi_page_t* page, bool force);
 void          _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head);
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page);
@@ -296,7 +274,6 @@ size_t        _mi_bin(size_t size);                      // for stats
 
 // "theap.c"
 mi_theap_t*   _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld);
-void          _mi_theap_delete(mi_theap_t* theap, bool acquire_tld_theaps_lock);
 void          _mi_theap_default_set(mi_theap_t* theap);
 void          _mi_theap_cached_set(mi_theap_t* theap);
 void          _mi_theap_collect_retired(mi_theap_t* theap, bool force);
@@ -306,14 +283,13 @@ void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 bool          _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acquire_tld_theaps_lock);
 void          _mi_theap_incref(mi_theap_t* theap);
 void          _mi_theap_decref(mi_theap_t* theap);
-bool          _mi_page_visit_blocks( mi_page_t* page, mi_block_visit_fun* visitor, void* arg );
 
 // "heap.c"
 void          _mi_heap_area_init(mi_heap_area_t* area, mi_page_t* page);
 mi_decl_cold  mi_theap_t* _mi_heap_theap_get_or_init(const mi_heap_t* heap);  // get (and possible create) the theap belonging to a heap
 void          _mi_heap_move_pages(mi_heap_t* heap_from, mi_heap_t* heap_to);  // in "arena.c"
 void          _mi_heap_destroy_pages(mi_heap_t* heap_from);                   // in "arena.c"
-void          _mi_heap_force_destroy(mi_heap_t* heap);                        // allow destroying the main heap
+void          _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock); // allow destroying the main heap
 mi_heap_t*    _mi_heap_new_for_subproc(mi_subproc_t* subproc, mi_arena_id_t exclusive_arena_id, bool is_heap_main);
 bool          _mi_heap_theap_set(mi_heap_t* heap, mi_theap_t* theap);
 
@@ -541,6 +517,11 @@ static inline bool _mi_is_power_of_two(uintptr_t x) {
   return ((x & (x - 1)) == 0);
 }
 
+// valid alignment values are as posix memalign: <https://en.cppreference.com/c/memory/aligned_alloc#Notes>
+static inline bool mi_alignment_is_valid(size_t alignment) {
+  return ((alignment!=0) && _mi_is_power_of_two(alignment)); 
+}
+
 // Is a pointer aligned?
 static inline bool _mi_is_aligned(const void* p, size_t alignment) {
   return (alignment==0 || ((uintptr_t)p % alignment) == 0);
@@ -615,10 +596,10 @@ static inline size_t _mi_wsize_from_size(size_t size) {
 #undef _CLOCK_T
 #endif
 static inline bool mi_mul_overflow(size_t count, size_t size, size_t* total) {
-  #if (SIZE_MAX == ULONG_MAX)
-    return __builtin_umull_overflow(count, size, (unsigned long *)total);
-  #elif (SIZE_MAX == UINT_MAX)
+  #if (SIZE_MAX == UINT_MAX)
     return __builtin_umul_overflow(count, size, (unsigned int *)total);
+  #elif (SIZE_MAX == ULONG_MAX)
+    return __builtin_umull_overflow(count, size, (unsigned long *)total);
   #else
     return __builtin_umulll_overflow(count, size, (unsigned long long *)total);
   #endif
@@ -705,20 +686,30 @@ static inline mi_page_t* _mi_theap_get_free_small_page(mi_theap_t* theap, size_t
 // flat page-map committed on demand, using one byte per slice (64 KiB).
 // single indirection and low commit, but large initial virtual reserve (4 GiB with 48 bit virtual addresses)
 // used by default on <= 40 bit virtual address spaces.
-extern mi_decl_hidden uint8_t* _mi_page_map;
+extern mi_decl_hidden _Atomic(uint8_t*) _mi_page_map;
+extern mi_decl_hidden _Atomic(void*)    _mi_page_map_max_address;
 
 static inline size_t _mi_page_map_index(const void* p) {
   return (size_t)((uintptr_t)p >> MI_ARENA_SLICE_SHIFT);
 }
 
+static inline uint8_t _mi_page_map_at(size_t idx) {
+  return mi_atomic_load_ptr_relaxed(uint8_t,&_mi_page_map)[idx];
+}
+
 static inline mi_page_t* _mi_ptr_page_ex(const void* p, bool* valid) {
   const size_t idx = _mi_page_map_index(p);
-  const size_t ofs = _mi_page_map[idx];
+  const size_t ofs = _mi_page_map_at(idx);
   if (valid != NULL) { *valid = (ofs != 0); }
   return (mi_page_t*)((((uintptr_t)p >> MI_ARENA_SLICE_SHIFT) + 1 - ofs) << MI_ARENA_SLICE_SHIFT);
 }
 
 static inline mi_page_t* _mi_checked_ptr_page(const void* p) {
+  #if MI_MIN_VABITS < MI_INTPTR_BITS
+  if mi_unlikely(((uintptr_t)p >> MI_MIN_VABITS) != 0) {
+    if (p > mi_atomic_load_ptr_relaxed(void, &_mi_page_map_max_address)) return NULL;
+  }
+  #endif
   bool valid;
   mi_page_t* const page = _mi_ptr_page_ex(p, &valid);
   return (valid ? page : NULL);
@@ -744,6 +735,7 @@ static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
 
 typedef mi_page_t**   mi_submap_t;
 extern mi_decl_hidden _Atomic(mi_submap_t)* _mi_page_map;
+extern mi_decl_hidden _Atomic(void*) _mi_page_map_max_address;
 
 static inline size_t _mi_page_map_index(const void* p, size_t* sub_idx) {
   const size_t u = (size_t)((uintptr_t)p / MI_ARENA_SLICE_SIZE);
@@ -762,6 +754,11 @@ static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
 }
 
 static inline mi_page_t* _mi_checked_ptr_page(const void* p) {
+  #if MI_MIN_VABITS < MI_INTPTR_BITS
+  if mi_unlikely(((uintptr_t)p >> MI_MIN_VABITS) != 0) {
+    if (p > mi_atomic_load_ptr_relaxed(void, &_mi_page_map_max_address)) return NULL;
+  }
+  #endif
   size_t sub_idx;
   const size_t idx = _mi_page_map_index(p, &sub_idx);
   mi_submap_t const sub = _mi_page_map_at(idx);
@@ -770,7 +767,6 @@ static inline mi_page_t* _mi_checked_ptr_page(const void* p) {
 }
 
 #endif
-
 
 static inline mi_page_t* _mi_ptr_page(const void* p) {
   mi_assert_internal(p==NULL || mi_is_in_heap_region(p));
@@ -791,7 +787,7 @@ static inline size_t mi_page_block_size(const mi_page_t* page) {
 // Page start
 static inline uint8_t* mi_page_start(const mi_page_t* page) {
   // multiplication must be done in `size_t`; in a 32-bit multiplication the offset wraps for pages whose blocks start 4 GiB or more after the page meta info
-  return (uint8_t*)page + ((size_t)page->page_woffset * MI_SIZE_SIZE);
+  return (uint8_t*)page + (((size_t)page->page_ma_offset) * MI_MAX_ALIGN_SIZE);
 }
 
 static inline size_t mi_page_size(const mi_page_t* page) {
@@ -1104,23 +1100,28 @@ static inline bool mi_theap_malloc_use_guarded(mi_theap_t* theap, size_t size) {
     // no sample
     theap->guarded_sample_count = count;
     return false;
-  }
-  else if (size >= theap->guarded_size_min && size <= theap->guarded_size_max) {
-    // use guarded allocation
-    theap->guarded_sample_count = theap->guarded_sample_rate;  // reset
-    return (theap->guarded_sample_rate != 0);
-  }
-  else {
-    // failed size criteria, rewind count (but don't write to an empty theap)
-    if (theap->guarded_sample_rate != 0) { theap->guarded_sample_count = 1; }
-    return false;
+  }  
+  else { 
+    // count == 0
+    const size_t rate = theap->guarded_sample_rate;
+    if (rate == 0) {
+      return false; // don't write to an empty theap
+    }
+    else if (size >= theap->guarded_size_min && size <= theap->guarded_size_max) {
+      // use guarded allocation        
+      theap->guarded_sample_count = rate;  // reset
+      return true;
+    }
+    else {
+      // failed size criteria, rewind count
+      theap->guarded_sample_count = 1;
+      return false;
+    }
   }
 }
 
-mi_decl_restrict void* _mi_theap_malloc_guarded(mi_theap_t* theap, size_t size, bool zero) mi_attr_noexcept;
-
+mi_decl_restrict void* _mi_theap_malloc_guarded(mi_theap_t* theap, size_t size, bool zero, size_t* usable) mi_attr_noexcept;
 #endif
-
 
 /* -------------------------------------------------------------------
 Encoding/Decoding the free list next pointers
@@ -1221,6 +1222,8 @@ static inline void mi_block_set_next(const mi_page_t* page, mi_block_t* block, c
   mi_block_set_nextx(page,block,next,NULL);
   #endif
 }
+
+
 
 /* -----------------------------------------------------------
   arena blocks

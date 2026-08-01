@@ -371,3 +371,81 @@ Vendored: [python/cpython#113141](https://github.com/python/cpython/issues/11314
 
 Upstream issues cited: #147, #263, #309, #372, #377, #482, #798, #817, #939, #996, #1046,
 #1048, #1077, #1087, #1152, #1213, #1266, #1301, #1327, #1333, #1341.
+
+---
+
+## Upstream's own branches (issue #84)
+
+Third-party forks are only half the landscape. `microsoft/mimalloc` carries **44 branches**,
+and fixes reach them well before a release. All were classified against our pin
+**`bcee5a88`** (= `upstream/dev3` tip, after the #80 bump).
+
+**Headline: almost nothing is importable, and the two things that looked most promising
+were both mirages.** That is the useful result — it means the pin bump, not branch
+cherry-picking, is how upstream work reaches us.
+
+### The two leads that did not survive contact
+
+**`copilot/review-*` (three branches) — empty.** These were billed in #84 as possibly the
+highest-value artifact in the tracker: `1ec619bc` is titled *"Audit include/src for
+allocator safety issues and deliver prioritized triage."* It changes **no source at all** —
+`git diff --stat bcee5a88 1ec619bc -- src/ include/` is byte-identical to the diff against
+its own base. What the commits actually add are leaked build artifacts: `a.out`, `*.o`,
+and a 49-line assembly experiment. There is no triage document in any of the three trees,
+and no PR exists for any of them. They are abandoned Copilot session branches; their
+reasoning lives in `github.com/microsoft/mimalloc/sessions/…`, which is not publicly
+retrievable.
+
+**`dev3-meta` — its "unmerged use-after-free" is branch-local.** 57 commits, actively
+developed, and it does contain `2f2c19c6` *"fix access after free for theap_meta stats in
+subprocesses."* But the same branch **introduced** that bug three hours earlier in
+`1eab8008`, and the code it lives in does not exist in our tree: `git grep theap_meta
+bcee5a88 -- src include` returns **zero hits**, as do `src/subproc.c` and
+`src/prim/prim-tls.c`. The branch is one unfinished refactor — replacing `src/arena-meta.c`
+with a detached theap — whose own tip commit is *"try to fix test heap-os2."* Nothing to
+import; its second "priority" commit (`a5650085`) is likewise 3/4 branch-local.
+
+### Where upstream's real audit findings live
+
+Not in the copilot branches — in **upstream issue #1271**, an external LLM audit by *Zoxc*
+run in four passes (~132 findings), each triaged by daanx. Still open. Because our pin *is*
+the `dev3` tip, nearly every accepted fix is already in; nine spot-checks all confirmed
+genuinely fixed. The value is the **residue** daanx marked `todo`/`revisit`, three items of
+which sit in paths our hooks occupy — tracked in issues of our own rather than repeated here.
+
+### Classification
+
+| Branch(es) | Status | Verdict |
+|---|---|---|
+| `dev3` | **our pin** | 0 ahead / 0 behind after #80 |
+| `dev3-meta` (57 ahead) | not-in-pin | unfinished meta refactor; nothing separable. **Watch:** if merged, `src/arena-meta.c` is deleted and `src/subproc.c` + `src/prim/prim-tls.c` appear — `src/static.c` must be updated or the Rust sys crate silently loses them |
+| `dev` (3 ahead) | not-in-pin | **one real fix**: `1fb345674` makes `mi_page_set_in_full` use `page->reserved` rather than `page->capacity` |
+| `pr-1266` | not-in-pin, v2-based | **an upstream heap-profiling PR claiming our filenames** — see below |
+| `copilot/review-*` ×3 | empty | build artifacts only; no findings recoverable |
+| `dev3-subproc`, `dev3-separate`, `dev3-heap`, `dev3-nuget` | already-in-pin | 0 ahead; fully merged |
+| `dev3-cdb`, `dev3-cdb-sk`, `dev3-bin`, `dev3-bin-dbg` | abandoned | forked before the arena/page-map rewrite; trees obsolete (~210 files divergent) |
+| `dev-guarded` | superseded | 27 lines of "initial work"; full `MI_GUARDED` shipped long ago |
+| `users/gustavovaro/cherry-pick-arm64-fix` | already-in-pin | its one distinctive line is already at `CMakeLists.txt:150` |
+| `dev-slice*` ×7, `dev-remap`, `dev-reset`, `dev-platform`, `dev-align`, `dev-trace`, `dev-atomic`, `dev-debug`, `dev-exp-tls`, `dev-win` | abandoned | segment-era experiments (2020–2025); v3 replaced segments with `src/arena.c` entirely |
+| `main`, `dev-main`, `dev2`, `dev2-bin` | different release line | the v1/v2 line. Their 3000+ "ahead" counts are that line, **not** 3000 features |
+| `daanx-patch-*`, `users/GitHubPolicyService/*` | noise | readme edits and a policy bot |
+
+### `pr-1266`: upstream has a competing heap profiler, in our filenames
+
+*"feat: enable memory profiling"* by Daniel Schwartz-Narbonne (Datadog) adds
+**`include/mimalloc/profile.h`, `src/profile.c`, `test/test-profile.c`** — the same paths
+this fork claims — with sampled records hung off `page->metadata` behind a
+`page->has_metadata` flag, and inline hooks in `alloc.c`/`free.c`/`page.c`.
+
+It is v2-based (touches `src/segment.c`), so it does not apply to our v3 pin and is not
+importable. It matters anyway: it is a **collision risk for our upstreaming plan**. If it
+lands, our `pr/*` branches conflict at the file level, and there are then two competing
+designs for the same feature in the same namespace. Read its design and discussion before
+cutting the next upstream PR.
+
+### Method note
+
+Every row was settled with `git merge-base --is-ancestor <sha> bcee5a88` rather than by
+reading code and guessing, and branches with large ahead-counts were checked for *which
+release line* they belong to before any significance was attributed. Three of the entries
+above are corrections to claims made earlier in this repository's own issue tracker.

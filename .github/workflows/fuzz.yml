@@ -1,0 +1,79 @@
+name: fuzz
+
+# Issue #87. Short bounded runs per PR for regression only, plus a longer scheduled
+# run. A per-PR fuzz job long enough to find NEW bugs is also long enough to be flaky
+# and get disabled, which is how fuzzing quietly stops happening.
+#
+# The oracle is AddressSanitizer (#86). Without a sanitizer, fuzzing an allocator
+# mostly proves it does not segfault.
+
+on:
+  push:
+    branches: [main, v4]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'test/fuzz/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/fuzz.yml'
+  schedule:
+    - cron: '0 4 * * *'   # nightly, longer budget
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build harnesses (libFuzzer + ASan)
+        run: |
+          set -euo pipefail
+          cmake -B build-fuzz -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_FUZZ=ON
+          cmake --build build-fuzz --parallel
+
+      # A short deterministic budget on PRs; the nightly run gets the real one.
+      - name: Fuzz
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "schedule" ]; then RUNS=2000000; else RUNS=60000; fi
+          for h in alloc-ops prof-dump; do
+            echo "::group::$h ($RUNS runs)"
+            ./build-fuzz/mimalloc-fuzz-$h test/fuzz/corpus/$h -runs=$RUNS -print_final_stats=1
+            echo "::endgroup::"
+          done
+
+      # A fuzzer that has never found anything is indistinguishable from one that is
+      # not running the code under test. Plant a reachable bug and require it be found.
+      - name: Positive control -- the fuzzer must find a planted bug
+        run: |
+          set -uo pipefail
+          cmake -B build-fuzz-bug -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_FUZZ=ON -DMI_FUZZ_PLANT_BUG=ON
+          cmake --build build-fuzz-bug --parallel --target mimalloc-fuzz-alloc-ops
+          set +e
+          out=$(./build-fuzz-bug/mimalloc-fuzz-alloc-ops test/fuzz/corpus/alloc-ops -runs=200000 2>&1)
+          rc=$?
+          set -e
+          echo "$out" | tail -40
+          if [ $rc -eq 0 ]; then
+            echo "::error::the fuzzer did NOT find the planted overflow -- the harness is not exercising the allocator."
+            exit 1
+          fi
+          if ! echo "$out" | grep -qiE "AddressSanitizer|heap-buffer-overflow"; then
+            echo "::error::the harness failed (rc=$rc) but produced no AddressSanitizer report; that is a different bug."
+            exit 1
+          fi
+          echo "positive control fired: the fuzzer found the planted overflow (rc=$rc)"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+          if-no-files-found: ignore

@@ -66,9 +66,18 @@ jobs:
           # reading it, killing individual test binaries. The tool's own advice is to
           # retry, and to bypass the cache if that fails -- reruns alone do NOT help,
           # because the restored cache carries the same poisoned entry back in.
+          # Keep the raw JSON. Piping cargo straight into jq discards every
+          # `compiler-message` record, which is where the actual error text lives -- so a
+          # failing build printed only "could not compile (test ...)" with no reason, on
+          # every retry. Render the diagnostics on failure instead of dropping them.
           run_build() {
-            eval "$1 --target $TARGET --release --message-format=json" \
-              | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' > bins.txt
+            local rc=0
+            eval "$1 --target $TARGET --release --message-format=json" > cargo.json || rc=$?
+            jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' cargo.json > bins.txt
+            if [ "$rc" -ne 0 ]; then
+              jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' cargo.json >&2
+            fi
+            return "$rc"
           }
           cmd="$BUILD_COMMAND"
           if ! run_build "$cmd"; then
@@ -131,9 +140,18 @@ jobs:
           # reading it, killing individual test binaries. The tool's own advice is to
           # retry, and to bypass the cache if that fails -- reruns alone do NOT help,
           # because the restored cache carries the same poisoned entry back in.
+          # Keep the raw JSON. Piping cargo straight into jq discards every
+          # `compiler-message` record, which is where the actual error text lives -- so a
+          # failing build printed only "could not compile (test ...)" with no reason, on
+          # every retry. Render the diagnostics on failure instead of dropping them.
           run_build() {
-            eval "$1 --target $TARGET --release --message-format=json" \
-              | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' > bins.txt
+            local rc=0
+            eval "$1 --target $TARGET --release --message-format=json" > cargo.json || rc=$?
+            jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' cargo.json > bins.txt
+            if [ "$rc" -ne 0 ]; then
+              jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' cargo.json >&2
+            fi
+            return "$rc"
           }
           cmd="soldr cargo test --no-run"
           if ! run_build "$cmd"; then

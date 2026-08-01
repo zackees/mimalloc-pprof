@@ -32,7 +32,15 @@ jobs:
       - name: Build harnesses (libFuzzer + ASan)
         run: |
           set -euo pipefail
-          cmake -B build-fuzz -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_FUZZ=ON
+          # MI_TRACK_ASAN=ON is REQUIRED, not optional: without it a block handed out by
+          # mimalloc lives inside mimalloc's own arena, so ASan cannot see an overflow
+          # within it -- the planted-bug control could never fire and real finds would be
+          # invisible. MI_OVERRIDE=OFF because ASan installs its own malloc interceptors
+          # and mimalloc replacing malloc underneath them is what SIGSEGV'd the first run
+          # (bare segfault, no ASan report, no crash- file: the process died rather than
+          # the sanitizer reporting). The harnesses call mi_* explicitly, so overriding
+          # the global allocator buys nothing here.
+          cmake -B build-fuzz -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_FUZZ=ON                 -DMI_TRACK_ASAN=ON -DMI_OVERRIDE=OFF
           cmake --build build-fuzz --parallel
 
       # A short deterministic budget on PRs; the nightly run gets the real one.
@@ -51,7 +59,7 @@ jobs:
       - name: Positive control -- the fuzzer must find a planted bug
         run: |
           set -uo pipefail
-          cmake -B build-fuzz-bug -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_FUZZ=ON -DMI_FUZZ_PLANT_BUG=ON
+          cmake -B build-fuzz-bug -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_FUZZ=ON                 -DMI_TRACK_ASAN=ON -DMI_OVERRIDE=OFF -DMI_FUZZ_PLANT_BUG=ON
           cmake --build build-fuzz-bug --parallel --target mimalloc-fuzz-alloc-ops
           set +e
           out=$(./build-fuzz-bug/mimalloc-fuzz-alloc-ops test/fuzz/corpus/alloc-ops -runs=200000 2>&1)

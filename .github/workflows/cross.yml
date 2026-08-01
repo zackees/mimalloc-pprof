@@ -33,7 +33,8 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            command: soldr cargo test --no-run
+            # Plain cargo, not `soldr cargo`: see the comment on cmd= in build-cross.
+            command: cargo test --no-run
             cflags: ""
           - target: aarch64-unknown-linux-gnu
             command: soldr cargo zigbuild --tests
@@ -153,7 +154,19 @@ jobs:
             fi
             return "$rc"
           }
-          cmd="soldr cargo test --no-run"
+          # Plain `cargo`, NOT `soldr cargo`. setup-soldr still provisions the
+          # toolchain above; only the build wrapper is dropped.
+          #
+          # Every `soldr cargo test --no-run` target has been failing to link since
+          # ~23:10 with `undefined reference to mi_prof_is_enabled` and friends, while
+          # the two targets that do NOT use it (aarch64-linux via zigbuild, and the
+          # MinGW job) keep passing. build.rs defines MI_PPROF=1 unconditionally and the
+          # vendored amalgamation contains every missing symbol, so the C is right and
+          # something in the wrapper is dropping it.
+          #
+          # Already tested and disproved: build-cache:false, linker:platform-default,
+          # and cache:false (the action's own "skip zccache wrapping entirely" switch).
+          cmd="cargo test --no-run"
           if ! run_build "$cmd"; then
             echo "::warning::build failed; retrying with the soldr compile cache bypassed (soldr#1969)"
             run_build "${cmd/soldr/soldr --no-cache}"

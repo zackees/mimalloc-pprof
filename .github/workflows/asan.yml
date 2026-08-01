@@ -1,0 +1,86 @@
+name: asan
+
+# Issue #86. The repo inherited an ASan job in test.yaml whose trigger is
+# `push: branches: ['dev*']` -- our branches are main/v2/v4, and there is no
+# pull_request trigger at all, so it has never run on a single commit of this fork.
+# Inherited configuration that looks like coverage and provides none.
+#
+# This job is ours, runs on PRs, and is a hard failure.
+
+on:
+  push:
+    branches: [main, v4]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'test/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/asan.yml'
+
+jobs:
+  asan:
+    name: address sanitizer
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      # MI_TRACK_ASAN silently turns itself OFF if sanitizer/asan_interface.h is
+      # missing, which would leave this job green while sanitizing nothing. Fail
+      # here instead, on the configure output that says which way it resolved.
+      - name: Configure (and prove ASan actually enabled)
+        run: |
+          set -euo pipefail
+          cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+                -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_TRACK_ASAN=ON 2>&1 | tee configure.log
+          if ! grep -q "Compile with address sanitizer support (MI_TRACK_ASAN=ON)" configure.log; then
+            echo "::error::MI_TRACK_ASAN did not survive configure -- the sanitizer is NOT enabled."
+            grep -i "sanitizer" configure.log || true
+            exit 1
+          fi
+
+      - run: cmake --build build-asan --parallel
+
+      # Flags are not the artifact. Check the shipped binary really links ASan.
+      - name: Verify __asan_init is present in the built binaries
+        run: |
+          set -euo pipefail
+          exe=$(find build-asan -name 'mimalloc-test-api' -type f | head -1)
+          test -n "$exe"
+          if ! nm -C "$exe" 2>/dev/null | grep -q "__asan_init"; then
+            echo "::error::$exe does not reference __asan_init -- ASan is not linked in."
+            exit 1
+          fi
+          echo "ASan confirmed linked into $exe"
+
+      - name: ctest under ASan
+        run: ctest --test-dir build-asan --output-on-failure --timeout 600
+
+      # A sanitizer that has never been observed to catch anything is
+      # indistinguishable from one that is misconfigured. This program reads freed
+      # heap memory through mi_free; ASan must abort it. Passing cleanly means
+      # mimalloc is not telling ASan about our allocations, even if ASan is linked.
+      - name: Positive control -- ASan must catch a use-after-free
+        run: |
+          set -uo pipefail
+          exe=$(find build-asan -name 'mimalloc-test-asan-control' -type f | head -1)
+          if [ -z "$exe" ]; then
+            echo "::error::the ASan control binary was not built, so MI_TRACK_ASAN was off at generate time."
+            exit 1
+          fi
+          set +e
+          out=$("$exe" 2>&1); rc=$?
+          set -e
+          echo "$out"
+          if [ $rc -eq 0 ]; then
+            echo "::error::the control exited 0 -- ASan did NOT catch a use-after-free."
+            exit 1
+          fi
+          if ! echo "$out" | grep -qiE "AddressSanitizer|use-after-poison|heap-use-after-free"; then
+            echo "::error::the control failed (rc=$rc) but produced no AddressSanitizer report; that is a different bug."
+            exit 1
+          fi
+          echo "positive control fired: ASan caught the use-after-free (rc=$rc)"

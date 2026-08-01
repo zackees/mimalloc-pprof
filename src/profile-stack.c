@@ -52,6 +52,31 @@ static bool stack_grow(void) {
   return true;
 }
 
+/* Why this path needs no reentrancy guard and no in-process symbolizer (issue #128,
+   D1/D2 -- audited against upstream's three attempts at allocation-site capture in
+   dev-trace, dev-slice-trace and dev-debug).
+
+   Upstream hit two hazards here and we avoid both BY CONSTRUCTION, which is worth
+   recording so neither gets "fixed" back in:
+
+   1. CAPTURE MUST NOT ALLOCATE. Upstream wrapped its capture in mi_recurse_enter/exit
+      plus _mi_preloading() because backtrace()/backtrace_symbols() allocate, so
+      capturing from inside the allocator re-enters through pthread/dl paths. Every
+      branch below writes into a caller-supplied buffer and allocates nothing:
+      RtlCaptureStackBackTrace on Windows, backtrace() with a caller buffer on Apple
+      (libSystem strips PAC bits and does not allocate), and a manual frame-pointer
+      walk everywhere else. There is therefore no allocation to recurse through.
+
+   2. WE NEVER SYMBOLIZE IN-PROCESS. Upstream had to move SymInitialize/SymCleanup out
+      of the per-trace path into process init because the dbghelp Sym* API is not
+      thread-safe and a per-call SymCleanup tears down state another thread may be
+      mid-lookup on. This fork calls no dbghelp API at all: profile-maps.c emits the
+      loaded-module ranges and pprof resolves symbols offline against the PDB. Upstream
+      also deliberately LEAKS backtrace_symbols() output, having concluded that calling
+      free() on it from inside the allocator is unsafe -- we never call it.
+
+   Keep it that way. Adding an in-process symbolizer, or any capture that allocates,
+   reintroduces both hazards on the platform this fork cares most about. */
 #ifdef _WIN32
 #include <windows.h>
 size_t _mi_prof_stack_capture(void** pcs, size_t capacity) {

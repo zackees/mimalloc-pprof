@@ -97,6 +97,19 @@ jobs:
       - run: cmake -B build -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
       - run: cmake --build build --config Release
       - run: ctest --test-dir build -C Release --output-on-failure
+      # DIAGNOSTIC (#69): ctest reported the env-activation test as Failed with no output
+      # at all, despite --output-on-failure, so the five distinct stderr messages the test
+      # emits never reached the log. Run the binary directly and print everything, so the
+      # exit code alone tells us which branch fired.
+      - name: "#69 diagnostic: run the env-activation check directly"
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          exe=$(find build -name 'mimalloc-test-memory-events*' -type f | grep -iE '\.exe$|memory-events$' | head -1)
+          echo "binary: $exe"
+          MIMALLOC_MEMORY_EVENTS=1 "$exe" --env-enabled-check
+          echo "exit code: $?  (1=env not set  2=alloc failed  3=tracking not enabled  4=second alloc failed  5=callback did not fire)"
 
   ctest-shared-win-gnu:
     runs-on: windows-latest

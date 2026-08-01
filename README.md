@@ -351,6 +351,27 @@ target_link_libraries(my_app PRIVATE mimalloc-static)
 > Rust binary using the crate's vendored allocator must not also link the root
 > CMake library.
 
+### Reallocation, including the zeroing forms
+
+Beyond `mi_realloc`, mimalloc provides variants that Rust's `GlobalAlloc` cannot express
+and that are easy to miss:
+
+| Function | What it does |
+|---|---|
+| `mi_rezalloc(p, n)` | grow/shrink **and zero the newly-exposed tail** |
+| `mi_recalloc(p, count, size)` | same, in `calloc`'s element-count form |
+| `mi_rezalloc_aligned`, `mi_recalloc_aligned` | aligned variants |
+| `mi_expand(p, n)` | grow **in place only** — returns `NULL` rather than moving, leaving `p` valid |
+
+The zeroing forms save a `memset` you would otherwise write by hand. One subtlety worth
+knowing: they zero from the block's old **usable** size, not from the size you
+originally requested. A block requested at 64 bytes may be usable to 80, so growing it
+to 70 is served in place with nothing zeroed. If you need a specific range zeroed,
+capture `mi_usable_size` before the call.
+
+All of these are available from Rust as `mimalloc_pprof::{rezalloc, recalloc, expand,
+usable_size}`.
+
 ### Build flags for usable stacks
 
 The profiler walks **your application's** frames, so the flags that matter are the ones

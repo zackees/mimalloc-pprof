@@ -445,11 +445,22 @@ MIMALLOC_PROF_SAMPLE_INTERVAL=524288 \
 | `MIMALLOC_PROF_ACCUM=1` | Keep cumulative counters until `mi_prof_reset` |
 | `MIMALLOC_PROF_BT_MAX=32` | Maximum captured stack depth (compile-time cap 128) |
 | `MIMALLOC_PROF_MAX_BYTES=N` | Bound persistent profiler arena memory |
-| `MIMALLOC_PROF_SEED=N` | Deterministic sampling, for repeatable tests |
+| `MIMALLOC_PROF_SEED=N` | Deterministic sampling, for repeatable tests (see the note below) |
 | `MIMALLOC_PROF_DUMP_FORMAT=proto` | Write pprof `profile.proto` instead of text |
 
 `MIMALLOC_PROF_SAMPLE_RATE` remains a compatibility alias for
 `MIMALLOC_PROF_SAMPLE_INTERVAL`; when both are set, `..._INTERVAL` wins.
+
+**What `MIMALLOC_PROF_SEED` guarantees.** Two runs of the same workload with the same
+seed sample at the same points, **provided the threads are created in the same order** —
+each thread's stream is derived from the seed and its creation ordinal. It does not make
+a workload whose threads race to allocate reproducible, because which thread reaches a
+given allocation first is still nondeterministic. Single-threaded and
+deterministic-startup workloads are fully repeatable.
+
+Until 0.9.1 this was not true at all: the per-thread stream mixed in the *address* of the
+thread's allocator state, which ASLR randomises, so seeded runs differed in every
+process ([#91](https://github.com/zackees/mimalloc-pprof/issues/91)).
 
 #### A caution about the shared `MIMALLOC_*` namespace
 

@@ -322,6 +322,39 @@ target_link_libraries(my_app PRIVATE mimalloc-static)
 > Rust binary using the crate's vendored allocator must not also link the root
 > CMake library.
 
+### Build flags for usable stacks
+
+The profiler walks **your application's** frames, so the flags that matter are the ones
+on **your** targets — not the ones this library builds itself with.
+
+`MI_PPROF=ON` adds `-fno-omit-frame-pointer` to mimalloc's own translation units
+(`CMakeLists.txt`), but that is `PRIVATE` and does not propagate to consumers. Enabling
+the profiler does **not** make your code unwindable, and the symptom is truncated or
+nonsensical stacks rather than an error:
+
+```cmake
+add_subdirectory(path/to/mimalloc-pprof)
+target_link_libraries(my_app PRIVATE mimalloc-static)
+
+# Linux/macOS: the profiler walks frame pointers, so your code must keep them.
+if(NOT WIN32)
+  target_compile_options(my_app PRIVATE -fno-omit-frame-pointer)
+endif()
+```
+
+Or from the command line: `-fno-omit-frame-pointer` (plus `-g`, or
+`-DCMAKE_BUILD_TYPE=RelWithDebInfo`, so the addresses resolve to names). Apply it to
+every library you want to see in a profile, not just the top-level executable — an
+optimised dependency built without it terminates the stack at its boundary.
+
+**Windows is different, and `/Oy-` is not the answer.** Stack capture there uses the
+unwind tables x64 emits regardless of frame-pointer settings; what you need is the
+**PDB** next to the binary at analysis time. Keep it even for release builds — the ZIP
+that ships with each GitHub release contains no symbols for your code.
+
+The Rust equivalent is [`-Cforce-frame-pointers=yes`](#rust-integration); the two are the
+same requirement expressed in each toolchain.
+
 ### Full example
 
 ```c
@@ -410,7 +443,8 @@ println!(
 );
 ```
 
-On Linux and macOS, retain frame pointers for reliable stack walking:
+On Linux and macOS, retain frame pointers for reliable stack walking. This is the same
+requirement as [the C build flags](#build-flags-for-usable-stacks), expressed for cargo:
 
 ```toml
 # .cargo/config.toml

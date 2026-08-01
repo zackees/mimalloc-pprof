@@ -119,6 +119,82 @@ pub unsafe fn unwrapped_realloc(p: *mut u8, new_size: usize, alignment: usize) -
     unsafe { sys::mi_unwrapped_realloc(p.cast(), new_size, alignment).cast() }
 }
 
+/// Grow or shrink an allocation, zeroing any newly-exposed tail.
+///
+/// Thin wrapper around `mi_rezalloc`. This is the operation Rust's [`GlobalAlloc`]
+/// cannot express — that trait has no `grow_zeroed` — so without it a caller has to
+/// grow and then `memset` by hand, repeating work the allocator has already done, and
+/// (with zero-tracking) work it may be able to skip entirely.
+///
+/// # What is actually zeroed
+///
+/// **Not** `[old_requested_size, new_size)`. mimalloc measures from the block's old
+/// *usable* size, so the slack between what you asked for and what the block actually
+/// holds is left untouched:
+///
+/// ```text
+/// requested 64  ->  usable 80  ->  rezalloc to 70
+/// bytes [64,70) are NOT zeroed: the grow was served in place, within the old block
+/// ```
+///
+/// The guarantee is: everything past [`usable_size`] of the *original* block is zero.
+/// If you need a specific range zeroed, capture [`usable_size`] before the call and
+/// zero the remainder yourself.
+///
+/// (This is documented so precisely because a fuzz harness asserted the intuitive
+/// version and was falsified within seconds — see issue #87.)
+///
+/// # Safety
+///
+/// - `p` must be null, or a pointer from the **plain** allocation family — the global
+///   allocator, [`sys::mi_malloc`], or a previous [`rezalloc`]/[`recalloc`] — that has
+///   not been freed.
+/// - **Not interchangeable with [`unwrapped_malloc`]/[`unwrapped_realloc`].** Those
+///   place a header before the pointer, so passing one here fails the pointer check
+///   (`mi_usable_size: invalid pointer`) rather than working by accident.
+/// - After this call `p` is consumed: do not read, write, or free it again, whether or
+///   not the return value is null.
+/// - On failure a null pointer is returned and `p` is left valid and unfreed.
+pub unsafe fn rezalloc(p: *mut u8, new_size: usize) -> *mut u8 {
+    unsafe { sys::mi_rezalloc(p.cast(), new_size).cast() }
+}
+
+/// Grow or shrink an allocation to `count * size` bytes, zeroing any newly-exposed tail.
+///
+/// The [`rezalloc`] contract applies, including what is and is not zeroed. Thin wrapper
+/// around `mi_recalloc`; the element-count form exists to mirror `calloc`.
+///
+/// # Safety
+///
+/// Same contract as [`rezalloc`].
+pub unsafe fn recalloc(p: *mut u8, count: usize, size: usize) -> *mut u8 {
+    unsafe { sys::mi_recalloc(p.cast(), count, size).cast() }
+}
+
+/// Try to grow an allocation **in place**, without moving it.
+///
+/// Returns a null pointer if the block cannot be extended where it is — in which case
+/// `p` remains valid and unchanged, unlike [`rezalloc`]. Useful when moving would be
+/// more expensive than falling back to a different strategy.
+///
+/// # Safety
+///
+/// - `p` must be a pointer from this allocator that has not been freed.
+/// - Unlike [`rezalloc`], `p` is **not** consumed: on failure it is still live and must
+///   still be freed.
+pub unsafe fn expand(p: *mut u8, new_size: usize) -> *mut u8 {
+    unsafe { sys::mi_expand(p.cast(), new_size).cast() }
+}
+
+/// Bytes actually available in an allocation, which may exceed what was requested.
+///
+/// # Safety
+///
+/// `p` must be a live pointer from this allocator.
+pub unsafe fn usable_size(p: *const u8) -> usize {
+    unsafe { sys::mi_usable_size(p.cast()) }
+}
+
 /// Turn on sampled heap profiling at the default sample rate.
 ///
 /// Convenience entry point for wiring profiling to a command-line flag:

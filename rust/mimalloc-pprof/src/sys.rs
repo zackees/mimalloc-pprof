@@ -118,6 +118,25 @@ unsafe extern "C" {
     pub fn mi_malloc_aligned(size: usize, alignment: usize) -> *mut c_void;
     pub fn mi_zalloc_aligned(size: usize, alignment: usize) -> *mut c_void;
     pub fn mi_realloc_aligned(p: *mut c_void, newsize: usize, alignment: usize) -> *mut c_void;
+    // Zeroing reallocation (issue #83). These grow a block AND zero the new tail, which
+    // `GlobalAlloc` cannot express -- it has no `grow_zeroed` -- so a Rust caller would
+    // otherwise grow and `memset` by hand, redoing work mimalloc has already done.
+    //
+    // What they zero is NOT [old_requested, new): mimalloc measures from the block's
+    // old *usable* size, so the slack between requested and usable is left as-is. A
+    // block requested at 64 bytes may be usable to 80, and growing to 70 is served in
+    // place with nothing zeroed. See `prof::rezalloc` for the safe-wrapper docs.
+    pub fn mi_rezalloc(p: *mut c_void, newsize: usize) -> *mut c_void;
+    pub fn mi_recalloc(p: *mut c_void, newcount: usize, size: usize) -> *mut c_void;
+    pub fn mi_rezalloc_aligned(p: *mut c_void, newsize: usize, alignment: usize) -> *mut c_void;
+    pub fn mi_recalloc_aligned(
+        p: *mut c_void,
+        newcount: usize,
+        size: usize,
+        alignment: usize,
+    ) -> *mut c_void;
+    /// Grow in place only; returns NULL if the block cannot be extended without moving.
+    pub fn mi_expand(p: *mut c_void, newsize: usize) -> *mut c_void;
     pub fn mi_usable_size(p: *const c_void) -> usize;
     pub fn mi_prof_start(sample_rate: usize) -> bool;
     pub fn mi_prof_start_seeded(sample_rate: usize, seed: u64) -> bool;

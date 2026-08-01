@@ -64,6 +64,32 @@ jobs:
           name: mimalloc-portable-${{ matrix.os }}
           path: build-portable/libmimalloc*.a
 
+  # MI_GUARDED places guard pages behind sampled allocations. It was documented as
+  # default-on in debug builds and was NEVER enabled -- two dead CMake constructs (see
+  # #116). Now that it can turn on, it needs a job that actually builds with it, or we
+  # have simply moved the flag from "silently off" to "on and untested".
+  ctest-guarded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and prove MI_GUARDED survived
+        run: |
+          set -euo pipefail
+          cmake -B build-guarded -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_GUARDED=ON 2>&1 | tee cfg.log
+          # The whole point of #116 is that the flag silently did not reach the compiler.
+          # Assert on the resolved defines, not on the option we passed in.
+          if ! grep -qE "Compiler defines *:.*MI_GUARDED=1" cfg.log; then
+            echo "::error::MI_GUARDED=1 did not reach mi_defines -- the flag is not actually enabled."
+            grep -i "guard\|Compiler defines" cfg.log || true
+            exit 1
+          fi
+      - run: cmake --build build-guarded --parallel
+      - run: ctest --test-dir build-guarded --output-on-failure --timeout 900
+      # NOT added yet: a run at MIMALLOC_GUARDED_SAMPLE_RATE=1. It is currently RED --
+      # mimalloc reports "double free detected" and test-memory-events' allocation count
+      # goes wrong. Adding it red, or with continue-on-error, is how a gate becomes
+      # decoration; it goes in with the fix. Tracked on #116.
+
   ctest-pprof-off:
     runs-on: ubuntu-latest
     steps:

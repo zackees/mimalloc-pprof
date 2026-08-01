@@ -372,9 +372,24 @@ elseif(CMAKE_BUILD_TYPE MATCHES "Debug")
   list(APPEND mi_defines MI_DEBUG=2)   # invariant checking (mi_assert and mi_assert_internal)
 endif()
 
-if(MI_DEBUG AND !MI_GUARDED)
-  message(STATUS "Enable MI_GUARDED (since MI_DEBUG=ON)")
-  set(MI_GUARDED=ON)
+# NOTE: `!` is NOT negation in CMake -- `!MI_GUARDED` parses as a variable name, and an
+# undefined variable is false, so the original `if(MI_DEBUG AND !MI_GUARDED)` was ALWAYS
+# false. And `set(MI_GUARDED=ON)` creates a variable literally named `MI_GUARDED=ON`
+# rather than setting anything. Either defect alone disabled this block; together it
+# could never fire, so MI_GUARDED was never on despite being documented as default-on in
+# debug builds (see issue #116). Both verified experimentally.
+#
+# The auto-enable is deliberately NOT restored yet. Turning it on surfaced a real
+# interaction bug: at MIMALLOC_GUARDED_SAMPLE_RATE=1 the suite reports
+# "double free detected" from mimalloc's own checker and our memory-events allocation
+# count goes wrong (test-memory-events.c:378). At the default 1-in-4000 rate the suite
+# passes -- which would make that failure RARE AND NONDETERMINISTIC in every debug build,
+# which is worse than it being off. Restore the auto-enable once that is understood.
+#
+# `-DMI_GUARDED=ON` now works as intended, which is what the constructs below were
+# supposed to provide all along.
+if(MI_DEBUG AND NOT MI_GUARDED)
+  message(STATUS "MI_GUARDED auto-enable is disabled pending the guarded/memory-events interaction bug; pass -DMI_GUARDED=ON explicitly to opt in")
 endif()
 if(MI_GUARDED)
   message(STATUS "Compile guard pages behind certain object allocations (MI_GUARDED=ON)")

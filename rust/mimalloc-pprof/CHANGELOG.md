@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.9.2
+
+One behavioural fix: **seeded sampling is now actually reproducible.**
+
+- **Fix: `mi_prof_start_seeded` and `MIMALLOC_PROF_SEED` were not deterministic**
+  ([#91](https://github.com/zackees/mimalloc-pprof/issues/91)). The per-thread sampling
+  PRNG seeded from `prof_seed ^ (uintptr_t)tld` -- the *address* of the thread's
+  allocator state, which ASLR randomises -- so the same seed produced a different sample
+  sequence in every process, while the documentation promised "deterministic sampling,
+  for repeatable tests". It now derives from the thread's creation ordinal
+  (`mi_tld_t.thread_seq`), which is per-thread without being address-dependent.
+
+  If you pinned a seed to get repeatable profiles, **0.9.1 and earlier did not give you
+  one.** This does.
+
+  The guarantee is bounded, and the README now says so: runs reproduce when thread
+  *creation order* is deterministic. Threads racing to allocate remain only
+  statistically repeatable.
+
+  Covered by `test-prof-seed-determinism`, which spawns itself and compares two
+  processes -- an in-process loop shares an address layout and would have passed while
+  the bug was live. Verified to fail without the fix on Linux and macOS.
+
 ## 0.9.1
 
 Hardening release. No API changes -- everything here is a fix or a CI gate.

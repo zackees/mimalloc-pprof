@@ -108,8 +108,15 @@ jobs:
           set +e
           exe=$(find build -name 'mimalloc-test-memory-events*' -type f | grep -iE '\.exe$|memory-events$' | head -1)
           echo "binary: $exe"
-          MIMALLOC_MEMORY_EVENTS=1 "$exe" --env-enabled-check
+          echo "--- does the shell itself export it? ---"
+          export MIMALLOC_MEMORY_EVENTS=1
+          env | grep -i mimalloc || echo "(nothing in env)"
+          echo "--- exported, run via bash ---"
+          "$exe" --env-enabled-check
           echo "exit code: $?  (1=env not set  2=alloc failed  3=tracking not enabled  4=second alloc failed  5=callback did not fire)"
+          echo "--- run via cmd.exe, which sets the variable itself ---"
+          cmd //c "set MIMALLOC_MEMORY_EVENTS=1 && $(cygpath -w "$exe") --env-enabled-check"
+          echo "exit code: $?"
 
   ctest-shared-win-gnu:
     runs-on: windows-latest

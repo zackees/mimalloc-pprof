@@ -4,6 +4,35 @@ A fork of [microsoft/mimalloc](https://github.com/microsoft/mimalloc) that adds
 **pprof-compatible sampled heap profiling**, with native Windows as a first-class
 target alongside Linux and macOS.
 
+```
+ __  __ ___ __  __    _    _     _     ___   ____      ____  ____  ____   ___  _____
+|  \/  |_ _|  \/  |  / \  | |   | |   / _ \ / ___|    |  _ \|  _ \|  _ \ / _ \|  ___|
+| |\/| || || |\/| | / _ \ | |   | |  | | | | |   _____| |_) | |_) | |_) | | | | |_
+| |  | || || |  | |/ ___ \| |___| |__| |_| | |__|_____|  __/|  __/|  _ <| |_| |  _|
+|_|  |_|___|_|  |_/_/   \_\_____|_____\___/ \____|    |_|   |_|   |_| \_\\___/|_|
+
+                  PPROF-COMPATIBLE SAMPLED HEAP PROFILING
+
+                  WINDOWS FIRST-CLASS | LINUX | MACOS
+
+
+       malloc / free
+             |
+             v
+    +------------------+
+    |     mimalloc     |
+    |                  |
+    |   [ live heap ]  |
+    +---------+--------+
+              |
+              | sampled allocations
+              v
+    +------------------+            +--------------------------+
+    |    heap.prof     | ---------> |      google/pprof        |
+    | heap_v2 / proto  |            | flamegraphs | top | diff |
+    +------------------+            +--------------------------+
+```
+
 The allocator tracks sampled live allocations and writes either the gperftools
 `heap_v2` text format or an uncompressed pprof `profile.proto`. Both open directly
 in [google/pprof](https://github.com/google/pprof) for flame graphs, call graphs,

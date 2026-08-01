@@ -34,7 +34,7 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
 ## Repo facts
 
 - Branch layout: `main` is the **v3** line (crate 0.9.x, overlay pinned to `upstream/dev3`
-  commit `579f8c0e`). The previous v2 line is preserved on the **`v2`** branch and is what
+  commit `bcee5a88`; was `579f8c0e` before the #80 bump). The previous v2 line is preserved on the **`v2`** branch and is what
   crates.io still serves as 0.8.x. Do not move the v3 overlay to a newer `dev3` without
   re-verifying the profiler hook patches — they only apply byte-identically against the
   pinned base, and the current tip fixes nothing we need.

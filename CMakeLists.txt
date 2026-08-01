@@ -922,6 +922,23 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-memory-gate PRIVATE Threads::Threads)
   endif()
   add_test(NAME test-memory-gate COMMAND mimalloc-test-memory-gate)
+
+  # Positive control for the ASan job (issue #86). Only built when the sanitizer is
+  # actually enabled -- and MI_TRACK_ASAN is the *resolved* value here, since
+  # CMakeLists turns it OFF above if sanitizer/asan_interface.h is missing. It is
+  # deliberately NOT an add_test: it must abort, so CI runs it directly and fails if
+  # it exits cleanly.
+  if(MI_TRACK_ASAN)
+    add_executable(mimalloc-test-asan-control test/test-asan-control.c)
+    target_compile_definitions(mimalloc-test-asan-control PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-asan-control PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-asan-control PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-asan-control PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-asan-control PRIVATE mimalloc ${mi_libraries})
+    endif()
+  endif()
   set_tests_properties(test-memory-gate PROPERTIES TIMEOUT 900)
 
   # Degenerate memory patterns and memory-bound regression guards (issue #47).

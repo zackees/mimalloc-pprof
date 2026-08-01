@@ -56,11 +56,44 @@ jobs:
           BUILD_COMMAND: ${{ matrix.command }}
           CFLAGS_aarch64_unknown_linux_gnu: ${{ matrix.cflags }}
         run: |
-          eval "$BUILD_COMMAND --target $TARGET --release --message-format=json" \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' > bins.txt
+          # pipefail is NOT on by default in GitHub's `bash -e` shell, so without it
+          # this pipeline reports jq's exit status and a FAILED cargo build looks green.
+          # Not hypothetical: a soldr compile-cache race (soldr#1969) killed four test
+          # binaries, this step passed, a partial dist/ was uploaded, and the downstream
+          # job failed with a bare `test -n "$generator"` and no output at all.
+          set -euo pipefail
+          # soldr#1969: an intermediate can be reclaimed while a slow link is still
+          # reading it, killing individual test binaries. The tool's own advice is to
+          # retry, and to bypass the cache if that fails -- reruns alone do NOT help,
+          # because the restored cache carries the same poisoned entry back in.
+          # Keep the raw JSON. Piping cargo straight into jq discards every
+          # `compiler-message` record, which is where the actual error text lives -- so a
+          # failing build printed only "could not compile (test ...)" with no reason, on
+          # every retry. Render the diagnostics on failure instead of dropping them.
+          run_build() {
+            local rc=0
+            eval "$1 --target $TARGET --release --message-format=json" > cargo.json || rc=$?
+            jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' cargo.json > bins.txt
+            if [ "$rc" -ne 0 ]; then
+              jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' cargo.json >&2
+            fi
+            return "$rc"
+          }
+          cmd="$BUILD_COMMAND"
+          if ! run_build "$cmd"; then
+            echo "::warning::build failed; retrying with the soldr compile cache bypassed (soldr#1969)"
+            run_build "${cmd/soldr/soldr --no-cache}"
+          fi
           test -s bins.txt
           mkdir -p "dist/$TARGET"
           xargs -r -a bins.txt -I{} cp {} "dist/$TARGET/"
+          # The downstream test job needs t3_stats specifically. Assert it here, next to
+          # the compiler output, instead of letting the consumer fail without saying why.
+          if ! ls "dist/$TARGET"/t3_stats-* >/dev/null 2>&1; then
+            echo "::error::t3_stats was not built for $TARGET. Staged binaries:"
+            ls -1 "dist/$TARGET" || echo "  (none)"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: test-bins-${{ matrix.target }}
@@ -97,11 +130,44 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          soldr cargo test --no-run --target "$TARGET" --release --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' > bins.txt
+          # pipefail is NOT on by default in GitHub's `bash -e` shell, so without it
+          # this pipeline reports jq's exit status and a FAILED cargo build looks green.
+          # Not hypothetical: a soldr compile-cache race (soldr#1969) killed four test
+          # binaries, this step passed, a partial dist/ was uploaded, and the downstream
+          # job failed with a bare `test -n "$generator"` and no output at all.
+          set -euo pipefail
+          # soldr#1969: an intermediate can be reclaimed while a slow link is still
+          # reading it, killing individual test binaries. The tool's own advice is to
+          # retry, and to bypass the cache if that fails -- reruns alone do NOT help,
+          # because the restored cache carries the same poisoned entry back in.
+          # Keep the raw JSON. Piping cargo straight into jq discards every
+          # `compiler-message` record, which is where the actual error text lives -- so a
+          # failing build printed only "could not compile (test ...)" with no reason, on
+          # every retry. Render the diagnostics on failure instead of dropping them.
+          run_build() {
+            local rc=0
+            eval "$1 --target $TARGET --release --message-format=json" > cargo.json || rc=$?
+            jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' cargo.json > bins.txt
+            if [ "$rc" -ne 0 ]; then
+              jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' cargo.json >&2
+            fi
+            return "$rc"
+          }
+          cmd="soldr cargo test --no-run"
+          if ! run_build "$cmd"; then
+            echo "::warning::build failed; retrying with the soldr compile cache bypassed (soldr#1969)"
+            run_build "${cmd/soldr/soldr --no-cache}"
+          fi
           test -s bins.txt
           mkdir -p "dist/$TARGET"
           xargs -r -a bins.txt -I{} cp {} "dist/$TARGET/"
+          # The downstream test job needs t3_stats specifically. Assert it here, next to
+          # the compiler output, instead of letting the consumer fail without saying why.
+          if ! ls "dist/$TARGET"/t3_stats-* >/dev/null 2>&1; then
+            echo "::error::t3_stats was not built for $TARGET. Staged binaries:"
+            ls -1 "dist/$TARGET" || echo "  (none)"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: test-bins-${{ matrix.target }}

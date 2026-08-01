@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit e6f47a41 of the three public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fba9f8cc of the three public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -494,6 +494,7 @@ typedef enum mi_option_e {
   mi_option_prof_seed,                  // profiler sampling PRNG seed; 0 = nondeterministic (=0)
   mi_option_prof_max_bytes,             // budget (in bytes) for profiler-internal arena memory; 0 = unbudgeted (=0)
   mi_option_memory_events,              // enable opt-in allocation-change accounting/callbacks (MIMALLOC_MEMORY_EVENTS) (=0)
+  mi_option_purge_zeroes,               // treat decommit-purged slices as zeroed, letting mi_zalloc skip its memset (=0, experimental)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

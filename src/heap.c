@@ -249,7 +249,15 @@ void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   if (heap==NULL) return;
   mi_heap_free_theaps(heap);
   _mi_heap_destroy_pages(heap);
-  if (!_mi_is_heap_main(heap)) { mi_heap_free(heap, acquire_heaps_lock); }  // todo: release locks of the main heap?
+  // Free unless this is the PROCESS main heap (which is statically allocated and must
+  // outlive everything). _mi_is_heap_main alone is not the right test: it resolves via
+  // heap->subproc, so a *subproc's* heap_main is "main" by that definition too -- yet it
+  // was dynamically allocated by _mi_heap_new_for_subproc and must be freed. Skipping it
+  // leaked one mi_heap_t (plus its arena_pages) per mi_subproc_destroy; measured at
+  // ~7.3 KB per subproc, 21.8 MB over 3000 create/destroy cycles. Issue #128 B1.
+  if (!_mi_is_heap_main(heap) || heap->subproc != _mi_subproc_main()) {
+    mi_heap_free(heap, acquire_heaps_lock);  // todo: release locks of the main heap?
+  }
 }
 
 void mi_heap_destroy(mi_heap_t* heap) {

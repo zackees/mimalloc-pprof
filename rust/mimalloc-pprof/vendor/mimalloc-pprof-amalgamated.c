@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ccb931da of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 1201a9d8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -15649,6 +15649,23 @@ void _mi_memevt_suppress_end(void)   { memevt_suppress_depth--; }
 // ---------------------------------------------------------------------------------------
 
 static void memevt_resolve_env(void) {
+  // Do not latch an answer while the C runtime is still coming up (issue #69).
+  //
+  // In an MSVC *shared* build the first allocation happens during DLL_PROCESS_ATTACH,
+  // before the CRT can answer getenv. mimalloc's own option machinery handles that by
+  // leaving the option UNINIT and retrying later -- src/options.c: "on another error,
+  // keep unitialized to try again (can happen during preloading if getenv is not
+  // available)". Our once-guard was stricter: it cached that pre-CRT read permanently,
+  // so MIMALLOC_MEMORY_EVENTS=1 could never take effect no matter when it was set.
+  //
+  // Static builds never saw this because their first allocation really does happen in
+  // main, with the CRT already up -- which is why the whole static suite passed while
+  // the MSVC DLL failed.
+  //
+  // Returning early leaves memevt_state == MEMEVT_UNINIT, so the next allocation
+  // retries. Tracking stays off until then, which is the only honest answer: during
+  // preloading we cannot yet know what the environment says.
+  if (_mi_preloading()) return;
   if (_mi_atomic_once_enter(&memevt_once)) {
     const bool enabled = mi_option_is_enabled(mi_option_memory_events);
     mi_atomic_store_release(&memevt_state, (size_t)(enabled ? MEMEVT_ENABLED : MEMEVT_DISABLED));

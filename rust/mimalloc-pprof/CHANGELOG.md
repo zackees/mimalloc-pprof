@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.9.1
+
+Hardening release. No API changes -- everything here is a fix or a CI gate.
+
+- **Fix: shared-library builds were broken.** Four test targets hardcoded
+  `mimalloc-static`, so a `-DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF` build failed to
+  link with `cannot find -lmimalloc-static` (#62, #68). This is the one that unbreaks
+  someone.
+- Fix: `-Wmaybe-uninitialized` on `fmt_buf` in `src/profile.c` (#72).
+- `MI_PROF_CONFIG_OVERRIDE` is now tested against a hostile ambient environment for
+  *every* env-backed field, not just `sample_interval` (#65, #73). The documented way to
+  be immune to process-global `MIMALLOC_*` is now covered by tests rather than by
+  assertion.
+- New CI gates, each with a positive control proving it can actually fail: peak-memory
+  and thread-counter regression gate with per-platform baselines (#63), CPU-baseline
+  instruction scanner for portable builds (#64), AddressSanitizer with an
+  allocator-mediated use-after-free control (#86), vendored-amalgamation drift guard
+  (#88), and `ruff` + `pyright --strict` over the CI scripts (#74).
+
+Four of those gates were found to be silently checking nothing when first written; the
+controls are why that was noticed. See the README's "CI gates" section.
+
 ## 0.8.0
 
 First real release of `mimalloc-pprof`.

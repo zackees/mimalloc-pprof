@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit c9b24702 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit e22b1663 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -13871,7 +13871,12 @@ static void mi_heap_free_theaps(mi_heap_t* heap) {
 
 // free the heap resources (assuming the pages are already moved/destroyed, and all theaps have been freed)
 static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
-  mi_assert_internal(heap!=NULL && !_mi_is_heap_main(heap));
+  // Not `!_mi_is_heap_main(heap)`: that predicate resolves via heap->subproc, so a
+  // SUBPROC's heap_main satisfies it while still being dynamically allocated and
+  // freeable. The real invariant is that the PROCESS main heap is never freed --
+  // it is statically allocated. Same conflation as the bug in _mi_heap_force_destroy
+  // this assertion was tripping on (issue #128 B1).
+  mi_assert_internal(heap!=NULL && !(_mi_is_heap_main(heap) && heap->subproc == _mi_subproc_main()));
 
   // free all arena pages infos
   mi_lock(&heap->arena_pages_lock) {
@@ -13917,7 +13922,15 @@ void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   if (heap==NULL) return;
   mi_heap_free_theaps(heap);
   _mi_heap_destroy_pages(heap);
-  if (!_mi_is_heap_main(heap)) { mi_heap_free(heap, acquire_heaps_lock); }  // todo: release locks of the main heap?
+  // Free unless this is the PROCESS main heap (which is statically allocated and must
+  // outlive everything). _mi_is_heap_main alone is not the right test: it resolves via
+  // heap->subproc, so a *subproc's* heap_main is "main" by that definition too -- yet it
+  // was dynamically allocated by _mi_heap_new_for_subproc and must be freed. Skipping it
+  // leaked one mi_heap_t (plus its arena_pages) per mi_subproc_destroy; measured at
+  // ~7.3 KB per subproc, 21.8 MB over 3000 create/destroy cycles. Issue #128 B1.
+  if (!_mi_is_heap_main(heap) || heap->subproc != _mi_subproc_main()) {
+    mi_heap_free(heap, acquire_heaps_lock);  // todo: release locks of the main heap?
+  }
 }
 
 void mi_heap_destroy(mi_heap_t* heap) {

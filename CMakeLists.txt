@@ -940,6 +940,21 @@ if (MI_BUILD_TESTS)
   endif()
   add_test(NAME test-memory-gate COMMAND mimalloc-test-memory-gate)
 
+  # Subproc lifecycle leak (issue #128 B1). mi_subproc_destroy skipped mi_heap_free for
+  # the subproc's own heap_main, because _mi_is_heap_main resolves via heap->subproc and
+  # is therefore true for it -- leaking one mi_heap_t per destroy (~7.3 KB measured).
+  add_executable(mimalloc-test-subproc-lifecycle test/test-subproc-lifecycle.c)
+  target_compile_definitions(mimalloc-test-subproc-lifecycle PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-subproc-lifecycle PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-subproc-lifecycle PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-subproc-lifecycle PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-subproc-lifecycle PRIVATE mimalloc ${mi_libraries})
+  endif()
+  add_test(NAME test-subproc-lifecycle COMMAND mimalloc-test-subproc-lifecycle)
+  set_tests_properties(test-subproc-lifecycle PROPERTIES TIMEOUT 600)
+
   # libFuzzer harnesses (issue #87). Off by default and clang-only: -fsanitize=fuzzer
   # is a clang feature, and these are driven by the fuzz CI job rather than ctest --
   # a fuzz run has no fixed duration, so it does not belong in the normal suite.

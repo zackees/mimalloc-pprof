@@ -1,5 +1,12 @@
 # mimalloc-pprof
 
+> ## mimalloc with native pprof-compatible heap profiling — on Windows, Linux, and macOS alike.
+>
+> **The one mimalloc heap profiler that runs natively on Windows.** Upstream mimalloc
+> has no profiler at all, and the only other known implementation
+> ([Bun's](https://github.com/oven-sh/mimalloc)) is POSIX-only — its stack capture is
+> guarded behind glibc/Apple `<execinfo.h>`.
+
 [mimalloc](https://github.com/microsoft/mimalloc) as a Rust global allocator, with
 **pprof-compatible sampled heap profiling** built in. Windows is a first-class
 target alongside Linux and macOS.

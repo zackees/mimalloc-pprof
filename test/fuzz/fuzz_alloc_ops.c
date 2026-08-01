@@ -171,15 +171,23 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         live[slot].ptr = p; live[slot].size = n;
         break;
       }
-      case 5: {  /* rezalloc -- the GROWN region must be zero */
+      case 5: {  /* rezalloc -- the region beyond the old USABLE size must be zero */
         if (live[slot].ptr == NULL) break;
-        const size_t old = live[slot].size;
+        /* Measured against the old *usable* size, not the old requested size.
+           _mi_theap_realloc_zero starts from `size = _mi_usable_size(p, page)` and
+           zeroes from there, so the slack between requested and usable is legitimately
+           stale -- a block requested at 64 bytes may be usable to 80, and a grow to 70
+           is served in place without zeroing [64,70).
+           The first version of this harness asserted from the requested size and the
+           fuzzer falsified it within seconds. The fuzzer was right; this is the
+           property mimalloc actually provides. */
+        const size_t usable_old = mi_usable_size(live[slot].ptr);
         const size_t n = rd_size(&r);
         void* p = mi_rezalloc(live[slot].ptr, n);
         if (p == NULL) break;
-        if (n > old) {
+        if (n > usable_old) {
           const unsigned char* b = (const unsigned char*)p;
-          for (size_t i = old; i < n; i++) assert(b[i] == 0);
+          for (size_t i = usable_old; i < n; i++) assert(b[i] == 0);
         }
         assert(mi_usable_size(p) >= n);
         live[slot].ptr = p; live[slot].size = n;

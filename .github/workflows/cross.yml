@@ -11,7 +11,7 @@ on:
       - rust/**
       - .github/workflows/cross.yml
   push:
-    branches: [main]
+    branches: [main, v4]
     paths:
       - src/**
       - include/**

@@ -923,6 +923,21 @@ if (MI_BUILD_TESTS)
   endif()
   add_test(NAME test-memory-gate COMMAND mimalloc-test-memory-gate)
 
+  # Seeded-sampling determinism across processes (issue #91). Spawns itself, so it
+  # cannot be an in-process loop: the bug was ASLR-dependent, and two runs inside one
+  # process share an address layout and would have agreed even while broken.
+  add_executable(mimalloc-test-prof-seed-determinism test/test-prof-seed-determinism.c)
+  target_compile_definitions(mimalloc-test-prof-seed-determinism PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-prof-seed-determinism PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-prof-seed-determinism PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-prof-seed-determinism PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-prof-seed-determinism PRIVATE mimalloc ${mi_libraries})
+  endif()
+  add_test(NAME test-prof-seed-determinism COMMAND mimalloc-test-prof-seed-determinism)
+  set_tests_properties(test-prof-seed-determinism PROPERTIES TIMEOUT 300)
+
   # Positive control for the ASan job (issue #86). Only built when the sanitizer is
   # actually enabled -- and MI_TRACK_ASAN is the *resolved* value here, since
   # CMakeLists turns it OFF above if sanitizer/asan_interface.h is missing. It is

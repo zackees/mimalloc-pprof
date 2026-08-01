@@ -2113,6 +2113,19 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
   if (needs_recommit) {
     // no longer committed
     mi_bitmap_clearN(arena->slices_committed, slice_index, slice_count);
+    // Experimental (#67, mi_option_purge_zeroes, default off): decommitted memory reads
+    // back zero when it is recommitted, so the slices are no longer dirty. Clearing the
+    // dirty bits lets the next allocation see memid->initially_zero, which in turn lets
+    // mi_zalloc skip its memset (alloc.c: `if (!page->free_is_zero) memset(...)`).
+    //
+    // Reached only on the `needs_recommit` branch, i.e. only when we genuinely
+    // decommitted. A *reset* (MADV_FREE / MEM_RESET) may preserve contents, and a custom
+    // commit_fun makes no zeroing promise at all -- claiming zero in either case would
+    // hand dirty memory to mi_zalloc, which is silent heap corruption rather than a
+    // visible failure. Hence both guards.
+    if (arena->commit_fun == NULL && mi_option_is_enabled(mi_option_purge_zeroes)) {
+      mi_bitmap_clearN(arena->slices_dirty, slice_index, slice_count);
+    }
     // we just counted in the purge to decommit all, but the some part was not committed so adjust that here
     // mi_subproc_stat_decrease(arena->subproc, committed, mi_size_of_slices(slice_count - already_committed));
   }

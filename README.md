@@ -136,6 +136,8 @@ Build with debug info, and on MSVC keep the matching PDB next to the binary.
 
 ## Choosing a version: v2 or v3
 
+**when in doubt chose v3 or later, which is the default latest**
+
 Two engine lines are published as two version ranges of the same crate. The
 profiler API, environment variables, and output formats are **identical** in both,
 so switching is a version bump, not a code change.

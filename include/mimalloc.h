@@ -322,6 +322,26 @@ typedef struct mi_heap_area_s {
 // reference for output shape only. Background reading; no code to take.
 typedef bool (mi_cdecl mi_block_visit_fun)(const mi_heap_t* heap, const mi_heap_area_t* area, void* block, size_t block_size, void* arg);
 
+// THREAD SAFETY (#78): these are NOT safe to call while other threads are freeing into
+// `heap`. The implementation says so only in an internal comment -- `_mi_heap_visit_blocks`
+// in src/arena.c reads `heap->os_abandoned_pages` under `os_abandoned_pages_lock`, then
+// walks the `page->next` chain with the lock RELEASED, above the comment "technically we
+// don't need the initial lock as we assume we are the only thread running in this
+// subproc".
+//
+// Under that assumption the unlocked walk is correct. But nothing in this header said so,
+// and nothing enforces it: a caller who visits a heap while another thread performs the
+// last `mi_free` into one of its OS-allocated abandoned pages can have that page unlinked
+// and unmapped between the `next` read and its use.
+//
+// The #78 inventory listed this as an outright use-after-free "in code we ship". That
+// overstates it -- it is reachable only by violating a precondition the implementation
+// does hold, which upstream simply never wrote down here. Documented rather than locked:
+// taking the lock across the whole walk would serialise visiting against every free on
+// the heap, and the callers that matter (heap teardown, our profiler's snapshot) do
+// satisfy the precondition.
+//
+// If you need to visit a live heap concurrently, that is not supported today.
 mi_decl_export bool   mi_heap_visit_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg);
 mi_decl_export bool   mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg);
 

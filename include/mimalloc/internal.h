@@ -972,6 +972,10 @@ static inline void mi_page_set_in_full(mi_page_t* page, bool in_full) {
     mi_theap_t* const theap = page->theap;
     mi_assert_internal(theap!=NULL);
     if (theap != NULL) {
+      // NEXT PIN BUMP: upstream `1fb345674` / `f9a74121f` change `capacity` to
+      // `reserved` here (#128 A2). Not cherry-picked, because `pages_full_size` is
+      // write-only at this pin -- nothing reads it, so a wrong value has no release-build
+      // effect. It arrives with the bump; confirm it did and drop this comment then.
       const size_t size = page->capacity * mi_page_block_size(page);
       if (in_full) { theap->pages_full_size += size; }
               else { mi_assert_internal(size <= theap->pages_full_size); theap->pages_full_size -= size; }

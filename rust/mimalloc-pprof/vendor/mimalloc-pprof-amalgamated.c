@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit b1c3f15d of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4d5c07e9 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4778,6 +4778,10 @@ static inline void mi_page_set_in_full(mi_page_t* page, bool in_full) {
     mi_theap_t* const theap = page->theap;
     mi_assert_internal(theap!=NULL);
     if (theap != NULL) {
+      // NEXT PIN BUMP: upstream `1fb345674` / `f9a74121f` change `capacity` to
+      // `reserved` here (#128 A2). Not cherry-picked, because `pages_full_size` is
+      // write-only at this pin -- nothing reads it, so a wrong value has no release-build
+      // effect. It arrives with the bump; confirm it did and drop this comment then.
       const size_t size = page->capacity * mi_page_block_size(page);
       if (in_full) { theap->pages_full_size += size; }
               else { mi_assert_internal(size <= theap->pages_full_size); theap->pages_full_size -= size; }
@@ -9876,6 +9880,21 @@ static mi_page_t* mi_arenas_page_singleton_alloc(mi_theap_t* theap, size_t block
 
   mi_assert(page->reserved == 1);
   if (!_mi_page_init(theap, page)) {
+    // NEXT PIN BUMP: upstream `b0ac42ebc` replaces this raw `_mi_arenas_free` with
+    // `_mi_arenas_page_free` (#128 A1). Both sibling failure paths already use the
+    // latter; this one skips `_mi_page_map_unregister`, the arena pages-bitmap clear and
+    // the page-stat decrements, and passes the wrong pointer under
+    // MI_PAGE_META_IS_SEPARATED.
+    //
+    // Deliberately NOT cherry-picked: it is unreachable at this pin, so taking it early
+    // would only create merge friction when the pin moves. Verified rather than assumed
+    // -- mi_page_extend_free's commit-on-demand block (and the only `return false` on
+    // this path) is gated on `page->slice_committed > 0`, and singletons are allocated
+    // with commit=true just above, so slice_committed is 0 and _mi_page_init cannot fail
+    // here.
+    //
+    // When the pin moves: confirm this became `_mi_arenas_page_free`, and delete this
+    // comment. If a future change ever allows uncommitted singletons, it becomes live.
     _mi_arenas_free( _mi_theap_subproc(theap), page, mi_page_full_size(page), page->memid);
     return NULL;
   }

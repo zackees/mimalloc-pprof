@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 97c448e4 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2a9c2c34 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -20908,14 +20908,36 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   prof_auto_start();
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;
   if (prof_callback_depth > 0) return;
-  mi_lock_acquire(&prof_lock);
-  if (!mi_atomic_load_relaxed(&prof_enabled)) { mi_lock_release(&prof_lock); return; }
+
+  // The sampling DECISION is thread-local and is made without taking prof_lock.
+  //
+  // This used to acquire prof_lock first and decide afterwards, so every allocating
+  // thread serialized on one global lock on every allocation while profiling was
+  // enabled -- not just on the roughly 1-in-(rate) that actually sample. That is a
+  // process-wide bottleneck in exactly the configuration users turn on to diagnose a
+  // performance problem. Found by comparing against oven-sh/mimalloc's profiler (#78),
+  // whose countdown is likewise thread-local.
+  //
+  // Everything read or written below is per-theap: bytes_since_sample, next_threshold,
+  // generation, and the PRNG state prof_threshold() advances. prof_generation and
+  // prof_rate are written only under prof_lock in mi_prof_start_ex; reading a stale
+  // generation here merely delays a counter reset by one allocation, which is harmless.
+  //
+  // prof_rate IS load-bearing though: prof_threshold() computes `% (rate * 2)`, so a
+  // rate of 0 -- which is what a concurrent mi_prof_stop leaves behind -- would divide
+  // by zero. Under the old code the lock plus the re-check of prof_enabled made that
+  // unreachable. Now it has to be checked explicitly.
   mi_profiler_tld_t* tld = &theap->tld->profiler;
   if (tld->generation != prof_generation) { tld->bytes_since_sample = 0; tld->next_threshold = 0; tld->random = 0; tld->generation = prof_generation; }
+  if (prof_rate == 0) return;   // stopped concurrently; prof_threshold would divide by zero
   tld->bytes_since_sample += size;
   if (tld->next_threshold == 0) tld->next_threshold = prof_threshold(theap->tld);
-  if (tld->bytes_since_sample < tld->next_threshold) { mi_lock_release(&prof_lock); return; }
+  if mi_likely(tld->bytes_since_sample < tld->next_threshold) return;   // the common case: no lock taken at all
   tld->bytes_since_sample = 0; tld->next_threshold = prof_threshold(theap->tld);
+
+  // Only an actual sample touches the shared record/stack/page state.
+  mi_lock_acquire(&prof_lock);
+  if (!mi_atomic_load_relaxed(&prof_enabled)) { mi_lock_release(&prof_lock); return; }
   mi_prof_record_t* rec = prof_record_alloc();
   if (rec != NULL) {
     rec->stack = _mi_prof_stack_intern();

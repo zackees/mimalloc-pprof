@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 62f750b7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit b1c3f15d of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4689,6 +4689,32 @@ static inline bool mi_page_is_full(const mi_page_t* page) {
 }
 
 // is more than 7/8th of a page in use?
+//
+// #128 C2 (upstream `204d93b2`, "consider medium pages only mostly used if these are
+// fully used") proposes `frac = 0` unless block_size <= MI_SMALL_MAX_OBJ_SIZE, on the
+// reasoning that up to 12.5% of every medium/large page is otherwise stranded. #128
+// asked for a measurement rather than a patch. Measured, and DECLINED: no effect above
+// noise on this platform.
+//
+// Windows/MinGW, Release, both arms built from the same commit and run interleaved:
+//   test-memory-gate, min of 6:        stock 61.9 MB  vs patched 62.5 MB  (+0.97%),
+//                                      within-arm spread 13.1 MB (~21%)
+//   purpose-built abandoned-page probe, median of 5:
+//                                      stock 237.1 MB vs patched 236.5 MB (-0.25%),
+//                                      within-arm spread ~1%
+// Both differences are well inside the noise of their own arms.
+//
+// The second probe exists because the first could not have detected the effect. Of the
+// four call sites, only free.c's mi_abandoned_page_try_reabandon_to_mapped and
+// mi_abandoned_page_try_reclaim decide whether memory is recovered, and both run only
+// for ABANDONED pages -- a single-threaded workload reuses its own pages' free lists and
+// never reaches them. The second probe abandons partly-free medium pages from exiting
+// threads, which is the case this predicate actually governs.
+//
+// Scope of the claim: one platform, one allocator build, these two workloads. Upstream
+// shipped it on the v3.0.x consumer branch, presumably against a workload where it does
+// pay. It is a one-line change if a measured case ever appears here -- so re-open with
+// numbers, not with the reasoning, which is sound and still produced no effect.
 static inline bool mi_page_is_mostly_used(const mi_page_t* page) {
   if (page==NULL) return true;
   uint16_t frac = page->reserved / 8U;
@@ -17219,6 +17245,15 @@ static void* mi_os_prim_alloc_at(mi_subproc_t* subproc, void* hint_addr, size_t 
   mi_assert_internal(is_zero != NULL);
   mi_assert_internal(is_large != NULL);
   if (size == 0) return NULL;
+  // #128 C3 (upstream `aed99d3a`, THP MADV_HUGEPAGE gated on allow_large) is about this
+  // line and the hardcoded `false` in _mi_os_alloc. DECLINED, and it is the weakest item
+  // in that issue: the main path is already covered -- mi_arena_reserve passes the
+  // caller's allow_large through to mi_reserve_os_memory_ex2 -- so what remains is
+  // uncommitted reservations declining huge pages, which is defensible in itself (a
+  // huge page you have not committed is not obviously a win). The effect is Linux
+  // throughput only, with zero profiler or footprint impact, and we have no Linux
+  // throughput benchmark that would show it. Taking it would mean a divergence in os.c
+  // justified by reasoning alone, which is what rule #66 C.2 exists to prevent.
   if (!commit) { allow_large = false; }
   if (try_alignment == 0) { try_alignment = 1; } // avoid 0 to ensure there will be no divide by zero when aligning
 

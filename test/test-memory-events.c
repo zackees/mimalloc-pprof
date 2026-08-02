@@ -706,9 +706,19 @@ static int run_env_enabled_check(void) {
           (int)installed, (int)ctx.counts[MI_MEMORY_ALLOCATE], (int)ctx.counts[MI_MEMORY_FREE],
           (q != NULL ? "ok" : "NULL"));
   fflush(stderr);
-  if (q == NULL) { fprintf(stderr, "second alloc failed\n"); fflush(stderr); mi_free(p); return 4; }
-  if (ctx.counts[MI_MEMORY_ALLOCATE] != 1) { fprintf(stderr, "callback did not fire after lazy env activation\n"); fflush(stderr); mi_free(p); mi_free(q); return 5; }
+  if (q == NULL) { fprintf(stderr, "second alloc failed\n"); fflush(stderr); mi_memory_set_callbacks(NULL); mi_free(p); return 4; }
+  if (ctx.counts[MI_MEMORY_ALLOCATE] != 1) { fprintf(stderr, "callback did not fire after lazy env activation\n"); fflush(stderr); mi_memory_set_callbacks(NULL); mi_free(p); mi_free(q); return 5; }
 
+  /* MUST clear before returning: `ctx` is a stack local, and the callbacks registered
+     above hold its address. Leaving them installed means any allocation after this frame
+     dies -- CRT teardown, DLL_PROCESS_DETACH, atexit -- calls on_change with a dangling
+     pointer and writes through it.
+     This is the root cause of #69, and it is a defect in this test rather than in
+     mimalloc. Every other case here already does it; T7 even spells out why
+     ("ctx is about to go out of scope"). This one was missed, and only the MSVC DLL
+     build allocates during teardown often enough to notice: the process ran the whole
+     check successfully, returned 0 from main, and still exited non-zero. */
+  mi_memory_set_callbacks(NULL);
   mi_free(p);
   mi_free(q);
   return 0;

@@ -45,6 +45,15 @@ int main(void) {
     return 1;
   }
 
+  /* On Apple the comparison below MUST run. Without this, a missing or renamed
+     VM_MEMORY_APPLICATION_SPECIFIC_1 -- or the TARGET_OS_OSX guard above excluding the
+     include -- would silently skip the only check that verifies anything, and the test
+     would pass on macOS while testing nothing. This repository has shipped seven checks
+     that were quietly verifying nothing; make the skip a compile error instead. */
+#if defined(__APPLE__) && !defined(VM_MEMORY_APPLICATION_SPECIFIC_1)
+#error "VM_MEMORY_APPLICATION_SPECIFIC_1 is not visible on Apple: the os_tag check would be skipped, so this test would verify nothing."
+#endif
+
 #if defined(__APPLE__) && defined(VM_MEMORY_APPLICATION_SPECIFIC_1)
   printf("VM_MEMORY_APPLICATION_SPECIFIC_1 = %d\n", (int)VM_MEMORY_APPLICATION_SPECIFIC_1);
   if (tag != (long)VM_MEMORY_APPLICATION_SPECIFIC_1) {

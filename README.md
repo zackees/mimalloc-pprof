@@ -604,6 +604,32 @@ symbolization.
 
 ## Profiler reference
 
+### What it costs when it is not running
+
+Measured, so you can decide whether to ship `MI_PPROF=ON`. Windows/MinGW, Release,
+4M alloc/free pairs single-threaded, both arms built from the same commit and run
+interleaved, minimum of four runs of three reps each:
+
+| build | ns per allocation | within-arm spread |
+|---|---|---|
+| `MI_PPROF=OFF` | **11.75** | 4% |
+| `MI_PPROF=ON`, profiler stopped | **20.00** | 14% |
+
+**About +70% per allocation with the profiler switched off.** That is the cost of the
+unconditional `_mi_prof_on_alloc` call on the allocation fast path, which then checks an
+atomic flag and returns. Single-threaded on purpose — this is per-allocation instruction
+count, not lock contention (contention was a separate defect, fixed in #152).
+
+This is larger than it should be and is a known gap rather than a design choice. Bun's
+fork takes a different approach: it leaves the fast path completely untouched and, when
+profiling is switched on, poisons `pages_free_direct` so allocations divert into the
+already-cold `_mi_malloc_generic`, where the sampling check lives. That is strictly
+better when disabled, which is the common case for a shipping build. Tracked in #50.
+
+Until then: if allocation throughput matters more to you than being able to turn
+profiling on at runtime, build with `MI_PPROF=OFF`. Enabling the profiler at runtime
+costs more again, but the sampling decision itself is now lock-free (#152).
+
 ### Environment variables
 
 Set these before process launch to capture allocations made during startup,

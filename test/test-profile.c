@@ -747,6 +747,69 @@ static void test_empty_profile_is_valid(void) {
   mi_prof_stop();
 }
 
+/* ---- start/stop cycling ------------------------------------------------------------
+   Adapted from oven-sh/mimalloc's test-prof-adversarial.c `case_enable_cycle` (#50);
+   written against our API rather than copied.
+
+   This exercises the per-theap generation counter, which is how a theap notices that
+   the profiler was restarted and its carried-over byte counter and threshold are stale.
+   That check moved OUT of the global lock in #152, so this is now also the regression
+   test for that change: if the generation handling were wrong, a cycle would leave a
+   theap accumulating against a threshold from a previous run, and the sample counts
+   below would drift or the dump would stop being well-formed. */
+static void test_start_stop_cycles(void) {
+  for (int c = 0; c < 20; c++) {
+    if ((c % 2) == 0) {
+      assert(mi_prof_start_seeded(256, 900 + (unsigned)c));
+    }
+    for (int i = 0; i < 1000; i++) { void* p = mi_malloc(100); assert(p != NULL); mi_free(p); }
+    if ((c % 2) == 0) {
+      mi_prof_stop();
+    }
+  }
+
+  /* After all that cycling the profiler must still work normally. */
+  assert(mi_prof_start_seeded(256, 4242));
+  for (int i = 0; i < 4000; i++) { void* p = mi_malloc(100); assert(p != NULL); mi_free(p); }
+
+  mi_prof_stats_t_decl(st);
+  assert(mi_prof_stats_get(&st));
+  assert(st.accum_samples > 0);   /* sampling still happens after 10 start/stop rounds */
+
+  t12_buf_t out = { t12_proto_buf, 0, sizeof(t12_proto_buf) };
+  assert(mi_prof_dump_proto_writer(t12_write, &out));
+  assert(out.len > 0);            /* and the dump is still well-formed */
+  mi_prof_stop();
+}
+
+/* ---- page reuse after the profiler is stopped --------------------------------------
+   Adapted from `case_page_flag_reuse` (#50).
+
+   A sampled allocation sets page->has_metadata and hangs records off page->metadata.
+   If a page carrying that flag is returned to the arena and later handed out again
+   while the profiler is off, the stale flag would send frees down _mi_prof_on_free into
+   profiler state that is no longer initialized. mi_collect(true) between the phases is
+   what forces the pages back so they can be recycled. */
+static void test_page_reuse_after_stop(void) {
+  enum { N = 2048 };
+  static void* blocks[N];
+
+  assert(mi_prof_start_seeded(64, 77));   /* low rate: many pages get marked */
+  for (int i = 0; i < N; i++) { blocks[i] = mi_malloc(128); assert(blocks[i] != NULL); }
+  for (int i = 0; i < N; i++) { mi_free(blocks[i]); blocks[i] = NULL; }
+  mi_collect(true);                       /* force the pages back to the arena */
+  mi_prof_stop();
+
+  /* Same size class again, profiler off: any page recycled from above must behave. */
+  for (int i = 0; i < N; i++) { blocks[i] = mi_malloc(128); assert(blocks[i] != NULL); memset(blocks[i], 0x5A, 128); }
+  for (int i = 0; i < N; i++) { mi_free(blocks[i]); blocks[i] = NULL; }
+
+  /* And the profiler still starts cleanly afterwards. */
+  assert(mi_prof_start_seeded(4096, 78));
+  void* p = mi_malloc(128); assert(p != NULL); mi_free(p);
+  mi_prof_stop();
+}
+
 int main(void) {
   enum { count = 1000, size = 512 };
   void* blocks[count];
@@ -839,6 +902,8 @@ int main(void) {
   test_stats_v3_heap_stats();
   test_aligned_allocations_are_tracked();
   test_empty_profile_is_valid();
+  test_start_stop_cycles();
+  test_page_reuse_after_stop();
   if (getenv("MIMALLOC_PROF_DUMP_AT_EXIT") != NULL) {
     assert(mi_prof_start_seeded(1, 47));
     assert(mi_malloc(4096) != NULL);  /* Preserve one real sample for pprof validation. */

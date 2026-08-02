@@ -30,10 +30,16 @@ static void on_change(const mi_memory_change_t* change, void* arg) {
   ctx->last[change->kind] = *change;
 }
 
-static void evt_install(evt_ctx_t* ctx) {
+/* Returns whether registration succeeded. The result used to be swallowed by an
+   assert(), which is compiled out under NDEBUG -- so a failing mi_memory_set_callbacks
+   turned into "callbacks silently never installed" in exactly the Release builds where
+   #69 shows up. Callers that do not care may ignore the value. */
+static bool evt_install(evt_ctx_t* ctx) {
   mi_memory_callbacks_t cbs;
   for (int i = 0; i < MI_MEMORY_CHANGE_COUNT; i++) { cbs.handlers[i] = on_change; cbs.args[i] = ctx; }
-  assert(mi_memory_set_callbacks(&cbs));
+  const bool ok = mi_memory_set_callbacks(&cbs);
+  assert(ok);
+  return ok;
 }
 
 /* ---- T1: disabled by default -------------------------------------------------------------
@@ -694,10 +700,14 @@ static int run_env_enabled_check(void) {
   if (!mi_memory_tracking_is_enabled()) { fprintf(stderr, "tracking not enabled after lazy env read\n"); mi_free(p); return 3; }
 
   evt_ctx_t ctx; evt_ctx_reset(&ctx);
-  evt_install(&ctx);
+  const bool installed = evt_install(&ctx);
   void* q = mi_malloc(32);
-  if (q == NULL) { fprintf(stderr, "second alloc failed\n"); mi_free(p); return 4; }
-  if (ctx.counts[MI_MEMORY_ALLOCATE] != 1) { fprintf(stderr, "callback did not fire after lazy env activation\n"); mi_free(p); mi_free(q); return 5; }
+  fprintf(stderr, "[env-check] evt_install=%d  after second alloc: ALLOCATE=%d FREE=%d  q=%s\n",
+          (int)installed, (int)ctx.counts[MI_MEMORY_ALLOCATE], (int)ctx.counts[MI_MEMORY_FREE],
+          (q != NULL ? "ok" : "NULL"));
+  fflush(stderr);
+  if (q == NULL) { fprintf(stderr, "second alloc failed\n"); fflush(stderr); mi_free(p); return 4; }
+  if (ctx.counts[MI_MEMORY_ALLOCATE] != 1) { fprintf(stderr, "callback did not fire after lazy env activation\n"); fflush(stderr); mi_free(p); mi_free(q); return 5; }
 
   mi_free(p);
   mi_free(q);

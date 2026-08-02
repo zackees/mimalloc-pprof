@@ -299,6 +299,15 @@ static void* mi_os_prim_alloc_at(mi_subproc_t* subproc, void* hint_addr, size_t 
   mi_assert_internal(is_zero != NULL);
   mi_assert_internal(is_large != NULL);
   if (size == 0) return NULL;
+  // #128 C3 (upstream `aed99d3a`, THP MADV_HUGEPAGE gated on allow_large) is about this
+  // line and the hardcoded `false` in _mi_os_alloc. DECLINED, and it is the weakest item
+  // in that issue: the main path is already covered -- mi_arena_reserve passes the
+  // caller's allow_large through to mi_reserve_os_memory_ex2 -- so what remains is
+  // uncommitted reservations declining huge pages, which is defensible in itself (a
+  // huge page you have not committed is not obviously a win). The effect is Linux
+  // throughput only, with zero profiler or footprint impact, and we have no Linux
+  // throughput benchmark that would show it. Taking it would mean a divergence in os.c
+  // justified by reasoning alone, which is what rule #66 C.2 exists to prevent.
   if (!commit) { allow_large = false; }
   if (try_alignment == 0) { try_alignment = 1; } // avoid 0 to ensure there will be no divide by zero when aligning
 

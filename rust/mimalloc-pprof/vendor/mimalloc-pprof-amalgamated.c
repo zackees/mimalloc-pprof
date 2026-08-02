@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit a9c8c8b2 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4d7cecb5 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -325,6 +325,20 @@ typedef struct mi_heap_area_s {
   void*  reserved1;   // internal
 } mi_heap_area_t;
 
+// Do not extend this signature to carry per-block debug metadata.
+//
+// #128 D4 evaluated upstream's `dev-debug` branch (`120af372a`, `aa47541ee`), whose
+// block record is `block, size, usable_size, allocated_size, valid, source` and which
+// widens exactly this typedef to deliver it. DECLINED: this is a public exported type,
+// so changing it is an ABI break for every existing caller of mi_heap_visit_blocks --
+// including our own Rust crate. Its source info is also padding-resident, so it needs
+// MI_PADDING, is only accurate in debug builds, and inflates every block in the heap.
+//
+// The schema itself was worth reading and is retained where it belongs: our pprof output
+// already carries size and allocation site per sample without touching this API, because
+// the profiler samples at the allocation hook rather than reconstructing state by walking
+// the heap afterwards. `mi_heap_print_json` from that branch remains a reasonable
+// reference for output shape only. Background reading; no code to take.
 typedef bool (mi_cdecl mi_block_visit_fun)(const mi_heap_t* heap, const mi_heap_area_t* area, void* block, size_t block_size, void* arg);
 
 mi_decl_export bool   mi_heap_visit_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg);
@@ -6605,6 +6619,31 @@ void mi_free_aligned(void* p, size_t alignment) mi_attr_noexcept {
 // Check for double free in secure and debug mode
 // This is somewhat expensive so only enabled for secure mode 4
 // ------------------------------------------------------
+//
+// #128 D3 (upstream `971d4529a`, a per-block allocated/free bitmask plus poison-on-free)
+// was evaluated against this code and DECLINED. Its stated goal -- "assert at the
+// offending free instead of crashing later in an unrelated page" -- is what
+// mi_check_is_double_freex below already does: it walks the free, local-free and
+// thread-free lists and reports
+//
+//     "double free detected of block %p with size %zu"
+//
+// naming the offending block at the offending free. MI_CHECK_DOUBLE_FREE is enabled
+// whenever MI_DEBUG != 0 (see types.h), i.e. in every debug build.
+//
+// The other half of D3, poison-on-free, is also already live and now demonstrated:
+// mi_track_free_size poisons freed blocks for ASan, and the fuzz job's positive control
+// reports a genuine "AddressSanitizer: use-after-poison" on a freed mimalloc block
+// (#139). Guard pages cover the overflow case via MI_GUARDED, on by default in debug
+// builds since #132/#136.
+//
+// So D3 would add a third mechanism overlapping two working ones, at the cost of the
+// three blockers #128 already recorded: mi_assert_release uses reinterpret_cast (does
+// not compile as C), mi_page_block_mask()'s `block_size >= 1024` proxy for "at most 64
+// blocks" is wrong for a 512KiB medium page with 1024-byte blocks (block_index reaches
+// 511, so `1ULL << 511` is UB), and it changes mi_page_t layout.
+//
+// Re-open only with a concrete failure that all three existing detectors miss.
 
 #if MI_CHECK_DOUBLE_FREE
 // linear check if the free list contains a specific element

@@ -1091,6 +1091,18 @@ if (MI_BUILD_TESTS)
   endif()
   add_test(NAME test-rezalloc-slack COMMAND mimalloc-test-rezalloc-slack)
 
+  # mi_process_info's current_rss must be RSS, not committed bytes (issue #78).
+  add_executable(mimalloc-test-process-rss test/test-process-rss.c)
+  target_compile_definitions(mimalloc-test-process-rss PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-process-rss PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-process-rss PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-process-rss PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-process-rss PRIVATE mimalloc ${mi_libraries})
+  endif()
+  add_test(NAME test-process-rss COMMAND mimalloc-test-process-rss)
+
   # dynamic override test
   if(MI_BUILD_SHARED AND NOT (MI_TRACK_ASAN OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN)) # AND NOT (APPLE AND MI_USE_CXX))
     add_executable(mimalloc-test-stress-dynamic test/test-stress.c)

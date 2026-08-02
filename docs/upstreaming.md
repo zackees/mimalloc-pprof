@@ -118,6 +118,41 @@ These branches are cut from upstream history, so they can be pushed to a fork of
 Lead with the measurements and the stock-upstream control results; they are what make
 the reports self-contained.
 
+## Upstream adoption status (verified 2026-08-02)
+
+Checked against `upstream/main`, `upstream/dev` and `upstream/dev3` directly rather
+than from memory. Two of the three fixes this document proposes are **already upstream**;
+one is filed; and one new defect was found in the process.
+
+**v2 thread-exit (FLS) — ADOPTED, with attribution.** `upstream/main` and `upstream/dev`
+both carry it at `src/prim/windows/prim.c:764`:
+
+```c
+#if defined(__GNUC__) && !defined(_MSC_VER)  /* mingw */
+  #define MI_WIN_INIT_USE_FLS  1  /* needed for v1/v2, see <https://github.com/zackees/mimalloc-pprof/pull/48> */
+```
+
+So the "report the v2 fix upstream" task is complete — it was adopted before we got
+round to filing it. No PR needed; do not re-send it.
+
+**v3 thread-exit — adopted, then broken by a typo.** `60c4f031` took it and credits
+[#56](https://github.com/zackees/mimalloc-pprof/issues/56), but guards on `__GCC__`,
+which no compiler defines. Filed as
+[microsoft/mimalloc#1349](https://github.com/microsoft/mimalloc/pull/1349) with a 44×
+thread-churn measurement.
+
+**The `__GCC__` typo is NOT dev3-only.** It is also present on `upstream/main` and
+`upstream/dev` at lines ~879 and ~976, in the `MI_WIN_INIT_USE_*` blocks. On the v2 line
+the practical impact is smaller — MinGW now takes the FLS path above, so those branches
+are not reached — but they are still dead code that would silently do nothing for anyone
+who forces `MI_WIN_INIT_USE_CRT_TLS`, and the same one-token fix applies. Worth folding
+into #1349's discussion rather than opening a second PR, since it is the same defect and
+the same reviewer.
+
+**MinGW CI job — still not proposed.** Upstream has no MinGW coverage, which is the root
+cause of all of the above: nobody there builds the configuration in which these break.
+That remains the highest-leverage thing we could contribute, and it is unfiled.
+
 ## Posture on upstream PR #1266 (competing profiler)
 
 Resolves #128 F2. Re-check the dates below before cutting a `pr/*` branch that touches

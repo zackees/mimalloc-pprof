@@ -89,6 +89,23 @@ typedef struct sample_s {
   size_t   profiler_arena;  /* our own arena, so the confound is visible */
 } sample_t;
 
+/* Both branches below resolve to an OS-reported counter, which is what makes this gate
+   immune to #128 F3(b).
+   F3(b) is upstream #1271's observation that src/arena.c erases genuinely-committed bits
+   while merely counting them (it setN's to learn how many were already set, then clearN's
+   the lot) and decrements subproc->stats.committed accordingly -- so mimalloc's own
+   committed stat under-reports. #128 flagged this gate as exposed because it is
+   "commit-based" on Windows. It is not:
+     - Windows: _mi_prim_process_info overwrites current/peak_commit with
+       PROCESS_MEMORY_COUNTERS.PagefileUsage / PeakPagefileUsage from psapi.
+     - Linux/macOS: this returns peak_rss, which the unix prim fills from
+       ru_maxrss / task_basic_info.resident_size.
+   mi_process_info only falls back to subproc->stats.committed when a platform's prim
+   leaves the field alone, and no platform we gate on does. #67's zero-tracking is
+   likewise unaffected: it keys off arena->slices_dirty, a different bitmap from the
+   slices_committed that F3(b) corrupts.
+   If a future port gates on mi_stats_print's committed line, or on current_commit on a
+   Unix platform, re-open F3(b) -- that path IS affected. */
 static const char* gated_metric(void) {
 #ifdef _WIN32
   return "peak_commit";     /* working set is trimmed under pressure; commit is not */

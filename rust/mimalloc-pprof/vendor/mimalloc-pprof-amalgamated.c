@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit e3e944f5 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4e492e9e of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -22801,9 +22801,28 @@ void _mi_theap_decref(mi_theap_t* theap) {
 // i.e. a thread exiting while another thread calls mi_heap_delete / mi_heap_destroy on a
 // heap that exiting thread has theaps for.
 //
-// The `theap->freed` exchange just below does NOT prevent this. It serializes callers
-// racing on the SAME theap; the cycle needs two DIFFERENT theaps that share a tld and a
-// heap, and neither caller takes the `freed != 0` early return in that case.
+// The `theap->freed` exchange just below DOES defeat the two-party version of this, and
+// an earlier revision of this comment got that wrong. Worked through properly:
+//
+//   A thread in mi_thread_theaps_done holds tld_X and waits on heap_Y, for theap(X,Y).
+//   A thread in mi_heap_free_theaps   holds heap_Y and waits on tld_Z, for theap(Z,Y).
+//
+// A 2-cycle needs the second to wait on tld_X, i.e. Z == X -- so both are freeing
+// theap(X,Y), the SAME theap, and one of them gets `freed != 0`, returns false, and
+// releases. There is exactly one theap per (tld, heap) pair, so "two different theaps
+// sharing a tld and a heap" -- what this comment previously claimed -- cannot exist.
+//
+// A 4-cycle is not prevented, and needs four distinct theaps:
+//
+//   T1 holds tld_X,  waits heap_Y   freeing theap(X,Y)
+//   T2 holds heap_Y, waits tld_Z    freeing theap(Z,Y)     Z != X
+//   T3 holds tld_Z,  waits heap_W   freeing theap(Z,W)     W != Y
+//   T4 holds heap_W, waits tld_X    freeing theap(X,W)
+//
+// All four are distinct, so no `freed` early return fires anywhere in the cycle. It
+// requires two threads exiting concurrently with two heaps being deleted, where both
+// threads hold theaps on both heaps -- considerably narrower than the two-party story,
+// and a reason the ordering has survived this long.
 //
 // Both callers already have the retry machinery this wants -- each comments "We do this
 // in a loop where we release the theaps_lock at every potential re-iteration to unblock"
@@ -22819,9 +22838,11 @@ void _mi_theap_decref(mi_theap_t* theap) {
 // corruption still could not be produced. A deadlock fix that is subtly wrong is worse
 // than a deadlock that may be unreachable.
 //
-// To re-open: build a stress case that exits threads while concurrently deleting heaps
-// those threads hold theaps for, with more than one theap per (tld, heap) pair, and get
-// it to hang. Then apply the try-acquire form above.
+// To re-open: build a stress case matching the 4-cycle above -- at least TWO threads
+// exiting concurrently with at least TWO heaps being deleted, where both threads hold
+// theaps on both heaps -- and get it to hang under a timeout. Then apply the try-acquire
+// form above. Note the earlier "more than one theap per (tld, heap) pair" phrasing was a
+// consequence of the same mistake and describes something that cannot happen.
 bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acquire_tld_theaps_lock) {
   mi_assert(theap != NULL);
   if (theap==NULL) return true;

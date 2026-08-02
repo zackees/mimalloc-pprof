@@ -128,6 +128,25 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
   // `mi_free` in `_mi_thread_locals_thread_done`, which finds the owning page itself.
   mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_heap_rezalloc(mi_heap_main(), tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
   if mi_unlikely(tls==NULL) return NULL;
+  // imported from oven-sh/mimalloc @ d078ad06 (src/threadlocal.c), MIT -- see #78.
+  //
+  // The new slots are NOT guaranteed zero, despite `rezalloc`. `_mi_theap_realloc_zero`
+  // starts its zero-fill from the block's OLD USABLE size, not from the size that was
+  // originally requested -- it cannot do better, since the requested size is not tracked
+  // in release builds. So the slack between the old requested size and the old bin size
+  // is copied across verbatim, and that slack was never initialized: it holds whatever
+  // the previous tenant of that page left behind.
+  //
+  // Confirmed on our own tree, deterministically: mi_malloc(40) yields usable 48, and
+  // after mi_rezalloc(p,112) the eight bytes [40,48) still read 0xAA. See
+  // test/test-rezalloc-slack.c.
+  //
+  // That matters here because `_mi_thread_local_get` validates a slot ONLY by comparing
+  // its `version` lane against the key's version, and versions are small sequential
+  // counters. A garbage lane that happens to equal a live key's version makes the
+  // adjacent garbage lane get returned as a cached `mi_theap_t*` -- i.e. application
+  // bytes dereferenced as a theap. Zero the new range explicitly.
+  _mi_memzero(&tls->slots[count_old], (count - count_old)*sizeof(mi_tls_slot_t));
   tls->count = count;
   mi_thread_locals_set(tls);
   return tls;

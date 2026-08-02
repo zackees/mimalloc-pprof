@@ -1078,6 +1078,19 @@ if (MI_BUILD_TESTS)
   endif()
   add_test(NAME test-tls-slots-heap COMMAND mimalloc-test-tls-slots-heap)
 
+  # mi_rezalloc zero-fill boundary (issue #78): pins the behaviour that makes the
+  # explicit slot zeroing in src/threadlocal.c necessary.
+  add_executable(mimalloc-test-rezalloc-slack test/test-rezalloc-slack.c)
+  target_compile_definitions(mimalloc-test-rezalloc-slack PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-rezalloc-slack PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-rezalloc-slack PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-rezalloc-slack PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-rezalloc-slack PRIVATE mimalloc ${mi_libraries})
+  endif()
+  add_test(NAME test-rezalloc-slack COMMAND mimalloc-test-rezalloc-slack)
+
   # dynamic override test
   if(MI_BUILD_SHARED AND NOT (MI_TRACK_ASAN OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN)) # AND NOT (APPLE AND MI_USE_CXX))
     add_executable(mimalloc-test-stress-dynamic test/test-stress.c)

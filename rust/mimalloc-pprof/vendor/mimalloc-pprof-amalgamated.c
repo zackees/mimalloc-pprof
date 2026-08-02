@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit e8b709e6 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 93aadc4a of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -25444,6 +25444,47 @@ void _mi_prim_process_info(mi_process_info_t* pinfo)
       pinfo->current_rss = (size_t)info.resident_size;
     }
     #endif
+  #elif defined(__linux__)
+    // Read the resident set size from /proc/self/statm (issue #78).
+    //
+    // Without this, `current_rss` is never assigned on Linux and keeps the default
+    // mi_process_info() gives it -- which is `current_commit`, mimalloc's own committed
+    // counter. So `mi_process_info`, `mi_stats_print` and the `rss_current` field of
+    // `mi_stats_as_json` all reported COMMITTED bytes while calling them RSS. For a fork
+    // whose purpose is memory profiling that is the worst kind of wrong: plausible,
+    // stable, and off by however much of the heap is untouched.
+    //
+    // statm field 2 is `resident`, in pages. Parsed by hand rather than with scanf
+    // because this can run from inside the allocator: no allocation, no locale, no
+    // stdio. Failure leaves `current_rss` alone, so the old behaviour remains the
+    // fallback rather than reporting zero.
+    //
+    // Approach from oven-sh/mimalloc @ 6aedf5e1, MIT (see #78); parser written here.
+    {
+      const int fd = mi_prim_open("/proc/self/statm", O_RDONLY);
+      if (fd >= 0) {
+        char buf[64];
+        const ssize_t n = mi_prim_read(fd, buf, sizeof(buf) - 1);
+        mi_prim_close(fd);
+        if (n > 0) {
+          buf[n] = 0;
+          const char* p = buf;
+          while (*p == ' ') p++;
+          while (*p >= '0' && *p <= '9') p++;   // field 1: total program size
+          while (*p == ' ') p++;
+          size_t resident_pages = 0;
+          bool any = false;
+          while (*p >= '0' && *p <= '9') {      // field 2: resident set size, in pages
+            resident_pages = (resident_pages * 10) + (size_t)(*p - '0');
+            any = true;
+            p++;
+          }
+          if (any) {
+            pinfo->current_rss = resident_pages * (size_t)sysconf(_SC_PAGESIZE);
+          }
+        }
+      }
+    }
   #endif
   // use defaults for commit
 }
@@ -27074,6 +27115,47 @@ void _mi_prim_process_info(mi_process_info_t* pinfo)
       pinfo->current_rss = (size_t)info.resident_size;
     }
     #endif
+  #elif defined(__linux__)
+    // Read the resident set size from /proc/self/statm (issue #78).
+    //
+    // Without this, `current_rss` is never assigned on Linux and keeps the default
+    // mi_process_info() gives it -- which is `current_commit`, mimalloc's own committed
+    // counter. So `mi_process_info`, `mi_stats_print` and the `rss_current` field of
+    // `mi_stats_as_json` all reported COMMITTED bytes while calling them RSS. For a fork
+    // whose purpose is memory profiling that is the worst kind of wrong: plausible,
+    // stable, and off by however much of the heap is untouched.
+    //
+    // statm field 2 is `resident`, in pages. Parsed by hand rather than with scanf
+    // because this can run from inside the allocator: no allocation, no locale, no
+    // stdio. Failure leaves `current_rss` alone, so the old behaviour remains the
+    // fallback rather than reporting zero.
+    //
+    // Approach from oven-sh/mimalloc @ 6aedf5e1, MIT (see #78); parser written here.
+    {
+      const int fd = mi_prim_open("/proc/self/statm", O_RDONLY);
+      if (fd >= 0) {
+        char buf[64];
+        const ssize_t n = mi_prim_read(fd, buf, sizeof(buf) - 1);
+        mi_prim_close(fd);
+        if (n > 0) {
+          buf[n] = 0;
+          const char* p = buf;
+          while (*p == ' ') p++;
+          while (*p >= '0' && *p <= '9') p++;   // field 1: total program size
+          while (*p == ' ') p++;
+          size_t resident_pages = 0;
+          bool any = false;
+          while (*p >= '0' && *p <= '9') {      // field 2: resident set size, in pages
+            resident_pages = (resident_pages * 10) + (size_t)(*p - '0');
+            any = true;
+            p++;
+          }
+          if (any) {
+            pinfo->current_rss = resident_pages * (size_t)sysconf(_SC_PAGESIZE);
+          }
+        }
+      }
+    }
   #endif
   // use defaults for commit
 }

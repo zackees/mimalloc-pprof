@@ -810,6 +810,92 @@ static void test_page_reuse_after_stop(void) {
   mi_prof_stop();
 }
 
+
+/* ---- sample rate 1: every eligible allocation is sampled --------------------------
+   Adapted from oven-sh/mimalloc's test-prof-adversarial.c `case_rate1_hammer` (#50).
+
+   prof_threshold() returns a value uniform in [1, 2*rate), so at rate 1 it is always 1
+   and every allocation crosses the threshold. That is the maximum-pressure path through
+   record allocation, stack interning and the page->metadata chain, and it is the
+   configuration most likely to exhaust the profiler's own arena budget -- which must
+   degrade by counting dropped samples, not by corrupting anything or failing. */
+static void test_sample_rate_one(void) {
+  enum { N = 500 };
+  static void* blocks[N];
+
+  assert(mi_prof_start_seeded(1, 313));
+  for (int i = 0; i < N; i++) { blocks[i] = mi_malloc(64); assert(blocks[i] != NULL); }
+
+  mi_prof_stats_t_decl(live);
+  assert(mi_prof_stats_get(&live));
+  /* Every allocation either produced a record or was counted as dropped; nothing may
+     vanish silently. Bounded above by N because at rate 1 each allocation samples once. */
+  assert(live.live_samples > 0);
+  assert(live.live_samples <= (size_t)N);
+
+  for (int i = 0; i < N; i++) { mi_free(blocks[i]); blocks[i] = NULL; }
+
+  mi_prof_stats_t_decl(freed);
+  assert(mi_prof_stats_get(&freed));
+  assert(freed.live_samples == 0 && freed.live_bytes == 0);   /* all records reclaimed */
+
+  /* And the dump is still well-formed after that much churn. */
+  t12_buf_t out = { t12_proto_buf, 0, sizeof(t12_proto_buf) };
+  assert(mi_prof_dump_proto_writer(t12_write, &out));
+  assert(out.len > 0);
+  mi_prof_stop();
+}
+
+/* ---- cross-thread free of sampled blocks -------------------------------------------
+   Adapted from `case_cross_thread_free` (#50).
+
+   Sample records hang off page->metadata and are reclaimed by _mi_prof_on_free. A block
+   freed by a thread that does not own its page takes the remote path instead, and the
+   record is only reclaimed later, when the deferred free list is collected
+   (_mi_prof_on_free_collect). If that path were missed, live_samples would never return
+   to zero and the profiler would over-report live memory indefinitely -- which is the
+   headline number of a heap profile. */
+static void* xthread_blocks[300];
+
+#ifdef _WIN32
+static DWORD WINAPI xthread_freer(LPVOID arg) {
+  (void)arg;
+  for (int i = 0; i < 300; i++) { mi_free(xthread_blocks[i]); xthread_blocks[i] = NULL; }
+  return 0;
+}
+static void xthread_run(void) {
+  HANDLE h = CreateThread(NULL, 0, xthread_freer, NULL, 0, NULL);
+  assert(h != NULL); WaitForSingleObject(h, INFINITE); CloseHandle(h);
+}
+#else
+static void* xthread_freer(void* arg) {
+  (void)arg;
+  for (int i = 0; i < 300; i++) { mi_free(xthread_blocks[i]); xthread_blocks[i] = NULL; }
+  return NULL;
+}
+static void xthread_run(void) {
+  pthread_t t; assert(pthread_create(&t, NULL, xthread_freer, NULL) == 0);
+  assert(pthread_join(t, NULL) == 0);
+}
+#endif
+
+static void test_cross_thread_free_of_sampled(void) {
+  assert(mi_prof_start_seeded(64, 314));   /* low rate: most of these get sampled */
+  for (int i = 0; i < 300; i++) { xthread_blocks[i] = mi_malloc(256); assert(xthread_blocks[i] != NULL); }
+
+  mi_prof_stats_t_decl(live);
+  assert(mi_prof_stats_get(&live));
+  assert(live.live_samples > 0);           /* confirm we are actually testing something */
+
+  xthread_run();                            /* every block freed from another thread */
+  mi_collect(true);                         /* drain the deferred cross-thread frees */
+
+  mi_prof_stats_t_decl(after);
+  assert(mi_prof_stats_get(&after));
+  assert(after.live_samples == 0 && after.live_bytes == 0);
+  mi_prof_stop();
+}
+
 int main(void) {
   enum { count = 1000, size = 512 };
   void* blocks[count];
@@ -904,6 +990,8 @@ int main(void) {
   test_empty_profile_is_valid();
   test_start_stop_cycles();
   test_page_reuse_after_stop();
+  test_sample_rate_one();
+  test_cross_thread_free_of_sampled();
   if (getenv("MIMALLOC_PROF_DUMP_AT_EXIT") != NULL) {
     assert(mi_prof_start_seeded(1, 47));
     assert(mi_malloc(4096) != NULL);  /* Preserve one real sample for pprof validation. */

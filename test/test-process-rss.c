@@ -71,16 +71,16 @@ int main(void) {
     return 1;
   }
 
-  /* And RSS should be the smaller of the two here, since most of the commit was never
-     faulted in. A little slack for allocator metadata and whatever else is resident. */
-  if (rss > commit) {
-    fprintf(stderr,
-            "FAIL: current_rss (%zu) exceeds current_commit (%zu) with most of the\n"
-            "committed memory deliberately untouched.\n", rss, commit);
-    return 1;
-  }
-
-  printf("ok: rss is %.1f%% of commit, as expected for mostly-untouched memory\n",
+  /* Deliberately NO assertion that rss < commit.
+     `commit` counts only what MIMALLOC committed; `rss` is the whole process, including
+     the binary, stacks, libc, and any sanitizer's shadow memory. Under AddressSanitizer
+     the shadow and redzones push RSS above mimalloc's own commit counter as a matter of
+     course -- the asan job measured rss=321 MiB against commit=285 MiB. An earlier
+     version of this test asserted rss <= commit and failed there, contradicting the
+     comment at the top of this file about RSS depending on "what else the process has
+     faulted in". The only thing actually guaranteed is that the two are not the SAME
+     number, which is what the check above tests. */
+  printf("ok: rss and commit differ (rss is %.1f%% of commit)\n",
          100.0 * (double)rss / (double)commit);
 
   for (int i = 0; i < BLOCKS; i++) mi_free(keep[i]);

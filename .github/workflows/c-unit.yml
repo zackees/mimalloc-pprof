@@ -118,11 +118,20 @@ jobs:
   # bug -- MIMALLOC_MEMORY_EVENTS env activation fails in an MSVC DLL build, tracked in
   # issue #69 -- and adding it red, or with continue-on-error, is how a gate becomes
   # decoration. It goes in with the fix. win-gnu shared runs below and is green.
+  # windows-latest (MSVC) is in this matrix as a DIAGNOSTIC for #69 -- it is expected to
+  # fail on test-memory-events-env-enabled until that issue is fixed. It is here rather
+  # than deferred because #69's hypothesis (env resolution racing DLL init) was never
+  # confirmed: "I do not have MSVC locally and could not reproduce it outside CI ... Do
+  # not fix it on my say-so -- confirm first." CI *is* the MSVC machine. This job plus
+  # the [env-check] lines in test-memory-events.c are the confirmation step.
+  # It must not stay red: either it goes green with the fix, or windows-latest comes back
+  # out of this matrix. Do NOT add continue-on-error -- see the note below on why a
+  # permanently-yellow job is worse than an absent one.
   ctest-shared:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

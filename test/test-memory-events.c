@@ -672,9 +672,25 @@ static int run_env_enabled_check(void) {
     return 1;
   }
   /* Nothing must have touched the allocator yet in this fresh process; the very first
-     allocation hook below is what triggers the lazy env resolution. */
+     allocation hook below is what triggers the lazy env resolution.
+
+     That assumption is exactly what is in question on an MSVC DLL build (#69), where
+     allocations happen during DLL_PROCESS_ATTACH and CRT init, before main. So dump the
+     inputs before drawing any conclusion: a bare "tracking not enabled" cannot tell
+     "the option never saw the environment" from "the option saw it but the once had
+     already cached disabled". */
+  fprintf(stderr, "[env-check] getenv(MIMALLOC_MEMORY_EVENTS)=\"%s\"  option_is_enabled(before first alloc)=%d  tracking_is_enabled(before)=%d\n",
+          getenv("MIMALLOC_MEMORY_EVENTS"),
+          (int)mi_option_is_enabled(mi_option_memory_events),
+          (int)mi_memory_tracking_is_enabled());
+  fflush(stderr);
+
   void* p = mi_malloc(64);
   if (p == NULL) { fprintf(stderr, "alloc failed\n"); return 2; }
+  fprintf(stderr, "[env-check] after first alloc: option_is_enabled=%d  tracking_is_enabled=%d\n",
+          (int)mi_option_is_enabled(mi_option_memory_events),
+          (int)mi_memory_tracking_is_enabled());
+  fflush(stderr);
   if (!mi_memory_tracking_is_enabled()) { fprintf(stderr, "tracking not enabled after lazy env read\n"); mi_free(p); return 3; }
 
   evt_ctx_t ctx; evt_ctx_reset(&ctx);

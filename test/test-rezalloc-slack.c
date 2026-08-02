@@ -62,7 +62,16 @@ int main(void) {
     return 0;
   }
 
-  memset(p, 0xAA, usable);          /* stand in for a previous tenant's bytes */
+  /* Stand in for a previous tenant's bytes. Deliberately a volatile byte loop and NOT
+     memset: mi_malloc carries mi_attr_alloc_size(1), so with _FORTIFY_SOURCE glibc's
+     fortified memset sees an object of `requested` bytes and aborts with
+     "*** buffer overflow detected ***" -- which is exactly what happened on the first
+     CI run. Writing up to mi_usable_size is legal for mimalloc; the compiler just has
+     no way to know that. */
+  {
+    volatile unsigned char* vp = p;
+    for (size_t i = 0; i < usable; i++) vp[i] = 0xAA;
+  }
 
   const size_t newsize = usable + 64;
   unsigned char* q = (unsigned char*)mi_rezalloc(p, newsize);

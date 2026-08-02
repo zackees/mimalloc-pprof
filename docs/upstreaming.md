@@ -118,6 +118,64 @@ These branches are cut from upstream history, so they can be pushed to a fork of
 Lead with the measurements and the stock-upstream control results; they are what make
 the reports self-contained.
 
+## Posture on upstream PR #1266 (competing profiler)
+
+Resolves #128 F2. Re-check the dates below before cutting a `pr/*` branch that touches
+profiler files; everything else here is stable.
+
+**What it is.** [microsoft/mimalloc#1266](https://github.com/microsoft/mimalloc/pull/1266),
+*"feat: enable memory profiling"* by Daniel Schwartz-Narbonne (Datadog), opened
+2026-04-16. It adds `include/mimalloc/profile.h`, `src/profile.c`, and
+`test/test-profile.c` — **our exact three filenames** — plus alloc/free hooks and
+sampled records hung off `page->metadata` behind a page flag. Our technique, arrived at
+independently.
+
+**Status: never triaged, not rejected.** #128 asked whether it was stalled, rejected, or
+awaiting revision. It is none of those:
+
+- The only comment on the PR itself is the CLA bot. Zero review comments.
+- On the parent issue [#1070](https://github.com/microsoft/mimalloc/issues/1070) the
+  author asked daanx directly twice — 2026-04-21 (*"ready for review"*) and 2026-05-11
+  (*"is the approach ... one you'd be interested in exploring?"*). Neither was answered.
+- daanx's last word on profiling anywhere in that thread is **2025-06-14**.
+
+So there is no upstream decision to react to, and no evidence of one coming soon. Do not
+plan around #1266 landing.
+
+**The collision is smaller than it looks.** #1266 targets `dev-main` and modifies
+`src/segment.c`, which does not exist on v3. It cannot merge to the v3 line as written.
+Our `pr/*` branches are cut from `dev3`. A file-level collision only materialises if
+upstream merges it on v2 *and* someone ports it forward.
+
+**Two constraints worth honouring anyway**, because they are what upstream and the
+requesters actually said:
+
+1. *daanx, 2025-06-14:* there is already tracing support via `mimalloc-track.h`
+   (valgrind/asan) and Windows perf counters — *"If we add USDT it would be good if we
+   could reuse the same mechanism? Or at least impact the code as little as possible."*
+   Our hooks are `#if MI_PPROF`-guarded and a few lines per site (repo rule 6). **Lead
+   with the diff size**, not the feature list.
+2. *brancz, 2025-06-15:* the ask is sampling **inside** the allocator every X bytes, so
+   the profiler need not unwind on every allocation. That is exactly what we do, and it
+   is the requirement neither USDT draft satisfies.
+
+**Decision: differentiate, do not coordinate.** Three approaches now exist — #1266
+(in-process callbacks, v2), lucab's USDT probes
+([lucab/mimalloc#1](https://github.com/lucab/mimalloc/pull/1), explicitly abandoned by
+its author on 2026-04-23), and ours. Ours is the only one that is v3-native, sampled
+in-allocator, and works on Windows — and #110 established Windows as the real
+differentiator, since every alternative here is Linux/eBPF-shaped. Upstreaming stays
+focused on the **bug fixes** above, which are uncontested and reviewable on their own.
+Profiler upstreaming is a separate, later conversation.
+
+**Do not rename our files defensively.** Renaming to dodge a collision that may never
+happen costs us the fork's own history and every issue reference. If #1266 ever lands on
+a line we target, rename then.
+
+We are already visible in the thread: zackees posted the fork on #1070 on 2026-07-29.
+The convergence itself is the signal worth remembering — Datadog, Bun, and this fork
+independently reached `page->metadata` plus a flag.
+
 ## Local reproduction
 
 ```sh

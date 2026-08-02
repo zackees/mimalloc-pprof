@@ -1103,6 +1103,18 @@ if (MI_BUILD_TESTS)
   endif()
   add_test(NAME test-process-rss COMMAND mimalloc-test-process-rss)
 
+  # macOS VM tag must be application-specific (issue #78).
+  add_executable(mimalloc-test-os-tag test/test-os-tag.c)
+  target_compile_definitions(mimalloc-test-os-tag PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-os-tag PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-os-tag PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-os-tag PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-os-tag PRIVATE mimalloc ${mi_libraries})
+  endif()
+  add_test(NAME test-os-tag COMMAND mimalloc-test-os-tag)
+
   # dynamic override test
   if(MI_BUILD_SHARED AND NOT (MI_TRACK_ASAN OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN)) # AND NOT (APPLE AND MI_USE_CXX))
     add_executable(mimalloc-test-stress-dynamic test/test-stress.c)

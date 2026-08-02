@@ -149,9 +149,34 @@ who forces `MI_WIN_INIT_USE_CRT_TLS`, and the same one-token fix applies. Worth 
 into #1349's discussion rather than opening a second PR, since it is the same defect and
 the same reviewer.
 
-**MinGW CI job — still not proposed.** Upstream has no MinGW coverage, which is the root
-cause of all of the above: nobody there builds the configuration in which these break.
-That remains the highest-leverage thing we could contribute, and it is unfiled.
+**MinGW CI job — still not proposed, and now known to be urgent.** Upstream has no MinGW
+coverage, which is the root cause of all of the above: nobody there builds the
+configuration in which these break.
+
+Measured what such a job would actually report, by building `upstream/dev3` tip
+(`1f06f694`) unmodified with MinGW-w64 GCC 12.2, `-DCMAKE_BUILD_TYPE=Debug
+-DMI_DEBUG_FULL=ON` — the same configuration upstream's own `test.yaml` runs for its
+`basic` matrix entry:
+
+```
+67% tests passed, 2 tests failed out of 6
+
+The following tests FAILED:
+   3 - test-stress-heaps     (Exit code 0xc0000409)
+   4 - test-stress-subprocs  (Exit code 0xc0000409)
+```
+
+Configure and build are clean; the failures are at runtime. `0xc0000409` is Windows
+fail-fast (`STATUS_STACK_BUFFER_OVERRUN`), i.e. a hard abort rather than an assertion.
+
+This matters for how the CI proposal is framed. A MinGW job added to upstream today
+would be **red on arrival**, so it cannot be pitched as "add coverage for completeness" —
+it has to go in together with, or after, the fixes. It is also independent corroboration
+that the `mi_heap_new` / `mi_subproc_new` bootstrap fix above is still needed upstream:
+those are exactly the two tests it addresses, and they are exactly the two that fail.
+
+Order to propose in: bootstrap fix first, then the MinGW job, so the job lands green.
+Not yet filed.
 
 ## Posture on upstream PR #1266 (competing profiler)
 

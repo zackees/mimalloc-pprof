@@ -630,6 +630,33 @@ Until then: if allocation throughput matters more to you than being able to turn
 profiling on at runtime, build with `MI_PPROF=OFF`. Enabling the profiler at runtime
 costs more again, but the sampling decision itself is now lock-free (#152).
 
+### If your process contains more than one mimalloc
+
+Some libraries statically embed mimalloc (NVIDIA's drivers are the usual example), so a
+process can end up with our build *and* a stock one, each with its own options table.
+We evaluated namespacing our additions — `MIMALLOC_PPROF_*` instead of `MIMALLOC_PROF_*`
+— and **decided against it**, because it does not address the actual hazard.
+
+**Our additions are already inert to a stock mimalloc.** `mi_option_init` looks options up
+**by name** (`_mi_getenv("mimalloc_" + option_name)`); nothing enumerates the environment.
+A stock build never asks for `mimalloc_prof_sample_rate` or `mimalloc_memory_events`, so
+it does not see them, does not warn, and does not misbehave. Renaming them would prevent
+a collision that cannot occur.
+
+**The real collision is on upstream's own option names**, and it is inherited rather than
+introduced by us. `MIMALLOC_VERBOSE`, `MIMALLOC_SHOW_STATS`, `MIMALLOC_PURGE_DELAY` and
+friends are read by *every* mimalloc in the process, so setting one to debug our allocator
+also reconfigures the embedded one. Renaming *our* options does nothing about that — and
+we cannot rename upstream's without ceasing to be a drop-in replacement.
+
+So: no namespacing. It would break every 0.9.x user's configuration to solve a problem
+that does not exist, while leaving the one that does.
+
+**What to do if it bites you.** There is no per-instance environment scoping in mimalloc.
+Configure our instance through the API instead — `mi_prof_start_ex`, `mi_option_set` — and
+leave the environment alone; API calls affect only the instance you call them on. If you
+need the environment for startup-time capture, be aware it is process-wide.
+
 ### Environment variables
 
 Set these before process launch to capture allocations made during startup,

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 93aadc4a of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 97c448e4 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -19817,6 +19817,38 @@ static bool mi_page_map_set_range(mi_page_t* page, size_t idx, size_t sub_idx, s
   return true;
 }
 
+// NOTE (#78): the `+ (page_start - slice_start)/SLICE` term below is an over-count in
+// THIS variant, and upstream `oven-sh/mimalloc@0e150b5c` removes it. We have not taken
+// that fix; here is the reasoning, so nobody has to re-derive it.
+//
+// The two variants of this function use different index bases:
+//   - MI_PAGE_MAP_FLAT (above) returns `_mi_page_map_index(page)`, indexed from the
+//     SLICE START, so the correction term is correct there.
+//   - this one returns `_mi_page_map_index(page_start, ...)`, indexed from PAGE_START,
+//     so adding the same term counts that distance twice.
+// The term is nonzero only for os_align pages (block_alignment > 64 KiB), where it is
+// exactly 1. Confirmed by instrumentation: `mi_malloc_aligned(1024, 1<<20)` gives
+// corr=1, registered=2, while the body spans 1 slice.
+//
+// So registration covers slices [1, 2+ceil(bs/S)) where the page's own reservation is
+// [0, 1+ceil(bs/S)) -- one slice past its own end, and `_mi_page_map_unregister` uses
+// this same helper, so it would zero that slice's entry too.
+//
+// Why it is not fixed here: the corruption is NOT reproducible in our configuration.
+// 512 interleaved os_align/ordinary allocation pairs, freed aligned-first, under
+// MI_DEBUG_FULL, came back clean -- no content anomalies, no bad usable_size, no crash.
+// The reason appears structural: an os_align page is served by an OS allocation that
+// over-allocates for alignment (2 MiB+ for the case above), so the extra slice lands in
+// that allocation's own trailing slack, where nothing else is mapped.
+//
+// Repo rule #66 C.2 is to import only with a test that fails without the import, and
+// there is no such test. Taking a one-line change to a hot page-map path on arithmetic
+// alone is exactly what that rule prevents. The defect is real and worth reporting
+// upstream (it is still present at dev3 tip `1f06f694`); it is not, on the evidence
+// available, exploitable here.
+//
+// Re-open with a repro that actually corrupts -- most likely on a platform or path
+// where the os_align allocation has NO trailing slack.
 static size_t mi_page_map_get_idx(mi_page_t* page, size_t* sub_idx, size_t* slice_count) {
   size_t page_size;
   uint8_t* page_start = mi_page_area(page, &page_size);

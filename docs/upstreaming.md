@@ -176,7 +176,15 @@ that the `mi_heap_new` / `mi_subproc_new` bootstrap fix above is still needed up
 those are exactly the two tests it addresses, and they are exactly the two that fail.
 
 Order to propose in: bootstrap fix first, then the MinGW job, so the job lands green.
-Not yet filed.
+
+**Bootstrap fix: FILED as [microsoft/mimalloc#1351](https://github.com/microsoft/mimalloc/pull/1351)**
+(2026-08-02), cut from `upstream/dev3` tip. Two `mi_thread_init()` calls, in
+`mi_heap_new_in_arena` and `mi_subproc_new`. Verified on that tree in upstream's own
+`basic` configuration: **2/6 failing before, 6/6 after**. The PR also flags #1349 and
+offers the MinGW job as a follow-up, explicitly noting it would be red today and so
+should land after the fixes.
+
+**MinGW CI job: still unfiled**, and now correctly sequenced behind #1351.
 
 ## Posture on upstream PR #1266 (competing profiler)
 

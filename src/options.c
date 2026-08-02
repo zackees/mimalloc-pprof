@@ -263,6 +263,22 @@ mi_decl_export void mi_options_print(void) mi_attr_noexcept {
   mi_options_print_out(NULL, NULL);
 }
 
+// #128 F3(c): upstream #1271 notes that option descriptors are read and written without
+// synchronization -- desc->value here versus the store in mi_option_set -- which is
+// formally a data race, and daanx left it as-is. Our profiler reads options from
+// allocation hooks, so #128 asked whether that raises the stakes for us.
+//
+// DECIDED: no change. `value` is a naturally-aligned long; every platform we build for
+// (x86-64, arm64, MSVC/GCC/Clang) makes such loads and stores single-instruction and
+// non-tearing, so the reachable outcome is reading a stale-but-valid value, never a torn
+// one. Options are set at startup or by a deliberate API call, and every consumer here
+// tolerates a one-call-late value.
+//
+// The fix would mean converting the descriptor table to atomics -- a wide divergence in a
+// file we keep nearly upstream-identical (repo rule 6), to remove UB that is formal
+// rather than reachable. Not worth it. Revisit if we ever add an option whose value must
+// change atomically mid-run, or if a sanitizer build starts reporting it: TSan would flag
+// this legitimately, and MI_DEBUG_TSAN exists.
 long _mi_option_get_fast(mi_option_t option) {
   mi_assert(option >= 0 && option < _mi_option_last);
   mi_option_desc_t* desc = &mi_options[option];

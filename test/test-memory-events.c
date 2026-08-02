@@ -621,6 +621,71 @@ static void test_visit_live_allocations(void) {
    EINVAL). Not done: mixing the families the other direction (mi_free on an unwrapped
    pointer) -- header explicitly documents that as forbidden/UB-adjacent territory beyond
    the one safe, diagnostic-only direction exercised here. */
+/* ---- T11: free from a thread that never allocated ------------------------------------
+   Settles #128 F3(a). Upstream issue #1271 records that mimalloc's own per-heap stats
+   charge the free to the *freeing* theap while _mi_page_malloc charged the *allocating*
+   one -- and that the decrement is dropped entirely when the freeing thread has no theap
+   at all. daanx marks that as-intended for mimalloc's stats.
+
+   #128 asks whether memory-events inherits it, and notes the answer was unverified. It
+   does not, and this test is why rather than a reading of the code: memevt_live_bytes is
+   a process-global atomic, and _mi_memevt_on_free derives the size from the *page*
+   (mi_page_usable_block_size) rather than from any theap. No theap is consulted, so a
+   theap-less freeing thread decrements exactly like any other.
+
+   Were the decrement theap-dependent, the accounting below would stay elevated after the
+   foreign thread frees everything, and this fails. */
+#define T11_BLOCKS 128
+static void* t11_blocks[T11_BLOCKS];
+
+static void t11_free_all(void) {
+  for (int i = 0; i < T11_BLOCKS; i++) { mi_free(t11_blocks[i]); t11_blocks[i] = NULL; }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI t11_thread(LPVOID arg) { (void)arg; t11_free_all(); return 0; }
+static void t11_run_freer(void) {
+  HANDLE th = CreateThread(NULL, 0, t11_thread, NULL, 0, NULL);
+  assert(th != NULL);
+  WaitForSingleObject(th, INFINITE);
+  CloseHandle(th);
+}
+#else
+static void* t11_thread(void* arg) { (void)arg; t11_free_all(); return NULL; }
+static void t11_run_freer(void) {
+  pthread_t th;
+  assert(pthread_create(&th, NULL, t11_thread, NULL) == 0);
+  assert(pthread_join(th, NULL) == 0);
+}
+#endif
+
+static void test_free_from_foreign_thread(void) {
+  assert(mi_memory_tracking_is_enabled());
+
+  mi_memory_snapshot_t_decl(before);
+  assert(mi_memory_snapshot(&before));
+
+  for (int i = 0; i < T11_BLOCKS; i++) {
+    t11_blocks[i] = mi_malloc(512);
+    assert(t11_blocks[i] != NULL);
+  }
+
+  mi_memory_snapshot_t_decl(mid);
+  assert(mi_memory_snapshot(&mid));
+  assert(mid.live_bytes > before.live_bytes);   /* the allocations were counted at all */
+  assert(mid.live_count == before.live_count + T11_BLOCKS);
+
+  /* The freeing thread's first mi_* call is the free itself, so it has no theap of its
+     own when the decrement happens -- the exact condition F3(a) is about. */
+  t11_run_freer();
+  mi_collect(true);   /* drain delayed cross-thread frees before reading counters */
+
+  mi_memory_snapshot_t_decl(after);
+  assert(mi_memory_snapshot(&after));
+  assert(after.live_bytes == before.live_bytes);
+  assert(after.live_count == before.live_count);
+}
+
 static void test_unwrapped_family(void) {
   assert(mi_memory_tracking_is_enabled());
   evt_ctx_t ctx; evt_ctx_reset(&ctx);
@@ -738,6 +803,7 @@ int main(int argc, char** argv) {
   test_snapshot_accuracy();
   test_disable_reenable_partial();
   test_visit_live_allocations();
+  test_free_from_foreign_thread();
   test_unwrapped_family();
 
   puts("memory-events tests passed");

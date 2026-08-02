@@ -324,6 +324,40 @@ void _mi_theap_decref(mi_theap_t* theap) {
 
 
 // called from `mi_theap_delete` to free the internal theap resources.
+// KNOWN ISSUE (#78): the two `mi_lock_maybe` acquisitions below are BLOCKING, and the
+// two callers take them in opposite orders. That is an AB-BA cycle:
+//
+//   mi_thread_theaps_done (init.c)  holds tld->theaps_lock,
+//                                   calls _mi_theap_free(theap, true, false)
+//                                   -> blocks on heap->theaps_lock
+//   mi_heap_free_theaps   (heap.c)  holds heap->theaps_lock,
+//                                   calls _mi_theap_free(theap, false, true)
+//                                   -> blocks on tld->theaps_lock
+//
+// i.e. a thread exiting while another thread calls mi_heap_delete / mi_heap_destroy on a
+// heap that exiting thread has theaps for.
+//
+// The `theap->freed` exchange just below does NOT prevent this. It serializes callers
+// racing on the SAME theap; the cycle needs two DIFFERENT theaps that share a tld and a
+// heap, and neither caller takes the `freed != 0` early return in that case.
+//
+// Both callers already have the retry machinery this wants -- each comments "We do this
+// in a loop where we release the theaps_lock at every potential re-iteration to unblock"
+// and each re-loops when this function returns false. So the fix is to make these two
+// acquisitions non-blocking (`mi_lock_try_acquire`, available at atomic.h:424/451) and,
+// on failure, release whatever was taken, restore `theap->freed` to 0, and return false
+// so the existing outer loop retries. That is what oven-sh/mimalloc does.
+//
+// NOT changed here, deliberately. The cycle is derived by reading the two call sites; it
+// has no reproduction. Rewriting lock acquisition in the thread-exit path on analysis
+// alone is exactly the trade this fork got right on the page-map os_align defect (see
+// src/page-map.c), where the same style of reasoning was sound and the predicted
+// corruption still could not be produced. A deadlock fix that is subtly wrong is worse
+// than a deadlock that may be unreachable.
+//
+// To re-open: build a stress case that exits threads while concurrently deleting heaps
+// those threads hold theaps for, with more than one theap per (tld, heap) pair, and get
+// it to hang. Then apply the try-acquire form above.
 bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acquire_tld_theaps_lock) {
   mi_assert(theap != NULL);
   if (theap==NULL) return true;

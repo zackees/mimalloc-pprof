@@ -103,10 +103,56 @@ jobs:
       - run: cmake -B build -DMI_PPROF=OFF && cmake --build build && ctest --test-dir build --output-on-failure
 
   ctest-debug-full:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON && cmake --build build --config Debug && ctest --test-dir build -C Debug --output-on-failure
+
+  ctest-debug-full-win-gnu:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+      - run: cmake -B build -G Ninja -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+
+  diagnostic-gates:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cmake -B build -DMI_DEBUG_FULL=ON && cmake --build build && ctest --test-dir build --output-on-failure
+      - name: Internal-state inventory and positive controls
+        run: |
+          python3 ci/check_internal_state.py
+          python3 ci/check_internal_state.py --selftest
+      - name: Release diagnostic/layout/data firewall and positive control
+        run: python3 ci/check_release_equivalence.py --selftest
+      - name: Diagnostic source and symbols are absent from release libraries
+        run: |
+          set -euo pipefail
+          for pprof in ON OFF; do
+            build="build-release-${pprof,,}"
+            cmake -S . -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DMI_DEBUG=OFF -DMI_PPROF="$pprof" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+            if grep -q 'diagnostic.c' "$build/compile_commands.json"; then
+              echo "::error::diagnostic.c entered the MI_DEBUG=0 $pprof build"
+              exit 1
+            fi
+            cmake --build "$build" --target mimalloc-static
+            if nm -a "$build"/libmimalloc*.a | grep -q -e '_mi_.*diagnostic' -e '_mi_lock_debug'; then
+              echo "::error::diagnostic symbols entered the MI_DEBUG=0 $pprof library"
+              exit 1
+            fi
+          done
 
   # Shared-library build (issue #62). Our src/static.c amalgamation compiles
   # everything as one TU, which hides link errors that only appear when the library

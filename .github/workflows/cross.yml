@@ -211,7 +211,7 @@ jobs:
         shell: pwsh
         run: |
           $metadata = Join-Path $PWD 'bins.jsonl'
-          soldr cargo test --no-run --target x86_64-pc-windows-gnu --release --message-format=json | Tee-Object -FilePath $metadata
+          soldr --no-cache cargo test --no-run --target x86_64-pc-windows-gnu --release --message-format=json | Tee-Object -FilePath $metadata
           if ($LASTEXITCODE -ne 0) { throw 'Soldr test build failed' }
           $bins = Get-Content $metadata | ForEach-Object {
             try { $_ | ConvertFrom-Json } catch { $null }

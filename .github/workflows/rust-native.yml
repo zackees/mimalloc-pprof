@@ -57,4 +57,4 @@ jobs:
         run: |
           $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
           $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "x86_64-w64-mingw32-gcc"
-          soldr cargo test --locked --target x86_64-pc-windows-gnu
+          soldr --no-cache cargo test --locked --target x86_64-pc-windows-gnu

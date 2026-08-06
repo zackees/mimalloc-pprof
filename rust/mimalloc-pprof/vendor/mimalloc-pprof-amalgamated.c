@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 56e8f2de of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 84a5884e of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -1901,28 +1901,68 @@ typedef _Atomic(uintptr_t) mi_atomic_guard_t;
 #define mi_lock(lock)                  for(bool _mi_go = (mi_lock_acquire(lock),true); _mi_go; (mi_lock_release(lock), _mi_go=false) )
 #define mi_lock_maybe(lock,acquire)    for(bool _mi_go = (acquire ? (mi_lock_acquire(lock),true) : true); _mi_go; _mi_go = (acquire ? (mi_lock_release(lock),false) : false) )
 
+#if MI_DEBUG > 2
+#define MI_LOCK_DEBUG_FIELD         _Atomic(uintptr_t) debug_owner;
+#define MI_LOCK_DEBUG_INITIALIZER   , MI_ATOMIC_VAR_INIT(0)
+void _mi_lock_debug_before_acquire(const void* lock, const _Atomic(uintptr_t)* owner,
+                                   const char* file, unsigned line, const char* func);
+void _mi_lock_debug_after_acquire(const void* lock, _Atomic(uintptr_t)* owner,
+                                  const char* file, unsigned line, const char* func);
+void _mi_lock_debug_before_release(const void* lock, _Atomic(uintptr_t)* owner,
+                                   const char* file, unsigned line, const char* func);
+void _mi_lock_debug_init(_Atomic(uintptr_t)* owner);
+void _mi_lock_debug_done(const void* lock, const _Atomic(uintptr_t)* owner,
+                         const char* file, unsigned line, const char* func);
+#else
+#define MI_LOCK_DEBUG_FIELD
+#define MI_LOCK_DEBUG_INITIALIZER
+#endif
+
 
 #if defined(_WIN32)
 
 typedef struct mi_lock_s {
   SRWLOCK mutex;    // slim reader-writer lock
+  MI_LOCK_DEBUG_FIELD
 } mi_lock_t;
 
-#define MI_LOCK_INITIALIZER   { SRWLOCK_INIT }
+#define MI_LOCK_INITIALIZER   { SRWLOCK_INIT MI_LOCK_DEBUG_INITIALIZER }
 
 static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  const bool acquired = TryAcquireSRWLockExclusive(&lock->mutex);
+  if (acquired) { _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__); }
+  return acquired;
+  #else
   return TryAcquireSRWLockExclusive(&lock->mutex);
+  #endif
 }
 static inline void mi_lock_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   AcquireSRWLockExclusive(&lock->mutex);
+  #if MI_DEBUG > 2
+  _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
 }
 static inline void mi_lock_release(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_release(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   ReleaseSRWLockExclusive(&lock->mutex);
 }
 static inline void mi_lock_init(mi_lock_t* lock) {
   InitializeSRWLock(&lock->mutex);
+  #if MI_DEBUG > 2
+  _mi_lock_debug_init(&lock->debug_owner);
+  #endif
 }
 static inline void mi_lock_done(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_done(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   (void)(lock);
 }
 
@@ -1933,20 +1973,37 @@ void _mi_error_message(int err, const char* fmt, ...);
 
 typedef struct mi_lock_s {
   pthread_mutex_t mutex;
+  MI_LOCK_DEBUG_FIELD
 } mi_lock_t;
 
-#define MI_LOCK_INITIALIZER { PTHREAD_MUTEX_INITIALIZER }
+#define MI_LOCK_INITIALIZER { PTHREAD_MUTEX_INITIALIZER MI_LOCK_DEBUG_INITIALIZER }
 
 static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  const bool acquired = (pthread_mutex_trylock(&lock->mutex) == 0);
+  if (acquired) { _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__); }
+  return acquired;
+  #else
   return (pthread_mutex_trylock(&lock->mutex) == 0);
+  #endif
 }
 static inline void mi_lock_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   const int err = pthread_mutex_lock(&lock->mutex);
   if (err != 0) {
     _mi_error_message(err, "internal error: lock cannot be acquired (err %i)\n", err);
   }
+  #if MI_DEBUG > 2
+  _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
 }
 static inline void mi_lock_release(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_release(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   pthread_mutex_unlock(&lock->mutex);
 }
 static inline void mi_lock_init(mi_lock_t* lock) {
@@ -1954,8 +2011,14 @@ static inline void mi_lock_init(mi_lock_t* lock) {
   // use this instead of pthread_mutex_init since that can cause allocation on some platforms (and recursively initialize)
   const pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
   memcpy(&lock->mutex,&mutex,sizeof(mutex));
+  #if MI_DEBUG > 2
+  _mi_lock_debug_init(&lock->debug_owner);
+  #endif
 }
 static inline void mi_lock_done(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_done(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   pthread_mutex_destroy(&lock->mutex);
 }
 
@@ -1967,23 +2030,50 @@ static inline void mi_lock_done(mi_lock_t* lock) {
 
 typedef struct mi_lock_s {
   std::mutex mutex;
+  MI_LOCK_DEBUG_FIELD
 } mi_lock_t;
 
+#if MI_DEBUG > 2
+#define MI_LOCK_INITIALIZER   { {}, MI_ATOMIC_VAR_INIT(0) }
+#else
 #define MI_LOCK_INITIALIZER   { }
+#endif
 
 static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  const bool acquired = lock->mutex.try_lock();
+  if (acquired) { _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__); }
+  return acquired;
+  #else
   return lock->mutex.try_lock();
+  #endif
 }
 static inline void mi_lock_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   lock->mutex.lock();
+  #if MI_DEBUG > 2
+  _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
 }
 static inline void mi_lock_release(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_release(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   lock->mutex.unlock();
 }
 static inline void mi_lock_init(mi_lock_t* lock) {
   new(&lock->mutex) std::mutex();  // in-place constructor
+  #if MI_DEBUG > 2
+  _mi_lock_debug_init(&lock->debug_owner);
+  #endif
 }
 static inline void mi_lock_done(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_done(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   lock->mutex.~mutex(); // in-place destructor
 }
 
@@ -2000,29 +2090,60 @@ void _mi_prim_thread_yield(void);
 
 typedef struct mi_lock_s {
   _Atomic(uintptr_t) mutex;
+  MI_LOCK_DEBUG_FIELD
 } mi_lock_t;
 
-#define MI_LOCK_INITIALIZER  { MI_ATOMIC_VAR_INIT(0) }
+#define MI_LOCK_INITIALIZER  { MI_ATOMIC_VAR_INIT(0) MI_LOCK_DEBUG_INITIALIZER }
 
 static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  uintptr_t expected = 0;
+  const bool acquired = mi_atomic_cas_strong_acq_rel(&lock->mutex, &expected, (uintptr_t)1);
+  if (acquired) { _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__); }
+  return acquired;
+  #else
   uintptr_t expected = 0;
   return mi_atomic_cas_strong_acq_rel(&lock->mutex, &expected, (uintptr_t)1);
+  #endif
 }
 static inline void mi_lock_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   size_t ticks = 0;
   for (int i = 0; i < 10000; i++) {  // for at most 10000 tries?
+    #if MI_DEBUG > 2
+    uintptr_t expected = 0;
+    if (mi_atomic_cas_strong_acq_rel(&lock->mutex, &expected, (uintptr_t)1)) {
+      _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+      return;
+    }
+    #else
     if (mi_lock_try_acquire(lock)) return;
+    #endif
     _mi_prim_thread_yield();
   }
   _mi_error_message(EFAULT, "internal error: lock cannot be acquired (due to lack of native lock primitives)\n");
 }
 static inline void mi_lock_release(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_release(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   mi_atomic_store_release(&lock->mutex, (uintptr_t)0);
 }
 static inline void mi_lock_init(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  mi_atomic_store_release(&lock->mutex, (uintptr_t)0);
+  _mi_lock_debug_init(&lock->debug_owner);
+  #else
   mi_lock_release(lock);
+  #endif
 }
 static inline void mi_lock_done(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_done(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   (void)(lock);
 }
 
@@ -4207,8 +4328,22 @@ mi_decl_noreturn mi_decl_cold void _mi_assert_fail(const char* assertion, const 
 
 #if (MI_DEBUG>2)
 #define mi_assert_expensive   mi_assert
+
+// Debug-only diagnostics for internal state whose lifetime or initialization
+// cannot be expressed as a local assertion at the allocation site.
+void _mi_diagnostic_check_tls_owner(const void* p);
+void _mi_diagnostic_check_zero(const void* p, size_t size, const char* reason);
 #else
 #define mi_assert_expensive(x)
+#endif
+
+// Test-only controls. These are compiled only into the dedicated diagnostic
+// control executable and are absent from every shipped library configuration.
+#if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
+void _mi_test_tls_control_set(int mode);
+int  _mi_test_tls_control_mode(void);
+bool _mi_test_tls_control_fail_growth(size_t old_count);
+bool _mi_test_tls_force_expand(size_t least_idx);
 #endif
 
 
@@ -13773,6 +13908,148 @@ bool mi_bbitmap_try_find_and_clearN_(mi_bbitmap_t* bbitmap, size_t tseq, size_t 
 
 
 /* ---- end inlined: src/bitmap.c ---- */
+#if MI_DEBUG > 2
+/* ---- begin inlined: src/diagnostic.c ---- */
+/* ----------------------------------------------------------------------------
+Copyright (c) 2026 Microsoft Research, Daan Leijen
+This is free software; you can redistribute it and/or modify it under the
+terms of the MIT license. A copy of the license can be found in the file
+"LICENSE" at the root of this distribution.
+-----------------------------------------------------------------------------*/
+
+/* MI_DEBUG_FULL-only internal diagnostics (issue #167).
+
+   This file must never allocate: lock diagnostics run during allocator bootstrap,
+   teardown, and failure paths where calling a hooked allocator would recurse. */
+
+
+#if MI_DEBUG > 2
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
+static char* mi_diag_append(char* out, const char* end, const char* text) {
+  while (out < end && *text != 0) { *out++ = *text++; }
+  return out;
+}
+
+static char* mi_diag_append_uint(char* out, const char* end, uintptr_t value) {
+  char digits[3*sizeof(uintptr_t)];
+  size_t count = 0;
+  do {
+    digits[count++] = (char)('0' + (value % 10));
+    value /= 10;
+  } while (value != 0 && count < sizeof(digits));
+  while (out < end && count > 0) { *out++ = digits[--count]; }
+  return out;
+}
+
+static void mi_lock_debug_fail(const char* reason, const void* lock,
+                               const char* file, unsigned line, const char* func) {
+  char message[512] = { 0 };
+  char* out = message;
+  const char* const end = message + sizeof(message) - 1;
+  out = mi_diag_append(out, end, "mimalloc: ");
+  out = mi_diag_append(out, end, reason);
+  out = mi_diag_append(out, end, " lock=");
+  out = mi_diag_append_uint(out, end, (uintptr_t)lock);
+  out = mi_diag_append(out, end, " at ");
+  out = mi_diag_append(out, end, file);
+  out = mi_diag_append(out, end, ":");
+  out = mi_diag_append_uint(out, end, (uintptr_t)line);
+  out = mi_diag_append(out, end, " (");
+  out = mi_diag_append(out, end, func);
+  out = mi_diag_append(out, end, ")\n");
+  *out = 0;
+  _mi_prim_out_stderr(message);
+  /* Do not run allocator teardown from a corrupted state, and do not spend
+     seconds writing a core file in a timeout-bounded diagnostic test. */
+  _exit(134);
+}
+
+void _mi_diagnostic_check_tls_owner(const void* p) {
+  mi_page_t* const page = _mi_ptr_page(p);
+  if (page == NULL || !_mi_is_heap_main(mi_page_heap(page))) {
+    mi_lock_debug_fail("internal_tls_storage_not_main_owned", p,
+                       __FILE__, __LINE__, __func__);
+  }
+}
+
+void _mi_diagnostic_check_zero(const void* p, size_t size, const char* reason) {
+  const uint8_t* const bytes = (const uint8_t*)p;
+  for (size_t i = 0; i < size; i++) {
+    if (bytes[i] != 0) {
+      mi_lock_debug_fail(reason, p, __FILE__, __LINE__, __func__);
+    }
+  }
+}
+
+#if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
+static _Atomic(int) mi_test_tls_control = MI_ATOMIC_VAR_INIT(0);
+
+void _mi_test_tls_control_set(int mode) {
+  mi_atomic_store_relaxed(&mi_test_tls_control, mode);
+}
+
+int _mi_test_tls_control_mode(void) {
+  return mi_atomic_load_relaxed(&mi_test_tls_control);
+}
+
+bool _mi_test_tls_control_fail_growth(size_t old_count) {
+  if (old_count == 0 || mi_atomic_load_relaxed(&mi_test_tls_control) != 3) {
+    return false;
+  }
+  return (mi_atomic_exchange_relaxed(&mi_test_tls_control, 0) == 3);
+}
+#endif
+
+static uintptr_t mi_lock_debug_thread(void) {
+  /* Mimalloc reserves the low two thread-id bits. Set one so zero remains the
+     unowned sentinel even on a platform whose primitive can return zero. */
+  return ((uintptr_t)_mi_thread_id() | (uintptr_t)1);
+}
+
+void _mi_lock_debug_before_acquire(const void* lock, const _Atomic(uintptr_t)* owner,
+                                   const char* file, unsigned line, const char* func) {
+  const uintptr_t current = mi_lock_debug_thread();
+  if (mi_atomic_load_relaxed(owner) == current) {
+    mi_lock_debug_fail("reentrant_internal_lock_acquisition", lock, file, line, func);
+  }
+}
+
+void _mi_lock_debug_after_acquire(const void* lock, _Atomic(uintptr_t)* owner,
+                                  const char* file, unsigned line, const char* func) {
+  if (mi_atomic_load_relaxed(owner) != 0) {
+    mi_lock_debug_fail("internal_lock_owner_not_cleared", lock, file, line, func);
+  }
+  mi_atomic_store_relaxed(owner, mi_lock_debug_thread());
+}
+
+void _mi_lock_debug_before_release(const void* lock, _Atomic(uintptr_t)* owner,
+                                   const char* file, unsigned line, const char* func) {
+  if (mi_atomic_load_relaxed(owner) != mi_lock_debug_thread()) {
+    mi_lock_debug_fail("internal_lock_release_by_non_owner", lock, file, line, func);
+  }
+  mi_atomic_store_relaxed(owner, (uintptr_t)0);
+}
+
+void _mi_lock_debug_init(_Atomic(uintptr_t)* owner) {
+  mi_atomic_store_relaxed(owner, (uintptr_t)0);
+}
+
+void _mi_lock_debug_done(const void* lock, const _Atomic(uintptr_t)* owner,
+                         const char* file, unsigned line, const char* func) {
+  if (mi_atomic_load_relaxed(owner) != 0) {
+    mi_lock_debug_fail("destroying_owned_internal_lock", lock, file, line, func);
+  }
+}
+
+#endif /* MI_DEBUG > 2 */
+/* ---- end inlined: src/diagnostic.c ---- */
+#endif
 /* ---- begin inlined: src/heap.c ---- */
 /*----------------------------------------------------------------------------
 Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
@@ -23297,6 +23574,9 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
     count = least_idx + 1;
   }
   if (count > MI_TLS_IDX_MAX) { return NULL; }  // too large
+#if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
+  if (_mi_test_tls_control_fail_growth(count_old)) { return NULL; }
+#endif
   // Allocate from the main heap explicitly, never from the calling thread's default.
   // Plain `mi_rezalloc` uses whatever heap the application last passed to
   // `mi_theap_set_default`, so a later `mi_heap_destroy` on that heap frees this array
@@ -23305,8 +23585,17 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
   // check and lookups then just return NULL. See test/test-tls-slots-heap.c (#128 B3).
   // The main heap cannot be destroyed through any public API. Freeing stays plain
   // `mi_free` in `_mi_thread_locals_thread_done`, which finds the owning page itself.
+#if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
+  mi_heap_t* const storage_heap = (_mi_test_tls_control_mode() == 1
+    ? _mi_theap_heap(mi_theap_get_default()) : mi_heap_main());
+  mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_heap_rezalloc(storage_heap, tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
+#else
   mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_heap_rezalloc(mi_heap_main(), tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
+#endif
   if mi_unlikely(tls==NULL) return NULL;
+#if MI_DEBUG > 2
+  _mi_diagnostic_check_tls_owner(tls);
+#endif
   // imported from oven-sh/mimalloc @ d078ad06 (src/threadlocal.c), MIT -- see #78.
   //
   // The new slots are NOT guaranteed zero, despite `rezalloc`. `_mi_theap_realloc_zero`
@@ -23325,11 +23614,34 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
   // counters. A garbage lane that happens to equal a live key's version makes the
   // adjacent garbage lane get returned as a cached `mi_theap_t*` -- i.e. application
   // bytes dereferenced as a theap. Zero the new range explicitly.
+#if (MI_DEBUG > 2) || (defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0))
+  const size_t new_size = (count - count_old)*sizeof(mi_tls_slot_t);
+  #if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
+  if (_mi_test_tls_control_mode() == 2) {
+    memset(&tls->slots[count_old], 0xA5, new_size);
+  }
+  else
+  #endif
+  {
+    _mi_memzero(&tls->slots[count_old], new_size);
+  }
+  #if MI_DEBUG > 2
+  _mi_diagnostic_check_zero(&tls->slots[count_old], new_size,
+                            "internal_tls_new_slots_not_zero");
+  #endif
+#else
   _mi_memzero(&tls->slots[count_old], (count - count_old)*sizeof(mi_tls_slot_t));
+#endif
   tls->count = count;
   mi_thread_locals_set(tls);
   return tls;
 }
+
+#if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
+bool _mi_test_tls_force_expand(size_t least_idx) {
+  return (mi_thread_locals_expand(least_idx) != NULL);
+}
+#endif
 
 static mi_decl_noinline bool mi_thread_local_set_expand( mi_thread_local_t key, void* val ) {
   if (val==NULL) return true;
@@ -23510,7 +23822,6 @@ void _mi_thread_local_free(mi_thread_local_t key) {
     }
   }
 }
-
 /* ---- end inlined: src/threadlocal.c ---- */
 /* ---- begin inlined: src/prim/prim.c ---- */
 /* ----------------------------------------------------------------------------

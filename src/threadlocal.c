@@ -118,6 +118,9 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
     count = least_idx + 1;
   }
   if (count > MI_TLS_IDX_MAX) { return NULL; }  // too large
+#if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
+  if (_mi_test_tls_control_fail_growth(count_old)) { return NULL; }
+#endif
   // Allocate from the main heap explicitly, never from the calling thread's default.
   // Plain `mi_rezalloc` uses whatever heap the application last passed to
   // `mi_theap_set_default`, so a later `mi_heap_destroy` on that heap frees this array
@@ -126,8 +129,17 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
   // check and lookups then just return NULL. See test/test-tls-slots-heap.c (#128 B3).
   // The main heap cannot be destroyed through any public API. Freeing stays plain
   // `mi_free` in `_mi_thread_locals_thread_done`, which finds the owning page itself.
+#if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
+  mi_heap_t* const storage_heap = (_mi_test_tls_control_mode() == 1
+    ? _mi_theap_heap(mi_theap_get_default()) : mi_heap_main());
+  mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_heap_rezalloc(storage_heap, tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
+#else
   mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_heap_rezalloc(mi_heap_main(), tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
+#endif
   if mi_unlikely(tls==NULL) return NULL;
+#if MI_DEBUG > 2
+  _mi_diagnostic_check_tls_owner(tls);
+#endif
   // imported from oven-sh/mimalloc @ d078ad06 (src/threadlocal.c), MIT -- see #78.
   //
   // The new slots are NOT guaranteed zero, despite `rezalloc`. `_mi_theap_realloc_zero`
@@ -146,11 +158,34 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
   // counters. A garbage lane that happens to equal a live key's version makes the
   // adjacent garbage lane get returned as a cached `mi_theap_t*` -- i.e. application
   // bytes dereferenced as a theap. Zero the new range explicitly.
+#if (MI_DEBUG > 2) || (defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0))
+  const size_t new_size = (count - count_old)*sizeof(mi_tls_slot_t);
+  #if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
+  if (_mi_test_tls_control_mode() == 2) {
+    memset(&tls->slots[count_old], 0xA5, new_size);
+  }
+  else
+  #endif
+  {
+    _mi_memzero(&tls->slots[count_old], new_size);
+  }
+  #if MI_DEBUG > 2
+  _mi_diagnostic_check_zero(&tls->slots[count_old], new_size,
+                            "internal_tls_new_slots_not_zero");
+  #endif
+#else
   _mi_memzero(&tls->slots[count_old], (count - count_old)*sizeof(mi_tls_slot_t));
+#endif
   tls->count = count;
   mi_thread_locals_set(tls);
   return tls;
 }
+
+#if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
+bool _mi_test_tls_force_expand(size_t least_idx) {
+  return (mi_thread_locals_expand(least_idx) != NULL);
+}
+#endif
 
 static mi_decl_noinline bool mi_thread_local_set_expand( mi_thread_local_t key, void* val ) {
   if (val==NULL) return true;
@@ -332,4 +367,3 @@ void _mi_thread_local_free(mi_thread_local_t key) {
     }
   }
 }
-

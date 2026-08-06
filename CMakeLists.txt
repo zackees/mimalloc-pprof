@@ -372,6 +372,12 @@ elseif(CMAKE_BUILD_TYPE MATCHES "Debug")
   list(APPEND mi_defines MI_DEBUG=2)   # invariant checking (mi_assert and mi_assert_internal)
 endif()
 
+# Debug-only lock diagnostics (#167). Keep this source out of release libraries
+# entirely; src/static.c includes it under the equivalent preprocessor guard.
+if(MI_DEBUG_FULL)
+  list(APPEND mi_sources src/diagnostic.c)
+endif()
+
 # NOTE: `!` is NOT negation in CMake -- `!MI_GUARDED` parses as a variable name, and an
 # undefined variable is false, so the original `if(MI_DEBUG AND !MI_GUARDED)` was ALWAYS
 # false. And `set(MI_GUARDED=ON)` created a variable literally named `MI_GUARDED=ON`.
@@ -647,7 +653,7 @@ endif()
 # set language for source files now
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c PROPERTIES LANGUAGE CXX )
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -1090,6 +1096,100 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-rezalloc-slack PRIVATE mimalloc ${mi_libraries})
   endif()
   add_test(NAME test-rezalloc-slack COMMAND mimalloc-test-rezalloc-slack)
+
+  # Public-API regression for the full TLS growth schedule and lifetime edges
+  # that motivated issue #167 (including upstream microsoft/mimalloc#1358).
+  add_executable(mimalloc-test-threadlocal-growth test/test-threadlocal-growth.c)
+  target_compile_definitions(mimalloc-test-threadlocal-growth PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-threadlocal-growth PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-threadlocal-growth PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-threadlocal-growth PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-threadlocal-growth PRIVATE mimalloc ${mi_libraries})
+  endif()
+  if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(mimalloc-test-threadlocal-growth PRIVATE Threads::Threads)
+  endif()
+  add_test(NAME test-threadlocal-growth COMMAND mimalloc-test-threadlocal-growth)
+  set_tests_properties(test-threadlocal-growth PROPERTIES TIMEOUT 60)
+
+  # MI_DEBUG_FULL-only positive control for the internal lock diagnostics (#167).
+  # The program deliberately reacquires a non-recursive lock. The CMake wrapper
+  # requires an immediate diagnostic failure with the expected message; a deadlock
+  # times out and fails the test instead of wedging the suite.
+  if(MI_DEBUG_FULL)
+    add_executable(mimalloc-test-lock-reentrancy test/test-lock-reentrancy.c)
+    target_compile_definitions(mimalloc-test-lock-reentrancy PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-lock-reentrancy PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-lock-reentrancy PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-lock-reentrancy PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-lock-reentrancy PRIVATE mimalloc ${mi_libraries})
+    endif()
+    add_test(
+      NAME test-lock-reentrancy
+      COMMAND ${CMAKE_COMMAND}
+        -DTEST_EXE=$<TARGET_FILE:mimalloc-test-lock-reentrancy>
+        -DTEST_ARG=reentrant
+        -DEXPECTED_TEXT=reentrant_internal_lock_acquisition
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run-negative.cmake)
+    add_test(
+      NAME test-lock-uncleared-owner
+      COMMAND ${CMAKE_COMMAND}
+        -DTEST_EXE=$<TARGET_FILE:mimalloc-test-lock-reentrancy>
+        -DTEST_ARG=uncleared
+        -DEXPECTED_TEXT=internal_lock_owner_not_cleared
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run-negative.cmake)
+    add_test(
+      NAME test-lock-nonowner-release
+      COMMAND ${CMAKE_COMMAND}
+        -DTEST_EXE=$<TARGET_FILE:mimalloc-test-lock-reentrancy>
+        -DTEST_ARG=nonowner-release
+        -DEXPECTED_TEXT=internal_lock_release_by_non_owner
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run-negative.cmake)
+    add_test(
+      NAME test-lock-destroy-owned
+      COMMAND ${CMAKE_COMMAND}
+        -DTEST_EXE=$<TARGET_FILE:mimalloc-test-lock-reentrancy>
+        -DTEST_ARG=destroy-owned
+        -DEXPECTED_TEXT=destroying_owned_internal_lock
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run-negative.cmake)
+    set_tests_properties(
+      test-lock-reentrancy test-lock-uncleared-owner
+      test-lock-nonowner-release test-lock-destroy-owned
+      PROPERTIES TIMEOUT 15)
+
+    # Compile a private amalgamation with deterministic fault/poison controls.
+    # MI_TEST_TLS_CONTROL is absent from all library targets and releases.
+    add_executable(mimalloc-test-tls-controls src/static.c test/test-tls-controls.c)
+    target_compile_definitions(mimalloc-test-tls-controls PRIVATE
+      ${mi_defines} MI_STATIC_LIB MI_TEST_TLS_CONTROL=1)
+    target_compile_options(mimalloc-test-tls-controls PRIVATE ${mi_cflags} ${mi_cflags_static})
+    target_include_directories(mimalloc-test-tls-controls PRIVATE include)
+    target_link_libraries(mimalloc-test-tls-controls PRIVATE ${mi_libraries})
+
+    add_test(
+      NAME test-tls-control-owner
+      COMMAND ${CMAKE_COMMAND}
+        -DTEST_EXE=$<TARGET_FILE:mimalloc-test-tls-controls>
+        -DTEST_ARG=owner
+        -DEXPECTED_TEXT=internal_tls_storage_not_main_owned
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run-negative.cmake)
+    add_test(
+      NAME test-tls-control-zero
+      COMMAND ${CMAKE_COMMAND}
+        -DTEST_EXE=$<TARGET_FILE:mimalloc-test-tls-controls>
+        -DTEST_ARG=zero
+        -DEXPECTED_TEXT=internal_tls_new_slots_not_zero
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run-negative.cmake)
+    add_test(NAME test-tls-control-failure COMMAND mimalloc-test-tls-controls failure)
+    set_tests_properties(
+      test-tls-control-owner test-tls-control-zero test-tls-control-failure
+      PROPERTIES TIMEOUT 15)
+  endif()
 
   # mi_process_info's current_rss must be RSS, not committed bytes (issue #78).
   add_executable(mimalloc-test-process-rss test/test-process-rss.c)

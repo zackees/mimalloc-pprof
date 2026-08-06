@@ -381,8 +381,22 @@ mi_decl_noreturn mi_decl_cold void _mi_assert_fail(const char* assertion, const 
 
 #if (MI_DEBUG>2)
 #define mi_assert_expensive   mi_assert
+
+// Debug-only diagnostics for internal state whose lifetime or initialization
+// cannot be expressed as a local assertion at the allocation site.
+void _mi_diagnostic_check_tls_owner(const void* p);
+void _mi_diagnostic_check_zero(const void* p, size_t size, const char* reason);
 #else
 #define mi_assert_expensive(x)
+#endif
+
+// Test-only controls. These are compiled only into the dedicated diagnostic
+// control executable and are absent from every shipped library configuration.
+#if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
+void _mi_test_tls_control_set(int mode);
+int  _mi_test_tls_control_mode(void);
+bool _mi_test_tls_control_fail_growth(size_t old_count);
+bool _mi_test_tls_force_expand(size_t least_idx);
 #endif
 
 

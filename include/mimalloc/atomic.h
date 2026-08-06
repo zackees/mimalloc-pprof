@@ -412,28 +412,68 @@ typedef _Atomic(uintptr_t) mi_atomic_guard_t;
 #define mi_lock(lock)                  for(bool _mi_go = (mi_lock_acquire(lock),true); _mi_go; (mi_lock_release(lock), _mi_go=false) )
 #define mi_lock_maybe(lock,acquire)    for(bool _mi_go = (acquire ? (mi_lock_acquire(lock),true) : true); _mi_go; _mi_go = (acquire ? (mi_lock_release(lock),false) : false) )
 
+#if MI_DEBUG > 2
+#define MI_LOCK_DEBUG_FIELD         _Atomic(uintptr_t) debug_owner;
+#define MI_LOCK_DEBUG_INITIALIZER   , MI_ATOMIC_VAR_INIT(0)
+void _mi_lock_debug_before_acquire(const void* lock, const _Atomic(uintptr_t)* owner,
+                                   const char* file, unsigned line, const char* func);
+void _mi_lock_debug_after_acquire(const void* lock, _Atomic(uintptr_t)* owner,
+                                  const char* file, unsigned line, const char* func);
+void _mi_lock_debug_before_release(const void* lock, _Atomic(uintptr_t)* owner,
+                                   const char* file, unsigned line, const char* func);
+void _mi_lock_debug_init(_Atomic(uintptr_t)* owner);
+void _mi_lock_debug_done(const void* lock, const _Atomic(uintptr_t)* owner,
+                         const char* file, unsigned line, const char* func);
+#else
+#define MI_LOCK_DEBUG_FIELD
+#define MI_LOCK_DEBUG_INITIALIZER
+#endif
+
 
 #if defined(_WIN32)
 
 typedef struct mi_lock_s {
   SRWLOCK mutex;    // slim reader-writer lock
+  MI_LOCK_DEBUG_FIELD
 } mi_lock_t;
 
-#define MI_LOCK_INITIALIZER   { SRWLOCK_INIT }
+#define MI_LOCK_INITIALIZER   { SRWLOCK_INIT MI_LOCK_DEBUG_INITIALIZER }
 
 static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  const bool acquired = TryAcquireSRWLockExclusive(&lock->mutex);
+  if (acquired) { _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__); }
+  return acquired;
+  #else
   return TryAcquireSRWLockExclusive(&lock->mutex);
+  #endif
 }
 static inline void mi_lock_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   AcquireSRWLockExclusive(&lock->mutex);
+  #if MI_DEBUG > 2
+  _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
 }
 static inline void mi_lock_release(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_release(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   ReleaseSRWLockExclusive(&lock->mutex);
 }
 static inline void mi_lock_init(mi_lock_t* lock) {
   InitializeSRWLock(&lock->mutex);
+  #if MI_DEBUG > 2
+  _mi_lock_debug_init(&lock->debug_owner);
+  #endif
 }
 static inline void mi_lock_done(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_done(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   (void)(lock);
 }
 
@@ -444,20 +484,37 @@ void _mi_error_message(int err, const char* fmt, ...);
 
 typedef struct mi_lock_s {
   pthread_mutex_t mutex;
+  MI_LOCK_DEBUG_FIELD
 } mi_lock_t;
 
-#define MI_LOCK_INITIALIZER { PTHREAD_MUTEX_INITIALIZER }
+#define MI_LOCK_INITIALIZER { PTHREAD_MUTEX_INITIALIZER MI_LOCK_DEBUG_INITIALIZER }
 
 static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  const bool acquired = (pthread_mutex_trylock(&lock->mutex) == 0);
+  if (acquired) { _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__); }
+  return acquired;
+  #else
   return (pthread_mutex_trylock(&lock->mutex) == 0);
+  #endif
 }
 static inline void mi_lock_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   const int err = pthread_mutex_lock(&lock->mutex);
   if (err != 0) {
     _mi_error_message(err, "internal error: lock cannot be acquired (err %i)\n", err);
   }
+  #if MI_DEBUG > 2
+  _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
 }
 static inline void mi_lock_release(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_release(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   pthread_mutex_unlock(&lock->mutex);
 }
 static inline void mi_lock_init(mi_lock_t* lock) {
@@ -465,8 +522,14 @@ static inline void mi_lock_init(mi_lock_t* lock) {
   // use this instead of pthread_mutex_init since that can cause allocation on some platforms (and recursively initialize)
   const pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
   memcpy(&lock->mutex,&mutex,sizeof(mutex));
+  #if MI_DEBUG > 2
+  _mi_lock_debug_init(&lock->debug_owner);
+  #endif
 }
 static inline void mi_lock_done(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_done(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   pthread_mutex_destroy(&lock->mutex);
 }
 
@@ -478,23 +541,50 @@ static inline void mi_lock_done(mi_lock_t* lock) {
 
 typedef struct mi_lock_s {
   std::mutex mutex;
+  MI_LOCK_DEBUG_FIELD
 } mi_lock_t;
 
+#if MI_DEBUG > 2
+#define MI_LOCK_INITIALIZER   { {}, MI_ATOMIC_VAR_INIT(0) }
+#else
 #define MI_LOCK_INITIALIZER   { }
+#endif
 
 static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  const bool acquired = lock->mutex.try_lock();
+  if (acquired) { _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__); }
+  return acquired;
+  #else
   return lock->mutex.try_lock();
+  #endif
 }
 static inline void mi_lock_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   lock->mutex.lock();
+  #if MI_DEBUG > 2
+  _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
 }
 static inline void mi_lock_release(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_release(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   lock->mutex.unlock();
 }
 static inline void mi_lock_init(mi_lock_t* lock) {
   new(&lock->mutex) std::mutex();  // in-place constructor
+  #if MI_DEBUG > 2
+  _mi_lock_debug_init(&lock->debug_owner);
+  #endif
 }
 static inline void mi_lock_done(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_done(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   lock->mutex.~mutex(); // in-place destructor
 }
 
@@ -511,29 +601,60 @@ void _mi_prim_thread_yield(void);
 
 typedef struct mi_lock_s {
   _Atomic(uintptr_t) mutex;
+  MI_LOCK_DEBUG_FIELD
 } mi_lock_t;
 
-#define MI_LOCK_INITIALIZER  { MI_ATOMIC_VAR_INIT(0) }
+#define MI_LOCK_INITIALIZER  { MI_ATOMIC_VAR_INIT(0) MI_LOCK_DEBUG_INITIALIZER }
 
 static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  uintptr_t expected = 0;
+  const bool acquired = mi_atomic_cas_strong_acq_rel(&lock->mutex, &expected, (uintptr_t)1);
+  if (acquired) { _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__); }
+  return acquired;
+  #else
   uintptr_t expected = 0;
   return mi_atomic_cas_strong_acq_rel(&lock->mutex, &expected, (uintptr_t)1);
+  #endif
 }
 static inline void mi_lock_acquire(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   size_t ticks = 0;
   for (int i = 0; i < 10000; i++) {  // for at most 10000 tries?
+    #if MI_DEBUG > 2
+    uintptr_t expected = 0;
+    if (mi_atomic_cas_strong_acq_rel(&lock->mutex, &expected, (uintptr_t)1)) {
+      _mi_lock_debug_after_acquire(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+      return;
+    }
+    #else
     if (mi_lock_try_acquire(lock)) return;
+    #endif
     _mi_prim_thread_yield();
   }
   _mi_error_message(EFAULT, "internal error: lock cannot be acquired (due to lack of native lock primitives)\n");
 }
 static inline void mi_lock_release(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_before_release(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   mi_atomic_store_release(&lock->mutex, (uintptr_t)0);
 }
 static inline void mi_lock_init(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  mi_atomic_store_release(&lock->mutex, (uintptr_t)0);
+  _mi_lock_debug_init(&lock->debug_owner);
+  #else
   mi_lock_release(lock);
+  #endif
 }
 static inline void mi_lock_done(mi_lock_t* lock) {
+  #if MI_DEBUG > 2
+  _mi_lock_debug_done(lock, &lock->debug_owner, __FILE__, __LINE__, __func__);
+  #endif
   (void)(lock);
 }
 

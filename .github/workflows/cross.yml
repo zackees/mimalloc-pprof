@@ -197,11 +197,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: zackees/setup-soldr@v0
         with:
-          cache: true
+          # The embedded cache expects MSVC-style .pdb outputs even though this
+          # target is GNU, then fails while materializing files that do not exist.
+          # Keep Soldr's managed MinGW toolchain but bypass zccache for this job.
+          cache: false
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
-          build-cache-mode: full
       - name: Prepare managed MinGW through Soldr
         shell: pwsh
         run: soldr prepare --target x86_64-pc-windows-gnu --github-env $env:GITHUB_ENV

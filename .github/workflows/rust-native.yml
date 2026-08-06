@@ -45,10 +45,13 @@ jobs:
           install: mingw-w64-x86_64-gcc
       - uses: zackees/setup-soldr@v0
         with:
+          # The embedded cache expects MSVC-style .pdb outputs even though this
+          # target is GNU, then fails while materializing files that do not exist.
+          # Keep Soldr's pinned toolchain but bypass zccache for this one job.
+          cache: false
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
-          build-cache-mode: full
       - run: rustup target add x86_64-pc-windows-gnu
       - shell: pwsh
         run: |

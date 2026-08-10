@@ -1,0 +1,17 @@
+[package]
+name = "dashboard"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Benchmark dashboard generator for mimalloc-pprof — PR sentinel tier (#171)"
+
+[[bin]]
+name = "dashboard"
+path = "src/main.rs"
+
+[dependencies]
+bench-harness = { path = "../bench-harness" }
+stress-harness = { path = "../stress-harness" }
+mimalloc-pprof = { path = "../mimalloc-pprof" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

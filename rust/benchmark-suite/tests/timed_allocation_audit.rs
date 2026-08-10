@@ -131,6 +131,7 @@ impl AllocatorAdapter for InstrumentedAdapter {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "macOS realloc may route through the global allocator")]
 fn ordinary_measured_region_performs_zero_harness_allocations() {
     let adapter = InstrumentedAdapter {
         layouts: Mutex::new(HashMap::new()),

@@ -71,6 +71,31 @@ impl fmt::Display for AdapterError {
 
 impl std::error::Error for AdapterError {}
 
+/// Validate the identity returned by the linked C adapter against the build
+/// envelope embedded in this benchmark child. Keeping this check independently
+/// testable prevents a wrong adapter from passing merely because native-link
+/// integration tests were skipped on a developer host.
+pub fn validate_runtime_identity(
+    actual_id: &str,
+    actual_version: &str,
+) -> Result<(), AdapterError> {
+    if actual_id != BUILD_ALLOCATOR_ID {
+        return Err(AdapterError::IdentityMismatch {
+            field: "ID",
+            expected: BUILD_ALLOCATOR_ID,
+            actual: actual_id.to_owned(),
+        });
+    }
+    if actual_version != BUILD_ALLOCATOR_VERSION {
+        return Err(AdapterError::IdentityMismatch {
+            field: "version",
+            expected: BUILD_ALLOCATOR_VERSION,
+            actual: actual_version.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkedAdapter {
     identity: LinkedAllocatorIdentity,
@@ -81,20 +106,7 @@ impl LinkedAdapter {
     pub fn load() -> Result<Self, AdapterError> {
         let actual_id = unsafe { checked_identity(bench_allocator_id(), "allocator ID")? };
         let actual_version = unsafe { checked_identity(bench_allocator_version(), "version")? };
-        if actual_id != BUILD_ALLOCATOR_ID {
-            return Err(AdapterError::IdentityMismatch {
-                field: "ID",
-                expected: BUILD_ALLOCATOR_ID,
-                actual: actual_id.to_owned(),
-            });
-        }
-        if actual_version != BUILD_ALLOCATOR_VERSION {
-            return Err(AdapterError::IdentityMismatch {
-                field: "version",
-                expected: BUILD_ALLOCATOR_VERSION,
-                actual: actual_version.to_owned(),
-            });
-        }
+        validate_runtime_identity(actual_id, actual_version)?;
         Ok(Self {
             identity: LinkedAllocatorIdentity {
                 allocator_id: BUILD_ALLOCATOR_ID,

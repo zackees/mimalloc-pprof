@@ -141,7 +141,12 @@ fn sync_support_headers(paths: &Paths) {
 fn amalgamate_c(paths: &Paths) -> String {
     let mut visited = HashSet::new();
     let mut body = String::new();
-    inline_file(&paths.src_root.join("static.c"), paths, &mut visited, &mut body);
+    inline_file(
+        &paths.src_root.join("static.c"),
+        paths,
+        &mut visited,
+        &mut body,
+    );
     let header = generated_header(paths, "src/static.c", "amalgamate-c");
     format!("{header}{body}")
 }
@@ -153,8 +158,17 @@ fn amalgamate_c(paths: &Paths) -> String {
 fn amalgamate_h(paths: &Paths) -> String {
     let mut visited = HashSet::new();
     let mut body = String::new();
-    for rel in ["mimalloc.h", "mimalloc/profile.h", "mimalloc/memory-events.h"] {
-        inline_file(&paths.include_root.join(rel), paths, &mut visited, &mut body);
+    for rel in [
+        "mimalloc.h",
+        "mimalloc/profile.h",
+        "mimalloc/memory-events.h",
+    ] {
+        inline_file(
+            &paths.include_root.join(rel),
+            paths,
+            &mut visited,
+            &mut body,
+        );
     }
     let header = generated_header(
         paths,
@@ -265,7 +279,11 @@ fn parse_quoted_include(line: &str) -> Option<String> {
 /// `-I<include_root>` would: first relative to the including file's own
 /// directory, then relative to each known local search root.
 fn resolve_include(inc: &str, current_dir: &Path, paths: &Paths) -> Option<PathBuf> {
-    for base in [current_dir, paths.include_root.as_path(), paths.src_root.as_path()] {
+    for base in [
+        current_dir,
+        paths.include_root.as_path(),
+        paths.src_root.as_path(),
+    ] {
         let candidate = base.join(inc);
         if candidate.exists() {
             return Some(candidate);

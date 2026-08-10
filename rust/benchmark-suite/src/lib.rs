@@ -5,13 +5,17 @@
 
 pub mod adapter;
 pub mod child;
+pub mod comparison_key;
 pub mod config;
 pub mod execution;
 pub mod model;
 pub mod orchestration;
 pub mod provenance;
+pub mod report;
 pub mod runner;
 pub mod scenarios;
+pub mod stats;
+pub mod validate;
 
 pub const RAW_SCHEMA_VERSION: &str = "benchmark-raw-v1";
 pub const CORE_SUITE_VERSION: &str = "core-throughput-v1";

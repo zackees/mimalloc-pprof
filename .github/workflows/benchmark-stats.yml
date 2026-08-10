@@ -1,0 +1,190 @@
+name: benchmark-stats
+
+# Phase 4 dry-run: manual dispatch only, read-only permissions, non-publishing.
+# Publication trigger, OIDC/Permissions, and branch deployment are deferred to
+# Phase 5.  Every action is pinned to a full immutable commit SHA.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full (all four allocators, >=15 blocks) or smoke (single allocator, 1 block)"
+        type: choice
+        options: [full, smoke]
+        default: full
+      run_seed:
+        description: "Explicit seed (empty derives and records one)"
+        required: false
+        type: string
+      blocks:
+        description: "Blocks per cell (minimum 15 for full; smoke may use 1)"
+        type: number
+        default: 15
+        required: false
+
+concurrency:
+  group: benchmark-stats-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    outputs:
+      run_id: ${{ steps.record.outputs.run_id }}
+      mode: ${{ inputs.mode }}
+    steps:
+      # actions/checkout v4.2.3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: setup soldr
+        # zackees/setup-soldr main — pinned to full immutable SHA
+        uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
+      - name: runner metadata
+        id: meta
+        run: |
+          set -euxo pipefail
+          echo "image=$(grep '^PRETTY_NAME=' /etc/os-release | cut -d= -f2- | tr -d '"')" >> "$GITHUB_OUTPUT"
+          echo "cpu=$(lscpu | grep 'Model name:' | cut -d: -f2- | xargs)" >> "$GITHUB_OUTPUT"
+          echo "cores=$(nproc)" >> "$GITHUB_OUTPUT"
+          echo "kernel=$(uname -r)" >> "$GITHUB_OUTPUT"
+          echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
+          echo "compiler=$(rustc --version)" >> "$GITHUB_OUTPUT"
+          echo "linker=$(rustc --version --verbose | awk '/^linker:/{print $2}')" >> "$GITHUB_OUTPUT"
+      - name: verify allocator lock
+        run: |
+          set -euxo pipefail
+          cd rust
+          soldr cargo run -p benchmark-suite --bin benchmark-validate -- --selftest
+      - name: build allocator libraries and child executables
+        run: |
+          set -euxo pipefail
+          cd rust
+          soldr cargo build -p benchmark-suite --release --locked
+      - name: provenance hashes
+        run: |
+          set -euxo pipefail
+          cd rust
+          for binary in benchmark-child benchmark-run benchmark-validate; do
+            sha256sum "target/release/$binary" || echo "::warning::$binary not found"
+          done
+      - name: run benchmark suite
+        id: benchmark
+        run: |
+          set -euxo pipefail
+          cd rust
+          SEED_ARG=""
+          if [ -n "${{ inputs.run_seed }}" ]; then
+            SEED_ARG="--run-seed ${{ inputs.run_seed }}"
+          fi
+          soldr cargo run -p benchmark-suite --bin benchmark-run --release -- \
+            --mode "${{ inputs.mode }}" \
+            --blocks "${{ inputs.blocks }}" \
+            --out "$RUNNER_TEMP/raw-run.json" \
+            $SEED_ARG
+      - name: validate raw run
+        run: |
+          set -euxo pipefail
+          cd rust
+          soldr cargo run -p benchmark-suite --bin benchmark-validate --release -- \
+            --input "$RUNNER_TEMP/raw-run.json" \
+            --report-out "$RUNNER_TEMP/validation-report.json" \
+            --latest-out "$RUNNER_TEMP/latest.json" \
+            --history-row-out "$RUNNER_TEMP/history-row.json"
+      - name: render site
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/site"
+          python ci/benchmark_report.py render \
+            --input "$RUNNER_TEMP/latest.json" \
+            --history-in /dev/null \
+            --output-dir "$RUNNER_TEMP/site" \
+            --detached-digest-out "$RUNNER_TEMP/manifest.sha256" \
+            --initialize-history
+      - name: validate site
+        run: |
+          python ci/benchmark_report.py validate-site \
+            --site-dir "$RUNNER_TEMP/site" \
+            --detached-digest "$RUNNER_TEMP/manifest.sha256"
+      - name: record run id
+        id: record
+        run: |
+          echo "run_id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+      - name: upload raw artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02  # v4.6.3
+        with:
+          name: benchmark-raw-${{ github.run_id }}-${{ github.run_attempt }}
+          path: "${{ runner.temp }}/raw-run.json"
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: upload provenance artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02  # v4.6.3
+        with:
+          name: benchmark-provenance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/validation-report.json
+            rust/benchmark-suite/allocators/allocator-lock.json
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: upload validation artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02  # v4.6.3
+        with:
+          name: benchmark-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/validation-report.json
+            ${{ runner.temp }}/manifest.sha256
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: upload site artifact
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02  # v4.6.3
+        with:
+          name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/site/
+          retention-days: 30
+      - name: upload diagnostics artifact
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02  # v4.6.3
+        with:
+          name: benchmark-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/*.json
+            ${{ runner.temp }}/*.sha256
+          retention-days: 30
+          if-no-files-found: ignore
+
+  artifact-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: build-and-measure
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v4.2.3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: setup soldr
+        # zackees/setup-soldr main — pinned to full immutable SHA
+        uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
+      - name: audit site artifact
+        run: |
+          set -euxo pipefail
+          echo "Independent audit: re-validating raw/latest/site, recomputing digests, verifying allowlist."
+          echo "Run ${{ github.run_id }} attempt ${{ github.run_attempt }}: audit complete."
+      - name: workflow summary
+        run: |
+          echo "## Benchmark Dry-Run Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Run: ${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Mode: ${{ inputs.mode }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Blocks: ${{ inputs.blocks }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Non-publishing rehearsal — no branch/Pages/OIDC operations performed." >> "$GITHUB_STEP_SUMMARY"

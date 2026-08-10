@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-gnu",
+  "allocators": [
+    {
+      "id": "tcmalloc",
+      "pin": "c316de3ee8ffb5aff6547aa10151bc8dda3a2942",
+      "source": {
+        "kind": "archive",
+        "canonical_repository": "https://github.com/google/tcmalloc",
+        "commit": "c316de3ee8ffb5aff6547aa10151bc8dda3a2942",
+        "archive_url": "https://github.com/google/tcmalloc/archive/c316de3ee8ffb5aff6547aa10151bc8dda3a2942.tar.gz",
+        "archive_sha256": "66d2923630f7786c1e64c170de4333da34eba546c4aa675812e723b332110c03"
+      },
+      "build": {
+        "system": "bazel",
+        "required_tool_version": "bazel 9.1.0",
+        "generated_lock_sha256": "5ec8cc791ba4a4ca8841144e4c3a8abf28aec0d289dcfec0f2c10d392349b553",
+        "commands": [
+          [
+            "bazel",
+            "--output_user_root={build_dir}/bazel",
+            "cquery",
+            "--lockfile_mode=update",
+            "--dynamic_mode=off",
+            "-c",
+            "opt",
+            "--copt=-fno-omit-frame-pointer",
+            "//tcmalloc:tcmalloc",
+            "--output=label"
+          ],
+          [
+            "bazel",
+            "--output_user_root={build_dir}/bazel",
+            "build",
+            "--lockfile_mode=error",
+            "--dynamic_mode=off",
+            "-c",
+            "opt",
+            "--copt=-fno-omit-frame-pointer",
+            "//tcmalloc:tcmalloc"
+          ]
+        ],
+        "flags": ["-c opt", "-fno-omit-frame-pointer", "static-only"]
+      },
+      "expected_static_library": "libtcmalloc.lo",
+      "adapter_kind": "cxx-public-api",
+      "license": "Apache-2.0",
+      "patches": {
+        "source": [
+          {
+            "file": "tcmalloc-remove-dev-fuzztest.patch",
+            "sha256": "33f048ab1a867d6fcf40b1e0ed5b6b4d9e8515785c1267b918882fbf231714b4"
+          }
+        ],
+        "build": []
+      }
+    },
+    {
+      "id": "jemalloc",
+      "pin": "5.3.1@81034ce1f1373e37dc865038e1bc8eeecf559ce8",
+      "source": {
+        "kind": "archive",
+        "canonical_repository": "https://github.com/jemalloc/jemalloc",
+        "commit": "81034ce1f1373e37dc865038e1bc8eeecf559ce8",
+        "archive_url": "https://github.com/jemalloc/jemalloc/archive/81034ce1f1373e37dc865038e1bc8eeecf559ce8.tar.gz",
+        "archive_sha256": "33d3a3f7c60bd17656f41711847ffa392dcbee1dcdadebb4915475dcb276b979"
+      },
+      "build": {
+        "system": "autoconf-make",
+        "commands": [
+          [
+            "env",
+            "CFLAGS=-O3 -fno-omit-frame-pointer",
+            "sh",
+            "autogen.sh",
+            "--disable-shared",
+            "--enable-static",
+            "--disable-debug",
+            "--disable-stats",
+            "--with-jemalloc-prefix=je_"
+          ],
+          ["make", "-j{jobs}"]
+        ],
+        "flags": [
+          "--disable-shared",
+          "--enable-static",
+          "--disable-debug",
+          "--disable-stats",
+          "--with-jemalloc-prefix=je_",
+          "-O3",
+          "-fno-omit-frame-pointer"
+        ]
+      },
+      "expected_static_library": "libjemalloc.a",
+      "adapter_kind": "prefixed-c-api",
+      "license": "BSD-2-Clause",
+      "patches": { "source": [], "build": [] }
+    },
+    {
+      "id": "upstream-mimalloc",
+      "pin": "dev3@bcee5a88",
+      "source": {
+        "kind": "archive",
+        "canonical_repository": "https://github.com/microsoft/mimalloc",
+        "commit": "bcee5a88e9311c08b8f93fbce3dcafe2f22a2d26",
+        "archive_url": "https://github.com/microsoft/mimalloc/archive/bcee5a88e9311c08b8f93fbce3dcafe2f22a2d26.tar.gz",
+        "archive_sha256": "d440bbf0d09bd4bb2fecb195fb0c0faa148b890b73bc1afbf534e734edad1189"
+      },
+      "build": {
+        "system": "cmake-ninja",
+        "commands": [
+          [
+            "cmake",
+            "-S",
+            "{source_dir}",
+            "-B",
+            "{build_dir}",
+            "-G",
+            "Ninja",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DMI_BUILD_STATIC=ON",
+            "-DMI_BUILD_SHARED=OFF",
+            "-DMI_BUILD_TESTS=OFF",
+            "-DMI_PPROF=OFF",
+            "-DMI_OPT_ARCH=OFF",
+            "-DMI_OPT_SIMD=ON",
+            "-DCMAKE_C_FLAGS_RELEASE=-O3 -fno-omit-frame-pointer"
+          ],
+          ["cmake", "--build", "{build_dir}", "--parallel", "{jobs}"]
+        ],
+        "flags": [
+          "Release",
+          "MI_BUILD_STATIC=ON",
+          "MI_BUILD_SHARED=OFF",
+          "MI_BUILD_TESTS=OFF",
+          "MI_PPROF=OFF",
+          "MI_OPT_ARCH=OFF",
+          "MI_OPT_SIMD=ON",
+          "-O3",
+          "-fno-omit-frame-pointer"
+        ]
+      },
+      "expected_static_library": "libmimalloc.a",
+      "adapter_kind": "mimalloc-c-api",
+      "license": "MIT",
+      "patches": { "source": [], "build": [] }
+    },
+    {
+      "id": "mimalloc-pprof",
+      "pin": "workflow-source",
+      "source": {
+        "kind": "checkout",
+        "canonical_repository": "https://github.com/zackees/mimalloc-pprof",
+        "commit": "workflow-source"
+      },
+      "build": {
+        "system": "cmake-ninja",
+        "commands": [
+          [
+            "cmake",
+            "-S",
+            "{source_dir}",
+            "-B",
+            "{build_dir}",
+            "-G",
+            "Ninja",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DMI_BUILD_STATIC=ON",
+            "-DMI_BUILD_SHARED=OFF",
+            "-DMI_BUILD_TESTS=OFF",
+            "-DMI_PPROF=ON",
+            "-DMI_OPT_ARCH=OFF",
+            "-DMI_OPT_SIMD=ON",
+            "-DCMAKE_C_FLAGS_RELEASE=-O3 -fno-omit-frame-pointer"
+          ],
+          ["cmake", "--build", "{build_dir}", "--parallel", "{jobs}"]
+        ],
+        "flags": [
+          "Release",
+          "MI_BUILD_STATIC=ON",
+          "MI_BUILD_SHARED=OFF",
+          "MI_BUILD_TESTS=OFF",
+          "MI_PPROF=ON",
+          "MI_OPT_ARCH=OFF",
+          "MI_OPT_SIMD=ON",
+          "-O3",
+          "-fno-omit-frame-pointer"
+        ]
+      },
+      "expected_static_library": "libmimalloc.a",
+      "adapter_kind": "mimalloc-pprof-c-api",
+      "license": "MIT",
+      "patches": { "source": [], "build": [] }
+    }
+  ]
+}

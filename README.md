@@ -12,6 +12,16 @@ A fork of [microsoft/mimalloc](https://github.com/microsoft/mimalloc) that adds
 **pprof-compatible sampled heap profiling**, with native Windows as a first-class
 target alongside Linux and macOS.
 
+## Allocator benchmark preview
+
+![Development smoke preview comparing mimalloc-pprof, upstream mimalloc, TCMalloc, and jemalloc](doc/benchmark-smoke-preview.svg)
+
+**Development smoke preview only.** This is one Linux x86-64 reduced-smoke block
+for the 1-thread `tiny-fixed-64` cell, with profiling and memory-events collection
+disabled. One block is not statistically valid and this is not a headline
+benchmark result; it is shown only as an early end-to-end preview while the full
+benchmark suite is completed.
+
 ```
    __  __ ___ __  __    _    _     _     ___   ____
   |  \/  |_ _|  \/  |  / \  | |   | |   / _ \ / ___|

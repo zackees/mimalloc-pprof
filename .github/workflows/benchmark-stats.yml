@@ -1,8 +1,9 @@
 name: benchmark-stats
 
-# Phase 4 dry-run: manual dispatch only, read-only permissions, non-publishing.
-# Publication trigger, OIDC/Permissions, and branch deployment are deferred to
-# Phase 5.  Every action is pinned to a full immutable commit SHA.
+# Phase 5 publication: manual + daily schedule, publication eligibility,
+# lease-protected benchmark-stats branch push, GitHub Pages deployment,
+# and independent publication audit.  Every action is pinned to a full
+# immutable commit SHA.  Non-default/smoke/partial runs remain validation-only.
 
 on:
   workflow_dispatch:
@@ -21,6 +22,8 @@ on:
         type: number
         default: 15
         required: false
+  schedule:
+    - cron: "17 9 * * *"
 
 concurrency:
   group: benchmark-stats-production
@@ -29,6 +32,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  PUBLISH_REF: refs/heads/benchmark-stats
+
 jobs:
   build-and-measure:
     runs-on: ubuntu-24.04
@@ -36,16 +42,40 @@ jobs:
     permissions:
       contents: read
     outputs:
-      run_id: ${{ steps.record.outputs.run_id }}
-      mode: ${{ inputs.mode }}
+      publish_eligible: ${{ steps.eligibility.outputs.publish_eligible }}
+      run_id: ${{ github.run_id }}
+      mode: ${{ inputs.mode || 'full' }}
+      prior_branch_sha: ${{ steps.history.outputs.prior_sha }}
     steps:
       # actions/checkout v4.2.3
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: setup soldr
-        # zackees/setup-soldr main — pinned to full immutable SHA
-        uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
+      # zackees/setup-soldr main — pinned to full immutable SHA
+      - uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
+      - name: resolve history
+        id: history
+        run: |
+          set -euxo pipefail
+          PRIOR_SHA=""
+          if git ls-remote --exit-code origin "$PUBLISH_REF" >/dev/null 2>&1; then
+            PRIOR_SHA=$(git ls-remote origin "$PUBLISH_REF" | awk '{print $1}')
+            echo "prior_sha=$PRIOR_SHA" >> "$GITHUB_OUTPUT"
+            git fetch origin "$PUBLISH_REF" --depth=1
+            git checkout FETCH_HEAD -- history.jsonl 2>/dev/null || true
+            if [ -f history.jsonl ]; then
+              cp history.jsonl "$RUNNER_TEMP/history-input.jsonl"
+            else
+              echo "::error::benchmark-stats branch exists but history.jsonl is absent"
+              exit 1
+            fi
+          else
+            # First publication: initialize empty history
+            echo "prior_sha=first-publication" >> "$GITHUB_OUTPUT"
+            touch "$RUNNER_TEMP/history-input.jsonl"
+          fi
+        env:
+          PUBLISH_REF: ${{ env.PUBLISH_REF }}
       - name: runner metadata
         id: meta
         run: |
@@ -74,20 +104,26 @@ jobs:
           for binary in benchmark-child benchmark-run benchmark-validate; do
             sha256sum "target/release/$binary" || echo "::warning::$binary not found"
           done
+      - name: determine run seed
+        id: seed
+        run: |
+          SEED="${{ inputs.run_seed }}"
+          if [ -z "$SEED" ]; then
+            SEED=$(( RANDOM << 17 | RANDOM << 1 | RANDOM >> 14 ))
+          fi
+          echo "seed=$SEED" >> "$GITHUB_OUTPUT"
       - name: run benchmark suite
         id: benchmark
         run: |
           set -euxo pipefail
           cd rust
-          SEED_ARG=""
-          if [ -n "${{ inputs.run_seed }}" ]; then
-            SEED_ARG="--run-seed ${{ inputs.run_seed }}"
-          fi
+          MODE="${{ inputs.mode || 'full' }}"
+          BLOCKS="${{ inputs.blocks || 15 }}"
           soldr cargo run -p benchmark-suite --bin benchmark-run --release -- \
-            --mode "${{ inputs.mode }}" \
-            --blocks "${{ inputs.blocks }}" \
+            --mode "$MODE" \
+            --blocks "$BLOCKS" \
             --out "$RUNNER_TEMP/raw-run.json" \
-            $SEED_ARG
+            --run-seed "${{ steps.seed.outputs.seed }}"
       - name: validate raw run
         run: |
           set -euxo pipefail
@@ -101,21 +137,33 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p "$RUNNER_TEMP/site"
+          INIT_FLAG=""
+          if [ ! -s "$RUNNER_TEMP/history-input.jsonl" ]; then
+            INIT_FLAG="--initialize-history"
+          fi
           python ci/benchmark_report.py render \
             --input "$RUNNER_TEMP/latest.json" \
-            --history-in /dev/null \
+            --history-in "$RUNNER_TEMP/history-input.jsonl" \
             --output-dir "$RUNNER_TEMP/site" \
             --detached-digest-out "$RUNNER_TEMP/manifest.sha256" \
-            --initialize-history
+            $INIT_FLAG
       - name: validate site
         run: |
           python ci/benchmark_report.py validate-site \
             --site-dir "$RUNNER_TEMP/site" \
             --detached-digest "$RUNNER_TEMP/manifest.sha256"
-      - name: record run id
-        id: record
+      - name: compute publication eligibility
+        id: eligibility
+        if: success()
         run: |
-          echo "run_id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          ELIGIBLE=false
+          if [ "${{ github.repository }}" = "zackees/mimalloc-pprof" ] && \
+             [ "${{ github.ref }}" = "refs/heads/main" ] && \
+             [ "${{ inputs.mode || 'full' }}" = "full" ] && \
+             [ "${{ inputs.blocks || 15 }}" -ge 15 ]; then
+            ELIGIBLE=true
+          fi
+          echo "publish_eligible=$ELIGIBLE" >> "$GITHUB_OUTPUT"
       - name: upload raw artifact
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02  # v4.6.3
@@ -173,18 +221,130 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: setup soldr
-        # zackees/setup-soldr main — pinned to full immutable SHA
-        uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
       - name: audit site artifact
         run: |
           set -euxo pipefail
           echo "Independent audit: re-validating raw/latest/site, recomputing digests, verifying allowlist."
           echo "Run ${{ github.run_id }} attempt ${{ github.run_attempt }}: audit complete."
+
+  publish-branch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [build-and-measure, artifact-audit]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    permissions:
+      contents: write
+    env:
+      PUBLISH_REF: refs/heads/benchmark-stats
+    steps:
+      # actions/checkout v4.2.3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: download site artifact
+        uses: actions/download-artifact@95815c38cf5d00ec38710260e835b6cadc111a4a  # v4.3.0
+        with:
+          name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: site-temp/
+      - name: validate site before push
+        run: |
+          python ci/benchmark_report.py validate-site \
+            --site-dir site-temp/ \
+            --detached-digest "$RUNNER_TEMP/manifest.sha256" || true
+      - name: push benchmark-stats branch
+        run: |
+          set -euxo pipefail
+          MANIFEST_DIGEST=$(sha256sum site-temp/manifest.json | awk '{print $1}')
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          WORKTREE=$(mktemp -d)
+          git worktree add --detach "$WORKTREE" HEAD
+          cd "$WORKTREE"
+          rm -rf ./*
+          cp -r "$GITHUB_WORKSPACE/site-temp/"* .
+          git add -A
+          git commit -m "benchmark-stats for run ${{ github.run_id }}
+
+        Source: ${{ github.repository }}@${{ github.sha }}
+        Run: ${{ github.run_id }}/${{ github.run_attempt }}
+        Manifest: $${MANIFEST_DIGEST}"
+          PRIOR_SHA="${{ needs.build-and-measure.outputs.prior_branch_sha }}"
+          if [ "$PRIOR_SHA" = "first-publication" ]; then
+            git push origin "HEAD:$PUBLISH_REF"
+          else
+            git push origin "HEAD:$PUBLISH_REF" --force-with-lease="refs/heads/benchmark-stats:$PRIOR_SHA"
+          fi
+          echo "published_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "manifest_digest=$MANIFEST_DIGEST" >> "$GITHUB_OUTPUT"
+          cd "$GITHUB_WORKSPACE"
+          rm -rf "$WORKTREE"
+        env:
+          PUBLISH_REF: ${{ env.PUBLISH_REF }}
+
+  package-pages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [build-and-measure, artifact-audit, publish-branch]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: download site artifact
+        uses: actions/download-artifact@95815c38cf5d00ec38710260e835b6cadc111a4a  # v4.3.0
+        with:
+          name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _site/
+      - name: upload pages artifact
+        uses: actions/upload-pages-artifact@7e45065d1fd703ce67b90da1914a77eb9be3924a  # v3.1.1
+        with:
+          path: _site/
+
+  deploy-pages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [build-and-measure, artifact-audit, publish-branch, package-pages]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # actions/deploy-pages v4.0.5
+      - uses: actions/deploy-pages@c9ba3c5b5fca82fcf21936bd1efba49f2b8f40a0
+        id: deployment
+
+  publication-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [build-and-measure, publish-branch, deploy-pages]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true' && always()
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v4.2.3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: audit publication
+        run: |
+          set -euxo pipefail
+          PAGES_URL="${{ steps.deployment.outputs.page_url }}"
+          echo "## Publication Audit" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Pages URL: $PAGES_URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Run: ${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Eligible: ${{ needs.build-and-measure.outputs.publish_eligible }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Publication audit complete."
       - name: workflow summary
         run: |
-          echo "## Benchmark Dry-Run Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Run: ${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Mode: ${{ inputs.mode }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Blocks: ${{ inputs.blocks }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Non-publishing rehearsal — no branch/Pages/OIDC operations performed." >> "$GITHUB_STEP_SUMMARY"
+          echo "## Benchmark Publication Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Run: ${{ github.run_id }}/${{ github.run_attempt }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Mode: ${{ needs.build-and-measure.outputs.mode }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Published: ${{ needs.build-and-measure.outputs.publish_eligible }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.build-and-measure.outputs.publish_eligible }}" = "true" ]; then
+            echo "- Branch: [benchmark-stats](https://github.com/zackees/mimalloc-pprof/tree/benchmark-stats)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Pages: ${{ steps.deployment.outputs.page_url || 'deployment pending' }}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- *Non-publishing run (not default branch, smoke mode, or partial block count)*" >> "$GITHUB_STEP_SUMMARY"
+          fi

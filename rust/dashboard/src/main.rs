@@ -3,7 +3,7 @@
 //!
 //! Part of #171 "perf: publish a bounded four-allocator benchmark dashboard".
 
-use bench_harness::{run_benchmark, BenchConfig, BenchResult, ScenarioType};
+use bench_harness::{run_benchmark, BenchConfig, BenchResult, ChildProgram, ScenarioType};
 use mimalloc_pprof::MiMalloc;
 use serde::Serialize;
 use std::time::Duration;
@@ -41,7 +41,7 @@ const PR_SENTINEL_CARDS: &[ScenarioCard] = &[
     ScenarioCard {
         id: "small-mixed",
         name: "Small mixed (8–1024 B)",
-        description: "Multi-thread, log-distributed sizes — exercises size-class lookup.",
+        description: "Multi-thread, uniformly distributed sizes — exercises size-class lookup.",
         worker_count: 4,
         operation_count: 2_000_000,
         allocation_size_min: 8,
@@ -69,9 +69,9 @@ const PR_SENTINEL_CARDS: &[ScenarioCard] = &[
         scenario: ScenarioType::Sawtooth,
     },
     ScenarioCard {
-        id: "cross-thread-free",
-        name: "Cross-thread free",
-        description: "Allocate in one thread, drop in another — exercises remote-free paths.",
+        id: "cross-thread-free-pending",
+        name: "Cross-thread free (pending)",
+        description: "Pending a real cross-thread-free workload; this sentinel does not report remote-free results.",
         worker_count: 4,
         operation_count: 500_000,
         allocation_size_min: 16,
@@ -124,10 +124,23 @@ fn run_card(card: &ScenarioCard) -> BenchResult {
         scenario: card.scenario,
         serialized: false,
     };
-    run_benchmark(config)
+    let child = ChildProgram {
+        program: std::env::current_exe().expect("locate dashboard child executable"),
+        arguments: vec!["--stress-child".into()],
+        environment: Vec::new(),
+    };
+    run_benchmark(config, &child).expect("valid sentinel benchmark configuration")
 }
 
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--stress-child")) {
+        if let Err(error) = stress_harness::run_stdio_child() {
+            eprintln!("dashboard stress child rejected request: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     eprintln!("=== mimalloc-pprof PR sentinel benchmark ===");
     let start = std::time::Instant::now();
 
@@ -164,9 +177,7 @@ fn main() {
 
         eprintln!(
             "  {:.0} ops/s ({:.1} ns/op), CV={:.1}%",
-            cr.mean_throughput_ops_per_sec,
-            cr.mean_ns_per_op,
-            cr.cv_percent,
+            cr.mean_throughput_ops_per_sec, cr.mean_ns_per_op, cr.cv_percent,
         );
 
         card_results.push(cr);
@@ -211,11 +222,7 @@ fn generate_html(d: &DashboardOutput, elapsed: Duration) -> String {
     <td class="num">{:.1}</td>
 </tr>
 "#,
-            c.card_id,
-            c.card_name,
-            c.mean_throughput_ops_per_sec,
-            c.mean_ns_per_op,
-            c.cv_percent,
+            c.card_id, c.card_name, c.mean_throughput_ops_per_sec, c.mean_ns_per_op, c.cv_percent,
         ));
     }
 

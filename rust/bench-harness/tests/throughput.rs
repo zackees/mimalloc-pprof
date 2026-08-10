@@ -1,11 +1,19 @@
 //! Throughput benchmark — warmup + measurement rounds, machine-readable
 //! output, and build/host metadata recording.
 
-use bench_harness::{run_benchmark, BenchConfig, ScenarioType};
+use bench_harness::{run_benchmark, BenchConfig, ChildProgram, ScenarioType};
 use mimalloc_pprof::MiMalloc;
 
 #[global_allocator]
 static ALLOCATOR: MiMalloc = MiMalloc;
+
+fn stress_child() -> ChildProgram {
+    ChildProgram {
+        program: env!("CARGO_BIN_EXE_stress-child").into(),
+        arguments: Vec::new(),
+        environment: Vec::new(),
+    }
+}
 
 #[test]
 fn throughput_benchmark_with_metadata() {
@@ -23,16 +31,22 @@ fn throughput_benchmark_with_metadata() {
         serialized: false,
     };
 
-    let result = run_benchmark(config);
+    let result = run_benchmark(config, &stress_child()).expect("valid benchmark configuration");
 
     // Verify metadata was captured.
-    assert!(!result.metadata.commit.is_empty(), "commit should be recorded");
+    assert!(
+        !result.metadata.commit.is_empty(),
+        "commit should be recorded"
+    );
     assert!(
         result.metadata.rustc.contains("rustc"),
         "rustc version should be recorded, got: {}",
         result.metadata.rustc
     );
-    assert!(!result.metadata.cpu_model.is_empty(), "cpu model should be recorded");
+    assert!(
+        !result.metadata.cpu_model.is_empty(),
+        "cpu model should be recorded"
+    );
     assert!(!result.metadata.os.is_empty(), "os should be recorded");
 
     // Verify measurement rounds.

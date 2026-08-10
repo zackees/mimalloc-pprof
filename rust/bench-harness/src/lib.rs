@@ -22,10 +22,14 @@
 //!   stable reference hardware per the #170 acceptance criteria.
 
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 // Re-export the stress harness types we build on.
-pub use stress_harness::{ScenarioType, StressConfig};
+pub use stress_harness::{ExecutionMode, ScenarioType, StressConfig};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -64,6 +68,44 @@ pub struct BenchConfig {
     #[serde(default)]
     pub serialized: bool,
 }
+
+/// Explicit, production-locatable child program used for every benchmark
+/// sample. The program must accept one [`stress_harness::StressChildRequest`]
+/// on stdin and emit exactly one JSON response on stdout.
+#[derive(Debug, Clone)]
+pub struct ChildProgram {
+    pub program: PathBuf,
+    pub arguments: Vec<OsString>,
+    pub environment: Vec<(OsString, OsString)>,
+}
+
+/// A measurement rejection. No rejected sample can enter a [`BenchResult`].
+#[derive(Debug)]
+pub enum BenchError {
+    InvalidConfig(String),
+    Spawn(std::io::Error),
+    WriteRequest(std::io::Error),
+    Timeout { seconds: u64 },
+    NonZeroChild,
+    InvalidChildResponse(String),
+    InvalidSample(String),
+}
+
+impl std::fmt::Display for BenchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfig(message)
+            | Self::InvalidChildResponse(message)
+            | Self::InvalidSample(message) => f.write_str(message),
+            Self::Spawn(error) => write!(f, "spawn stress child: {error}"),
+            Self::WriteRequest(error) => write!(f, "write stress child request: {error}"),
+            Self::Timeout { seconds } => write!(f, "stress child timed out after {seconds}s"),
+            Self::NonZeroChild => f.write_str("stress child exited unsuccessfully"),
+        }
+    }
+}
+
+impl std::error::Error for BenchError {}
 
 fn default_alloc_min() -> usize {
     16
@@ -272,15 +314,16 @@ pub struct BenchResult {
 // Runner
 // ---------------------------------------------------------------------------
 
-/// Run a full benchmark (warmup + measurement) and return aggregated results.
-pub fn run_benchmark(config: BenchConfig) -> BenchResult {
+/// Run every warmup and measurement round in a fresh watchdog-owned child.
+/// Invalid, partial, or malformed results are rejected before aggregation.
+pub fn run_benchmark(config: BenchConfig, child: &ChildProgram) -> Result<BenchResult, BenchError> {
+    validate_benchmark_config(&config)?;
     let metadata = BenchMetadata::capture();
     let total_rounds = config.warmup_rounds + config.measurement_rounds;
     let mut samples = Vec::with_capacity(config.measurement_rounds);
 
     for round in 0..total_rounds {
         let is_warmup = round < config.warmup_rounds;
-        let round_start = Instant::now();
 
         let stress_cfg = StressConfig {
             name: format!("{}-round-{}", config.name, round),
@@ -289,159 +332,160 @@ pub fn run_benchmark(config: BenchConfig) -> BenchResult {
             operation_count: config.operation_count,
             allocation_size_min: config.allocation_size_min,
             allocation_size_max: config.allocation_size_max,
-            max_duration_secs: config.max_duration_secs,
         };
 
-        let stress_result = if config.serialized {
-            // Planted-slower control: force all allocations through a Mutex.
-            run_serialized(stress_cfg, config.scenario)
-        } else {
-            stress_harness::run_scenario(stress_cfg, config.scenario)
+        let request = stress_harness::StressChildRequest {
+            protocol_version: stress_harness::CHILD_PROTOCOL_VERSION,
+            config: stress_cfg,
+            scenario: config.scenario,
+            execution_mode: if config.serialized {
+                ExecutionMode::SerializedControl
+            } else {
+                ExecutionMode::Normal
+            },
         };
+        let stress_result =
+            run_child_sample(child, &request, config.max_duration_secs.unwrap_or(60))?;
 
-        let elapsed = round_start.elapsed().as_secs_f64();
+        let elapsed = stress_result.elapsed_secs;
         let ops = stress_result.ops_completed;
+        validate_stress_result(&stress_result, &request.config)?;
 
         if !is_warmup {
-            let tput = if elapsed > 0.0 {
-                ops as f64 / elapsed
-            } else {
-                f64::INFINITY
-            };
+            let tput = ops as f64 / elapsed;
+            let ns_per_op = (elapsed * 1e9) / ops as f64;
+            if !tput.is_finite() || !ns_per_op.is_finite() || tput <= 0.0 || ns_per_op <= 0.0 {
+                return Err(BenchError::InvalidSample(
+                    "sample has non-finite or non-positive throughput".into(),
+                ));
+            }
             samples.push(BenchSample {
                 round: round - config.warmup_rounds,
                 ops_completed: ops,
                 elapsed_secs: elapsed,
                 throughput_ops_per_sec: tput,
-                throughput_ns_per_op: if ops > 0 {
-                    (elapsed * 1e9) / ops as f64
-                } else {
-                    f64::INFINITY
-                },
+                throughput_ns_per_op: ns_per_op,
             });
         }
     }
 
     let summary = compute_summary(&samples);
-    let repro = format!(
-        "cargo test -p bench-harness --release -- --nocapture --test-threads=1"
-    );
+    let repro = format!("cargo test -p bench-harness --release -- --nocapture --test-threads=1");
 
-    BenchResult {
+    Ok(BenchResult {
         config,
         metadata,
         samples,
         summary,
         reproduction_command: repro,
+    })
+}
+
+fn validate_benchmark_config(config: &BenchConfig) -> Result<(), BenchError> {
+    StressConfig {
+        name: config.name.clone(),
+        seed: config.seed,
+        worker_count: config.worker_count,
+        operation_count: config.operation_count,
+        allocation_size_min: config.allocation_size_min,
+        allocation_size_max: config.allocation_size_max,
+    }
+    .validate()
+    .map_err(|error| BenchError::InvalidConfig(error.to_string()))?;
+    if config.measurement_rounds == 0 {
+        return Err(BenchError::InvalidConfig(
+            "measurement_rounds must be greater than zero".into(),
+        ));
+    }
+    if config.max_duration_secs == Some(0) {
+        return Err(BenchError::InvalidConfig(
+            "max_duration_secs must be greater than zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn run_child_sample(
+    child: &ChildProgram,
+    request: &stress_harness::StressChildRequest,
+    timeout_secs: u64,
+) -> Result<stress_harness::StressResult, BenchError> {
+    let request = serde_json::to_vec(request).map_err(|error| {
+        BenchError::InvalidConfig(format!("serialize stress-child request: {error}"))
+    })?;
+    let mut process = Command::new(&child.program)
+        .args(&child.arguments)
+        .envs(child.environment.iter().map(|(key, value)| (key, value)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(BenchError::Spawn)?;
+    process
+        .stdin
+        .take()
+        .expect("child stdin piped")
+        .write_all(&request)
+        .map_err(BenchError::WriteRequest)?;
+
+    let started = Instant::now();
+    loop {
+        match process.try_wait().map_err(BenchError::Spawn)? {
+            Some(status) => {
+                let output = process.wait_with_output().map_err(BenchError::Spawn)?;
+                if !status.success() {
+                    return Err(BenchError::NonZeroChild);
+                }
+                return serde_json::from_slice(&output.stdout).map_err(|error| {
+                    BenchError::InvalidChildResponse(format!(
+                        "expected exactly one JSON response: {error}"
+                    ))
+                });
+            }
+            None if started.elapsed() >= Duration::from_secs(timeout_secs) => {
+                let _ = process.kill();
+                let _ = process.wait();
+                return Err(BenchError::Timeout {
+                    seconds: timeout_secs,
+                });
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Planted-slower (serialized) path
-// ---------------------------------------------------------------------------
-
-/// Run the same workload shape but force every allocation through a global
-/// [`std::sync::Mutex`], effectively serialising all workers.  This is the
-/// planted-slower control that any statistical comparison must reject.
-fn run_serialized(
-    config: StressConfig,
-    scenario: ScenarioType,
-) -> stress_harness::StressResult {
-    use std::sync::{Arc, Barrier, Mutex};
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::thread;
-
-    let worker_count = config.worker_count.max(1);
-    let ops_completed = Arc::new(AtomicU64::new(0));
-    let simultaneous = Arc::new(AtomicUsize::new(0));
-    let max_simultaneous = Arc::new(AtomicUsize::new(0));
-    let serial_lock = Arc::new(Mutex::new(()));
-
-    let ready = Arc::new(Barrier::new(worker_count));
-    let running = Arc::new(Barrier::new(worker_count + 1));
-
-    let mut handles = Vec::with_capacity(worker_count);
-    for wid in 0..worker_count {
-        let cfg = config.clone();
-        let ops = Arc::clone(&ops_completed);
-        let sim = Arc::clone(&simultaneous);
-        let max_sim = Arc::clone(&max_simultaneous);
-        let rb = Arc::clone(&ready);
-        let run_b = Arc::clone(&running);
-        let lock = Arc::clone(&serial_lock);
-
-        handles.push(thread::spawn(move || {
-            rb.wait();
-            let cur = sim.fetch_add(1, Ordering::SeqCst) + 1;
-            max_sim.fetch_max(cur, Ordering::SeqCst);
-            run_b.wait();
-
-            let per_worker = (cfg.operation_count / worker_count).max(1);
-            let mut rng = stress_harness::SeededRng::new(
-                cfg.seed.wrapping_add(wid as u64),
-            );
-
-            match scenario {
-                ScenarioType::AllocFree => {
-                    for _ in 0..per_worker {
-                        let _guard = lock.lock().unwrap();
-                        let sz = cfg.allocation_size_min
-                            + rng.next_usize(
-                                cfg.allocation_size_max
-                                    - cfg.allocation_size_min
-                                    + 1,
-                            );
-                        let v = vec![0u8; sz];
-                        drop(v); // alloc + free inside the lock
-                        drop(_guard);
-                        ops.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                ScenarioType::Sawtooth => {
-                    const BATCH: usize = 1024;
-                    let mut held: Vec<Vec<u8>> = Vec::with_capacity(BATCH);
-                    for i in 0..per_worker {
-                        let _guard = lock.lock().unwrap();
-                        let sz = cfg.allocation_size_min
-                            + rng.next_usize(
-                                cfg.allocation_size_max
-                                    - cfg.allocation_size_min
-                                    + 1,
-                            );
-                        held.push(vec![0u8; sz]);
-                        drop(_guard);
-                        ops.fetch_add(1, Ordering::Relaxed);
-                        if held.len() >= BATCH || i == per_worker - 1 {
-                            held.clear();
-                        }
-                    }
-                }
-                ScenarioType::Hang => loop {
-                    thread::sleep(Duration::from_secs(1));
-                },
-            }
-
-            sim.fetch_sub(1, Ordering::SeqCst);
-        }));
+fn validate_stress_result(
+    result: &stress_harness::StressResult,
+    requested_config: &StressConfig,
+) -> Result<(), BenchError> {
+    if result.timed_out || result.crashed {
+        return Err(BenchError::InvalidSample(
+            "stress child reported timeout or crash".into(),
+        ));
     }
-
-    // Main thread waits on the same barrier so all workers proceed.
-    running.wait();
-    std::thread::sleep(Duration::from_millis(5));
-
-    for h in handles {
-        let _ = h.join();
+    if &result.config != requested_config {
+        return Err(BenchError::InvalidSample(
+            "stress child response configuration does not match its request".into(),
+        ));
     }
-
-    stress_harness::StressResult {
-        config,
-        max_simultaneous_workers: max_simultaneous.load(Ordering::SeqCst),
-        ops_completed: ops_completed.load(Ordering::Relaxed),
-        timed_out: false,
-        crashed: false,
-        elapsed_secs: 0.0, // measured externally
-        reproduction_command: String::new(),
+    if result.ops_completed == 0 || result.ops_completed != requested_config.operation_count as u64
+    {
+        return Err(BenchError::InvalidSample(format!(
+            "stress child completed {} operations; expected {}",
+            result.ops_completed, requested_config.operation_count
+        )));
     }
+    if result.observed_checksum != result.expected_checksum {
+        return Err(BenchError::InvalidSample(
+            "stress child reported a checksum mismatch".into(),
+        ));
+    }
+    if !result.elapsed_secs.is_finite() || result.elapsed_secs <= 0.0 {
+        return Err(BenchError::InvalidSample(
+            "stress child has non-finite or non-positive elapsed time".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +519,11 @@ fn compute_summary(samples: &[BenchSample]) -> BenchSummary {
     };
     let min_tput = tputs.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_tput = tputs.iter().cloned().fold(0.0_f64, f64::max);
-    let mean_ns = if mean > 0.0 { 1e9 / mean } else { f64::INFINITY };
+    let mean_ns = if mean > 0.0 {
+        1e9 / mean
+    } else {
+        f64::INFINITY
+    };
 
     BenchSummary {
         rounds: n,
@@ -492,11 +540,7 @@ fn compute_summary(samples: &[BenchSample]) -> BenchSummary {
 /// Returns `true` when the A/B comparison confidently identifies `slower` as
 /// meaningfully slower than `baseline`.  Uses Welch's t-test at the given
 /// significance level (default 0.01).
-pub fn is_significantly_slower(
-    baseline: &BenchResult,
-    slower: &BenchResult,
-    alpha: f64,
-) -> bool {
+pub fn is_significantly_slower(baseline: &BenchResult, slower: &BenchResult, alpha: f64) -> bool {
     let a: Vec<f64> = baseline
         .samples
         .iter()

@@ -29,11 +29,10 @@ fn concurrent_alloc_free_with_profiler_snapshots() {
         operation_count: 200_000,
         allocation_size_min: 16,
         allocation_size_max: 8192,
-        max_duration_secs: Some(30),
     };
 
     // Run the workload.
-    let result = run_scenario(config, ScenarioType::AllocFree);
+    let result = run_scenario(config, ScenarioType::AllocFree).expect("valid configuration");
 
     // Verify the harness saw real concurrency.
     assert!(

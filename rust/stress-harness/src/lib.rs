@@ -14,8 +14,9 @@
 //! the RED/GREEN gate that proves the harness is exercising real concurrency.
 
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,7 +25,7 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 
 /// Configuration for a stress scenario run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StressConfig {
     /// Human-readable scenario name (e.g. "tiny-hot-path", "cross-thread-free").
     pub name: String,
@@ -40,9 +41,6 @@ pub struct StressConfig {
     /// Maximum allocation size in bytes.
     #[serde(default = "default_alloc_max")]
     pub allocation_size_max: usize,
-    /// Hard wall-clock limit for the run; exceeded → timed-out kill.
-    #[serde(default)]
-    pub max_duration_secs: Option<u64>,
 }
 
 fn default_alloc_min() -> usize {
@@ -50,6 +48,53 @@ fn default_alloc_min() -> usize {
 }
 fn default_alloc_max() -> usize {
     4096
+}
+
+/// Invalid workload configuration, rejected before threads are created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StressError {
+    ZeroWorkers,
+    ZeroOperations,
+    InsufficientOperationsForWorkers,
+    InvalidAllocationRange,
+    UnsupportedProtocolVersion(u32),
+}
+
+impl std::fmt::Display for StressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroWorkers => f.write_str("worker_count must be greater than zero"),
+            Self::ZeroOperations => f.write_str("operation_count must be greater than zero"),
+            Self::InsufficientOperationsForWorkers => {
+                f.write_str("operation_count must be at least worker_count")
+            }
+            Self::InvalidAllocationRange => {
+                f.write_str("allocation_size_min must not exceed allocation_size_max")
+            }
+            Self::UnsupportedProtocolVersion(version) => {
+                write!(f, "unsupported stress-child protocol version {version}")
+            }
+        }
+    }
+}
+impl std::error::Error for StressError {}
+
+impl StressConfig {
+    pub fn validate(&self) -> Result<(), StressError> {
+        if self.worker_count == 0 {
+            return Err(StressError::ZeroWorkers);
+        }
+        if self.operation_count == 0 {
+            return Err(StressError::ZeroOperations);
+        }
+        if self.operation_count < self.worker_count {
+            return Err(StressError::InsufficientOperationsForWorkers);
+        }
+        if self.allocation_size_min > self.allocation_size_max {
+            return Err(StressError::InvalidAllocationRange);
+        }
+        Ok(())
+    }
 }
 
 /// The result of executing a [`StressConfig`] against a [`ScenarioType`].
@@ -61,6 +106,10 @@ pub struct StressResult {
     pub max_simultaneous_workers: usize,
     /// Total operations completed before exit / timeout / crash.
     pub ops_completed: u64,
+    /// Deterministic checksum observed from touched workload memory.
+    pub observed_checksum: u64,
+    /// Deterministic checksum expected from the versioned workload sequence.
+    pub expected_checksum: u64,
     /// True if the watchdog killed the run.
     pub timed_out: bool,
     /// True if the child process exited with a non-zero code or signal.
@@ -82,6 +131,31 @@ pub enum ScenarioType {
     Sawtooth,
     /// Sleep forever — a positive control for the watchdog path.
     Hang,
+}
+
+/// The workload implementation selected by a child request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionMode {
+    Normal,
+    SerializedControl,
+}
+
+/// Current wire format version for one isolated workload request.
+pub const CHILD_PROTOCOL_VERSION: u32 = 1;
+
+/// Versioned request accepted by the production stress-child entry point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StressChildRequest {
+    pub protocol_version: u32,
+    pub config: StressConfig,
+    pub scenario: ScenarioType,
+    pub execution_mode: ExecutionMode,
+}
+
+#[derive(Default)]
+struct StartGateState {
+    parked_workers: usize,
+    released: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,67 +192,120 @@ impl SeededRng {
 // In-process executor
 // ---------------------------------------------------------------------------
 
-/// Run `scenario` in-process with the given config, returning a machine-readable
-/// [`StressResult`].  All workers are barrier-synchronised so their allocation
-/// work genuinely overlaps.
-pub fn run_scenario(config: StressConfig, scenario: ScenarioType) -> StressResult {
-    let started = Instant::now();
-    let worker_count = config.worker_count.max(1);
+/// Run in-process without a hard timeout. Use a child process when a workload
+/// must be forcibly bounded.
+pub fn run_scenario(
+    config: StressConfig,
+    scenario: ScenarioType,
+) -> Result<StressResult, StressError> {
+    run_with_mode(config, scenario, ExecutionMode::Normal)
+}
 
+/// Execute a versioned child request after validating its protocol version.
+pub fn run_child_request(request: StressChildRequest) -> Result<StressResult, StressError> {
+    if request.protocol_version != CHILD_PROTOCOL_VERSION {
+        return Err(StressError::UnsupportedProtocolVersion(
+            request.protocol_version,
+        ));
+    }
+    run_with_mode(request.config, request.scenario, request.execution_mode)
+}
+
+fn run_with_mode(
+    config: StressConfig,
+    scenario: ScenarioType,
+    execution_mode: ExecutionMode,
+) -> Result<StressResult, StressError> {
+    config.validate()?;
+    let workers = config.worker_count;
     let simultaneous = Arc::new(AtomicUsize::new(0));
-    let max_simultaneous = Arc::new(AtomicUsize::new(0));
-    let ops_completed = Arc::new(AtomicU64::new(0));
-
-    let ready_barrier = Arc::new(Barrier::new(worker_count));
-    let running_barrier = Arc::new(Barrier::new(worker_count + 1)); // +1 for main
-
-    let mut handles = Vec::with_capacity(worker_count);
-
-    for wid in 0..worker_count {
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicU64::new(0));
+    let observed_checksum = Arc::new(AtomicU64::new(0));
+    let expected_checksum = Arc::new(AtomicU64::new(0));
+    let serial_lock = Arc::new(std::sync::Mutex::new(()));
+    let ready = Arc::new(Barrier::new(workers + 1));
+    let start_gate = Arc::new((Mutex::new(StartGateState::default()), Condvar::new()));
+    let complete = Arc::new(Barrier::new(workers + 1));
+    let mut handles = Vec::with_capacity(workers);
+    for worker in 0..workers {
         let cfg = config.clone();
-        let sim = Arc::clone(&simultaneous);
-        let max_sim = Arc::clone(&max_simultaneous);
-        let ops = Arc::clone(&ops_completed);
-        let rb = Arc::clone(&ready_barrier);
-        let run_b = Arc::clone(&running_barrier);
-
+        let simultaneous = Arc::clone(&simultaneous);
+        let maximum = Arc::clone(&maximum);
+        let completed = Arc::clone(&completed);
+        let observed_checksum = Arc::clone(&observed_checksum);
+        let expected_checksum = Arc::clone(&expected_checksum);
+        let serial_lock = Arc::clone(&serial_lock);
+        let ready = Arc::clone(&ready);
+        let start_gate = Arc::clone(&start_gate);
+        let complete = Arc::clone(&complete);
         handles.push(thread::spawn(move || {
-            // 1. All workers rendezvous — nobody starts before everyone is here.
-            rb.wait();
-
-            // 2. Atomically bump the "in flight" counter.
-            let cur = sim.fetch_add(1, Ordering::SeqCst) + 1;
-            max_sim.fetch_max(cur, Ordering::SeqCst);
-
-            // 3. Signal main that we're past the counter increment.
-            run_b.wait();
-
-            // 4. Do the actual work.
-            let per_worker = (cfg.operation_count / worker_count).max(1);
-            let mut rng = SeededRng::new(cfg.seed.wrapping_add(wid as u64));
-
+            let mut rng = SeededRng::new(cfg.seed.wrapping_add(worker as u64));
+            let mut held = (scenario == ScenarioType::Sawtooth).then(|| Vec::with_capacity(1024));
+            ready.wait();
+            #[cfg(debug_assertions)]
+            if worker == 0 {
+                if let Ok(milliseconds) = std::env::var("STRESS_HARNESS_TEST_PRE_PARK_DELAY_MS") {
+                    if let Ok(milliseconds) = milliseconds.parse::<u64>() {
+                        thread::sleep(Duration::from_millis(milliseconds));
+                    }
+                }
+            }
+            let (gate_state, gate_ready) = &*start_gate;
+            let mut gate = gate_state.lock().expect("start gate lock poisoned");
+            gate.parked_workers += 1;
+            // The coordinator and parked workers share this condition; wake
+            // all so a worker cannot consume the readiness notification.
+            gate_ready.notify_all();
+            while !gate.released {
+                gate = gate_ready.wait(gate).expect("start gate wait poisoned");
+            }
+            drop(gate);
+            let current = simultaneous.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(current, Ordering::SeqCst);
+            let operation_count =
+                cfg.operation_count / workers + usize::from(worker < cfg.operation_count % workers);
             match scenario {
                 ScenarioType::AllocFree => {
-                    for _ in 0..per_worker {
-                        let sz = cfg.allocation_size_min
-                            + rng.next_usize(
-                                cfg.allocation_size_max - cfg.allocation_size_min + 1,
-                            );
-                        let _v = vec![0u8; sz];
-                        ops.fetch_add(1, Ordering::Relaxed);
+                    for _ in 0..operation_count {
+                        let serial_guard = (execution_mode == ExecutionMode::SerializedControl)
+                            .then(|| {
+                                serial_lock
+                                    .lock()
+                                    .expect("serialized control lock poisoned")
+                            });
+                        let size = cfg.allocation_size_min
+                            + rng.next_usize(cfg.allocation_size_max - cfg.allocation_size_min + 1);
+                        let expected = (size as u8).wrapping_add(worker as u8);
+                        let mut allocation = vec![0u8; size];
+                        allocation[0] = expected;
+                        observed_checksum.fetch_add(allocation[0] as u64, Ordering::Relaxed);
+                        expected_checksum.fetch_add(expected as u64, Ordering::Relaxed);
+                        drop(allocation);
+                        drop(serial_guard);
+                        completed.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 ScenarioType::Sawtooth => {
-                    const BATCH: usize = 1024;
-                    let mut held: Vec<Vec<u8>> = Vec::with_capacity(BATCH);
-                    for i in 0..per_worker {
-                        let sz = cfg.allocation_size_min
-                            + rng.next_usize(
-                                cfg.allocation_size_max - cfg.allocation_size_min + 1,
-                            );
-                        held.push(vec![0u8; sz]);
-                        ops.fetch_add(1, Ordering::Relaxed);
-                        if held.len() >= BATCH || i == per_worker - 1 {
+                    let held = held.as_mut().expect("sawtooth control state preallocated");
+                    for index in 0..operation_count {
+                        let serial_guard = (execution_mode == ExecutionMode::SerializedControl)
+                            .then(|| {
+                                serial_lock
+                                    .lock()
+                                    .expect("serialized control lock poisoned")
+                            });
+                        let size = cfg.allocation_size_min
+                            + rng.next_usize(cfg.allocation_size_max - cfg.allocation_size_min + 1);
+                        let expected = (size as u8).wrapping_add(worker as u8);
+                        let mut allocation = vec![0u8; size];
+                        allocation[0] = expected;
+                        observed_checksum.fetch_add(allocation[0] as u64, Ordering::Relaxed);
+                        expected_checksum.fetch_add(expected as u64, Ordering::Relaxed);
+                        held.push(allocation);
+                        drop(serial_guard);
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        if held.len() == 1024 || index + 1 == operation_count {
                             held.clear();
                         }
                     }
@@ -187,47 +314,44 @@ pub fn run_scenario(config: StressConfig, scenario: ScenarioType) -> StressResul
                     thread::sleep(Duration::from_secs(1));
                 },
             }
-
-            sim.fetch_sub(1, Ordering::SeqCst);
+            simultaneous.fetch_sub(1, Ordering::SeqCst);
+            complete.wait();
         }));
     }
-
-    // 5. Wait for all workers to reach the post-increment barrier.
-    running_barrier.wait();
-    // Tiny grace period so the last straggler has time to register.
-    thread::sleep(Duration::from_millis(5));
-
-    // 6. Join all threads (or time out).
-    let timed_out = if let Some(max_secs) = config.max_duration_secs {
-        let deadline = started + Duration::from_secs(max_secs);
-        let mut all_done = false;
-        while !all_done && Instant::now() < deadline {
-            all_done = handles.iter().all(|h| h.is_finished());
-            if !all_done {
-                thread::sleep(Duration::from_millis(10));
-            }
+    // Debug-test-only setup delay used to prove that pre-start coordination is
+    // outside the reported interval. It is never present in release builds.
+    #[cfg(debug_assertions)]
+    if let Ok(milliseconds) = std::env::var("STRESS_HARNESS_TEST_SETUP_DELAY_MS") {
+        if let Ok(milliseconds) = milliseconds.parse::<u64>() {
+            thread::sleep(Duration::from_millis(milliseconds));
         }
-        !all_done
-    } else {
-        for h in handles {
-            let _ = h.join();
-        }
-        false
-    };
-
-    let elapsed = started.elapsed().as_secs_f64();
-
-    StressResult {
-        config: config.clone(),
-        max_simultaneous_workers: max_simultaneous.load(Ordering::SeqCst),
-        ops_completed: ops_completed.load(Ordering::Relaxed),
-        timed_out,
-        crashed: false,
-        elapsed_secs: elapsed,
-        reproduction_command: format!(
-            "cargo test -p stress-harness -- --nocapture --test-threads=1"
-        ),
     }
+    ready.wait();
+    let (gate_state, gate_ready) = &*start_gate;
+    let mut gate = gate_state.lock().expect("start gate lock poisoned");
+    while gate.parked_workers < workers {
+        gate = gate_ready.wait(gate).expect("start gate wait poisoned");
+    }
+    let started = Instant::now();
+    gate.released = true;
+    gate_ready.notify_all();
+    drop(gate);
+    complete.wait();
+    let elapsed_secs = started.elapsed().as_secs_f64();
+    for handle in handles {
+        let _ = handle.join();
+    }
+    Ok(StressResult {
+        config,
+        max_simultaneous_workers: maximum.load(Ordering::SeqCst),
+        ops_completed: completed.load(Ordering::Relaxed),
+        observed_checksum: observed_checksum.load(Ordering::Relaxed),
+        expected_checksum: expected_checksum.load(Ordering::Relaxed),
+        timed_out: false,
+        crashed: false,
+        elapsed_secs,
+        reproduction_command: "cargo test -p stress-harness -- --nocapture --test-threads=1".into(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -250,8 +374,7 @@ pub fn run_in_child_process(
     scenario: ScenarioType,
     watchdog_secs: u64,
 ) -> StressResult {
-    let input_json = serde_json::to_string(&(&config, scenario))
-        .expect("serialise child input");
+    let input_json = serde_json::to_string(&(&config, scenario)).expect("serialise child input");
 
     // Build the reproduction command before we consume config.
     let repro = format!(
@@ -260,8 +383,8 @@ pub fn run_in_child_process(
 
     // Spawn the *same test binary* directly (not via `cargo test`) to avoid
     // lock-file collisions when a prior child was killed.
-    let test_binary = std::env::current_exe()
-        .unwrap_or_else(|_| std::path::PathBuf::from("stress-harness-test"));
+    let test_binary =
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("stress-harness-test"));
 
     let mut child = std::process::Command::new(&test_binary)
         .args(["--nocapture", "child_process_isolation"])
@@ -296,9 +419,7 @@ pub fn run_in_child_process(
                         .rev()
                         .find(|l| l.trim_start().starts_with('{'))
                     {
-                        if let Ok(result) =
-                            serde_json::from_str::<StressResult>(line)
-                        {
+                        if let Ok(result) = serde_json::from_str::<StressResult>(line) {
                             return result;
                         }
                     }
@@ -308,6 +429,8 @@ pub fn run_in_child_process(
                     config,
                     max_simultaneous_workers: 0,
                     ops_completed: 0,
+                    observed_checksum: 0,
+                    expected_checksum: 0,
                     timed_out: false,
                     crashed: !status.success(),
                     elapsed_secs: elapsed,
@@ -322,6 +445,8 @@ pub fn run_in_child_process(
                         config,
                         max_simultaneous_workers: 0,
                         ops_completed: 0,
+                        observed_checksum: 0,
+                        expected_checksum: 0,
                         timed_out: true,
                         crashed: false,
                         elapsed_secs: started.elapsed().as_secs_f64(),
@@ -335,6 +460,8 @@ pub fn run_in_child_process(
                     config,
                     max_simultaneous_workers: 0,
                     ops_completed: 0,
+                    observed_checksum: 0,
+                    expected_checksum: 0,
                     timed_out: false,
                     crashed: true,
                     elapsed_secs: started.elapsed().as_secs_f64(),
@@ -345,13 +472,31 @@ pub fn run_in_child_process(
     }
 }
 
+/// Serve one strict production child request on stdin and write exactly one
+/// JSON [`StressResult`] to stdout. Diagnostics are returned to the caller so
+/// the binary can write them to stderr without corrupting the protocol.
+pub fn run_stdio_child() -> Result<(), String> {
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|error| format!("read stress-child request: {error}"))?;
+    let request: StressChildRequest = serde_json::from_str(&input)
+        .map_err(|error| format!("invalid stress-child request: {error}"))?;
+    let result = run_child_request(request).map_err(|error| error.to_string())?;
+    let response = serde_json::to_string(&result)
+        .map_err(|error| format!("serialize stress-child response: {error}"))?;
+    std::io::stdout()
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("write stress-child response: {error}"))?;
+    Ok(())
+}
+
 /// Entry-point for child-process mode.  Call this at the top of a test
 /// function that checks `CHILD_ENV_VAR`.  Deserialises the scenario config
 /// from the env var, runs it, prints the JSON result to stdout, and exits
 /// the process.
 pub fn run_child_mode() -> ! {
-    let input_json =
-        std::env::var(CHILD_ENV_VAR).expect("CHILD_ENV_VAR not set in child mode");
+    let input_json = std::env::var(CHILD_ENV_VAR).expect("CHILD_ENV_VAR not set in child mode");
     let (config, scenario): (StressConfig, ScenarioType) =
         serde_json::from_str(&input_json).expect("deserialise child input");
 
@@ -360,8 +505,17 @@ pub fn run_child_mode() -> ! {
         config.name, config.worker_count, config.seed
     );
 
-    let result = run_scenario(config, scenario);
-    let json = serde_json::to_string(&result).expect("serialise result");
-    println!("{}", json);
-    std::process::exit(if result.crashed { 1 } else { 0 });
+    match run_scenario(config, scenario) {
+        Ok(result) => {
+            println!(
+                "{}",
+                serde_json::to_string(&result).expect("serialise result")
+            );
+            std::process::exit(if result.crashed { 1 } else { 0 });
+        }
+        Err(error) => {
+            eprintln!("[stress-harness child] rejected configuration: {error}");
+            std::process::exit(1);
+        }
+    }
 }

@@ -4,9 +4,7 @@
 //! - A planted hang is killed by the watchdog and reports `timed_out: true`.
 //! - A clean short run exits normally and reports `timed_out: false`.
 
-use stress_harness::{
-    run_in_child_process, ScenarioType, StressConfig, CHILD_ENV_VAR,
-};
+use stress_harness::{run_in_child_process, ScenarioType, StressConfig, CHILD_ENV_VAR};
 
 // ---------------------------------------------------------------------------
 // Child-mode entry point — invoked when CHILD_ENV_VAR is set
@@ -36,7 +34,6 @@ fn watchdog_kills_planted_hang() {
         operation_count: 1,
         allocation_size_min: 16,
         allocation_size_max: 16,
-        max_duration_secs: Some(60),
     };
 
     let result = run_in_child_process(config, ScenarioType::Hang, 10);
@@ -60,15 +57,11 @@ fn watchdog_passes_clean_short_run() {
         operation_count: 10_000,
         allocation_size_min: 16,
         allocation_size_max: 64,
-        max_duration_secs: Some(60),
     };
 
     let result = run_in_child_process(config, ScenarioType::AllocFree, 30);
 
-    assert!(
-        !result.timed_out,
-        "clean short run should not time out"
-    );
+    assert!(!result.timed_out, "clean short run should not time out");
     assert!(!result.crashed, "clean short run should not crash");
     assert!(
         result.ops_completed > 0,

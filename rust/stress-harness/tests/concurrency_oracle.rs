@@ -14,7 +14,6 @@ fn make_config(name: &str, workers: usize) -> StressConfig {
         operation_count: 100_000,
         allocation_size_min: 16,
         allocation_size_max: 256,
-        max_duration_secs: Some(30),
     }
 }
 
@@ -23,7 +22,8 @@ fn red_single_worker_reports_no_concurrency() {
     let result = run_scenario(
         make_config("oracle-single-worker", 1),
         ScenarioType::AllocFree,
-    );
+    )
+    .expect("valid configuration");
     assert!(
         result.max_simultaneous_workers < 2,
         "RED FAIL: single worker reported max_simultaneous_workers={}, expected < 2",
@@ -39,7 +39,8 @@ fn green_multi_worker_reports_real_concurrency() {
     let result = run_scenario(
         make_config("oracle-multi-worker", workers),
         ScenarioType::AllocFree,
-    );
+    )
+    .expect("valid configuration");
     assert!(
         result.max_simultaneous_workers >= 2,
         "GREEN FAIL: {} workers reported max_simultaneous_workers={}, expected >= 2",
@@ -56,4 +57,24 @@ fn green_multi_worker_reports_real_concurrency() {
         completed >= expected / 2,
         "only {completed}/{expected} ops completed"
     );
+}
+
+#[test]
+fn exact_operation_count_with_remainder() {
+    let mut config = make_config("exact-operation-count", 3);
+    config.operation_count = 10;
+    let result = run_scenario(config, ScenarioType::AllocFree).expect("valid configuration");
+    assert_eq!(result.ops_completed, 10);
+}
+
+#[test]
+fn rejects_zero_operations_and_workers() {
+    let mut config = make_config("zero-workers", 0);
+    assert!(config.validate().is_err());
+    config.worker_count = 1;
+    config.operation_count = 0;
+    assert!(config.validate().is_err());
+    config.operation_count = 1;
+    config.worker_count = 2;
+    assert!(config.validate().is_err());
 }

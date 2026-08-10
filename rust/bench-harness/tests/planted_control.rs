@@ -1,11 +1,21 @@
 //! Planted-slower control — proves the benchmark harness can statistically
 //! distinguish a normal concurrent run from a deliberately serialised one.
 
-use bench_harness::{is_significantly_slower, run_benchmark, BenchConfig, ScenarioType};
+use bench_harness::{
+    is_significantly_slower, run_benchmark, BenchConfig, ChildProgram, ScenarioType,
+};
 use mimalloc_pprof::MiMalloc;
 
 #[global_allocator]
 static ALLOCATOR: MiMalloc = MiMalloc;
+
+fn stress_child() -> ChildProgram {
+    ChildProgram {
+        program: env!("CARGO_BIN_EXE_stress-child").into(),
+        arguments: Vec::new(),
+        environment: Vec::new(),
+    }
+}
 
 #[test]
 fn planted_serialized_control_is_rejected() {
@@ -24,18 +34,20 @@ fn planted_serialized_control_is_rejected() {
     };
 
     // Run the normal (unserialised) benchmark.
-    let normal = run_benchmark(base_config.clone());
+    let normal =
+        run_benchmark(base_config.clone(), &stress_child()).expect("valid normal benchmark");
 
     // Run the planted-slower (serialised) benchmark.
     let mut serial_cfg = base_config.clone();
     serial_cfg.serialized = true;
     serial_cfg.name = "planted-control-serialized".into();
-    let serialized = run_benchmark(serial_cfg);
+    let serialized =
+        run_benchmark(serial_cfg, &stress_child()).expect("valid serialized benchmark");
 
     // The serialised run must be significantly slower (α = 0.05).
     let significantly_slower = is_significantly_slower(&normal, &serialized, 0.05);
-    let ratio = serialized.summary.mean_throughput_ops_per_sec
-        / normal.summary.mean_throughput_ops_per_sec;
+    let ratio =
+        serialized.summary.mean_throughput_ops_per_sec / normal.summary.mean_throughput_ops_per_sec;
 
     println!(
         "Planted control: normal={:.0} ops/s, serialized={:.0} ops/s, ratio={:.3}, \

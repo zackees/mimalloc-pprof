@@ -1,0 +1,10 @@
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -26,7 +26,6 @@
+ bazel_dep(name = "re2", version = "2025-11-05.bcr.1", repo_name = "com_googlesource_code_re2")
+ bazel_dep(name = "rules_cc", version = "0.2.9")
+ 
+-bazel_dep(name = "fuzztest", version = "20260629.0", dev_dependency = True, repo_name = "com_google_fuzztest")
+ bazel_dep(name = "google_benchmark", version = "1.9.5", dev_dependency = True, repo_name = "com_github_google_benchmark")
+ bazel_dep(name = "googletest", version = "1.17.0.bcr.2", dev_dependency = True, repo_name = "com_google_googletest")
+ bazel_dep(name = "rules_fuzzing", version = "0.5.2", dev_dependency = True)

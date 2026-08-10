@@ -42,7 +42,11 @@ fn rezalloc_zeroes_past_the_old_usable_size() {
         assert!(!q.is_null());
 
         for i in usable_old..n_new {
-            assert_eq!(*q.add(i), 0, "byte {i} past the old usable size was not zeroed");
+            assert_eq!(
+                *q.add(i),
+                0,
+                "byte {i} past the old usable size was not zeroed"
+            );
         }
         sys::mi_free(q.cast());
     }
@@ -78,7 +82,10 @@ fn expand_never_moves_and_leaves_p_valid_on_failure() {
 
         // Absurdly large: must fail rather than move.
         let q = mimalloc_pprof::expand(p, 1 << 40);
-        assert!(q.is_null(), "expand must return null rather than move the block");
+        assert!(
+            q.is_null(),
+            "expand must return null rather than move the block"
+        );
         // p is still live and unchanged -- this is what distinguishes it from rezalloc.
         assert_eq!(*p, 0x42);
 

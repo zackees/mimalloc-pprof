@@ -12,6 +12,13 @@ pub struct ToolchainProvenance {
     pub linker: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SourcePatchProvenance {
+    pub file: String,
+    pub sha256: String,
+}
+
 /// The subset of one producer record required to launch and identify a child.
 /// Unknown producer fields remain allowed so the Python artifact can retain
 /// richer link/symbol/build evidence without duplicating that schema in Rust.
@@ -21,9 +28,13 @@ pub struct AllocatorProvenance {
     pub allocator_id: String,
     #[serde(rename = "version")]
     pub allocator_version: String,
+    pub canonical_repository: String,
     pub source_sha: String,
+    pub source_archive_url: Option<String>,
     #[serde(rename = "source_archive_sha256")]
     pub source_archive_sha256: Option<String>,
+    pub source_tree_sha256: String,
+    pub source_patches: Vec<SourcePatchProvenance>,
     #[serde(rename = "library_sha256")]
     pub static_library_sha256: String,
     #[serde(rename = "library")]
@@ -37,6 +48,24 @@ pub struct AllocatorProvenance {
     pub build_flags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IntentionalMimallocDifference {
+    pub field: String,
+    #[serde(rename = "upstream-mimalloc")]
+    pub upstream_mimalloc: String,
+    #[serde(rename = "mimalloc-pprof")]
+    pub mimalloc_pprof: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MimallocOptionComparison {
+    pub equivalent_fields: BTreeMap<String, String>,
+    pub intentional_difference: IntentionalMimallocDifference,
+    pub runtime_disabled_state: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProducerProvenance {
     pub schema_version: u32,
@@ -44,6 +73,7 @@ pub struct ProducerProvenance {
     pub environment: BTreeMap<String, String>,
     pub tool_versions: BTreeMap<String, String>,
     pub build_elapsed_seconds: f64,
+    pub mimalloc_option_comparison: MimallocOptionComparison,
     pub allocators: Vec<AllocatorProvenance>,
 }
 
@@ -56,6 +86,7 @@ impl ProducerProvenance {
         if !provenance.build_elapsed_seconds.is_finite() || provenance.build_elapsed_seconds < 0.0 {
             return Err("producer build elapsed time must be finite and nonnegative".into());
         }
+        provenance.validate_mimalloc_options()?;
         let embedded_lock_sha256 =
             sha256_bytes(include_bytes!("../allocators/allocator-lock.json"));
         if provenance.lockfile_sha256 != embedded_lock_sha256 {
@@ -76,10 +107,13 @@ impl ProducerProvenance {
                 Some(pin.source.commit.as_str())
             };
             if expected_source.is_some_and(|expected| built.source_sha != expected)
+                || built.canonical_repository != pin.source.repository
+                || built.source_archive_url.as_deref() != pin.source.archive_url.as_deref()
                 || (pin.id != "mimalloc-pprof"
                     && built.source_archive_sha256.as_deref()
                         != pin.source.archive_sha256.as_deref())
                 || !is_lower_hex(&built.source_sha, 40)
+                || !is_lower_hex(&built.source_tree_sha256, 64)
                 || (pin.id != "mimalloc-pprof"
                     && !is_lower_hex(
                         built.source_archive_sha256.as_deref().unwrap_or_default(),
@@ -93,11 +127,48 @@ impl ProducerProvenance {
                 || built.build_commands.is_empty()
                 || built.toolchain.compiler.is_empty()
                 || built.toolchain.linker.is_empty()
+                || built.source_patches
+                    != pin
+                        .patches
+                        .source
+                        .iter()
+                        .map(|patch| SourcePatchProvenance {
+                            file: patch.file.clone(),
+                            sha256: patch.sha256.clone(),
+                        })
+                        .collect::<Vec<_>>()
             {
                 return Err(format!("producer provenance for {} is invalid", pin.id));
             }
         }
         Ok(provenance)
+    }
+
+    fn validate_mimalloc_options(&self) -> Result<(), String> {
+        let expected_equivalent = BTreeMap::from([
+            ("MI_BUILD_SHARED".into(), "OFF".into()),
+            ("MI_BUILD_STATIC".into(), "ON".into()),
+            ("MI_BUILD_TESTS".into(), "OFF".into()),
+            ("MI_OPT_ARCH".into(), "OFF".into()),
+            ("MI_OPT_SIMD".into(), "ON".into()),
+            ("build_type".into(), "Release".into()),
+            ("frame_pointers".into(), "-fno-omit-frame-pointer".into()),
+            ("optimization".into(), "-O3".into()),
+        ]);
+        let expected_runtime = BTreeMap::from([
+            ("MIMALLOC_MEMORY_EVENTS".into(), "0".into()),
+            ("MIMALLOC_PROF".into(), "0".into()),
+        ]);
+        let difference = &self.mimalloc_option_comparison.intentional_difference;
+        if self.mimalloc_option_comparison.equivalent_fields != expected_equivalent
+            || self.mimalloc_option_comparison.runtime_disabled_state != expected_runtime
+            || difference.field != "MI_PPROF"
+            || difference.upstream_mimalloc != "OFF"
+            || difference.mimalloc_pprof != "ON"
+        {
+            return Err("mimalloc build/runtime option comparison is incomplete or false".into());
+        }
+        Ok(())
     }
 
     /// Hash the exact files immediately before launch. Provenance strings are

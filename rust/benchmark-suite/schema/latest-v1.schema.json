@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zackees/mimalloc-pprof/schema/latest-v1.schema.json",
+  "title": "mimalloc-pprof latest benchmark report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["latest_schema_version", "raw_schema_version", "statistics_version", "suite_version", "validation_report", "run", "runner", "allocators", "calibrations", "raw_samples", "absolute_summaries", "paired_summaries", "comparison_key", "methodology", "pending_metrics", "canonical_urls", "reproduction_command", "actions_run_url"],
+  "properties": {
+    "latest_schema_version": { "const": "benchmark-latest-v1" },
+    "raw_schema_version": { "const": "benchmark-raw-v1" },
+    "statistics_version": { "const": "paired-log-median-bootstrap-v1" },
+    "suite_version": { "const": "core-throughput-v1" },
+    "validation_report": { "$ref": "#/$defs/validation" },
+    "run": { "$ref": "raw-run-v1.schema.json#/$defs/run" },
+    "runner": { "$ref": "raw-run-v1.schema.json#/$defs/runner" },
+    "allocators": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "raw-run-v1.schema.json#/$defs/allocator" } },
+    "calibrations": { "type": "array", "minItems": 30, "maxItems": 30, "items": { "$ref": "raw-run-v1.schema.json#/$defs/calibration" } },
+    "raw_samples": { "type": "array", "minItems": 1800, "items": { "$ref": "raw-run-v1.schema.json#/$defs/sample" } },
+    "absolute_summaries": { "type": "array", "minItems": 120, "items": { "$ref": "#/$defs/absoluteCell" } },
+    "paired_summaries": { "type": "array", "minItems": 90, "items": { "$ref": "#/$defs/pairedCell" } },
+    "comparison_key": { "$ref": "#/$defs/sha256" },
+    "methodology": { "$ref": "#/$defs/methodology" },
+    "pending_metrics": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/pending" } },
+    "canonical_urls": { "$ref": "#/$defs/urls" },
+    "reproduction_command": { "$ref": "#/$defs/nonempty" },
+    "actions_run_url": { "type": "string" }
+  },
+  "$defs": {
+    "nonempty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "validation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["validator_version", "status", "headline_eligible", "sample_count", "cell_count", "minimum_blocks_per_cell", "allocator_ids", "checks", "errors"],
+      "properties": {
+        "validator_version": { "const": "benchmark-validator-v1" }, "status": { "const": "valid" }, "headline_eligible": { "const": true },
+        "sample_count": { "type": "integer", "minimum": 1800 }, "cell_count": { "const": 30 }, "minimum_blocks_per_cell": { "type": "integer", "minimum": 15 },
+        "allocator_ids": { "const": ["tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof"] },
+        "checks": { "type": "array", "minItems": 8, "uniqueItems": true, "items": { "$ref": "#/$defs/nonempty" } },
+        "errors": { "const": [] }
+      }
+    },
+    "absoluteStats": {
+      "type": "object", "additionalProperties": false,
+      "required": ["count", "median", "min", "max", "q1", "q3", "iqr", "relative_iqr", "noisy"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 15 }, "median": { "type": "number", "exclusiveMinimum": 0 }, "min": { "type": "number", "exclusiveMinimum": 0 }, "max": { "type": "number", "exclusiveMinimum": 0 }, "q1": { "type": "number", "exclusiveMinimum": 0 }, "q3": { "type": "number", "exclusiveMinimum": 0 }, "iqr": { "type": "number", "minimum": 0 }, "relative_iqr": { "type": "number", "minimum": 0 }, "noisy": { "type": "boolean" }
+      }
+    },
+    "absoluteCell": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scenario_id", "thread_point", "metric_id", "direction", "allocator_id", "summary"],
+      "properties": {
+        "scenario_id": { "$ref": "#/$defs/nonempty" }, "thread_point": { "$ref": "#/$defs/nonempty" }, "metric_id": { "$ref": "#/$defs/nonempty" }, "direction": { "enum": ["higher-is-better", "lower-is-better"] }, "allocator_id": { "$ref": "#/$defs/nonempty" }, "summary": { "$ref": "#/$defs/absoluteStats" }
+      }
+    },
+    "interval": {
+      "type": "object", "additionalProperties": false,
+      "required": ["lower", "upper", "confidence_level"],
+      "properties": { "lower": { "type": "number", "exclusiveMinimum": 0 }, "upper": { "type": "number", "exclusiveMinimum": 0 }, "confidence_level": { "const": 0.95 } }
+    },
+    "bootstrap": {
+      "type": "object", "additionalProperties": false,
+      "required": ["seed", "resample_count", "method", "prng"],
+      "properties": { "seed": { "type": "integer", "minimum": 0 }, "resample_count": { "const": 10000 }, "method": { "const": "percentile-block-bootstrap-type7-v1" }, "prng": { "const": "splitmix64-rejection-v1" } }
+    },
+    "pairedStats": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candidate_id", "reference_id", "direction", "block_count", "effect", "confidence_interval", "bootstrap", "informational"],
+      "properties": {
+        "candidate_id": { "$ref": "#/$defs/nonempty" }, "reference_id": { "const": "upstream-mimalloc" }, "direction": { "enum": ["higher-is-better", "lower-is-better"] }, "block_count": { "type": "integer", "minimum": 15 }, "effect": { "type": "number", "exclusiveMinimum": 0 }, "confidence_interval": { "$ref": "#/$defs/interval" }, "bootstrap": { "$ref": "#/$defs/bootstrap" }, "informational": { "const": true }
+      }
+    },
+    "pairedCell": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scenario_id", "thread_point", "metric_id", "summary"],
+      "properties": { "scenario_id": { "$ref": "#/$defs/nonempty" }, "thread_point": { "$ref": "#/$defs/nonempty" }, "metric_id": { "$ref": "#/$defs/nonempty" }, "summary": { "$ref": "#/$defs/pairedStats" } }
+    },
+    "methodology": {
+      "type": "object", "additionalProperties": false,
+      "required": ["absolute_summary", "paired_effect", "confidence_interval", "quantile_method", "noise_threshold_relative_iqr", "informational"],
+      "properties": { "absolute_summary": { "$ref": "#/$defs/nonempty" }, "paired_effect": { "$ref": "#/$defs/nonempty" }, "confidence_interval": { "$ref": "#/$defs/nonempty" }, "quantile_method": { "$ref": "#/$defs/nonempty" }, "noise_threshold_relative_iqr": { "const": 0.1 }, "informational": { "const": true } }
+    },
+    "pending": {
+      "type": "object", "additionalProperties": false,
+      "required": ["metric_id", "status", "reason", "phase_issue_url"],
+      "properties": { "metric_id": { "$ref": "#/$defs/nonempty" }, "status": { "const": "pending" }, "reason": { "$ref": "#/$defs/nonempty" }, "phase_issue_url": { "$ref": "#/$defs/nonempty" } }
+    },
+    "urls": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pages", "stats_branch", "latest_json", "methodology"],
+      "properties": { "pages": { "$ref": "#/$defs/nonempty" }, "stats_branch": { "$ref": "#/$defs/nonempty" }, "latest_json": { "$ref": "#/$defs/nonempty" }, "methodology": { "$ref": "#/$defs/nonempty" } }
+    }
+  }
+}

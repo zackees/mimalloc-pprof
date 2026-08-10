@@ -13,3 +13,5 @@ docs/
 *.gz
 .vscode
 .DS_STore
+__pycache__/
+*.pyc

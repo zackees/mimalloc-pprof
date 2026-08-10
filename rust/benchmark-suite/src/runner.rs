@@ -12,7 +12,9 @@ use serde_json::json;
 
 use crate::config::AllocatorLock;
 use crate::model::{
-    AllocatorIdentity, BenchmarkChildRequest, RawRun, RunnerMetadata, ToolchainMetadata,
+    AffinityMetadata, AllocatorBuildIdentity, AllocatorFeatureOptions, AllocatorIdentity,
+    BenchmarkChildRequest, CellCalibration, FeatureState, PowerMetadata, PublicationRawRun,
+    PublicationRunner, RawRun, RunIdentity, RunnerMetadata, SourcePatchIdentity, ToolchainMetadata,
     CHILD_PROTOCOL_VERSION,
 };
 use crate::orchestration::{calibrate_cell, run_balanced_cell, CellRunPlan, ChildProgram};
@@ -84,11 +86,13 @@ fn run(options: Options) -> Result<(), String> {
         .iter()
         .find(|child| child.allocator.allocator_id == "upstream-mimalloc")
         .ok_or_else(|| "provenance is missing upstream-mimalloc".to_string())?;
+    let run_identity = collect_run_identity(&provenance)?;
+    let publication_runner = collect_publication_runner(topology)?;
     let runner = RunnerMetadata {
-        os: std::env::consts::OS.into(),
-        architecture: std::env::consts::ARCH.into(),
-        physical_cores: topology.physical_cores as u32,
-        logical_cores: topology.logical_cores as u32,
+        os: publication_runner.os.clone(),
+        architecture: publication_runner.architecture.clone(),
+        physical_cores: publication_runner.physical_cores,
+        logical_cores: publication_runner.logical_cores,
     };
 
     let mut sample_output = create_new_writer(options.output_dir.join("raw-samples.jsonl"))?;
@@ -107,6 +111,7 @@ fn run(options: Options) -> Result<(), String> {
         }),
     )?;
     let mut all_samples = Vec::new();
+    let mut calibrations = Vec::new();
     let runner_started = Instant::now();
     let mut calibration_wall = Duration::ZERO;
     let mut block_wall = Duration::ZERO;
@@ -147,6 +152,23 @@ fn run(options: Options) -> Result<(), String> {
             let calibration = calibrate_cell(upstream, &request, options.timeout)?;
             calibration_wall = calibration_wall.saturating_add(calibration_started.elapsed());
             request.transactions_per_worker = calibration.transactions_per_worker;
+            let calibration_cell = crate::scenarios::ScenarioCell::new(
+                definition.id,
+                thread_point,
+                topology,
+                calibration.transactions_per_worker,
+                1,
+            )
+            .map_err(|error| error.to_string())?;
+            calibrations.push(CellCalibration {
+                scenario_id: definition.id.as_str().into(),
+                thread_point: thread_point.name().into(),
+                thread_count: calibration_cell.threads as u32,
+                transactions_per_worker: calibration.transactions_per_worker,
+                warmup_transactions_per_worker: options.warmup_transactions,
+                operation_count: calibration.operation_count,
+                elapsed_ns: calibration.elapsed_ns,
+            });
             write_json_line(
                 &mut diagnostic_output,
                 &json!({
@@ -199,7 +221,20 @@ fn run(options: Options) -> Result<(), String> {
                 / 1_000_000_000.0
         })
         .sum::<f64>();
-    write_new_json(options.output_dir.join("raw-run.json"), &raw_run)?;
+    let publication_raw = PublicationRawRun {
+        schema_version: RAW_SCHEMA_VERSION.into(),
+        suite_version: CORE_SUITE_VERSION.into(),
+        run_kind: run_kind.into(),
+        execution_mode: "normal".into(),
+        run_seed: options.run_seed,
+        run: run_identity,
+        runner: publication_runner,
+        allocator_lock_sha256: provenance.lockfile_sha256.clone(),
+        allocators: publication_allocators(&lock, &provenance)?,
+        calibrations,
+        samples: raw_run.samples.clone(),
+    };
+    write_new_json(options.output_dir.join("raw-run.json"), &publication_raw)?;
     write_new_json(
         options.output_dir.join("run-provenance.json"),
         &json!({
@@ -295,6 +330,210 @@ fn children_from_provenance(provenance: &ProducerProvenance) -> Result<Vec<Child
             })
         })
         .collect()
+}
+
+fn publication_allocators(
+    lock: &AllocatorLock,
+    provenance: &ProducerProvenance,
+) -> Result<Vec<AllocatorBuildIdentity>, String> {
+    lock.allocators
+        .iter()
+        .map(|pin| {
+            let built = provenance
+                .allocators
+                .iter()
+                .find(|candidate| candidate.allocator_id == pin.id)
+                .ok_or_else(|| format!("producer provenance is missing {}", pin.id))?;
+            Ok(AllocatorBuildIdentity {
+                allocator_id: built.allocator_id.clone(),
+                allocator_version: built.allocator_version.clone(),
+                source_kind: pin.source.kind.clone(),
+                canonical_repository: built.canonical_repository.clone(),
+                source_sha: built.source_sha.clone(),
+                source_archive_url: built
+                    .source_archive_url
+                    .clone()
+                    .unwrap_or_else(|| "not-applicable".into()),
+                source_archive_sha256: built
+                    .source_archive_sha256
+                    .clone()
+                    .unwrap_or_else(|| "not-applicable".into()),
+                source_tree_sha256: built.source_tree_sha256.clone(),
+                source_patches: built
+                    .source_patches
+                    .iter()
+                    .map(|patch| SourcePatchIdentity {
+                        file: patch.file.clone(),
+                        sha256: patch.sha256.clone(),
+                    })
+                    .collect(),
+                build_system: pin.build.system.clone(),
+                build_commands: built.build_commands.clone(),
+                build_flags: built.build_flags.clone(),
+                compiler: built.toolchain.compiler.clone(),
+                linker: built.toolchain.linker.clone(),
+                static_library_sha256: built.static_library_sha256.clone(),
+                child_binary_sha256: built.child_binary_sha256.clone(),
+                options: publication_options(&pin.id),
+            })
+        })
+        .collect()
+}
+
+fn publication_options(id: &str) -> AllocatorFeatureOptions {
+    use FeatureState::{Disabled, Enabled, NotApplicable};
+    match id {
+        "mimalloc-pprof" => AllocatorFeatureOptions {
+            pprof_compiled: Enabled,
+            pprof_runtime: Disabled,
+            memory_events_compiled: Enabled,
+            memory_events_runtime: Disabled,
+            frame_pointers: Enabled,
+            opt_arch: Disabled,
+            opt_simd: Enabled,
+        },
+        "upstream-mimalloc" => AllocatorFeatureOptions {
+            pprof_compiled: Disabled,
+            pprof_runtime: Disabled,
+            memory_events_compiled: NotApplicable,
+            memory_events_runtime: NotApplicable,
+            frame_pointers: Enabled,
+            opt_arch: Disabled,
+            opt_simd: Enabled,
+        },
+        _ => AllocatorFeatureOptions {
+            pprof_compiled: NotApplicable,
+            pprof_runtime: NotApplicable,
+            memory_events_compiled: NotApplicable,
+            memory_events_runtime: NotApplicable,
+            frame_pointers: Enabled,
+            opt_arch: NotApplicable,
+            opt_simd: NotApplicable,
+        },
+    }
+}
+
+fn collect_run_identity(provenance: &ProducerProvenance) -> Result<RunIdentity, String> {
+    let source_sha = provenance
+        .allocators
+        .iter()
+        .find(|allocator| allocator.allocator_id == "mimalloc-pprof")
+        .map(|allocator| allocator.source_sha.clone())
+        .ok_or_else(|| "producer provenance is missing mimalloc-pprof".to_string())?;
+    let run_origin = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+        "github-actions"
+    } else {
+        "local"
+    };
+    let source_ref = std::env::var("GITHUB_REF").unwrap_or_else(|_| {
+        command_text("git", &["symbolic-ref", "--short", "HEAD"])
+            .map(|branch| format!("refs/heads/{branch}"))
+            .unwrap_or_else(|| "refs/heads/local-benchmark".into())
+    });
+    let run_id = std::env::var("GITHUB_RUN_ID")
+        .unwrap_or_else(|_| format!("local-{}-{}", &source_sha[..12], std::process::id()));
+    let run_attempt = std::env::var("GITHUB_RUN_ATTEMPT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let generated_at_utc = command_text("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .ok_or_else(|| "unable to collect UTC generation timestamp".to_string())?;
+    Ok(RunIdentity {
+        source_repository: "https://github.com/zackees/mimalloc-pprof".into(),
+        source_sha,
+        source_ref,
+        run_origin: run_origin.into(),
+        run_id,
+        run_attempt,
+        generated_at_utc,
+    })
+}
+
+fn collect_publication_runner(topology: Topology) -> Result<PublicationRunner, String> {
+    let runner_class = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+        "github-hosted"
+    } else {
+        "self-hosted-informational"
+    };
+    let os_release = read_key_value_file(Path::new("/etc/os-release"));
+    let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                line.split_once(':')
+                    .filter(|(key, _)| key.trim() == "model name")
+                    .map(|(_, value)| value.trim().to_owned())
+            })
+        })
+        .unwrap_or_else(|| "not-observable".into());
+    let governor = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|_| "not-observable".into());
+    let boost = std::fs::read_to_string("/sys/devices/system/cpu/cpufreq/boost")
+        .or_else(|_| std::fs::read_to_string("/sys/devices/system/cpu/intel_pstate/no_turbo"))
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|_| "not-observable".into());
+    let mut runner = PublicationRunner {
+        runner_class: runner_class.into(),
+        stable_host_id: String::new(),
+        fingerprint_sha256: String::new(),
+        cpu_model,
+        os: "linux".into(),
+        os_image: os_release
+            .get("PRETTY_NAME")
+            .cloned()
+            .unwrap_or_else(|| "not-observable".into()),
+        os_version: os_release
+            .get("VERSION_ID")
+            .cloned()
+            .unwrap_or_else(|| "not-observable".into()),
+        kernel: command_text("uname", &["-r"]).unwrap_or_else(|| "not-observable".into()),
+        architecture: "x86_64".into(),
+        physical_cores: topology.physical_cores as u32,
+        logical_cores: topology.logical_cores as u32,
+        target: "x86_64-unknown-linux-gnu".into(),
+        rustc: rustc_version(),
+        affinity: AffinityMetadata {
+            policy: "unrestricted".into(),
+            logical_cpu_ids: Vec::new(),
+        },
+        power: PowerMetadata {
+            frequency_policy: if governor == "not-observable" {
+                "not-observable".into()
+            } else {
+                "observed-cpufreq".into()
+            },
+            governor,
+            boost,
+        },
+    };
+    runner.fingerprint_sha256 =
+        crate::validate::runner_fingerprint(&runner).map_err(|error| error.to_string())?;
+    Ok(runner)
+}
+
+fn read_key_value_file(path: &Path) -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|contents| {
+            contents
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(key, value)| (key.to_owned(), value.trim().trim_matches('"').to_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn command_text(program: &str, arguments: &[&str]) -> Option<String> {
+    std::process::Command::new(program)
+        .args(arguments)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn detect_topology() -> Result<Topology, String> {

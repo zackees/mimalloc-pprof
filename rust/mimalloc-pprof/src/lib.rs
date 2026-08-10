@@ -669,10 +669,7 @@ pub mod prof {
     pub fn modules() -> Vec<ModuleInfo> {
         let mut out: Vec<ModuleInfo> = Vec::new();
         unsafe {
-            sys::mi_prof_modules_visit(
-                modules_visitor,
-                (&mut out as *mut Vec<ModuleInfo>).cast(),
-            );
+            sys::mi_prof_modules_visit(modules_visitor, (&mut out as *mut Vec<ModuleInfo>).cast());
         }
         out
     }

@@ -3,6 +3,245 @@ use serde::{Deserialize, Serialize};
 use crate::{CORE_SUITE_VERSION, RAW_SCHEMA_VERSION};
 
 pub const CHILD_PROTOCOL_VERSION: &str = "benchmark-child-v1";
+pub const VALIDATOR_VERSION: &str = "benchmark-validator-v1";
+pub const LATEST_SCHEMA_VERSION: &str = "benchmark-latest-v1";
+pub const HISTORY_SCHEMA_VERSION: &str = "benchmark-history-v1";
+pub const STATISTICS_VERSION: &str = "paired-log-median-bootstrap-v1";
+
+/// Strict publication input. `RawRun` intentionally remains the small Phase 2
+/// producer value so existing child/controller APIs stay source-compatible.
+/// Publication must use this envelope; a bare or aggregate-only `RawRun` is
+/// never sufficient evidence for a headline result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationRawRun {
+    pub schema_version: String,
+    pub suite_version: String,
+    pub run_kind: String,
+    pub execution_mode: String,
+    pub run_seed: u64,
+    pub run: RunIdentity,
+    pub runner: PublicationRunner,
+    pub allocator_lock_sha256: String,
+    pub allocators: Vec<AllocatorBuildIdentity>,
+    pub calibrations: Vec<CellCalibration>,
+    pub samples: Vec<RawSample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunIdentity {
+    pub source_repository: String,
+    pub source_sha: String,
+    pub source_ref: String,
+    /// `github-actions` or `local`; the paired run ID remains explicit in both
+    /// cases so two attempts can never be conflated.
+    pub run_origin: String,
+    pub run_id: String,
+    pub run_attempt: u32,
+    pub generated_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationRunner {
+    pub runner_class: String,
+    pub stable_host_id: String,
+    pub fingerprint_sha256: String,
+    pub cpu_model: String,
+    pub os: String,
+    pub os_image: String,
+    pub os_version: String,
+    pub kernel: String,
+    pub architecture: String,
+    pub physical_cores: u32,
+    pub logical_cores: u32,
+    pub target: String,
+    pub rustc: String,
+    pub affinity: AffinityMetadata,
+    pub power: PowerMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AffinityMetadata {
+    /// `unrestricted` or `pinned`.
+    pub policy: String,
+    pub logical_cpu_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PowerMetadata {
+    /// Non-empty observed values; `not-observable` is an explicit value, not
+    /// missing data.
+    pub governor: String,
+    pub boost: String,
+    pub frequency_policy: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FeatureState {
+    Enabled,
+    Disabled,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AllocatorFeatureOptions {
+    pub pprof_compiled: FeatureState,
+    pub pprof_runtime: FeatureState,
+    pub memory_events_compiled: FeatureState,
+    pub memory_events_runtime: FeatureState,
+    pub frame_pointers: FeatureState,
+    pub opt_arch: FeatureState,
+    pub opt_simd: FeatureState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SourcePatchIdentity {
+    pub file: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AllocatorBuildIdentity {
+    pub allocator_id: String,
+    pub allocator_version: String,
+    pub source_kind: String,
+    pub canonical_repository: String,
+    pub source_sha: String,
+    /// Exact URL/hash for archive inputs, or the literal `not-applicable` for
+    /// the workflow checkout. This makes absence explicit in JSON.
+    pub source_archive_url: String,
+    pub source_archive_sha256: String,
+    pub source_tree_sha256: String,
+    pub source_patches: Vec<SourcePatchIdentity>,
+    pub build_system: String,
+    pub build_commands: Vec<Vec<String>>,
+    pub build_flags: Vec<String>,
+    pub compiler: String,
+    pub linker: String,
+    pub static_library_sha256: String,
+    pub child_binary_sha256: String,
+    pub options: AllocatorFeatureOptions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CellCalibration {
+    pub scenario_id: String,
+    pub thread_point: String,
+    pub thread_count: u32,
+    pub transactions_per_worker: u64,
+    pub warmup_transactions_per_worker: u64,
+    pub operation_count: u64,
+    pub elapsed_ns: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationReport {
+    pub validator_version: String,
+    pub status: String,
+    pub headline_eligible: bool,
+    pub sample_count: u64,
+    pub cell_count: u32,
+    pub minimum_blocks_per_cell: u32,
+    pub allocator_ids: Vec<String>,
+    pub checks: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AbsoluteCellSummary {
+    pub scenario_id: String,
+    pub thread_point: String,
+    pub metric_id: String,
+    pub direction: crate::stats::MetricDirection,
+    pub allocator_id: String,
+    pub summary: crate::stats::AbsoluteSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PairedCellSummary {
+    pub scenario_id: String,
+    pub thread_point: String,
+    pub metric_id: String,
+    pub summary: crate::stats::PairedEffectSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MethodologyContract {
+    pub absolute_summary: String,
+    pub paired_effect: String,
+    pub confidence_interval: String,
+    pub quantile_method: String,
+    pub noise_threshold_relative_iqr: f64,
+    pub informational: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PendingMetric {
+    pub metric_id: String,
+    pub status: String,
+    pub reason: String,
+    pub phase_issue_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalUrls {
+    pub pages: String,
+    pub stats_branch: String,
+    pub latest_json: String,
+    pub methodology: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LatestReport {
+    pub latest_schema_version: String,
+    pub raw_schema_version: String,
+    pub statistics_version: String,
+    pub suite_version: String,
+    pub validation_report: ValidationReport,
+    pub run: RunIdentity,
+    pub runner: PublicationRunner,
+    pub allocators: Vec<AllocatorBuildIdentity>,
+    pub calibrations: Vec<CellCalibration>,
+    pub raw_samples: Vec<RawSample>,
+    pub absolute_summaries: Vec<AbsoluteCellSummary>,
+    pub paired_summaries: Vec<PairedCellSummary>,
+    pub comparison_key: String,
+    pub methodology: MethodologyContract,
+    pub pending_metrics: Vec<PendingMetric>,
+    pub canonical_urls: CanonicalUrls,
+    pub reproduction_command: String,
+    pub actions_run_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryRow {
+    pub history_schema_version: String,
+    pub statistics_version: String,
+    pub suite_version: String,
+    pub run: RunIdentity,
+    pub comparison_key: String,
+    pub runner: PublicationRunner,
+    pub allocator_identities: Vec<AllocatorIdentity>,
+    pub absolute_summaries: Vec<AbsoluteCellSummary>,
+    pub paired_summaries: Vec<PairedCellSummary>,
+}
 
 /// Immutable identity supplied by the producer after it hashes the directly
 /// linked artifacts. The child echoes these values into every raw record.

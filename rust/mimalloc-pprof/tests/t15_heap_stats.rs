@@ -51,7 +51,10 @@ fn heap_stats_are_populated_and_exact() {
             "malloc_requested must be 0 when the build does not track it"
         );
     }
-    assert!(during.heap.committed > 0, "heap.committed must be populated");
+    assert!(
+        during.heap.committed > 0,
+        "heap.committed must be populated"
+    );
     assert!(during.heap.reserved >= during.heap.committed);
     assert!(during.heap.pages > 0, "heap.pages must be populated");
     assert!(during.heap.heaps > 0, "heap.heaps must be populated");

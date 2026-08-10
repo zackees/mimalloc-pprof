@@ -36,8 +36,8 @@ fn profiler_accounting_survives_the_realloc_matrix() {
             let q = match round % 4 {
                 0 => sys::mi_realloc(p.cast(), 16384).cast::<u8>(), // grow, likely moves
                 1 => sys::mi_realloc(p.cast(), 128).cast::<u8>(),   // shrink, in place
-                2 => mimalloc_pprof::rezalloc(p, 32768),             // zeroing grow
-                _ => mimalloc_pprof::recalloc(p, 512, 64),           // zeroing grow, count form
+                2 => mimalloc_pprof::rezalloc(p, 32768),            // zeroing grow
+                _ => mimalloc_pprof::recalloc(p, 512, 64),          // zeroing grow, count form
             };
             assert!(!q.is_null());
             blocks.push(q);

@@ -32,6 +32,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashboard"
+version = "0.1.0"
+dependencies = [
+ "bench-harness",
+ "mimalloc-pprof",
+ "serde",
+ "serde_json",
+ "stress-harness",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

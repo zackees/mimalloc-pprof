@@ -6,6 +6,7 @@ ide/vs20??/.vs
 ide/vs20??/VTune*
 out/
 rust/target/
+rust/benchmark-report.html
 docs/
 *.zip
 *.tar

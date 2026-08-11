@@ -85,6 +85,7 @@ FORBIDDEN_COMMAND_PATTERNS = (
 
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 TAG_REF_RE = re.compile(r"^v?\d+")
+VERSION_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
 
 JOB_TIMEOUTS = {"build-and-measure": 50, "artifact-audit": 10}
 
@@ -175,15 +176,22 @@ def check_permissions(workflow: Mapping[str, object]) -> None:
 
 def check_action_ref(ref: str, label: str) -> None:
     if "/" not in ref:
-        fail(f"{label}: expected owner/repo@sha action ref, got {ref!r}")
-    _, _, version = ref.partition("@")
+        fail(f"{label}: expected owner/repo@version action ref, got {ref!r}")
+    owner_repo, _, version = ref.partition("@")
     if not version:
-        fail(f"{label}: missing @sha in action ref {ref!r}")
+        fail(f"{label}: missing @version in action ref {ref!r}")
     candidate = version.strip()
-    if not FULL_SHA_RE.match(candidate):
-        if TAG_REF_RE.match(candidate):
-            fail(f"{label}: tag ref {ref!r} is forbidden; pin to full commit SHA")
-        fail(f"{label}: action ref {ref!r} is not a full 40-char SHA")
+    if FULL_SHA_RE.match(candidate):
+        return  # full SHA is always acceptable
+    if VERSION_TAG_RE.match(candidate):
+        if owner_repo.startswith("actions/"):
+            return  # first-party actions may use immutable semver tags
+        fail(
+            f"{label}: third-party action {ref!r} must use a full commit SHA, not tag {candidate!r}"
+        )
+    if TAG_REF_RE.match(candidate):
+        fail(f"{label}: tag ref {ref!r} is forbidden; pin to a specific version tag")
+    fail(f"{label}: action ref {ref!r} must be a full SHA or specific version tag")
 
 
 def check_jobs(workflow: Mapping[str, object]) -> None:
@@ -439,9 +447,7 @@ def selftest() -> int:
     _expect_policy_error(lambda: check(bad), "unconditional force")
     # negative: deploy-pages action in wrong job
     bad = cast(dict[str, object], _deep_copy(base))
-    bad["jobs"]["publish-branch"]["steps"].append(
-        {"uses": "actions/deploy-pages@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0"}
-    )  # type: ignore[union-attr]
+    bad["jobs"]["publish-branch"]["steps"].append({"uses": "actions/deploy-pages@v4.0.5"})  # type: ignore[union-attr]
     _expect_policy_error(lambda: check(bad), "deploy-pages outside deploy job")
     print("PASS benchmark workflow policy checker selftest")
     return 0

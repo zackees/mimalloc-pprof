@@ -2,8 +2,10 @@ name: benchmark-stats
 
 # Phase 5 publication: manual + daily schedule, publication eligibility,
 # lease-protected benchmark-stats branch push, GitHub Pages deployment,
-# and independent publication audit.  Every action is pinned to a full
-# immutable commit SHA.  Non-default/smoke/partial runs remain validation-only.
+# and independent publication audit.
+# First-party actions (checkout, upload-/download-artifact, pages) use
+# immutable semver tags.  Third-party action (setup-soldr) is pinned to a
+# full commit SHA.
 
 on:
   workflow_dispatch:
@@ -47,11 +49,9 @@ jobs:
       mode: ${{ inputs.mode || 'full' }}
       prior_branch_sha: ${{ steps.history.outputs.prior_sha }}
     steps:
-      # actions/checkout v4.2.3
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
-      # zackees/setup-soldr main — pinned to full immutable SHA
       - uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
       - name: resolve history
         id: history
@@ -70,7 +70,6 @@ jobs:
               exit 1
             fi
           else
-            # First publication: initialize empty history
             echo "prior_sha=first-publication" >> "$GITHUB_OUTPUT"
             touch "$RUNNER_TEMP/history-input.jsonl"
           fi
@@ -166,7 +165,7 @@ jobs:
           echo "publish_eligible=$ELIGIBLE" >> "$GITHUB_OUTPUT"
       - name: upload raw artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02  # v4.6.3
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: benchmark-raw-${{ github.run_id }}-${{ github.run_attempt }}
           path: "${{ runner.temp }}/raw-run.json"
@@ -174,7 +173,7 @@ jobs:
           if-no-files-found: ignore
       - name: upload provenance artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02  # v4.6.3
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: benchmark-provenance-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -184,7 +183,7 @@ jobs:
           if-no-files-found: ignore
       - name: upload validation artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02  # v4.6.3
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: benchmark-validation-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -194,14 +193,14 @@ jobs:
           if-no-files-found: ignore
       - name: upload site artifact
         if: success()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02  # v4.6.3
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/site/
           retention-days: 30
       - name: upload diagnostics artifact
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02  # v4.6.3
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: benchmark-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -217,8 +216,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      # actions/checkout v4.2.3
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
       - name: audit site artifact
@@ -237,12 +235,11 @@ jobs:
     env:
       PUBLISH_REF: refs/heads/benchmark-stats
     steps:
-      # actions/checkout v4.2.3
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
       - name: download site artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        uses: actions/download-artifact@v4.3.0
         with:
           name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
           path: site-temp/
@@ -286,12 +283,12 @@ jobs:
       contents: read
     steps:
       - name: download site artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        uses: actions/download-artifact@v4.3.0
         with:
           name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
           path: _site/
       - name: upload pages artifact
-        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b  # v4.0.0
+        uses: actions/upload-pages-artifact@v4.0.0
         with:
           path: _site/
 
@@ -307,8 +304,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      # actions/deploy-pages v4.0.5
-      - uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e  # v4.0.5
+      - uses: actions/deploy-pages@v4.0.5
         id: deployment
 
   publication-audit:
@@ -319,8 +315,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      # actions/checkout v4.2.3
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
       - name: audit publication
@@ -330,17 +325,16 @@ jobs:
           echo "## Publication Audit" >> "$GITHUB_STEP_SUMMARY"
           echo "- Pages URL: $PAGES_URL" >> "$GITHUB_STEP_SUMMARY"
           echo "- Run: ${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Eligible: ${{ needs.build-and-measure.outputs.publish_eligible }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Publication audit complete."
       - name: workflow summary
+        if: always()
         run: |
           echo "## Benchmark Publication Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "- Run: ${{ github.run_id }}/${{ github.run_attempt }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Mode: ${{ needs.build-and-measure.outputs.mode }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Published: ${{ needs.build-and-measure.outputs.publish_eligible }}" >> "$GITHUB_STEP_SUMMARY"
-          if [ "${{ needs.build-and-measure.outputs.publish_eligible }}" = "true" ]; then
-            echo "- Branch: [benchmark-stats](https://github.com/zackees/mimalloc-pprof/tree/benchmark-stats)" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Pages: ${{ steps.deployment.outputs.page_url || 'deployment pending' }}" >> "$GITHUB_STEP_SUMMARY"
+          ELIGIBLE="${{ needs.build-and-measure.outputs.publish_eligible }}"
+          if [ "$ELIGIBLE" = "true" ]; then
+            echo "- Published to branch and Pages" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Pages: ${{ steps.deployment.outputs.page_url || 'pending' }}" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "- *Non-publishing run (not default branch, smoke mode, or partial block count)*" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Non-publishing run" >> "$GITHUB_STEP_SUMMARY"
           fi

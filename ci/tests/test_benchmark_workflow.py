@@ -155,9 +155,7 @@ class TestPhase5Policy(unittest.TestCase):
 
     def test_deploy_pages_outside_deploy_job_rejected(self) -> None:
         bad = _phase5_workflow()
-        bad["jobs"]["publish-branch"]["steps"].append(
-            {"uses": "actions/deploy-pages@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0"}
-        )
+        bad["jobs"]["publish-branch"]["steps"].append({"uses": "actions/deploy-pages@v4.0.5"})
         with self.assertRaises(PolicyError):
             check(bad)
 

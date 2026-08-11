@@ -120,8 +120,7 @@ jobs:
           BLOCKS="${{ inputs.blocks || 15 }}"
           SEED="${{ steps.seed.outputs.seed }}"
           SMOKE_FLAG=""
-          OUTPUT_DIR="$RUNNER_TEMP/benchmark-output"
-          mkdir -p "$OUTPUT_DIR"
+          OUTPUT_DIR="$RUNNER_TEMP/benchmark-output-${{ github.run_id }}"
           if [ "$MODE" = "smoke" ]; then
             SMOKE_FLAG="--reduced-smoke"
           fi
@@ -136,7 +135,7 @@ jobs:
           set -euxo pipefail
           cd rust
           soldr cargo run -p benchmark-suite --bin benchmark-validate --release -- \
-            --input "${{ runner.temp }}/benchmark-output/raw-run.json" \
+            --input "${{ runner.temp }}/benchmark-output-${{ github.run_id }}/raw-run.json" \
             --report-out "$RUNNER_TEMP/validation-report.json" \
             --latest-out "$RUNNER_TEMP/latest.json" \
             --history-row-out "$RUNNER_TEMP/history-row.json"

@@ -272,6 +272,7 @@ jobs:
           cp -r "$GITHUB_WORKSPACE/site-temp/"* .
           git add -A
           git commit -m "benchmark-stats run=${{ github.run_id }}/${{ github.run_attempt }} src=${{ github.sha }} manifest=$MANIFEST_DIGEST"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           PRIOR_SHA="${{ needs.build-and-measure.outputs.prior_branch_sha }}"
           if [ "$PRIOR_SHA" = "first-publication" ]; then
             git push origin "HEAD:$PUBLISH_REF"

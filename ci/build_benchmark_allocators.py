@@ -1120,7 +1120,7 @@ def build_records(
         library = find_primary_library(record, source_dir, build_dir)
         source_sha = source_commit(record, workflow_commit)
         version = adapter_version(record, workflow_commit)
-        child, child_commands, link_inputs, link_identity = build_child(
+        child, _child_commands, link_inputs, link_identity = build_child(
             record,
             source_dir,
             build_dir,
@@ -1158,7 +1158,12 @@ def build_records(
                 "library_sha256": library_sha256,
                 "child_binary": str(child),
                 "child_binary_sha256": child_sha256,
-                "commands": [*resolved, *child_commands],
+                # Store the lockfile's template commands — not the expanded
+                # paths — so the validator can compare them byte-for-byte
+                # against the pinned lockfile.  Child cargo commands are
+                # always identical and reconstructable from toolchain + binary
+                # provenance; including them would cause a spurious mismatch.
+                "commands": [list(command) for command in commands],
                 "build_flags": require_string_list(
                     build.get("flags"), f"{allocator_id}.build.flags"
                 ),

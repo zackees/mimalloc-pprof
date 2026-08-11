@@ -53,9 +53,13 @@ jobs:
         with:
           persist-credentials: false
       - name: build native allocator libraries
+        env:
+          PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          HOME: /root
         run: |
           set -euxo pipefail
-          /usr/bin/python3 ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
+          which python3
+          python3 ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
       - uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
       - name: resolve history
         id: history

@@ -238,6 +238,20 @@ def check_jobs(workflow: Mapping[str, object]) -> None:
             env = job.get("environment")
             if not isinstance(env, dict) or env.get("name") != "github-pages":
                 fail("workflow.jobs.deploy-pages.environment: must target github-pages")
+            outputs = object_value(job.get("outputs", {}), "workflow.jobs.deploy-pages.outputs")
+            if outputs.get("page_url") != "${{ steps.deployment.outputs.page_url }}":
+                fail("workflow.jobs.deploy-pages.outputs.page_url: must expose deployment URL")
+        if name == "publication-audit":
+            needs = job.get("needs", [])
+            needs_list = (
+                [needs]
+                if isinstance(needs, str)
+                else list_value(needs, f"workflow.jobs.{name}.needs")
+            )
+            if not {"publish-branch", "deploy-pages"}.issubset(set(needs_list)):
+                fail(
+                    "workflow.jobs.publication-audit.needs: must include publish-branch and deploy-pages"
+                )
         _check_steps(name, job.get("steps", []), f"workflow.jobs.{name}")
 
 
@@ -246,13 +260,20 @@ def _check_steps(job_name: str, steps: object, label: str) -> None:
         fail(f"{label}.steps: expected array")
     steps_list = cast(list[object], steps)
     seen_validate = False
+    seen_site_validate = False
     seen_eligible = job_name != "build-and-measure"
+    seen_site_upload = job_name != "build-and-measure"
+    seen_prepare_branch = job_name != "publish-branch"
+    seen_pages_upload = job_name != "package-pages"
+    seen_revision_audit = job_name != "publication-audit"
+    seen_pages_audit = job_name != "publication-audit"
     for index, step in enumerate(steps_list):
         prefix = f"{label}.steps[{index}]"
         step_obj = object_value(step, prefix)
         uses = step_obj.get("uses")
         if uses and isinstance(uses, str):
             parts = uses.split("@", 1)
+            action = parts[0]
             if len(parts) == 2:
                 action = parts[0]
                 if action in FORBIDDEN_ACTIONS:
@@ -266,14 +287,89 @@ def _check_steps(job_name: str, steps: object, label: str) -> None:
                     fail(f"{prefix}.with.persist-credentials: must be false")
                 continue
             check_action_ref(uses, prefix)
+            if step_obj.get("name") == "upload site artifact":
+                if action != "actions/upload-artifact":
+                    fail(f"{prefix}: site artifact must use actions/upload-artifact")
+                if not seen_site_validate:
+                    fail(f"{prefix}: site upload before sealed-site validation step")
+                with_obj = object_value(step_obj.get("with", {}), f"{prefix}.with")
+                if with_obj.get("include-hidden-files") is not True:
+                    fail(f"{prefix}.with.include-hidden-files: must be true for .nojekyll")
+                if with_obj.get("if-no-files-found") != "error":
+                    fail(f"{prefix}.with.if-no-files-found: must be error")
+                if with_obj.get("path") != "${{ runner.temp }}/site/":
+                    fail(f"{prefix}.with.path: must upload exactly the sealed site directory")
+                seen_site_upload = True
+            if action == "actions/upload-pages-artifact":
+                if job_name != "package-pages":
+                    fail(f"{prefix}: upload-pages-artifact is only allowed in package-pages")
+                with_obj = object_value(step_obj.get("with", {}), f"{prefix}.with")
+                if with_obj.get("include-hidden-files") is not True:
+                    fail(f"{prefix}.with.include-hidden-files: must be true for .nojekyll")
+                seen_pages_upload = True
         run = step_obj.get("run")
         if run and isinstance(run, str):
             if step_obj.get("name") == "validate raw run":
                 seen_validate = True
+            if step_obj.get("name") == "validate site":
+                if (
+                    "benchmark_report.py validate-site" not in run
+                    or '--site-dir "$RUNNER_TEMP/site"' not in run
+                ):
+                    fail(f"{prefix}: validate site must validate the rendered site directory")
+                seen_site_validate = True
             if step_obj.get("name") == "compute publication eligibility":
                 seen_eligible = True
-            if step_obj.get("name") == "upload site artifact" and not seen_validate:
-                fail(f"{prefix}: site upload before validation step")
+            if job_name == "publish-branch":
+                if "shopt -s dotglob" in run or re.search(r"rm\s+-rf\s+\.?/?\*", run):
+                    fail(f"{prefix}: shell-glob worktree deletion can remove .git")
+                if step_obj.get("name") == "push benchmark-stats branch":
+                    required = (
+                        "benchmark_report.py prepare-branch",
+                        '--worktree "$WORKTREE"',
+                        '--site-dir "$GITHUB_WORKSPACE/site-temp"',
+                        "git commit",
+                        'benchmark_report.py" validate-revision',
+                        "--revision HEAD",
+                        "git push origin",
+                    )
+                    if any(value not in run for value in required):
+                        fail(
+                            f"{prefix}: publish command is missing exact preparation/audit arguments"
+                        )
+                    positions = [
+                        run.index("benchmark_report.py prepare-branch"),
+                        run.index("git commit"),
+                        run.index('benchmark_report.py" validate-revision'),
+                        run.index("git push origin"),
+                    ]
+                    if positions != sorted(positions) or len(set(positions)) != len(positions):
+                        fail(f"{prefix}: prepare, commit, revision audit, and push must be ordered")
+                    seen_prepare_branch = True
+            if job_name == "publication-audit" and step_obj.get("name") == "audit publication":
+                required = (
+                    "git fetch origin refs/heads/benchmark-stats --depth=1",
+                    "benchmark_report.py validate-revision",
+                    "--revision FETCH_HEAD",
+                    "--site-dir audit/site/",
+                    'PAGES_URL="${{ needs.deploy-pages.outputs.page_url }}"',
+                    "benchmark_report.py audit-pages",
+                    '--page-url "$PAGES_URL"',
+                )
+                if any(value not in run for value in required):
+                    fail(f"{prefix}: publication audit is missing exact branch/Pages arguments")
+                positions = [
+                    run.index("git fetch origin refs/heads/benchmark-stats --depth=1"),
+                    run.index("benchmark_report.py validate-revision"),
+                    run.index('PAGES_URL="${{ needs.deploy-pages.outputs.page_url }}"'),
+                    run.index("benchmark_report.py audit-pages"),
+                ]
+                if positions != sorted(positions) or len(set(positions)) != len(positions):
+                    fail(
+                        f"{prefix}: fetch, revision audit, URL wiring, and Pages audit must be ordered"
+                    )
+                seen_revision_audit = True
+                seen_pages_audit = True
             # force-with-lease is required in publish-branch push
             if job_name == "publish-branch" and "git push" in run:
                 if "--force-with-lease" not in run:
@@ -291,6 +387,16 @@ def _check_steps(job_name: str, steps: object, label: str) -> None:
             fail(f"{label}: missing validation step in build-and-measure job")
         if not seen_eligible:
             fail(f"{label}: missing publication eligibility step in build-and-measure job")
+        if not seen_site_validate:
+            fail(f"{label}: missing sealed-site validation step")
+        if not seen_site_upload:
+            fail(f"{label}: missing fail-closed hidden-file site upload")
+    if not seen_prepare_branch:
+        fail(f"{label}: missing exact prepare-branch step")
+    if not seen_pages_upload:
+        fail(f"{label}: missing hidden-file Pages artifact upload")
+    if not seen_revision_audit or not seen_pages_audit:
+        fail(f"{label}: publication audit must validate branch revision and Pages bytes")
 
 
 def check_artifact_retention(workflow: Mapping[str, object]) -> None:
@@ -359,10 +465,20 @@ def selftest() -> int:
                         "with": {"persist-credentials": False},
                     },
                     {"name": "validate raw run", "run": "echo validated"},
+                    {
+                        "name": "validate site",
+                        "run": 'python ci/benchmark_report.py validate-site --site-dir "$RUNNER_TEMP/site"',
+                    },
                     {"name": "compute publication eligibility", "run": "echo eligible"},
                     {
+                        "name": "upload site artifact",
                         "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4880f43607fa02",
-                        "with": {"name": "x", "path": "."},
+                        "with": {
+                            "name": "x",
+                            "path": "${{ runner.temp }}/site/",
+                            "include-hidden-files": True,
+                            "if-no-files-found": "error",
+                        },
                         "retention-days": 30,
                     },
                 ],
@@ -384,8 +500,8 @@ def selftest() -> int:
                 "permissions": {"contents": "write"},
                 "steps": [
                     {
-                        "name": "push",
-                        "run": "git push origin HEAD:ref --force-with-lease=ref:abc123",
+                        "name": "push benchmark-stats branch",
+                        "run": 'python ci/benchmark_report.py prepare-branch --worktree "$WORKTREE" --site-dir "$GITHUB_WORKSPACE/site-temp"\ngit commit -m generated\npython "$GITHUB_WORKSPACE/ci/benchmark_report.py" validate-revision --repository "$WORKTREE" --revision HEAD --site-dir "$GITHUB_WORKSPACE/site-temp"\ngit push origin HEAD:ref --force-with-lease=ref:abc123',
                     }
                 ],
             },
@@ -393,13 +509,19 @@ def selftest() -> int:
                 "runs-on": "ubuntu-24.04",
                 "timeout-minutes": 10,
                 "permissions": {"contents": "read"},
-                "steps": [],
+                "steps": [
+                    {
+                        "uses": "actions/upload-pages-artifact@v4.0.0",
+                        "with": {"path": "_site/", "include-hidden-files": True},
+                    }
+                ],
             },
             "deploy-pages": {
                 "runs-on": "ubuntu-24.04",
                 "timeout-minutes": 10,
                 "permissions": {"pages": "write", "id-token": "write"},
                 "environment": {"name": "github-pages"},
+                "outputs": {"page_url": "${{ steps.deployment.outputs.page_url }}"},
                 "steps": [
                     {"uses": "actions/deploy-pages@c9ba3c5b5fca82fcf21936bd1efba49f2b8f40a0"}
                 ],
@@ -408,11 +530,16 @@ def selftest() -> int:
                 "runs-on": "ubuntu-24.04",
                 "timeout-minutes": 10,
                 "permissions": {"contents": "read"},
+                "needs": ["publish-branch", "deploy-pages"],
                 "steps": [
                     {
                         "uses": "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
                         "with": {"persist-credentials": False},
-                    }
+                    },
+                    {
+                        "name": "audit publication",
+                        "run": 'git fetch origin refs/heads/benchmark-stats --depth=1\npython ci/benchmark_report.py validate-revision --repository . --revision FETCH_HEAD --site-dir audit/site/\nPAGES_URL="${{ needs.deploy-pages.outputs.page_url }}"\npython ci/benchmark_report.py audit-pages --site-dir audit/site/ --page-url "$PAGES_URL"',
+                    },
                 ],
             },
         },

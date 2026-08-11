@@ -118,20 +118,24 @@ jobs:
           cd rust
           MODE="${{ inputs.mode || 'full' }}"
           BLOCKS="${{ inputs.blocks || 15 }}"
+          SEED="${{ steps.seed.outputs.seed }}"
           SMOKE_FLAG=""
+          OUTPUT_DIR="$RUNNER_TEMP/benchmark-output"
+          mkdir -p "$OUTPUT_DIR"
           if [ "$MODE" = "smoke" ]; then
             SMOKE_FLAG="--reduced-smoke"
           fi
           soldr cargo run -p benchmark-suite --bin benchmark-run --release -- \
             $SMOKE_FLAG \
             --blocks "$BLOCKS" \
-            --out "$RUNNER_TEMP/raw-run.json"
+            --run-seed "$SEED" \
+            --output-dir "$OUTPUT_DIR"
       - name: validate raw run
         run: |
           set -euxo pipefail
           cd rust
           soldr cargo run -p benchmark-suite --bin benchmark-validate --release -- \
-            --input "$RUNNER_TEMP/raw-run.json" \
+            --input "${{ runner.temp }}/benchmark-output/raw-run.json" \
             --report-out "$RUNNER_TEMP/validation-report.json" \
             --latest-out "$RUNNER_TEMP/latest.json" \
             --history-row-out "$RUNNER_TEMP/history-row.json"

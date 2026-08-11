@@ -263,11 +263,7 @@ jobs:
           rm -rf ./*
           cp -r "$GITHUB_WORKSPACE/site-temp/"* .
           git add -A
-          git commit -m "benchmark-stats for run ${{ github.run_id }}
-
-        Source: ${{ github.repository }}@${{ github.sha }}
-        Run: ${{ github.run_id }}/${{ github.run_attempt }}
-        Manifest: $${MANIFEST_DIGEST}"
+          git commit -m "benchmark-stats run=${{ github.run_id }}/${{ github.run_attempt }} src=${{ github.sha }} manifest=$MANIFEST_DIGEST"
           PRIOR_SHA="${{ needs.build-and-measure.outputs.prior_branch_sha }}"
           if [ "$PRIOR_SHA" = "first-publication" ]; then
             git push origin "HEAD:$PUBLISH_REF"

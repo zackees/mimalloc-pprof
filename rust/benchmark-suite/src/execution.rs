@@ -1,7 +1,7 @@
 //! Allocator-neutral execution of one `core-throughput-v1` child request.
 
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
 
@@ -165,11 +165,43 @@ struct WorkerOutcome {
     checksum: u64,
 }
 
+/// Fixed control hooks used by the Linux external-memory sampler. The normal
+/// throughput child uses the zero-cost no-op implementation below.
+pub trait MeasurementObserver {
+    fn baseline_ready_and_wait_for_begin(&mut self) -> Result<(), String>;
+    fn workload_active(&mut self) -> Result<(), String>;
+    fn workload_drained(&mut self, outcome: &ExecutionResult) -> Result<(), String>;
+}
+
+struct NoopObserver;
+
+impl MeasurementObserver for NoopObserver {
+    fn baseline_ready_and_wait_for_begin(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn workload_active(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn workload_drained(&mut self, _outcome: &ExecutionResult) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// Execute one strict request and construct its raw response. This is the
 /// reusable entrypoint used by `benchmark-child` and native wrapper builds.
 pub fn execute_child_request<A: AllocatorAdapter>(
     adapter: &A,
     request: BenchmarkChildRequest,
+) -> Result<BenchmarkChildResponse, String> {
+    execute_child_request_with_observer(adapter, request, &mut NoopObserver)
+}
+
+pub fn execute_child_request_with_observer<A: AllocatorAdapter, O: MeasurementObserver>(
+    adapter: &A,
+    request: BenchmarkChildRequest,
+    observer: &mut O,
 ) -> Result<BenchmarkChildResponse, String> {
     request.validate()?;
     validate_linked_identity(adapter, &request)?;
@@ -206,7 +238,7 @@ pub fn execute_child_request<A: AllocatorAdapter>(
             request.workload_seed ^ 0xa076_1d64_78bd_642f,
         )
         .map_err(|error| error.to_string())?;
-        execute_for_mode(adapter, &warmup, &request.execution_mode)?;
+        execute_for_mode(adapter, &warmup, &request.execution_mode, &mut NoopObserver)?;
     }
     let warmup_ns = if request.warmup_transactions_per_worker == 0 {
         0
@@ -214,7 +246,7 @@ pub fn execute_child_request<A: AllocatorAdapter>(
         nonzero_ns(warmup_started)
     };
 
-    let outcome = execute_for_mode(adapter, &measured_cell, &request.execution_mode)?;
+    let outcome = execute_for_mode(adapter, &measured_cell, &request.execution_mode, observer)?;
     let setup_ns = request_setup_ns.saturating_add(outcome.setup_ns);
     let elapsed_ns = outcome.elapsed_ns;
 
@@ -288,19 +320,21 @@ pub fn execute_child_request<A: AllocatorAdapter>(
     Ok(response)
 }
 
-fn execute_for_mode<A: AllocatorAdapter>(
+fn execute_for_mode<A: AllocatorAdapter, O: MeasurementObserver>(
     adapter: &A,
     cell: &ScenarioCell,
     mode: &str,
+    observer: &mut O,
 ) -> Result<ExecutionResult, String> {
     match mode {
-        "normal" => execute_cell(adapter, cell),
-        "serialized-control" => execute_cell(
+        "normal" => execute_cell_with_observer(adapter, cell, observer),
+        "serialized-control" => execute_cell_with_observer(
             &SerializedAdapter {
                 inner: adapter,
                 gate: Mutex::new(()),
             },
             cell,
+            observer,
         ),
         _ => Err("unknown benchmark execution mode".into()),
     }
@@ -325,27 +359,37 @@ pub fn execute_cell<A: AllocatorAdapter>(
     adapter: &A,
     cell: &ScenarioCell,
 ) -> Result<ExecutionResult, String> {
+    execute_cell_with_observer(adapter, cell, &mut NoopObserver)
+}
+
+fn execute_cell_with_observer<A: AllocatorAdapter, O: MeasurementObserver>(
+    adapter: &A,
+    cell: &ScenarioCell,
+    observer: &mut O,
+) -> Result<ExecutionResult, String> {
     if cell.card == CardId::ThreadChurn {
-        return execute_thread_churn(adapter, cell);
+        return execute_thread_churn(adapter, cell, observer);
     }
     if matches!(
         cell.card,
         CardId::CrossThreadProducerConsumer | CardId::RandomOwnership
     ) {
-        execute_cross_thread_cell(adapter, cell)
+        execute_cross_thread_cell(adapter, cell, observer)
     } else {
-        execute_ordered_cell(adapter, cell)
+        execute_ordered_cell(adapter, cell, observer)
     }
 }
 
-fn execute_ordered_cell<A: AllocatorAdapter>(
+fn execute_ordered_cell<A: AllocatorAdapter, O: MeasurementObserver>(
     adapter: &A,
     cell: &ScenarioCell,
+    observer: &mut O,
 ) -> Result<ExecutionResult, String> {
     let setup_started = Instant::now();
     let ready_barrier = Arc::new(Barrier::new(cell.threads + 1));
     let start_barrier = Arc::new(Barrier::new(cell.threads + 1));
     let end_barrier = Arc::new(Barrier::new(cell.threads + 1));
+    let cancelled = Arc::new(AtomicBool::new(false));
     let live = Arc::new(AtomicU64::new(0));
     let peak = Arc::new(AtomicU64::new(0));
 
@@ -355,6 +399,7 @@ fn execute_ordered_cell<A: AllocatorAdapter>(
             let ready_barrier = Arc::clone(&ready_barrier);
             let start_barrier = Arc::clone(&start_barrier);
             let end_barrier = Arc::clone(&end_barrier);
+            let cancelled = Arc::clone(&cancelled);
             let live = Arc::clone(&live);
             let peak = Arc::clone(&peak);
             let slot_capacity = card(cell.card).max_live_allocations_per_worker();
@@ -366,6 +411,13 @@ fn execute_ordered_cell<A: AllocatorAdapter>(
                 let mut failure: Option<String> = None;
                 ready_barrier.wait();
                 start_barrier.wait();
+                if cancelled.load(Ordering::SeqCst) {
+                    end_barrier.wait();
+                    return Ok(WorkerOutcome {
+                        counts,
+                        checksum: observation_checksum,
+                    });
+                }
                 for operation in 0..cell.transactions_per_worker {
                     if let Err(error) =
                         cell.fill_worker_transaction(worker, operation, &mut requests)
@@ -411,6 +463,15 @@ fn execute_ordered_cell<A: AllocatorAdapter>(
         // state construction are setup, not measured work.
         ready_barrier.wait();
         let setup_ns = nonzero_ns(setup_started);
+        if let Err(error) = observer
+            .baseline_ready_and_wait_for_begin()
+            .and_then(|()| observer.workload_active())
+        {
+            cancelled.store(true, Ordering::SeqCst);
+            start_barrier.wait();
+            end_barrier.wait();
+            return Err(error);
+        }
         notify_measured_region(true);
         let measured_started = Instant::now();
         start_barrier.wait();
@@ -428,7 +489,7 @@ fn execute_ordered_cell<A: AllocatorAdapter>(
         Ok::<_, String>((outcomes, setup_ns, elapsed_ns))
     })?;
     let teardown_started = Instant::now();
-    finish_execution(
+    let outcome = finish_execution(
         cell,
         outcomes,
         &live,
@@ -436,17 +497,21 @@ fn execute_ordered_cell<A: AllocatorAdapter>(
         setup_ns,
         elapsed_ns,
         nonzero_ns(teardown_started),
-    )
+    )?;
+    observer.workload_drained(&outcome)?;
+    Ok(outcome)
 }
 
-fn execute_cross_thread_cell<A: AllocatorAdapter>(
+fn execute_cross_thread_cell<A: AllocatorAdapter, O: MeasurementObserver>(
     adapter: &A,
     cell: &ScenarioCell,
+    observer: &mut O,
 ) -> Result<ExecutionResult, String> {
     let setup_started = Instant::now();
     let ready_barrier = Arc::new(Barrier::new(cell.threads + 1));
     let start_barrier = Arc::new(Barrier::new(cell.threads + 1));
     let end_barrier = Arc::new(Barrier::new(cell.threads + 1));
+    let cancelled = Arc::new(AtomicBool::new(false));
     let operation_barrier = Arc::new(Barrier::new(cell.threads));
     let live = Arc::new(AtomicU64::new(0));
     let peak = Arc::new(AtomicU64::new(0));
@@ -462,6 +527,7 @@ fn execute_cross_thread_cell<A: AllocatorAdapter>(
             let ready_barrier = Arc::clone(&ready_barrier);
             let start_barrier = Arc::clone(&start_barrier);
             let end_barrier = Arc::clone(&end_barrier);
+            let cancelled = Arc::clone(&cancelled);
             let operation_barrier = Arc::clone(&operation_barrier);
             let live = Arc::clone(&live);
             let peak = Arc::clone(&peak);
@@ -476,6 +542,13 @@ fn execute_cross_thread_cell<A: AllocatorAdapter>(
                 let mut failure: Option<String> = None;
                 ready_barrier.wait();
                 start_barrier.wait();
+                if cancelled.load(Ordering::SeqCst) {
+                    end_barrier.wait();
+                    return Ok(WorkerOutcome {
+                        counts,
+                        checksum: observation_checksum,
+                    });
+                }
                 for operation in 0..transactions_per_worker {
                     if failure.is_none() {
                         if let Err(error) =
@@ -584,6 +657,15 @@ fn execute_cross_thread_cell<A: AllocatorAdapter>(
         }
         ready_barrier.wait();
         let setup_ns = nonzero_ns(setup_started);
+        if let Err(error) = observer
+            .baseline_ready_and_wait_for_begin()
+            .and_then(|()| observer.workload_active())
+        {
+            cancelled.store(true, Ordering::SeqCst);
+            start_barrier.wait();
+            end_barrier.wait();
+            return Err(error);
+        }
         notify_measured_region(true);
         let measured_started = Instant::now();
         start_barrier.wait();
@@ -601,7 +683,7 @@ fn execute_cross_thread_cell<A: AllocatorAdapter>(
         Ok::<_, String>((outcomes, setup_ns, elapsed_ns))
     })?;
     let teardown_started = Instant::now();
-    finish_execution(
+    let outcome = finish_execution(
         cell,
         outcomes,
         &live,
@@ -609,12 +691,15 @@ fn execute_cross_thread_cell<A: AllocatorAdapter>(
         setup_ns,
         elapsed_ns,
         nonzero_ns(teardown_started),
-    )
+    )?;
+    observer.workload_drained(&outcome)?;
+    Ok(outcome)
 }
 
-fn execute_thread_churn<A: AllocatorAdapter>(
+fn execute_thread_churn<A: AllocatorAdapter, O: MeasurementObserver>(
     adapter: &A,
     cell: &ScenarioCell,
+    observer: &mut O,
 ) -> Result<ExecutionResult, String> {
     let setup_started = Instant::now();
     let mut request_buffers = (0..cell.threads)
@@ -631,6 +716,8 @@ fn execute_thread_churn<A: AllocatorAdapter>(
 
     let setup_ns = nonzero_ns(setup_started);
     // Spawning each generation is part of this card's declared workload.
+    observer.baseline_ready_and_wait_for_begin()?;
+    observer.workload_active()?;
     let measured_started = Instant::now();
     for operation in 0..cell.transactions_per_worker {
         for (worker, requests) in request_buffers.iter_mut().enumerate() {
@@ -691,7 +778,7 @@ fn execute_thread_churn<A: AllocatorAdapter>(
     }
     let elapsed_ns = nonzero_ns(measured_started);
     let teardown_started = Instant::now();
-    finish_execution(
+    let outcome = finish_execution(
         cell,
         totals,
         &live,
@@ -699,7 +786,9 @@ fn execute_thread_churn<A: AllocatorAdapter>(
         setup_ns,
         elapsed_ns,
         nonzero_ns(teardown_started),
-    )
+    )?;
+    observer.workload_drained(&outcome)?;
+    Ok(outcome)
 }
 
 fn finish_execution(
@@ -1072,6 +1161,98 @@ fn nonzero_ns(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PanicAdapter;
+
+    impl AllocatorAdapter for PanicAdapter {
+        fn allocator_id(&self) -> &str {
+            "panic-adapter"
+        }
+
+        fn allocator_version(&self) -> &str {
+            "test"
+        }
+
+        fn source_sha(&self) -> &str {
+            "0000000000000000000000000000000000000000"
+        }
+
+        fn library_sha256(&self) -> &str {
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+
+        fn alloc(&self, _size: usize) -> Result<NonNull<u8>, String> {
+            panic!("cancelled workers must not allocate")
+        }
+
+        fn calloc(&self, _count: usize, _size: usize) -> Result<NonNull<u8>, String> {
+            panic!("cancelled workers must not allocate")
+        }
+
+        unsafe fn realloc(
+            &self,
+            _pointer: NonNull<u8>,
+            _size: usize,
+        ) -> Result<NonNull<u8>, String> {
+            panic!("cancelled workers must not reallocate")
+        }
+
+        fn aligned_alloc(&self, _alignment: usize, _size: usize) -> Result<NonNull<u8>, String> {
+            panic!("cancelled workers must not allocate")
+        }
+
+        unsafe fn free(&self, _pointer: NonNull<u8>) {
+            panic!("cancelled workers must not free")
+        }
+    }
+
+    struct FailingObserver;
+
+    impl MeasurementObserver for FailingObserver {
+        fn baseline_ready_and_wait_for_begin(&mut self) -> Result<(), String> {
+            Err("planted observer failure".into())
+        }
+
+        fn workload_active(&mut self) -> Result<(), String> {
+            panic!("active must not follow a failed baseline callback")
+        }
+
+        fn workload_drained(&mut self, _outcome: &ExecutionResult) -> Result<(), String> {
+            panic!("drained must not follow a failed baseline callback")
+        }
+    }
+
+    #[test]
+    fn observer_failure_releases_ordered_and_cross_thread_workers() {
+        for card in [CardId::LargeObjects, CardId::CrossThreadProducerConsumer] {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let point = if card == CardId::LargeObjects {
+                    ThreadPoint::One
+                } else {
+                    ThreadPoint::PhysicalCores
+                };
+                let cell = ScenarioCell::new(
+                    card,
+                    point,
+                    Topology {
+                        physical_cores: 2,
+                        logical_cores: 2,
+                    },
+                    1,
+                    1,
+                )
+                .unwrap();
+                let result = execute_cell_with_observer(&PanicAdapter, &cell, &mut FailingObserver);
+                sender.send(result).unwrap();
+            });
+            let result = receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("observer failure must not strand workers at a barrier");
+            assert_eq!(result.unwrap_err(), "planted observer failure");
+            handle.join().unwrap();
+        }
+    }
 
     #[test]
     fn large_objects_touch_every_cache_line_and_include_the_final_byte() {

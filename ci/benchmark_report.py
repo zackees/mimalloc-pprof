@@ -9,6 +9,7 @@ validator and rejects raw or aggregate-only inputs.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import html
 import json
@@ -69,6 +70,7 @@ TOP_LEVEL_FIELDS = {
     "reproduction_command",
     "actions_run_url",
 }
+OPTIONAL_TOP_LEVEL_FIELDS = {"memory"}
 HISTORY_FIELDS = {
     "history_schema_version",
     "statistics_version",
@@ -80,6 +82,7 @@ HISTORY_FIELDS = {
     "absolute_summaries",
     "paired_summaries",
 }
+OPTIONAL_HISTORY_FIELDS = {"memory"}
 RUN_FIELDS = {
     "source_repository",
     "source_sha",
@@ -149,10 +152,160 @@ ROLES = {
     "history.jsonl": "bounded-compatible-history",
     "benchmark-throughput.png": "throughput-chart",
     "benchmark-history.png": "history-chart",
-    "benchmark-memory.png": "pending-memory-panel",
+    "benchmark-memory.png": "memory-panel",
     "benchmark-latency.png": "pending-latency-panel",
     "benchmark-scaling.png": "pending-scaling-panel",
     "benchmark-pprof-tax.png": "pending-pprof-tax-panel",
+}
+
+MEMORY_SCHEMA = "linux-process-memory-v1"
+MEMORY_METRICS = (
+    "sampled-peak-rss-bytes",
+    "post-drain-rss-100ms-bytes",
+    "post-drain-rss-1s-bytes",
+    "post-drain-rss-5s-bytes",
+    "fragmentation-proxy",
+)
+MEMORY_CELLS = (
+    ("large-objects", "1"),
+    ("large-objects", "2"),
+    ("sawtooth-retain-drain", "1"),
+    ("sawtooth-retain-drain", "physical-core"),
+    ("small-log-mixed", "physical-core"),
+    ("cross-thread-producer-consumer", "physical-core"),
+    ("thread-churn", "physical-core"),
+)
+MEMORY_REPORT_FIELDS = {
+    "metric_schema_version",
+    "status",
+    "invalid_reason",
+    "metric_comparison_key",
+    "run",
+    "runner",
+    "sampling_target_interval_ns",
+    "purge_policy",
+    "units",
+    "direction",
+    "informational",
+    "methodology",
+    "absolute_summaries",
+    "paired_summaries",
+    "raw_samples",
+}
+MEMORY_METHODOLOGY = {
+    "rss_source": "/proc/<pid>/smaps_rollup Rss, parsed as integer kB * 1024",
+    "hwm_source": "/proc/<pid>/status VmHWM, parsed as integer kB * 1024; cross-check only",
+    "baseline_definition": "external RSS/HWM after child warmup and baseline-ready, before begin",
+    "sampled_peak_definition": "maximum external smaps_rollup RSS timestamped inside workload-active..workload-drained",
+    "post_drain_definition": "external smaps_rollup RSS at >=100ms, >=1s, and >=5s after workload-drained",
+    "fragmentation_formula": "(sampled_peak_rss_bytes - baseline_rss_bytes) / peak_live_requested_bytes; both operands must be positive",
+    "hwm_discrepancy_tolerance": "flag when abs(sampled RSS delta - VmHWM delta) > max(8 MiB, 20% of the larger positive delta)",
+    "page_touch_contract": "every allocation touches deterministic boundary bytes and at least one byte per OS page",
+    "purge_policy": "natural allocator behavior only; no allocator-specific purge call",
+}
+MEMORY_HISTORY_FIELDS = MEMORY_REPORT_FIELDS - {"invalid_reason", "runner", "raw_samples"} | {
+    "runner_fingerprint_sha256"
+}
+MEMORY_SAMPLE_FIELDS = {
+    "metric_schema_version",
+    "block_id",
+    "ordinal",
+    "workload_seed",
+    "allocator_id",
+    "allocator_source_sha",
+    "child_binary_sha256",
+    "scenario_id",
+    "thread_point",
+    "thread_count",
+    "baseline_ready_ns",
+    "workload_active_ns",
+    "workload_drained_ns",
+    "post_drain_sample_100ms_ns",
+    "post_drain_sample_1s_ns",
+    "post_drain_sample_5s_ns",
+    "sampler_pid",
+    "sampled_pid",
+    "baseline_rss_bytes",
+    "baseline_hwm_bytes",
+    "sampled_peak_rss_bytes",
+    "kernel_peak_hwm_bytes",
+    "peak_live_requested_bytes",
+    "post_drain_rss_100ms_bytes",
+    "post_drain_rss_1s_bytes",
+    "post_drain_rss_5s_bytes",
+    "sampled_peak_rss_delta_bytes",
+    "post_drain_rss_delta_100ms_bytes",
+    "post_drain_rss_delta_1s_bytes",
+    "post_drain_rss_delta_5s_bytes",
+    "fragmentation_proxy",
+    "hwm_discrepancy",
+    "hwm_tolerance_bytes",
+    "sampling",
+    "timeline",
+    "environment",
+    "child_sample",
+}
+CHILD_SAMPLE_FIELDS = {
+    "schema_version",
+    "suite_version",
+    "run_kind",
+    "execution_mode",
+    "run_seed",
+    "block_id",
+    "ordinal",
+    "workload_seed",
+    "allocator_id",
+    "allocator_version",
+    "allocator_source_sha",
+    "allocator_library_sha256",
+    "child_binary_sha256",
+    "scenario_id",
+    "scenario_version",
+    "thread_point",
+    "thread_count",
+    "operation_unit",
+    "operation_count",
+    "requested_transactions",
+    "completed_transactions",
+    "allocation_calls",
+    "calloc_calls",
+    "aligned_allocation_calls",
+    "free_calls",
+    "realloc_calls",
+    "setup_ns",
+    "warmup_ns",
+    "elapsed_ns",
+    "teardown_ns",
+    "throughput_operations_per_second",
+    "checksum",
+    "peak_live_requested_bytes",
+    "timed_out",
+    "crashed",
+    "exit_code",
+    "signal",
+    "runner",
+    "toolchain",
+    "reproduction_command",
+}
+CHILD_RUNNER_FIELDS = {"os", "architecture", "physical_cores", "logical_cores"}
+CHILD_TOOLCHAIN_FIELDS = {"rustc", "target", "compiler", "linker"}
+CHILD_BLOCK_IDENTITY_FIELDS = {
+    "run_seed",
+    "workload_seed",
+    "scenario_id",
+    "scenario_version",
+    "thread_point",
+    "thread_count",
+    "operation_unit",
+    "operation_count",
+    "requested_transactions",
+    "completed_transactions",
+    "allocation_calls",
+    "calloc_calls",
+    "aligned_allocation_calls",
+    "free_calls",
+    "realloc_calls",
+    "checksum",
 }
 
 
@@ -210,6 +363,16 @@ def exact_fields(value: Mapping[str, object], fields: set[str], label: str) -> N
         fail(
             f"{label}: fields mismatch; missing={sorted(fields - actual)} unexpected={sorted(actual - fields)}"
         )
+
+
+def exact_fields_with_optional(
+    value: Mapping[str, object], required: set[str], optional: set[str], label: str
+) -> None:
+    actual = set(value)
+    missing = required - actual
+    unexpected = actual - required - optional
+    if missing or unexpected:
+        fail(f"{label}: fields mismatch; missing={sorted(missing)} unexpected={sorted(unexpected)}")
 
 
 def reject_nonfinite(value: object, label: str) -> None:
@@ -491,8 +654,449 @@ def validate_paired(record: object, label: str) -> dict[str, object]:
     return item
 
 
+def signed_int_value(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        fail(f"{label}: expected signed integer")
+    return value
+
+
+def validate_memory_environment(value: object, label: str) -> dict[str, object]:
+    environment = object_value(value, label)
+    exact_fields(
+        environment,
+        {
+            "page_size_bytes",
+            "kernel",
+            "transparent_hugepage",
+            "cgroup_memory_max",
+            "cgroup_memory_high",
+            "hosted_runner",
+            "purge_policy",
+            "allocator_runtime_options",
+        },
+        label,
+    )
+    page_size = int_value(environment.get("page_size_bytes"), f"{label}.page_size_bytes", 1)
+    if page_size & (page_size - 1):
+        fail(f"{label}.page_size_bytes: expected a power of two")
+    for field in ("kernel", "transparent_hugepage", "cgroup_memory_max", "cgroup_memory_high"):
+        string_value(environment.get(field), f"{label}.{field}")
+    if not isinstance(environment.get("hosted_runner"), bool):
+        fail(f"{label}.hosted_runner: expected boolean")
+    if environment.get("purge_policy") != "natural-only":
+        fail(f"{label}.purge_policy: allocator-specific purge is forbidden")
+    options = object_value(
+        environment.get("allocator_runtime_options"), f"{label}.allocator_runtime_options"
+    )
+    exact_fields(
+        options, {"MIMALLOC_MEMORY_EVENTS", "MIMALLOC_PROF"}, f"{label}.allocator_runtime_options"
+    )
+    if options != {"MIMALLOC_MEMORY_EVENTS": "0", "MIMALLOC_PROF": "0"}:
+        fail(f"{label}.allocator_runtime_options: profiler and memory events must be disabled")
+    return environment
+
+
+def validate_memory_sample(value: object, label: str) -> dict[str, object]:
+    sample = object_value(value, label)
+    exact_fields(sample, MEMORY_SAMPLE_FIELDS, label)
+    if sample.get("metric_schema_version") != MEMORY_SCHEMA:
+        fail(f"{label}.metric_schema_version: unsupported memory metric")
+    allocator = string_value(sample.get("allocator_id"), f"{label}.allocator_id")
+    if allocator not in ALLOCATOR_IDS:
+        fail(f"{label}.allocator_id: unknown allocator")
+    if not HEX_40.fullmatch(
+        string_value(sample.get("allocator_source_sha"), f"{label}.allocator_source_sha")
+    ):
+        fail(f"{label}.allocator_source_sha: invalid digest")
+    comparison_digest(sample.get("child_binary_sha256"), f"{label}.child_binary_sha256")
+    cell = (
+        string_value(sample.get("scenario_id"), f"{label}.scenario_id"),
+        string_value(sample.get("thread_point"), f"{label}.thread_point"),
+    )
+    if cell not in MEMORY_CELLS:
+        fail(f"{label}: undeclared memory scenario/thread cell")
+    for field in (
+        "block_id",
+        "workload_seed",
+        "thread_count",
+        "baseline_ready_ns",
+        "workload_active_ns",
+        "workload_drained_ns",
+        "post_drain_sample_100ms_ns",
+        "post_drain_sample_1s_ns",
+        "post_drain_sample_5s_ns",
+        "sampler_pid",
+        "sampled_pid",
+        "baseline_rss_bytes",
+        "baseline_hwm_bytes",
+        "sampled_peak_rss_bytes",
+        "kernel_peak_hwm_bytes",
+        "peak_live_requested_bytes",
+        "post_drain_rss_100ms_bytes",
+        "post_drain_rss_1s_bytes",
+        "post_drain_rss_5s_bytes",
+        "hwm_tolerance_bytes",
+    ):
+        int_value(
+            sample.get(field),
+            f"{label}.{field}",
+            0 if field in ("block_id", "workload_seed") else 1,
+        )
+    ordinal = int_value(sample.get("ordinal"), f"{label}.ordinal")
+    if ordinal > 3:
+        fail(f"{label}.ordinal: expected 0..3")
+    if sample["sampler_pid"] == sample["sampled_pid"]:
+        fail(f"{label}: sampler must target a distinct child PID")
+    baseline_ready = cast(int, sample["baseline_ready_ns"])
+    active = cast(int, sample["workload_active_ns"])
+    drained = cast(int, sample["workload_drained_ns"])
+    if not baseline_ready < active < drained:
+        fail(f"{label}: control timestamps are out of order")
+    for field, target in (
+        ("post_drain_sample_100ms_ns", 100_000_000),
+        ("post_drain_sample_1s_ns", 1_000_000_000),
+        ("post_drain_sample_5s_ns", 5_000_000_000),
+    ):
+        observed = cast(int, sample[field]) - drained
+        if observed < target or observed > target + 100_000_000:
+            fail(f"{label}.{field}: outside declared post-drain window")
+    baseline_rss = cast(int, sample["baseline_rss_bytes"])
+    derived = {
+        "sampled_peak_rss_delta_bytes": cast(int, sample["sampled_peak_rss_bytes"]) - baseline_rss,
+        "post_drain_rss_delta_100ms_bytes": cast(int, sample["post_drain_rss_100ms_bytes"])
+        - baseline_rss,
+        "post_drain_rss_delta_1s_bytes": cast(int, sample["post_drain_rss_1s_bytes"])
+        - baseline_rss,
+        "post_drain_rss_delta_5s_bytes": cast(int, sample["post_drain_rss_5s_bytes"])
+        - baseline_rss,
+    }
+    for field, expected in derived.items():
+        if signed_int_value(sample.get(field), f"{label}.{field}") != expected:
+            fail(f"{label}.{field}: inconsistent signed delta")
+    if derived["sampled_peak_rss_delta_bytes"] <= 0:
+        fail(
+            f"{label}.sampled_peak_rss_delta_bytes: fragmentation denominator delta must be positive"
+        )
+    expected_ratio = derived["sampled_peak_rss_delta_bytes"] / cast(
+        int, sample["peak_live_requested_bytes"]
+    )
+    ratio = float_value(sample.get("fragmentation_proxy"), f"{label}.fragmentation_proxy", True)
+    if not math.isclose(ratio, expected_ratio, rel_tol=1e-12):
+        fail(f"{label}.fragmentation_proxy: inconsistent ratio")
+    if not isinstance(sample.get("hwm_discrepancy"), bool):
+        fail(f"{label}.hwm_discrepancy: expected boolean")
+    hwm_delta = cast(int, sample["kernel_peak_hwm_bytes"]) - cast(int, sample["baseline_hwm_bytes"])
+    tolerance = max(
+        8 * 1024 * 1024,
+        max(derived["sampled_peak_rss_delta_bytes"], hwm_delta, 0) // 5,
+    )
+    discrepancy = abs(derived["sampled_peak_rss_delta_bytes"] - hwm_delta) > tolerance
+    if sample["hwm_tolerance_bytes"] != tolerance or sample["hwm_discrepancy"] != discrepancy:
+        fail(f"{label}: inconsistent VmHWM discrepancy flag or tolerance")
+    sampling = object_value(sample.get("sampling"), f"{label}.sampling")
+    exact_fields(
+        sampling,
+        {
+            "target_interval_ns",
+            "sample_count",
+            "minimum_interval_ns",
+            "median_interval_ns",
+            "p95_interval_ns",
+            "maximum_interval_ns",
+        },
+        f"{label}.sampling",
+    )
+    if (
+        int_value(sampling.get("target_interval_ns"), f"{label}.sampling.target_interval_ns")
+        != 5_000_000
+    ):
+        fail(f"{label}.sampling.target_interval_ns: expected 5 ms")
+    timeline = list_value(sample.get("timeline"), f"{label}.timeline")
+    if int_value(sampling.get("sample_count"), f"{label}.sampling.sample_count", 2) != len(
+        timeline
+    ):
+        fail(f"{label}.sampling.sample_count: does not match timeline")
+    timestamps: list[int] = []
+    rss_values: list[int] = []
+    for index, point_value in enumerate(timeline):
+        point = object_value(point_value, f"{label}.timeline[{index}]")
+        exact_fields(point, {"elapsed_ns", "rss_bytes"}, f"{label}.timeline[{index}]")
+        timestamps.append(
+            int_value(point.get("elapsed_ns"), f"{label}.timeline[{index}].elapsed_ns", 1)
+        )
+        rss_values.append(
+            int_value(point.get("rss_bytes"), f"{label}.timeline[{index}].rss_bytes", 1)
+        )
+    intervals = [right - left for left, right in zip(timestamps, timestamps[1:])]
+    if timestamps[0] < active or timestamps[-1] > drained or any(value <= 0 for value in intervals):
+        fail(f"{label}.timeline: timestamps must be strictly inside the workload window")
+    if timestamps[0] - active > 100_000_000 or drained - timestamps[-1] > 100_000_000:
+        fail(f"{label}.timeline: sampler missed a workload edge")
+    if max(intervals) > 100_000_000 or sampling.get("maximum_interval_ns") != max(intervals):
+        fail(f"{label}.timeline: sampler interval bound/summary mismatch")
+    ordered_intervals = sorted(intervals)
+
+    def interval_quantile(numerator: int, denominator: int) -> int:
+        return ordered_intervals[(len(ordered_intervals) - 1) * numerator // denominator]
+
+    expected_sampling = {
+        "target_interval_ns": 5_000_000,
+        "sample_count": len(timeline),
+        "minimum_interval_ns": ordered_intervals[0],
+        "median_interval_ns": interval_quantile(1, 2),
+        "p95_interval_ns": interval_quantile(95, 100),
+        "maximum_interval_ns": ordered_intervals[-1],
+    }
+    if sampling != expected_sampling:
+        fail(f"{label}.sampling: interval distribution does not match timeline")
+    if max(rss_values) != sample["sampled_peak_rss_bytes"]:
+        fail(f"{label}.sampled_peak_rss_bytes: does not match timeline")
+    validate_memory_environment(sample.get("environment"), f"{label}.environment")
+    child = object_value(sample.get("child_sample"), f"{label}.child_sample")
+    exact_fields(child, CHILD_SAMPLE_FIELDS, f"{label}.child_sample")
+    if (
+        child.get("schema_version") != RAW_SCHEMA
+        or child.get("suite_version") != SUITE_VERSION
+        or child.get("scenario_version") != SUITE_VERSION
+        or child.get("run_kind") != "headline"
+        or child.get("execution_mode") != "normal"
+        or int_value(child.get("run_seed"), f"{label}.child_sample.run_seed", 1) == 0
+        or child.get("timed_out") is not False
+        or child.get("crashed") is not False
+        or child.get("exit_code") != 0
+        or child.get("signal") is not None
+    ):
+        fail(f"{label}.child_sample: invalid protocol, run mode, or process result")
+    for field in (
+        "operation_count",
+        "requested_transactions",
+        "completed_transactions",
+        "free_calls",
+        "warmup_ns",
+        "elapsed_ns",
+        "checksum",
+        "peak_live_requested_bytes",
+    ):
+        int_value(child.get(field), f"{label}.child_sample.{field}", 1)
+    for field in (
+        "allocation_calls",
+        "calloc_calls",
+        "aligned_allocation_calls",
+        "realloc_calls",
+        "setup_ns",
+        "teardown_ns",
+    ):
+        int_value(child.get(field), f"{label}.child_sample.{field}")
+    if child["completed_transactions"] != child["requested_transactions"]:
+        fail(f"{label}.child_sample: incomplete transactions")
+    float_value(
+        child.get("throughput_operations_per_second"),
+        f"{label}.child_sample.throughput_operations_per_second",
+        True,
+    )
+    for field in (
+        "allocator_version",
+        "operation_unit",
+        "reproduction_command",
+    ):
+        string_value(child.get(field), f"{label}.child_sample.{field}")
+    for field, pattern in (
+        ("allocator_source_sha", HEX_40),
+        ("allocator_library_sha256", HEX_64),
+        ("child_binary_sha256", HEX_64),
+    ):
+        if not pattern.fullmatch(string_value(child.get(field), f"{label}.child_sample.{field}")):
+            fail(f"{label}.child_sample.{field}: invalid digest")
+    child_runner = object_value(child.get("runner"), f"{label}.child_sample.runner")
+    exact_fields(child_runner, CHILD_RUNNER_FIELDS, f"{label}.child_sample.runner")
+    for field in ("os", "architecture"):
+        string_value(child_runner.get(field), f"{label}.child_sample.runner.{field}")
+    for field in ("physical_cores", "logical_cores"):
+        int_value(child_runner.get(field), f"{label}.child_sample.runner.{field}", 1)
+    child_toolchain = object_value(child.get("toolchain"), f"{label}.child_sample.toolchain")
+    exact_fields(child_toolchain, CHILD_TOOLCHAIN_FIELDS, f"{label}.child_sample.toolchain")
+    for field in CHILD_TOOLCHAIN_FIELDS:
+        string_value(child_toolchain.get(field), f"{label}.child_sample.toolchain.{field}")
+    if (
+        child.get("allocator_id") != allocator
+        or child.get("allocator_source_sha") != sample["allocator_source_sha"]
+        or child.get("child_binary_sha256") != sample["child_binary_sha256"]
+        or child.get("scenario_id") != cell[0]
+        or child.get("thread_point") != cell[1]
+        or child.get("thread_count") != sample["thread_count"]
+        or child.get("block_id") != sample["block_id"]
+        or child.get("ordinal") != sample["ordinal"]
+        or child.get("workload_seed") != sample["workload_seed"]
+        or child.get("peak_live_requested_bytes") != sample["peak_live_requested_bytes"]
+    ):
+        fail(f"{label}.child_sample: child workload oracle mismatch")
+    return sample
+
+
+def validate_memory_report(
+    value: object, label: str, *, compact: bool = False
+) -> dict[str, object]:
+    report = object_value(value, label)
+    exact_fields(report, MEMORY_HISTORY_FIELDS if compact else MEMORY_REPORT_FIELDS, label)
+    if report.get("metric_schema_version") != MEMORY_SCHEMA or report.get("status") != "complete":
+        fail(f"{label}: memory report must be complete {MEMORY_SCHEMA}")
+    if not compact and report.get("invalid_reason") is not None:
+        fail(f"{label}.invalid_reason: complete report requires null")
+    comparison_digest(report.get("metric_comparison_key"), f"{label}.metric_comparison_key")
+    validate_run(report.get("run"), f"{label}.run")
+    runner: dict[str, object] | None = None
+    runner_class = None
+    if compact:
+        comparison_digest(
+            report.get("runner_fingerprint_sha256"), f"{label}.runner_fingerprint_sha256"
+        )
+    else:
+        runner = validate_runner(report.get("runner"), f"{label}.runner")
+        runner_class = runner["runner_class"]
+    if report.get("sampling_target_interval_ns") != 5_000_000:
+        fail(f"{label}.sampling_target_interval_ns: expected 5 ms")
+    if report.get("purge_policy") != "natural-only":
+        fail(f"{label}.purge_policy: explicit purge is forbidden")
+    units = object_value(report.get("units"), f"{label}.units")
+    exact_fields(units, set(MEMORY_METRICS), f"{label}.units")
+    expected_units = {
+        metric: "ratio" if metric == "fragmentation-proxy" else "bytes" for metric in MEMORY_METRICS
+    }
+    if (
+        units != expected_units
+        or report.get("direction") != "lower-is-better"
+        or report.get("informational") is not True
+    ):
+        fail(f"{label}: invalid units, direction, or hosted-runner interpretation")
+    methodology = object_value(report.get("methodology"), f"{label}.methodology")
+    exact_fields(methodology, set(MEMORY_METHODOLOGY), f"{label}.methodology")
+    if methodology != MEMORY_METHODOLOGY:
+        fail(f"{label}.methodology: unsupported Linux process-memory contract")
+    absolute = [
+        validate_absolute(item, f"{label}.absolute_summaries[{index}]")
+        for index, item in enumerate(
+            list_value(report.get("absolute_summaries"), f"{label}.absolute_summaries")
+        )
+    ]
+    paired = [
+        validate_paired(item, f"{label}.paired_summaries[{index}]")
+        for index, item in enumerate(
+            list_value(report.get("paired_summaries"), f"{label}.paired_summaries")
+        )
+    ]
+    expected_absolute = {
+        (scenario, point, metric, allocator)
+        for scenario, point in MEMORY_CELLS
+        for metric in MEMORY_METRICS
+        for allocator in ALLOCATOR_IDS
+    }
+    actual_absolute = {
+        (item["scenario_id"], item["thread_point"], item["metric_id"], item["allocator_id"])
+        for item in absolute
+        if item.get("direction") == "lower-is-better"
+    }
+    expected_paired = {
+        (scenario, point, metric, allocator)
+        for scenario, point in MEMORY_CELLS
+        for metric in MEMORY_METRICS
+        for allocator in ALLOCATOR_IDS
+        if allocator != "upstream-mimalloc"
+    }
+    actual_paired = {
+        (
+            item["scenario_id"],
+            item["thread_point"],
+            item["metric_id"],
+            object_value(item["summary"], "memory paired summary")["candidate_id"],
+        )
+        for item in paired
+        if object_value(item["summary"], "memory paired summary").get("direction")
+        == "lower-is-better"
+    }
+    if (
+        len(absolute) != len(expected_absolute)
+        or len(paired) != len(expected_paired)
+        or actual_absolute != expected_absolute
+        or actual_paired != expected_paired
+        or any(item.get("direction") != "lower-is-better" for item in absolute)
+        or any(
+            object_value(item["summary"], "memory paired summary").get("direction")
+            != "lower-is-better"
+            for item in paired
+        )
+    ):
+        fail(f"{label}: incomplete or duplicate memory summary matrix")
+    if compact:
+        return report
+    raw = [
+        validate_memory_sample(item, f"{label}.raw_samples[{index}]")
+        for index, item in enumerate(list_value(report.get("raw_samples"), f"{label}.raw_samples"))
+    ]
+    groups: dict[tuple[object, object, object], list[dict[str, object]]] = {}
+    first_environment: dict[str, object] | None = None
+    run_seeds: set[object] = set()
+    allocator_identities: dict[object, tuple[object, ...]] = {}
+    for sample in raw:
+        groups.setdefault(
+            (sample["scenario_id"], sample["thread_point"], sample["block_id"]), []
+        ).append(sample)
+        environment = object_value(sample["environment"], "memory environment")
+        if first_environment is None:
+            first_environment = environment
+        elif environment != first_environment:
+            fail(f"{label}: mixed memory environments are not comparable")
+        if runner_class is not None and environment["hosted_runner"] != (
+            runner_class == "github-hosted"
+        ):
+            fail(f"{label}: hosted-runner label disagrees with runner metadata")
+        child = object_value(sample["child_sample"], "memory child sample")
+        run_seeds.add(child["run_seed"])
+        child_runner = object_value(child["runner"], "memory child runner")
+        if runner is not None and child_runner != {
+            "os": runner["os"],
+            "architecture": runner["architecture"],
+            "physical_cores": runner["physical_cores"],
+            "logical_cores": runner["logical_cores"],
+        }:
+            fail(f"{label}: child runner contradicts memory runner metadata")
+        identity = (
+            child["allocator_version"],
+            child["allocator_source_sha"],
+            child["allocator_library_sha256"],
+            child["child_binary_sha256"],
+        )
+        prior_identity = allocator_identities.setdefault(sample["allocator_id"], identity)
+        if prior_identity != identity:
+            fail(f"{label}: allocator identity changed within the memory run")
+    if len(run_seeds) != 1 or set(allocator_identities) != set(ALLOCATOR_IDS):
+        fail(f"{label}: memory run seed or allocator provenance is incomplete")
+    blocks_by_cell: dict[tuple[object, object], set[object]] = {}
+    for (scenario, point, block), samples in groups.items():
+        ids = {sample["allocator_id"] for sample in samples}
+        ordinals = {sample["ordinal"] for sample in samples}
+        seeds = {sample["workload_seed"] for sample in samples}
+        if (
+            len(samples) != 4
+            or ids != set(ALLOCATOR_IDS)
+            or ordinals != {0, 1, 2, 3}
+            or len(seeds) != 1
+        ):
+            fail(f"{label}: incomplete memory pair for {scenario}/{point}/block-{block}")
+        first_child = object_value(samples[0]["child_sample"], "memory paired child")
+        for sample in samples[1:]:
+            child = object_value(sample["child_sample"], "memory paired child")
+            if any(child[field] != first_child[field] for field in CHILD_BLOCK_IDENTITY_FIELDS):
+                fail(f"{label}: mismatched workload identity within a complete memory pair")
+        blocks_by_cell.setdefault((scenario, point), set()).add(block)
+    if set(blocks_by_cell) != set(MEMORY_CELLS) or any(
+        len(blocks) < 15 for blocks in blocks_by_cell.values()
+    ):
+        fail(f"{label}: every memory cell requires at least 15 complete paired blocks")
+    return report
+
+
 def validate_latest(latest: dict[str, object], label: str) -> None:
-    exact_fields(latest, TOP_LEVEL_FIELDS, label)
+    exact_fields_with_optional(latest, TOP_LEVEL_FIELDS, OPTIONAL_TOP_LEVEL_FIELDS, label)
     versions = {
         "latest_schema_version": LATEST_SCHEMA,
         "raw_schema_version": RAW_SCHEMA,
@@ -631,9 +1235,31 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
         or methodology.get("informational") is not True
     ):
         fail(f"{label}.methodology: unsupported methodology contract")
+    memory = latest.get("memory")
+    if memory is not None:
+        memory_report = validate_memory_report(memory, f"{label}.memory")
+        expected_sources = {
+            object_value(value, f"{label}.allocators")["allocator_id"]: object_value(
+                value, f"{label}.allocators"
+            )["source_sha"]
+            for value in allocators
+        }
+        observed_sources = {
+            object_value(value, f"{label}.memory.raw_samples")["allocator_id"]: object_value(
+                value, f"{label}.memory.raw_samples"
+            )["allocator_source_sha"]
+            for value in list_value(memory_report["raw_samples"], f"{label}.memory.raw_samples")
+        }
+        if observed_sources != expected_sources:
+            fail(f"{label}.memory: allocator source pins differ from the core run")
     pending = list_value(latest.get("pending_metrics"), f"{label}.pending_metrics")
-    if len(pending) != 4:
-        fail(f"{label}.pending_metrics: expected four explicit pending metrics")
+    expected_pending = (
+        ("latency", "scaling", "pprof-tax")
+        if memory is not None
+        else ("memory", "latency", "scaling", "pprof-tax")
+    )
+    if len(pending) != len(expected_pending):
+        fail(f"{label}.pending_metrics: does not match collected optional metrics")
     for index, value in enumerate(pending):
         item = object_value(value, f"{label}.pending_metrics[{index}]")
         exact_fields(
@@ -650,12 +1276,7 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
         )
         if any(isinstance(item.get(field), (int, float)) for field in item):
             fail(f"{label}.pending_metrics[{index}]: pending metrics cannot contain numbers")
-    if tuple(object_value(item, "pending")["metric_id"] for item in pending) != (
-        "memory",
-        "latency",
-        "scaling",
-        "pprof-tax",
-    ):
+    if tuple(object_value(item, "pending")["metric_id"] for item in pending) != expected_pending:
         fail(f"{label}.pending_metrics: unexpected metric IDs or order")
     urls = object_value(latest.get("canonical_urls"), f"{label}.canonical_urls")
     exact_fields(
@@ -686,12 +1307,14 @@ def compact_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def history_row(latest: dict[str, object]) -> dict[str, object]:
+def history_row(
+    latest: dict[str, object], *, include_optional_metrics: bool = True
+) -> dict[str, object]:
     allocators = [
         object_value(value, "latest.allocators")
         for value in list_value(latest["allocators"], "latest.allocators")
     ]
-    return {
+    row: dict[str, object] = {
         "history_schema_version": HISTORY_SCHEMA,
         "statistics_version": STATISTICS_VERSION,
         "suite_version": SUITE_VERSION,
@@ -711,11 +1334,20 @@ def history_row(latest: dict[str, object]) -> dict[str, object]:
         "absolute_summaries": latest["absolute_summaries"],
         "paired_summaries": latest["paired_summaries"],
     }
+    if include_optional_metrics and "memory" in latest:
+        memory = validate_memory_report(latest["memory"], "latest.memory")
+        runner = object_value(memory["runner"], "latest.memory.runner")
+        row["memory"] = {
+            key: value
+            for key, value in memory.items()
+            if key not in {"invalid_reason", "runner", "raw_samples"}
+        } | {"runner_fingerprint_sha256": runner["fingerprint_sha256"]}
+    return row
 
 
 def validate_history_row(value: object, label: str) -> dict[str, object]:
     row = object_value(value, label)
-    exact_fields(row, HISTORY_FIELDS, label)
+    exact_fields_with_optional(row, HISTORY_FIELDS, OPTIONAL_HISTORY_FIELDS, label)
     if row.get("history_schema_version") != HISTORY_SCHEMA:
         fail(f"{label}.history_schema_version: incompatible schema")
     if (
@@ -767,6 +1399,8 @@ def validate_history_row(value: object, label: str) -> dict[str, object]:
         validate_absolute(item, f"{label}.absolute_summaries[{index}]")
     for index, item in enumerate(paired):
         validate_paired(item, f"{label}.paired_summaries[{index}]")
+    if "memory" in row:
+        validate_memory_report(row["memory"], f"{label}.memory", compact=True)
     return row
 
 
@@ -814,7 +1448,21 @@ def history_sort_key(row: Mapping[str, object]) -> tuple[datetime, str, int, str
 def merge_history(
     rows: list[dict[str, object]], current: dict[str, object]
 ) -> list[dict[str, object]]:
-    combined = [*rows, current]
+    current_run = object_value(current["run"], "current history run")
+    current_identity = (current_run["run_id"], current_run["run_attempt"])
+    combined = list(rows)
+    for index, row in enumerate(combined):
+        run = object_value(row["run"], "history run")
+        if (run["run_id"], run["run_attempt"]) != current_identity:
+            continue
+        previous_base = {key: value for key, value in row.items() if key != "memory"}
+        current_base = {key: value for key, value in current.items() if key != "memory"}
+        if previous_base != current_base or "memory" not in current:
+            fail("history append: duplicate run may only gain a validated optional metric")
+        combined[index] = current
+        break
+    else:
+        combined.append(current)
     reject_duplicate_history(combined, "history append")
     combined.sort(key=history_sort_key)
     return combined[-1000:]
@@ -945,6 +1593,53 @@ def pending_png(metric: str, reason: str) -> bytes:
     return encode_png(960, 540, canvas.pixels, f"PENDING {metric}: {reason}")
 
 
+def memory_png(memory: Mapping[str, object]) -> bytes:
+    canvas = Canvas(960, 540, (248, 250, 252))
+    canvas.rectangle(0, 0, 960, 62, (24, 35, 52))
+    records = [
+        validate_absolute(value, "memory absolute summary")
+        for value in list_value(memory["absolute_summaries"], "memory absolute summaries")
+        if object_value(value, "memory absolute summary").get("metric_id")
+        == "sampled-peak-rss-bytes"
+    ]
+    cells: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for record in records:
+        key = (cast(str, record["scenario_id"]), cast(str, record["thread_point"]))
+        cells.setdefault(key, []).append(record)
+    for ordinal, (_key, values) in enumerate(sorted(cells.items())):
+        column, row = ordinal % 2, ordinal // 2
+        left, top = 45 + column * 460, 85 + row * 112
+        canvas.rectangle(left, top, 420, 92, (235, 240, 246))
+        medians = [
+            float_value(object_value(value["summary"], "summary")["median"], "median", True)
+            for value in values
+        ]
+        maximum = max(medians)
+        for index, median in enumerate(medians):
+            canvas.rectangle(
+                left + 14,
+                top + 10 + index * 19,
+                max(1, int(380 * median / maximum)),
+                11,
+                COLORS[index],
+            )
+    return encode_png(960, 540, canvas.pixels, "Linux process RSS; lower is better")
+
+
+def carry_forward_optional_metrics(latest: dict[str, object], prior: dict[str, object]) -> bool:
+    validate_latest(prior, "prior latest")
+    if "memory" not in latest and "memory" in prior:
+        latest["memory"] = copy.deepcopy(prior["memory"])
+        pending = list_value(latest["pending_metrics"], "latest.pending_metrics")
+        latest["pending_metrics"] = [
+            value
+            for value in pending
+            if object_value(value, "latest pending metric").get("metric_id") != "memory"
+        ]
+        return True
+    return False
+
+
 def escaped(value: object) -> str:
     return html.escape(str(value), quote=True)
 
@@ -973,16 +1668,35 @@ def render_html(latest: Mapping[str, object]) -> bytes:
         for value in paired
     )
     pending = cast(list[dict[str, object]], latest["pending_metrics"])
-    pending_names = [
-        "benchmark-memory.png",
-        "benchmark-latency.png",
-        "benchmark-scaling.png",
-        "benchmark-pprof-tax.png",
-    ]
+    pending_names = {
+        "memory": "benchmark-memory.png",
+        "latency": "benchmark-latency.png",
+        "scaling": "benchmark-scaling.png",
+        "pprof-tax": "benchmark-pprof-tax.png",
+    }
     pending_html = "".join(
-        f"<article class='pending'><img src='{name}' alt='{escaped(item['metric_id'])} pending: {escaped(item['reason'])}'><h3>{escaped(item['metric_id'])}: pending</h3><p>{escaped(item['reason'])}</p><a href='{escaped(item['phase_issue_url'])}'>Phase issue</a></article>"
-        for name, item in zip(pending_names, pending)
+        f"<article class='pending'><img src='{pending_names[cast(str, item['metric_id'])]}' alt='{escaped(item['metric_id'])} pending: {escaped(item['reason'])}'><h3>{escaped(item['metric_id'])}: pending</h3><p>{escaped(item['reason'])}</p><a href='{escaped(item['phase_issue_url'])}'>Phase issue</a></article>"
+        for item in pending
     )
+    memory_html = ""
+    if "memory" in latest:
+        memory = validate_memory_report(latest["memory"], "latest.memory")
+        memory_run = object_value(memory["run"], "latest.memory.run")
+        memory_runner = object_value(memory["runner"], "latest.memory.runner")
+        memory_absolute = [
+            validate_absolute(value, "memory absolute")
+            for value in list_value(memory["absolute_summaries"], "memory absolute summaries")
+        ]
+        memory_rows = "".join(
+            f"<tr><td>{escaped(value['scenario_id'])}</td><td>{escaped(value['thread_point'])}</td><td>{escaped(value['metric_id'])}</td><td>{escaped(value['allocator_id'])}</td><td>{escaped(round(float_value(object_value(value['summary'], 'memory summary')['median'], 'memory median') / (1024 * 1024), 3) if value['metric_id'] != 'fragmentation-proxy' else object_value(value['summary'], 'memory summary')['median'])}</td></tr>"
+            for value in memory_absolute
+        )
+        memory_actions = (
+            f"https://github.com/zackees/mimalloc-pprof/actions/runs/{escaped(memory_run['run_id'])}"
+            if memory_run["run_origin"] == "github-actions"
+            else "https://github.com/zackees/mimalloc-pprof/actions"
+        )
+        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Absolute Linux process RSS for all four allocators; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>mimalloc allocator benchmarks</title>
 <style>body{{font:15px system-ui,sans-serif;max-width:1200px;margin:auto;padding:24px;color:#182334}}table{{border-collapse:collapse;width:100%;margin:16px 0}}th,td{{border:1px solid #ccd4dd;padding:7px;text-align:left}}img{{max-width:100%;height:auto}}.pending{{border:1px solid #ccd4dd;padding:12px;margin:12px 0}}code,pre{{overflow-wrap:anywhere;white-space:pre-wrap}}small{{color:#596575}}</style></head><body>
@@ -991,7 +1705,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
 <h2 id="throughput">Throughput</h2><img src="benchmark-throughput.png" alt="Per-scenario absolute throughput bars for all four allocators"><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>Median</th><th>Noisy</th></tr></thead><tbody>{absolute_rows}</tbody></table>
 <h2>Paired effects</h2><table><thead><tr><th>Scenario</th><th>Candidate</th><th>Effect</th><th>95% interval</th><th>Interpretation</th></tr></thead><tbody>{paired_rows}</tbody></table>
 <h2 id="history">Compatible history</h2><img src="benchmark-history.png" alt="History connected only across the selected identical comparison key">
-<h2>Pending Phase 6 panels</h2>{pending_html}<section id="phase-6"><p>Pending panels contain no measured values.</p></section>
+{memory_html}<h2>Pending Phase 6 panels</h2>{pending_html}<section id="phase-6"><p>Pending panels contain no measured values.</p></section>
 <h2>Provenance</h2><p>Run {escaped(run["run_id"])}, attempt {escaped(run["run_attempt"])}; target {escaped(runner["target"])}; fingerprint <code>{escaped(runner["fingerprint_sha256"])}</code>.</p><table><thead><tr><th>Allocator</th><th>Source</th><th>Binary</th></tr></thead><tbody>{allocator_rows}</tbody></table><p><a href="{escaped(latest["actions_run_url"])}">Actions run</a></p>
 <h2>Methodology</h2><pre>{escaped(json.dumps(latest["methodology"], sort_keys=True, ensure_ascii=False))}</pre><h2>Reproduce</h2><pre><code>{escaped(latest["reproduction_command"])}</code></pre>
 </body></html>"""
@@ -1025,12 +1739,25 @@ def ensure_empty_output(path: Path) -> None:
 
 
 def render(
-    input_path: Path, history_path: Path, output: Path, digest_out: Path, initialize: bool
+    input_path: Path,
+    history_path: Path,
+    output: Path,
+    digest_out: Path,
+    initialize: bool,
+    prior_latest_path: Path | None = None,
 ) -> str:
     latest = read_json(input_path)
     validate_latest(latest, str(input_path))
+    carried_optional_metrics = False
+    if prior_latest_path is not None:
+        prior = read_json(prior_latest_path)
+        carried_optional_metrics = carry_forward_optional_metrics(latest, prior)
+        validate_latest(latest, str(input_path))
     rows = read_history(history_path, initialize)
-    rows = merge_history(rows, history_row(latest))
+    rows = merge_history(
+        rows,
+        history_row(latest, include_optional_metrics=not carried_optional_metrics),
+    )
     output_resolved = output.resolve()
     digest_resolved = digest_out.resolve()
     try:
@@ -1047,19 +1774,27 @@ def render(
     (output / "benchmark-throughput.png").write_bytes(throughput_png(latest))
     key = comparison_digest(latest["comparison_key"], "comparison_key")
     (output / "benchmark-history.png").write_bytes(history_png(rows, key))
-    pending = cast(list[dict[str, object]], latest["pending_metrics"])
-    for name, item in zip(
-        (
-            "benchmark-memory.png",
-            "benchmark-latency.png",
-            "benchmark-scaling.png",
-            "benchmark-pprof-tax.png",
-        ),
-        pending,
-    ):
-        (output / name).write_bytes(
-            pending_png(cast(str, item["metric_id"]), cast(str, item["reason"]))
+    pending = {
+        cast(str, item["metric_id"]): item
+        for item in cast(list[dict[str, object]], latest["pending_metrics"])
+    }
+    image_names = {
+        "memory": "benchmark-memory.png",
+        "latency": "benchmark-latency.png",
+        "scaling": "benchmark-scaling.png",
+        "pprof-tax": "benchmark-pprof-tax.png",
+    }
+    if "memory" in latest:
+        memory = validate_memory_report(latest["memory"], "latest.memory")
+        (output / image_names["memory"]).write_bytes(memory_png(memory))
+    else:
+        item = pending["memory"]
+        (output / image_names["memory"]).write_bytes(
+            pending_png("memory", cast(str, item["reason"]))
         )
+    for metric in ("latency", "scaling", "pprof-tax"):
+        item = pending[metric]
+        (output / image_names[metric]).write_bytes(pending_png(metric, cast(str, item["reason"])))
     (output / "manifest.json").write_bytes(compact_json(manifest_for(output)))
     digest = sha256(output / "manifest.json")
     digest_out.parent.mkdir(parents=True, exist_ok=True)
@@ -1321,6 +2056,7 @@ def assert_fixture_determinism(
     rendered_site: Path,
     rendered_digest: Path,
     initialize: bool,
+    prior_latest_path: Path | None = None,
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="benchmark-report-fixture-repeat-") as temporary:
         root = Path(temporary)
@@ -1332,6 +2068,7 @@ def assert_fixture_determinism(
             repeated_site,
             repeated_digest,
             initialize,
+            prior_latest_path,
         )
         for name in SITE_FILES:
             if (rendered_site / name).read_bytes() != (repeated_site / name).read_bytes():
@@ -1377,6 +2114,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     render_parser.add_argument("--detached-digest-out", type=Path, required=True)
     render_parser.add_argument("--initialize-history", action="store_true")
     render_parser.add_argument(
+        "--prior-latest",
+        type=Path,
+        help="carry forward validated optional metrics from the prior public latest.json",
+    )
+    render_parser.add_argument(
         "--fixture-mode",
         action="store_true",
         help="assert deterministic fixture workflow (rendering is always deterministic)",
@@ -1408,6 +2150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output_dir,
             args.detached_digest_out,
             args.initialize_history,
+            args.prior_latest,
         )
         if args.fixture_mode:
             assert_fixture_determinism(
@@ -1416,6 +2159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.output_dir,
                 args.detached_digest_out,
                 args.initialize_history,
+                args.prior_latest,
             )
         print(f"PASS rendered and sealed {args.output_dir}; manifest sha256={digest}")
         return 0

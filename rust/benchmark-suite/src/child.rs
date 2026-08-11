@@ -1,11 +1,15 @@
 //! Reusable benchmark-child protocol entrypoint.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 
 use serde::Serialize;
 
 use crate::adapter::LinkedAdapter;
-use crate::execution::execute_child_request;
+use crate::execution::{
+    execute_child_request, execute_child_request_with_observer, ExecutionResult,
+    MeasurementObserver,
+};
+use crate::memory::{read_control_record, write_control_record, ControlKind, ControlRecord};
 use crate::model::BenchmarkChildRequest;
 
 #[derive(Serialize)]
@@ -28,8 +32,95 @@ pub fn benchmark_child_main() -> Result<(), String> {
         Some(argument) if argument == "--adapter-smoke" && arguments.next().is_none() => {
             run_adapter_smoke()
         }
-        Some(_) => Err("usage: benchmark-child [--adapter-smoke]".into()),
+        Some(argument) if argument == "--memory" && arguments.next().is_none() => {
+            run_memory_measurement()
+        }
+        Some(_) => Err("usage: benchmark-child [--adapter-smoke|--memory]".into()),
     }
+}
+
+struct MemoryChildObserver<'a, R: Read, W: Write> {
+    reader: &'a mut R,
+    writer: &'a mut W,
+}
+
+impl<R: Read, W: Write> MeasurementObserver for MemoryChildObserver<'_, R, W> {
+    fn baseline_ready_and_wait_for_begin(&mut self) -> Result<(), String> {
+        write_control_record(
+            self.writer,
+            ControlRecord::empty(ControlKind::BaselineReady),
+        )?;
+        let begin = read_control_record(self.reader)?;
+        if begin != ControlRecord::empty(ControlKind::Begin) {
+            return Err("memory child expected an empty begin message".into());
+        }
+        Ok(())
+    }
+
+    fn workload_active(&mut self) -> Result<(), String> {
+        write_control_record(
+            self.writer,
+            ControlRecord::empty(ControlKind::WorkloadActive),
+        )
+    }
+
+    fn workload_drained(&mut self, outcome: &ExecutionResult) -> Result<(), String> {
+        write_control_record(
+            self.writer,
+            ControlRecord {
+                kind: ControlKind::WorkloadDrained,
+                current_live_requested_bytes: 0,
+                peak_live_requested_bytes: outcome.peak_live_requested_bytes,
+                checksum: outcome.checksum,
+            },
+        )
+    }
+}
+
+fn run_memory_measurement() -> Result<(), String> {
+    let adapter = LinkedAdapter::load().map_err(|error| error.to_string())?;
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut writer = stdout.lock();
+    let mut input = Vec::with_capacity(16 * 1024);
+    (&mut reader)
+        .take(1024 * 1024 + 1)
+        .read_until(b'\n', &mut input)
+        .map_err(|error| format!("read memory child request: {error}"))?;
+    if input.len() > 1024 * 1024 || !input.ends_with(b"\n") {
+        return Err("memory child request must be one newline-terminated value below 1 MiB".into());
+    }
+    let request: BenchmarkChildRequest = serde_json::from_slice(&input)
+        .map_err(|error| format!("expected exactly one memory child request: {error}"))?;
+    let mut observer = MemoryChildObserver {
+        reader: &mut reader,
+        writer: &mut writer,
+    };
+    let response = execute_child_request_with_observer(&adapter, request, &mut observer)?;
+    let exit = read_control_record(observer.reader)?;
+    if exit != ControlRecord::empty(ControlKind::ExitResult) {
+        return Err("memory child expected an empty exit-result request".into());
+    }
+    // Serialize only after the parent completed the five-second post-drain
+    // window, so response allocation cannot perturb any reported RSS value.
+    let output = serde_json::to_vec(&response)
+        .map_err(|error| format!("serialize memory child response: {error}"))?;
+    let length = u32::try_from(output.len())
+        .map_err(|_| "memory child response exceeds the framing limit".to_string())?;
+    if output.len() > 1024 * 1024 {
+        return Err("memory child response exceeded 1 MiB".into());
+    }
+    write_control_record(
+        observer.writer,
+        ControlRecord::empty(ControlKind::ExitResult),
+    )?;
+    observer
+        .writer
+        .write_all(&length.to_le_bytes())
+        .and_then(|()| observer.writer.write_all(&output))
+        .and_then(|()| observer.writer.flush())
+        .map_err(|error| format!("write memory child result: {error}"))
 }
 
 fn run_measurement() -> Result<(), String> {

@@ -125,6 +125,7 @@ pub fn build_latest_report(
             pending("scaling", 186),
             pending("pprof-tax", 187),
         ],
+        memory: None,
         canonical_urls: CanonicalUrls {
             pages: "https://zackees.github.io/mimalloc-pprof/".into(),
             stats_branch: "https://github.com/zackees/mimalloc-pprof/tree/benchmark-stats".into(),
@@ -158,6 +159,10 @@ pub fn build_latest_report(
             .collect(),
         absolute_summaries: latest.absolute_summaries.clone(),
         paired_summaries: latest.paired_summaries.clone(),
+        memory: latest
+            .memory
+            .as_ref()
+            .map(|value| value.history_projection()),
     };
     Ok((latest, history))
 }

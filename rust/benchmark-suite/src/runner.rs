@@ -298,7 +298,9 @@ fn run(options: Options) -> Result<(), String> {
     Ok(())
 }
 
-fn children_from_provenance(provenance: &ProducerProvenance) -> Result<Vec<ChildProgram>, String> {
+pub(crate) fn children_from_provenance(
+    provenance: &ProducerProvenance,
+) -> Result<Vec<ChildProgram>, String> {
     provenance
         .allocators
         .iter()
@@ -332,7 +334,7 @@ fn children_from_provenance(provenance: &ProducerProvenance) -> Result<Vec<Child
         .collect()
 }
 
-fn publication_allocators(
+pub(crate) fn publication_allocators(
     lock: &AllocatorLock,
     provenance: &ProducerProvenance,
 ) -> Result<Vec<AllocatorBuildIdentity>, String> {
@@ -413,7 +415,7 @@ fn publication_options(id: &str) -> AllocatorFeatureOptions {
     }
 }
 
-fn collect_run_identity(provenance: &ProducerProvenance) -> Result<RunIdentity, String> {
+pub(crate) fn collect_run_identity(provenance: &ProducerProvenance) -> Result<RunIdentity, String> {
     let source_sha = provenance
         .allocators
         .iter()
@@ -449,7 +451,7 @@ fn collect_run_identity(provenance: &ProducerProvenance) -> Result<RunIdentity, 
     })
 }
 
-fn collect_publication_runner(topology: Topology) -> Result<PublicationRunner, String> {
+pub(crate) fn collect_publication_runner(topology: Topology) -> Result<PublicationRunner, String> {
     let runner_class = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
         "github-hosted"
     } else {
@@ -536,7 +538,7 @@ fn command_text(program: &str, arguments: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn detect_topology() -> Result<Topology, String> {
+pub(crate) fn detect_topology() -> Result<Topology, String> {
     let logical = std::thread::available_parallelism()
         .map_err(|error| format!("detect logical CPU count: {error}"))?
         .get();
@@ -584,7 +586,7 @@ fn rustc_version() -> String {
         .unwrap_or_else(|| "rustc-version-unavailable".into())
 }
 
-fn create_new_writer(path: PathBuf) -> Result<BufWriter<File>, String> {
+pub(crate) fn create_new_writer(path: PathBuf) -> Result<BufWriter<File>, String> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -593,7 +595,10 @@ fn create_new_writer(path: PathBuf) -> Result<BufWriter<File>, String> {
         .map_err(|error| format!("create {}: {error}", path.display()))
 }
 
-fn write_json_line<T: Serialize>(writer: &mut BufWriter<File>, value: &T) -> Result<(), String> {
+pub(crate) fn write_json_line<T: Serialize>(
+    writer: &mut BufWriter<File>,
+    value: &T,
+) -> Result<(), String> {
     serde_json::to_writer(&mut *writer, value)
         .map_err(|error| format!("serialize JSONL record: {error}"))?;
     writer
@@ -602,7 +607,7 @@ fn write_json_line<T: Serialize>(writer: &mut BufWriter<File>, value: &T) -> Res
         .map_err(|error| format!("append JSONL record: {error}"))
 }
 
-fn write_new_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), String> {
+pub(crate) fn write_new_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), String> {
     let mut writer = create_new_writer(path)?;
     serde_json::to_writer_pretty(&mut writer, value)
         .map_err(|error| format!("serialize JSON artifact: {error}"))?;
@@ -612,7 +617,7 @@ fn write_new_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), String> 
         .map_err(|error| format!("finish JSON artifact: {error}"))
 }
 
-fn write_new_bytes(path: PathBuf, value: &[u8]) -> Result<(), String> {
+pub(crate) fn write_new_bytes(path: PathBuf, value: &[u8]) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)

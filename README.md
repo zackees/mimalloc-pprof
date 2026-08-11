@@ -1,5 +1,8 @@
 # mimalloc-pprof
 
+
+![Development smoke preview comparing mimalloc-pprof, upstream mimalloc, TCMalloc, and jemalloc](doc/benchmark-smoke-preview.svg)
+
 > ## mimalloc with native pprof-compatible heap profiling — on Windows, Linux, and macOS alike.
 >
 > **The one mimalloc heap profiler that runs natively on Windows.** Upstream mimalloc
@@ -46,13 +49,6 @@ runs, no unpublished baselines.
 Full protocol details, JSON schemas, and reproduction commands are in
 [`rust/benchmark-suite/`](rust/benchmark-suite/).
 
-### Development smoke preview
-
-![Development smoke preview comparing mimalloc-pprof, upstream mimalloc, TCMalloc, and jemalloc](doc/benchmark-smoke-preview.svg)
-
-*This is one reduced-smoke block for the 1-thread `tiny-fixed-64` cell — not a
-headline result.  For live statistically-valid results, see the dashboard
-above.*
 
 ```
    __  __ ___ __  __    _    _     _     ___   ____

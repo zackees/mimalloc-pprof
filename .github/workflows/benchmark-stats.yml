@@ -55,13 +55,8 @@ jobs:
       - name: build native allocator libraries
         run: |
           set -euxo pipefail
-          # soldr may inject into Python subprocess; try uv first, then system python
-          if command -v uv >/dev/null 2>&1; then
-            uv run --no-project --with pyyaml python3 ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
-          else
-            unset $(env | grep -i soldr | cut -d= -f1) 2>/dev/null || true
-            PYTHONPATH="" python3 ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
-          fi
+          mkdir -p /root/.soldr/bin/syslib 2>/dev/null || true
+          python3 ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
       - uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
       - name: resolve history
         id: history

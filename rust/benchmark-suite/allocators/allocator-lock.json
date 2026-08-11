@@ -15,7 +15,6 @@
       "build": {
         "system": "bazel",
         "required_tool_version": "bazel 9.1.0",
-        "generated_lock_sha256": "5ec8cc791ba4a4ca8841144e4c3a8abf28aec0d289dcfec0f2c10d392349b553",
         "commands": [
           [
             "bazel",

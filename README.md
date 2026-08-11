@@ -12,15 +12,47 @@ A fork of [microsoft/mimalloc](https://github.com/microsoft/mimalloc) that adds
 **pprof-compatible sampled heap profiling**, with native Windows as a first-class
 target alongside Linux and macOS.
 
-## Allocator benchmark preview
+## Performance
+
+mimalloc-pprof is continuously benchmarked against **upstream mimalloc**,
+**TCMalloc**, and **jemalloc** on a dedicated Linux x86-64 runner.  Every result
+is **GitHub-hosted and informational** — no self-hosted hardware, no hand-picked
+runs, no unpublished baselines.
+
+| Resource | Description |
+|---|---|
+| [**Benchmark dashboard**](https://zackees.github.io/mimalloc-pprof/) | Live per-scenario throughput, paired statistical effects, and full allocator provenance |
+| [`benchmark-stats` branch](https://github.com/zackees/mimalloc-pprof/tree/benchmark-stats) | Raw sealed site artifacts (history, manifests, digests) |
+| [`latest.json`](https://zackees.github.io/mimalloc-pprof/latest.json) | Machine-readable publication envelope for the most recent headline run |
+
+### Methodology summary
+
+- **4 allocators** — mimalloc-pprof, upstream mimalloc (same `dev3` base),
+  TCMalloc, and jemalloc — pinned to immutable commits with SHA-256-verified
+  source archives.
+- **Paired balanced blocks** — every block runs all four allocators in
+  randomized order under one workload seed; ≥15 complete blocks per headline
+  cell.
+- **Type-7 quantile bootstrap** — 10,000 resamples, splitmix64-rejection PRNG,
+  percentile-block confidence intervals at 95%.  Paired effects are expressed
+  relative to upstream mimalloc.
+- **No profiling during measurement** — `MIMALLOC_PROF=0` and
+  `MIMALLOC_MEMORY_EVENTS=0` are set on every child process; the allocator runs
+  in its natural configuration.
+- **Deterministic reproducibility** — every raw sample carries its exact command
+  line and workload seed; the published site manifest carries a detached SHA-256
+  digest of every file.
+
+Full protocol details, JSON schemas, and reproduction commands are in
+[`rust/benchmark-suite/`](rust/benchmark-suite/).
+
+### Development smoke preview
 
 ![Development smoke preview comparing mimalloc-pprof, upstream mimalloc, TCMalloc, and jemalloc](doc/benchmark-smoke-preview.svg)
 
-**Development smoke preview only.** This is one Linux x86-64 reduced-smoke block
-for the 1-thread `tiny-fixed-64` cell, with profiling and memory-events collection
-disabled. One block is not statistically valid and this is not a headline
-benchmark result; it is shown only as an early end-to-end preview while the full
-benchmark suite is completed.
+*This is one reduced-smoke block for the 1-thread `tiny-fixed-64` cell — not a
+headline result.  For live statistically-valid results, see the dashboard
+above.*
 
 ```
    __  __ ___ __  __    _    _     _     ___   ____

@@ -460,6 +460,7 @@ def command_environment() -> dict[str, str]:
     # into its persistent soldr volume rather than the base image. Make those
     # exact binaries visible to the native recipes and retain the resulting PATH
     # in provenance.
+    inherited = environment.get("PATH", "")
     soldr_syslib = Path("/root/.soldr/bin/syslib")
     try:
         is_syslib = soldr_syslib.is_dir()
@@ -471,8 +472,21 @@ def command_environment() -> dict[str, str]:
             reverse=True,
         )
         if syslib_bins:
-            inherited = environment.get("PATH", "")
-            environment["PATH"] = os.pathsep.join([*(str(path) for path in syslib_bins), inherited])
+            inherited = os.pathsep.join([*(str(path) for path in syslib_bins), inherited])
+    # Ensure the soldr binary itself is discoverable. The setup-soldr action adds
+    # it to PATH in the shell environment, but our allowlist-based filtering may
+    # drop its directory. Resolve it from the unfiltered environment and prepend
+    # its parent directory so subprocess.run can find it.
+    soldr_path = shutil.which("soldr", path=os.environ.get("PATH", os.defpath))
+    if soldr_path is None:
+        # Fall back to the canonical Docker harness install location.
+        candidate = Path("/root/.soldr/bin/soldr")
+        if candidate.is_file():
+            soldr_path = str(candidate)
+    if soldr_path is not None:
+        soldr_dir = str(Path(soldr_path).resolve().parent)
+        inherited = os.pathsep.join([soldr_dir, inherited])
+    environment["PATH"] = inherited
     return environment
 
 
@@ -893,8 +907,7 @@ def build_child(
         allocator_id, source_dir, build_dir, library, build_root, logs
     )
     target_dir = (build_root / "cargo-target" / allocator_id).resolve()
-    command = [
-        "soldr",
+    cargo_args = [
         "cargo",
         "build",
         "--manifest-path",
@@ -922,8 +935,20 @@ def build_child(
             "BENCH_ALLOCATOR_LINK_MANIFEST": str(link_manifest),
         }
     )
+    # soldr may be installed as a binary on PATH (detected by command_environment
+    # above) or as a shell function (common in the setup-soldr Docker harness).
+    # Resolve it once and prefer the absolute path for subprocess safety.
+    resolved_soldr = shutil.which("soldr", path=environment.get("PATH", os.defpath))
+    if resolved_soldr is not None:
+        command = [resolved_soldr, *cargo_args]
+        display = " ".join(command)
+    else:
+        # soldr may be a shell function; invoke through bash to resolve it.
+        quoted = " ".join(shlex.quote(arg) for arg in cargo_args)
+        command = ["bash", "-c", f"soldr {quoted}"]
+        display = "$ " + " ".join(command)
     with (logs / f"{allocator_id}-child.log").open("w", encoding="utf-8") as log:
-        log.write("$ " + " ".join(command) + "\n")
+        log.write(display + "\n")
         log.flush()
         subprocess.run(
             command,

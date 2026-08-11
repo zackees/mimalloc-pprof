@@ -129,7 +129,8 @@ jobs:
             $SMOKE_FLAG \
             --blocks "$BLOCKS" \
             --run-seed "$SEED" \
-            --output-dir "$OUTPUT_DIR"
+            --output-dir "$OUTPUT_DIR" \
+            --build-root target/release
       - name: validate raw run
         run: |
           set -euxo pipefail

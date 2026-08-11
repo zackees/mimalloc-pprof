@@ -13,10 +13,17 @@ import hashlib
 import html
 import json
 import math
+import os
 import re
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import zlib
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -981,9 +988,9 @@ def render_html(latest: Mapping[str, object]) -> bytes:
 <style>body{{font:15px system-ui,sans-serif;max-width:1200px;margin:auto;padding:24px;color:#182334}}table{{border-collapse:collapse;width:100%;margin:16px 0}}th,td{{border:1px solid #ccd4dd;padding:7px;text-align:left}}img{{max-width:100%;height:auto}}.pending{{border:1px solid #ccd4dd;padding:12px;margin:12px 0}}code,pre{{overflow-wrap:anywhere;white-space:pre-wrap}}small{{color:#596575}}</style></head><body>
 <h1>Allocator benchmark report</h1><p>Suite <code>{escaped(latest["suite_version"])}</code>; source <code>{escaped(run["source_sha"])}</code>; runner {escaped(runner["runner_class"])}. Intervals are informational.</p>
 <nav><a href="latest.json">validated latest data</a> · <a href="history.jsonl">compact history</a></nav>
-<h2>Throughput</h2><img src="benchmark-throughput.png" alt="Per-scenario absolute throughput bars for all four allocators"><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>Median</th><th>Noisy</th></tr></thead><tbody>{absolute_rows}</tbody></table>
+<h2 id="throughput">Throughput</h2><img src="benchmark-throughput.png" alt="Per-scenario absolute throughput bars for all four allocators"><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>Median</th><th>Noisy</th></tr></thead><tbody>{absolute_rows}</tbody></table>
 <h2>Paired effects</h2><table><thead><tr><th>Scenario</th><th>Candidate</th><th>Effect</th><th>95% interval</th><th>Interpretation</th></tr></thead><tbody>{paired_rows}</tbody></table>
-<h2>Compatible history</h2><img src="benchmark-history.png" alt="History connected only across the selected identical comparison key">
+<h2 id="history">Compatible history</h2><img src="benchmark-history.png" alt="History connected only across the selected identical comparison key">
 <h2>Pending Phase 6 panels</h2>{pending_html}<section id="phase-6"><p>Pending panels contain no measured values.</p></section>
 <h2>Provenance</h2><p>Run {escaped(run["run_id"])}, attempt {escaped(run["run_attempt"])}; target {escaped(runner["target"])}; fingerprint <code>{escaped(runner["fingerprint_sha256"])}</code>.</p><table><thead><tr><th>Allocator</th><th>Source</th><th>Binary</th></tr></thead><tbody>{allocator_rows}</tbody></table><p><a href="{escaped(latest["actions_run_url"])}">Actions run</a></p>
 <h2>Methodology</h2><pre>{escaped(json.dumps(latest["methodology"], sort_keys=True, ensure_ascii=False))}</pre><h2>Reproduce</h2><pre><code>{escaped(latest["reproduction_command"])}</code></pre>
@@ -1097,13 +1104,21 @@ def validate_site(site: Path, detached: Path | None = None) -> None:
     if site.is_symlink() or not site.is_dir():
         fail(f"{site}: site must be a real directory")
     actual: set[str] = set()
-    for path in site.rglob("*"):
-        relative = path.relative_to(site).as_posix()
-        if path.is_symlink():
-            fail(f"{path}: symlinks are forbidden")
-        if not path.is_file():
-            fail(f"{path}: nested directories and special entries are forbidden")
-        actual.add(relative)
+    # os.walk includes dotfiles unconditionally; rglob("*") may not on every Python.
+    for dirpath_str, dirnames, filenames in os.walk(site):
+        dirpath = Path(dirpath_str)
+        for name in dirnames:
+            path = dirpath / name
+            if path.is_symlink():
+                fail(f"{path}: symlinks are forbidden")
+            fail(f"{path}: nested directories are forbidden")
+        for name in filenames:
+            path = dirpath / name
+            if path.is_symlink():
+                fail(f"{path}: symlinks are forbidden")
+            if not path.is_file():
+                fail(f"{path}: special entries are forbidden")
+            actual.add(path.relative_to(site).as_posix())
     if actual != SITE_FILES:
         fail(
             f"{site}: site allowlist mismatch; missing={sorted(SITE_FILES - actual)} unexpected={sorted(actual - SITE_FILES)}"
@@ -1175,6 +1190,131 @@ def validate_site(site: Path, detached: Path | None = None) -> None:
             fail(f"{detached}: detached manifest digest mismatch")
 
 
+def git_command(repository: Path, *arguments: str) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=False,
+            capture_output=True,
+        )
+    except OSError as error:
+        fail(f"git {' '.join(arguments)}: cannot execute: {error}")
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        fail(f"git {' '.join(arguments)} failed in {repository}: {detail}")
+    return completed.stdout
+
+
+def decode_git_paths(data: bytes, label: str) -> set[str]:
+    paths: set[str] = set()
+    for raw in data.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            path = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            fail(f"{label}: non-UTF-8 path: {error}")
+        if path in paths:
+            fail(f"{label}: duplicate path {path!r}")
+        paths.add(path)
+    return paths
+
+
+def git_index_files(repository: Path) -> set[str]:
+    return decode_git_paths(git_command(repository, "ls-files", "-z"), "git index")
+
+
+def git_revision_files(repository: Path, revision: str) -> set[str]:
+    return decode_git_paths(
+        git_command(repository, "ls-tree", "-r", "--name-only", "-z", revision),
+        f"git revision {revision}",
+    )
+
+
+def require_exact_files(actual: set[str], label: str) -> None:
+    if actual != SITE_FILES:
+        fail(
+            f"{label} allowlist mismatch; missing={sorted(SITE_FILES - actual)} "
+            f"unexpected={sorted(actual - SITE_FILES)}"
+        )
+
+
+def prepare_branch(worktree: Path, site: Path) -> None:
+    """Replace a linked worktree's index with exactly the sealed site."""
+
+    validate_site(site)
+    worktree = worktree.resolve()
+    site = site.resolve()
+    if worktree == site:
+        fail("publication worktree and site directory must be distinct")
+    administrative_file = worktree / ".git"
+    if not administrative_file.is_file() or administrative_file.is_symlink():
+        fail(f"{administrative_file}: expected linked-worktree administrative file")
+    top_level = Path(
+        git_command(worktree, "rev-parse", "--show-toplevel").decode("utf-8").strip()
+    ).resolve()
+    if top_level != worktree:
+        fail(f"{worktree}: not the Git worktree root ({top_level})")
+    if git_command(worktree, "status", "--porcelain=v1", "-z"):
+        fail(f"{worktree}: publication worktree must start clean")
+
+    git_command(worktree, "rm", "-r", "-f", "--ignore-unmatch", "--", ".")
+    leftovers = sorted(path.name for path in worktree.iterdir() if path.name != ".git")
+    if leftovers:
+        fail(f"{worktree}: unexpected untracked files after git rm: {leftovers}")
+    for name in sorted(SITE_FILES):
+        shutil.copy2(site / name, worktree / name)
+    git_command(worktree, "add", "-A")
+
+    if not administrative_file.is_file():
+        fail(f"{administrative_file}: worktree administration was removed")
+    require_exact_files(git_index_files(worktree), "staged publication index")
+    for name in SITE_FILES:
+        if (worktree / name).read_bytes() != (site / name).read_bytes():
+            fail(f"{worktree / name}: copied bytes differ from sealed site")
+
+
+def validate_git_revision(repository: Path, revision: str, site: Path) -> None:
+    """Prove a revision contains exactly the sealed site and identical bytes."""
+
+    validate_site(site)
+    require_exact_files(git_revision_files(repository, revision), "revision")
+    for name in SITE_FILES:
+        published = git_command(repository, "show", f"{revision}:{name}")
+        if published != (site / name).read_bytes():
+            fail(f"{revision}:{name}: bytes differ from sealed site")
+
+
+def audit_pages(site: Path, page_url: str, attempts: int, delay_seconds: float) -> None:
+    """Wait for the deployed public payload to become byte-identical to the sealed site."""
+
+    validate_site(site)
+    parsed = urllib.parse.urlparse(page_url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+        fail(f"{page_url!r}: expected a plain HTTPS Pages base URL")
+    if attempts < 1 or delay_seconds < 0:
+        fail("Pages audit attempts must be positive and delay non-negative")
+    base = page_url.rstrip("/") + "/"
+    version = sha256(site / "manifest.json")
+    public_files = SITE_FILES - {".nojekyll"}
+    last_error = "Pages payload did not match"
+    for attempt in range(1, attempts + 1):
+        try:
+            for name in sorted(public_files):
+                url = urllib.parse.urljoin(base, name) + f"?manifest={version}"
+                request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    data = response.read(FILE_CAPS[name] + 1)
+                if data != (site / name).read_bytes():
+                    raise ReportError(f"{url}: deployed bytes differ from sealed site")
+            return
+        except (OSError, urllib.error.URLError, ReportError) as error:
+            last_error = str(error)
+            if attempt < attempts:
+                time.sleep(delay_seconds)
+    fail(f"Pages audit failed after {attempts} attempts: {last_error}")
+
+
 def assert_fixture_determinism(
     input_path: Path,
     history_path: Path,
@@ -1244,6 +1384,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     validate_parser = subparsers.add_parser("validate-site")
     validate_parser.add_argument("--site-dir", type=Path, required=True)
     validate_parser.add_argument("--detached-digest", type=Path)
+    prepare_parser = subparsers.add_parser("prepare-branch")
+    prepare_parser.add_argument("--worktree", type=Path, required=True)
+    prepare_parser.add_argument("--site-dir", type=Path, required=True)
+    revision_parser = subparsers.add_parser("validate-revision")
+    revision_parser.add_argument("--repository", type=Path, required=True)
+    revision_parser.add_argument("--revision", required=True)
+    revision_parser.add_argument("--site-dir", type=Path, required=True)
+    pages_parser = subparsers.add_parser("audit-pages")
+    pages_parser.add_argument("--site-dir", type=Path, required=True)
+    pages_parser.add_argument("--page-url", required=True)
+    pages_parser.add_argument("--attempts", type=int, default=12)
+    pages_parser.add_argument("--delay-seconds", type=float, default=10.0)
     args = parser.parse_args(argv)
     if args.selftest:
         if args.command is not None:
@@ -1271,7 +1423,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         validate_site(args.site_dir, args.detached_digest)
         print(f"PASS validated sealed benchmark site {args.site_dir}")
         return 0
-    parser.error("choose --selftest, render, or validate-site")
+    if args.command == "prepare-branch":
+        prepare_branch(args.worktree, args.site_dir)
+        print(f"PASS prepared exact benchmark branch index in {args.worktree}")
+        return 0
+    if args.command == "validate-revision":
+        validate_git_revision(args.repository, args.revision, args.site_dir)
+        print(f"PASS validated {args.revision} against sealed benchmark site")
+        return 0
+    if args.command == "audit-pages":
+        audit_pages(args.site_dir, args.page_url, args.attempts, args.delay_seconds)
+        print(f"PASS Pages payload matches sealed benchmark site at {args.page_url}")
+        return 0
+    parser.error(
+        "choose --selftest, render, validate-site, prepare-branch, validate-revision, or audit-pages"
+    )
     return 2
 
 

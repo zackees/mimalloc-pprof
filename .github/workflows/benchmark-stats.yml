@@ -208,7 +208,9 @@ jobs:
         with:
           name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/site/
+          include-hidden-files: true
           retention-days: 30
+          if-no-files-found: error
       - name: upload diagnostics artifact
         if: failure()
         uses: actions/upload-artifact@v4.6.2
@@ -230,10 +232,22 @@ jobs:
       - uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
+      - name: download site artifact
+        uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: audit/site/
+      - name: download validation artifact
+        uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: audit/validation/
       - name: audit site artifact
         run: |
           set -euxo pipefail
-          echo "Independent audit: re-validating raw/latest/site, recomputing digests, verifying allowlist."
+          python ci/benchmark_report.py validate-site \
+            --site-dir audit/site/ \
+            --detached-digest audit/validation/manifest.sha256
           echo "Run ${{ github.run_id }} attempt ${{ github.run_attempt }}: audit complete."
 
   publish-branch:
@@ -257,9 +271,9 @@ jobs:
       - name: validate site before push
         run: |
           python ci/benchmark_report.py validate-site \
-            --site-dir site-temp/ \
-            --detached-digest "$RUNNER_TEMP/manifest.sha256" || true
+            --site-dir site-temp/
       - name: push benchmark-stats branch
+        id: publish
         run: |
           set -euxo pipefail
           MANIFEST_DIGEST=$(sha256sum site-temp/manifest.json | awk '{print $1}')
@@ -267,11 +281,15 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           WORKTREE=$(mktemp -d)
           git worktree add --detach "$WORKTREE" HEAD
+          python ci/benchmark_report.py prepare-branch \
+            --worktree "$WORKTREE" \
+            --site-dir "$GITHUB_WORKSPACE/site-temp"
           cd "$WORKTREE"
-          rm -rf ./*
-          cp -r "$GITHUB_WORKSPACE/site-temp/"* .
-          git add -A
           git commit -m "benchmark-stats run=${{ github.run_id }}/${{ github.run_attempt }} src=${{ github.sha }} manifest=$MANIFEST_DIGEST"
+          python "$GITHUB_WORKSPACE/ci/benchmark_report.py" validate-revision \
+            --repository "$WORKTREE" \
+            --revision HEAD \
+            --site-dir "$GITHUB_WORKSPACE/site-temp"
           git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           PRIOR_SHA="${{ needs.build-and-measure.outputs.prior_branch_sha }}"
           if [ "$PRIOR_SHA" = "first-publication" ]; then
@@ -279,10 +297,13 @@ jobs:
           else
             git push origin "HEAD:$PUBLISH_REF" --force-with-lease="refs/heads/benchmark-stats:$PRIOR_SHA"
           fi
-          echo "published_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          PUBLISHED_SHA=$(git rev-parse HEAD)
+          REMOTE_SHA=$(git ls-remote origin "$PUBLISH_REF" | awk '{print $1}')
+          test "$REMOTE_SHA" = "$PUBLISHED_SHA"
+          echo "published_sha=$PUBLISHED_SHA" >> "$GITHUB_OUTPUT"
           echo "manifest_digest=$MANIFEST_DIGEST" >> "$GITHUB_OUTPUT"
           cd "$GITHUB_WORKSPACE"
-          rm -rf "$WORKTREE"
+          git worktree remove --force "$WORKTREE"
         env:
           PUBLISH_REF: ${{ env.PUBLISH_REF }}
 
@@ -303,6 +324,7 @@ jobs:
         uses: actions/upload-pages-artifact@v4.0.0
         with:
           path: _site/
+          include-hidden-files: true
 
   deploy-pages:
     runs-on: ubuntu-24.04
@@ -315,6 +337,8 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/deploy-pages@v4.0.5
         id: deployment
@@ -330,10 +354,23 @@ jobs:
       - uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
+      - name: download sealed site artifact
+        uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: audit/site/
       - name: audit publication
         run: |
           set -euxo pipefail
-          PAGES_URL="${{ steps.deployment.outputs.page_url }}"
+          git fetch origin refs/heads/benchmark-stats --depth=1
+          python ci/benchmark_report.py validate-revision \
+            --repository . \
+            --revision FETCH_HEAD \
+            --site-dir audit/site/
+          PAGES_URL="${{ needs.deploy-pages.outputs.page_url }}"
+          python ci/benchmark_report.py audit-pages \
+            --site-dir audit/site/ \
+            --page-url "$PAGES_URL"
           echo "## Publication Audit" >> "$GITHUB_STEP_SUMMARY"
           echo "- Pages URL: $PAGES_URL" >> "$GITHUB_STEP_SUMMARY"
           echo "- Run: ${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
@@ -346,7 +383,7 @@ jobs:
           ELIGIBLE="${{ needs.build-and-measure.outputs.publish_eligible }}"
           if [ "$ELIGIBLE" = "true" ]; then
             echo "- Published to branch and Pages" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Pages: ${{ steps.deployment.outputs.page_url || 'pending' }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Pages: ${{ needs.deploy-pages.outputs.page_url || 'pending' }}" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "- Non-publishing run" >> "$GITHUB_STEP_SUMMARY"
           fi

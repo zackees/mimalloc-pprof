@@ -4,6 +4,9 @@
 
 ![Development smoke preview comparing mimalloc-pprof, upstream mimalloc, TCMalloc, and jemalloc](doc/benchmark-smoke-preview.svg)
 
+*Development-only smoke preview from one reduced block; the statistically
+validated headline results are published below.*
+
 > **The one mimalloc heap profiler that runs natively on Windows.** Upstream mimalloc
 > has no profiler at all, and the only other known implementation
 > ([Bun's](https://github.com/oven-sh/mimalloc), surveyed in
@@ -48,6 +51,28 @@ runs, no unpublished baselines.
 Full protocol details, JSON schemas, and reproduction commands are in
 [`rust/benchmark-suite/`](rust/benchmark-suite/).
 
+### Headline results
+
+[![Per-scenario throughput: mimalloc-pprof, upstream mimalloc, TCMalloc, and jemalloc](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-throughput.png)](https://zackees.github.io/mimalloc-pprof/#throughput)
+
+[![Compatible history for the current comparison key](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-history.png)](https://zackees.github.io/mimalloc-pprof/#history)
+
+*Headline throughput and history charts from the latest daily publication run.
+Click either chart for the live interactive dashboard with full per-scenario
+tables and paired effects. The raw sealed artifacts remain available on the
+[`benchmark-stats` branch](https://github.com/zackees/mimalloc-pprof/tree/benchmark-stats).*
+
+#### Pending Phase 6 panels
+
+The following metrics are tracked in the dashboard as explicitly pending
+placeholder panels until their measurement protocols land:
+
+| Metric | Phase issue |
+|---|---|
+| Memory (Linux RSS, fragmentation proxy) | [#184](https://github.com/zackees/mimalloc-pprof/issues/184) |
+| Honest transaction latency | [#185](https://github.com/zackees/mimalloc-pprof/issues/185) |
+| Thread/affinity scaling curves | [#186](https://github.com/zackees/mimalloc-pprof/issues/186) |
+| Pprof compilation and runtime tax | [#187](https://github.com/zackees/mimalloc-pprof/issues/187) |
 
 ```
    __  __ ___ __  __    _    _     _     ___   ____

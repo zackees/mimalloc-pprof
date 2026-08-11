@@ -92,9 +92,11 @@ jobs:
           cd rust
           soldr cargo run -p benchmark-suite --bin benchmark-validate -- --selftest
       - name: build native allocator libraries
+        env:
+          SOLDR_DISABLE_INJECT: "1"
         run: |
           set -euxo pipefail
-          python ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
+          python3 ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
       - name: build benchmark suite with native adapters
         run: |
           set -euxo pipefail

@@ -665,7 +665,11 @@ fn validate_block(
             || sample.free_calls != first.free_calls
             || sample.realloc_calls != first.realloc_calls
             || sample.checksum != first.checksum
-            || sample.peak_live_requested_bytes != first.peak_live_requested_bytes
+            // peak_live_requested_bytes is excluded from the block-identity
+            // check: it is measured via AtomicU64::fetch_max across threads,
+            // and different allocator speeds cause different thread-scheduling
+            // order, so the observed peak is inherently non-deterministic
+            // across allocators in multi-threaded workloads.
         {
             return Err(ValidationError::new(format!(
                 "cell {}/{} block {block_id} has mismatched seed/count/request identity",

@@ -224,6 +224,10 @@ pub struct LatestReport {
     pub comparison_key: String,
     pub methodology: MethodologyContract,
     pub pending_metrics: Vec<PendingMetric>,
+    /// Backward-compatible Phase 6 extension. Absence means the metric was not
+    /// collected under `linux-process-memory-v1`; it never means zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::memory::MemoryMetricReport>,
     pub canonical_urls: CanonicalUrls,
     pub reproduction_command: String,
     pub actions_run_url: String,
@@ -241,6 +245,8 @@ pub struct HistoryRow {
     pub allocator_identities: Vec<AllocatorIdentity>,
     pub absolute_summaries: Vec<AbsoluteCellSummary>,
     pub paired_summaries: Vec<PairedCellSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::memory::MemoryHistoryReport>,
 }
 
 /// Immutable identity supplied by the producer after it hashes the directly

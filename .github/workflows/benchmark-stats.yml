@@ -66,11 +66,12 @@ jobs:
             PRIOR_SHA=$(git ls-remote origin "$PUBLISH_REF" | awk '{print $1}')
             echo "prior_sha=$PRIOR_SHA" >> "$GITHUB_OUTPUT"
             git fetch origin "$PUBLISH_REF" --depth=1
-            git checkout FETCH_HEAD -- history.jsonl 2>/dev/null || true
-            if [ -f history.jsonl ]; then
+            git checkout FETCH_HEAD -- history.jsonl latest.json 2>/dev/null || true
+            if [ -f history.jsonl ] && [ -f latest.json ]; then
               cp history.jsonl "$RUNNER_TEMP/history-input.jsonl"
+              cp latest.json "$RUNNER_TEMP/prior-latest.json"
             else
-              echo "::error::benchmark-stats branch exists but history.jsonl is absent"
+              echo "::error::benchmark-stats branch exists but history.jsonl/latest.json is absent"
               exit 1
             fi
           else
@@ -148,15 +149,19 @@ jobs:
           set -euxo pipefail
           mkdir -p "$RUNNER_TEMP/site"
           INIT_FLAG=""
+          PRIOR_FLAG=""
           if [ ! -s "$RUNNER_TEMP/history-input.jsonl" ]; then
             INIT_FLAG="--initialize-history"
+          fi
+          if [ -f "$RUNNER_TEMP/prior-latest.json" ]; then
+            PRIOR_FLAG="--prior-latest $RUNNER_TEMP/prior-latest.json"
           fi
           python ci/benchmark_report.py render \
             --input "$RUNNER_TEMP/latest.json" \
             --history-in "$RUNNER_TEMP/history-input.jsonl" \
             --output-dir "$RUNNER_TEMP/site" \
             --detached-digest-out "$RUNNER_TEMP/manifest.sha256" \
-            $INIT_FLAG
+            $INIT_FLAG $PRIOR_FLAG
       - name: validate site
         run: |
           python ci/benchmark_report.py validate-site \
@@ -179,7 +184,7 @@ jobs:
         uses: actions/upload-artifact@v4.6.2
         with:
           name: benchmark-raw-${{ github.run_id }}-${{ github.run_attempt }}
-          path: "${{ runner.temp }}/raw-run.json"
+          path: "${{ runner.temp }}/benchmark-output-${{ github.run_id }}/raw-run.json"
           retention-days: 30
           if-no-files-found: ignore
       - name: upload provenance artifact

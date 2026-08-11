@@ -201,6 +201,7 @@ fn checked_in_schemas_are_valid_strict_json() {
         include_str!("../schema/raw-run-v1.schema.json"),
         include_str!("../schema/latest-v1.schema.json"),
         include_str!("../schema/history-v1.schema.json"),
+        include_str!("../schema/memory-v1.schema.json"),
     ] {
         let value: Value = serde_json::from_str(schema).unwrap();
         assert_eq!(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# pyright: reportUnknownArgumentType=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportIndexIssue=false
+
 # The production script is intentionally standalone, not an installed package.
 # ruff: noqa: I001
 
@@ -38,6 +40,188 @@ class BenchmarkReportTests(unittest.TestCase):
 
     def write_json(self, path: Path, value: object) -> None:
         path.write_text(json.dumps(value) + "\n", encoding="utf-8", newline="\n")
+
+    def with_complete_memory(self, latest: dict[str, object]) -> dict[str, object]:
+        value = copy.deepcopy(latest)
+        raw_samples = value["raw_samples"]
+        assert isinstance(raw_samples, list)
+        memory_samples: list[dict[str, object]] = []
+        templates = [
+            item
+            for item in raw_samples
+            if isinstance(item, dict)
+            and item.get("scenario_id") == "scenario-00"
+            and item.get("thread_point") == "1"
+        ]
+        self.assertEqual(15 * 4, len(templates))
+        for scenario, point in report.MEMORY_CELLS:
+            for template in templates:
+                child_value = copy.deepcopy(template)
+                child_value["scenario_id"] = scenario
+                child_value["thread_point"] = point
+                child_value["thread_count"] = (
+                    1 if point == "1" else 2 if point == "2" else value["runner"]["physical_cores"]
+                )
+                assert isinstance(child_value, dict)
+                allocator = str(child_value["allocator_id"])
+                delta_mib = {
+                    "tcmalloc": 120,
+                    "jemalloc": 110,
+                    "upstream-mimalloc": 100,
+                    "mimalloc-pprof": 90,
+                }[allocator] + int(child_value["block_id"])
+                baseline = 100 * 1024 * 1024
+                delta = delta_mib * 1024 * 1024
+                peak = baseline + delta
+                post = baseline + delta // 2
+                memory_samples.append(
+                    {
+                        "metric_schema_version": report.MEMORY_SCHEMA,
+                        "block_id": child_value["block_id"],
+                        "ordinal": child_value["ordinal"],
+                        "workload_seed": child_value["workload_seed"],
+                        "allocator_id": allocator,
+                        "allocator_source_sha": child_value["allocator_source_sha"],
+                        "child_binary_sha256": child_value["child_binary_sha256"],
+                        "scenario_id": child_value["scenario_id"],
+                        "thread_point": child_value["thread_point"],
+                        "thread_count": child_value["thread_count"],
+                        "baseline_ready_ns": 1_000_000,
+                        "workload_active_ns": 9_000_000,
+                        "workload_drained_ns": 21_000_000,
+                        "post_drain_sample_100ms_ns": 121_000_000,
+                        "post_drain_sample_1s_ns": 1_021_000_000,
+                        "post_drain_sample_5s_ns": 5_021_000_000,
+                        "sampler_pid": 100,
+                        "sampled_pid": 101 + int(child_value["ordinal"]),
+                        "baseline_rss_bytes": baseline,
+                        "baseline_hwm_bytes": baseline,
+                        "sampled_peak_rss_bytes": peak,
+                        "kernel_peak_hwm_bytes": peak,
+                        "peak_live_requested_bytes": child_value["peak_live_requested_bytes"],
+                        "post_drain_rss_100ms_bytes": post,
+                        "post_drain_rss_1s_bytes": post,
+                        "post_drain_rss_5s_bytes": post,
+                        "sampled_peak_rss_delta_bytes": delta,
+                        "post_drain_rss_delta_100ms_bytes": delta // 2,
+                        "post_drain_rss_delta_1s_bytes": delta // 2,
+                        "post_drain_rss_delta_5s_bytes": delta // 2,
+                        "fragmentation_proxy": delta
+                        / int(child_value["peak_live_requested_bytes"]),
+                        "hwm_discrepancy": False,
+                        "hwm_tolerance_bytes": max(8 * 1024 * 1024, delta // 5),
+                        "sampling": {
+                            "target_interval_ns": 5_000_000,
+                            "sample_count": 3,
+                            "minimum_interval_ns": 5_000_000,
+                            "median_interval_ns": 5_000_000,
+                            "p95_interval_ns": 5_000_000,
+                            "maximum_interval_ns": 5_000_000,
+                        },
+                        "timeline": [
+                            {"elapsed_ns": 10_000_000, "rss_bytes": baseline + delta // 2},
+                            {"elapsed_ns": 15_000_000, "rss_bytes": peak},
+                            {"elapsed_ns": 20_000_000, "rss_bytes": baseline + delta * 3 // 4},
+                        ],
+                        "environment": {
+                            "page_size_bytes": 4096,
+                            "kernel": value["runner"]["kernel"],
+                            "transparent_hugepage": "always [madvise] never",
+                            "cgroup_memory_max": "2147483648",
+                            "cgroup_memory_high": "max",
+                            "hosted_runner": value["runner"]["runner_class"] == "github-hosted",
+                            "purge_policy": "natural-only",
+                            "allocator_runtime_options": {
+                                "MIMALLOC_MEMORY_EVENTS": "0",
+                                "MIMALLOC_PROF": "0",
+                            },
+                        },
+                        "child_sample": child_value,
+                    }
+                )
+
+        absolute: list[dict[str, object]] = []
+        paired: list[dict[str, object]] = []
+        stats = {
+            "count": 15,
+            "median": float(128 * 1024 * 1024),
+            "min": float(120 * 1024 * 1024),
+            "max": float(136 * 1024 * 1024),
+            "q1": float(124 * 1024 * 1024),
+            "q3": float(132 * 1024 * 1024),
+            "iqr": float(8 * 1024 * 1024),
+            "relative_iqr": 0.0625,
+            "noisy": False,
+        }
+        for scenario, point in report.MEMORY_CELLS:
+            for metric in report.MEMORY_METRICS:
+                metric_stats = copy.deepcopy(stats)
+                if metric == "fragmentation-proxy":
+                    metric_stats.update(median=1.1, min=1.0, max=1.2, q1=1.05, q3=1.15, iqr=0.1)
+                for allocator in report.ALLOCATOR_IDS:
+                    absolute.append(
+                        {
+                            "scenario_id": scenario,
+                            "thread_point": point,
+                            "metric_id": metric,
+                            "direction": "lower-is-better",
+                            "allocator_id": allocator,
+                            "summary": copy.deepcopy(metric_stats),
+                        }
+                    )
+                    if allocator != "upstream-mimalloc":
+                        paired.append(
+                            {
+                                "scenario_id": scenario,
+                                "thread_point": point,
+                                "metric_id": metric,
+                                "summary": {
+                                    "candidate_id": allocator,
+                                    "reference_id": "upstream-mimalloc",
+                                    "direction": "lower-is-better",
+                                    "block_count": 15,
+                                    "effect": 1.05,
+                                    "confidence_interval": {
+                                        "lower": 1.01,
+                                        "upper": 1.09,
+                                        "confidence_level": 0.95,
+                                    },
+                                    "bootstrap": {
+                                        "seed": 1,
+                                        "resample_count": 10_000,
+                                        "method": "percentile-block-bootstrap-type7-v1",
+                                        "prng": "splitmix64-rejection-v1",
+                                    },
+                                    "informational": True,
+                                },
+                            }
+                        )
+        value["memory"] = {
+            "metric_schema_version": report.MEMORY_SCHEMA,
+            "status": "complete",
+            "invalid_reason": None,
+            "metric_comparison_key": "a" * 64,
+            "run": copy.deepcopy(value["run"]),
+            "runner": copy.deepcopy(value["runner"]),
+            "sampling_target_interval_ns": 5_000_000,
+            "purge_policy": "natural-only",
+            "units": {
+                metric: "ratio" if metric == "fragmentation-proxy" else "bytes"
+                for metric in report.MEMORY_METRICS
+            },
+            "direction": "lower-is-better",
+            "informational": True,
+            "methodology": copy.deepcopy(report.MEMORY_METHODOLOGY),
+            "absolute_summaries": absolute,
+            "paired_summaries": paired,
+            "raw_samples": memory_samples,
+        }
+        pending = value["pending_metrics"]
+        assert isinstance(pending, list)
+        value["pending_metrics"] = [
+            item for item in pending if isinstance(item, dict) and item.get("metric_id") != "memory"
+        ]
+        return value
 
     def render_fixture(self, root: Path) -> tuple[Path, Path]:
         site = root / "site"
@@ -158,6 +342,110 @@ class BenchmarkReportTests(unittest.TestCase):
             page = (site / "index.html").read_text(encoding="utf-8")
             self.assertIn('<h2 id="throughput">Throughput</h2>', page)
             self.assertIn('<h2 id="history">Compatible history</h2>', page)
+
+    def test_complete_memory_replaces_pending_panel_and_history_stays_compact(self) -> None:
+        latest = self.with_complete_memory(self.load_latest())
+        report.validate_latest(latest, "memory fixture")
+        history = report.history_row(latest)
+        self.assertIn("memory", history)
+        memory_history = history["memory"]
+        assert isinstance(memory_history, dict)
+        self.assertNotIn("raw_samples", memory_history)
+        report.validate_history_row(history, "memory history")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            self.assertIn('<h2 id="memory">Linux process memory</h2>', page)
+            self.assertNotIn("memory: pending", page)
+            self.assertIn(b"Linux process RSS", (site / "benchmark-memory.png").read_bytes())
+
+    def test_incomplete_memory_never_replaces_pending_and_prior_complete_is_carried(self) -> None:
+        prior = self.with_complete_memory(self.load_latest())
+        incomplete = copy.deepcopy(prior)
+        memory = incomplete["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list)
+        samples.pop()
+        with self.assertRaisesRegex(report.ReportError, "complete memory pair"):
+            report.validate_latest(incomplete, "incomplete")
+
+        bad_hwm = copy.deepcopy(prior)
+        memory = bad_hwm["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list) and isinstance(samples[0], dict)
+        samples[0]["hwm_discrepancy"] = True
+        with self.assertRaisesRegex(report.ReportError, "VmHWM discrepancy"):
+            report.validate_latest(bad_hwm, "bad hwm")
+
+        bad_intervals = copy.deepcopy(prior)
+        memory = bad_intervals["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list) and isinstance(samples[0], dict)
+        sampling = samples[0]["sampling"]
+        assert isinstance(sampling, dict)
+        sampling["median_interval_ns"] = 1
+        with self.assertRaisesRegex(report.ReportError, "interval distribution"):
+            report.validate_latest(bad_intervals, "bad intervals")
+
+        mixed_environment = copy.deepcopy(prior)
+        memory = mixed_environment["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list) and isinstance(samples[0], dict)
+        environment = samples[0]["environment"]
+        assert isinstance(environment, dict)
+        environment["kernel"] = "other"
+        with self.assertRaisesRegex(report.ReportError, "mixed memory environments"):
+            report.validate_latest(mixed_environment, "mixed environment")
+
+        bad_child = copy.deepcopy(prior)
+        memory = bad_child["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list) and isinstance(samples[0], dict)
+        child = samples[0]["child_sample"]
+        assert isinstance(child, dict)
+        child["run_seed"] = 0
+        with self.assertRaisesRegex(report.ReportError, "run_seed"):
+            report.validate_latest(bad_child, "bad child")
+
+        mismatched_pair = copy.deepcopy(prior)
+        memory = mismatched_pair["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list) and isinstance(samples[0], dict)
+        child = samples[0]["child_sample"]
+        assert isinstance(child, dict)
+        child["checksum"] = int(child["checksum"]) + 1
+        with self.assertRaisesRegex(report.ReportError, "mismatched workload identity"):
+            report.validate_latest(mismatched_pair, "mismatched pair")
+
+        duplicate_summary = copy.deepcopy(prior)
+        memory = duplicate_summary["memory"]
+        assert isinstance(memory, dict)
+        absolute = memory["absolute_summaries"]
+        assert isinstance(absolute, list)
+        absolute.append(copy.deepcopy(absolute[0]))
+        with self.assertRaisesRegex(report.ReportError, "duplicate memory summary"):
+            report.validate_latest(duplicate_summary, "duplicate summary")
+
+        fresh = self.load_latest()
+        self.assertTrue(report.carry_forward_optional_metrics(fresh, prior))
+        report.validate_latest(fresh, "carried")
+        self.assertIn("memory", fresh)
+        self.assertNotIn("memory", report.history_row(fresh, include_optional_metrics=False))
+        pending = fresh["pending_metrics"]
+        assert isinstance(pending, list)
+        self.assertNotIn(
+            "memory", [item["metric_id"] for item in pending if isinstance(item, dict)]
+        )
 
     def test_readme_embeds_only_real_charts_and_clicks_through_to_pages(self) -> None:
         readme = Path(__file__).resolve().parents[2] / "README.md"

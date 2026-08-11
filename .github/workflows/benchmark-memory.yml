@@ -1,0 +1,302 @@
+name: benchmark-memory
+
+# Linux-only weekly/manual process-memory collection. It serializes with the
+# daily producer and publishes through the same sealed branch/Pages pipeline.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full (publishable, >=15 blocks) or smoke (1 block, artifact only)"
+        type: choice
+        options: [full, smoke]
+        default: full
+      run_seed:
+        description: "Explicit seed (empty derives and records one)"
+        required: false
+        type: string
+      blocks:
+        description: "Blocks per cell (minimum 15 for full; smoke must use 1)"
+        type: number
+        default: 15
+        required: false
+  schedule:
+    - cron: "41 8 * * 0"
+
+concurrency:
+  group: benchmark-stats-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PUBLISH_REF: refs/heads/benchmark-stats
+
+jobs:
+  build-and-measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      publish_eligible: ${{ steps.eligibility.outputs.publish_eligible }}
+      mode: ${{ inputs.mode || 'full' }}
+      prior_branch_sha: ${{ steps.prior.outputs.prior_sha }}
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
+      - name: build native allocator libraries
+        run: |
+          set -euxo pipefail
+          python3 ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
+      - name: resolve prior public site
+        id: prior
+        run: |
+          set -euxo pipefail
+          git ls-remote --exit-code origin "$PUBLISH_REF" >/dev/null
+          PRIOR_SHA=$(git ls-remote origin "$PUBLISH_REF" | awk '{print $1}')
+          test -n "$PRIOR_SHA"
+          echo "prior_sha=$PRIOR_SHA" >> "$GITHUB_OUTPUT"
+          git fetch origin "$PUBLISH_REF" --depth=1
+          git checkout FETCH_HEAD -- history.jsonl latest.json
+          test -s history.jsonl
+          test -s latest.json
+          cp history.jsonl "$RUNNER_TEMP/history-input.jsonl"
+          cp latest.json "$RUNNER_TEMP/base-latest.json"
+      - name: build benchmark suite
+        run: |
+          set -euxo pipefail
+          cd rust
+          soldr cargo build -p benchmark-suite --release --locked
+      - name: determine run seed
+        id: seed
+        env:
+          INPUT_RUN_SEED: ${{ inputs.run_seed }}
+        run: |
+          set -euo pipefail
+          SEED="$INPUT_RUN_SEED"
+          if [ -z "$SEED" ]; then
+            SEED=$(( RANDOM << 17 | RANDOM << 1 | RANDOM >> 14 ))
+          fi
+          case "$SEED" in
+            *[!0-9]*) echo "::error::run_seed must be a positive decimal integer"; exit 1 ;;
+          esac
+          test "$SEED" -gt 0
+          echo "seed=$SEED" >> "$GITHUB_OUTPUT"
+      - name: run external memory suite
+        env:
+          MEMORY_MODE: ${{ inputs.mode || 'full' }}
+          MEMORY_BLOCKS: ${{ inputs.blocks || 15 }}
+          MEMORY_RUN_SEED: ${{ steps.seed.outputs.seed }}
+        run: |
+          set -euxo pipefail
+          cd rust
+          MODE="$MEMORY_MODE"
+          BLOCKS="$MEMORY_BLOCKS"
+          SMOKE_FLAG=""
+          if [ "$MODE" = "smoke" ]; then
+            test "$BLOCKS" = "1"
+            SMOKE_FLAG="--reduced-smoke"
+          fi
+          soldr cargo run -p benchmark-suite --bin benchmark-memory-run --release -- \
+            $SMOKE_FLAG \
+            --blocks "$BLOCKS" \
+            --run-seed "$MEMORY_RUN_SEED" \
+            --output-dir "$RUNNER_TEMP/memory-output-${{ github.run_id }}" \
+            --build-root target/release
+      - name: validate and overlay complete memory report
+        if: (inputs.mode || 'full') == 'full'
+        run: |
+          set -euxo pipefail
+          cd rust
+          soldr cargo run -p benchmark-suite --bin benchmark-memory-validate --release -- \
+            --input "$RUNNER_TEMP/memory-output-${{ github.run_id }}/memory-raw-run.json" \
+            --base-latest "$RUNNER_TEMP/base-latest.json" \
+            --report-out "$RUNNER_TEMP/memory-report.json" \
+            --latest-out "$RUNNER_TEMP/latest.json"
+      - name: render sealed site
+        if: (inputs.mode || 'full') == 'full'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/site"
+          python ci/benchmark_report.py render \
+            --input "$RUNNER_TEMP/latest.json" \
+            --history-in "$RUNNER_TEMP/history-input.jsonl" \
+            --output-dir "$RUNNER_TEMP/site" \
+            --detached-digest-out "$RUNNER_TEMP/manifest.sha256"
+          python ci/benchmark_report.py validate-site \
+            --site-dir "$RUNNER_TEMP/site" \
+            --detached-digest "$RUNNER_TEMP/manifest.sha256"
+      - name: compute publication eligibility
+        id: eligibility
+        if: success()
+        env:
+          MEMORY_REPOSITORY: ${{ github.repository }}
+          MEMORY_REF: ${{ github.ref }}
+          MEMORY_MODE: ${{ inputs.mode || 'full' }}
+          MEMORY_BLOCKS: ${{ inputs.blocks || 15 }}
+        run: |
+          set -euo pipefail
+          ELIGIBLE=false
+          if [ "$MEMORY_REPOSITORY" = "zackees/mimalloc-pprof" ] && \
+             [ "$MEMORY_REF" = "refs/heads/main" ] && \
+             [ "$MEMORY_MODE" = "full" ] && \
+             [ "$MEMORY_BLOCKS" -ge 15 ]; then
+            ELIGIBLE=true
+          fi
+          echo "publish_eligible=$ELIGIBLE" >> "$GITHUB_OUTPUT"
+      - name: upload raw proc artifact
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: benchmark-memory-raw-${{ github.run_id }}-${{ github.run_attempt }}
+          path: "${{ runner.temp }}/memory-output-${{ github.run_id }}/"
+          include-hidden-files: true
+          retention-days: 30
+          if-no-files-found: error
+      - name: upload validation artifact
+        if: (inputs.mode || 'full') == 'full' && always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: benchmark-memory-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/memory-report.json
+            ${{ runner.temp }}/manifest.sha256
+          retention-days: 30
+          if-no-files-found: error
+      - name: upload site artifact
+        if: (inputs.mode || 'full') == 'full' && success()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: benchmark-memory-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/site/
+          include-hidden-files: true
+          retention-days: 30
+          if-no-files-found: error
+
+  artifact-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: build-and-measure
+    if: needs.build-and-measure.outputs.mode == 'full'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-memory-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: audit/site/
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-memory-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: audit/validation/
+      - name: audit sealed memory site
+        run: |
+          python ci/benchmark_report.py validate-site \
+            --site-dir audit/site/ \
+            --detached-digest audit/validation/manifest.sha256
+
+  publish-branch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [build-and-measure, artifact-audit]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-memory-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: site-temp/
+      - name: publish exact memory site revision
+        run: |
+          set -euxo pipefail
+          MANIFEST_DIGEST=$(sha256sum site-temp/manifest.json | awk '{print $1}')
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          WORKTREE=$(mktemp -d)
+          git worktree add --detach "$WORKTREE" HEAD
+          python ci/benchmark_report.py prepare-branch \
+            --worktree "$WORKTREE" \
+            --site-dir "$GITHUB_WORKSPACE/site-temp"
+          cd "$WORKTREE"
+          git commit -m "benchmark-memory run=${{ github.run_id }}/${{ github.run_attempt }} src=${{ github.sha }} manifest=$MANIFEST_DIGEST"
+          python "$GITHUB_WORKSPACE/ci/benchmark_report.py" validate-revision \
+            --repository "$WORKTREE" \
+            --revision HEAD \
+            --site-dir "$GITHUB_WORKSPACE/site-temp"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push origin "HEAD:$PUBLISH_REF" --force-with-lease="refs/heads/benchmark-stats:${{ needs.build-and-measure.outputs.prior_branch_sha }}"
+          test "$(git ls-remote origin "$PUBLISH_REF" | awk '{print $1}')" = "$(git rev-parse HEAD)"
+          cd "$GITHUB_WORKSPACE"
+          git worktree remove --force "$WORKTREE"
+
+  package-pages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [build-and-measure, artifact-audit, publish-branch]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-memory-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _site/
+      - uses: actions/upload-pages-artifact@v4.0.0
+        with:
+          path: _site/
+          include-hidden-files: true
+
+  deploy-pages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [build-and-measure, artifact-audit, publish-branch, package-pages]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4.0.5
+        id: deployment
+
+  publication-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [build-and-measure, publish-branch, deploy-pages]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true' && always()
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-memory-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: audit/site/
+      - name: audit memory publication
+        run: |
+          set -euxo pipefail
+          git fetch origin refs/heads/benchmark-stats --depth=1
+          python ci/benchmark_report.py validate-revision \
+            --repository . \
+            --revision FETCH_HEAD \
+            --site-dir audit/site/
+          python ci/benchmark_report.py audit-pages \
+            --site-dir audit/site/ \
+            --page-url "${{ needs.deploy-pages.outputs.page_url }}"
+          echo "Memory publication branch and Pages bytes match." >> "$GITHUB_STEP_SUMMARY"

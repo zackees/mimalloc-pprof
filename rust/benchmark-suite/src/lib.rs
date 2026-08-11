@@ -8,6 +8,8 @@ pub mod child;
 pub mod comparison_key;
 pub mod config;
 pub mod execution;
+pub mod memory;
+pub mod memory_runner;
 pub mod model;
 pub mod orchestration;
 pub mod provenance;

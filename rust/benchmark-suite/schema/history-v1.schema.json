@@ -14,7 +14,8 @@
     "runner": { "$ref": "raw-run-v1.schema.json#/$defs/runner" },
     "allocator_identities": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/allocatorIdentity" } },
     "absolute_summaries": { "type": "array", "minItems": 120, "items": { "$ref": "latest-v1.schema.json#/$defs/absoluteCell" } },
-    "paired_summaries": { "type": "array", "minItems": 90, "items": { "$ref": "latest-v1.schema.json#/$defs/pairedCell" } }
+    "paired_summaries": { "type": "array", "minItems": 90, "items": { "$ref": "latest-v1.schema.json#/$defs/pairedCell" } },
+    "memory": { "$ref": "memory-v1.schema.json#/$defs/history" }
   },
   "$defs": {
     "allocatorIdentity": {

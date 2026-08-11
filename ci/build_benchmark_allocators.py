@@ -1158,7 +1158,12 @@ def build_records(
                 "library_sha256": library_sha256,
                 "child_binary": str(child),
                 "child_binary_sha256": child_sha256,
-                "commands": [*resolved, *child_commands],
+                # Store the lockfile's template commands — not the expanded
+                # paths — so the validator can compare them byte-for-byte
+                # against the pinned lockfile.  Child cargo commands are
+                # always identical and reconstructable from toolchain + binary
+                # provenance; including them would cause a spurious mismatch.
+                "commands": [list(command) for command in commands],
                 "build_flags": require_string_list(
                     build.get("flags"), f"{allocator_id}.build.flags"
                 ),

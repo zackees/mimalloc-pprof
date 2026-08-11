@@ -118,11 +118,14 @@ jobs:
           cd rust
           MODE="${{ inputs.mode || 'full' }}"
           BLOCKS="${{ inputs.blocks || 15 }}"
+          SMOKE_FLAG=""
+          if [ "$MODE" = "smoke" ]; then
+            SMOKE_FLAG="--reduced-smoke"
+          fi
           soldr cargo run -p benchmark-suite --bin benchmark-run --release -- \
-            --mode "$MODE" \
+            $SMOKE_FLAG \
             --blocks "$BLOCKS" \
-            --out "$RUNNER_TEMP/raw-run.json" \
-            --run-seed "${{ steps.seed.outputs.seed }}"
+            --out "$RUNNER_TEMP/raw-run.json"
       - name: validate raw run
         run: |
           set -euxo pipefail

@@ -1120,7 +1120,7 @@ def build_records(
         library = find_primary_library(record, source_dir, build_dir)
         source_sha = source_commit(record, workflow_commit)
         version = adapter_version(record, workflow_commit)
-        child, child_commands, link_inputs, link_identity = build_child(
+        child, _child_commands, link_inputs, link_identity = build_child(
             record,
             source_dir,
             build_dir,

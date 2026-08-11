@@ -461,7 +461,11 @@ def command_environment() -> dict[str, str]:
     # exact binaries visible to the native recipes and retain the resulting PATH
     # in provenance.
     soldr_syslib = Path("/root/.soldr/bin/syslib")
-    if soldr_syslib.is_dir():
+    try:
+        is_syslib = soldr_syslib.is_dir()
+    except PermissionError:
+        is_syslib = False
+    if is_syslib:
         syslib_bins = sorted(
             (path for path in soldr_syslib.glob("*/*/*/package/bin") if path.is_dir()),
             reverse=True,

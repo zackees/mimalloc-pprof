@@ -55,7 +55,6 @@ jobs:
       - name: build native allocator libraries
         run: |
           set -euxo pipefail
-          mkdir -p /root/.soldr/bin/syslib 2>/dev/null || true
           python3 ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
       - uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
       - name: resolve history

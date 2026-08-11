@@ -91,7 +91,11 @@ jobs:
           set -euxo pipefail
           cd rust
           soldr cargo run -p benchmark-suite --bin benchmark-validate -- --selftest
-      - name: build allocator libraries and child executables
+      - name: build native allocator libraries
+        run: |
+          set -euxo pipefail
+          python ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
+      - name: build benchmark suite with native adapters
         run: |
           set -euxo pipefail
           cd rust

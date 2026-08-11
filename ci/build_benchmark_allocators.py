@@ -1087,7 +1087,10 @@ def build_records(
         required_tool = build.get("required_tool_version")
         if required_tool is not None:
             actual_tool = checked_tool_version([resolved[0][0]])
-            if not _tool_version_satisfies(actual_tool, required_tool):
+            required_tool_str = require_string(
+                required_tool, f"{allocator_id}.build.required_tool_version"
+            )
+            if not _tool_version_satisfies(actual_tool, required_tool_str):
                 raise ArchiveError(f"{allocator_id} requires {required_tool}, got {actual_tool}")
         with (logs / f"{allocator_id}.log").open("w", encoding="utf-8") as log:
             for command in resolved:

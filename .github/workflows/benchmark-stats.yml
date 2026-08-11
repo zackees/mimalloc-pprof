@@ -242,7 +242,7 @@ jobs:
         with:
           persist-credentials: false
       - name: download site artifact
-        uses: actions/download-artifact@95815c38cf5d00ec38710260e835b6cadc111a4a  # v4.3.0
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
           path: site-temp/
@@ -286,12 +286,12 @@ jobs:
       contents: read
     steps:
       - name: download site artifact
-        uses: actions/download-artifact@95815c38cf5d00ec38710260e835b6cadc111a4a  # v4.3.0
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
           path: _site/
       - name: upload pages artifact
-        uses: actions/upload-pages-artifact@7e45065d1fd703ce67b90da1914a77eb9be3924a  # v3.1.1
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b  # v4.0.0
         with:
           path: _site/
 
@@ -308,7 +308,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       # actions/deploy-pages v4.0.5
-      - uses: actions/deploy-pages@c9ba3c5b5fca82fcf21936bd1efba49f2b8f40a0
+      - uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e  # v4.0.5
         id: deployment
 
   publication-audit:

@@ -20,8 +20,9 @@
     "paired_summaries": { "type": "array", "minItems": 90, "items": { "$ref": "#/$defs/pairedCell" } },
     "comparison_key": { "$ref": "#/$defs/sha256" },
     "methodology": { "$ref": "#/$defs/methodology" },
-    "pending_metrics": { "type": "array", "minItems": 3, "maxItems": 4, "items": { "$ref": "#/$defs/pending" } },
+    "pending_metrics": { "type": "array", "minItems": 2, "maxItems": 4, "items": { "$ref": "#/$defs/pending" } },
     "memory": { "$ref": "memory-v1.schema.json#/$defs/report" },
+    "latency": { "$ref": "latency-v1.schema.json#/$defs/report" },
     "canonical_urls": { "$ref": "#/$defs/urls" },
     "reproduction_command": { "$ref": "#/$defs/nonempty" },
     "actions_run_url": { "type": "string" }

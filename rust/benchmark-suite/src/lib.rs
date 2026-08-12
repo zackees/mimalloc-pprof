@@ -8,6 +8,8 @@ pub mod child;
 pub mod comparison_key;
 pub mod config;
 pub mod execution;
+pub mod latency;
+pub mod latency_runner;
 pub mod memory;
 pub mod memory_runner;
 pub mod model;

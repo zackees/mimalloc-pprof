@@ -70,7 +70,7 @@ TOP_LEVEL_FIELDS = {
     "reproduction_command",
     "actions_run_url",
 }
-OPTIONAL_TOP_LEVEL_FIELDS = {"memory"}
+OPTIONAL_TOP_LEVEL_FIELDS = {"memory", "latency"}
 HISTORY_FIELDS = {
     "history_schema_version",
     "statistics_version",
@@ -82,7 +82,7 @@ HISTORY_FIELDS = {
     "absolute_summaries",
     "paired_summaries",
 }
-OPTIONAL_HISTORY_FIELDS = {"memory"}
+OPTIONAL_HISTORY_FIELDS = {"memory", "latency"}
 RUN_FIELDS = {
     "source_repository",
     "source_sha",
@@ -153,7 +153,7 @@ ROLES = {
     "benchmark-throughput.png": "throughput-chart",
     "benchmark-history.png": "history-chart",
     "benchmark-memory.png": "memory-panel",
-    "benchmark-latency.png": "pending-latency-panel",
+    "benchmark-latency.png": "latency-panel",
     "benchmark-scaling.png": "pending-scaling-panel",
     "benchmark-pprof-tax.png": "pending-pprof-tax-panel",
 }
@@ -175,6 +175,31 @@ MEMORY_CELLS = (
     ("cross-thread-producer-consumer", "physical-core"),
     ("thread-churn", "physical-core"),
 )
+LATENCY_SCHEMA = "transaction-latency-v1"
+LATENCY_CHILD_PROTOCOL = "transaction-latency-child-v1"
+LATENCY_CELLS = (
+    ("tiny-fixed-64", "1"),
+    ("small-log-mixed", "1"),
+    ("small-log-mixed", "physical-core"),
+    ("cross-thread-producer-consumer", "physical-core"),
+    ("large-objects", "1"),
+)
+LATENCY_REPORT_FIELDS = {
+    "metric_schema_version",
+    "status",
+    "invalid_reason",
+    "metric_comparison_key",
+    "run",
+    "runner",
+    "direction",
+    "informational",
+    "sampling_denominators",
+    "methodology",
+    "absolute_summaries",
+    "paired_summaries",
+    "block_summaries",
+    "raw_samples",
+}
 MEMORY_REPORT_FIELDS = {
     "metric_schema_version",
     "status",
@@ -1095,6 +1120,664 @@ def validate_memory_report(
     return report
 
 
+def validate_latency_distribution(value: object, label: str) -> dict[str, object]:
+    distribution = object_value(value, label)
+    exact_fields(
+        distribution,
+        {
+            "count",
+            "p50_ns",
+            "p95_ns",
+            "p99_ns",
+            "min_ns",
+            "max_ns",
+            "median_absolute_deviation_ns",
+            "iqr_ns",
+            "zero_count",
+        },
+        label,
+    )
+    count = int_value(distribution.get("count"), f"{label}.count", 1)
+    p50 = float_value(distribution.get("p50_ns"), f"{label}.p50_ns", True)
+    p95 = float_value(distribution.get("p95_ns"), f"{label}.p95_ns", True)
+    p99 = float_value(distribution.get("p99_ns"), f"{label}.p99_ns", True)
+    minimum = int_value(distribution.get("min_ns"), f"{label}.min_ns", 1)
+    maximum = int_value(distribution.get("max_ns"), f"{label}.max_ns", 1)
+    float_value(
+        distribution.get("median_absolute_deviation_ns"),
+        f"{label}.median_absolute_deviation_ns",
+    )
+    float_value(distribution.get("iqr_ns"), f"{label}.iqr_ns")
+    if (
+        distribution.get("zero_count") != 0
+        or not minimum <= p50 <= p95 <= p99 <= maximum
+        or count < 1
+    ):
+        fail(f"{label}: invalid latency order statistics or zero duration")
+    return distribution
+
+
+def latency_type7(values: Sequence[int | float], probability: float) -> float:
+    if not values or not 0.0 <= probability <= 1.0:
+        fail("latency Type-7 input is empty or has an invalid probability")
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * probability
+    lower = math.floor(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    return ordered[lower] + (position - lower) * (ordered[upper] - ordered[lower])
+
+
+def summarize_latency_values(values: Sequence[int]) -> dict[str, object]:
+    if not values or any(value <= 0 for value in values):
+        fail("latency raw distribution is empty or contains a non-positive duration")
+    p50 = latency_type7(values, 0.50)
+    q1 = latency_type7(values, 0.25)
+    q3 = latency_type7(values, 0.75)
+    return {
+        "count": len(values),
+        "p50_ns": p50,
+        "p95_ns": latency_type7(values, 0.95),
+        "p99_ns": latency_type7(values, 0.99),
+        "min_ns": min(values),
+        "max_ns": max(values),
+        "median_absolute_deviation_ns": latency_type7(
+            [abs(float(value) - p50) for value in values], 0.50
+        ),
+        "iqr_ns": q3 - q1,
+        "zero_count": 0,
+    }
+
+
+def validate_latency_scheduling(value: object, label: str) -> dict[str, object]:
+    scheduling = object_value(value, label)
+    exact_fields(
+        scheduling,
+        {
+            "affinity_policy",
+            "actual_cpu_ids",
+            "thread_count",
+            "physical_cores",
+            "logical_cores",
+            "context_switches",
+            "runner_class",
+            "clock",
+        },
+        label,
+    )
+    string_value(scheduling.get("affinity_policy"), f"{label}.affinity_policy")
+    string_value(scheduling.get("runner_class"), f"{label}.runner_class")
+    thread_count = int_value(scheduling.get("thread_count"), f"{label}.thread_count", 1)
+    physical = int_value(scheduling.get("physical_cores"), f"{label}.physical_cores", 1)
+    logical = int_value(scheduling.get("logical_cores"), f"{label}.logical_cores", 1)
+    if physical > logical:
+        fail(f"{label}: physical cores exceed logical cores")
+    cpu_ids = list_value(scheduling.get("actual_cpu_ids"), f"{label}.actual_cpu_ids")
+    if len(cpu_ids) != thread_count:
+        fail(f"{label}.actual_cpu_ids: expected one observation per worker")
+    for index, cpu in enumerate(cpu_ids):
+        if cpu is not None:
+            int_value(cpu, f"{label}.actual_cpu_ids[{index}]")
+    switches = object_value(scheduling.get("context_switches"), f"{label}.context_switches")
+    exact_fields(switches, {"voluntary", "involuntary"}, f"{label}.context_switches")
+    int_value(switches.get("voluntary"), f"{label}.context_switches.voluntary")
+    int_value(switches.get("involuntary"), f"{label}.context_switches.involuntary")
+    clock = object_value(scheduling.get("clock"), f"{label}.clock")
+    exact_fields(clock, {"source", "implementation", "resolution_ns"}, f"{label}.clock")
+    if clock.get("source") != "monotonic":
+        fail(f"{label}.clock.source: monotonic clock required")
+    string_value(clock.get("implementation"), f"{label}.clock.implementation")
+    int_value(clock.get("resolution_ns"), f"{label}.clock.resolution_ns", 1)
+    return scheduling
+
+
+def validate_latency_child(value: object, label: str, control: bool) -> dict[str, object]:
+    child = object_value(value, label)
+    exact_fields(
+        child,
+        {
+            "protocol_version",
+            "metric_schema_version",
+            "control",
+            "completed_transactions",
+            "checksum",
+            "observations",
+            "scheduling",
+        },
+        label,
+    )
+    if (
+        child.get("protocol_version") != LATENCY_CHILD_PROTOCOL
+        or child.get("metric_schema_version") != LATENCY_SCHEMA
+        or child.get("control") is not control
+    ):
+        fail(f"{label}: latency child identity/control mismatch")
+    int_value(child.get("completed_transactions"), f"{label}.completed_transactions", 1)
+    int_value(child.get("checksum"), f"{label}.checksum", 1)
+    observations = list_value(child.get("observations"), f"{label}.observations")
+    if not observations:
+        fail(f"{label}.observations: empty")
+    previous: tuple[int, int] | None = None
+    for index, value in enumerate(observations):
+        item = object_value(value, f"{label}.observations[{index}]")
+        exact_fields(
+            item,
+            {"thread_index", "transaction_index", "duration_ns"},
+            f"{label}.observations[{index}]",
+        )
+        key = (
+            int_value(item.get("thread_index"), f"{label}.observations[{index}].thread_index"),
+            int_value(
+                item.get("transaction_index"),
+                f"{label}.observations[{index}].transaction_index",
+            ),
+        )
+        int_value(item.get("duration_ns"), f"{label}.observations[{index}].duration_ns", 1)
+        if previous is not None and key <= previous:
+            fail(f"{label}.observations: schedule must be strictly ordered")
+        previous = key
+    validate_latency_scheduling(child.get("scheduling"), f"{label}.scheduling")
+    return child
+
+
+def latency_schedule(child: Mapping[str, object], label: str) -> list[tuple[int, int]]:
+    return [
+        (
+            cast(int, object_value(value, label)["thread_index"]),
+            cast(int, object_value(value, label)["transaction_index"]),
+        )
+        for value in list_value(child["observations"], label)
+    ]
+
+
+def validate_latency_paired(value: object, label: str) -> dict[str, object]:
+    item = object_value(value, label)
+    exact_fields(item, {"scenario_id", "thread_point", "quantile", "summary"}, label)
+    if (item.get("scenario_id"), item.get("thread_point")) not in LATENCY_CELLS:
+        fail(f"{label}: undeclared latency cell")
+    if item.get("quantile") not in ("p50", "p95", "p99"):
+        fail(f"{label}.quantile: unsupported")
+    summary = object_value(item.get("summary"), f"{label}.summary")
+    exact_fields(
+        summary,
+        {
+            "candidate_id",
+            "reference_id",
+            "direction",
+            "block_count",
+            "effect",
+            "confidence_interval",
+            "bootstrap",
+            "informational",
+        },
+        f"{label}.summary",
+    )
+    if (
+        summary.get("candidate_id") not in set(ALLOCATOR_IDS) - {"upstream-mimalloc"}
+        or summary.get("reference_id") != "upstream-mimalloc"
+        or summary.get("direction") != "lower-is-better"
+        or summary.get("informational") is not True
+    ):
+        fail(f"{label}.summary: invalid paired latency identity")
+    int_value(summary.get("block_count"), f"{label}.summary.block_count", 15)
+    float_value(summary.get("effect"), f"{label}.summary.effect", True)
+    interval = object_value(summary.get("confidence_interval"), f"{label}.summary.interval")
+    exact_fields(interval, {"lower", "upper", "confidence_level"}, f"{label}.summary.interval")
+    lower = float_value(interval.get("lower"), f"{label}.summary.interval.lower", True)
+    upper = float_value(interval.get("upper"), f"{label}.summary.interval.upper", True)
+    if interval.get("confidence_level") != 0.95 or lower > upper:
+        fail(f"{label}.summary.interval: invalid")
+    bootstrap = object_value(summary.get("bootstrap"), f"{label}.summary.bootstrap")
+    exact_fields(
+        bootstrap, {"seed", "resample_count", "method", "prng"}, f"{label}.summary.bootstrap"
+    )
+    if (
+        int_value(bootstrap.get("seed"), f"{label}.summary.bootstrap.seed") < 0
+        or bootstrap.get("resample_count") != 10_000
+        or bootstrap.get("method") != "percentile-whole-block-transaction-quantile-type7-v1"
+        or bootstrap.get("prng") != "splitmix64-rejection-v1"
+    ):
+        fail(f"{label}.summary.bootstrap: unsupported block bootstrap")
+    return item
+
+
+def validate_latency_report(
+    value: object, label: str, *, compact: bool = False
+) -> dict[str, object]:
+    report = object_value(value, label)
+    required = LATENCY_REPORT_FIELDS - (
+        {"invalid_reason", "runner", "raw_samples"} if compact else set()
+    )
+    if compact:
+        required.add("runner_fingerprint_sha256")
+    exact_fields(report, required, label)
+    if (
+        report.get("metric_schema_version") != LATENCY_SCHEMA
+        or report.get("status") != "complete"
+        or report.get("direction") != "lower-is-better"
+        or report.get("informational") is not True
+    ):
+        fail(f"{label}: complete informational lower-is-better latency required")
+    comparison_digest(report.get("metric_comparison_key"), f"{label}.metric_comparison_key")
+    validate_run(report.get("run"), f"{label}.run")
+    runner: dict[str, object] | None = None
+    if compact:
+        digest = string_value(
+            report.get("runner_fingerprint_sha256"), f"{label}.runner_fingerprint_sha256"
+        )
+        if not HEX_64.fullmatch(digest):
+            fail(f"{label}.runner_fingerprint_sha256: invalid")
+    else:
+        if report.get("invalid_reason") is not None:
+            fail(f"{label}.invalid_reason: must be null")
+        runner = validate_runner(report.get("runner"), f"{label}.runner")
+    rates = object_value(report.get("sampling_denominators"), f"{label}.sampling_denominators")
+    if set(rates) != {f"{scenario}/{point}" for scenario, point in LATENCY_CELLS}:
+        fail(f"{label}.sampling_denominators: exact latency cell matrix required")
+    for cell, rate in rates.items():
+        denominator = int_value(rate, f"{label}.sampling_denominators.{cell}", 1)
+        if denominator > 1024:
+            fail(f"{label}.sampling_denominators.{cell}: exceeds protocol maximum")
+    methodology = object_value(report.get("methodology"), f"{label}.methodology")
+    exact_fields(
+        methodology,
+        {
+            "transaction_boundaries",
+            "quantile_method",
+            "sampling_schedule",
+            "overhead_control",
+            "bootstrap",
+            "storage_decision",
+            "tail_policy",
+        },
+        f"{label}.methodology",
+    )
+    boundaries = object_value(
+        methodology.get("transaction_boundaries"), f"{label}.methodology.transaction_boundaries"
+    )
+    exact_fields(
+        boundaries,
+        {"local", "cross-thread", "large-object"},
+        f"{label}.methodology.transaction_boundaries",
+    )
+    for field in (
+        "quantile_method",
+        "sampling_schedule",
+        "overhead_control",
+        "bootstrap",
+        "storage_decision",
+        "tail_policy",
+    ):
+        string_value(methodology.get(field), f"{label}.methodology.{field}")
+    for key in boundaries:
+        definition = string_value(
+            boundaries[key], f"{label}.methodology.transaction_boundaries.{key}"
+        )
+        if "free" not in definition or "allocation" not in definition:
+            fail(f"{label}.methodology: transaction boundary must include allocation through free")
+
+    absolute = list_value(report.get("absolute_summaries"), f"{label}.absolute_summaries")
+    if len(absolute) != 20:
+        fail(f"{label}.absolute_summaries: expected exact 5x4 matrix")
+    absolute_keys: set[tuple[str, str, str]] = set()
+    for index, value in enumerate(absolute):
+        item = object_value(value, f"{label}.absolute_summaries[{index}]")
+        exact_fields(
+            item,
+            {
+                "allocator_id",
+                "scenario_id",
+                "thread_point",
+                "transaction_definition",
+                "measured",
+                "control",
+                "overhead_valid",
+            },
+            f"{label}.absolute_summaries[{index}]",
+        )
+        key = (
+            cast(str, item.get("scenario_id")),
+            cast(str, item.get("thread_point")),
+            cast(str, item.get("allocator_id")),
+        )
+        if key[:2] not in LATENCY_CELLS or key[2] not in ALLOCATOR_IDS or key in absolute_keys:
+            fail(f"{label}.absolute_summaries[{index}]: duplicate or undeclared cell")
+        absolute_keys.add(key)
+        definition = string_value(
+            item.get("transaction_definition"),
+            f"{label}.absolute_summaries[{index}].transaction_definition",
+        )
+        if (
+            "allocation" not in definition
+            or "free" not in definition
+            or "allocator-call" in definition
+        ):
+            fail(f"{label}.absolute_summaries[{index}]: dishonest transaction label")
+        measured = validate_latency_distribution(
+            item.get("measured"), f"{label}.absolute_summaries[{index}].measured"
+        )
+        control = validate_latency_distribution(
+            item.get("control"), f"{label}.absolute_summaries[{index}].control"
+        )
+        if (
+            int_value(measured["count"], "latency measured count") < 10_000
+            or int_value(control["count"], "latency control count") < 10_000
+            or item.get("overhead_valid") is not True
+            or cast(float, control["p50_ns"]) > cast(float, measured["p50_ns"]) * 0.05
+            or cast(float, measured["p99_ns"]) <= cast(float, control["p99_ns"]) * 2.0
+        ):
+            fail(f"{label}.absolute_summaries[{index}]: control/sample threshold failed")
+
+    paired = list_value(report.get("paired_summaries"), f"{label}.paired_summaries")
+    if len(paired) != 45:
+        fail(f"{label}.paired_summaries: expected exact quantile matrix")
+    paired_keys: set[tuple[str, str, str, str]] = set()
+    for index, value in enumerate(paired):
+        item = validate_latency_paired(value, f"{label}.paired_summaries[{index}]")
+        summary = object_value(item["summary"], f"{label}.paired_summaries[{index}].summary")
+        key = (
+            cast(str, item["scenario_id"]),
+            cast(str, item["thread_point"]),
+            cast(str, item["quantile"]),
+            cast(str, summary["candidate_id"]),
+        )
+        if key in paired_keys:
+            fail(f"{label}.paired_summaries[{index}]: duplicate")
+        paired_keys.add(key)
+
+    blocks = list_value(report.get("block_summaries"), f"{label}.block_summaries")
+    if len(blocks) < 300:
+        fail(f"{label}.block_summaries: at least 15 blocks per allocator/cell required")
+    block_keys: set[tuple[str, str, str, int]] = set()
+    for index, value in enumerate(blocks):
+        item = object_value(value, f"{label}.block_summaries[{index}]")
+        exact_fields(
+            item,
+            {"block_id", "allocator_id", "scenario_id", "thread_point", "measured", "control"},
+            f"{label}.block_summaries[{index}]",
+        )
+        key = (
+            cast(str, item.get("scenario_id")),
+            cast(str, item.get("thread_point")),
+            cast(str, item.get("allocator_id")),
+            int_value(item.get("block_id"), f"{label}.block_summaries[{index}].block_id"),
+        )
+        if key[:2] not in LATENCY_CELLS or key[2] not in ALLOCATOR_IDS or key in block_keys:
+            fail(f"{label}.block_summaries[{index}]: duplicate or undeclared")
+        block_keys.add(key)
+        validate_latency_distribution(
+            item.get("measured"), f"{label}.block_summaries[{index}].measured"
+        )
+        validate_latency_distribution(
+            item.get("control"), f"{label}.block_summaries[{index}].control"
+        )
+    for scenario, point in LATENCY_CELLS:
+        for allocator in ALLOCATOR_IDS:
+            if sum(1 for key in block_keys if key[:3] == (scenario, point, allocator)) < 15:
+                fail(f"{label}: incomplete block matrix for {scenario}/{point}/{allocator}")
+
+    if compact:
+        return report
+    raw = list_value(report.get("raw_samples"), f"{label}.raw_samples")
+    if len(raw) < 300:
+        fail(f"{label}.raw_samples: incomplete")
+    raw_groups: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+    raw_blocks: dict[tuple[str, str, int], list[dict[str, object]]] = {}
+    paired_schedules: dict[tuple[str, str, int], tuple[int, list[tuple[int, int]]]] = {}
+    allocator_identities: dict[str, tuple[object, object]] = {}
+    common_clock: object | None = None
+    common_block_ids: set[int] | None = None
+    for index, value in enumerate(raw):
+        item = object_value(value, f"{label}.raw_samples[{index}]")
+        exact_fields(
+            item,
+            {
+                "metric_schema_version",
+                "block_id",
+                "ordinal",
+                "workload_seed",
+                "allocator_id",
+                "allocator_source_sha",
+                "child_binary_sha256",
+                "scenario_id",
+                "thread_point",
+                "thread_count",
+                "sample_denominator",
+                "transaction_definition",
+                "measured",
+                "control",
+            },
+            f"{label}.raw_samples[{index}]",
+        )
+        if item.get("metric_schema_version") != LATENCY_SCHEMA:
+            fail(f"{label}.raw_samples[{index}]: schema mismatch")
+        scenario = string_value(
+            item.get("scenario_id"), f"{label}.raw_samples[{index}].scenario_id"
+        )
+        point = string_value(item.get("thread_point"), f"{label}.raw_samples[{index}].thread_point")
+        allocator = string_value(
+            item.get("allocator_id"), f"{label}.raw_samples[{index}].allocator_id"
+        )
+        if (scenario, point) not in LATENCY_CELLS or allocator not in ALLOCATOR_IDS:
+            fail(f"{label}.raw_samples[{index}]: undeclared cell or allocator")
+        if not HEX_40.fullmatch(
+            string_value(
+                item.get("allocator_source_sha"),
+                f"{label}.raw_samples[{index}].allocator_source_sha",
+            )
+        ):
+            fail(f"{label}.raw_samples[{index}].allocator_source_sha: invalid")
+        comparison_digest(
+            item.get("child_binary_sha256"), f"{label}.raw_samples[{index}].child_binary_sha256"
+        )
+        block = int_value(item.get("block_id"), f"{label}.raw_samples[{index}].block_id")
+        ordinal = int_value(item.get("ordinal"), f"{label}.raw_samples[{index}].ordinal")
+        if ordinal > 3:
+            fail(f"{label}.raw_samples[{index}].ordinal: invalid")
+        seed = int_value(
+            item.get("workload_seed"), f"{label}.raw_samples[{index}].workload_seed", 1
+        )
+        denominator = int_value(
+            item.get("sample_denominator"), f"{label}.raw_samples[{index}].sample_denominator", 1
+        )
+        if denominator != rates[f"{scenario}/{point}"]:
+            fail(f"{label}.raw_samples[{index}]: sample rate differs from comparison key input")
+        definition = string_value(
+            item.get("transaction_definition"),
+            f"{label}.raw_samples[{index}].transaction_definition",
+        )
+        if (
+            "allocation" not in definition
+            or "free" not in definition
+            or "allocator-call" in definition
+        ):
+            fail(f"{label}.raw_samples[{index}]: invalid transaction definition")
+        measured = validate_latency_child(
+            item.get("measured"), f"{label}.raw_samples[{index}].measured", False
+        )
+        control = validate_latency_child(
+            item.get("control"), f"{label}.raw_samples[{index}].control", True
+        )
+        measured_schedule = latency_schedule(measured, f"{label}.raw_samples[{index}].measured")
+        if measured_schedule != latency_schedule(control, f"{label}.raw_samples[{index}].control"):
+            fail(f"{label}.raw_samples[{index}]: measured/control schedules differ")
+        measured_scheduling = object_value(measured["scheduling"], "latency measured scheduling")
+        control_scheduling = object_value(control["scheduling"], "latency control scheduling")
+        for field in (
+            "affinity_policy",
+            "thread_count",
+            "physical_cores",
+            "logical_cores",
+            "clock",
+        ):
+            if measured_scheduling[field] != control_scheduling[field]:
+                fail(f"{label}.raw_samples[{index}]: measured/control scheduling differs")
+        thread_count = int_value(
+            item.get("thread_count"), f"{label}.raw_samples[{index}].thread_count", 1
+        )
+        expected_threads = (
+            1
+            if point == "1"
+            else cast(int, runner["physical_cores"])
+            if runner is not None
+            else thread_count
+        )
+        completed = int_value(
+            measured.get("completed_transactions"),
+            f"{label}.raw_samples[{index}].measured.completed_transactions",
+            1,
+        )
+        if (
+            control.get("completed_transactions") != completed
+            or completed % thread_count != 0
+            or thread_count != expected_threads
+            or measured_scheduling["thread_count"] != thread_count
+            or control.get("checksum") != 1
+            or measured.get("checksum") == 1
+            or any(
+                worker >= thread_count or transaction >= completed // thread_count
+                for worker, transaction in measured_schedule
+            )
+        ):
+            fail(f"{label}.raw_samples[{index}]: transaction count/checksum/topology mismatch")
+        if runner is not None:
+            affinity = object_value(runner["affinity"], f"{label}.runner.affinity")
+            if (
+                measured_scheduling["physical_cores"] != runner["physical_cores"]
+                or measured_scheduling["logical_cores"] != runner["logical_cores"]
+                or measured_scheduling["runner_class"] != runner["runner_class"]
+                or control_scheduling["runner_class"] != runner["runner_class"]
+                or measured_scheduling["affinity_policy"] != affinity["policy"]
+            ):
+                fail(f"{label}.raw_samples[{index}]: scheduling contradicts report runner")
+            if affinity["policy"] == "pinned":
+                allowed = set(cast(list[int], affinity["logical_cpu_ids"]))
+                observed = list_value(
+                    measured_scheduling["actual_cpu_ids"], "latency measured CPU IDs"
+                ) + list_value(control_scheduling["actual_cpu_ids"], "latency control CPU IDs")
+                if any(cpu is None or cpu not in allowed for cpu in observed):
+                    fail(f"{label}.raw_samples[{index}]: pinned CPU assignment was not observed")
+        clock = measured_scheduling["clock"]
+        if common_clock is None:
+            common_clock = clock
+        elif clock != common_clock:
+            fail(f"{label}.raw_samples[{index}]: mixed monotonic clocks")
+        identity = (item["allocator_source_sha"], item["child_binary_sha256"])
+        prior_identity = allocator_identities.setdefault(allocator, identity)
+        if identity != prior_identity:
+            fail(f"{label}.raw_samples[{index}]: allocator provenance changed within run")
+        pair_key = (scenario, point, block)
+        if pair_key in paired_schedules:
+            expected_seed, expected_schedule = paired_schedules[pair_key]
+            if seed != expected_seed or measured_schedule != expected_schedule:
+                fail(
+                    f"{label}.raw_samples[{index}]: allocator sample schedule differs within block"
+                )
+        else:
+            paired_schedules[pair_key] = (seed, measured_schedule)
+        raw_groups.setdefault((scenario, point, allocator), []).append(item)
+        raw_blocks.setdefault(pair_key, []).append(item)
+    for scenario, point in LATENCY_CELLS:
+        cell_block_ids: set[int] | None = None
+        for allocator in ALLOCATOR_IDS:
+            group = raw_groups.get((scenario, point, allocator), [])
+            block_ids = {cast(int, item["block_id"]) for item in group}
+            if len(group) < 15 or len(block_ids) != len(group):
+                fail(f"{label}: incomplete/duplicate raw blocks for {scenario}/{point}/{allocator}")
+            if cell_block_ids is None:
+                cell_block_ids = block_ids
+            elif block_ids != cell_block_ids:
+                fail(f"{label}: allocators do not share an exact raw block set")
+            for child_name in ("measured", "control"):
+                count = sum(
+                    len(
+                        list_value(
+                            object_value(item[child_name], "latency child")["observations"],
+                            "latency observations",
+                        )
+                    )
+                    for item in group
+                )
+                if count < 10_000:
+                    fail(
+                        f"{label}: {scenario}/{point}/{allocator}/{child_name} has fewer than 10000 samples"
+                    )
+        if cell_block_ids is None:
+            fail(f"{label}: latency cell contains no blocks")
+        if common_block_ids is None:
+            common_block_ids = cell_block_ids
+        elif cell_block_ids != common_block_ids:
+            fail(f"{label}: latency cells do not share an exact raw block set")
+    if common_block_ids is None or common_block_ids != set(range(len(common_block_ids))):
+        fail(f"{label}: latency block IDs must be contiguous from zero")
+    if len(raw) != len(LATENCY_CELLS) * len(ALLOCATOR_IDS) * len(common_block_ids):
+        fail(f"{label}: raw latency matrix contains missing or extra records")
+    for (scenario, point, block_id), group in raw_blocks.items():
+        if (
+            len(group) != 4
+            or {item["allocator_id"] for item in group} != set(ALLOCATOR_IDS)
+            or {item["ordinal"] for item in group} != {0, 1, 2, 3}
+            or len({item["workload_seed"] for item in group}) != 1
+        ):
+            fail(f"{label}: incomplete paired raw block {scenario}/{point}/{block_id}")
+
+    raw_keys = {
+        (
+            cast(str, item["scenario_id"]),
+            cast(str, item["thread_point"]),
+            cast(str, item["allocator_id"]),
+            cast(int, item["block_id"]),
+        )
+        for item in cast(list[dict[str, object]], raw)
+    }
+    if raw_keys != block_keys or len(blocks) != len(raw):
+        fail(f"{label}: block summaries do not exactly cover raw latency records")
+    block_by_key = {
+        (
+            cast(str, object_value(item, "latency block")["scenario_id"]),
+            cast(str, object_value(item, "latency block")["thread_point"]),
+            cast(str, object_value(item, "latency block")["allocator_id"]),
+            cast(int, object_value(item, "latency block")["block_id"]),
+        ): object_value(item, "latency block")
+        for item in blocks
+    }
+    absolute_by_key = {
+        (
+            cast(str, object_value(item, "latency absolute")["scenario_id"]),
+            cast(str, object_value(item, "latency absolute")["thread_point"]),
+            cast(str, object_value(item, "latency absolute")["allocator_id"]),
+        ): object_value(item, "latency absolute")
+        for item in absolute
+    }
+    for group_key, group in raw_groups.items():
+        measured_values: list[int] = []
+        control_values: list[int] = []
+        for item in group:
+            measured = object_value(item["measured"], "latency measured")
+            control = object_value(item["control"], "latency control")
+            measured_block = [
+                cast(int, object_value(value, "latency observation")["duration_ns"])
+                for value in list_value(measured["observations"], "latency observations")
+            ]
+            control_block = [
+                cast(int, object_value(value, "latency observation")["duration_ns"])
+                for value in list_value(control["observations"], "latency observations")
+            ]
+            measured_values.extend(measured_block)
+            control_values.extend(control_block)
+            key = (*group_key, cast(int, item["block_id"]))
+            block_summary = block_by_key[key]
+            if block_summary["measured"] != summarize_latency_values(
+                measured_block
+            ) or block_summary["control"] != summarize_latency_values(control_block):
+                fail(f"{label}: latency block summary differs from raw durations")
+        absolute_summary = absolute_by_key[group_key]
+        if absolute_summary["measured"] != summarize_latency_values(
+            measured_values
+        ) or absolute_summary["control"] != summarize_latency_values(control_values):
+            fail(f"{label}: latency absolute summary differs from raw durations")
+    return report
+
+
 def validate_latest(latest: dict[str, object], label: str) -> None:
     exact_fields_with_optional(latest, TOP_LEVEL_FIELDS, OPTIONAL_TOP_LEVEL_FIELDS, label)
     versions = {
@@ -1252,11 +1935,33 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
         }
         if observed_sources != expected_sources:
             fail(f"{label}.memory: allocator source pins differ from the core run")
+    latency = latest.get("latency")
+    if latency is not None:
+        latency_report = validate_latency_report(latency, f"{label}.latency")
+        expected_sources = {
+            object_value(value, f"{label}.allocators")["allocator_id"]: object_value(
+                value, f"{label}.allocators"
+            )["source_sha"]
+            for value in allocators
+        }
+        observed_sources = {
+            object_value(value, f"{label}.latency.raw_samples")["allocator_id"]: object_value(
+                value, f"{label}.latency.raw_samples"
+            )["allocator_source_sha"]
+            for value in list_value(latency_report["raw_samples"], f"{label}.latency.raw_samples")
+        }
+        if observed_sources != expected_sources:
+            fail(f"{label}.latency: allocator source pins differ from the core run")
     pending = list_value(latest.get("pending_metrics"), f"{label}.pending_metrics")
-    expected_pending = (
-        ("latency", "scaling", "pprof-tax")
-        if memory is not None
-        else ("memory", "latency", "scaling", "pprof-tax")
+    expected_pending = tuple(
+        metric
+        for metric, complete in (
+            ("memory", memory is not None),
+            ("latency", latency is not None),
+            ("scaling", False),
+            ("pprof-tax", False),
+        )
+        if not complete
     )
     if len(pending) != len(expected_pending):
         fail(f"{label}.pending_metrics: does not match collected optional metrics")
@@ -1342,6 +2047,14 @@ def history_row(
             for key, value in memory.items()
             if key not in {"invalid_reason", "runner", "raw_samples"}
         } | {"runner_fingerprint_sha256": runner["fingerprint_sha256"]}
+    if include_optional_metrics and "latency" in latest:
+        latency = validate_latency_report(latest["latency"], "latest.latency")
+        runner = object_value(latency["runner"], "latest.latency.runner")
+        row["latency"] = {
+            key: value
+            for key, value in latency.items()
+            if key not in {"invalid_reason", "runner", "raw_samples"}
+        } | {"runner_fingerprint_sha256": runner["fingerprint_sha256"]}
     return row
 
 
@@ -1401,6 +2114,8 @@ def validate_history_row(value: object, label: str) -> dict[str, object]:
         validate_paired(item, f"{label}.paired_summaries[{index}]")
     if "memory" in row:
         validate_memory_report(row["memory"], f"{label}.memory", compact=True)
+    if "latency" in row:
+        validate_latency_report(row["latency"], f"{label}.latency", compact=True)
     return row
 
 
@@ -1455,9 +2170,11 @@ def merge_history(
         run = object_value(row["run"], "history run")
         if (run["run_id"], run["run_attempt"]) != current_identity:
             continue
-        previous_base = {key: value for key, value in row.items() if key != "memory"}
-        current_base = {key: value for key, value in current.items() if key != "memory"}
-        if previous_base != current_base or "memory" not in current:
+        optional = {"memory", "latency"}
+        previous_base = {key: value for key, value in row.items() if key not in optional}
+        current_base = {key: value for key, value in current.items() if key not in optional}
+        gained = (set(current) & optional) - (set(row) & optional)
+        if previous_base != current_base or not gained:
             fail("history append: duplicate run may only gain a validated optional metric")
         combined[index] = current
         break
@@ -1626,18 +2343,61 @@ def memory_png(memory: Mapping[str, object]) -> bytes:
     return encode_png(960, 540, canvas.pixels, "Linux process RSS; lower is better")
 
 
+def latency_png(latency: Mapping[str, object]) -> bytes:
+    canvas = Canvas(960, 540, (248, 250, 252))
+    canvas.rectangle(0, 0, 960, 62, (24, 35, 52))
+    records = [
+        object_value(value, "latency absolute summary")
+        for value in list_value(latency["absolute_summaries"], "latency absolute summaries")
+    ]
+    cells: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for record in records:
+        key = (cast(str, record["scenario_id"]), cast(str, record["thread_point"]))
+        cells.setdefault(key, []).append(record)
+    for ordinal, (_key, values) in enumerate(sorted(cells.items())):
+        column, row = ordinal % 2, ordinal // 2
+        left, top = 45 + column * 460, 85 + row * 145
+        canvas.rectangle(left, top, 420, 120, (235, 240, 246))
+        values.sort(key=lambda value: ALLOCATOR_IDS.index(cast(str, value["allocator_id"])))
+        p99_values = [
+            float_value(
+                object_value(value["measured"], "latency measured")["p99_ns"],
+                "latency p99",
+                True,
+            )
+            for value in values
+        ]
+        maximum = max(p99_values)
+        for index, duration in enumerate(p99_values):
+            canvas.rectangle(
+                left + 14,
+                top + 13 + index * 24,
+                max(1, int(380 * duration / maximum)),
+                14,
+                COLORS[index],
+            )
+    return encode_png(
+        960,
+        540,
+        canvas.pixels,
+        "Transaction latency p99; allocation plus touch/checksum through free; lower is better",
+    )
+
+
 def carry_forward_optional_metrics(latest: dict[str, object], prior: dict[str, object]) -> bool:
     validate_latest(prior, "prior latest")
-    if "memory" not in latest and "memory" in prior:
-        latest["memory"] = copy.deepcopy(prior["memory"])
-        pending = list_value(latest["pending_metrics"], "latest.pending_metrics")
-        latest["pending_metrics"] = [
-            value
-            for value in pending
-            if object_value(value, "latest pending metric").get("metric_id") != "memory"
-        ]
-        return True
-    return False
+    carried = False
+    for metric in ("memory", "latency"):
+        if metric not in latest and metric in prior:
+            latest[metric] = copy.deepcopy(prior[metric])
+            pending = list_value(latest["pending_metrics"], "latest.pending_metrics")
+            latest["pending_metrics"] = [
+                value
+                for value in pending
+                if object_value(value, "latest pending metric").get("metric_id") != metric
+            ]
+            carried = True
+    return carried
 
 
 def escaped(value: object) -> str:
@@ -1697,6 +2457,46 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             else "https://github.com/zackees/mimalloc-pprof/actions"
         )
         memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Absolute Linux process RSS for all four allocators; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
+    latency_html = ""
+    if "latency" in latest:
+        latency = validate_latency_report(latest["latency"], "latest.latency")
+        latency_run = object_value(latency["run"], "latest.latency.run")
+        latency_runner = object_value(latency["runner"], "latest.latency.runner")
+        latency_absolute = [
+            object_value(value, "latency absolute")
+            for value in list_value(latency["absolute_summaries"], "latency absolute summaries")
+        ]
+        latency_rows = "".join(
+            f"<tr><td>{escaped(value['scenario_id'])}</td><td>{escaped(value['thread_point'])}</td><td>{escaped(value['allocator_id'])}</td><td>{escaped(round(float_value(object_value(value['measured'], 'latency measured')['p50_ns'], 'latency p50'), 3))}</td><td>{escaped(round(float_value(object_value(value['measured'], 'latency measured')['p95_ns'], 'latency p95'), 3))}</td><td>{escaped(round(float_value(object_value(value['measured'], 'latency measured')['p99_ns'], 'latency p99'), 3))}</td><td>control OK ({escaped(object_value(value['control'], 'latency control')['p50_ns'])} ns p50)</td><td>{escaped(object_value(value['measured'], 'latency measured')['count'])}</td></tr>"
+            for value in latency_absolute
+        )
+        first_raw = object_value(
+            list_value(latency["raw_samples"], "latency raw samples")[0], "latency raw sample"
+        )
+        scheduling = object_value(
+            object_value(first_raw["measured"], "latency measured")["scheduling"],
+            "latency scheduling",
+        )
+        definitions = object_value(
+            object_value(latency["methodology"], "latency methodology")["transaction_boundaries"],
+            "latency transaction boundaries",
+        )
+        latency_actions = (
+            f"https://github.com/zackees/mimalloc-pprof/actions/runs/{escaped(latency_run['run_id'])}"
+            if latency_run["run_origin"] == "github-actions"
+            else "https://github.com/zackees/mimalloc-pprof/actions"
+        )
+        block_count = min(
+            cast(
+                int,
+                object_value(
+                    object_value(value, "latency paired")["summary"],
+                    "latency paired summary",
+                )["block_count"],
+            )
+            for value in list_value(latency["paired_summaries"], "latency paired summaries")
+        )
+        latency_html = f"""<section><h2 id="latency">Transaction latency</h2><img src="benchmark-latency.png" alt="End-to-end transaction latency p99 for all four allocators; lower is better"><p><strong>Lower is better; informational hosted-runner measurements.</strong> These are transaction latencies, never allocator-call latencies and never throughput reciprocals. Local: {escaped(definitions["local"])}. Cross-thread: {escaped(definitions["cross-thread"])}. Large object: {escaped(definitions["large-object"])}.</p><p>Each allocator/cell has at least 10,000 raw samples across {escaped(block_count)} paired blocks. Controls are reported without subtraction. Runner: {escaped(latency_runner["runner_class"])}; affinity: {escaped(scheduling["affinity_policy"])}; upstream reference: <code>upstream-mimalloc</code>. Latency run <a href="{latency_actions}">{escaped(latency_run["run_id"])}/{escaped(latency_run["run_attempt"])}</a>; metric key <code>{escaped(latency["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>p50 ns</th><th>p95 ns</th><th>p99 ns</th><th>Overhead</th><th>Samples</th></tr></thead><tbody>{latency_rows}</tbody></table></section>"""
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>mimalloc allocator benchmarks</title>
 <style>body{{font:15px system-ui,sans-serif;max-width:1200px;margin:auto;padding:24px;color:#182334}}table{{border-collapse:collapse;width:100%;margin:16px 0}}th,td{{border:1px solid #ccd4dd;padding:7px;text-align:left}}img{{max-width:100%;height:auto}}.pending{{border:1px solid #ccd4dd;padding:12px;margin:12px 0}}code,pre{{overflow-wrap:anywhere;white-space:pre-wrap}}small{{color:#596575}}</style></head><body>
@@ -1705,7 +2505,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
 <h2 id="throughput">Throughput</h2><img src="benchmark-throughput.png" alt="Per-scenario absolute throughput bars for all four allocators"><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>Median</th><th>Noisy</th></tr></thead><tbody>{absolute_rows}</tbody></table>
 <h2>Paired effects</h2><table><thead><tr><th>Scenario</th><th>Candidate</th><th>Effect</th><th>95% interval</th><th>Interpretation</th></tr></thead><tbody>{paired_rows}</tbody></table>
 <h2 id="history">Compatible history</h2><img src="benchmark-history.png" alt="History connected only across the selected identical comparison key">
-{memory_html}<h2>Pending Phase 6 panels</h2>{pending_html}<section id="phase-6"><p>Pending panels contain no measured values.</p></section>
+{memory_html}{latency_html}<h2>Pending Phase 6 panels</h2>{pending_html}<section id="phase-6"><p>Pending panels contain no measured values.</p></section>
 <h2>Provenance</h2><p>Run {escaped(run["run_id"])}, attempt {escaped(run["run_attempt"])}; target {escaped(runner["target"])}; fingerprint <code>{escaped(runner["fingerprint_sha256"])}</code>.</p><table><thead><tr><th>Allocator</th><th>Source</th><th>Binary</th></tr></thead><tbody>{allocator_rows}</tbody></table><p><a href="{escaped(latest["actions_run_url"])}">Actions run</a></p>
 <h2>Methodology</h2><pre>{escaped(json.dumps(latest["methodology"], sort_keys=True, ensure_ascii=False))}</pre><h2>Reproduce</h2><pre><code>{escaped(latest["reproduction_command"])}</code></pre>
 </body></html>"""
@@ -1792,7 +2592,15 @@ def render(
         (output / image_names["memory"]).write_bytes(
             pending_png("memory", cast(str, item["reason"]))
         )
-    for metric in ("latency", "scaling", "pprof-tax"):
+    if "latency" in latest:
+        latency = validate_latency_report(latest["latency"], "latest.latency")
+        (output / image_names["latency"]).write_bytes(latency_png(latency))
+    else:
+        item = pending["latency"]
+        (output / image_names["latency"]).write_bytes(
+            pending_png("latency", cast(str, item["reason"]))
+        )
+    for metric in ("scaling", "pprof-tax"):
         item = pending[metric]
         (output / image_names[metric]).write_bytes(pending_png(metric, cast(str, item["reason"])))
     (output / "manifest.json").write_bytes(compact_json(manifest_for(output)))

@@ -5,11 +5,14 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use benchmark_suite::execution::{execute_cell, set_measured_region_hook, AllocatorAdapter};
+use benchmark_suite::execution::{
+    execute_cell, execute_latency_cell, set_measured_region_hook, AllocatorAdapter,
+};
 use benchmark_suite::scenarios::{cards, CardId, ScenarioCell, Topology};
 
 static MEASURED: AtomicBool = AtomicBool::new(false);
 static HARNESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static TEST_GATE: Mutex<()> = Mutex::new(());
 
 thread_local! {
     static INSIDE_ADAPTER: Cell<bool> = const { Cell::new(false) };
@@ -136,6 +139,7 @@ impl AllocatorAdapter for InstrumentedAdapter {
     ignore = "macOS realloc may route through the global allocator"
 )]
 fn ordinary_measured_region_performs_zero_harness_allocations() {
+    let _test_guard = TEST_GATE.lock().unwrap();
     let adapter = InstrumentedAdapter {
         layouts: Mutex::new(HashMap::new()),
     };
@@ -184,4 +188,48 @@ fn audit_cell(adapter: &InstrumentedAdapter, cell: &ScenarioCell) {
         "Rust control-plane allocation entered the measured interval for {:?}",
         cell.card
     );
+}
+
+#[test]
+fn latency_sampling_buffers_do_not_allocate_after_warmup() {
+    let _test_guard = TEST_GATE.lock().unwrap();
+    let adapter = InstrumentedAdapter {
+        layouts: Mutex::new(HashMap::new()),
+    };
+    let topology = Topology {
+        physical_cores: 2,
+        logical_cores: 2,
+    };
+    for (card, point) in [
+        (
+            CardId::TinyFixed64,
+            benchmark_suite::scenarios::ThreadPoint::One,
+        ),
+        (
+            CardId::SmallLogMixed,
+            benchmark_suite::scenarios::ThreadPoint::PhysicalCores,
+        ),
+        (
+            CardId::CrossThreadProducerConsumer,
+            benchmark_suite::scenarios::ThreadPoint::PhysicalCores,
+        ),
+        (
+            CardId::LargeObjects,
+            benchmark_suite::scenarios::ThreadPoint::One,
+        ),
+    ] {
+        let cell = ScenarioCell::new(card, point, topology, 8, 0x5eed).unwrap();
+        for control in [false, true] {
+            HARNESS_ALLOCATIONS.store(0, Ordering::SeqCst);
+            set_measured_region_hook(Some(timing_hook));
+            let result = execute_latency_cell(&adapter, &cell, 2, control);
+            set_measured_region_hook(None);
+            result.unwrap();
+            assert_eq!(
+                HARNESS_ALLOCATIONS.load(Ordering::SeqCst),
+                0,
+                "latency sampling allocated in the measured region for {card:?}, control={control}"
+            );
+        }
+    }
 }

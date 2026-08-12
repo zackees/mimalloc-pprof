@@ -223,6 +223,189 @@ class BenchmarkReportTests(unittest.TestCase):
         ]
         return value
 
+    def with_complete_latency(self, latest: dict[str, object]) -> dict[str, object]:
+        value = copy.deepcopy(latest)
+        runner = value["runner"]
+        allocators = value["allocators"]
+        assert isinstance(runner, dict) and isinstance(allocators, list)
+        allocator_sources = {
+            str(item["allocator_id"]): (str(item["source_sha"]), str(item["child_binary_sha256"]))
+            for item in allocators
+            if isinstance(item, dict)
+        }
+        rates = {f"{scenario}/{point}": 1 for scenario, point in report.LATENCY_CELLS}
+        raw: list[dict[str, object]] = []
+        block_summaries: list[dict[str, object]] = []
+        absolute: list[dict[str, object]] = []
+        paired: list[dict[str, object]] = []
+
+        def distribution(values: list[int]) -> dict[str, object]:
+            return report.summarize_latency_values(values)
+
+        definitions = {
+            "tiny-fixed-64": "allocation plus required touch/checksum plus free",
+            "small-log-mixed": "allocation plus required touch/checksum plus free",
+            "cross-thread-producer-consumer": "producer allocation through consumer free completion, including queue and ownership transfer",
+            "large-objects": "allocation plus one-byte-per-page touch/checksum plus free",
+        }
+        for scenario, point in report.LATENCY_CELLS:
+            thread_count = 1 if point == "1" else int(runner["physical_cores"])
+            for allocator_index, allocator in enumerate(report.ALLOCATOR_IDS):
+                base = 1_000 + allocator_index * 100
+                if allocator != "upstream-mimalloc":
+                    for quantile in ("p50", "p95", "p99"):
+                        paired.append(
+                            {
+                                "scenario_id": scenario,
+                                "thread_point": point,
+                                "quantile": quantile,
+                                "summary": {
+                                    "candidate_id": allocator,
+                                    "reference_id": "upstream-mimalloc",
+                                    "direction": "lower-is-better",
+                                    "block_count": 15,
+                                    "effect": 1.05,
+                                    "confidence_interval": {
+                                        "lower": 1.01,
+                                        "upper": 1.09,
+                                        "confidence_level": 0.95,
+                                    },
+                                    "bootstrap": {
+                                        "seed": 1,
+                                        "resample_count": 10_000,
+                                        "method": "percentile-whole-block-transaction-quantile-type7-v1",
+                                        "prng": "splitmix64-rejection-v1",
+                                    },
+                                    "informational": True,
+                                },
+                            }
+                        )
+                all_measured: list[int] = []
+                all_control: list[int] = []
+                for block in range(15):
+                    observations = [
+                        {
+                            "thread_index": index % thread_count,
+                            "transaction_index": index // thread_count,
+                            "duration_ns": base + index % 41,
+                        }
+                        for index in range(667)
+                    ]
+                    observations.sort(
+                        key=lambda item: (item["thread_index"], item["transaction_index"])
+                    )
+                    control_observations = [
+                        item | {"duration_ns": 40 + int(item["transaction_index"]) % 3}
+                        for item in observations
+                    ]
+                    measured_values = [int(item["duration_ns"]) for item in observations]
+                    control_values = [int(item["duration_ns"]) for item in control_observations]
+                    all_measured.extend(measured_values)
+                    all_control.extend(control_values)
+                    scheduling = {
+                        "affinity_policy": runner["affinity"]["policy"],
+                        "actual_cpu_ids": list(range(thread_count)),
+                        "thread_count": thread_count,
+                        "physical_cores": runner["physical_cores"],
+                        "logical_cores": runner["logical_cores"],
+                        "context_switches": {"voluntary": 0, "involuntary": 0},
+                        "runner_class": runner["runner_class"],
+                        "clock": {
+                            "source": "monotonic",
+                            "implementation": "std::time::Instant/CLOCK_MONOTONIC",
+                            "resolution_ns": 1,
+                        },
+                    }
+                    child_base = {
+                        "protocol_version": report.LATENCY_CHILD_PROTOCOL,
+                        "metric_schema_version": report.LATENCY_SCHEMA,
+                        "completed_transactions": thread_count * 1_000,
+                        "checksum": 2,
+                        "scheduling": copy.deepcopy(scheduling),
+                    }
+                    source_sha, child_sha = allocator_sources[allocator]
+                    raw.append(
+                        {
+                            "metric_schema_version": report.LATENCY_SCHEMA,
+                            "block_id": block,
+                            "ordinal": allocator_index,
+                            "workload_seed": block + 1,
+                            "allocator_id": allocator,
+                            "allocator_source_sha": source_sha,
+                            "child_binary_sha256": child_sha,
+                            "scenario_id": scenario,
+                            "thread_point": point,
+                            "thread_count": thread_count,
+                            "sample_denominator": 1,
+                            "transaction_definition": definitions[scenario],
+                            "measured": child_base
+                            | {"control": False, "observations": observations},
+                            "control": copy.deepcopy(child_base)
+                            | {
+                                "control": True,
+                                "checksum": 1,
+                                "observations": control_observations,
+                            },
+                        }
+                    )
+                    block_summaries.append(
+                        {
+                            "block_id": block,
+                            "allocator_id": allocator,
+                            "scenario_id": scenario,
+                            "thread_point": point,
+                            "measured": distribution(measured_values),
+                            "control": distribution(control_values),
+                        }
+                    )
+                absolute.append(
+                    {
+                        "allocator_id": allocator,
+                        "scenario_id": scenario,
+                        "thread_point": point,
+                        "transaction_definition": definitions[scenario],
+                        "measured": distribution(all_measured),
+                        "control": distribution(all_control),
+                        "overhead_valid": True,
+                    }
+                )
+        value["latency"] = {
+            "metric_schema_version": report.LATENCY_SCHEMA,
+            "status": "complete",
+            "invalid_reason": None,
+            "metric_comparison_key": "c" * 64,
+            "run": copy.deepcopy(value["run"]),
+            "runner": copy.deepcopy(runner),
+            "direction": "lower-is-better",
+            "informational": True,
+            "sampling_denominators": rates,
+            "methodology": {
+                "transaction_boundaries": {
+                    "local": definitions["tiny-fixed-64"],
+                    "cross-thread": definitions["cross-thread-producer-consumer"],
+                    "large-object": definitions["large-objects"],
+                },
+                "quantile_method": "R/NumPy Type 7 linear interpolation",
+                "sampling_schedule": "deterministic paired 1/N indices",
+                "overhead_control": "reported separately and never subtracted",
+                "bootstrap": "whole blocks with transaction quantile recomputation",
+                "storage_decision": "raw vectors fit the public cap",
+                "tail_policy": "all scheduler tails retained",
+            },
+            "absolute_summaries": absolute,
+            "paired_summaries": paired,
+            "block_summaries": block_summaries,
+            "raw_samples": raw,
+        }
+        pending = value["pending_metrics"]
+        assert isinstance(pending, list)
+        value["pending_metrics"] = [
+            item
+            for item in pending
+            if isinstance(item, dict) and item.get("metric_id") != "latency"
+        ]
+        return value
+
     def render_fixture(self, root: Path) -> tuple[Path, Path]:
         site = root / "site"
         digest = root / "manifest.sha256"
@@ -445,6 +628,66 @@ class BenchmarkReportTests(unittest.TestCase):
         assert isinstance(pending, list)
         self.assertNotIn(
             "memory", [item["metric_id"] for item in pending if isinstance(item, dict)]
+        )
+
+    def test_complete_latency_replaces_pending_with_transaction_chart_and_compact_history(
+        self,
+    ) -> None:
+        latest = self.with_complete_latency(self.load_latest())
+        report.validate_latest(latest, "latency fixture")
+        history = report.history_row(latest)
+        self.assertIn("latency", history)
+        latency_history = history["latency"]
+        assert isinstance(latency_history, dict)
+        self.assertNotIn("raw_samples", latency_history)
+        report.validate_history_row(history, "latency history")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            self.assertIn('<h2 id="latency">Transaction latency</h2>', page)
+            self.assertIn("never allocator-call latencies", page)
+            self.assertIn("p50 ns", page)
+            self.assertIn("p95 ns", page)
+            self.assertIn("p99 ns", page)
+            self.assertNotIn("latency: pending", page)
+            chart = (site / "benchmark-latency.png").read_bytes()
+            self.assertIn(b"Transaction latency", chart)
+            self.assertIn(b"through free", chart)
+
+    def test_incomplete_or_failed_control_latency_cannot_replace_pending(self) -> None:
+        complete = self.with_complete_latency(self.load_latest())
+        incomplete = copy.deepcopy(complete)
+        latency = incomplete["latency"]
+        assert isinstance(latency, dict)
+        raw = latency["raw_samples"]
+        assert isinstance(raw, list)
+        raw.pop()
+        with self.assertRaisesRegex(report.ReportError, "incomplete"):
+            report.validate_latest(incomplete, "incomplete latency")
+
+        failed_control = copy.deepcopy(complete)
+        latency = failed_control["latency"]
+        assert isinstance(latency, dict)
+        absolute = latency["absolute_summaries"]
+        assert isinstance(absolute, list) and isinstance(absolute[0], dict)
+        control = absolute[0]["control"]
+        assert isinstance(control, dict)
+        control.update(p50_ns=60.0, p95_ns=61.0, p99_ns=62.0, max_ns=62)
+        with self.assertRaisesRegex(report.ReportError, "control/sample threshold"):
+            report.validate_latest(failed_control, "failed latency control")
+
+        carried = self.load_latest()
+        self.assertTrue(report.carry_forward_optional_metrics(carried, complete))
+        report.validate_latest(carried, "carried latency")
+        self.assertIn("latency", carried)
+        pending = carried["pending_metrics"]
+        assert isinstance(pending, list)
+        self.assertNotIn(
+            "latency", [item["metric_id"] for item in pending if isinstance(item, dict)]
         )
 
     def test_readme_embeds_only_real_charts_and_clicks_through_to_pages(self) -> None:

@@ -9,6 +9,7 @@ use crate::execution::{
     execute_child_request, execute_child_request_with_observer, ExecutionResult,
     MeasurementObserver,
 };
+use crate::latency::{execute_latency_child_request, LatencyChildRequest};
 use crate::memory::{read_control_record, write_control_record, ControlKind, ControlRecord};
 use crate::model::BenchmarkChildRequest;
 
@@ -35,8 +36,32 @@ pub fn benchmark_child_main() -> Result<(), String> {
         Some(argument) if argument == "--memory" && arguments.next().is_none() => {
             run_memory_measurement()
         }
-        Some(_) => Err("usage: benchmark-child [--adapter-smoke|--memory]".into()),
+        Some(argument) if argument == "--latency" && arguments.next().is_none() => {
+            run_latency_measurement()
+        }
+        Some(_) => Err("usage: benchmark-child [--adapter-smoke|--memory|--latency]".into()),
     }
+}
+
+fn run_latency_measurement() -> Result<(), String> {
+    let adapter = LinkedAdapter::load().map_err(|error| error.to_string())?;
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut input)
+        .map_err(|error| format!("read latency child request: {error}"))?;
+    if input.len() > 1024 * 1024 {
+        return Err("latency child request exceeded 1 MiB".into());
+    }
+    let request: LatencyChildRequest = serde_json::from_slice(&input)
+        .map_err(|error| format!("expected exactly one latency child request: {error}"))?;
+    let response = execute_latency_child_request(&adapter, request)?;
+    let output = serde_json::to_vec(&response)
+        .map_err(|error| format!("serialize latency child response: {error}"))?;
+    std::io::stdout()
+        .lock()
+        .write_all(&output)
+        .map_err(|error| format!("write latency child response: {error}"))
 }
 
 struct MemoryChildObserver<'a, R: Read, W: Write> {

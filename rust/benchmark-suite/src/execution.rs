@@ -6,6 +6,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
 
 use crate::adapter::LinkedAdapter;
+use crate::latency::{deterministic_sample_indices, LatencyExecutionResult, LatencyObservation};
 use crate::model::{
     BenchmarkChildRequest, BenchmarkChildResponse, RawSample, CHILD_PROTOCOL_VERSION,
 };
@@ -360,6 +361,385 @@ pub fn execute_cell<A: AllocatorAdapter>(
     cell: &ScenarioCell,
 ) -> Result<ExecutionResult, String> {
     execute_cell_with_observer(adapter, cell, &mut NoopObserver)
+}
+
+/// Execute one of the five `transaction-latency-v1` cells. The sampling
+/// schedule and every output buffer are built before the measured-region hook
+/// is entered. `control` keeps the same worker topology, sample branch, clock
+/// reads, and barriers while replacing the allocator transaction with a
+/// black-box operation.
+pub fn execute_latency_cell<A: AllocatorAdapter>(
+    adapter: &A,
+    cell: &ScenarioCell,
+    sample_denominator: u64,
+    control: bool,
+) -> Result<LatencyExecutionResult, String> {
+    if sample_denominator == 0 {
+        return Err("latency sample denominator must be nonzero".into());
+    }
+    match (cell.card, cell.thread_point) {
+        (CardId::TinyFixed64, ThreadPoint::One)
+        | (CardId::SmallLogMixed, ThreadPoint::One)
+        | (CardId::SmallLogMixed, ThreadPoint::PhysicalCores)
+        | (CardId::CrossThreadProducerConsumer, ThreadPoint::PhysicalCores)
+        | (CardId::LargeObjects, ThreadPoint::One) => {}
+        _ => return Err("cell is outside transaction-latency-v1".into()),
+    }
+    if cell.card == CardId::CrossThreadProducerConsumer {
+        execute_cross_thread_latency(adapter, cell, sample_denominator, control)
+    } else {
+        execute_ordered_latency(adapter, cell, sample_denominator, control)
+    }
+}
+
+fn execute_ordered_latency<A: AllocatorAdapter>(
+    adapter: &A,
+    cell: &ScenarioCell,
+    sample_denominator: u64,
+    control: bool,
+) -> Result<LatencyExecutionResult, String> {
+    let ready_barrier = Arc::new(Barrier::new(cell.threads + 1));
+    let start_barrier = Arc::new(Barrier::new(cell.threads + 1));
+    let end_barrier = Arc::new(Barrier::new(cell.threads + 1));
+    let live = Arc::new(AtomicU64::new(0));
+    let peak = Arc::new(AtomicU64::new(0));
+    let outcomes = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(cell.threads);
+        for worker in 0..cell.threads {
+            let indices = deterministic_sample_indices(
+                cell.seed,
+                worker as u32,
+                cell.transactions_per_worker,
+                sample_denominator,
+            )?;
+            let start_barrier = Arc::clone(&start_barrier);
+            let ready_barrier = Arc::clone(&ready_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let live = Arc::clone(&live);
+            let peak = Arc::clone(&peak);
+            handles.push(scope.spawn(move || {
+                let mut allocations =
+                    Vec::with_capacity(card(cell.card).max_live_allocations_per_worker());
+                let mut requests = Vec::with_capacity(MAX_REQUESTS_PER_TRANSACTION);
+                let mut observations = Vec::with_capacity(indices.len());
+                let mut sample_cursor = 0_usize;
+                let mut counts = ExpectedCounts::default();
+                let mut checksum = 0_u64;
+                let mut failure = None;
+                // Some libc implementations initialize CPU-query state on the
+                // first sched_getcpu call. Prime that state before the timed
+                // gate so recording the actual end CPU cannot allocate.
+                std::hint::black_box(current_cpu_id());
+                ready_barrier.wait();
+                start_barrier.wait();
+                for operation in 0..cell.transactions_per_worker {
+                    if let Err(error) =
+                        cell.fill_worker_transaction(worker, operation, &mut requests)
+                    {
+                        failure = Some(error.to_string());
+                        break;
+                    }
+                    let sampled =
+                        sample_cursor < indices.len() && indices[sample_cursor] == operation;
+                    let started = sampled.then(Instant::now);
+                    if control {
+                        for request in &requests {
+                            std::hint::black_box((request.kind, request.size, request.token));
+                        }
+                    } else {
+                        for request in &requests {
+                            if let Err(error) = execute_one(
+                                adapter,
+                                cell.card,
+                                request,
+                                &mut allocations,
+                                &mut counts,
+                                &mut checksum,
+                                &live,
+                                &peak,
+                            ) {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(started) = started {
+                        if observations.len() == observations.capacity() {
+                            failure =
+                                Some("preallocated latency observation buffer exhausted".into());
+                            break;
+                        }
+                        observations.push(LatencyObservation {
+                            thread_index: worker as u32,
+                            transaction_index: operation,
+                            duration_ns: started.elapsed().as_nanos().min(u128::from(u64::MAX))
+                                as u64,
+                        });
+                        sample_cursor += 1;
+                    }
+                    if failure.is_some() {
+                        break;
+                    }
+                }
+                std::hint::black_box(checksum);
+                let actual_cpu_id = current_cpu_id();
+                end_barrier.wait();
+                for (_, allocation) in allocations {
+                    unsafe { adapter.free(allocation.pointer) };
+                    subtract_live(&live, allocation.size as u64);
+                }
+                match failure {
+                    Some(error) => Err(error),
+                    None if sample_cursor != indices.len() => {
+                        Err("latency sample schedule was not completely observed".into())
+                    }
+                    None => Ok((
+                        WorkerOutcome { counts, checksum },
+                        observations,
+                        actual_cpu_id,
+                    )),
+                }
+            }));
+        }
+        ready_barrier.wait();
+        notify_measured_region(true);
+        start_barrier.wait();
+        end_barrier.wait();
+        notify_measured_region(false);
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "latency worker panicked".to_string())?
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+    finish_latency_execution(cell, outcomes, &live, control)
+}
+
+fn execute_cross_thread_latency<A: AllocatorAdapter>(
+    adapter: &A,
+    cell: &ScenarioCell,
+    sample_denominator: u64,
+    control: bool,
+) -> Result<LatencyExecutionResult, String> {
+    let ready_barrier = Arc::new(Barrier::new(cell.threads + 1));
+    let start_barrier = Arc::new(Barrier::new(cell.threads + 1));
+    let end_barrier = Arc::new(Barrier::new(cell.threads + 1));
+    let operation_barrier = Arc::new(Barrier::new(cell.threads));
+    let live = Arc::new(AtomicU64::new(0));
+    let peak = Arc::new(AtomicU64::new(0));
+    let handoffs: HandoffQueues = Arc::new(
+        (0..cell.threads)
+            .map(|_| Mutex::new(Vec::with_capacity(1)))
+            .collect(),
+    );
+    let outcomes = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(cell.threads);
+        for worker in 0..cell.threads {
+            let indices = deterministic_sample_indices(
+                cell.seed,
+                worker as u32,
+                cell.transactions_per_worker,
+                sample_denominator,
+            )?;
+            let start_barrier = Arc::clone(&start_barrier);
+            let ready_barrier = Arc::clone(&ready_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let operation_barrier = Arc::clone(&operation_barrier);
+            let live = Arc::clone(&live);
+            let peak = Arc::clone(&peak);
+            let handoffs = Arc::clone(&handoffs);
+            handles.push(scope.spawn(move || {
+                let mut allocations = Vec::with_capacity(1);
+                let mut requests = Vec::with_capacity(MAX_REQUESTS_PER_TRANSACTION);
+                let mut observations = Vec::with_capacity(indices.len());
+                let mut sample_cursor = 0_usize;
+                let mut counts = ExpectedCounts::default();
+                let mut checksum = 0_u64;
+                let mut failure: Option<String> = None;
+                std::hint::black_box(current_cpu_id());
+                ready_barrier.wait();
+                start_barrier.wait();
+                for operation in 0..cell.transactions_per_worker {
+                    if failure.is_none() {
+                        if let Err(error) =
+                            cell.fill_worker_transaction(worker, operation, &mut requests)
+                        {
+                            failure = Some(error.to_string());
+                        }
+                    }
+                    let sampled =
+                        sample_cursor < indices.len() && indices[sample_cursor] == operation;
+                    let started = sampled.then(Instant::now);
+                    let mut transfer = None;
+                    if control {
+                        for request in &requests {
+                            std::hint::black_box((request.kind, request.size, request.token));
+                        }
+                    } else if failure.is_none() {
+                        for request in &requests {
+                            if request.kind == RequestKind::Free
+                                && request.owner_worker != request.executor_worker
+                            {
+                                transfer = Some(*request);
+                            } else if let Err(error) = execute_one(
+                                adapter,
+                                cell.card,
+                                request,
+                                &mut allocations,
+                                &mut counts,
+                                &mut checksum,
+                                &live,
+                                &peak,
+                            ) {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                        if let Some(request) = transfer {
+                            match remove_slot(&mut allocations, request.token) {
+                                Some(allocation) => handoffs[request.executor_worker]
+                                    .lock()
+                                    .expect("handoff queue lock poisoned")
+                                    .push((request, allocation)),
+                                None => {
+                                    failure =
+                                        Some("latency remote-transfer token was not live".into())
+                                }
+                            }
+                        }
+                    }
+                    operation_barrier.wait();
+                    if !control {
+                        let mut inbox = handoffs[worker]
+                            .lock()
+                            .expect("handoff queue lock poisoned");
+                        for (request, allocation) in inbox.drain(..) {
+                            allocations.push((request.token, allocation));
+                            if failure.is_none() {
+                                if let Err(error) = execute_one(
+                                    adapter,
+                                    cell.card,
+                                    &request,
+                                    &mut allocations,
+                                    &mut counts,
+                                    &mut checksum,
+                                    &live,
+                                    &peak,
+                                ) {
+                                    failure = Some(error);
+                                }
+                            }
+                        }
+                    }
+                    operation_barrier.wait();
+                    if let Some(started) = started {
+                        if observations.len() == observations.capacity() {
+                            failure =
+                                Some("preallocated latency observation buffer exhausted".into());
+                        } else {
+                            observations.push(LatencyObservation {
+                                thread_index: worker as u32,
+                                transaction_index: operation,
+                                duration_ns: started.elapsed().as_nanos().min(u128::from(u64::MAX))
+                                    as u64,
+                            });
+                            sample_cursor += 1;
+                        }
+                    }
+                }
+                std::hint::black_box(checksum);
+                let actual_cpu_id = current_cpu_id();
+                end_barrier.wait();
+                for (_, allocation) in allocations {
+                    unsafe { adapter.free(allocation.pointer) };
+                    subtract_live(&live, allocation.size as u64);
+                }
+                match failure {
+                    Some(error) => Err(error),
+                    None if sample_cursor != indices.len() => {
+                        Err("latency sample schedule was not completely observed".into())
+                    }
+                    None => Ok((
+                        WorkerOutcome { counts, checksum },
+                        observations,
+                        actual_cpu_id,
+                    )),
+                }
+            }));
+        }
+        ready_barrier.wait();
+        notify_measured_region(true);
+        start_barrier.wait();
+        end_barrier.wait();
+        notify_measured_region(false);
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "latency worker panicked".to_string())?
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+    finish_latency_execution(cell, outcomes, &live, control)
+}
+
+fn finish_latency_execution(
+    cell: &ScenarioCell,
+    outcomes: Vec<(WorkerOutcome, Vec<LatencyObservation>, Option<u32>)>,
+    live: &AtomicU64,
+    control: bool,
+) -> Result<LatencyExecutionResult, String> {
+    if live.load(Ordering::SeqCst) != 0 {
+        return Err("latency workload finished with live requested bytes".into());
+    }
+    let mut counts = ExpectedCounts {
+        requested_transactions: cell.requested_transactions(),
+        completed_transactions: cell.requested_transactions(),
+        ..ExpectedCounts::default()
+    };
+    let mut checksum = FNV_OFFSET;
+    let mut observations = Vec::new();
+    let mut actual_cpu_ids = Vec::with_capacity(outcomes.len());
+    for (worker, (outcome, mut worker_observations, cpu)) in outcomes.into_iter().enumerate() {
+        if !control {
+            add_counts(&mut counts, outcome.counts);
+            checksum = fnv_u64(checksum, worker as u64);
+            checksum = fnv_u64(checksum, outcome.checksum);
+        }
+        observations.append(&mut worker_observations);
+        actual_cpu_ids.push(cpu);
+    }
+    if !control {
+        let expected = cell.expected_counts().map_err(|error| error.to_string())?;
+        if counts != expected || checksum != expected_touch_checksum(cell)? {
+            return Err("latency execution contradicted scenario counts or checksum".into());
+        }
+    }
+    observations.sort_by_key(|value| (value.thread_index, value.transaction_index));
+    Ok(LatencyExecutionResult {
+        observations,
+        completed_transactions: cell.requested_transactions(),
+        checksum: if control { 1 } else { checksum },
+        actual_cpu_ids,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn current_cpu_id() -> Option<u32> {
+    unsafe extern "C" {
+        fn sched_getcpu() -> std::os::raw::c_int;
+    }
+    let cpu = unsafe { sched_getcpu() };
+    (cpu >= 0).then_some(cpu as u32)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_cpu_id() -> Option<u32> {
+    None
 }
 
 fn execute_cell_with_observer<A: AllocatorAdapter, O: MeasurementObserver>(

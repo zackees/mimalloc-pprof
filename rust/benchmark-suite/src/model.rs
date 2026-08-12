@@ -228,6 +228,10 @@ pub struct LatestReport {
     /// collected under `linux-process-memory-v1`; it never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::memory::MemoryMetricReport>,
+    /// Backward-compatible Phase 6 extension. Absence means no validated
+    /// `transaction-latency-v1` collection is available; it never means zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<crate::latency::LatencyMetricReport>,
     pub canonical_urls: CanonicalUrls,
     pub reproduction_command: String,
     pub actions_run_url: String,
@@ -247,6 +251,8 @@ pub struct HistoryRow {
     pub paired_summaries: Vec<PairedCellSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::memory::MemoryHistoryReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<crate::latency::LatencyHistoryReport>,
 }
 
 /// Immutable identity supplied by the producer after it hashes the directly

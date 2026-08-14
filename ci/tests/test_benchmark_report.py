@@ -546,7 +546,10 @@ class BenchmarkReportTests(unittest.TestCase):
             page = (site / "index.html").read_text(encoding="utf-8")
             self.assertIn('<h2 id="memory">Linux process memory</h2>', page)
             self.assertNotIn("memory: pending", page)
-            self.assertIn(b"Linux process RSS", (site / "benchmark-memory.png").read_bytes())
+            self.assertIn(
+                b"Sampled peak RSS relative to upstream-mimalloc",
+                (site / "benchmark-memory.png").read_bytes(),
+            )
             self.assertIn(
                 b"Speed-memory Pareto scatter",
                 (site / "benchmark-pareto.png").read_bytes(),
@@ -554,6 +557,10 @@ class BenchmarkReportTests(unittest.TestCase):
             self.assertIn(
                 b"RSS over time with post-drain",
                 (site / "benchmark-rss-timeline.png").read_bytes(),
+            )
+            self.assertIn(
+                b"Fragmentation proxy",
+                (site / "benchmark-fragmentation.png").read_bytes(),
             )
 
     def test_pending_memory_keeps_placeholder_panels(self) -> None:
@@ -563,6 +570,156 @@ class BenchmarkReportTests(unittest.TestCase):
             self.assertIn(b"PENDING speed-memory Pareto scatter", pareto)
             timeline = (site / "benchmark-rss-timeline.png").read_bytes()
             self.assertIn(b"PENDING RSS timeline", timeline)
+            fragmentation = (site / "benchmark-fragmentation.png").read_bytes()
+            self.assertIn(b"PENDING fragmentation proxy panel", fragmentation)
+
+    def test_memory_bars_normalize_to_upstream_reference(self) -> None:
+        medians = {
+            "tcmalloc": 120 * 1024 * 1024,
+            "jemalloc": 110 * 1024 * 1024,
+            "upstream-mimalloc": 100 * 1024 * 1024,
+            "mimalloc-pprof": 90 * 1024 * 1024,
+        }
+        normalized = {
+            allocator: float(median) / medians["upstream-mimalloc"]
+            for allocator, median in medians.items()
+        }
+        self.assertAlmostEqual(1.2, normalized["tcmalloc"])
+
+        def record(allocator: str, median: int) -> dict[str, object]:
+            return {
+                "scenario_id": "large-objects",
+                "thread_point": "1",
+                "metric_id": "sampled-peak-rss-bytes",
+                "direction": "lower-is-better",
+                "allocator_id": allocator,
+                "summary": {
+                    "count": 15,
+                    "median": float(median),
+                    "min": float(median) * 0.9,
+                    "max": float(median) * 1.1,
+                    "q1": float(median) * 0.95,
+                    "q3": float(median) * 1.05,
+                    "iqr": float(median) * 0.1,
+                    "relative_iqr": 0.1,
+                    "noisy": False,
+                },
+            }
+
+        memory = {
+            "absolute_summaries": [
+                record(allocator, median) for allocator, median in medians.items()
+            ]
+        }
+        canvas = report.Canvas(
+            report.MEMORY_PANEL_WIDTH, report.MEMORY_PANEL_HEIGHT, (248, 250, 252)
+        )
+        cells = report.memory_bar_cells(memory, "sampled-peak-rss-bytes")
+        normalized_cells = {
+            key: {
+                allocator: value / values["upstream-mimalloc"]
+                for allocator, value in values.items()
+            }
+            for key, values in cells.items()
+        }
+        report.draw_ratio_bar_grid(canvas, normalized_cells)
+        # Cell 0 sits at (45, 85); bars start at x=59, allocator rows are 19 px
+        # apart, and the largest normalized value (1.2x) fills the 380 px bar
+        # zone. The 1.0 reference line lands at 380 * 1.0/1.2 = 316 px.
+        left, top = 45, 85
+        bar_left = left + 14
+        baseline_x = bar_left + 316
+
+        def pixel(x: int, y: int) -> tuple[int, int, int]:
+            offset = (y * report.MEMORY_PANEL_WIDTH + x) * 3
+            value = canvas.pixels[offset : offset + 3]
+            return value[0], value[1], value[2]
+
+        # tcmalloc (1.2x) fills the bar zone; its row is index 0.
+        self.assertEqual(report.COLORS[0], pixel(bar_left + 379, top + 10 + 5))
+        # upstream-mimalloc (1.0x) ends at 316 px; the reference line drawn on
+        # top occupies that exact column.
+        self.assertEqual(report.COLORS[2], pixel(bar_left + 313, top + 10 + 2 * 19 + 5))
+        self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 2 * 19 + 5))
+        # mimalloc-pprof (0.9x) ends at 285 px; beyond it is background.
+        self.assertEqual(report.COLORS[3], pixel(bar_left + 284, top + 10 + 3 * 19 + 5))
+        self.assertEqual((235, 240, 246), pixel(bar_left + 286, top + 10 + 3 * 19 + 5))
+        # The reference line stays visible across the tcmalloc bar too.
+        self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 5))
+
+    def test_fragmentation_panel_draws_ratio_bars_with_reference_line(self) -> None:
+        ratios = {
+            "tcmalloc": 1.4,
+            "jemalloc": 1.2,
+            "upstream-mimalloc": 1.0,
+            "mimalloc-pprof": 0.8,
+        }
+
+        def record(allocator: str, ratio: float) -> dict[str, object]:
+            return {
+                "scenario_id": "sawtooth-retain-drain",
+                "thread_point": "physical-core",
+                "metric_id": "fragmentation-proxy",
+                "direction": "lower-is-better",
+                "allocator_id": allocator,
+                "summary": {
+                    "count": 15,
+                    "median": ratio,
+                    "min": ratio * 0.9,
+                    "max": ratio * 1.1,
+                    "q1": ratio * 0.95,
+                    "q3": ratio * 1.05,
+                    "iqr": ratio * 0.1,
+                    "relative_iqr": 0.1,
+                    "noisy": False,
+                },
+            }
+
+        memory = {
+            "absolute_summaries": [record(allocator, ratio) for allocator, ratio in ratios.items()]
+        }
+        cells = report.memory_bar_cells(memory, "fragmentation-proxy")
+        canvas = report.Canvas(
+            report.MEMORY_PANEL_WIDTH, report.MEMORY_PANEL_HEIGHT, (248, 250, 252)
+        )
+        report.draw_ratio_bar_grid(canvas, cells)
+        # 1.4 is the cell maximum: bars scale to 380 px, the 1.0 reference
+        # line lands at 380 * 1/1.4 = 271 px.
+        left, top = 45, 85
+        bar_left = left + 14
+        baseline_x = bar_left + 271
+
+        def pixel(x: int, y: int) -> tuple[int, int, int]:
+            offset = (y * report.MEMORY_PANEL_WIDTH + x) * 3
+            value = canvas.pixels[offset : offset + 3]
+            return value[0], value[1], value[2]
+
+        self.assertEqual(report.COLORS[0], pixel(bar_left + 379, top + 10 + 5))
+        # upstream-mimalloc (1.0) ends at 271 px; the reference line drawn on
+        # top occupies that exact column.
+        self.assertEqual(report.COLORS[2], pixel(bar_left + 268, top + 10 + 2 * 19 + 5))
+        self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 2 * 19 + 5))
+        # mimalloc-pprof (0.8) ends at 217 px; beyond it is background.
+        self.assertEqual(report.COLORS[3], pixel(bar_left + 216, top + 10 + 3 * 19 + 5))
+        self.assertEqual((235, 240, 246), pixel(bar_left + 218, top + 10 + 3 * 19 + 5))
+
+    def test_memory_section_sits_next_to_throughput(self) -> None:
+        latest = self.with_complete_memory(self.load_latest())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            throughput = page.find('<h2 id="throughput">Throughput</h2>')
+            memory = page.find('<h2 id="memory">Linux process memory</h2>')
+            paired = page.find("<h2>Paired effects</h2>")
+            self.assertGreater(throughput, -1)
+            self.assertLess(throughput, memory)
+            self.assertLess(memory, paired, "memory must pair with throughput, not history")
+            self.assertIn("vs upstream", page)
+            self.assertIn("1.00x", page, "the upstream allocator row must read 1.00x")
 
     def test_rss_timeline_sawtooth_rises_falls_and_decay_markers_at_offsets(self) -> None:
         # One synthetic cell: every allocator gets a sawtooth timeline that

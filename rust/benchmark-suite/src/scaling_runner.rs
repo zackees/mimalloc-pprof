@@ -103,7 +103,7 @@ fn calibrate(
             "scaling calibration probe pattern={} threads={}",
             template.pattern, template.thread_count
         );
-        let response = run_scaling_child(child, &probe, timeout)?;
+        let (response, _peak_rss) = run_scaling_child(child, &probe, timeout)?;
         if (SCALING_MIN_BLOCK_NS..=SCALING_MAX_BLOCK_NS).contains(&response.elapsed_ns) {
             return Ok((operations, response));
         }
@@ -270,7 +270,7 @@ fn run(options: Options) -> Result<(), String> {
                         request_path.display()
                     );
                     write_new_json(request_path.clone(), &request)?;
-                    let response =
+                    let (response, peak_rss_bytes) =
                         run_scaling_child_with_plan(child, &request, options.timeout, &plan)?;
                     let sample = ScalingRawSample {
                         metric_schema_version: SCALING_SCHEMA_VERSION.into(),
@@ -282,6 +282,7 @@ fn run(options: Options) -> Result<(), String> {
                         allocator_source_sha: child.allocator.source_sha.clone(),
                         child_binary_sha256: child.allocator.child_binary_sha256.clone(),
                         operations_per_worker,
+                        peak_rss_bytes,
                         reproduction_command: request.reproduction_command.clone(),
                         response,
                     };

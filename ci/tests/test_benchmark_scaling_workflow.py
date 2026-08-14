@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import benchmark_report as report
 import check_benchmark_scaling_workflow as policy
 
 
@@ -22,8 +23,26 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
 
     def test_selftest_negative_controls_all_fail_closed(self) -> None:
         # The selftest is the real guard against a checker that checks nothing.
-        policy.selftest(policy.WORKFLOW)
+        policy.selftest(policy.WORKFLOW, policy.SCALING_SOURCE)
         self.assertGreaterEqual(len(policy.MUTATIONS), 15)
+        self.assertGreaterEqual(len(policy.SOURCE_MUTATIONS), 5)
+
+    def test_production_scaling_source_matches_the_validator(self) -> None:
+        policy.validate_source_contract(policy.SCALING_SOURCE.read_text(encoding="utf-8"))
+
+    def test_rust_thread_points_drifting_from_python_is_rejected(self) -> None:
+        # The failure this exists to catch: someone edits the dense sweep on one
+        # side only, and the mismatch surfaces only after a scheduled run has
+        # spent its whole budget producing a report the validator throws away.
+        source = policy.SCALING_SOURCE.read_text(encoding="utf-8")
+        drifted = source.replace(
+            f"[u32; {len(report.SCALING_THREAD_POINTS)}] = "
+            f"[{', '.join(str(point) for point in report.SCALING_THREAD_POINTS)}]",
+            "[u32; 3] = [1, 4, 16]",
+        )
+        self.assertNotEqual(drifted, source)
+        with self.assertRaisesRegex(policy.ScalingWorkflowError, "SCALING_THREAD_POINTS"):
+            policy.validate_source_contract(drifted)
 
     def test_budget_over_twenty_minutes_is_rejected(self) -> None:
         value = self.workflow()

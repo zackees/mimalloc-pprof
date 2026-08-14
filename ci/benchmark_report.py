@@ -114,9 +114,21 @@ RUNNER_FIELDS = {
     "power",
 }
 SCALING_SCHEMA = "throughput-scaling-sparse-v1"
+SCALING_RSS_SCHEMA = "throughput-scaling-rss-v1"
 SCALING_RIGOR_LABEL = "coverage mode - reduced statistical rigor (3 blocks)"
 SCALING_BLOCKS = 3
-SCALING_THREAD_POINTS = (1, 4, 16)
+# Dense sweep up to 2x the 4-vCPU hosted runner's logical cores. The 6/8
+# points are oversubscribed and describe contention, not core scaling. The
+# thread points are part of the metric comparison key, so changing them
+# starts a new history lineage instead of rewriting the sparse one.
+SCALING_THREAD_POINTS = (1, 2, 3, 4, 6, 8)
+# Every sweep shape this validator will accept, oldest first. New production
+# runs must use SCALING_THREAD_POINTS, but the published branch still carries
+# rows -- and a `latest.json` -- recorded under the earlier shape, and those
+# must keep validating and rendering forever: a lineage that stops parsing is
+# a lineage that has been silently rewritten. A report is checked against the
+# shape it declares, not against the current one.
+SCALING_THREAD_POINT_LINEAGES = ((1, 4, 16), SCALING_THREAD_POINTS)
 SCALING_PATTERN_IDS = (
     "sparse-tiny-hot",
     "sparse-mixed-general",
@@ -3262,6 +3274,85 @@ SCALING_SUMMARY_FIELDS = {
 }
 
 
+def validate_scaling_rss(
+    value: object, label: str, thread_points: tuple[int, ...]
+) -> dict[str, object]:
+    """The RSS side-car is an optional object with its own schema version, so
+    rows published before it existed stay valid history.
+
+    `thread_points` is the sweep shape its parent report declares, not the
+    current contract: a side-car must cover exactly the cells its own report
+    measured, whichever lineage that report belongs to.
+    """
+
+    rss = object_value(value, label)
+    exact_fields(rss, {"metric_schema_version", "sampling", "cell_summaries"}, label)
+    if rss.get("metric_schema_version") != SCALING_RSS_SCHEMA:
+        fail(f"{label}.metric_schema_version: unsupported scaling RSS schema")
+    sampling = object_value(rss.get("sampling"), f"{label}.sampling")
+    exact_fields(sampling, {"source", "method", "poll_interval_ns"}, f"{label}.sampling")
+    string_value(sampling.get("source"), f"{label}.sampling.source")
+    string_value(sampling.get("method"), f"{label}.sampling.method")
+    int_value(sampling.get("poll_interval_ns"), f"{label}.sampling.poll_interval_ns", 1)
+    summaries = [
+        object_value(item, f"{label}.cell_summaries[{index}]")
+        for index, item in enumerate(
+            list_value(rss.get("cell_summaries"), f"{label}.cell_summaries")
+        )
+    ]
+    expected_cells = len(SCALING_PATTERN_IDS) * len(thread_points) * len(ALLOCATOR_IDS)
+    if len(summaries) != expected_cells:
+        fail(f"{label}.cell_summaries: expected exactly {expected_cells} cells")
+    seen: set[tuple[str, int, str]] = set()
+    for index, summary in enumerate(summaries):
+        exact_fields(
+            summary,
+            {
+                "pattern",
+                "thread_count",
+                "allocator_id",
+                "block_count",
+                "median_peak_rss_bytes",
+                "min_peak_rss_bytes",
+                "max_peak_rss_bytes",
+            },
+            f"{label}.cell_summaries[{index}]",
+        )
+        pattern = string_value(summary.get("pattern"), f"{label}.cell_summaries[{index}].pattern")
+        allocator = string_value(
+            summary.get("allocator_id"), f"{label}.cell_summaries[{index}].allocator_id"
+        )
+        threads = int_value(
+            summary.get("thread_count"), f"{label}.cell_summaries[{index}].thread_count", 1
+        )
+        key = (pattern, threads, allocator)
+        if (
+            pattern not in SCALING_PATTERN_IDS
+            or allocator not in ALLOCATOR_IDS
+            or threads not in thread_points
+            or key in seen
+        ):
+            fail(f"{label}.cell_summaries[{index}]: undeclared or duplicate RSS cell")
+        seen.add(key)
+        if (
+            int_value(summary.get("block_count"), f"{label}.cell_summaries[{index}].block_count", 1)
+            != SCALING_BLOCKS
+        ):
+            fail(f"{label}.cell_summaries[{index}].block_count: {SCALING_BLOCKS} blocks required")
+        minimum = int_value(
+            summary.get("min_peak_rss_bytes"), f"{label}.cell_summaries[{index}].min", 1
+        )
+        median = int_value(
+            summary.get("median_peak_rss_bytes"), f"{label}.cell_summaries[{index}].median", 1
+        )
+        maximum = int_value(
+            summary.get("max_peak_rss_bytes"), f"{label}.cell_summaries[{index}].max", 1
+        )
+        if minimum > median or maximum < median:
+            fail(f"{label}.cell_summaries[{index}]: min/median/max are inconsistent")
+    return rss
+
+
 def validate_scaling_report(
     value: object, label: str, *, compact: bool = False
 ) -> dict[str, object]:
@@ -3271,7 +3362,7 @@ def validate_scaling_report(
     )
     if compact:
         required.add("runner_fingerprint_sha256")
-    exact_fields(report, required, label)
+    exact_fields_with_optional(report, required, {"rss"}, label)
     if (
         report.get("metric_schema_version") != SCALING_SCHEMA
         or report.get("status") != "complete"
@@ -3287,8 +3378,16 @@ def validate_scaling_report(
             list_value(report.get("thread_points"), f"{label}.thread_points")
         )
     ]
-    if tuple(points) != SCALING_THREAD_POINTS:
-        fail(f"{label}.thread_points: exactly {list(SCALING_THREAD_POINTS)} required")
+    thread_points = tuple(points)
+    if thread_points not in SCALING_THREAD_POINT_LINEAGES:
+        fail(
+            f"{label}.thread_points: {list(thread_points)} is not a known sweep lineage; "
+            f"expected one of {[list(shape) for shape in SCALING_THREAD_POINT_LINEAGES]}"
+        )
+    # After the shape is known, so the side-car is checked against the sweep
+    # its own report declares rather than against the current contract.
+    if "rss" in report:
+        validate_scaling_rss(report.get("rss"), f"{label}.rss", thread_points)
     comparison_digest(report.get("metric_comparison_key"), f"{label}.metric_comparison_key")
     validate_run(report.get("run"), f"{label}.run")
     if compact:
@@ -3317,7 +3416,7 @@ def validate_scaling_report(
     ):
         fail(f"{label}.methodology.blocks_per_cell: protocol fixes {SCALING_BLOCKS} blocks")
     summaries = list_value(report.get("cell_summaries"), f"{label}.cell_summaries")
-    expected_cells = len(SCALING_PATTERN_IDS) * len(SCALING_THREAD_POINTS) * len(ALLOCATOR_IDS)
+    expected_cells = len(SCALING_PATTERN_IDS) * len(thread_points) * len(ALLOCATOR_IDS)
     if len(summaries) != expected_cells:
         fail(f"{label}.cell_summaries: expected exactly {expected_cells} cells")
     seen: set[tuple[str, int, str]] = set()
@@ -3334,7 +3433,7 @@ def validate_scaling_report(
         if (
             pattern not in SCALING_PATTERN_IDS
             or allocator not in ALLOCATOR_IDS
-            or threads not in SCALING_THREAD_POINTS
+            or threads not in thread_points
         ):
             fail(f"{label}.cell_summaries[{index}]: undeclared pattern, allocator, or thread point")
         key = (pattern, threads, allocator)
@@ -3436,14 +3535,172 @@ def format_throughput(value: float, unit: tuple[float, str, int] | None = None) 
     return f"{value / divisor:.{decimals}f}{suffix}"
 
 
-def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
-    """One dark line chart: x is worker count (log2), y is aggregate
-    throughput, one line per allocator."""
+SCALING_WIDTH = 1000
+SCALING_DUAL_WIDTH = 1400
+SCALING_HEIGHT = 590
+SCALING_TOP = 118
+SCALING_BOTTOM = 110
+SCALING_LEFT = 92
+SCALING_RIGHT = 40
+SCALING_PLOT_WIDTH = SCALING_WIDTH - SCALING_LEFT - SCALING_RIGHT
+SCALING_DUAL_PLOT_WIDTH = 560
+SCALING_DUAL_RSS_LEFT = 712
 
-    width, height = 1000, 590
-    left, right, top, bottom = 92, 40, 118, 110
-    plot_width = width - left - right
+
+def scaling_x_of(
+    threads: int, left: int, plot_width: int, thread_points: Sequence[int] = SCALING_THREAD_POINTS
+) -> float:
+    """Log2 spacing: every doubling is one step, so the dense sweep 1/2/3/4/6/8
+    places 2/4/8 evenly and the odd points between their neighbors.
+
+    The axis spans the sweep the report being drawn actually declares, so a
+    panel rendered from an older lineage is not squeezed against a scale it
+    never measured.
+    """
+
+    span = math.log2(max(thread_points))
+    return left + plot_width * (math.log2(threads) / span if span else 0.0)
+
+
+def scaling_y_of(value: float, ceiling: float, top: int, plot_height: int) -> float:
+    return top + plot_height * (1.0 - value / ceiling)
+
+
+def _scaling_plot_parts(
+    parts: list[str],
+    left: int,
+    top: int,
+    plot_width: int,
+    plot_height: int,
+    series: Mapping[str, list[tuple[int, float]]],
+    ceiling: float,
+    allowed: int,
+    title: str,
+    subtitle: str,
+    unit: tuple[float, str, int],
+    thread_points: Sequence[int] = SCALING_THREAD_POINTS,
+) -> None:
+    """Append one dark line plot: x is worker count (log2), y one series per
+    allocator, with the oversubscribed band shaded."""
+
+    parts.append(
+        f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" '
+        f'fill="{SCALING_INK["plot"]}" rx="6"/>'
+    )
+    # Shade the oversubscribed region so contention is never read as core scaling.
+    oversubscribed = [point for point in thread_points if point > allowed]
+    in_budget = [point for point in thread_points if point <= allowed]
+    if oversubscribed:
+        first_over = scaling_x_of(oversubscribed[0], left, plot_width, thread_points)
+        # The first oversubscribed point is usually the last point on the axis,
+        # so anchoring the band at it would give it zero width. Start it halfway
+        # back to the last in-budget point instead.
+        band_start = (
+            (scaling_x_of(in_budget[-1], left, plot_width, thread_points) + first_over) / 2
+            if in_budget
+            else float(left)
+        )
+        band_width = left + plot_width - band_start
+        parts.append(
+            f'<rect x="{band_start:.1f}" y="{top}" width="{band_width:.1f}" '
+            f'height="{plot_height}" fill="{SCALING_INK["oversubscribed"]}" rx="6"/>'
+        )
+        parts.append(
+            svg_text(
+                left + plot_width - 8,
+                top + 20,
+                f"oversubscribed (> {allowed} vCPU)",
+                fill=SCALING_INK["muted"],
+                size=12,
+                anchor="end",
+            )
+        )
+    for step in range(5):
+        value = ceiling * step / 4
+        y = scaling_y_of(value, ceiling, top, plot_height)
+        parts.append(
+            f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_width}" y2="{y:.1f}" '
+            f'stroke="{SCALING_INK["grid"]}" stroke-width="1"/>'
+        )
+        parts.append(
+            svg_text(
+                left - 12,
+                y + 4,
+                format_throughput(value, unit),
+                fill=SCALING_INK["axis"],
+                size=12,
+                anchor="end",
+            )
+        )
+    for threads in thread_points:
+        x = scaling_x_of(threads, left, plot_width, thread_points)
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top + plot_height}" '
+            f'stroke="{SCALING_INK["grid"]}" stroke-width="1"/>'
+        )
+        parts.append(
+            svg_text(
+                x,
+                top + plot_height + 26,
+                str(threads),
+                fill=SCALING_INK["title"],
+                size=13,
+                weight="600",
+                anchor="middle",
+            )
+        )
+        if threads > allowed:
+            parts.append(
+                svg_text(
+                    x,
+                    top + plot_height + 44,
+                    f"{threads / allowed:g}x",
+                    fill=SCALING_INK["muted"],
+                    size=11,
+                    anchor="middle",
+                )
+            )
+    for allocator in ALLOCATOR_IDS:
+        points = series.get(allocator, [])
+        if not points:
+            continue
+        color = SCALING_SERIES[allocator]
+        path = " ".join(
+            f"{'M' if index == 0 else 'L'}"
+            f"{scaling_x_of(threads, left, plot_width, thread_points):.1f} "
+            f"{scaling_y_of(value, ceiling, top, plot_height):.1f}"
+            for index, (threads, value) in enumerate(points)
+        )
+        parts.append(
+            f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.5" '
+            'stroke-linejoin="round" stroke-linecap="round"/>'
+        )
+        for threads, value in points:
+            parts.append(
+                f'<circle cx="{scaling_x_of(threads, left, plot_width, thread_points):.1f}" '
+                f'cy="{scaling_y_of(value, ceiling, top, plot_height):.1f}" r="4.5" '
+                f'fill="{SCALING_INK["background"]}" stroke="{color}" stroke-width="2.5"/>'
+            )
+    parts.append(
+        svg_text(left - 12, top - 46, title, fill=SCALING_INK["title"], size=20, weight="600")
+    )
+    parts.append(svg_text(left - 12, top - 24, subtitle, fill=SCALING_INK["muted"], size=13))
+
+
+def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
+    """One dark chart per pattern. Without RSS data: throughput vs worker
+    count. With the RSS side-car: throughput and peak-RSS panels side by side
+    so per-thread-cache footprint growth reads against the throughput curve."""
+
+    height = SCALING_HEIGHT
+    top, bottom = SCALING_TOP, SCALING_BOTTOM
     plot_height = height - top - bottom
+    # The report's own sweep, not the current contract: a published row from an
+    # older lineage keeps rendering on the axis it was measured against.
+    thread_points = tuple(
+        int_value(item, "scaling thread point", 1)
+        for item in list_value(scaling["thread_points"], "scaling thread points")
+    )
     summaries = [
         object_value(item, "scaling cell summary")
         for item in list_value(scaling["cell_summaries"], "scaling cell summaries")
@@ -3468,130 +3725,86 @@ def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
     ceiling = peak * 1.12
     topology = object_value(scaling.get("topology", {}), "scaling topology")
     allowed = int(cast(int, topology.get("allowed_logical_cpus", 1)) or 1)
-
-    def x_of(threads: int) -> float:
-        # Log2 spacing keeps 1/4/16 evenly placed.
-        span = math.log2(max(SCALING_THREAD_POINTS))
-        return left + plot_width * (math.log2(threads) / span if span else 0)
-
-    def y_of(value: float) -> float:
-        return top + plot_height * (1 - value / ceiling)
-
-    parts: list[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
-        f'width="{width}" height="{height}" role="img">',
-        f'<rect width="{width}" height="{height}" fill="{SCALING_INK["background"]}"/>',
-        f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" '
-        f'fill="{SCALING_INK["plot"]}" rx="6"/>',
-    ]
-    # Shade the oversubscribed region so contention is never read as core scaling.
-    oversubscribed = [point for point in SCALING_THREAD_POINTS if point > allowed]
-    in_budget = [point for point in SCALING_THREAD_POINTS if point <= allowed]
-    if oversubscribed:
-        first_over = x_of(oversubscribed[0])
-        # The first oversubscribed point is usually the last point on the axis,
-        # so anchoring the band at it would give it zero width. Start it halfway
-        # back to the last in-budget point instead.
-        band_start = (x_of(in_budget[-1]) + first_over) / 2 if in_budget else float(left)
-        band_width = left + plot_width - band_start
-        parts.append(
-            f'<rect x="{band_start:.1f}" y="{top}" width="{band_width:.1f}" '
-            f'height="{plot_height}" fill="{SCALING_INK["oversubscribed"]}" rx="6"/>'
-        )
-        parts.append(
-            svg_text(
-                left + plot_width - 8,
-                top + 20,
-                f"oversubscribed (> {allowed} vCPU)",
-                fill=SCALING_INK["muted"],
-                size=12,
-                anchor="end",
-            )
-        )
     unit = axis_unit(ceiling)
-    for step in range(5):
-        value = ceiling * step / 4
-        y = y_of(value)
-        parts.append(
-            f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_width}" y2="{y:.1f}" '
-            f'stroke="{SCALING_INK["grid"]}" stroke-width="1"/>'
-        )
-        parts.append(
-            svg_text(
-                left - 12,
-                y + 4,
-                format_throughput(value, unit),
-                fill=SCALING_INK["axis"],
-                size=12,
-                anchor="end",
-            )
-        )
-    for threads in SCALING_THREAD_POINTS:
-        x = x_of(threads)
-        parts.append(
-            f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top + plot_height}" '
-            f'stroke="{SCALING_INK["grid"]}" stroke-width="1"/>'
-        )
-        parts.append(
-            svg_text(
-                x,
-                top + plot_height + 26,
-                str(threads),
-                fill=SCALING_INK["title"],
-                size=13,
-                weight="600",
-                anchor="middle",
-            )
-        )
-        if threads > allowed:
-            parts.append(
-                svg_text(
-                    x,
-                    top + plot_height + 44,
-                    f"{threads / allowed:.0f}x",
-                    fill=SCALING_INK["muted"],
-                    size=11,
-                    anchor="middle",
+    rss = scaling.get("rss")
+    if rss is not None:
+        rss_report = validate_scaling_rss(rss, "scaling rss", thread_points)
+        rss_series: dict[str, list[tuple[int, float]]] = {}
+        for summary_value in list_value(rss_report["cell_summaries"], "scaling rss summaries"):
+            summary = object_value(summary_value, "scaling rss summary")
+            if summary.get("pattern") != pattern:
+                continue
+            allocator = cast(str, summary["allocator_id"])
+            rss_series.setdefault(allocator, []).append(
+                (
+                    int(cast(int, summary["thread_count"])),
+                    float(cast(int, summary["median_peak_rss_bytes"])),
                 )
             )
-    for allocator in ALLOCATOR_IDS:
-        points = series.get(allocator, [])
-        if not points:
-            continue
-        color = SCALING_SERIES[allocator]
-        path = " ".join(
-            f"{'M' if index == 0 else 'L'}{x_of(threads):.1f} {y_of(value):.1f}"
-            for index, (threads, value) in enumerate(points)
+        for points in rss_series.values():
+            points.sort()
+        rss_peak = max(
+            (value for points in rss_series.values() for _threads, value in points),
+            default=1.0,
         )
-        parts.append(
-            f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.5" '
-            'stroke-linejoin="round" stroke-linecap="round"/>'
-        )
-        for threads, value in points:
-            parts.append(
-                f'<circle cx="{x_of(threads):.1f}" cy="{y_of(value):.1f}" r="4.5" '
-                f'fill="{SCALING_INK["background"]}" stroke="{color}" stroke-width="2.5"/>'
-            )
-    parts.append(
-        svg_text(
-            left - 12,
-            top - 46,
+        rss_ceiling = rss_peak * 1.12
+        rss_unit = axis_unit(rss_ceiling)
+        width = SCALING_DUAL_WIDTH
+        parts: list[str] = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+            f'width="{width}" height="{height}" role="img">',
+            f'<rect width="{width}" height="{height}" fill="{SCALING_INK["background"]}"/>',
+        ]
+        _scaling_plot_parts(
+            parts,
+            SCALING_LEFT,
+            top,
+            SCALING_DUAL_PLOT_WIDTH,
+            plot_height,
+            series,
+            ceiling,
+            allowed,
             SCALING_PANEL_TITLES.get(pattern, pattern),
-            fill=SCALING_INK["title"],
-            size=20,
-            weight="600",
-        )
-    )
-    parts.append(
-        svg_text(
-            left - 12,
-            top - 24,
             "aggregate throughput (operations/second) by worker thread count",
-            fill=SCALING_INK["muted"],
-            size=13,
+            unit,
+            thread_points,
         )
-    )
-    legend_x = left - 12
+        _scaling_plot_parts(
+            parts,
+            SCALING_DUAL_RSS_LEFT,
+            top,
+            SCALING_DUAL_PLOT_WIDTH,
+            plot_height,
+            rss_series,
+            rss_ceiling,
+            allowed,
+            "peak RSS by worker count",
+            "external smaps_rollup peak during the measured block; lower is better",
+            rss_unit,
+            thread_points,
+        )
+    else:
+        width = SCALING_WIDTH
+        parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+            f'width="{width}" height="{height}" role="img">',
+            f'<rect width="{width}" height="{height}" fill="{SCALING_INK["background"]}"/>',
+        ]
+        _scaling_plot_parts(
+            parts,
+            SCALING_LEFT,
+            top,
+            SCALING_PLOT_WIDTH,
+            plot_height,
+            series,
+            ceiling,
+            allowed,
+            SCALING_PANEL_TITLES.get(pattern, pattern),
+            "aggregate throughput (operations/second) by worker thread count",
+            unit,
+            thread_points,
+        )
+    legend_x = SCALING_LEFT - 12
     for allocator in ALLOCATOR_IDS:
         if allocator not in series:
             continue
@@ -3605,7 +3818,7 @@ def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
         legend_x += 34 + 7.4 * len(allocator)
     parts.append(
         svg_text(
-            left - 12,
+            SCALING_LEFT - 12,
             height - 16,
             f"{SCALING_RIGOR_LABEL} | median of {SCALING_BLOCKS} paired blocks | "
             f"runner {topology.get('physical_cores', '?')}P/{topology.get('logical_cores', '?')}L "
@@ -3809,6 +4022,12 @@ def render_html(latest: Mapping[str, object]) -> bytes:
         scaling_run = object_value(scaling["run"], "latest.scaling.run")
         scaling_topology = object_value(scaling["topology"], "latest.scaling.topology")
         scaling_methodology = object_value(scaling["methodology"], "latest.scaling.methodology")
+        # Read from the report, not from the current contract: a published row
+        # measured under the earlier sweep must describe its own worker counts.
+        scaling_thread_points = [
+            int_value(item, "latest.scaling.thread_points", 1)
+            for item in list_value(scaling["thread_points"], "latest.scaling.thread_points")
+        ]
         scaling_summaries = [
             object_value(value, "scaling summary")
             for value in list_value(scaling["cell_summaries"], "scaling cell summaries")
@@ -3833,7 +4052,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             if scaling_run["run_origin"] == "github-actions"
             else "https://github.com/zackees/mimalloc-pprof/actions"
         )
-        scaling_html = f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(SCALING_RIGOR_LABEL)}.</strong> These panels trade statistical rigor for thread coverage: {escaped(SCALING_BLOCKS)} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating. Do not read them as headline-grade numbers.</p><p>Worker counts are literal {escaped(", ".join(str(point) for point in SCALING_THREAD_POINTS))}; the runner allows {escaped(scaling_topology["allowed_logical_cpus"])} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling_methodology["seed_chain"])}. Scaling run <a href="{scaling_actions}">{escaped(scaling_run["run_id"])}/{escaped(scaling_run["run_attempt"])}</a> measured mimalloc-pprof at source <code>{escaped(scaling_run["source_sha"])}</code>, which is not necessarily the commit above; metric key <code>{escaped(scaling["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table></section>"""
+        scaling_html = f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(SCALING_RIGOR_LABEL)}.</strong> These panels trade statistical rigor for thread coverage: {escaped(SCALING_BLOCKS)} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating. Do not read them as headline-grade numbers.</p><p>Worker counts are literal {escaped(", ".join(str(point) for point in scaling_thread_points))}; the runner allows {escaped(scaling_topology["allowed_logical_cpus"])} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling_methodology["seed_chain"])}. Scaling run <a href="{scaling_actions}">{escaped(scaling_run["run_id"])}/{escaped(scaling_run["run_attempt"])}</a> measured mimalloc-pprof at source <code>{escaped(scaling_run["source_sha"])}</code>, which is not necessarily the commit above; metric key <code>{escaped(scaling["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table></section>"""
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>mimalloc allocator benchmarks</title>
 <style>body{{font:15px system-ui,sans-serif;max-width:1200px;margin:auto;padding:24px;color:#182334}}table{{border-collapse:collapse;width:100%;margin:16px 0}}th,td{{border:1px solid #ccd4dd;padding:7px;text-align:left}}img{{max-width:100%;height:auto}}.pending{{border:1px solid #ccd4dd;padding:12px;margin:12px 0}}code,pre{{overflow-wrap:anywhere;white-space:pre-wrap}}small{{color:#596575}}</style></head><body>

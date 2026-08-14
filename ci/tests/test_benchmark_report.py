@@ -1289,7 +1289,9 @@ class BenchmarkReportTests(unittest.TestCase):
             for item in allocators
             if isinstance(item, dict)
         }
-        allowed = int(runner["logical_cores"])
+        # The production sweep runs on the 2P/4L hosted runner, so the dense
+        # 6/8 points are oversubscribed there; model that runner exactly.
+        allowed = 4
         summaries: list[dict[str, object]] = []
         raw: list[dict[str, object]] = []
         for pattern in report.SCALING_PATTERN_IDS:
@@ -1352,9 +1354,13 @@ class BenchmarkReportTests(unittest.TestCase):
             "run": copy.deepcopy(value["run"]),
             "runner": copy.deepcopy(runner),
             "topology": {
-                "physical_cores": int(runner["physical_cores"]),
-                "logical_cores": allowed,
-                "allowed_logical_cpus": allowed,
+                # The production sweep runs on the 2P/4L hosted runner; the
+                # dense 6/8 points are oversubscribed there and must be
+                # shaded. The fixture models that runner, not the core
+                # envelope's.
+                "physical_cores": 2,
+                "logical_cores": 4,
+                "allowed_logical_cpus": 4,
                 "affinity_policy": "unrestricted",
             },
             "direction": "higher-is-better",
@@ -1386,6 +1392,28 @@ class BenchmarkReportTests(unittest.TestCase):
             },
             "cell_summaries": summaries,
             "raw_samples": raw,
+            "rss": {
+                "metric_schema_version": report.SCALING_RSS_SCHEMA,
+                "sampling": {
+                    "source": "external /proc/<pid>/smaps_rollup Rss",
+                    "method": "polled while the measured block runs; peak retained",
+                    "poll_interval_ns": 5_000_000,
+                },
+                "cell_summaries": [
+                    {
+                        "pattern": pattern,
+                        "thread_count": threads,
+                        "allocator_id": allocator,
+                        "block_count": report.SCALING_BLOCKS,
+                        "median_peak_rss_bytes": (32 + 4 * threads + index) * 1024 * 1024,
+                        "min_peak_rss_bytes": (30 + 4 * threads + index) * 1024 * 1024,
+                        "max_peak_rss_bytes": (34 + 4 * threads + index) * 1024 * 1024,
+                    }
+                    for pattern in report.SCALING_PATTERN_IDS
+                    for threads in report.SCALING_THREAD_POINTS
+                    for index, allocator in enumerate(report.ALLOCATOR_IDS)
+                ],
+            },
         }
         pending = value["pending_metrics"]
         assert isinstance(pending, list)
@@ -1425,6 +1453,9 @@ class BenchmarkReportTests(unittest.TestCase):
                 for allocator in report.ALLOCATOR_IDS:
                     self.assertIn(allocator, panel)
                 self.assertIn("oversubscribed", panel)
+                # The RSS side-car must render its own side-by-side panel.
+                self.assertIn("peak RSS by worker count", panel)
+                self.assertIn("external smaps_rollup peak", panel)
                 # The shaded band must actually be visible, not a zero-width
                 # rectangle collapsed onto the last tick.
                 band = re.search(
@@ -1473,7 +1504,7 @@ class BenchmarkReportTests(unittest.TestCase):
         summaries = scaling["cell_summaries"]
         assert isinstance(summaries, list)
         summaries.pop()
-        with self.assertRaisesRegex(report.ReportError, "48 cells"):
+        with self.assertRaisesRegex(report.ReportError, "96 cells"):
             report.validate_latest(truncated, "truncated")
 
         mispinned = copy.deepcopy(latest)
@@ -1529,6 +1560,103 @@ class BenchmarkReportTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(report.ReportError, "pending_metrics"):
             report.validate_latest(still_pending, "still pending")
+
+    def test_scaling_rss_panel_places_known_points_at_expected_coordinates(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        self.assertIn("peak RSS by worker count", panel)
+        # The fixture RSS medians are (32 + 4*threads + index) MiB; the y
+        # ceiling is the largest median across all cells with 12% headroom,
+        # and the x axis is log2. Circles must land at the exact computed
+        # coordinates on the right-hand RSS panel.
+        rss_peak = (32 + 4 * report.SCALING_THREAD_POINTS[-1] + 3) * 1024 * 1024
+        ceiling = rss_peak * 1.12
+        plot_height = report.SCALING_HEIGHT - report.SCALING_TOP - report.SCALING_BOTTOM
+        for allocator_index in range(len(report.ALLOCATOR_IDS)):
+            for threads in report.SCALING_THREAD_POINTS:
+                median = (32 + 4 * threads + allocator_index) * 1024 * 1024
+                cx = report.scaling_x_of(
+                    threads, report.SCALING_DUAL_RSS_LEFT, report.SCALING_DUAL_PLOT_WIDTH
+                )
+                cy = report.scaling_y_of(median, ceiling, report.SCALING_TOP, plot_height)
+                self.assertIn(
+                    f'<circle cx="{cx:.1f}" cy="{cy:.1f}"',
+                    panel,
+                    f"RSS circle for allocator {allocator_index} at {threads} workers",
+                )
+        # Both panels render: throughput on the left, RSS on the right.
+        self.assertIn(f'<rect x="{report.SCALING_LEFT}" y="{report.SCALING_TOP}"', panel)
+        self.assertIn(f'<rect x="{report.SCALING_DUAL_RSS_LEFT}" y="{report.SCALING_TOP}"', panel)
+        # First-principles axis invariants.
+        self.assertLess(
+            report.scaling_x_of(2, report.SCALING_LEFT, 100),
+            report.scaling_x_of(4, report.SCALING_LEFT, 100),
+        )
+        self.assertLess(
+            report.scaling_y_of(200.0, 100.0, report.SCALING_TOP, plot_height),
+            report.scaling_y_of(50.0, 100.0, report.SCALING_TOP, plot_height),
+        )
+
+    def test_previous_sweep_lineage_still_validates_and_renders(self) -> None:
+        # The published benchmark-stats branch carries a latest.json and history
+        # rows recorded under the sparse (1, 4, 16) sweep. Densifying the thread
+        # points must not make that data unreadable: without this, the first
+        # daily run after the change fails on its own prior site.
+        legacy = report.SCALING_THREAD_POINT_LINEAGES[0]
+        self.assertNotEqual(legacy, report.SCALING_THREAD_POINTS)
+        current = report.SCALING_THREAD_POINTS
+        try:
+            report.SCALING_THREAD_POINTS = legacy
+            latest = self.with_complete_scaling(self.load_latest())
+        finally:
+            report.SCALING_THREAD_POINTS = current
+
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        self.assertEqual(scaling["thread_points"], list(legacy))
+        cells = scaling["cell_summaries"]
+        assert isinstance(cells, list)
+        self.assertEqual(
+            len(cells),  # pyright: ignore[reportUnknownArgumentType]
+            len(report.SCALING_PATTERN_IDS) * len(legacy) * len(report.ALLOCATOR_IDS),
+        )
+        # Validates as a known lineage rather than being rejected outright.
+        report.validate_latest(latest, "legacy lineage")
+
+        # And renders on its own axis: the last legacy point sits at the right
+        # edge, which it would not if the axis spanned the current sweep.
+        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        self.assertAlmostEqual(
+            report.scaling_x_of(legacy[-1], 0, 100, legacy),
+            100.0,
+            places=6,
+        )
+        # The fixture carries the RSS side-car, so this is the dual-panel layout.
+        for threads in legacy:
+            x = report.scaling_x_of(
+                threads, report.SCALING_LEFT, report.SCALING_DUAL_PLOT_WIDTH, legacy
+            )
+            self.assertIn(f'<line x1="{x:.1f}"', panel)
+        self.assertIn(">16<", panel)
+        self.assertNotIn(">6<", panel)
+        # A shape that belongs to no lineage is still rejected.
+        orphan = copy.deepcopy(latest)
+        orphan_scaling = orphan["scaling"]
+        assert isinstance(orphan_scaling, dict)
+        orphan_scaling["thread_points"] = [1, 5, 25]
+        with self.assertRaisesRegex(report.ReportError, "lineage"):
+            report.validate_latest(orphan, "orphan lineage")
+
+    def test_scaling_without_rss_sidecar_renders_a_single_panel(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        del scaling["rss"]
+        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        self.assertNotIn("peak RSS by worker count", panel)
+        self.assertIn('viewBox="0 0 1000 590"', panel)
 
     def test_scaling_svg_is_inert_and_self_contained(self) -> None:
         latest = self.with_complete_scaling(self.load_latest())

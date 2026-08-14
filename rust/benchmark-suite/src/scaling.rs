@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,12 +39,23 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
 
 pub const SCALING_SCHEMA_VERSION: &str = "throughput-scaling-sparse-v1";
 pub const SCALING_CHILD_PROTOCOL_VERSION: &str = "throughput-scaling-sparse-child-v1";
+/// The RSS side-car overlaid on the same sweep. It is deliberately an optional
+/// object inside the scaling report (not a mutation of the cell summaries) so
+/// every already-published sparse row stays valid history: rows recorded
+/// before the side-car existed simply carry no `rss` object.
+pub const SCALING_RSS_SCHEMA_VERSION: &str = "throughput-scaling-rss-v1";
 /// Coverage mode: three blocks is the minimum that still permits a paired
 /// comparison and still exposes a single wild outlier through min/max.
 pub const SCALING_BLOCKS: u32 = 3;
 /// Fixed literal worker counts. These are deliberately not topology-resolved;
 /// the runner records its own topology as metadata and labels oversubscription.
-pub const SCALING_THREAD_POINTS: [u32; 3] = [1, 4, 16];
+/// Dense sweep up to 2x the 4-vCPU hosted runner's logical cores; the 6/8
+/// points are oversubscribed and describe contention, not core scaling. The
+/// thread points are part of the metric comparison key, so changing them
+/// starts a new history lineage instead of rewriting the sparse one.
+pub const SCALING_THREAD_POINTS: [u32; 6] = [1, 2, 3, 4, 6, 8];
+/// External RSS sampling cadence while a scaling child runs.
+pub const SCALING_RSS_POLL_INTERVAL_NS: u64 = 5_000_000;
 pub const SCALING_RIGOR_LABEL: &str = "coverage mode - reduced statistical rigor (3 blocks)";
 pub const SCALING_MIN_BLOCK_NS: u64 = 400_000_000;
 pub const SCALING_MAX_BLOCK_NS: u64 = 1_500_000_000;
@@ -1049,14 +1061,38 @@ fn nonzero_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().max(1) as u64
 }
 
+/// Sample one child's RSS externally from /proc while it runs and return the
+/// peak. Linux-only: production collection refuses to run anywhere else, and
+/// other targets record zero so the code still compiles for the full matrix.
+pub fn sample_peak_rss(pid: u32, stop: &AtomicBool) -> u64 {
+    let mut peak = 0u64;
+    if !cfg!(target_os = "linux") {
+        return 0;
+    }
+    let path = format!("/proc/{pid}/smaps_rollup");
+    while !stop.load(Ordering::Relaxed) {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                if let Ok(rss) = crate::memory::parse_smaps_rollup(&text) {
+                    peak = peak.max(rss);
+                }
+            }
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_nanos(SCALING_RSS_POLL_INTERVAL_NS));
+    }
+    peak
+}
+
 /// Spawn one isolated scaling child and validate its response against the
 /// derived plan. Allocator runtime features are forced off exactly as the core
-/// producer does.
+/// producer does. Returns the validated response plus the externally sampled
+/// peak RSS for the child.
 pub fn run_scaling_child(
     child: &ChildProgram,
     request: &ScalingChildRequest,
     timeout: Duration,
-) -> Result<ScalingChildResponse, String> {
+) -> Result<(ScalingChildResponse, u64), String> {
     let pattern = request.pattern()?;
     let expected = simulate_cell(
         pattern,
@@ -1074,7 +1110,7 @@ pub fn run_scaling_child_with_plan(
     request: &ScalingChildRequest,
     timeout: Duration,
     expected: &ScalingCounts,
-) -> Result<ScalingChildResponse, String> {
+) -> Result<(ScalingChildResponse, u64), String> {
     request.validate()?;
     if child.allocator != request.allocator || timeout.is_zero() {
         return Err("scaling child identity mismatch or zero timeout".into());
@@ -1095,6 +1131,10 @@ pub fn run_scaling_child_with_plan(
     let mut child_process = process
         .spawn()
         .map_err(|error| format!("spawn scaling child: {error}"))?;
+    let pid = child_process.id();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_sampler = Arc::clone(&stop);
+    let sampler = std::thread::spawn(move || sample_peak_rss(pid, &stop_for_sampler));
     child_process
         .stdin
         .take()
@@ -1138,6 +1178,8 @@ pub fn run_scaling_child_with_plan(
             let error_bytes = stderr_reader
                 .join()
                 .map_err(|_| "scaling stderr reader panicked".to_string())??;
+            stop.store(true, Ordering::Relaxed);
+            let _ = sampler.join();
             return Err(format!(
                 "scaling child timed out: {}",
                 String::from_utf8_lossy(&error_bytes)
@@ -1145,6 +1187,10 @@ pub fn run_scaling_child_with_plan(
         }
         std::thread::sleep(Duration::from_millis(2));
     };
+    stop.store(true, Ordering::Relaxed);
+    let peak_rss_bytes = sampler
+        .join()
+        .map_err(|_| "scaling RSS sampler panicked".to_string())?;
     let output = stdout_reader
         .join()
         .map_err(|_| "scaling stdout reader panicked".to_string())??;
@@ -1160,7 +1206,7 @@ pub fn run_scaling_child_with_plan(
     let response: ScalingChildResponse = serde_json::from_slice(&output)
         .map_err(|error| format!("decode scaling child response: {error}"))?;
     response.validate_against_expected(request, expected)?;
-    Ok(response)
+    Ok((response, peak_rss_bytes))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1203,6 +1249,9 @@ pub struct ScalingRawSample {
     pub child_binary_sha256: String,
     pub operations_per_worker: u64,
     pub reproduction_command: String,
+    /// Externally sampled peak RSS of the child process while the measured
+    /// block ran (bytes). Observed by the runner, never reported by the child.
+    pub peak_rss_bytes: u64,
     pub response: ScalingChildResponse,
 }
 
@@ -1264,6 +1313,42 @@ pub struct ScalingMethodology {
     pub statistics_omitted: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScalingRssCellSummary {
+    pub pattern: String,
+    pub thread_count: u32,
+    pub allocator_id: String,
+    pub block_count: u32,
+    pub median_peak_rss_bytes: u64,
+    pub min_peak_rss_bytes: u64,
+    pub max_peak_rss_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScalingRssSampling {
+    pub source: String,
+    pub method: String,
+    pub poll_interval_ns: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScalingRssReport {
+    pub metric_schema_version: String,
+    pub sampling: ScalingRssSampling,
+    pub cell_summaries: Vec<ScalingRssCellSummary>,
+}
+
+pub fn rss_sampling() -> ScalingRssSampling {
+    ScalingRssSampling {
+        source: "external /proc/<pid>/smaps_rollup Rss, parsed as integer kB * 1024".into(),
+        method: "polled while the measured block runs; the peak over the block is retained".into(),
+        poll_interval_ns: SCALING_RSS_POLL_INTERVAL_NS,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ScalingMetricReport {
@@ -1281,6 +1366,10 @@ pub struct ScalingMetricReport {
     pub patterns: Vec<ScalingPatternDefinition>,
     pub methodology: ScalingMethodology,
     pub cell_summaries: Vec<ScalingCellSummary>,
+    /// Optional RSS side-car. Absent in rows published before it existed;
+    /// its own schema version keeps the extension compatible with them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss: Option<ScalingRssReport>,
     pub raw_samples: Vec<ScalingRawSample>,
 }
 
@@ -1298,6 +1387,8 @@ pub struct ScalingHistoryReport {
     pub thread_points: Vec<u32>,
     pub methodology: ScalingMethodology,
     pub cell_summaries: Vec<ScalingCellSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss: Option<ScalingRssReport>,
 }
 
 impl ScalingMetricReport {
@@ -1314,6 +1405,7 @@ impl ScalingMetricReport {
             thread_points: self.thread_points.clone(),
             methodology: self.methodology.clone(),
             cell_summaries: self.cell_summaries.clone(),
+            rss: self.rss.clone(),
         }
     }
 }
@@ -1344,7 +1436,14 @@ pub fn methodology() -> ScalingMethodology {
         seed_chain: "splitmix64 chain over (run seed, pattern tag, thread count, block, worker); the allocator is deliberately absent so all four allocators replay one stream".into(),
         pairing: "all four allocators run the same frozen per-worker operation count and the same stream inside one block, in a rotated near-balanced order".into(),
         work_normalization: "operations per worker are calibrated once per (pattern, thread point) against upstream-mimalloc and frozen across allocators; total work scales with worker count".into(),
-        oversubscription: "thread points are literal worker counts 1/4/16; points above the allowed logical CPU count are labeled oversubscribed and describe contention, not core scaling".into(),
+        oversubscription: format!(
+            "thread points are literal worker counts {}; points above the allowed logical CPU count are labeled oversubscribed and describe contention, not core scaling",
+            SCALING_THREAD_POINTS
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join("/")
+        ),
         cross_thread_backpressure: "bounded per-worker mailbox; a producer facing a full mailbox frees the block itself rather than blocking, and the fallback count is published".into(),
         statistics_omitted: "no bootstrap confidence intervals and no noise gating; three blocks cannot support them and the panel says so".into(),
     }
@@ -1450,6 +1549,12 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
                 "scaling sample did not use the frozen per-worker operation count".into(),
             );
         }
+        if sample.peak_rss_bytes == 0 {
+            return Err(format!(
+                "scaling sample for {}/{} on {} has no RSS observation",
+                sample.pattern, sample.thread_count, sample.allocator_id
+            ));
+        }
         // Re-derive the whole plan from the seed chain and compare every count.
         // The plan is allocator-independent, so it is derived once per
         // (pattern, thread point, block) and reused across that block's four
@@ -1539,6 +1644,7 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
 pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, String> {
     validate_scaling_raw_run(raw)?;
     let mut grouped: BTreeMap<(String, u32, String), Vec<f64>> = BTreeMap::new();
+    let mut rss_grouped: BTreeMap<(String, u32, String), Vec<u64>> = BTreeMap::new();
     for sample in &raw.samples {
         grouped
             .entry((
@@ -1548,6 +1654,14 @@ pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, 
             ))
             .or_default()
             .push(sample.response.throughput_operations_per_second);
+        rss_grouped
+            .entry((
+                sample.pattern.clone(),
+                sample.thread_count,
+                sample.allocator_id.clone(),
+            ))
+            .or_default()
+            .push(sample.peak_rss_bytes);
     }
     let mut single: BTreeMap<(String, String), f64> = BTreeMap::new();
     for ((pattern, threads, allocator), values) in &grouped {
@@ -1591,6 +1705,27 @@ pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, 
         )
             .cmp(&(&right.pattern, right.thread_count, &right.allocator_id))
     });
+    let mut rss_cell_summaries = Vec::new();
+    for ((pattern, threads, allocator), mut values) in rss_grouped {
+        values.sort_unstable();
+        rss_cell_summaries.push(ScalingRssCellSummary {
+            pattern,
+            thread_count: threads,
+            allocator_id: allocator,
+            block_count: values.len() as u32,
+            median_peak_rss_bytes: values[values.len() / 2],
+            min_peak_rss_bytes: *values.first().unwrap_or(&0),
+            max_peak_rss_bytes: *values.last().unwrap_or(&0),
+        });
+    }
+    rss_cell_summaries.sort_by(|left, right| {
+        (
+            &left.pattern,
+            left.thread_count,
+            &left.allocator_id,
+        )
+            .cmp(&(&right.pattern, right.thread_count, &right.allocator_id))
+    });
     Ok(ScalingMetricReport {
         metric_schema_version: SCALING_SCHEMA_VERSION.into(),
         status: "complete".into(),
@@ -1606,6 +1741,11 @@ pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, 
         patterns: pattern_definitions(),
         methodology: methodology(),
         cell_summaries,
+        rss: Some(ScalingRssReport {
+            metric_schema_version: SCALING_RSS_SCHEMA_VERSION.into(),
+            sampling: rss_sampling(),
+            cell_summaries: rss_cell_summaries,
+        }),
         raw_samples: raw.samples.clone(),
     })
 }
@@ -1693,6 +1833,32 @@ pub fn validate_scaling_report(report: &ScalingMetricReport) -> Result<(), Strin
     }
     if report.raw_samples.len() != expected_cells * SCALING_BLOCKS as usize {
         return Err("scaling report raw sample count does not match its matrix".into());
+    }
+    if let Some(rss) = &report.rss {
+        if rss.metric_schema_version != SCALING_RSS_SCHEMA_VERSION
+            || rss.sampling != rss_sampling()
+            || rss.cell_summaries.len() != expected_cells
+        {
+            return Err("scaling RSS side-car has an invalid schema, sampling, or matrix".into());
+        }
+        let mut rss_seen: BTreeSet<(String, u32, String)> = BTreeSet::new();
+        for summary in &rss.cell_summaries {
+            if summary.block_count != SCALING_BLOCKS
+                || summary.min_peak_rss_bytes == 0
+                || summary.min_peak_rss_bytes > summary.median_peak_rss_bytes
+                || summary.max_peak_rss_bytes < summary.median_peak_rss_bytes
+                || !rss_seen.insert((
+                    summary.pattern.clone(),
+                    summary.thread_count,
+                    summary.allocator_id.clone(),
+                ))
+            {
+                return Err(format!(
+                    "scaling RSS cell summary for {}/{} on {} is invalid or duplicated",
+                    summary.pattern, summary.thread_count, summary.allocator_id
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1834,6 +2000,15 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                         + u64::from(thread_count) * 3_000_000;
                     let elapsed_ns = base * allocator_scale / 100 * contention_scale / 100;
                     let operation_count = expected.operation_count();
+                    // Synthetic footprint: grows with worker count so the RSS
+                    // panel exercises a per-thread-cache slope, plus a small
+                    // per-allocator spread and per-block jitter.
+                    let peak_rss_bytes = (16u64
+                        + u64::from(thread_count) * 4
+                        + ordinal as u64 * 3
+                        + u64::from(block_id))
+                        * 1024
+                        * 1024;
                     samples.push(ScalingRawSample {
                         metric_schema_version: SCALING_SCHEMA_VERSION.into(),
                         block_id,
@@ -1844,6 +2019,7 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                         allocator_source_sha: identity.source_sha.clone(),
                         child_binary_sha256: identity.child_binary_sha256.clone(),
                         operations_per_worker,
+                        peak_rss_bytes,
                         reproduction_command: format!(
                             "benchmark-scaling-run --run-seed {run_seed} # {}/{thread_count}",
                             pattern.as_str()

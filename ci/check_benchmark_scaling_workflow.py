@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -18,9 +19,22 @@ from typing import Any, Callable, NoReturn, cast
 
 import yaml
 
+from benchmark_report import (
+    SCALING_BLOCKS,
+    SCALING_RSS_SCHEMA,
+    SCALING_SCHEMA,
+    SCALING_THREAD_POINTS,
+)
 from check_benchmark_workflow import check_action_ref
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "benchmark-scaling.yml"
+# The sweep contract is declared twice: the Rust producer emits it and the
+# Python validator rejects anything that disagrees. Drift is silent until a
+# scheduled run has already spent its budget and fails at overlay time, so the
+# two declarations are compared here, in a job that runs on every ci/ PR.
+SCALING_SOURCE = (
+    Path(__file__).resolve().parents[1] / "rust" / "benchmark-suite" / "src" / "scaling.rs"
+)
 JOBS = {
     "build-and-measure",
     "artifact-audit",
@@ -171,6 +185,54 @@ def validate(workflow: Mapping[str, object]) -> None:
             fail(f"publication audit is missing {required}")
 
 
+RUST_THREAD_POINTS = re.compile(
+    r"pub const SCALING_THREAD_POINTS:\s*\[u32;\s*(?P<length>\d+)\]\s*=\s*\[(?P<points>[^\]]*)\];"
+)
+RUST_BLOCKS = re.compile(r"pub const SCALING_BLOCKS:\s*u32\s*=\s*(?P<blocks>\d+);")
+RUST_SCHEMA = re.compile(r'pub const SCALING_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<schema>[^"]*)";')
+RUST_RSS_SCHEMA = re.compile(
+    r'pub const SCALING_RSS_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<schema>[^"]*)";'
+)
+
+
+def validate_source_contract(source: str) -> None:
+    """The Rust producer and the Python validator must declare the same sweep.
+
+    `SCALING_THREAD_POINTS` is part of the metric comparison key, so a
+    one-sided edit does not merely mismatch: it silently starts a history
+    lineage the other side rejects. Same for the block count and both schema
+    strings. Checked by regex rather than by building the crate so the gate
+    stays inside the `python-lint` job that already runs on every `ci/` PR.
+    """
+
+    points_match = RUST_THREAD_POINTS.search(source)
+    if points_match is None:
+        fail("scaling.rs: SCALING_THREAD_POINTS is missing or no longer a [u32; N] literal")
+    raw_points = [item.strip() for item in points_match.group("points").split(",") if item.strip()]
+    if not all(item.isdigit() for item in raw_points):
+        fail("scaling.rs: SCALING_THREAD_POINTS must be literal decimal worker counts")
+    points = tuple(int(item) for item in raw_points)
+    if int(points_match.group("length")) != len(points):
+        fail("scaling.rs: SCALING_THREAD_POINTS array length disagrees with its elements")
+    if points != SCALING_THREAD_POINTS:
+        fail(
+            "scaling.rs: SCALING_THREAD_POINTS is "
+            f"{list(points)} but benchmark_report.py declares {list(SCALING_THREAD_POINTS)}"
+        )
+    if sorted(set(points)) != list(points):
+        fail("scaling.rs: SCALING_THREAD_POINTS must be strictly increasing and unique")
+
+    blocks_match = RUST_BLOCKS.search(source)
+    if blocks_match is None or int(blocks_match.group("blocks")) != SCALING_BLOCKS:
+        fail(f"scaling.rs: SCALING_BLOCKS must be {SCALING_BLOCKS}")
+    schema_match = RUST_SCHEMA.search(source)
+    if schema_match is None or schema_match.group("schema") != SCALING_SCHEMA:
+        fail(f"scaling.rs: SCALING_SCHEMA_VERSION must be {SCALING_SCHEMA!r}")
+    rss_match = RUST_RSS_SCHEMA.search(source)
+    if rss_match is None or rss_match.group("schema") != SCALING_RSS_SCHEMA:
+        fail(f"scaling.rs: SCALING_RSS_SCHEMA_VERSION must be {SCALING_RSS_SCHEMA!r}")
+
+
 def load(path: Path) -> dict[str, object]:
     value = yaml.safe_load(path.read_text(encoding="utf-8"))
     return mapping(value, str(path))
@@ -243,7 +305,40 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
 }
 
 
-def selftest(path: Path) -> None:
+SOURCE_MUTATIONS: dict[str, Callable[[str], str]] = {
+    "thread points diverge from the validator": lambda text: text.replace(
+        f"[u32; {len(SCALING_THREAD_POINTS)}] = [{', '.join(str(p) for p in SCALING_THREAD_POINTS)}]",
+        "[u32; 3] = [1, 4, 16]",
+    ),
+    "thread point array length lies": lambda text: text.replace(
+        f"[u32; {len(SCALING_THREAD_POINTS)}]", "[u32; 99]"
+    ),
+    "block count diverges": lambda text: text.replace(
+        f"SCALING_BLOCKS: u32 = {SCALING_BLOCKS};", "SCALING_BLOCKS: u32 = 1;"
+    ),
+    "scaling schema renamed on one side": lambda text: text.replace(
+        f'SCALING_SCHEMA_VERSION: &str = "{SCALING_SCHEMA}"',
+        'SCALING_SCHEMA_VERSION: &str = "throughput-scaling-dense-v2"',
+    ),
+    "rss schema renamed on one side": lambda text: text.replace(
+        f'SCALING_RSS_SCHEMA_VERSION: &str = "{SCALING_RSS_SCHEMA}"',
+        'SCALING_RSS_SCHEMA_VERSION: &str = "throughput-scaling-rss-v2"',
+    ),
+    "thread points declared out of order": lambda text: text.replace(
+        f"[{', '.join(str(p) for p in SCALING_THREAD_POINTS)}]",
+        f"[{', '.join(str(p) for p in reversed(SCALING_THREAD_POINTS))}]",
+    ),
+    "thread points stop being literals": lambda text: text.replace(
+        f"[{', '.join(str(p) for p in SCALING_THREAD_POINTS)}]",
+        "[1, 2, 3, 4, 6, num_cpus()]",
+    ),
+    "constant deleted outright": lambda text: text.replace(
+        "pub const SCALING_THREAD_POINTS", "const SCALING_THREAD_POINTS_UNUSED"
+    ),
+}
+
+
+def selftest(path: Path, source_path: Path) -> None:
     """Every declared rule must reject at least one concrete mutation."""
 
     baseline = load(path)
@@ -257,17 +352,32 @@ def selftest(path: Path) -> None:
             continue
         fail(f"selftest: the checker accepted a workflow with {label}")
 
+    source = source_path.read_text(encoding="utf-8")
+    validate_source_contract(source)
+    for label, edit in SOURCE_MUTATIONS.items():
+        mutated = edit(source)
+        if mutated == source:
+            fail(f"selftest: the {label!r} mutation did not change scaling.rs")
+        try:
+            validate_source_contract(mutated)
+        except ScalingWorkflowError:
+            continue
+        fail(f"selftest: the checker accepted scaling.rs with {label}")
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workflow", type=Path, default=WORKFLOW)
+    parser.add_argument("--source", type=Path, default=SCALING_SOURCE)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
+    controls = len(MUTATIONS) + len(SOURCE_MUTATIONS)
     if args.selftest:
-        selftest(args.workflow)
-        print(f"PASS benchmark scaling workflow policy selftest ({len(MUTATIONS)} controls)")
+        selftest(args.workflow, args.source)
+        print(f"PASS benchmark scaling workflow policy selftest ({controls} controls)")
     else:
         validate(load(args.workflow))
+        validate_source_contract(args.source.read_text(encoding="utf-8"))
         print(f"PASS benchmark scaling workflow policy: {args.workflow}")
     return 0
 

@@ -1251,6 +1251,14 @@ pub struct ScalingRawSample {
     pub reproduction_command: String,
     /// Externally sampled peak RSS of the child process while the measured
     /// block ran (bytes). Observed by the runner, never reported by the child.
+    ///
+    /// Defaulted, not required: rows published before the RSS side-car existed
+    /// carry no observation, and every validator that reads a prior
+    /// `latest.json` (`--base-latest`) has to deserialize those rows. A fresh
+    /// producer run always sets it, and `validate_scaling_raw_run` rejects a
+    /// zero there, so the default cannot smuggle a missing observation into a
+    /// new run.
+    #[serde(default)]
     pub peak_rss_bytes: u64,
     pub response: ScalingChildResponse,
 }

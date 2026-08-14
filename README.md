@@ -62,6 +62,40 @@ Click either chart for the live interactive dashboard with full per-scenario
 tables and paired effects. The raw sealed artifacts remain available on the
 [`benchmark-stats` branch](https://github.com/zackees/mimalloc-pprof/tree/benchmark-stats).*
 
+### Thread scaling by allocation pattern
+
+How each allocator's aggregate throughput moves as worker threads go from 1 to
+4 to 16, for four different allocation patterns.  Each pattern is a **seeded
+random operation stream** — every operation, size, and slot is drawn from a
+splitmix64 chain that never observes allocator behavior — so all four
+allocators replay one identical stream inside each paired block.
+
+> **Coverage mode: reduced statistical rigor (3 blocks per cell).**  These
+> panels deliberately trade statistical rigor for thread coverage.  They carry
+> no confidence intervals and no noise gating; read them for shape, not for
+> headline-grade differences.  The runner allows 4 logical CPUs, so the
+> 16-thread point is 4× oversubscribed and describes contention, not core
+> scaling — it is shaded on every chart.
+
+[![Tiny hot path: aggregate throughput by worker count for all four allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-tiny-hot.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+[![General mix including realloc: aggregate throughput by worker count for all four allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-mixed-general.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+[![Large page-touched buffers: aggregate throughput by worker count for all four allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-buffers.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+[![Cross-thread producer/consumer handoff: aggregate throughput by worker count for all four allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-cross-thread.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+| Pattern | Sizes | What it stresses |
+|---|---|---|
+| Tiny hot path | 16–64 B | small-object fast path, high alloc/free rate, small live set |
+| General mix | 8 B–4 KiB log-uniform | everyday mix including realloc, medium live set |
+| Large buffers | 64 KiB–4 MiB | large allocations with one-byte-per-page touching |
+| Cross-thread handoff | 16–512 B | remote-free pressure; blocks are freed by another worker |
+
+*Protocol `throughput-scaling-sparse-v1`, published weekly.  Full per-cell
+tables, min/max spreads, and the metric comparison key are on the
+[dashboard](https://zackees.github.io/mimalloc-pprof/#scaling).*
+
 #### Pending Phase 6 panels
 
 The following metrics are tracked in the dashboard as explicitly pending
@@ -69,10 +103,12 @@ placeholder panels until their measurement protocols land:
 
 | Metric | Phase issue |
 |---|---|
-| Memory (Linux RSS, fragmentation proxy) | [#184](https://github.com/zackees/mimalloc-pprof/issues/184) |
-| Honest transaction latency | [#185](https://github.com/zackees/mimalloc-pprof/issues/185) |
-| Thread/affinity scaling curves | [#186](https://github.com/zackees/mimalloc-pprof/issues/186) |
 | Pprof compilation and runtime tax | [#187](https://github.com/zackees/mimalloc-pprof/issues/187) |
+
+Memory ([#184](https://github.com/zackees/mimalloc-pprof/issues/184)), honest
+transaction latency ([#185](https://github.com/zackees/mimalloc-pprof/issues/185)),
+and thread scaling ([#203](https://github.com/zackees/mimalloc-pprof/issues/203))
+have landed; their panels populate on each metric's next scheduled run.
 
 ```
    __  __ ___ __  __    _    _     _     ___   ____

@@ -70,7 +70,7 @@ TOP_LEVEL_FIELDS = {
     "reproduction_command",
     "actions_run_url",
 }
-OPTIONAL_TOP_LEVEL_FIELDS = {"memory", "latency"}
+OPTIONAL_TOP_LEVEL_FIELDS = {"memory", "latency", "scaling"}
 HISTORY_FIELDS = {
     "history_schema_version",
     "statistics_version",
@@ -82,7 +82,7 @@ HISTORY_FIELDS = {
     "absolute_summaries",
     "paired_summaries",
 }
-OPTIONAL_HISTORY_FIELDS = {"memory", "latency"}
+OPTIONAL_HISTORY_FIELDS = {"memory", "latency", "scaling"}
 RUN_FIELDS = {
     "source_repository",
     "source_sha",
@@ -109,6 +109,28 @@ RUNNER_FIELDS = {
     "affinity",
     "power",
 }
+SCALING_SCHEMA = "throughput-scaling-sparse-v1"
+SCALING_RIGOR_LABEL = "coverage mode - reduced statistical rigor (3 blocks)"
+SCALING_BLOCKS = 3
+SCALING_THREAD_POINTS = (1, 4, 16)
+SCALING_PATTERN_IDS = (
+    "sparse-tiny-hot",
+    "sparse-mixed-general",
+    "sparse-large-buffers",
+    "sparse-cross-thread",
+)
+# One panel per allocation pattern. Separate files (rather than one facet grid)
+# keep each chart legible in the README and on a phone.
+SCALING_PANELS = {
+    pattern: f"benchmark-scaling-{pattern.removeprefix('sparse-')}.svg"
+    for pattern in SCALING_PATTERN_IDS
+}
+SCALING_PANEL_TITLES = {
+    "sparse-tiny-hot": "Tiny hot path (16-64 B)",
+    "sparse-mixed-general": "General mix (8 B-4 KiB, with realloc)",
+    "sparse-large-buffers": "Large buffers (64 KiB-4 MiB, page-touched)",
+    "sparse-cross-thread": "Cross-thread handoff (16-512 B, remote free)",
+}
 SITE_FILES = {
     ".nojekyll",
     "index.html",
@@ -119,17 +141,17 @@ SITE_FILES = {
     "benchmark-history.png",
     "benchmark-memory.png",
     "benchmark-latency.png",
-    "benchmark-scaling.png",
     "benchmark-pprof-tax.png",
+    *SCALING_PANELS.values(),
 }
 PNG_DIMENSIONS = {
     "benchmark-throughput.png": (1280, 720),
     "benchmark-history.png": (1280, 720),
     "benchmark-memory.png": (960, 540),
     "benchmark-latency.png": (960, 540),
-    "benchmark-scaling.png": (960, 540),
     "benchmark-pprof-tax.png": (960, 540),
 }
+SVG_FILES = frozenset(SCALING_PANELS.values())
 FILE_CAPS = {
     ".nojekyll": 0,
     "index.html": 2 * 1024 * 1024,
@@ -137,6 +159,7 @@ FILE_CAPS = {
     "manifest.json": 1024 * 1024,
     "history.jsonl": 32 * 1024 * 1024,
     **dict.fromkeys(PNG_DIMENSIONS, 12 * 1024 * 1024),
+    **dict.fromkeys(SVG_FILES, 1024 * 1024),
 }
 MEDIA_TYPES = {
     ".nojekyll": "application/octet-stream",
@@ -144,6 +167,7 @@ MEDIA_TYPES = {
     "latest.json": "application/json",
     "history.jsonl": "application/x-ndjson",
     **dict.fromkeys(PNG_DIMENSIONS, "image/png"),
+    **dict.fromkeys(SVG_FILES, "image/svg+xml"),
 }
 ROLES = {
     ".nojekyll": "github-pages-marker",
@@ -154,8 +178,8 @@ ROLES = {
     "benchmark-history.png": "history-chart",
     "benchmark-memory.png": "memory-panel",
     "benchmark-latency.png": "latency-panel",
-    "benchmark-scaling.png": "pending-scaling-panel",
     "benchmark-pprof-tax.png": "pending-pprof-tax-panel",
+    **dict.fromkeys(SCALING_PANELS.values(), "scaling-panel"),
 }
 
 MEMORY_SCHEMA = "linux-process-memory-v1"
@@ -1952,13 +1976,35 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
         }
         if observed_sources != expected_sources:
             fail(f"{label}.latency: allocator source pins differ from the core run")
+    scaling = latest.get("scaling")
+    if scaling is not None:
+        scaling_report = validate_scaling_report(scaling, f"{label}.scaling")
+        # Compare the set of (allocator, source) pairs rather than a mapping:
+        # a mapping keeps only the last sample per allocator, which would let a
+        # single mispinned sample through.
+        expected_pairs = {
+            (
+                str(object_value(value, f"{label}.allocators")["allocator_id"]),
+                str(object_value(value, f"{label}.allocators")["source_sha"]),
+            )
+            for value in allocators
+        }
+        observed_pairs = {
+            (
+                str(object_value(value, f"{label}.scaling.raw_samples")["allocator_id"]),
+                str(object_value(value, f"{label}.scaling.raw_samples")["allocator_source_sha"]),
+            )
+            for value in list_value(scaling_report["raw_samples"], f"{label}.scaling.raw_samples")
+        }
+        if observed_pairs != expected_pairs:
+            fail(f"{label}.scaling: allocator source pins differ from the core run")
     pending = list_value(latest.get("pending_metrics"), f"{label}.pending_metrics")
     expected_pending = tuple(
         metric
         for metric, complete in (
             ("memory", memory is not None),
             ("latency", latency is not None),
-            ("scaling", False),
+            ("scaling", scaling is not None),
             ("pprof-tax", False),
         )
         if not complete
@@ -2055,6 +2101,14 @@ def history_row(
             for key, value in latency.items()
             if key not in {"invalid_reason", "runner", "raw_samples"}
         } | {"runner_fingerprint_sha256": runner["fingerprint_sha256"]}
+    if include_optional_metrics and "scaling" in latest:
+        scaling = validate_scaling_report(latest["scaling"], "latest.scaling")
+        runner = object_value(scaling["runner"], "latest.scaling.runner")
+        row["scaling"] = {
+            key: value
+            for key, value in scaling.items()
+            if key not in {"invalid_reason", "runner", "topology", "patterns", "raw_samples"}
+        } | {"runner_fingerprint_sha256": runner["fingerprint_sha256"]}
     return row
 
 
@@ -2116,6 +2170,8 @@ def validate_history_row(value: object, label: str) -> dict[str, object]:
         validate_memory_report(row["memory"], f"{label}.memory", compact=True)
     if "latency" in row:
         validate_latency_report(row["latency"], f"{label}.latency", compact=True)
+    if "scaling" in row:
+        validate_scaling_report(row["scaling"], f"{label}.scaling", compact=True)
     return row
 
 
@@ -2170,7 +2226,7 @@ def merge_history(
         run = object_value(row["run"], "history run")
         if (run["run_id"], run["run_attempt"]) != current_identity:
             continue
-        optional = {"memory", "latency"}
+        optional = {"memory", "latency", "scaling"}
         previous_base = {key: value for key, value in row.items() if key not in optional}
         current_base = {key: value for key, value in current.items() if key not in optional}
         gained = (set(current) & optional) - (set(row) & optional)
@@ -2384,10 +2440,436 @@ def latency_png(latency: Mapping[str, object]) -> bytes:
     )
 
 
+SCALING_REPORT_FIELDS = {
+    "metric_schema_version",
+    "status",
+    "invalid_reason",
+    "metric_comparison_key",
+    "run",
+    "runner",
+    "topology",
+    "direction",
+    "informational",
+    "rigor_label",
+    "thread_points",
+    "patterns",
+    "methodology",
+    "cell_summaries",
+    "raw_samples",
+}
+SCALING_METHODOLOGY_FIELDS = {
+    "rigor",
+    "blocks_per_cell",
+    "aggregation",
+    "operation_stream",
+    "seed_chain",
+    "pairing",
+    "work_normalization",
+    "oversubscription",
+    "cross_thread_backpressure",
+    "statistics_omitted",
+}
+SCALING_SUMMARY_FIELDS = {
+    "pattern",
+    "thread_count",
+    "oversubscription_factor",
+    "oversubscribed",
+    "allocator_id",
+    "block_count",
+    "median_throughput",
+    "min_throughput",
+    "max_throughput",
+    "speedup_vs_single_worker",
+}
+
+
+def validate_scaling_report(
+    value: object, label: str, *, compact: bool = False
+) -> dict[str, object]:
+    report = object_value(value, label)
+    required = SCALING_REPORT_FIELDS - (
+        {"invalid_reason", "runner", "topology", "patterns", "raw_samples"} if compact else set()
+    )
+    if compact:
+        required.add("runner_fingerprint_sha256")
+    exact_fields(report, required, label)
+    if (
+        report.get("metric_schema_version") != SCALING_SCHEMA
+        or report.get("status") != "complete"
+        or report.get("direction") != "higher-is-better"
+        or report.get("informational") is not True
+    ):
+        fail(f"{label}: complete informational higher-is-better scaling required")
+    if report.get("rigor_label") != SCALING_RIGOR_LABEL:
+        fail(f"{label}.rigor_label: coverage-mode labeling is mandatory")
+    points = [
+        int_value(item, f"{label}.thread_points[{index}]", 1)
+        for index, item in enumerate(
+            list_value(report.get("thread_points"), f"{label}.thread_points")
+        )
+    ]
+    if tuple(points) != SCALING_THREAD_POINTS:
+        fail(f"{label}.thread_points: exactly {list(SCALING_THREAD_POINTS)} required")
+    comparison_digest(report.get("metric_comparison_key"), f"{label}.metric_comparison_key")
+    validate_run(report.get("run"), f"{label}.run")
+    if compact:
+        digest = string_value(
+            report.get("runner_fingerprint_sha256"), f"{label}.runner_fingerprint_sha256"
+        )
+        if not HEX_64.fullmatch(digest):
+            fail(f"{label}.runner_fingerprint_sha256: invalid")
+    else:
+        if report.get("invalid_reason") is not None:
+            fail(f"{label}.invalid_reason: must be null")
+        validate_runner(report.get("runner"), f"{label}.runner")
+        topology = object_value(report.get("topology"), f"{label}.topology")
+        exact_fields(
+            topology,
+            {"physical_cores", "logical_cores", "allowed_logical_cpus", "affinity_policy"},
+            f"{label}.topology",
+        )
+        int_value(topology.get("allowed_logical_cpus"), f"{label}.topology.allowed_logical_cpus", 1)
+    methodology = object_value(report.get("methodology"), f"{label}.methodology")
+    exact_fields(methodology, SCALING_METHODOLOGY_FIELDS, f"{label}.methodology")
+    if methodology.get("rigor") != SCALING_RIGOR_LABEL:
+        fail(f"{label}.methodology.rigor: coverage-mode labeling is mandatory")
+    if int_value(methodology.get("blocks_per_cell"), f"{label}.methodology.blocks_per_cell", 1) != (
+        SCALING_BLOCKS
+    ):
+        fail(f"{label}.methodology.blocks_per_cell: protocol fixes {SCALING_BLOCKS} blocks")
+    summaries = list_value(report.get("cell_summaries"), f"{label}.cell_summaries")
+    expected_cells = len(SCALING_PATTERN_IDS) * len(SCALING_THREAD_POINTS) * len(ALLOCATOR_IDS)
+    if len(summaries) != expected_cells:
+        fail(f"{label}.cell_summaries: expected exactly {expected_cells} cells")
+    seen: set[tuple[str, int, str]] = set()
+    for index, item in enumerate(summaries):
+        summary = object_value(item, f"{label}.cell_summaries[{index}]")
+        exact_fields(summary, SCALING_SUMMARY_FIELDS, f"{label}.cell_summaries[{index}]")
+        pattern = string_value(summary.get("pattern"), f"{label}.cell_summaries[{index}].pattern")
+        allocator = string_value(
+            summary.get("allocator_id"), f"{label}.cell_summaries[{index}].allocator_id"
+        )
+        threads = int_value(
+            summary.get("thread_count"), f"{label}.cell_summaries[{index}].thread_count", 1
+        )
+        if (
+            pattern not in SCALING_PATTERN_IDS
+            or allocator not in ALLOCATOR_IDS
+            or threads not in SCALING_THREAD_POINTS
+        ):
+            fail(f"{label}.cell_summaries[{index}]: undeclared pattern, allocator, or thread point")
+        key = (pattern, threads, allocator)
+        if key in seen:
+            fail(f"{label}.cell_summaries[{index}]: duplicate cell {key}")
+        seen.add(key)
+        if (
+            int_value(summary.get("block_count"), f"{label}.cell_summaries[{index}].block_count", 1)
+            != SCALING_BLOCKS
+        ):
+            fail(f"{label}.cell_summaries[{index}].block_count: {SCALING_BLOCKS} blocks required")
+        median = float_value(
+            summary.get("median_throughput"), f"{label}.cell_summaries[{index}].median", True
+        )
+        low = float_value(
+            summary.get("min_throughput"), f"{label}.cell_summaries[{index}].min", True
+        )
+        high = float_value(
+            summary.get("max_throughput"), f"{label}.cell_summaries[{index}].max", True
+        )
+        float_value(
+            summary.get("speedup_vs_single_worker"),
+            f"{label}.cell_summaries[{index}].speedup",
+            True,
+        )
+        factor = float_value(
+            summary.get("oversubscription_factor"),
+            f"{label}.cell_summaries[{index}].oversubscription_factor",
+            True,
+        )
+        if low > median or high < median:
+            fail(f"{label}.cell_summaries[{index}]: min/median/max are inconsistent")
+        if summary.get("oversubscribed") is not (factor > 1.0):
+            fail(f"{label}.cell_summaries[{index}].oversubscribed: disagrees with its factor")
+    if len(seen) != expected_cells:
+        fail(f"{label}.cell_summaries: matrix is incomplete")
+    if not compact:
+        raw = list_value(report.get("raw_samples"), f"{label}.raw_samples")
+        if len(raw) != expected_cells * SCALING_BLOCKS:
+            fail(f"{label}.raw_samples: expected {expected_cells * SCALING_BLOCKS} samples")
+    return report
+
+
+# Dark panel palette. Defined once so every scaling facet reads as one system.
+SCALING_INK = {
+    "background": "#0d1117",
+    "plot": "#111823",
+    "grid": "#1f2937",
+    "axis": "#8b98ad",
+    "title": "#e8eef7",
+    "muted": "#7d8da5",
+    "badge": "#f0b429",
+    "oversubscribed": "#1a2230",
+}
+# One fixed color per allocator, reused identically on every panel.
+SCALING_SERIES = {
+    "mimalloc-pprof": "#58a6ff",
+    "upstream-mimalloc": "#3fb950",
+    "tcmalloc": "#e3b341",
+    "jemalloc": "#bc8cff",
+}
+
+
+def svg_text(
+    x: float,
+    y: float,
+    value: str,
+    *,
+    fill: str,
+    size: float = 13,
+    weight: str = "normal",
+    anchor: str = "start",
+    family: str = "system-ui,-apple-system,Segoe UI,Roboto,sans-serif",
+) -> str:
+    return (
+        f'<text x="{x:.1f}" y="{y:.1f}" fill="{fill}" font-size="{size:.0f}" '
+        f'font-family="{family}" font-weight="{weight}" text-anchor="{anchor}">'
+        f"{escaped(value)}</text>"
+    )
+
+
+def axis_unit(ceiling: float) -> tuple[float, str, int]:
+    """Pick one unit for the whole y axis. Mixing units between ticks (2k
+    above 822) makes a chart unreadable, so the scale is chosen once."""
+
+    if ceiling >= 1e9:
+        return 1e9, "G", 2
+    if ceiling >= 1e6:
+        return 1e6, "M", 1
+    if ceiling >= 1e3:
+        return 1e3, "k", 1
+    return 1.0, "", 0
+
+
+def format_throughput(value: float, unit: tuple[float, str, int] | None = None) -> str:
+    if value == 0:
+        return "0"
+    divisor, suffix, decimals = unit if unit is not None else axis_unit(value)
+    return f"{value / divisor:.{decimals}f}{suffix}"
+
+
+def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
+    """One dark line chart: x is worker count (log2), y is aggregate
+    throughput, one line per allocator."""
+
+    width, height = 1000, 590
+    left, right, top, bottom = 92, 40, 118, 110
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    summaries = [
+        object_value(item, "scaling cell summary")
+        for item in list_value(scaling["cell_summaries"], "scaling cell summaries")
+    ]
+    series: dict[str, list[tuple[int, float]]] = {}
+    for summary in summaries:
+        if summary.get("pattern") != pattern:
+            continue
+        allocator = cast(str, summary["allocator_id"])
+        series.setdefault(allocator, []).append(
+            (
+                int(cast(int, summary["thread_count"])),
+                float(cast(float, summary["median_throughput"])),
+            )
+        )
+    for points in series.values():
+        points.sort()
+    peak = max(
+        (value for points in series.values() for _threads, value in points),
+        default=1.0,
+    )
+    ceiling = peak * 1.12
+    topology = object_value(scaling.get("topology", {}), "scaling topology")
+    allowed = int(cast(int, topology.get("allowed_logical_cpus", 1)) or 1)
+
+    def x_of(threads: int) -> float:
+        # Log2 spacing keeps 1/4/16 evenly placed.
+        span = math.log2(max(SCALING_THREAD_POINTS))
+        return left + plot_width * (math.log2(threads) / span if span else 0)
+
+    def y_of(value: float) -> float:
+        return top + plot_height * (1 - value / ceiling)
+
+    parts: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+        f'width="{width}" height="{height}" role="img">',
+        f'<rect width="{width}" height="{height}" fill="{SCALING_INK["background"]}"/>',
+        f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" '
+        f'fill="{SCALING_INK["plot"]}" rx="6"/>',
+    ]
+    # Shade the oversubscribed region so contention is never read as core scaling.
+    oversubscribed = [point for point in SCALING_THREAD_POINTS if point > allowed]
+    if oversubscribed:
+        band_start = x_of(oversubscribed[0])
+        parts.append(
+            f'<rect x="{band_start:.1f}" y="{top}" width="{left + plot_width - band_start:.1f}" '
+            f'height="{plot_height}" fill="{SCALING_INK["oversubscribed"]}" rx="6"/>'
+        )
+        parts.append(
+            svg_text(
+                left + plot_width - 8,
+                top + 20,
+                f"oversubscribed (> {allowed} vCPU)",
+                fill=SCALING_INK["muted"],
+                size=12,
+                anchor="end",
+            )
+        )
+    unit = axis_unit(ceiling)
+    for step in range(5):
+        value = ceiling * step / 4
+        y = y_of(value)
+        parts.append(
+            f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_width}" y2="{y:.1f}" '
+            f'stroke="{SCALING_INK["grid"]}" stroke-width="1"/>'
+        )
+        parts.append(
+            svg_text(
+                left - 12,
+                y + 4,
+                format_throughput(value, unit),
+                fill=SCALING_INK["axis"],
+                size=12,
+                anchor="end",
+            )
+        )
+    for threads in SCALING_THREAD_POINTS:
+        x = x_of(threads)
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top + plot_height}" '
+            f'stroke="{SCALING_INK["grid"]}" stroke-width="1"/>'
+        )
+        parts.append(
+            svg_text(
+                x,
+                top + plot_height + 26,
+                str(threads),
+                fill=SCALING_INK["title"],
+                size=13,
+                weight="600",
+                anchor="middle",
+            )
+        )
+        if threads > allowed:
+            parts.append(
+                svg_text(
+                    x,
+                    top + plot_height + 44,
+                    f"{threads / allowed:.0f}x",
+                    fill=SCALING_INK["muted"],
+                    size=11,
+                    anchor="middle",
+                )
+            )
+    for allocator in ALLOCATOR_IDS:
+        points = series.get(allocator, [])
+        if not points:
+            continue
+        color = SCALING_SERIES[allocator]
+        path = " ".join(
+            f"{'M' if index == 0 else 'L'}{x_of(threads):.1f} {y_of(value):.1f}"
+            for index, (threads, value) in enumerate(points)
+        )
+        parts.append(
+            f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.5" '
+            'stroke-linejoin="round" stroke-linecap="round"/>'
+        )
+        for threads, value in points:
+            parts.append(
+                f'<circle cx="{x_of(threads):.1f}" cy="{y_of(value):.1f}" r="4.5" '
+                f'fill="{SCALING_INK["background"]}" stroke="{color}" stroke-width="2.5"/>'
+            )
+    parts.append(
+        svg_text(
+            left - 12,
+            top - 46,
+            SCALING_PANEL_TITLES.get(pattern, pattern),
+            fill=SCALING_INK["title"],
+            size=20,
+            weight="600",
+        )
+    )
+    parts.append(
+        svg_text(
+            left - 12,
+            top - 24,
+            "aggregate throughput (operations/second) by worker thread count",
+            fill=SCALING_INK["muted"],
+            size=13,
+        )
+    )
+    legend_x = left - 12
+    for allocator in ALLOCATOR_IDS:
+        if allocator not in series:
+            continue
+        color = SCALING_SERIES[allocator]
+        parts.append(
+            f'<rect x="{legend_x:.1f}" y="{height - 54}" width="22" height="4" rx="2" fill="{color}"/>'
+        )
+        parts.append(
+            svg_text(legend_x + 30, height - 47, allocator, fill=SCALING_INK["axis"], size=12)
+        )
+        legend_x += 34 + 7.4 * len(allocator)
+    parts.append(
+        svg_text(
+            left - 12,
+            height - 16,
+            f"{SCALING_RIGOR_LABEL} | median of {SCALING_BLOCKS} paired blocks | "
+            f"runner {topology.get('physical_cores', '?')}P/{topology.get('logical_cores', '?')}L "
+            f"| informational",
+            fill=SCALING_INK["muted"],
+            size=11,
+        )
+    )
+    parts.append("</svg>")
+    return ("\n".join(parts) + "\n").encode("utf-8")
+
+
+def pending_scaling_svg(pattern: str, reason: str) -> bytes:
+    """Dark placeholder in the same visual system, carrying no numbers."""
+
+    width, height = 1000, 560
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+        f'width="{width}" height="{height}" role="img">',
+        f'<rect width="{width}" height="{height}" fill="{SCALING_INK["background"]}"/>',
+        f'<rect x="60" y="60" width="{width - 120}" height="{height - 120}" '
+        f'fill="{SCALING_INK["plot"]}" rx="10"/>',
+        f'<rect x="60" y="60" width="{width - 120}" height="6" rx="3" fill="{SCALING_INK["badge"]}"/>',
+        svg_text(
+            80,
+            140,
+            SCALING_PANEL_TITLES.get(pattern, pattern),
+            fill=SCALING_INK["title"],
+            size=22,
+            weight="600",
+        ),
+        svg_text(80, 178, "pending", fill=SCALING_INK["badge"], size=15, weight="600"),
+        svg_text(80, 214, reason, fill=SCALING_INK["muted"], size=13),
+        svg_text(
+            80,
+            height - 100,
+            "No measured values are shown until the first validated sweep publishes.",
+            fill=SCALING_INK["muted"],
+            size=13,
+        ),
+        "</svg>",
+    ]
+    return ("\n".join(parts) + "\n").encode("utf-8")
+
+
 def carry_forward_optional_metrics(latest: dict[str, object], prior: dict[str, object]) -> bool:
     validate_latest(prior, "prior latest")
     carried = False
-    for metric in ("memory", "latency"):
+    for metric in ("memory", "latency", "scaling"):
         if metric not in latest and metric in prior:
             latest[metric] = copy.deepcopy(prior[metric])
             pending = list_value(latest["pending_metrics"], "latest.pending_metrics")
@@ -2431,7 +2913,9 @@ def render_html(latest: Mapping[str, object]) -> bytes:
     pending_names = {
         "memory": "benchmark-memory.png",
         "latency": "benchmark-latency.png",
-        "scaling": "benchmark-scaling.png",
+        # The scaling metric publishes one panel per pattern; its pending card
+        # previews the first of them.
+        "scaling": SCALING_PANELS[SCALING_PATTERN_IDS[0]],
         "pprof-tax": "benchmark-pprof-tax.png",
     }
     pending_html = "".join(
@@ -2497,6 +2981,37 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             for value in list_value(latency["paired_summaries"], "latency paired summaries")
         )
         latency_html = f"""<section><h2 id="latency">Transaction latency</h2><img src="benchmark-latency.png" alt="End-to-end transaction latency p99 for all four allocators; lower is better"><p><strong>Lower is better; informational hosted-runner measurements.</strong> These are transaction latencies, never allocator-call latencies and never throughput reciprocals. Local: {escaped(definitions["local"])}. Cross-thread: {escaped(definitions["cross-thread"])}. Large object: {escaped(definitions["large-object"])}.</p><p>Each allocator/cell has at least 10,000 raw samples across {escaped(block_count)} paired blocks. Controls are reported without subtraction. Runner: {escaped(latency_runner["runner_class"])}; affinity: {escaped(scheduling["affinity_policy"])}; upstream reference: <code>upstream-mimalloc</code>. Latency run <a href="{latency_actions}">{escaped(latency_run["run_id"])}/{escaped(latency_run["run_attempt"])}</a>; metric key <code>{escaped(latency["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>p50 ns</th><th>p95 ns</th><th>p99 ns</th><th>Overhead</th><th>Samples</th></tr></thead><tbody>{latency_rows}</tbody></table></section>"""
+    scaling_html = ""
+    if "scaling" in latest:
+        scaling = validate_scaling_report(latest["scaling"], "latest.scaling")
+        scaling_run = object_value(scaling["run"], "latest.scaling.run")
+        scaling_topology = object_value(scaling["topology"], "latest.scaling.topology")
+        scaling_methodology = object_value(scaling["methodology"], "latest.scaling.methodology")
+        scaling_summaries = [
+            object_value(value, "scaling summary")
+            for value in list_value(scaling["cell_summaries"], "scaling cell summaries")
+        ]
+        scaling_rows = "".join(
+            f"<tr><td>{escaped(value['pattern'])}</td><td>{escaped(value['thread_count'])}</td>"
+            f"<td>{escaped(value['allocator_id'])}</td>"
+            f"<td>{escaped(round(float_value(value['median_throughput'], 'scaling median'), 1))}</td>"
+            f"<td>{escaped(round(float_value(value['min_throughput'], 'scaling min'), 1))} - "
+            f"{escaped(round(float_value(value['max_throughput'], 'scaling max'), 1))}</td>"
+            f"<td>{escaped(round(float_value(value['speedup_vs_single_worker'], 'scaling speedup'), 2))}x</td>"
+            f"<td>{'yes' if value['oversubscribed'] else 'no'}</td></tr>"
+            for value in scaling_summaries
+        )
+        scaling_images = "".join(
+            f'<img src="{name}" alt="Aggregate throughput by worker count for the '
+            f'{escaped(SCALING_PANEL_TITLES[pattern])} pattern, one line per allocator">'
+            for pattern, name in SCALING_PANELS.items()
+        )
+        scaling_actions = (
+            f"https://github.com/zackees/mimalloc-pprof/actions/runs/{escaped(scaling_run['run_id'])}"
+            if scaling_run["run_origin"] == "github-actions"
+            else "https://github.com/zackees/mimalloc-pprof/actions"
+        )
+        scaling_html = f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(SCALING_RIGOR_LABEL)}.</strong> These panels trade statistical rigor for thread coverage: {escaped(SCALING_BLOCKS)} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating. Do not read them as headline-grade numbers.</p><p>Worker counts are literal {escaped(", ".join(str(point) for point in SCALING_THREAD_POINTS))}; the runner allows {escaped(scaling_topology["allowed_logical_cpus"])} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling_methodology["seed_chain"])}. Scaling run <a href="{scaling_actions}">{escaped(scaling_run["run_id"])}/{escaped(scaling_run["run_attempt"])}</a>; metric key <code>{escaped(scaling["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table></section>"""
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>mimalloc allocator benchmarks</title>
 <style>body{{font:15px system-ui,sans-serif;max-width:1200px;margin:auto;padding:24px;color:#182334}}table{{border-collapse:collapse;width:100%;margin:16px 0}}th,td{{border:1px solid #ccd4dd;padding:7px;text-align:left}}img{{max-width:100%;height:auto}}.pending{{border:1px solid #ccd4dd;padding:12px;margin:12px 0}}code,pre{{overflow-wrap:anywhere;white-space:pre-wrap}}small{{color:#596575}}</style></head><body>
@@ -2505,7 +3020,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
 <h2 id="throughput">Throughput</h2><img src="benchmark-throughput.png" alt="Per-scenario absolute throughput bars for all four allocators"><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>Median</th><th>Noisy</th></tr></thead><tbody>{absolute_rows}</tbody></table>
 <h2>Paired effects</h2><table><thead><tr><th>Scenario</th><th>Candidate</th><th>Effect</th><th>95% interval</th><th>Interpretation</th></tr></thead><tbody>{paired_rows}</tbody></table>
 <h2 id="history">Compatible history</h2><img src="benchmark-history.png" alt="History connected only across the selected identical comparison key">
-{memory_html}{latency_html}<h2>Pending Phase 6 panels</h2>{pending_html}<section id="phase-6"><p>Pending panels contain no measured values.</p></section>
+{memory_html}{latency_html}{scaling_html}<h2>Pending Phase 6 panels</h2>{pending_html}<section id="phase-6"><p>Pending panels contain no measured values.</p></section>
 <h2>Provenance</h2><p>Run {escaped(run["run_id"])}, attempt {escaped(run["run_attempt"])}; target {escaped(runner["target"])}; fingerprint <code>{escaped(runner["fingerprint_sha256"])}</code>.</p><table><thead><tr><th>Allocator</th><th>Source</th><th>Binary</th></tr></thead><tbody>{allocator_rows}</tbody></table><p><a href="{escaped(latest["actions_run_url"])}">Actions run</a></p>
 <h2>Methodology</h2><pre>{escaped(json.dumps(latest["methodology"], sort_keys=True, ensure_ascii=False))}</pre><h2>Reproduce</h2><pre><code>{escaped(latest["reproduction_command"])}</code></pre>
 </body></html>"""
@@ -2581,7 +3096,6 @@ def render(
     image_names = {
         "memory": "benchmark-memory.png",
         "latency": "benchmark-latency.png",
-        "scaling": "benchmark-scaling.png",
         "pprof-tax": "benchmark-pprof-tax.png",
     }
     if "memory" in latest:
@@ -2600,9 +3114,18 @@ def render(
         (output / image_names["latency"]).write_bytes(
             pending_png("latency", cast(str, item["reason"]))
         )
-    for metric in ("scaling", "pprof-tax"):
-        item = pending[metric]
-        (output / image_names[metric]).write_bytes(pending_png(metric, cast(str, item["reason"])))
+    if "scaling" in latest:
+        scaling = validate_scaling_report(latest["scaling"], "latest.scaling")
+        for pattern, name in SCALING_PANELS.items():
+            (output / name).write_bytes(scaling_svg(scaling, pattern))
+    else:
+        reason = cast(str, pending["scaling"]["reason"])
+        for pattern, name in SCALING_PANELS.items():
+            (output / name).write_bytes(pending_scaling_svg(pattern, reason))
+    item = pending["pprof-tax"]
+    (output / image_names["pprof-tax"]).write_bytes(
+        pending_png("pprof-tax", cast(str, item["reason"]))
+    )
     (output / "manifest.json").write_bytes(compact_json(manifest_for(output)))
     digest = sha256(output / "manifest.json")
     digest_out.parent.mkdir(parents=True, exist_ok=True)
@@ -2616,6 +3139,28 @@ def png_dimensions(path: Path) -> tuple[int, int]:
     if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
         fail(f"{path}: invalid PNG signature/IHDR")
     return struct.unpack(">II", data[16:24])
+
+
+def validate_svg(path: Path) -> None:
+    """Panels must be self-contained and inert: they are served from a raw
+    branch URL and embedded in the README, so no script, no external fetch,
+    and no interactive handlers may survive."""
+
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        fail(f"{path}: unreadable SVG: {error}")
+    if not source.lstrip().startswith("<svg"):
+        fail(f"{path}: SVG must begin with an <svg> root element")
+    if "viewBox=" not in source:
+        fail(f"{path}: SVG needs a viewBox so it scales in the README")
+    for forbidden in ("<script", "<foreignObject", "xlink:href", "<image", "@import"):
+        if forbidden in source:
+            fail(f"{path}: forbidden SVG construct {forbidden!r}")
+    if re.search(r"\bon[a-z]+\s*=", source, re.IGNORECASE):
+        fail(f"{path}: inline event handlers are forbidden")
+    if re.search(r"https?://(?!www\.w3\.org/)", source):
+        fail(f"{path}: remote references are forbidden")
 
 
 def validate_html_links(site: Path) -> None:
@@ -2707,6 +3252,8 @@ def validate_site(site: Path, detached: Path | None = None) -> None:
     for name, dimensions in PNG_DIMENSIONS.items():
         if png_dimensions(site / name) != dimensions:
             fail(f"{site / name}: unexpected PNG dimensions")
+    for name in SVG_FILES:
+        validate_svg(site / name)
     validate_latest(read_json(site / "latest.json"), str(site / "latest.json"))
     history_data = (site / "history.jsonl").read_bytes()
     if history_data and not history_data.endswith(b"\n"):

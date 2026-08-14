@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -697,11 +698,17 @@ class BenchmarkReportTests(unittest.TestCase):
             "benchmark-throughput.png": "https://zackees.github.io/mimalloc-pprof/#throughput",
             "benchmark-history.png": "https://zackees.github.io/mimalloc-pprof/#history",
         }
+        # Every scaling panel is embedded and clicks through to its section.
+        for name in report.SCALING_PANELS.values():
+            expected[name] = "https://zackees.github.io/mimalloc-pprof/#scaling"
         for image, destination in expected.items():
             raw = (
                 f"https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/{image}"
             )
             self.assertIn(f"]({raw})]({destination})", source)
+        # Every embedded name must be a file the renderer actually emits, or
+        # the README links 404 on the published branch.
+        self.assertTrue(set(expected) <= report.SITE_FILES)
         for pending in (
             "benchmark-memory.png",
             "benchmark-latency.png",
@@ -872,6 +879,254 @@ class BenchmarkReportTests(unittest.TestCase):
                 for line in (site / "history.jsonl").read_text(encoding="utf-8").splitlines()
             }
             self.assertEqual({"a" * 64, "b" * 64}, keys)
+
+    def with_complete_scaling(self, latest: dict[str, object]) -> dict[str, object]:
+        value = copy.deepcopy(latest)
+        runner = value["runner"]
+        allocators = value["allocators"]
+        assert isinstance(runner, dict) and isinstance(allocators, list)
+        allocator_sources = {
+            str(item["allocator_id"]): (str(item["source_sha"]), str(item["child_binary_sha256"]))
+            for item in allocators
+            if isinstance(item, dict)
+        }
+        allowed = int(runner["logical_cores"])
+        summaries: list[dict[str, object]] = []
+        raw: list[dict[str, object]] = []
+        for pattern in report.SCALING_PATTERN_IDS:
+            for threads in report.SCALING_THREAD_POINTS:
+                for index, allocator in enumerate(report.ALLOCATOR_IDS):
+                    median = 1_000_000.0 * threads * (1.0 + index / 10.0)
+                    summaries.append(
+                        {
+                            "pattern": pattern,
+                            "thread_count": threads,
+                            "oversubscription_factor": threads / allowed,
+                            "oversubscribed": threads / allowed > 1.0,
+                            "allocator_id": allocator,
+                            "block_count": report.SCALING_BLOCKS,
+                            "median_throughput": median,
+                            "min_throughput": median * 0.97,
+                            "max_throughput": median * 1.03,
+                            "speedup_vs_single_worker": float(threads),
+                        }
+                    )
+                    source_sha, child_sha = allocator_sources[allocator]
+                    for block in range(report.SCALING_BLOCKS):
+                        raw.append(
+                            {
+                                "metric_schema_version": report.SCALING_SCHEMA,
+                                "block_id": block,
+                                "ordinal": index,
+                                "pattern": pattern,
+                                "thread_count": threads,
+                                "allocator_id": allocator,
+                                "allocator_source_sha": source_sha,
+                                "child_binary_sha256": child_sha,
+                                "operations_per_worker": 4096,
+                                "reproduction_command": "benchmark-scaling-run --run-seed 1",
+                                "response": {
+                                    "protocol_version": "throughput-scaling-sparse-child-v1",
+                                    "metric_schema_version": report.SCALING_SCHEMA,
+                                    "allocator_id": allocator,
+                                    "thread_count": threads,
+                                    "alloc_calls": 1000,
+                                    "realloc_calls": 10,
+                                    "free_calls": 1000,
+                                    "operation_count": 2010,
+                                    "checksum": 12345,
+                                    "remote_free_calls": 0,
+                                    "producer_fallback_frees": 0,
+                                    "setup_ns": 1,
+                                    "warmup_ns": 0,
+                                    "elapsed_ns": 750_000_000,
+                                    "teardown_ns": 1,
+                                    "throughput_operations_per_second": median,
+                                },
+                            }
+                        )
+        value["scaling"] = {
+            "metric_schema_version": report.SCALING_SCHEMA,
+            "status": "complete",
+            "invalid_reason": None,
+            "metric_comparison_key": "c" * 64,
+            "run": copy.deepcopy(value["run"]),
+            "runner": copy.deepcopy(runner),
+            "topology": {
+                "physical_cores": int(runner["physical_cores"]),
+                "logical_cores": allowed,
+                "allowed_logical_cpus": allowed,
+                "affinity_policy": "unrestricted",
+            },
+            "direction": "higher-is-better",
+            "informational": True,
+            "rigor_label": report.SCALING_RIGOR_LABEL,
+            "thread_points": list(report.SCALING_THREAD_POINTS),
+            "patterns": [
+                {
+                    "pattern": pattern,
+                    "description": "seeded random operation stream",
+                    "min_size_bytes": 16,
+                    "max_size_bytes": 4096,
+                    "live_set_capacity": 256,
+                    "cross_thread": pattern == "sparse-cross-thread",
+                }
+                for pattern in report.SCALING_PATTERN_IDS
+            ],
+            "methodology": {
+                "rigor": report.SCALING_RIGOR_LABEL,
+                "blocks_per_cell": report.SCALING_BLOCKS,
+                "aggregation": "median with min/max",
+                "operation_stream": "seeded random operation stream",
+                "seed_chain": "splitmix64 chain over (run seed, pattern, threads, block, worker)",
+                "pairing": "one stream replayed by all four allocators",
+                "work_normalization": "frozen per-worker operation count",
+                "oversubscription": "literal worker counts; oversubscribed points labeled",
+                "cross_thread_backpressure": "bounded mailbox with producer self-free fallback",
+                "statistics_omitted": "no bootstrap intervals and no noise gating",
+            },
+            "cell_summaries": summaries,
+            "raw_samples": raw,
+        }
+        pending = value["pending_metrics"]
+        assert isinstance(pending, list)
+        value["pending_metrics"] = [
+            item
+            for item in pending
+            if not isinstance(item, dict) or item.get("metric_id") != "scaling"
+        ]
+        return value
+
+    def test_complete_scaling_publishes_one_dark_panel_per_pattern(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        report.validate_latest(latest, "scaling fixture")
+        history = report.history_row(latest)
+        self.assertIn("scaling", history)
+        scaling_history = history["scaling"]
+        assert isinstance(scaling_history, dict)
+        self.assertNotIn("raw_samples", scaling_history)
+        report.validate_history_row(history, "scaling history")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            self.assertIn('<h2 id="scaling">Thread scaling (sparse sweep)</h2>', page)
+            self.assertIn(report.SCALING_RIGOR_LABEL, page)
+            self.assertNotIn("scaling: pending", page)
+            for pattern, name in report.SCALING_PANELS.items():
+                panel = (site / name).read_text(encoding="utf-8")
+                self.assertTrue(panel.startswith("<svg"))
+                # Baked-in dark background: the panel must not inherit a theme.
+                self.assertIn(report.SCALING_INK["background"], panel)
+                self.assertIn(report.SCALING_PANEL_TITLES[pattern], panel)
+                self.assertIn(report.SCALING_RIGOR_LABEL, panel)
+                for allocator in report.ALLOCATOR_IDS:
+                    self.assertIn(allocator, panel)
+                self.assertIn("oversubscribed", panel)
+                # The shaded band must actually be visible, not a zero-width
+                # rectangle collapsed onto the last tick.
+                band = re.search(
+                    rf'<rect x="([\d.]+)" y="\d+" width="([\d.]+)" [^>]*'
+                    rf'fill="{report.SCALING_INK["oversubscribed"]}"',
+                    panel,
+                )
+                self.assertIsNotNone(band, "oversubscription band is missing")
+                assert band is not None
+                self.assertGreater(float(band.group(2)), 20.0)
+
+    def test_pending_scaling_panels_are_dark_and_carry_no_numbers(self) -> None:
+        latest = self.load_latest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            for name in report.SCALING_PANELS.values():
+                panel = (site / name).read_text(encoding="utf-8")
+                self.assertIn(report.SCALING_INK["background"], panel)
+                self.assertIn("pending", panel)
+                report.validate_svg(site / name)
+
+    def test_scaling_report_rejects_downgraded_rigor_and_incomplete_matrices(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+
+        relabeled = copy.deepcopy(latest)
+        scaling = relabeled["scaling"]
+        assert isinstance(scaling, dict)
+        scaling["rigor_label"] = "headline quality"
+        with self.assertRaisesRegex(report.ReportError, "coverage-mode"):
+            report.validate_latest(relabeled, "relabeled")
+
+        widened = copy.deepcopy(latest)
+        scaling = widened["scaling"]
+        assert isinstance(scaling, dict)
+        scaling["thread_points"] = [1, 4, 16, 64]
+        with self.assertRaisesRegex(report.ReportError, "thread_points"):
+            report.validate_latest(widened, "widened")
+
+        truncated = copy.deepcopy(latest)
+        scaling = truncated["scaling"]
+        assert isinstance(scaling, dict)
+        summaries = scaling["cell_summaries"]
+        assert isinstance(summaries, list)
+        summaries.pop()
+        with self.assertRaisesRegex(report.ReportError, "48 cells"):
+            report.validate_latest(truncated, "truncated")
+
+        mispinned = copy.deepcopy(latest)
+        scaling = mispinned["scaling"]
+        assert isinstance(scaling, dict)
+        samples = scaling["raw_samples"]
+        assert isinstance(samples, list) and isinstance(samples[0], dict)
+        samples[0]["allocator_source_sha"] = "f" * 40
+        with self.assertRaisesRegex(report.ReportError, "allocator source pins"):
+            report.validate_latest(mispinned, "mispinned")
+
+        still_pending = copy.deepcopy(latest)
+        pending = still_pending["pending_metrics"]
+        assert isinstance(pending, list)
+        pending.append(
+            {
+                "metric_id": "scaling",
+                "status": "pending",
+                "reason": "pending - metric protocol not implemented",
+                "phase_issue_url": "https://github.com/zackees/mimalloc-pprof/issues/203",
+            }
+        )
+        with self.assertRaisesRegex(report.ReportError, "pending_metrics"):
+            report.validate_latest(still_pending, "still pending")
+
+    def test_scaling_svg_is_inert_and_self_contained(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        for forbidden in ("<script", "xlink:href", "<foreignObject", "<image", "@import"):
+            self.assertNotIn(forbidden, panel)
+        # The SVG namespace is the only permitted URL; nothing may be fetched.
+        self.assertEqual(1, panel.count("http"))
+        self.assertIn('xmlns="http://www.w3.org/2000/svg"', panel)
+        self.assertIn("viewBox=", panel)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "panel.svg"
+            path.write_text(panel, encoding="utf-8")
+            report.validate_svg(path)
+            path.write_text(panel.replace("<svg", "<svg onload='x()'", 1), encoding="utf-8")
+            with self.assertRaisesRegex(report.ReportError, "event handlers"):
+                report.validate_svg(path)
+
+    def test_axis_uses_one_unit_for_every_tick(self) -> None:
+        unit = report.axis_unit(1_644.0)
+        self.assertEqual(
+            ["0", "0.4k", "0.8k", "1.2k", "1.6k"],
+            [report.format_throughput(1_644.0 * step / 4, unit) for step in range(5)],
+        )
+        megabyte_unit = report.axis_unit(5_000_000.0)
+        self.assertEqual("5.0M", report.format_throughput(5_000_000.0, megabyte_unit))
 
 
 if __name__ == "__main__":

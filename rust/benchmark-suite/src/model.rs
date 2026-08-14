@@ -232,6 +232,10 @@ pub struct LatestReport {
     /// `transaction-latency-v1` collection is available; it never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency: Option<crate::latency::LatencyMetricReport>,
+    /// Backward-compatible Phase 6 extension. Absence means no validated
+    /// `throughput-scaling-sparse-v1` sweep is available; it never means zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling: Option<crate::scaling::ScalingMetricReport>,
     pub canonical_urls: CanonicalUrls,
     pub reproduction_command: String,
     pub actions_run_url: String,
@@ -253,6 +257,8 @@ pub struct HistoryRow {
     pub memory: Option<crate::memory::MemoryHistoryReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency: Option<crate::latency::LatencyHistoryReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling: Option<crate::scaling::ScalingHistoryReport>,
 }
 
 /// Immutable identity supplied by the producer after it hashes the directly

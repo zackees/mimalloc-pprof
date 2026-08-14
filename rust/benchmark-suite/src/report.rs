@@ -122,11 +122,12 @@ pub fn build_latest_report(
         pending_metrics: vec![
             pending("memory", 184),
             pending("latency", 185),
-            pending("scaling", 186),
+            pending("scaling", 203),
             pending("pprof-tax", 187),
         ],
         memory: None,
         latency: None,
+        scaling: None,
         canonical_urls: CanonicalUrls {
             pages: "https://zackees.github.io/mimalloc-pprof/".into(),
             stats_branch: "https://github.com/zackees/mimalloc-pprof/tree/benchmark-stats".into(),
@@ -166,6 +167,10 @@ pub fn build_latest_report(
             .map(|value| value.history_projection()),
         latency: latest
             .latency
+            .as_ref()
+            .map(|value| value.history_projection()),
+        scaling: latest
+            .scaling
             .as_ref()
             .map(|value| value.history_projection()),
     };

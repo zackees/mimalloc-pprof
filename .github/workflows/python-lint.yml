@@ -14,6 +14,7 @@ on:
       - 'ci/**'
       - 'pyproject.toml'
       - '.github/workflows/python-lint.yml'
+      - '.github/workflows/benchmark-*.yml'
 
 jobs:
   lint:
@@ -25,7 +26,7 @@ jobs:
           python-version: '3.13'
       # Pinned so a tool release cannot turn a green PR red (or a red one green)
       # without a commit that says so.
-      - run: pip install ruff==0.12.10 pyright==1.1.411
+      - run: pip install ruff==0.12.10 pyright==1.1.411 pyyaml==6.0.2 pytest==8.3.4
       - run: ruff check ci/
       - run: ruff format --check ci/
       - run: pyright
@@ -40,3 +41,15 @@ jobs:
           python3 ci/memory_gate.py 2>&1 | grep -q "Exit codes"
           python3 ci/check_isa_baseline.py --help > /dev/null
           python3 ci/check_release_equivalence.py --help > /dev/null
+      # The benchmark publication policy checkers gate a workflow that can push
+      # to a public branch and to Pages. They were previously unreachable from
+      # any workflow, so a policy regression could not fail anything.
+      - name: Benchmark workflow policy checkers
+        run: |
+          set -euo pipefail
+          python3 ci/check_benchmark_workflow.py --selftest
+          python3 ci/check_benchmark_memory_workflow.py --selftest
+          python3 ci/check_benchmark_latency_workflow.py --selftest
+          python3 ci/check_benchmark_scaling_workflow.py --selftest
+      - name: Benchmark report and policy unit tests
+        run: python3 -m pytest ci/tests -q

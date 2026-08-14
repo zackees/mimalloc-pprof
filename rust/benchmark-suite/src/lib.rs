@@ -17,6 +17,8 @@ pub mod orchestration;
 pub mod provenance;
 pub mod report;
 pub mod runner;
+pub mod scaling;
+pub mod scaling_runner;
 pub mod scenarios;
 pub mod stats;
 pub mod validate;

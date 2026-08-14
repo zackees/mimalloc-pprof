@@ -339,7 +339,7 @@ fn validate_allocator(
     Ok(())
 }
 
-fn expected_options(id: &str) -> AllocatorFeatureOptions {
+pub(crate) fn expected_options(id: &str) -> AllocatorFeatureOptions {
     use FeatureState::{Disabled, Enabled, NotApplicable};
     match id {
         "mimalloc-pprof" => AllocatorFeatureOptions {
@@ -723,6 +723,10 @@ pub fn selftest() -> Result<(), ValidationError> {
             "memory-v1.schema.json",
             include_str!("../schema/memory-v1.schema.json"),
         ),
+        (
+            "scaling-v1.schema.json",
+            include_str!("../schema/scaling-v1.schema.json"),
+        ),
     ] {
         let value: serde_json::Value = serde_json::from_str(schema)
             .map_err(|error| ValidationError::new(format!("{name}: invalid JSON: {error}")))?;
@@ -946,6 +950,6 @@ pub fn synthetic_full_fixture() -> Result<PublicationRawRun, ValidationError> {
     })
 }
 
-fn repeated_hex(character: char, length: usize) -> String {
+pub(crate) fn repeated_hex(character: char, length: usize) -> String {
     std::iter::repeat(character).take(length).collect()
 }

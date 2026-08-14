@@ -12,6 +12,7 @@ use crate::execution::{
 use crate::latency::{execute_latency_child_request, LatencyChildRequest};
 use crate::memory::{read_control_record, write_control_record, ControlKind, ControlRecord};
 use crate::model::BenchmarkChildRequest;
+use crate::scaling::{execute_scaling_child_request, ScalingChildRequest};
 
 #[derive(Serialize)]
 struct AdapterSmokeOutput<'a> {
@@ -39,8 +40,34 @@ pub fn benchmark_child_main() -> Result<(), String> {
         Some(argument) if argument == "--latency" && arguments.next().is_none() => {
             run_latency_measurement()
         }
-        Some(_) => Err("usage: benchmark-child [--adapter-smoke|--memory|--latency]".into()),
+        Some(argument) if argument == "--scaling" && arguments.next().is_none() => {
+            run_scaling_measurement()
+        }
+        Some(_) => {
+            Err("usage: benchmark-child [--adapter-smoke|--memory|--latency|--scaling]".into())
+        }
     }
+}
+
+fn run_scaling_measurement() -> Result<(), String> {
+    let adapter = LinkedAdapter::load().map_err(|error| error.to_string())?;
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut input)
+        .map_err(|error| format!("read scaling child request: {error}"))?;
+    if input.len() > 1024 * 1024 {
+        return Err("scaling child request exceeded 1 MiB".into());
+    }
+    let request: ScalingChildRequest = serde_json::from_slice(&input)
+        .map_err(|error| format!("expected exactly one scaling child request: {error}"))?;
+    let response = execute_scaling_child_request(&adapter, request)?;
+    let output = serde_json::to_vec(&response)
+        .map_err(|error| format!("serialize scaling child response: {error}"))?;
+    std::io::stdout()
+        .lock()
+        .write_all(&output)
+        .map_err(|error| format!("write scaling child response: {error}"))
 }
 
 fn run_latency_measurement() -> Result<(), String> {

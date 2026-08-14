@@ -48,6 +48,6 @@ path = "src/bin/benchmark-scaling-validate.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [build-dependencies]

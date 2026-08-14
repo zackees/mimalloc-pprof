@@ -23,3 +23,5 @@ pub mod validate;
 
 pub const RAW_SCHEMA_VERSION: &str = "benchmark-raw-v1";
 pub const CORE_SUITE_VERSION: &str = "core-throughput-v1";
+
+// control: verify rust-native win-gnu baseline (no functional change)

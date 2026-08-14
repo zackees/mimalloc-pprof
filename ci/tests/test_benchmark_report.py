@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 import subprocess
 import sys
@@ -1082,9 +1083,40 @@ class BenchmarkReportTests(unittest.TestCase):
         assert isinstance(scaling, dict)
         samples = scaling["raw_samples"]
         assert isinstance(samples, list) and isinstance(samples[0], dict)
-        samples[0]["allocator_source_sha"] = "f" * 40
+        for sample in samples:
+            assert isinstance(sample, dict)
+            if sample["allocator_id"] == "upstream-mimalloc":
+                sample["allocator_source_sha"] = "f" * 40
         with self.assertRaisesRegex(report.ReportError, "allocator source pins"):
             report.validate_latest(mispinned, "mispinned")
+
+        # The sweep runs weekly against whichever daily core envelope is
+        # published, so the fork is normally built from a newer commit. That
+        # must overlay cleanly; only the lock-pinned competitors are frozen.
+        newer_fork = copy.deepcopy(latest)
+        scaling = newer_fork["scaling"]
+        assert isinstance(scaling, dict)
+        samples = scaling["raw_samples"]
+        assert isinstance(samples, list)
+        for sample in samples:
+            assert isinstance(sample, dict)
+            if sample["allocator_id"] == "mimalloc-pprof":
+                sample["allocator_source_sha"] = "a" * 40
+        report.validate_latest(newer_fork, "newer fork build")
+
+        mixed_forks = copy.deepcopy(latest)
+        scaling = mixed_forks["scaling"]
+        assert isinstance(scaling, dict)
+        samples = scaling["raw_samples"]
+        assert isinstance(samples, list)
+        changed = False
+        for sample in samples:
+            assert isinstance(sample, dict)
+            if sample["allocator_id"] == "mimalloc-pprof" and not changed:
+                sample["allocator_source_sha"] = "b" * 40
+                changed = True
+        with self.assertRaisesRegex(report.ReportError, "one mimalloc-pprof build"):
+            report.validate_latest(mixed_forks, "mixed fork builds")
 
         still_pending = copy.deepcopy(latest)
         pending = still_pending["pending_metrics"]
@@ -1118,6 +1150,59 @@ class BenchmarkReportTests(unittest.TestCase):
             path.write_text(panel.replace("<svg", "<svg onload='x()'", 1), encoding="utf-8")
             with self.assertRaisesRegex(report.ReportError, "event handlers"):
                 report.validate_svg(path)
+
+    def test_history_merge_tolerates_float_round_trip_but_not_real_edits(self) -> None:
+        # A published latest.json that passes back through the Rust overlay
+        # binaries returns with floats occasionally shifted by one ULP
+        # (serde_json parse/re-emit is not bit-identical to Python's). Observed
+        # live on relative_iqr: ...413 in, ...412 out.
+        self.assertTrue(
+            report.equivalent_payload(
+                {"relative_iqr": 0.11300528823968413},
+                {"relative_iqr": 0.11300528823968412},
+            )
+        )
+        self.assertFalse(
+            report.equivalent_payload({"median": 100.0}, {"median": 100.0001}),
+            "a real numeric change must still be rejected",
+        )
+        self.assertFalse(report.equivalent_payload({"a": 1}, {"a": 1, "b": 2}))
+        self.assertFalse(report.equivalent_payload([1.0, 2.0], [1.0]))
+        self.assertFalse(
+            report.equivalent_payload({"noisy": True}, {"noisy": 1}),
+            "booleans must not compare equal to their integer value",
+        )
+
+        base = self.load_history_row()
+        rounded = copy.deepcopy(base)
+        absolute = rounded["absolute_summaries"]
+        assert isinstance(absolute, list) and isinstance(absolute[0], dict)
+        summary = absolute[0]["summary"]
+        assert isinstance(summary, dict)
+        median = float(summary["median"])  # pyright: ignore[reportArgumentType]
+        summary["median"] = math.nextafter(median, math.inf)
+        gained = copy.deepcopy(rounded)
+        gained["scaling"] = {"placeholder": True}
+        merged = report.merge_history([base], gained)
+        self.assertEqual(1, len(merged))
+        self.assertIn("scaling", merged[0])
+        # The already-published row keeps its original bytes; only the new
+        # metric is added.
+        first = merged[0]["absolute_summaries"]
+        assert isinstance(first, list) and isinstance(first[0], dict)
+        original_summary = first[0]["summary"]
+        assert isinstance(original_summary, dict)
+        self.assertEqual(median, original_summary["median"])
+
+        moved = copy.deepcopy(rounded)
+        moved_absolute = moved["absolute_summaries"]
+        assert isinstance(moved_absolute, list) and isinstance(moved_absolute[0], dict)
+        moved_summary = moved_absolute[0]["summary"]
+        assert isinstance(moved_summary, dict)
+        moved_summary["median"] = median * 1.01
+        moved["scaling"] = {"placeholder": True}
+        with self.assertRaisesRegex(report.ReportError, "may only gain"):
+            report.merge_history([base], moved)
 
     def test_axis_uses_one_unit_for_every_tick(self) -> None:
         unit = report.axis_unit(1_644.0)

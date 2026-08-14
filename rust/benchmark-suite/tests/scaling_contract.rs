@@ -507,6 +507,50 @@ fn a_failing_worker_reports_an_error_instead_of_stranding_the_others() {
 }
 
 #[test]
+fn overlay_accepts_a_newer_fork_build_but_not_a_moved_competitor_pin() {
+    use benchmark_suite::scaling::{attach_scaling_report, LOCK_PINNED_ALLOCATORS};
+
+    // Reproduces the first live run's failure: the sweep runs weekly and
+    // overlays onto whichever daily core envelope is published, so
+    // mimalloc-pprof is normally built from a newer commit than the base.
+    let raw = benchmark_suite::scaling::synthetic_scaling_fixture(0x6d69_6d61_6c6c_6f63).unwrap();
+    let report = build_scaling_report(&raw).unwrap();
+    let core = benchmark_suite::validate::synthetic_full_fixture().unwrap();
+    let validation = benchmark_suite::validate::validate_publication_raw(&core).unwrap();
+    let base = benchmark_suite::report::build_latest_report(&core, validation)
+        .unwrap()
+        .0;
+    let mut latest = base.clone();
+
+    let mut newer_fork = report.clone();
+    for sample in &mut newer_fork.raw_samples {
+        if sample.allocator_id == "mimalloc-pprof" {
+            sample.allocator_source_sha = "a".repeat(40);
+        }
+    }
+    attach_scaling_report(&mut latest, newer_fork)
+        .expect("a newer fork build must still overlay");
+    assert!(latest.scaling.is_some());
+    assert!(!latest
+        .pending_metrics
+        .iter()
+        .any(|value| value.metric_id == "scaling"));
+
+    let mut moved_pin = report.clone();
+    for sample in &mut moved_pin.raw_samples {
+        if sample.allocator_id == "upstream-mimalloc" {
+            sample.allocator_source_sha = "f".repeat(40);
+        }
+    }
+    let mut fresh = base;
+    assert!(
+        attach_scaling_report(&mut fresh, moved_pin).is_err(),
+        "a competitor built from a different commit must be rejected"
+    );
+    assert_eq!(LOCK_PINNED_ALLOCATORS.len(), 3);
+}
+
+#[test]
 fn counts_helper_sums_every_allocator_call() {
     let counts = ScalingCounts {
         alloc_calls: 3,

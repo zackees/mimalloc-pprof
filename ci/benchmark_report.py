@@ -38,6 +38,10 @@ STATISTICS_VERSION = "paired-log-median-bootstrap-v1"
 SUITE_VERSION = "core-throughput-v1"
 VALIDATOR_VERSION = "benchmark-validator-v1"
 ALLOCATOR_IDS = ("tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof")
+# Allocators whose source commit is fixed by allocator-lock.json. A secondary
+# metric overlaid onto an older core envelope must match these exactly; the
+# fork's own commit legitimately moves between the two runs.
+LOCK_PINNED_ALLOCATORS = ("tcmalloc", "jemalloc", "upstream-mimalloc")
 VALIDATION_CHECKS = (
     "schema-and-versions",
     "run-identity",
@@ -1982,22 +1986,38 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
         # Compare the set of (allocator, source) pairs rather than a mapping:
         # a mapping keeps only the last sample per allocator, which would let a
         # single mispinned sample through.
+        #
+        # Only the lock-pinned competitors must match the core run. The sweep
+        # runs weekly and overlays onto whichever daily core envelope is
+        # published, so the fork's own commit is normally newer; requiring
+        # equality there would make the overlay permanently unpublishable.
         expected_pairs = {
             (
                 str(object_value(value, f"{label}.allocators")["allocator_id"]),
                 str(object_value(value, f"{label}.allocators")["source_sha"]),
             )
             for value in allocators
+            if str(object_value(value, f"{label}.allocators")["allocator_id"])
+            in LOCK_PINNED_ALLOCATORS
         }
-        observed_pairs = {
-            (
-                str(object_value(value, f"{label}.scaling.raw_samples")["allocator_id"]),
-                str(object_value(value, f"{label}.scaling.raw_samples")["allocator_source_sha"]),
-            )
+        scaling_samples = [
+            object_value(value, f"{label}.scaling.raw_samples")
             for value in list_value(scaling_report["raw_samples"], f"{label}.scaling.raw_samples")
+        ]
+        observed_pairs = {
+            (str(value["allocator_id"]), str(value["allocator_source_sha"]))
+            for value in scaling_samples
+            if str(value["allocator_id"]) in LOCK_PINNED_ALLOCATORS
         }
         if observed_pairs != expected_pairs:
             fail(f"{label}.scaling: allocator source pins differ from the core run")
+        fork_sources = {
+            str(value["allocator_source_sha"])
+            for value in scaling_samples
+            if str(value["allocator_id"]) == "mimalloc-pprof"
+        }
+        if len(fork_sources) != 1:
+            fail(f"{label}.scaling: exactly one mimalloc-pprof build must be measured")
     pending = list_value(latest.get("pending_metrics"), f"{label}.pending_metrics")
     expected_pending = tuple(
         metric
@@ -2175,6 +2195,41 @@ def validate_history_row(value: object, label: str) -> dict[str, object]:
     return row
 
 
+def equivalent_payload(left: object, right: object, tolerance: float = 1e-12) -> bool:
+    """Structural equality that tolerates float round-trip noise.
+
+    A published `latest.json` that passes back through the Rust overlay
+    binaries can return with a float shifted by one unit in the last place:
+    serde_json's parse-and-re-emit is not bit-identical to Python's json for
+    every value (observed on `relative_iqr`, ...413 in, ...412 out). The
+    history merge must not read that as a rewritten historical row, but must
+    still reject a real change. One ULP is around 1e-16 relative, four orders
+    of magnitude below this tolerance, so genuine edits are still caught.
+    """
+
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left is right
+    if isinstance(left, float) or isinstance(right, float):
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+            return False
+        if math.isnan(left) or math.isnan(right):
+            return False
+        return left == right or math.isclose(left, right, rel_tol=tolerance, abs_tol=0.0)
+    if isinstance(left, dict) and isinstance(right, dict):
+        left_map = cast(dict[str, object], left)
+        right_map = cast(dict[str, object], right)
+        return set(left_map) == set(right_map) and all(
+            equivalent_payload(left_map[key], right_map[key], tolerance) for key in left_map
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        left_list = cast(list[object], left)
+        right_list = cast(list[object], right)
+        return len(left_list) == len(right_list) and all(
+            equivalent_payload(one, other, tolerance) for one, other in zip(left_list, right_list)
+        )
+    return left == right
+
+
 def read_history(path: Path, initialize: bool) -> list[dict[str, object]]:
     if not path.exists():
         if not initialize:
@@ -2230,9 +2285,13 @@ def merge_history(
         previous_base = {key: value for key, value in row.items() if key not in optional}
         current_base = {key: value for key, value in current.items() if key not in optional}
         gained = (set(current) & optional) - (set(row) & optional)
-        if previous_base != current_base or not gained:
+        if not equivalent_payload(previous_base, current_base) or not gained:
             fail("history append: duplicate run may only gain a validated optional metric")
-        combined[index] = current
+        # Keep the row exactly as it was first published and add only the newly
+        # collected metric. Rewriting it from the round-tripped envelope would
+        # silently move already-published numbers by the same round-trip noise
+        # this comparison tolerates.
+        combined[index] = dict(row) | {key: current[key] for key in sorted(gained)}
         break
     else:
         combined.append(current)
@@ -3017,7 +3076,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             if scaling_run["run_origin"] == "github-actions"
             else "https://github.com/zackees/mimalloc-pprof/actions"
         )
-        scaling_html = f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(SCALING_RIGOR_LABEL)}.</strong> These panels trade statistical rigor for thread coverage: {escaped(SCALING_BLOCKS)} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating. Do not read them as headline-grade numbers.</p><p>Worker counts are literal {escaped(", ".join(str(point) for point in SCALING_THREAD_POINTS))}; the runner allows {escaped(scaling_topology["allowed_logical_cpus"])} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling_methodology["seed_chain"])}. Scaling run <a href="{scaling_actions}">{escaped(scaling_run["run_id"])}/{escaped(scaling_run["run_attempt"])}</a>; metric key <code>{escaped(scaling["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table></section>"""
+        scaling_html = f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(SCALING_RIGOR_LABEL)}.</strong> These panels trade statistical rigor for thread coverage: {escaped(SCALING_BLOCKS)} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating. Do not read them as headline-grade numbers.</p><p>Worker counts are literal {escaped(", ".join(str(point) for point in SCALING_THREAD_POINTS))}; the runner allows {escaped(scaling_topology["allowed_logical_cpus"])} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling_methodology["seed_chain"])}. Scaling run <a href="{scaling_actions}">{escaped(scaling_run["run_id"])}/{escaped(scaling_run["run_attempt"])}</a> measured mimalloc-pprof at source <code>{escaped(scaling_run["source_sha"])}</code>, which is not necessarily the commit above; metric key <code>{escaped(scaling["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table></section>"""
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>mimalloc allocator benchmarks</title>
 <style>body{{font:15px system-ui,sans-serif;max-width:1200px;margin:auto;padding:24px;color:#182334}}table{{border-collapse:collapse;width:100%;margin:16px 0}}th,td{{border:1px solid #ccd4dd;padding:7px;text-align:left}}img{{max-width:100%;height:auto}}.pending{{border:1px solid #ccd4dd;padding:12px;margin:12px 0}}code,pre{{overflow-wrap:anywhere;white-space:pre-wrap}}small{{color:#596575}}</style></head><body>

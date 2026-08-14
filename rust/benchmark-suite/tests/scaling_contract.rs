@@ -435,6 +435,77 @@ fn requests_with_undeclared_thread_points_or_patterns_are_rejected() {
     assert!(request.validate().is_err(), "a zero run seed is rejected");
 }
 
+/// Fails every allocation after a budget, to exercise the worker error path.
+struct FailingAdapter {
+    inner: MockAdapter,
+    budget: AtomicU64,
+}
+
+impl FailingAdapter {
+    fn new(budget: u64) -> Self {
+        Self {
+            inner: MockAdapter::new("upstream-mimalloc"),
+            budget: AtomicU64::new(budget),
+        }
+    }
+}
+
+impl AllocatorAdapter for FailingAdapter {
+    fn allocator_id(&self) -> &str {
+        self.inner.allocator_id()
+    }
+    fn allocator_version(&self) -> &str {
+        self.inner.allocator_version()
+    }
+    fn source_sha(&self) -> &str {
+        self.inner.source_sha()
+    }
+    fn library_sha256(&self) -> &str {
+        self.inner.library_sha256()
+    }
+    fn alloc(&self, size: usize) -> Result<NonNull<u8>, String> {
+        if self.budget.fetch_sub(1, Ordering::Relaxed) == 0 {
+            return Err("synthetic allocation failure".into());
+        }
+        self.inner.alloc(size)
+    }
+    fn calloc(&self, count: usize, size: usize) -> Result<NonNull<u8>, String> {
+        self.inner.calloc(count, size)
+    }
+    unsafe fn realloc(&self, pointer: NonNull<u8>, size: usize) -> Result<NonNull<u8>, String> {
+        unsafe { self.inner.realloc(pointer, size) }
+    }
+    fn aligned_alloc(&self, alignment: usize, size: usize) -> Result<NonNull<u8>, String> {
+        self.inner.aligned_alloc(alignment, size)
+    }
+    unsafe fn free(&self, pointer: NonNull<u8>) {
+        unsafe { self.inner.free(pointer) }
+    }
+}
+
+#[test]
+fn a_failing_worker_reports_an_error_instead_of_stranding_the_others() {
+    // A worker that returns early must still reach every barrier. `Barrier`
+    // has no poison state, so skipping one would hang the remaining workers
+    // and the controller until the parent's watchdog killed the child with an
+    // empty stderr, destroying the real diagnostic.
+    for pattern in SCALING_PATTERNS {
+        let adapter = FailingAdapter::new(64);
+        let request = request_for(pattern, 4, 0, "upstream-mimalloc", 400);
+        let error = execute_scaling_child_request(&adapter, request)
+            .expect_err("a failing allocator must surface an error");
+        assert!(
+            error.contains("synthetic allocation failure"),
+            "{} lost the underlying error: {error}",
+            pattern.as_str()
+        );
+        // Anything the failing run still held is intentionally not asserted:
+        // the child process exits on this path. Reaching this line at all is
+        // the property under test.
+        std::mem::forget(adapter);
+    }
+}
+
 #[test]
 fn counts_helper_sums_every_allocator_call() {
     let counts = ScalingCounts {

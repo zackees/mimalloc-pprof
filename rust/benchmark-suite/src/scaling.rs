@@ -448,24 +448,30 @@ fn fold(checksum: u64, value: u64) -> u64 {
 /// Byte offsets touched for one block. Large buffers touch one byte per OS
 /// page so the measurement includes real page faults; small blocks touch only
 /// their first and last byte.
-fn touch_offsets(size: usize, page_touch: bool) -> Vec<usize> {
-    let mut offsets = Vec::new();
-    if page_touch {
-        let mut offset = 0;
-        while offset < size {
-            offsets.push(offset);
-            offset += PAGE_BYTES;
+///
+/// This is an iterator rather than a `Vec` because it runs once per allocation
+/// on both the measured path and the oracle path; allocating here would make
+/// the harness's own cost comparable to the workload it measures.
+fn touch_offsets(size: usize, page_touch: bool) -> impl Iterator<Item = usize> {
+    let last = size - 1;
+    let stride = if page_touch { PAGE_BYTES } else { size.max(1) };
+    let mut offset = 0usize;
+    let mut emitted_last = false;
+    std::iter::from_fn(move || {
+        if offset < size {
+            let current = offset;
+            offset = offset.saturating_add(stride);
+            if current == last {
+                emitted_last = true;
+            }
+            return Some(current);
         }
-        if *offsets.last().unwrap_or(&usize::MAX) != size - 1 {
-            offsets.push(size - 1);
+        if !emitted_last && size > 1 {
+            emitted_last = true;
+            return Some(last);
         }
-    } else {
-        offsets.push(0);
-        if size > 1 {
-            offsets.push(size - 1);
-        }
-    }
-    offsets
+        None
+    })
 }
 
 /// Checksum contribution of one allocation, computed identically by the oracle
@@ -629,7 +635,6 @@ pub struct ScalingChildResponse {
 
 impl ScalingChildResponse {
     pub fn validate_against(&self, request: &ScalingChildRequest) -> Result<(), String> {
-        request.validate()?;
         let pattern = request.pattern()?;
         let expected = simulate_cell(
             pattern,
@@ -638,6 +643,20 @@ impl ScalingChildResponse {
             request.block_id,
             request.operations_per_worker,
         );
+        self.validate_against_expected(request, &expected)
+    }
+
+    /// Same contract with the plan supplied by the caller. The plan is
+    /// allocator-independent, so a controller running one paired block derives
+    /// it once instead of four times; replaying it per child would put the
+    /// harness's own cost on the same order as the workload.
+    pub fn validate_against_expected(
+        &self,
+        request: &ScalingChildRequest,
+        expected: &ScalingCounts,
+    ) -> Result<(), String> {
+        request.validate()?;
+        let pattern = request.pattern()?;
         let expected_throughput =
             expected.operation_count() as f64 * 1_000_000_000.0 / self.elapsed_ns as f64;
         let tolerance = (expected_throughput.abs() * 1e-12).max(f64::EPSILON);
@@ -729,54 +748,44 @@ pub fn execute_scaling_child_request<A: AllocatorAdapter>(
                     request.block_id,
                     worker_index,
                 );
-                if request.warmup_operations_per_worker > 0 {
-                    let mut warm = WorkerPlanner::new(
+                // Every barrier below is reached on both the success and the
+                // failure path. `Barrier` has no poison state, so a worker that
+                // returned early would strand every other worker and the main
+                // thread forever; the child would then die on the parent's
+                // watchdog with an empty stderr instead of reporting the real
+                // error. The outcome is therefore carried, not propagated.
+                let warmup =
+                    warm_up_worker(adapter, request, pattern, seed, worker_index, threads);
+                ready.wait();
+                start.wait();
+                let mut outcome = warmup.and_then(|()| {
+                    let mut planner = WorkerPlanner::new(
                         pattern,
-                        splitmix64(seed ^ 0xa076_1d64_78bd_642f),
-                        request.warmup_operations_per_worker,
+                        seed,
+                        request.operations_per_worker,
                         worker_index,
                         request.thread_count,
                     );
-                    // The warmup mailbox is private so warmup parcels can never
-                    // leak into a measured drain.
-                    let warm_mailboxes: Vec<Mutex<VecDeque<Parcel>>> = (0..threads)
-                        .map(|_| Mutex::new(VecDeque::new()))
-                        .collect();
-                    run_worker_stream(adapter, &mut warm, worker_index, &warm_mailboxes)?;
-                    for mailbox in &warm_mailboxes {
-                        let mut queue = mailbox
-                            .lock()
-                            .map_err(|_| "scaling warmup mailbox lock poisoned")?;
-                        while let Some(parcel) = queue.pop_front() {
-                            unsafe { adapter.free(parcel.pointer) };
-                        }
-                    }
-                }
-                ready.wait();
-                start.wait();
-                let mut planner = WorkerPlanner::new(
-                    pattern,
-                    seed,
-                    request.operations_per_worker,
-                    worker_index,
-                    request.thread_count,
-                );
-                let mut tally =
-                    run_worker_stream(adapter, &mut planner, worker_index, &mailboxes)?;
+                    run_worker_stream(adapter, &mut planner, worker_index, &mailboxes)
+                        .map(|tally| (tally, planner.page_touch()))
+                });
                 if spec.cross_thread {
                     // Every producer must finish before any final drain, so a
                     // parcel can never be published into a drained mailbox.
                     produced.wait();
-                    drain_own_mailbox(
-                        adapter,
-                        &mailboxes[worker],
-                        usize::MAX,
-                        &mut tally,
-                        planner.page_touch(),
-                    )?;
+                    outcome = outcome.and_then(|(mut tally, page_touch)| {
+                        drain_own_mailbox(
+                            adapter,
+                            &mailboxes[worker],
+                            usize::MAX,
+                            &mut tally,
+                            page_touch,
+                        )
+                        .map(|()| (tally, page_touch))
+                    });
                 }
                 finished.wait();
-                Ok(tally)
+                outcome.map(|(tally, _)| tally)
             }));
         }
         let warmup_mark = Instant::now();
@@ -839,6 +848,41 @@ pub fn execute_scaling_child_request<A: AllocatorAdapter>(
 /// planner so the planner can stay allocator-free.
 struct SlotTable {
     slots: Vec<Option<Parcel>>,
+}
+
+/// Untimed warmup on a private mailbox set, so a warmup parcel can never be
+/// drained by the measured region.
+fn warm_up_worker<A: AllocatorAdapter>(
+    adapter: &A,
+    request: &ScalingChildRequest,
+    pattern: ScalingPattern,
+    seed: u64,
+    worker: u32,
+    threads: usize,
+) -> Result<(), String> {
+    if request.warmup_operations_per_worker == 0 {
+        return Ok(());
+    }
+    let mut warm = WorkerPlanner::new(
+        pattern,
+        splitmix64(seed ^ 0xa076_1d64_78bd_642f),
+        request.warmup_operations_per_worker,
+        worker,
+        request.thread_count,
+    );
+    let warm_mailboxes: Vec<Mutex<VecDeque<Parcel>>> =
+        (0..threads).map(|_| Mutex::new(VecDeque::new())).collect();
+    let outcome = run_worker_stream(adapter, &mut warm, worker, &warm_mailboxes);
+    // Release warmup parcels even when the stream failed, so a failing warmup
+    // does not also leak.
+    for mailbox in &warm_mailboxes {
+        if let Ok(mut queue) = mailbox.lock() {
+            while let Some(parcel) = queue.pop_front() {
+                unsafe { adapter.free(parcel.pointer) };
+            }
+        }
+    }
+    outcome.map(|_| ())
 }
 
 fn run_worker_stream<A: AllocatorAdapter>(
@@ -1013,6 +1057,24 @@ pub fn run_scaling_child(
     request: &ScalingChildRequest,
     timeout: Duration,
 ) -> Result<ScalingChildResponse, String> {
+    let pattern = request.pattern()?;
+    let expected = simulate_cell(
+        pattern,
+        request.run_seed,
+        request.thread_count,
+        request.block_id,
+        request.operations_per_worker,
+    );
+    run_scaling_child_with_plan(child, request, timeout, &expected)
+}
+
+/// Spawn one child and validate it against a plan the caller already derived.
+pub fn run_scaling_child_with_plan(
+    child: &ChildProgram,
+    request: &ScalingChildRequest,
+    timeout: Duration,
+    expected: &ScalingCounts,
+) -> Result<ScalingChildResponse, String> {
     request.validate()?;
     if child.allocator != request.allocator || timeout.is_zero() {
         return Err("scaling child identity mismatch or zero timeout".into());
@@ -1097,7 +1159,7 @@ pub fn run_scaling_child(
     }
     let response: ScalingChildResponse = serde_json::from_slice(&output)
         .map_err(|error| format!("decode scaling child response: {error}"))?;
-    response.validate_against(request)?;
+    response.validate_against_expected(request, expected)?;
     Ok(response)
 }
 
@@ -1289,7 +1351,10 @@ pub fn methodology() -> ScalingMethodology {
 }
 
 fn median(values: &mut [f64]) -> f64 {
-    values.sort_by(|left, right| left.partial_cmp(right).expect("finite throughput"));
+    // total_cmp rather than partial_cmp: the validator already rejects
+    // non-finite throughput, so this never sees a NaN, but a total order means
+    // a future caller cannot turn that into a panic.
+    values.sort_by(|left, right| left.total_cmp(right));
     let middle = values.len() / 2;
     if values.len() % 2 == 1 {
         values[middle]
@@ -1360,6 +1425,7 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
     }
     let mut blocks: BTreeMap<(String, u32, String), BTreeSet<u32>> = BTreeMap::new();
     let mut ordinals: BTreeMap<(String, u32, u32), BTreeSet<u8>> = BTreeMap::new();
+    let mut plans: BTreeMap<(String, u32, u32, u64), ScalingCounts> = BTreeMap::new();
     for sample in &raw.samples {
         let pattern = ScalingPattern::parse(&sample.pattern)
             .ok_or_else(|| "scaling sample names an unknown pattern".to_string())?;
@@ -1385,14 +1451,30 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
             );
         }
         // Re-derive the whole plan from the seed chain and compare every count.
-        let expected = simulate_cell(
-            pattern,
-            raw.run_seed,
+        // The plan is allocator-independent, so it is derived once per
+        // (pattern, thread point, block) and reused across that block's four
+        // allocators rather than replayed 4x.
+        let plan_key = (
+            sample.pattern.clone(),
             sample.thread_count,
             sample.block_id,
             sample.operations_per_worker,
         );
+        let expected = *plans.entry(plan_key).or_insert_with(|| {
+            simulate_cell(
+                pattern,
+                raw.run_seed,
+                sample.thread_count,
+                sample.block_id,
+                sample.operations_per_worker,
+            )
+        });
         let response = &sample.response;
+        // The published number is throughput, so it is re-derived too; checking
+        // only that it is finite would let an arbitrary value reach the chart.
+        let expected_throughput =
+            expected.operation_count() as f64 * 1_000_000_000.0 / response.elapsed_ns as f64;
+        let tolerance = (expected_throughput.abs() * 1e-12).max(f64::EPSILON);
         if response.alloc_calls != expected.alloc_calls
             || response.realloc_calls != expected.realloc_calls
             || response.free_calls != expected.free_calls
@@ -1400,9 +1482,15 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
             || response.checksum != expected.checksum
             || response.thread_count != sample.thread_count
             || response.allocator_id != sample.allocator_id
+            || response.protocol_version != SCALING_CHILD_PROTOCOL_VERSION
+            || response.metric_schema_version != SCALING_SCHEMA_VERSION
             || response.elapsed_ns == 0
             || !response.throughput_operations_per_second.is_finite()
             || response.throughput_operations_per_second <= 0.0
+            || (response.throughput_operations_per_second - expected_throughput).abs() > tolerance
+            || (!pattern.spec().cross_thread
+                && (response.remote_free_calls != 0 || response.producer_fallback_frees != 0))
+            || (pattern.spec().cross_thread && response.remote_free_calls > response.free_calls)
         {
             return Err(format!(
                 "scaling sample for {}/{} on {} contradicts its derived plan",

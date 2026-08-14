@@ -14,10 +14,11 @@ use crate::runner::{
     detect_topology, publication_allocators, write_json_line, write_new_bytes, write_new_json,
 };
 use crate::scaling::{
-    run_scaling_child, validate_scaling_raw_run, ScalingCalibration, ScalingChildRequest,
-    ScalingChildResponse, ScalingPattern, ScalingRawRun, ScalingRawSample, ScalingTopology,
-    SCALING_BLOCKS, SCALING_CHILD_PROTOCOL_VERSION, SCALING_MAX_BLOCK_NS, SCALING_MIN_BLOCK_NS,
-    SCALING_PATTERNS, SCALING_SCHEMA_VERSION, SCALING_TARGET_BLOCK_NS, SCALING_THREAD_POINTS,
+    run_scaling_child, run_scaling_child_with_plan, simulate_cell, validate_scaling_raw_run,
+    ScalingCalibration, ScalingChildRequest, ScalingChildResponse, ScalingPattern, ScalingRawRun,
+    ScalingRawSample, ScalingTopology, SCALING_BLOCKS, SCALING_CHILD_PROTOCOL_VERSION,
+    SCALING_MAX_BLOCK_NS, SCALING_MIN_BLOCK_NS, SCALING_PATTERNS, SCALING_SCHEMA_VERSION,
+    SCALING_TARGET_BLOCK_NS, SCALING_THREAD_POINTS,
 };
 use crate::scenarios::Topology;
 
@@ -234,6 +235,16 @@ fn run(options: Options) -> Result<(), String> {
 
             let started = Instant::now();
             for order in balanced_block_orders(options.blocks, options.run_seed)? {
+                // The plan is allocator-independent, so derive it once per
+                // block and reuse it for all four children. Replaying it per
+                // child would cost as much as the measurement itself.
+                let plan = simulate_cell(
+                    pattern,
+                    options.run_seed,
+                    thread_count,
+                    order.block_id,
+                    operations_per_worker,
+                );
                 for (ordinal, allocator_id) in order.allocator_ids.iter().enumerate() {
                     let child = children
                         .iter()
@@ -259,7 +270,8 @@ fn run(options: Options) -> Result<(), String> {
                         request_path.display()
                     );
                     write_new_json(request_path.clone(), &request)?;
-                    let response = run_scaling_child(child, &request, options.timeout)?;
+                    let response =
+                        run_scaling_child_with_plan(child, &request, options.timeout, &plan)?;
                     let sample = ScalingRawSample {
                         metric_schema_version: SCALING_SCHEMA_VERSION.into(),
                         block_id: order.block_id,

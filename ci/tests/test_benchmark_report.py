@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -697,11 +698,17 @@ class BenchmarkReportTests(unittest.TestCase):
             "benchmark-throughput.png": "https://zackees.github.io/mimalloc-pprof/#throughput",
             "benchmark-history.png": "https://zackees.github.io/mimalloc-pprof/#history",
         }
+        # Every scaling panel is embedded and clicks through to its section.
+        for name in report.SCALING_PANELS.values():
+            expected[name] = "https://zackees.github.io/mimalloc-pprof/#scaling"
         for image, destination in expected.items():
             raw = (
                 f"https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/{image}"
             )
             self.assertIn(f"]({raw})]({destination})", source)
+        # Every embedded name must be a file the renderer actually emits, or
+        # the README links 404 on the published branch.
+        self.assertTrue(set(expected) <= report.SITE_FILES)
         for pending in (
             "benchmark-memory.png",
             "benchmark-latency.png",
@@ -1019,6 +1026,16 @@ class BenchmarkReportTests(unittest.TestCase):
                 for allocator in report.ALLOCATOR_IDS:
                     self.assertIn(allocator, panel)
                 self.assertIn("oversubscribed", panel)
+                # The shaded band must actually be visible, not a zero-width
+                # rectangle collapsed onto the last tick.
+                band = re.search(
+                    rf'<rect x="([\d.]+)" y="\d+" width="([\d.]+)" [^>]*'
+                    rf'fill="{report.SCALING_INK["oversubscribed"]}"',
+                    panel,
+                )
+                self.assertIsNotNone(band, "oversubscription band is missing")
+                assert band is not None
+                self.assertGreater(float(band.group(2)), 20.0)
 
     def test_pending_scaling_panels_are_dark_and_carry_no_numbers(self) -> None:
         latest = self.load_latest()

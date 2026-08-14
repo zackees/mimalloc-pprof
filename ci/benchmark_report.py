@@ -2707,10 +2707,16 @@ def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
     ]
     # Shade the oversubscribed region so contention is never read as core scaling.
     oversubscribed = [point for point in SCALING_THREAD_POINTS if point > allowed]
+    in_budget = [point for point in SCALING_THREAD_POINTS if point <= allowed]
     if oversubscribed:
-        band_start = x_of(oversubscribed[0])
+        first_over = x_of(oversubscribed[0])
+        # The first oversubscribed point is usually the last point on the axis,
+        # so anchoring the band at it would give it zero width. Start it halfway
+        # back to the last in-budget point instead.
+        band_start = (x_of(in_budget[-1]) + first_over) / 2 if in_budget else float(left)
+        band_width = left + plot_width - band_start
         parts.append(
-            f'<rect x="{band_start:.1f}" y="{top}" width="{left + plot_width - band_start:.1f}" '
+            f'<rect x="{band_start:.1f}" y="{top}" width="{band_width:.1f}" '
             f'height="{plot_height}" fill="{SCALING_INK["oversubscribed"]}" rx="6"/>'
         )
         parts.append(

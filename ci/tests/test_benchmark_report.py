@@ -547,6 +547,147 @@ class BenchmarkReportTests(unittest.TestCase):
             self.assertIn('<h2 id="memory">Linux process memory</h2>', page)
             self.assertNotIn("memory: pending", page)
             self.assertIn(b"Linux process RSS", (site / "benchmark-memory.png").read_bytes())
+            self.assertIn(
+                b"Speed-memory Pareto scatter",
+                (site / "benchmark-pareto.png").read_bytes(),
+            )
+
+    def test_pending_memory_keeps_pareto_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            site, _digest = self.render_fixture(Path(temporary))
+            pareto = (site / "benchmark-pareto.png").read_bytes()
+            self.assertIn(b"PENDING speed-memory Pareto scatter", pareto)
+
+    def test_pareto_places_known_points_at_expected_coordinates(self) -> None:
+        cells = (("scenario-00", "1"), ("scenario-01", "2"))
+        fragmentation = {
+            ("scenario-00", "1"): {
+                "tcmalloc": 1.6,
+                "jemalloc": 1.4,
+                "upstream-mimalloc": 1.2,
+                "mimalloc-pprof": 1.0,
+            },
+            ("scenario-01", "2"): {
+                "tcmalloc": 2.0,
+                "jemalloc": 1.8,
+                "upstream-mimalloc": 1.6,
+                "mimalloc-pprof": 1.2,
+            },
+        }
+        throughput = {
+            ("scenario-00", "1"): {
+                "tcmalloc": 3.0e8,
+                "jemalloc": 3.5e8,
+                "upstream-mimalloc": 4.0e8,
+                "mimalloc-pprof": 4.5e8,
+            },
+            ("scenario-01", "2"): {
+                "tcmalloc": 5.0e8,
+                "jemalloc": 5.5e8,
+                "upstream-mimalloc": 6.0e8,
+                "mimalloc-pprof": 6.5e8,
+            },
+        }
+
+        def record(
+            scenario: str, point: str, metric: str, allocator: str, median: float
+        ) -> dict[str, object]:
+            return {
+                "scenario_id": scenario,
+                "thread_point": point,
+                "metric_id": metric,
+                "direction": (
+                    "lower-is-better" if metric == "fragmentation-proxy" else "higher-is-better"
+                ),
+                "allocator_id": allocator,
+                "summary": {
+                    "count": 15,
+                    "median": median,
+                    "min": median * 0.9,
+                    "max": median * 1.1,
+                    "q1": median * 0.95,
+                    "q3": median * 1.05,
+                    "iqr": median * 0.1,
+                    "relative_iqr": 0.1,
+                    "noisy": False,
+                },
+            }
+
+        memory_records = [
+            record(scenario, point, "fragmentation-proxy", allocator, median)
+            for scenario, point in cells
+            for allocator, median in fragmentation[(scenario, point)].items()
+        ]
+        core_records = [
+            record(
+                scenario,
+                point,
+                "throughput-operations-per-second",
+                allocator,
+                median,
+            )
+            for scenario, point in cells
+            for allocator, median in throughput[(scenario, point)].items()
+        ]
+        memory_only: dict[str, object] = {"absolute_summaries": memory_records}
+        latest: dict[str, object] = {
+            "memory": memory_only,
+            "absolute_summaries": core_records,
+        }
+        points = report.pareto_points(memory_only, latest)
+        self.assertEqual(2 * 4, len(points))
+        canvas = report.Canvas(report.PARETO_WIDTH, report.PARETO_HEIGHT, (248, 250, 252))
+        report.draw_pareto(canvas, points)
+        x_max, y_max = report.pareto_scale(points)
+        self.assertAlmostEqual(x_max, 2.0 * 1.15)
+        self.assertAlmostEqual(y_max, 6.5e8 * 1.15)
+        by_cell = {
+            (scenario, point, allocator): (frag, ops)
+            for allocator, frag, ops, scenario, point in points
+        }
+        for scenario, point in cells:
+            for allocator in report.ALLOCATOR_IDS:
+                frag, ops = by_cell[(scenario, point, allocator)]
+                x = round(report.pareto_x(frag, x_max))
+                y = round(report.pareto_y(ops, y_max))
+                color = report.COLORS[report.ALLOCATOR_IDS.index(allocator)]
+                offset = (y * report.PARETO_WIDTH + x) * 3
+                self.assertEqual(
+                    color,
+                    tuple(canvas.pixels[offset : offset + 3]),
+                    f"marker for {allocator} at {scenario}/{point}",
+                )
+        # Placement invariants, from first principles: zero maps onto the axes,
+        # the largest observed fragmentation maps 1/1.15 of the way across, and
+        # both axes are monotonic in the value they carry.
+        left, _top, right, bottom = report.PARETO_MARGINS
+        self.assertEqual(round(report.pareto_x(0.0, x_max)), left)
+        self.assertEqual(round(report.pareto_y(0.0, y_max)), report.PARETO_HEIGHT - bottom)
+        max_frag = max(frag for _allocator, frag, _ops, _scenario, _point in points)
+        self.assertAlmostEqual(
+            report.pareto_x(max_frag, x_max),
+            left + (report.PARETO_WIDTH - left - right) / 1.15,
+        )
+        self.assertGreater(report.pareto_x(1.5, x_max), report.pareto_x(1.0, x_max))
+        self.assertLess(report.pareto_y(5.0, y_max), report.pareto_y(1.0, y_max))
+
+    def test_pareto_renders_empty_state_when_no_cells_match(self) -> None:
+        latest = self.with_complete_memory(self.load_latest())
+        memory = report.validate_memory_report(latest["memory"], "memory fixture")
+        # The fixture memory scenarios (large-objects, sawtooth-retain-drain,
+        # ...) deliberately have no counterpart among the core scenario-00..07
+        # cells, so the chart must say so instead of fabricating points.
+        self.assertEqual([], report.pareto_points(memory, latest))
+        canvas = report.Canvas(report.PARETO_WIDTH, report.PARETO_HEIGHT, (248, 250, 252))
+        report.draw_pareto(canvas, [])
+        muted = (117, 126, 140)
+        self.assertTrue(
+            any(
+                tuple(canvas.pixels[index : index + 3]) == muted
+                for index in range(0, len(canvas.pixels), 3)
+            ),
+            "empty Pareto chart must carry the no-match note",
+        )
 
     def test_incomplete_memory_never_replaces_pending_and_prior_complete_is_carried(self) -> None:
         prior = self.with_complete_memory(self.load_latest())

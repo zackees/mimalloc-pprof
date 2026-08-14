@@ -1894,6 +1894,12 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
     })
 }
 
+/// Allocators whose source commit is fixed by `allocator-lock.json`. These must
+/// match the core run exactly: they are the comparison baseline, and a
+/// competitor built from a different commit would silently change what the
+/// chart means.
+pub const LOCK_PINNED_ALLOCATORS: [&str; 3] = ["tcmalloc", "jemalloc", "upstream-mimalloc"];
+
 pub fn attach_scaling_report(
     latest: &mut LatestReport,
     report: ScalingMetricReport,
@@ -1902,15 +1908,35 @@ pub fn attach_scaling_report(
     let expected = latest
         .allocators
         .iter()
+        .filter(|value| LOCK_PINNED_ALLOCATORS.contains(&value.allocator_id.as_str()))
         .map(|value| (&value.allocator_id, &value.source_sha))
         .collect::<BTreeSet<_>>();
     let observed = report
         .raw_samples
         .iter()
+        .filter(|value| LOCK_PINNED_ALLOCATORS.contains(&value.allocator_id.as_str()))
         .map(|value| (&value.allocator_id, &value.allocator_source_sha))
         .collect::<BTreeSet<_>>();
     if expected != observed {
         return Err("scaling allocator provenance differs from core latest".into());
+    }
+    // The fork's own commit is deliberately not required to match. This sweep
+    // runs weekly and overlays onto whatever daily core envelope is published,
+    // so mimalloc-pprof is normally built from a newer commit than the base.
+    // Requiring equality would make the overlay permanently unpublishable.
+    // Instead the sweep must actually contain the fork, and the commit it was
+    // measured at is recorded on the report so the two sections of latest.json
+    // can never be read as one build.
+    let fork_sources = report
+        .raw_samples
+        .iter()
+        .filter(|value| value.allocator_id == "mimalloc-pprof")
+        .map(|value| value.allocator_source_sha.as_str())
+        .collect::<BTreeSet<_>>();
+    match fork_sources.len() {
+        1 => {}
+        0 => return Err("scaling run does not contain mimalloc-pprof".into()),
+        _ => return Err("scaling run mixes several mimalloc-pprof builds".into()),
     }
     latest.scaling = Some(report);
     latest

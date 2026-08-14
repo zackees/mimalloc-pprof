@@ -146,6 +146,7 @@ SITE_FILES = {
     "benchmark-memory.png",
     "benchmark-pareto.png",
     "benchmark-rss-timeline.png",
+    "benchmark-fragmentation.png",
     "benchmark-latency.png",
     "benchmark-pprof-tax.png",
     *SCALING_PANELS.values(),
@@ -156,6 +157,7 @@ PNG_DIMENSIONS = {
     "benchmark-memory.png": (960, 540),
     "benchmark-pareto.png": (960, 540),
     "benchmark-rss-timeline.png": (1280, 720),
+    "benchmark-fragmentation.png": (960, 540),
     "benchmark-latency.png": (960, 540),
     "benchmark-pprof-tax.png": (960, 540),
 }
@@ -187,6 +189,7 @@ ROLES = {
     "benchmark-memory.png": "memory-panel",
     "benchmark-pareto.png": "pareto-panel",
     "benchmark-rss-timeline.png": "rss-timeline-panel",
+    "benchmark-fragmentation.png": "fragmentation-panel",
     "benchmark-latency.png": "latency-panel",
     "benchmark-pprof-tax.png": "pending-pprof-tax-panel",
     **dict.fromkeys(SCALING_PANELS.values(), "scaling-panel"),
@@ -2530,37 +2533,152 @@ def pending_png(metric: str, reason: str, width: int = 960, height: int = 540) -
     return encode_png(width, height, canvas.pixels, f"PENDING {metric}: {reason}")
 
 
-def memory_png(memory: Mapping[str, object]) -> bytes:
-    canvas = Canvas(960, 540, (248, 250, 252))
-    canvas.rectangle(0, 0, 960, 62, (24, 35, 52))
+MEMORY_PANEL_WIDTH = 960
+MEMORY_PANEL_HEIGHT = 540
+MEMORY_BAR_MAX_WIDTH = 380
+
+
+def draw_allocator_legend(canvas: Canvas, x: int, y: int, swatch: int = 18, scale: int = 2) -> None:
+    """Header legend with one fixed swatch per allocator, in allocator order."""
+
+    for allocator in ALLOCATOR_IDS:
+        canvas.rectangle(x, y, swatch, swatch, COLORS[ALLOCATOR_IDS.index(allocator)])
+        canvas.text(x + swatch + 8, y, allocator, (232, 238, 247), scale)
+        x += swatch + 8 + text_width(allocator, scale) + 30
+
+
+def memory_bar_cells(
+    memory: Mapping[str, object], metric_id: str
+) -> dict[tuple[str, str], dict[str, float]]:
+    """Per-cell per-allocator medians for one memory metric, keyed in
+    allocator order so bar colors are always the legend colors."""
+
     records = [
-        validate_absolute(value, "memory absolute summary")
-        for value in list_value(memory["absolute_summaries"], "memory absolute summaries")
-        if object_value(value, "memory absolute summary").get("metric_id")
-        == "sampled-peak-rss-bytes"
+        validate_absolute(value, "memory bar summary")
+        for value in list_value(memory["absolute_summaries"], "memory bar summaries")
+        if object_value(value, "memory bar summary").get("metric_id") == metric_id
     ]
-    cells: dict[tuple[str, str], list[dict[str, object]]] = {}
+    cells: dict[tuple[str, str], dict[str, float]] = {}
     for record in records:
         key = (cast(str, record["scenario_id"]), cast(str, record["thread_point"]))
-        cells.setdefault(key, []).append(record)
-    for ordinal, (_key, values) in enumerate(sorted(cells.items())):
+        allocator = cast(str, record["allocator_id"])
+        median = float_value(
+            object_value(record["summary"], "memory bar summary")["median"],
+            "memory bar median",
+            True,
+        )
+        cells.setdefault(key, {})[allocator] = median
+    for key, values in cells.items():
+        cells[key] = {
+            allocator: values[allocator] for allocator in ALLOCATOR_IDS if allocator in values
+        }
+    return cells
+
+
+def memory_bar_length(value: float, maximum: float) -> int:
+    """Bar length in pixels for a value on a per-cell scale; the largest
+    value fills the bar zone exactly."""
+
+    if maximum <= 0:
+        fail("memory bar cell maximum must be positive")
+    return max(1, int(MEMORY_BAR_MAX_WIDTH * value / maximum))
+
+
+def draw_ratio_bar_grid(
+    canvas: Canvas, cells: Mapping[tuple[str, str], Mapping[str, float]]
+) -> None:
+    """Shared two-column bar grid for ratio panels: bars scale to each cell's
+    largest value, every cell carries a 1.0 reference line, and cells are
+    labeled. The 1.0 line is the honest reading for both panels: upstream
+    parity for the normalized memory bars, RSS-equals-live-bytes for the
+    fragmentation proxy."""
+
+    canvas.rectangle(0, 0, MEMORY_PANEL_WIDTH, 62, (24, 35, 52))
+    draw_allocator_legend(canvas, 30, 22)
+    if not cells:
+        empty = "no ratio cells in this envelope"
+        canvas.text(
+            (MEMORY_PANEL_WIDTH - text_width(empty, 2)) // 2,
+            240,
+            empty,
+            (117, 126, 140),
+            2,
+        )
+        return
+    for ordinal, (key, values) in enumerate(sorted(cells.items())):
         column, row = ordinal % 2, ordinal // 2
         left, top = 45 + column * 460, 85 + row * 112
         canvas.rectangle(left, top, 420, 92, (235, 240, 246))
-        medians = [
-            float_value(object_value(value["summary"], "summary")["median"], "median", True)
-            for value in values
-        ]
-        maximum = max(medians)
-        for index, median in enumerate(medians):
+        canvas.text(left + 8, top - 14, f"{key[0]}/{key[1]}", (90, 102, 115), 1)
+        maximum = max(values.values())
+        bar_left = left + 14
+        for index, allocator in enumerate(ALLOCATOR_IDS):
+            if allocator not in values:
+                continue
+            value = values[allocator]
+            bar_length = memory_bar_length(value, maximum)
             canvas.rectangle(
-                left + 14,
+                bar_left,
                 top + 10 + index * 19,
-                max(1, int(380 * median / maximum)),
+                bar_length,
                 11,
-                COLORS[index],
+                COLORS[ALLOCATOR_IDS.index(allocator)],
             )
-    return encode_png(960, 540, canvas.pixels, "Linux process RSS; lower is better")
+            label = f"{value:.2f}x"
+            canvas.text(
+                bar_left + bar_length + 6,
+                top + 9 + index * 19,
+                label,
+                COLORS[ALLOCATOR_IDS.index(allocator)],
+                1,
+            )
+        # The 1.0 reference line is drawn on top of the bars so it stays
+        # visible even when an allocator's bar extends past it.
+        baseline_x = bar_left + min(MEMORY_BAR_MAX_WIDTH, memory_bar_length(1.0, maximum))
+        canvas.line(baseline_x, top + 4, baseline_x, top + 88, (90, 102, 115), 2)
+        canvas.text(
+            baseline_x - text_width("1.0x", 1) // 2,
+            top + 80,
+            "1.0x",
+            (90, 102, 115),
+            1,
+        )
+
+
+def memory_png(memory: Mapping[str, object]) -> bytes:
+    """Sampled-peak RSS bars normalized to upstream-mimalloc = 1.0, matching
+    the throughput panel's normalization so '+X% memory' reads at a glance."""
+
+    raw = memory_bar_cells(memory, "sampled-peak-rss-bytes")
+    normalized: dict[tuple[str, str], dict[str, float]] = {}
+    for key, values in raw.items():
+        reference = values.get("upstream-mimalloc")
+        if reference is None or reference <= 0:
+            fail(f"memory cell {key}: missing upstream-mimalloc reference")
+        normalized[key] = {allocator: median / reference for allocator, median in values.items()}
+    canvas = Canvas(MEMORY_PANEL_WIDTH, MEMORY_PANEL_HEIGHT, (248, 250, 252))
+    draw_ratio_bar_grid(canvas, normalized)
+    return encode_png(
+        MEMORY_PANEL_WIDTH,
+        MEMORY_PANEL_HEIGHT,
+        canvas.pixels,
+        "Sampled peak RSS relative to upstream-mimalloc; 1.0 = upstream; lower is better",
+    )
+
+
+def fragmentation_png(memory: Mapping[str, object]) -> bytes:
+    """Fragmentation proxy (sampled peak RSS delta / peak live bytes) as its
+    own lower-is-better panel with a 1.0 reference line."""
+
+    cells = memory_bar_cells(memory, "fragmentation-proxy")
+    canvas = Canvas(MEMORY_PANEL_WIDTH, MEMORY_PANEL_HEIGHT, (248, 250, 252))
+    draw_ratio_bar_grid(canvas, cells)
+    return encode_png(
+        MEMORY_PANEL_WIDTH,
+        MEMORY_PANEL_HEIGHT,
+        canvas.pixels,
+        "Fragmentation proxy (sampled peak RSS delta / peak live bytes); lower is better",
+    )
 
 
 def latency_png(latency: Mapping[str, object]) -> bytes:
@@ -2699,11 +2817,7 @@ def draw_pareto(canvas: Canvas, points: Sequence[tuple[str, float, float, str, s
     grid_color = (223, 229, 236)
     label_color = (90, 102, 115)
     canvas.rectangle(0, 0, PARETO_WIDTH, 62, (24, 35, 52))
-    legend_x = 30
-    for allocator in ALLOCATOR_IDS:
-        canvas.rectangle(legend_x, 22, 18, 18, COLORS[ALLOCATOR_IDS.index(allocator)])
-        canvas.text(legend_x + 26, 22, allocator, (232, 238, 247), 2)
-        legend_x += 26 + text_width(allocator, 2) + 30
+    draw_allocator_legend(canvas, 30, 22)
     x_max, y_max = pareto_scale(points)
     unit = axis_unit(y_max)
     for step in range(5):
@@ -3602,16 +3716,53 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             validate_absolute(value, "memory absolute")
             for value in list_value(memory["absolute_summaries"], "memory absolute summaries")
         ]
-        memory_rows = "".join(
-            f"<tr><td>{escaped(value['scenario_id'])}</td><td>{escaped(value['thread_point'])}</td><td>{escaped(value['metric_id'])}</td><td>{escaped(value['allocator_id'])}</td><td>{escaped(round(float_value(object_value(value['summary'], 'memory summary')['median'], 'memory median') / (1024 * 1024), 3) if value['metric_id'] != 'fragmentation-proxy' else object_value(value['summary'], 'memory summary')['median'])}</td></tr>"
+        upstream_peaks = {
+            (
+                cast(str, value["scenario_id"]),
+                cast(str, value["thread_point"]),
+            ): float_value(
+                object_value(value["summary"], "memory summary")["median"],
+                "memory upstream median",
+                True,
+            )
             for value in memory_absolute
-        )
+            if value["metric_id"] == "sampled-peak-rss-bytes"
+            and value["allocator_id"] == "upstream-mimalloc"
+        }
+
+        def memory_row(value: Mapping[str, object]) -> str:
+            median = float_value(
+                object_value(value["summary"], "memory summary")["median"],
+                "memory median",
+                True,
+            )
+            display = (
+                median
+                if value["metric_id"] == "fragmentation-proxy"
+                else round(median / (1024 * 1024), 3)
+            )
+            if value["metric_id"] == "sampled-peak-rss-bytes":
+                reference = upstream_peaks[
+                    (cast(str, value["scenario_id"]), cast(str, value["thread_point"]))
+                ]
+                relative = f"{median / reference:.2f}x"
+            else:
+                relative = "-"
+            return (
+                f"<tr><td>{escaped(value['scenario_id'])}</td>"
+                f"<td>{escaped(value['thread_point'])}</td>"
+                f"<td>{escaped(value['metric_id'])}</td>"
+                f"<td>{escaped(value['allocator_id'])}</td>"
+                f"<td>{escaped(display)}</td><td>{escaped(relative)}</td></tr>"
+            )
+
+        memory_rows = "".join(memory_row(value) for value in memory_absolute)
         memory_actions = (
             f"https://github.com/zackees/mimalloc-pprof/actions/runs/{escaped(memory_run['run_id'])}"
             if memory_run["run_origin"] == "github-actions"
             else "https://github.com/zackees/mimalloc-pprof/actions"
         )
-        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Absolute Linux process RSS for all four allocators; lower is better"><img src="benchmark-pareto.png" alt="Speed-memory Pareto scatter: fragmentation proxy versus median throughput; upper-left is better"><img src="benchmark-rss-timeline.png" alt="Linux process RSS over time with workload-drained marker and post-drain return-to-OS points; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. The Pareto scatter pairs each allocator's fragmentation proxy with its median throughput on the matching scenario/thread cell; upper-left is better. The timeline shows RSS growth, the workload-drained marker, and the 100 ms / 1 s / 5 s post-drain points so return-to-OS behavior is visible. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
+        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Sampled peak RSS normalized to upstream-mimalloc; 1.0 equals upstream; lower is better"><img src="benchmark-pareto.png" alt="Speed-memory Pareto scatter: fragmentation proxy versus median throughput; upper-left is better"><img src="benchmark-rss-timeline.png" alt="Linux process RSS over time with workload-drained marker and post-drain return-to-OS points; lower is better"><img src="benchmark-fragmentation.png" alt="Fragmentation proxy ratio bars with a 1.0 reference line; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. The bar chart normalizes sampled peak RSS to <code>upstream-mimalloc</code> = 1.0 (matching the throughput panel), with absolute MiB in the table below. The Pareto scatter pairs each allocator's fragmentation proxy with its median throughput on the matching scenario/thread cell; upper-left is better. The timeline shows RSS growth, the workload-drained marker, and the 100 ms / 1 s / 5 s post-drain points so return-to-OS behavior is visible. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th><th>vs upstream</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
     latency_html = ""
     if "latency" in latest:
         latency = validate_latency_report(latest["latency"], "latest.latency")
@@ -3689,9 +3840,9 @@ def render_html(latest: Mapping[str, object]) -> bytes:
 <h1>Allocator benchmark report</h1><p>Suite <code>{escaped(latest["suite_version"])}</code>; source <code>{escaped(run["source_sha"])}</code>; runner {escaped(runner["runner_class"])}. Intervals are informational.</p>
 <nav><a href="latest.json">validated latest data</a> · <a href="history.jsonl">compact history</a></nav>
 <h2 id="throughput">Throughput</h2><img src="benchmark-throughput.png" alt="Per-scenario absolute throughput bars for all four allocators"><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>Median</th><th>Noisy</th></tr></thead><tbody>{absolute_rows}</tbody></table>
-<h2>Paired effects</h2><table><thead><tr><th>Scenario</th><th>Candidate</th><th>Effect</th><th>95% interval</th><th>Interpretation</th></tr></thead><tbody>{paired_rows}</tbody></table>
+{memory_html}<h2>Paired effects</h2><table><thead><tr><th>Scenario</th><th>Candidate</th><th>Effect</th><th>95% interval</th><th>Interpretation</th></tr></thead><tbody>{paired_rows}</tbody></table>
 <h2 id="history">Compatible history</h2><img src="benchmark-history.png" alt="History connected only across the selected identical comparison key">
-{memory_html}{latency_html}{scaling_html}<h2>Pending Phase 6 panels</h2>{pending_html}<section id="phase-6"><p>Pending panels contain no measured values.</p></section>
+{latency_html}{scaling_html}<h2>Pending Phase 6 panels</h2>{pending_html}<section id="phase-6"><p>Pending panels contain no measured values.</p></section>
 <h2>Provenance</h2><p>Run {escaped(run["run_id"])}, attempt {escaped(run["run_attempt"])}; target {escaped(runner["target"])}; fingerprint <code>{escaped(runner["fingerprint_sha256"])}</code>.</p><table><thead><tr><th>Allocator</th><th>Source</th><th>Binary</th></tr></thead><tbody>{allocator_rows}</tbody></table><p><a href="{escaped(latest["actions_run_url"])}">Actions run</a></p>
 <h2>Methodology</h2><pre>{escaped(json.dumps(latest["methodology"], sort_keys=True, ensure_ascii=False))}</pre><h2>Reproduce</h2><pre><code>{escaped(latest["reproduction_command"])}</code></pre>
 </body></html>"""
@@ -3774,6 +3925,7 @@ def render(
         (output / image_names["memory"]).write_bytes(memory_png(memory))
         (output / "benchmark-pareto.png").write_bytes(pareto_png(latest))
         (output / "benchmark-rss-timeline.png").write_bytes(rss_timeline_png(memory))
+        (output / "benchmark-fragmentation.png").write_bytes(fragmentation_png(memory))
     else:
         item = pending["memory"]
         (output / image_names["memory"]).write_bytes(
@@ -3789,6 +3941,9 @@ def render(
                 TIMELINE_WIDTH,
                 TIMELINE_HEIGHT,
             )
+        )
+        (output / "benchmark-fragmentation.png").write_bytes(
+            pending_png("fragmentation proxy panel", cast(str, item["reason"]))
         )
     if "latency" in latest:
         latency = validate_latency_report(latest["latency"], "latest.latency")

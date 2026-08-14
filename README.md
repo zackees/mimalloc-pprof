@@ -896,7 +896,14 @@ placeholder panels until their measurement protocols land:
 Memory ([#184](https://github.com/zackees/mimalloc-pprof/issues/184)), honest
 transaction latency ([#185](https://github.com/zackees/mimalloc-pprof/issues/185)),
 and thread scaling ([#203](https://github.com/zackees/mimalloc-pprof/issues/203))
-have landed; their panels populate on each metric's next scheduled run.
+have landed; their panels populate on each metric's next scheduled run. The
+memory section renders four views over the same sealed envelope
+([#211](https://github.com/zackees/mimalloc-pprof/issues/211)): sampled-peak RSS
+bars normalized to upstream mimalloc (1.0 = upstream, matching the throughput
+panel), a fragmentation-proxy panel with its own 1.0 reference line, an
+RSS-over-time timeline with the workload-drained marker and the 100 ms / 1 s /
+5 s return-to-OS points annotated, and a speed–memory Pareto scatter (upper-left
+is better).
 
 ---
 

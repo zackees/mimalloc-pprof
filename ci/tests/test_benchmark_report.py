@@ -695,10 +695,10 @@ class BenchmarkReportTests(unittest.TestCase):
     def test_readme_embeds_only_real_charts_and_clicks_through_to_pages(self) -> None:
         readme = Path(__file__).resolve().parents[2] / "README.md"
         source = readme.read_text(encoding="utf-8")
-        expected = {
-            "benchmark-throughput.png": "https://zackees.github.io/mimalloc-pprof/#throughput",
-            "benchmark-history.png": "https://zackees.github.io/mimalloc-pprof/#history",
-        }
+        # #210 dropped the unlabeled throughput/history PNG stubs from the
+        # README: only charts with real axes, legend, and values are embedded.
+        # The headline numbers stay live dashboard links instead.
+        expected = {}
         # Every scaling panel is embedded and clicks through to its section.
         for name in report.SCALING_PANELS.values():
             expected[name] = "https://zackees.github.io/mimalloc-pprof/#scaling"
@@ -710,13 +710,17 @@ class BenchmarkReportTests(unittest.TestCase):
         # Every embedded name must be a file the renderer actually emits, or
         # the README links 404 on the published branch.
         self.assertTrue(set(expected) <= report.SITE_FILES)
-        for pending in (
+        for anchor in ("#throughput", "#history"):
+            self.assertIn(f"](https://zackees.github.io/mimalloc-pprof/{anchor})", source)
+        for not_embedded in (
+            "benchmark-throughput.png",
+            "benchmark-history.png",
             "benchmark-memory.png",
             "benchmark-latency.png",
             "benchmark-scaling.png",
             "benchmark-pprof-tax.png",
         ):
-            self.assertNotIn(pending, source)
+            self.assertNotIn(not_embedded, source)
         self.assertIn("https://github.com/zackees/mimalloc-pprof/tree/benchmark-stats", source)
         self.assertIn("https://zackees.github.io/mimalloc-pprof/latest.json", source)
 

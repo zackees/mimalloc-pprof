@@ -551,12 +551,108 @@ class BenchmarkReportTests(unittest.TestCase):
                 b"Speed-memory Pareto scatter",
                 (site / "benchmark-pareto.png").read_bytes(),
             )
+            self.assertIn(
+                b"RSS over time with post-drain",
+                (site / "benchmark-rss-timeline.png").read_bytes(),
+            )
 
-    def test_pending_memory_keeps_pareto_placeholder(self) -> None:
+    def test_pending_memory_keeps_placeholder_panels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             site, _digest = self.render_fixture(Path(temporary))
             pareto = (site / "benchmark-pareto.png").read_bytes()
             self.assertIn(b"PENDING speed-memory Pareto scatter", pareto)
+            timeline = (site / "benchmark-rss-timeline.png").read_bytes()
+            self.assertIn(b"PENDING RSS timeline", timeline)
+
+    def test_rss_timeline_sawtooth_rises_falls_and_decay_markers_at_offsets(self) -> None:
+        # One synthetic cell: every allocator gets a sawtooth timeline that
+        # rises to a distinct peak, falls back, and then decays through the
+        # three post-drain return-to-OS points at distinct RSS values.
+        samples: list[dict[str, object]] = []
+        for index, allocator in enumerate(report.ALLOCATOR_IDS):
+            peak = (300 + 20 * index) * 1024 * 1024
+            samples.append(
+                {
+                    "scenario_id": "sawtooth-retain-drain",
+                    "thread_point": "physical-core",
+                    "allocator_id": allocator,
+                    "workload_active_ns": 10_000_000,
+                    "workload_drained_ns": 50_000_000,
+                    "post_drain_sample_100ms_ns": 150_000_000,
+                    "post_drain_sample_1s_ns": 1_050_000_000,
+                    "post_drain_sample_5s_ns": 5_050_000_000,
+                    "post_drain_rss_100ms_bytes": 160 * 1024 * 1024,
+                    "post_drain_rss_1s_bytes": 130 * 1024 * 1024,
+                    "post_drain_rss_5s_bytes": (110 + 20 * index) * 1024 * 1024,
+                    "timeline": [
+                        {"elapsed_ns": 15_000_000, "rss_bytes": 120 * 1024 * 1024},
+                        {"elapsed_ns": 25_000_000, "rss_bytes": 180 * 1024 * 1024},
+                        {"elapsed_ns": 35_000_000, "rss_bytes": peak},
+                        {"elapsed_ns": 45_000_000, "rss_bytes": 200 * 1024 * 1024},
+                    ],
+                }
+            )
+        memory = {"raw_samples": samples}
+        cells = report.timeline_cells(memory)
+        self.assertEqual(1, len(cells))
+        t_min, t_max, rss_min, rss_max = report.timeline_domain(cells)
+        slot_width = report.TIMELINE_WIDTH // report.TIMELINE_COLS
+        slot_height = report.TIMELINE_HEIGHT // report.TIMELINE_ROWS
+        left, top, right, bottom = report.TIMELINE_SLOT_MARGINS
+        plot_width = slot_width - left - right
+        plot_height = slot_height - top - bottom
+        canvas = report.Canvas(report.TIMELINE_WIDTH, report.TIMELINE_HEIGHT, (248, 250, 252))
+        report.draw_rss_timeline(canvas, cells)
+        # Time maps monotonically increasing; RSS maps monotonically decreasing.
+        self.assertGreater(report.timeline_x(20_000_000, t_min, t_max, left, plot_width), left)
+        self.assertGreater(
+            report.timeline_x(40_000_000, t_min, t_max, left, plot_width),
+            report.timeline_x(20_000_000, t_min, t_max, left, plot_width),
+        )
+        self.assertLess(
+            report.timeline_y(300 * 1024 * 1024, rss_min, rss_max, top, plot_height),
+            report.timeline_y(150 * 1024 * 1024, rss_min, rss_max, top, plot_height),
+        )
+        for index, allocator in enumerate(report.ALLOCATOR_IDS):
+            color = report.COLORS[report.ALLOCATOR_IDS.index(allocator)]
+            peak = (300 + 20 * index) * 1024 * 1024
+            # The rise is visible: the peak pixel carries the allocator color.
+            x = round(report.timeline_x(35_000_000, t_min, t_max, left, plot_width))
+            y = round(report.timeline_y(peak, rss_min, rss_max, top, plot_height))
+            offset = (y * report.TIMELINE_WIDTH + x) * 3
+            self.assertEqual(color, tuple(canvas.pixels[offset : offset + 3]), f"{allocator} peak")
+            # The fall is visible: the later, lower point sits below the peak.
+            self.assertGreater(
+                report.timeline_y(200 * 1024 * 1024, rss_min, rss_max, top, plot_height), y
+            )
+            # The 5 s post-drain diamond lands at the recorded elapsed offset.
+            decay_x = round(report.timeline_x(5_050_000_000, t_min, t_max, left, plot_width))
+            decay_y = round(
+                report.timeline_y(
+                    (110 + 20 * index) * 1024 * 1024, rss_min, rss_max, top, plot_height
+                )
+            )
+            # The diamond is a hollow outline; probe its top vertex.
+            offset = ((decay_y - 5) * report.TIMELINE_WIDTH + decay_x) * 3
+            self.assertEqual(
+                color, tuple(canvas.pixels[offset : offset + 3]), f"{allocator} 5s decay"
+            )
+        # The workload-drained dashed marker starts at the recorded drained
+        # offset at the top of the plot.
+        drained_x = round(report.timeline_x(50_000_000, t_min, t_max, left, plot_width))
+        offset = ((top + 2) * report.TIMELINE_WIDTH + drained_x) * 3
+        self.assertEqual(report.TIMELINE_DRAIN_COLOR, tuple(canvas.pixels[offset : offset + 3]))
+        # The axis carries the three post-drain offset diamonds at their
+        # recorded elapsed offsets.
+        for delay_ns in (100_000_000, 1_000_000_000, 5_000_000_000):
+            x = round(report.timeline_x(50_000_000 + delay_ns, t_min, t_max, left, plot_width))
+            # The axis diamonds are hollow outlines; probe their top vertex.
+            axis_diamond = ((top + plot_height + 10 - 3) * report.TIMELINE_WIDTH + x) * 3
+            self.assertEqual(
+                (90, 102, 115),
+                tuple(canvas.pixels[axis_diamond : axis_diamond + 3]),
+                f"axis diamond at +{delay_ns} ns",
+            )
 
     def test_pareto_places_known_points_at_expected_coordinates(self) -> None:
         cells = (("scenario-00", "1"), ("scenario-01", "2"))

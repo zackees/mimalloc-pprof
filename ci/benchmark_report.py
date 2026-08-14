@@ -144,6 +144,7 @@ SITE_FILES = {
     "benchmark-throughput.png",
     "benchmark-history.png",
     "benchmark-memory.png",
+    "benchmark-pareto.png",
     "benchmark-latency.png",
     "benchmark-pprof-tax.png",
     *SCALING_PANELS.values(),
@@ -152,6 +153,7 @@ PNG_DIMENSIONS = {
     "benchmark-throughput.png": (1280, 720),
     "benchmark-history.png": (1280, 720),
     "benchmark-memory.png": (960, 540),
+    "benchmark-pareto.png": (960, 540),
     "benchmark-latency.png": (960, 540),
     "benchmark-pprof-tax.png": (960, 540),
 }
@@ -181,6 +183,7 @@ ROLES = {
     "benchmark-throughput.png": "throughput-chart",
     "benchmark-history.png": "history-chart",
     "benchmark-memory.png": "memory-panel",
+    "benchmark-pareto.png": "pareto-panel",
     "benchmark-latency.png": "latency-panel",
     "benchmark-pprof-tax.png": "pending-pprof-tax-panel",
     **dict.fromkeys(SCALING_PANELS.values(), "scaling-panel"),
@@ -2353,6 +2356,103 @@ class Canvas:
             y = y0 + (y1 - y0) * step // steps
             self.rectangle(x - thickness // 2, y - thickness // 2, thickness, thickness, color)
 
+    def text(
+        self,
+        x: int,
+        y: int,
+        value: str,
+        color: tuple[int, int, int],
+        scale: int = 2,
+    ) -> None:
+        """Draw a label with the built-in 3x5 bitmap font.
+
+        The rasterized panels carry no vector text, so axis labels, legends,
+        and annotations all go through this. Unknown characters advance the
+        cursor and draw nothing; letters render in uppercase.
+        """
+
+        cursor = x
+        for character in value.upper():
+            glyph = FONT_3X5.get(character)
+            if glyph is None:
+                cursor += FONT_ADVANCE * scale
+                continue
+            for row, bits in enumerate(glyph):
+                for column, pixel in enumerate(bits):
+                    if pixel == "#":
+                        self.rectangle(
+                            cursor + column * scale,
+                            y + row * scale,
+                            scale,
+                            scale,
+                            color,
+                        )
+            cursor += FONT_ADVANCE * scale
+
+
+def text_width(value: str, scale: int = 2) -> int:
+    """Pixel width of a label; the trailing inter-glyph gap is not counted."""
+
+    return len(value) * FONT_ADVANCE * scale - scale
+
+
+# Minimal 3x5 bitmap font. Only the glyphs the panels use are included, so the
+# dict doubles as documentation of the rendered alphabet.
+FONT_3X5: dict[str, tuple[str, str, str, str, str]] = {
+    "0": (".#.", "#.#", "#.#", "#.#", ".#."),
+    "1": (".#.", "##.", ".#.", ".#.", "###"),
+    "2": ("##.", "..#", ".#.", "#..", "###"),
+    "3": ("##.", "..#", ".#.", "..#", "##."),
+    "4": ("#.#", "#.#", "###", "..#", "..#"),
+    "5": ("###", "#..", "##.", "..#", "##."),
+    "6": (".##", "#..", "##.", "#.#", ".#."),
+    "7": ("###", "..#", ".#.", ".#.", ".#."),
+    "8": (".#.", "#.#", ".#.", "#.#", ".#."),
+    "9": (".#.", "#.#", ".##", "..#", "##."),
+    "A": (".#.", "#.#", "###", "#.#", "#.#"),
+    "B": ("##.", "#.#", "##.", "#.#", "##."),
+    "C": (".##", "#..", "#..", "#..", ".##"),
+    "D": ("##.", "#.#", "#.#", "#.#", "##."),
+    "E": ("###", "#..", "##.", "#..", "###"),
+    "F": ("###", "#..", "##.", "#..", "#.."),
+    "G": (".##", "#..", "#.#", "#.#", ".##"),
+    "H": ("#.#", "#.#", "###", "#.#", "#.#"),
+    "I": ("###", ".#.", ".#.", ".#.", "###"),
+    "J": ("..#", "..#", "..#", "#.#", ".#."),
+    "K": ("#.#", "#.#", "##.", "#.#", "#.#"),
+    "L": ("#..", "#..", "#..", "#..", "###"),
+    "M": ("#.#", "###", "###", "#.#", "#.#"),
+    "N": ("##.", "#.#", "#.#", "#.#", "#.#"),
+    "O": (".#.", "#.#", "#.#", "#.#", ".#."),
+    "P": ("##.", "#.#", "##.", "#..", "#.."),
+    "Q": (".#.", "#.#", "#.#", "##.", ".##"),
+    "R": ("##.", "#.#", "##.", "#.#", "#.#"),
+    "S": (".##", "#..", ".#.", "..#", "##."),
+    "T": ("###", ".#.", ".#.", ".#.", ".#."),
+    "U": ("#.#", "#.#", "#.#", "#.#", "###"),
+    "V": ("#.#", "#.#", "#.#", "#.#", ".#."),
+    "W": ("#.#", "#.#", "###", "###", "#.#"),
+    "X": ("#.#", "#.#", ".#.", "#.#", "#.#"),
+    "Y": ("#.#", "#.#", ".#.", ".#.", ".#."),
+    "Z": ("###", "..#", ".#.", "#..", "###"),
+    " ": ("...", "...", "...", "...", "..."),
+    ".": ("...", "...", "...", "...", ".#."),
+    ",": ("...", "...", "...", "..#", ".#."),
+    "%": ("#.#", "..#", ".#.", "#..", "#.#"),
+    "/": ("..#", "..#", ".#.", "#..", "#.."),
+    "-": ("...", "...", "###", "...", "..."),
+    "+": ("...", ".#.", "###", ".#.", "..."),
+    "(": ("..#", ".#.", "#..", ".#.", "..#"),
+    ")": ("#..", ".#.", "..#", ".#.", "#.."),
+    "=": ("...", "###", "...", "###", "..."),
+    "<": ("..#", ".#.", "#..", ".#.", "..#"),
+    ">": ("#..", ".#.", "..#", ".#.", "#.."),
+    "^": (".#.", "#.#", "...", "...", "..."),
+}
+FONT_GLYPH_WIDTH = 3
+FONT_GLYPH_HEIGHT = 5
+FONT_ADVANCE = 4  # glyph width plus one blank column
+
 
 COLORS = [(53, 132, 228), (239, 108, 0), (15, 157, 88), (171, 71, 188)]
 
@@ -2496,6 +2596,172 @@ def latency_png(latency: Mapping[str, object]) -> bytes:
         540,
         canvas.pixels,
         "Transaction latency p99; allocation plus touch/checksum through free; lower is better",
+    )
+
+
+PARETO_WIDTH = 960
+PARETO_HEIGHT = 540
+# Plot margins in pixels: left, top, right, bottom.
+PARETO_MARGINS = (118, 96, 30, 56)
+
+
+def pareto_points(
+    memory: Mapping[str, object], latest: Mapping[str, object]
+) -> list[tuple[str, float, float, str, str]]:
+    """Pair each memory fragmentation median with the core throughput median
+    on the matching scenario/thread/allocator cell.
+
+    Every returned item is (allocator_id, fragmentation_proxy,
+    ops_per_second, scenario_id, thread_point). Cells missing either half are
+    skipped: the chart renders exactly what genuinely matches, and nothing
+    is fabricated for cells that do not.
+    """
+
+    def cell_medians(
+        records: Sequence[dict[str, object]], metric_id: str
+    ) -> dict[tuple[str, str, str], float]:
+        medians: dict[tuple[str, str, str], float] = {}
+        for record in records:
+            if cast(str, record["metric_id"]) != metric_id:
+                continue
+            key = (
+                cast(str, record["scenario_id"]),
+                cast(str, record["thread_point"]),
+                cast(str, record["allocator_id"]),
+            )
+            medians[key] = float_value(
+                object_value(record["summary"], "pareto summary")["median"],
+                "pareto median",
+                True,
+            )
+        return medians
+
+    memory_records = [
+        validate_absolute(value, "memory pareto record")
+        for value in list_value(memory["absolute_summaries"], "memory pareto summaries")
+    ]
+    core_records = [
+        validate_absolute(value, "core pareto record")
+        for value in list_value(latest["absolute_summaries"], "core pareto summaries")
+    ]
+    fragmentation = cell_medians(memory_records, "fragmentation-proxy")
+    throughput = cell_medians(core_records, "throughput-operations-per-second")
+    return [
+        (key[2], fragmentation[key], throughput[key], key[0], key[1])
+        for key in sorted(set(fragmentation) & set(throughput))
+    ]
+
+
+def pareto_scale(points: Sequence[tuple[str, float, float, str, str]]) -> tuple[float, float]:
+    """Axis ceilings with 15% headroom over the largest observed value."""
+
+    x_max = (
+        max(
+            (fragmentation for _allocator, fragmentation, _ops, _scenario, _point in points),
+            default=0.0,
+        )
+        * 1.15
+    )
+    y_max = (
+        max(
+            (ops for _allocator, _fragmentation, ops, _scenario, _point in points),
+            default=0.0,
+        )
+        * 1.15
+    )
+    return max(x_max, 1.0), max(y_max, 1.0)
+
+
+def pareto_x(fragmentation: float, x_max: float) -> float:
+    left, _top, right, _bottom = PARETO_MARGINS
+    return left + (PARETO_WIDTH - left - right) * fragmentation / x_max
+
+
+def pareto_y(ops: float, y_max: float) -> float:
+    _left, top, _right, bottom = PARETO_MARGINS
+    return top + (PARETO_HEIGHT - top - bottom) * (1.0 - ops / y_max)
+
+
+def draw_pareto(canvas: Canvas, points: Sequence[tuple[str, float, float, str, str]]) -> None:
+    """Fragmentation (x, lower is better) vs throughput (y, higher is better)
+    with one colored marker per matched cell. The upper-left corner is the
+    good corner and is marked explicitly."""
+
+    left, top, right, bottom = PARETO_MARGINS
+    plot_width = PARETO_WIDTH - left - right
+    plot_height = PARETO_HEIGHT - top - bottom
+    axis_color = (90, 102, 115)
+    grid_color = (223, 229, 236)
+    label_color = (90, 102, 115)
+    canvas.rectangle(0, 0, PARETO_WIDTH, 62, (24, 35, 52))
+    legend_x = 30
+    for allocator in ALLOCATOR_IDS:
+        canvas.rectangle(legend_x, 22, 18, 18, COLORS[ALLOCATOR_IDS.index(allocator)])
+        canvas.text(legend_x + 26, 22, allocator, (232, 238, 247), 2)
+        legend_x += 26 + text_width(allocator, 2) + 30
+    x_max, y_max = pareto_scale(points)
+    unit = axis_unit(y_max)
+    for step in range(5):
+        fraction = step / 4
+        x = round(left + plot_width * fraction)
+        y = round(top + plot_height * (1 - fraction))
+        canvas.line(x, top, x, PARETO_HEIGHT - bottom, grid_color)
+        canvas.line(left, y, PARETO_WIDTH - right, y, grid_color)
+        x_label = f"{x_max * fraction:.2f}"
+        canvas.text(
+            x - text_width(x_label) // 2,
+            PARETO_HEIGHT - bottom + 12,
+            x_label,
+            label_color,
+        )
+        y_label = format_throughput(y_max * fraction, unit)
+        canvas.text(left - 10 - text_width(y_label), y - 5, y_label, label_color)
+    canvas.line(left, top, left, PARETO_HEIGHT - bottom, axis_color, 2)
+    canvas.line(
+        left, PARETO_HEIGHT - bottom, PARETO_WIDTH - right, PARETO_HEIGHT - bottom, axis_color, 2
+    )
+    canvas.text(left, top - 30, "median throughput (ops/s)", label_color, 1)
+    x_caption = "fragmentation proxy (lower is better)"
+    canvas.text(
+        left + (plot_width - text_width(x_caption, 1)) // 2,
+        PARETO_HEIGHT - bottom + 27,
+        x_caption,
+        label_color,
+        1,
+    )
+    if not points:
+        empty = "no memory cells match a core throughput cell"
+        canvas.text(
+            left + (plot_width - text_width(empty, 2)) // 2,
+            top + plot_height // 2 - 10,
+            empty,
+            (117, 126, 140),
+            2,
+        )
+        return
+    # Mark the good corner with a green L-bracket and label.
+    better = (15, 157, 88)
+    canvas.line(left + 4, top + 6, left + 28, top + 6, better, 4)
+    canvas.line(left + 6, top + 4, left + 6, top + 26, better, 4)
+    canvas.text(left + 14, top + 34, "better", better, 2)
+    for allocator, fragmentation, ops, _scenario, _point in points:
+        x = round(pareto_x(fragmentation, x_max))
+        y = round(pareto_y(ops, y_max))
+        canvas.rectangle(x - 4, y - 4, 8, 8, COLORS[ALLOCATOR_IDS.index(allocator)])
+
+
+def pareto_png(latest: Mapping[str, object]) -> bytes:
+    # Envelope-level validation belongs to validate_latest in render(); like
+    # the sibling draw functions this validates only the records it consumes.
+    memory = object_value(latest["memory"], "latest.memory")
+    points = pareto_points(memory, latest)
+    canvas = Canvas(PARETO_WIDTH, PARETO_HEIGHT, (248, 250, 252))
+    draw_pareto(canvas, points)
+    return encode_png(
+        PARETO_WIDTH,
+        PARETO_HEIGHT,
+        canvas.pixels,
+        "Speed-memory Pareto scatter; fragmentation proxy vs median throughput; upper-left is better",
     )
 
 
@@ -3005,7 +3271,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             if memory_run["run_origin"] == "github-actions"
             else "https://github.com/zackees/mimalloc-pprof/actions"
         )
-        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Absolute Linux process RSS for all four allocators; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
+        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Absolute Linux process RSS for all four allocators; lower is better"><img src="benchmark-pareto.png" alt="Speed-memory Pareto scatter: fragmentation proxy versus median throughput; upper-left is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. The Pareto scatter pairs each allocator's fragmentation proxy with its median throughput on the matching scenario/thread cell; upper-left is better. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
     latency_html = ""
     if "latency" in latest:
         latency = validate_latency_report(latest["latency"], "latest.latency")
@@ -3166,10 +3432,14 @@ def render(
     if "memory" in latest:
         memory = validate_memory_report(latest["memory"], "latest.memory")
         (output / image_names["memory"]).write_bytes(memory_png(memory))
+        (output / "benchmark-pareto.png").write_bytes(pareto_png(latest))
     else:
         item = pending["memory"]
         (output / image_names["memory"]).write_bytes(
             pending_png("memory", cast(str, item["reason"]))
+        )
+        (output / "benchmark-pareto.png").write_bytes(
+            pending_png("speed-memory Pareto scatter", cast(str, item["reason"]))
         )
     if "latency" in latest:
         latency = validate_latency_report(latest["latency"], "latest.latency")

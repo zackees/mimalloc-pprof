@@ -145,6 +145,7 @@ SITE_FILES = {
     "benchmark-history.png",
     "benchmark-memory.png",
     "benchmark-pareto.png",
+    "benchmark-rss-timeline.png",
     "benchmark-latency.png",
     "benchmark-pprof-tax.png",
     *SCALING_PANELS.values(),
@@ -154,6 +155,7 @@ PNG_DIMENSIONS = {
     "benchmark-history.png": (1280, 720),
     "benchmark-memory.png": (960, 540),
     "benchmark-pareto.png": (960, 540),
+    "benchmark-rss-timeline.png": (1280, 720),
     "benchmark-latency.png": (960, 540),
     "benchmark-pprof-tax.png": (960, 540),
 }
@@ -184,6 +186,7 @@ ROLES = {
     "benchmark-history.png": "history-chart",
     "benchmark-memory.png": "memory-panel",
     "benchmark-pareto.png": "pareto-panel",
+    "benchmark-rss-timeline.png": "rss-timeline-panel",
     "benchmark-latency.png": "latency-panel",
     "benchmark-pprof-tax.png": "pending-pprof-tax-panel",
     **dict.fromkeys(SCALING_PANELS.values(), "scaling-panel"),
@@ -2516,13 +2519,15 @@ def history_png(rows: Sequence[Mapping[str, object]], key: str) -> bytes:
     return encode_png(1280, 720, canvas.pixels, "History for one identical comparison key")
 
 
-def pending_png(metric: str, reason: str) -> bytes:
-    canvas = Canvas(960, 540, (248, 250, 252))
-    canvas.rectangle(55, 55, 850, 430, (231, 236, 242))
-    canvas.rectangle(55, 55, 850, 18, (117, 126, 140))
-    canvas.rectangle(170, 205, 620, 95, (255, 193, 7))
-    canvas.line(205, 345, 755, 345, (117, 126, 140), 5)
-    return encode_png(960, 540, canvas.pixels, f"PENDING {metric}: {reason}")
+def pending_png(metric: str, reason: str, width: int = 960, height: int = 540) -> bytes:
+    canvas = Canvas(width, height, (248, 250, 252))
+    left = max(30, (width - 850) // 2)
+    top = max(30, (height - 430) // 2)
+    canvas.rectangle(left, top, 850, 430, (231, 236, 242))
+    canvas.rectangle(left, top, 850, 18, (117, 126, 140))
+    canvas.rectangle(left + 115, top + 150, 620, 95, (255, 193, 7))
+    canvas.line(left + 150, top + 290, left + 700, top + 290, (117, 126, 140), 5)
+    return encode_png(width, height, canvas.pixels, f"PENDING {metric}: {reason}")
 
 
 def memory_png(memory: Mapping[str, object]) -> bytes:
@@ -2762,6 +2767,341 @@ def pareto_png(latest: Mapping[str, object]) -> bytes:
         PARETO_HEIGHT,
         canvas.pixels,
         "Speed-memory Pareto scatter; fragmentation proxy vs median throughput; upper-left is better",
+    )
+
+
+TIMELINE_WIDTH = 1280
+TIMELINE_HEIGHT = 720
+TIMELINE_COLS = 4
+TIMELINE_ROWS = 2
+# Per-slot plot margins in pixels: left, top, right, bottom. The bottom margin
+# fits two label rows: the time tick labels plus the post-drain offset diamonds.
+TIMELINE_SLOT_MARGINS = (54, 26, 6, 34)
+TIMELINE_DRAIN_COLOR = (90, 102, 115)
+TIMELINE_GRID_COLOR = (223, 229, 236)
+
+
+def _median_int(values: Sequence[int]) -> int:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) // 2
+
+
+def _format_mib(value: int) -> str:
+    return f"{value // (1024 * 1024)}M"
+
+
+def _timeline_series(group: Sequence[Mapping[str, object]], label: str) -> dict[str, object]:
+    """Per-allocator series for one memory cell: the raw (elapsed, rss) points
+    plus the median drained timestamp and the three post-drain medians."""
+
+    allocators: dict[str, list[Mapping[str, object]]] = {}
+    for sample in group:
+        allocator = string_value(sample.get("allocator_id"), f"{label}.allocator_id")
+        if allocator not in ALLOCATOR_IDS:
+            fail(f"{label}: unknown allocator {allocator}")
+        allocators.setdefault(allocator, []).append(sample)
+    series: dict[str, dict[str, object]] = {}
+    for allocator in ALLOCATOR_IDS:
+        samples = allocators[allocator]
+        points: list[tuple[int, int]] = []
+        for sample in samples:
+            timeline = list_value(sample.get("timeline"), f"{label}.timeline")
+            for index, point_value in enumerate(timeline):
+                point = object_value(point_value, f"{label}.timeline[{index}]")
+                points.append(
+                    (
+                        int_value(
+                            point.get("elapsed_ns"), f"{label}.timeline[{index}].elapsed_ns", 1
+                        ),
+                        int_value(
+                            point.get("rss_bytes"), f"{label}.timeline[{index}].rss_bytes", 1
+                        ),
+                    )
+                )
+        series[allocator] = {
+            "points": sorted(points),
+            "drained_ns": _median_int(
+                [
+                    int_value(sample.get("workload_drained_ns"), f"{label}.workload_drained_ns", 1)
+                    for sample in samples
+                ]
+            ),
+            "active_ns": _median_int(
+                [
+                    int_value(sample.get("workload_active_ns"), f"{label}.workload_active_ns", 1)
+                    for sample in samples
+                ]
+            ),
+            "decay": [
+                (
+                    _median_int(
+                        [
+                            int_value(
+                                sample.get(f"post_drain_sample_{delay}_ns"),
+                                f"{label}.post_drain_sample_{delay}_ns",
+                                1,
+                            )
+                            for sample in samples
+                        ]
+                    ),
+                    _median_int(
+                        [
+                            int_value(
+                                sample.get(f"post_drain_rss_{delay}_bytes"),
+                                f"{label}.post_drain_rss_{delay}_bytes",
+                                1,
+                            )
+                            for sample in samples
+                        ]
+                    ),
+                )
+                for delay in ("100ms", "1s", "5s")
+            ],
+        }
+    return {
+        "series": series,
+        "drained_ns": _median_int(
+            [cast(int, series[allocator]["drained_ns"]) for allocator in ALLOCATOR_IDS]
+        ),
+        "active_ns": _median_int(
+            [cast(int, series[allocator]["active_ns"]) for allocator in ALLOCATOR_IDS]
+        ),
+    }
+
+
+def timeline_cells(memory: Mapping[str, object]) -> list[dict[str, object]]:
+    """Group the memory raw samples by declared cell, in cell order."""
+
+    samples = [
+        object_value(value, "timeline sample")
+        for value in list_value(memory["raw_samples"], "timeline raw samples")
+    ]
+    grouped: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    for sample in samples:
+        key = (
+            string_value(sample.get("scenario_id"), "timeline scenario"),
+            string_value(sample.get("thread_point"), "timeline thread point"),
+        )
+        if key not in MEMORY_CELLS:
+            fail(f"timeline sample: undeclared memory cell {key}")
+        grouped.setdefault(key, []).append(sample)
+    cells: list[dict[str, object]] = []
+    for key in MEMORY_CELLS:
+        group = grouped.get(key, [])
+        if not group:
+            continue
+        series = _timeline_series(group, f"memory cell {key[0]}/{key[1]}")
+        cells.append(
+            {
+                "scenario": key[0],
+                "point": key[1],
+                "series": series["series"],
+                "active_ns": series["active_ns"],
+                "drained_ns": series["drained_ns"],
+            }
+        )
+    return cells
+
+
+def timeline_domain(cells: Sequence[Mapping[str, object]]) -> tuple[int, int, int, int]:
+    """Global time/RSS domain across every cell, so all seven mini charts
+    share one scale and can be compared at a glance."""
+
+    active_values: list[int] = []
+    t_max_values: list[int] = []
+    rss_values: list[int] = []
+    for cell in cells:
+        for allocator in ALLOCATOR_IDS:
+            series = object_value(cell["series"], "timeline series")[allocator]
+            series = object_value(series, "timeline allocator series")
+            active = int(cast(int, series["active_ns"]))
+            active_values.append(active)
+            drained = int(cast(int, series["drained_ns"]))
+            t_max_values.append(drained + 5_000_000_000)
+            for _elapsed, rss in cast(list[tuple[int, int]], series["points"]):
+                rss_values.append(rss)
+            for elapsed, rss in cast(list[tuple[int, int]], series["decay"]):
+                rss_values.append(rss)
+                t_max_values.append(elapsed)
+    if not active_values or not t_max_values or not rss_values:
+        fail("timeline cells contain no series data")
+    # The x domain runs to the latest 5 s post-drain sample so return-to-OS is
+    # visible; per-sample windows may legally overshoot by up to 100 ms.
+    active_min = min(active_values)
+    t_max = max(t_max_values)
+    rss_min = min(rss_values)
+    rss_max = max(rss_values)
+    rss_span = rss_max - rss_min
+    if rss_span == 0:
+        rss_span = max(rss_max // 10, 1)
+    return active_min, t_max, rss_min - rss_span // 10, rss_max + rss_span // 10
+
+
+def timeline_x(elapsed_ns: int, t_min: int, t_max: int, left: int, width: int) -> float:
+    span = max(t_max - t_min, 1)
+    return left + width * (elapsed_ns - t_min) / span
+
+
+def timeline_y(rss_bytes: int, rss_min: int, rss_max: int, top: int, height: int) -> float:
+    span = max(rss_max - rss_min, 1)
+    return top + height * (1 - (rss_bytes - rss_min) / span)
+
+
+def _draw_diamond(canvas: Canvas, x: int, y: int, radius: int, color: tuple[int, int, int]) -> None:
+    canvas.line(x - radius, y, x, y - radius, color, 2)
+    canvas.line(x, y - radius, x + radius, y, color, 2)
+    canvas.line(x + radius, y, x, y + radius, color, 2)
+    canvas.line(x, y + radius, x - radius, y, color, 2)
+
+
+def draw_rss_timeline(canvas: Canvas, cells: Sequence[Mapping[str, object]]) -> None:
+    """One mini chart per memory cell: external RSS over time for all four
+    allocators, with the workload-drained marker and the three post-drain
+    return-to-OS points annotated on the axis."""
+
+    slot_width = TIMELINE_WIDTH // TIMELINE_COLS
+    slot_height = TIMELINE_HEIGHT // TIMELINE_ROWS
+    slot_left, slot_top, slot_right, slot_bottom = TIMELINE_SLOT_MARGINS
+    plot_width = slot_width - slot_left - slot_right
+    plot_height = slot_height - slot_top - slot_bottom
+    t_min, t_max, rss_min, rss_max = timeline_domain(cells)
+    label_color = (90, 102, 115)
+    for index, cell in enumerate(cells):
+        slot_x = (index % TIMELINE_COLS) * slot_width
+        slot_y = (index // TIMELINE_COLS) * slot_height
+        left = slot_x + slot_left
+        top = slot_y + slot_top
+        bottom = slot_y + slot_height - slot_bottom
+        canvas.text(
+            slot_x + 6,
+            slot_y + 8,
+            f"{cell['scenario']}/{cell['point']}",
+            label_color,
+            1,
+        )
+        for step in range(3):
+            fraction = step / 2
+            y = top + plot_height * (1 - fraction)
+            canvas.line(left, round(y), left + plot_width, round(y), TIMELINE_GRID_COLOR)
+            rss = rss_min + int((rss_max - rss_min) * fraction)
+            label = _format_mib(rss)
+            canvas.text(left - 4 - text_width(label, 1), round(y) - 3, label, label_color, 1)
+        for step in range(3):
+            fraction = step / 2
+            x = left + plot_width * fraction
+            elapsed = t_min + int((t_max - t_min) * fraction)
+            label = f"{(elapsed - t_min) / 1_000_000_000:.1f}s"
+            canvas.text(round(x) - text_width(label, 1) // 2, bottom + 2, label, label_color, 1)
+        # Axis ticks marking the three post-drain sample offsets.
+        for delay_label, delay_ns in (
+            ("100ms", 100_000_000),
+            ("1s", 1_000_000_000),
+            ("5s", 5_000_000_000),
+        ):
+            x = round(
+                timeline_x(cast(int, cell["drained_ns"]) + delay_ns, t_min, t_max, left, plot_width)
+            )
+            _draw_diamond(canvas, x, bottom + 10, 3, label_color)
+            canvas.text(
+                x - text_width(delay_label, 1) // 2, bottom + 17, delay_label, label_color, 1
+            )
+        canvas.line(left, top, left, bottom, label_color, 2)
+        canvas.line(left, bottom, left + plot_width, bottom, label_color, 2)
+        drained_x = round(timeline_x(cast(int, cell["drained_ns"]), t_min, t_max, left, plot_width))
+        # Dashed workload-drained marker, annotated with a D at the top.
+        dash_y = top
+        on = True
+        while dash_y < bottom:
+            if on:
+                canvas.line(
+                    drained_x, dash_y, drained_x, min(dash_y + 5, bottom), TIMELINE_DRAIN_COLOR, 2
+                )
+            dash_y += 5 if on else 4
+            on = not on
+        canvas.text(drained_x + 4, top + 2, "D", TIMELINE_DRAIN_COLOR, 1)
+        # Lines first, markers second: a steep line from another allocator may
+        # pass through this allocator's peak, and its marker must stay visible.
+        strokes: list[
+            tuple[tuple[int, int, int], list[tuple[int, int]], list[tuple[int, int]]]
+        ] = []
+        for allocator in ALLOCATOR_IDS:
+            series = object_value(
+                object_value(cell["series"], "timeline series")[allocator],
+                "timeline allocator series",
+            )
+            points = cast(list[tuple[int, int]], series["points"])
+            if not points:
+                continue
+            color = COLORS[ALLOCATOR_IDS.index(allocator)]
+            plotted = [
+                (
+                    round(timeline_x(elapsed, t_min, t_max, left, plot_width)),
+                    round(timeline_y(rss, rss_min, rss_max, top, plot_height)),
+                )
+                for elapsed, rss in points
+            ]
+            decay = [
+                (
+                    round(timeline_x(elapsed, t_min, t_max, left, plot_width)),
+                    round(timeline_y(rss, rss_min, rss_max, top, plot_height)),
+                )
+                for elapsed, rss in cast(list[tuple[int, int]], series["decay"])
+            ]
+            strokes.append((color, plotted, decay))
+        for color, plotted, _decay in strokes:
+            for first, second in zip(plotted, plotted[1:]):
+                canvas.line(first[0], first[1], second[0], second[1], color, 2)
+        for color, plotted, decay in strokes:
+            for x, y in plotted:
+                canvas.rectangle(x - 1, y - 1, 3, 3, color)
+            for x, y in decay:
+                _draw_diamond(canvas, x, y, 5, color)
+    # The final slot is the legend instead of an eighth chart.
+    legend_slot = TIMELINE_COLS * TIMELINE_ROWS - 1
+    legend_x = (legend_slot % TIMELINE_COLS) * slot_width + 16
+    legend_y = (legend_slot // TIMELINE_COLS) * slot_height + 18
+    canvas.text(legend_x, legend_y, "LEGEND", label_color, 2)
+    for row, allocator in enumerate(ALLOCATOR_IDS):
+        swatch_y = legend_y + 22 + row * 20
+        canvas.rectangle(legend_x, swatch_y, 14, 14, COLORS[ALLOCATOR_IDS.index(allocator)])
+        canvas.text(legend_x + 20, swatch_y + 2, allocator, label_color, 1)
+    notes = [
+        "line: external RSS over time,",
+        "5 ms smaps_rollup sampling,",
+        "all paired blocks",
+        "",
+        "D dashed: workload drained",
+        "",
+        "axis diamonds: post-drain",
+        "sample offsets 100ms/1s/5s",
+        "",
+        "colored diamonds: median",
+        "post-drain RSS per allocator",
+        "(return-to-OS)",
+        "",
+        "natural purge only;",
+        "lower is better",
+    ]
+    note_y = legend_y + 22 + 4 * 20 + 10
+    for note in notes:
+        canvas.text(legend_x, note_y, note, label_color, 1)
+        note_y += 12
+
+
+def rss_timeline_png(memory: Mapping[str, object]) -> bytes:
+    # Envelope-level validation belongs to validate_latest in render(); this
+    # validates only the fields it consumes, like the sibling draw functions.
+    cells = timeline_cells(memory)
+    canvas = Canvas(TIMELINE_WIDTH, TIMELINE_HEIGHT, (248, 250, 252))
+    draw_rss_timeline(canvas, cells)
+    return encode_png(
+        TIMELINE_WIDTH,
+        TIMELINE_HEIGHT,
+        canvas.pixels,
+        "Linux process RSS over time with post-drain return-to-OS points; lower is better",
     )
 
 
@@ -3271,7 +3611,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             if memory_run["run_origin"] == "github-actions"
             else "https://github.com/zackees/mimalloc-pprof/actions"
         )
-        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Absolute Linux process RSS for all four allocators; lower is better"><img src="benchmark-pareto.png" alt="Speed-memory Pareto scatter: fragmentation proxy versus median throughput; upper-left is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. The Pareto scatter pairs each allocator's fragmentation proxy with its median throughput on the matching scenario/thread cell; upper-left is better. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
+        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Absolute Linux process RSS for all four allocators; lower is better"><img src="benchmark-pareto.png" alt="Speed-memory Pareto scatter: fragmentation proxy versus median throughput; upper-left is better"><img src="benchmark-rss-timeline.png" alt="Linux process RSS over time with workload-drained marker and post-drain return-to-OS points; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. The Pareto scatter pairs each allocator's fragmentation proxy with its median throughput on the matching scenario/thread cell; upper-left is better. The timeline shows RSS growth, the workload-drained marker, and the 100 ms / 1 s / 5 s post-drain points so return-to-OS behavior is visible. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
     latency_html = ""
     if "latency" in latest:
         latency = validate_latency_report(latest["latency"], "latest.latency")
@@ -3433,6 +3773,7 @@ def render(
         memory = validate_memory_report(latest["memory"], "latest.memory")
         (output / image_names["memory"]).write_bytes(memory_png(memory))
         (output / "benchmark-pareto.png").write_bytes(pareto_png(latest))
+        (output / "benchmark-rss-timeline.png").write_bytes(rss_timeline_png(memory))
     else:
         item = pending["memory"]
         (output / image_names["memory"]).write_bytes(
@@ -3440,6 +3781,14 @@ def render(
         )
         (output / "benchmark-pareto.png").write_bytes(
             pending_png("speed-memory Pareto scatter", cast(str, item["reason"]))
+        )
+        (output / "benchmark-rss-timeline.png").write_bytes(
+            pending_png(
+                "RSS timeline with return-to-OS points",
+                cast(str, item["reason"]),
+                TIMELINE_WIDTH,
+                TIMELINE_HEIGHT,
+            )
         )
     if "latency" in latest:
         latency = validate_latency_report(latest["latency"], "latest.latency")

@@ -25,12 +25,11 @@ fn main() {
     if env::var("PROFILE").as_deref() == Ok("release") {
         build.define("NDEBUG", None);
     }
-    if build_target::needs_cxx_compilation(env::var("TARGET").ok().as_deref()) {
-        // clang's MSVC ARM64 C mode does not expose the intrinsics used by
-        // mimalloc's C atomics. The vendored source supports a C++ atomics
-        // path, and this package-scoped flag avoids changing unrelated C
-        // dependencies in the consumer's build graph.
-        build.cpp(true).flag("-TP");
+    if build_target::needs_c11_atomics(env::var("TARGET").ok().as_deref()) {
+        // ARM64 clang-cl does not expose __ldar64/__stlr64, which mimalloc's
+        // plain MSVC C wrapper uses. Keep the translation unit in C mode and
+        // select clang's C11 stdatomic implementation for this package only.
+        build.define("MI_USE_C11_ATOMICS", "1");
     }
     build.compile("mimalloc");
 

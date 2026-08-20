@@ -1,5 +1,7 @@
 use std::env;
 
+mod build_target;
+
 fn main() {
     // Everything the compiler needs lives in vendor/: the amalgamated
     // translation unit plus two verbatim support headers it opens via
@@ -22,6 +24,13 @@ fn main() {
         .define("MI_PPROF", "1");
     if env::var("PROFILE").as_deref() == Ok("release") {
         build.define("NDEBUG", None);
+    }
+    if build_target::needs_cxx_compilation(env::var("TARGET").ok().as_deref()) {
+        // clang's MSVC ARM64 C mode does not expose the intrinsics used by
+        // mimalloc's C atomics. The vendored source supports a C++ atomics
+        // path, and this package-scoped flag avoids changing unrelated C
+        // dependencies in the consumer's build graph.
+        build.cpp(true).flag("-TP");
     }
     build.compile("mimalloc");
 

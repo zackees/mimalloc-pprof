@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.3
+
+- Fix the Rust crate's bundled allocator build on `aarch64-pc-windows-msvc` by using
+  C11 atomics for that target, avoiding unsupported MSVC C atomic syntax (#223).
+
 ## 0.9.2
 
 One behavioural fix: **seeded sampling is now actually reproducible.**

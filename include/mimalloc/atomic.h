@@ -28,7 +28,20 @@ terms of the MIT license. A copy of the license can be found in the file
 // instead of passing the memory order as a parameter.
 // -----------------------------------------------------------------------------------------------
 
-#if defined(__cplusplus)
+#if defined(MI_USE_C11_ATOMICS)
+// Some MSVC-compatible C compilers provide C11 atomics but not every
+// architecture-specific intrinsic used by the plain MSVC wrapper below.
+#include <stdatomic.h>
+#define  mi_atomic(name)          atomic_##name
+#define  mi_memory_order(name)    memory_order_##name
+#if (__STDC_VERSION__ >= 201710L) // c17, see issue #735
+ #define MI_ATOMIC_VAR_INIT(x)    x
+#elif !defined(ATOMIC_VAR_INIT)
+ #define MI_ATOMIC_VAR_INIT(x)    x
+#else
+ #define MI_ATOMIC_VAR_INIT(x)    ATOMIC_VAR_INIT(x)
+#endif
+#elif defined(__cplusplus)
 // Use C++ atomics
 #include <atomic>
 #define  _Atomic(tp)              std::atomic<tp>
@@ -101,7 +114,7 @@ static inline intptr_t mi_atomic_addi(_Atomic(intptr_t)*p, intptr_t add);
 static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub);
 
 
-#if defined(__cplusplus) || !defined(_MSC_VER)
+#if defined(MI_USE_C11_ATOMICS) || defined(__cplusplus) || !defined(_MSC_VER)
 
 // In C++/C11 atomics we have polymorphic atomics so can use the typed `ptr` variants (where `tp` is the type of atomic value)
 // We use these macros so we can provide a typed wrapper in MSVC in C compilation mode as well

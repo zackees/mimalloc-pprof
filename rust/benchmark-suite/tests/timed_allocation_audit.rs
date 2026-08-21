@@ -191,6 +191,10 @@ fn audit_cell(adapter: &InstrumentedAdapter, cell: &ScenarioCell) {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS realloc may route through the global allocator"
+)]
 fn latency_sampling_buffers_do_not_allocate_after_warmup() {
     let _test_guard = TEST_GATE.lock().unwrap();
     let adapter = InstrumentedAdapter {

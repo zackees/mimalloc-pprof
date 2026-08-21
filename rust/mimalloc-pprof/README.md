@@ -86,6 +86,26 @@ println!(
 );
 ```
 
+## Platforms and cross-compilation
+
+The crate vendors mimalloc as a single amalgamated C translation unit with no
+autotools or CMake step, so it builds wherever `cc-rs` can reach a C compiler —
+including cross-compiled builds, in every direction.
+
+Windows ARM64 needs one adjustment, and the crate makes it itself. In plain C
+mode mimalloc models C11 atomics with a deprecated MSVC `Interlocked` wrapper
+whose `_acq`/`_rel` ARM64 intrinsics `clang-cl` does not declare, so a
+`cargo-xwin` cross build of `aarch64-pc-windows-msvc` cannot compile it. Since
+**0.9.3** the build script selects clang's C11 `stdatomic` implementation for
+that target instead.
+
+That choice is deliberately made in `build.rs` rather than left to the caller:
+`CFLAGS` is process-global for every `cc-rs` build script in a build, so a
+consumer trying to fix this from the outside — for example with `CFLAGS=-TP` to
+force mimalloc's C++ atomics path — also changes the language mode of every
+other native dependency in the graph. Nothing outside this crate should have to
+know how its atomics are selected.
+
 ## Notes
 
 - On Linux and macOS, keep frame pointers for reliable stack walking:

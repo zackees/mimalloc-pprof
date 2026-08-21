@@ -601,6 +601,25 @@ rustflags = ["-Cforce-frame-pointers=yes"]
 Windows x64 uses unwind information instead; keep the generated PDB for
 symbolization.
 
+### Cross-compilation
+
+The crate vendors mimalloc as a single amalgamated C translation unit with no
+autotools or CMake step, so it builds wherever `cc-rs` can reach a C compiler,
+cross-compiled builds included.
+
+`aarch64-pc-windows-msvc` needs one adjustment, and `build.rs` makes it itself.
+In plain C mode mimalloc models C11 atomics with a deprecated MSVC
+`Interlocked` wrapper whose `_acq`/`_rel` ARM64 intrinsics `clang-cl` does not
+declare, so a `cargo-xwin` cross build cannot compile it. Since **0.9.3** the
+build script compiles that target against clang's C11 `stdatomic`
+implementation instead.
+
+Selecting this inside `build.rs` is the point. `CFLAGS` applies to every
+`cc-rs` build script in a build, so a consumer forcing mimalloc's C++ atomics
+path from the outside with `CFLAGS=-TP` also flips the language mode of every
+other native dependency in the graph — `ring`, for one, fails to compile as
+C++. No consumer should have to know how this crate selects its atomics.
+
 ---
 
 ## Profiler reference

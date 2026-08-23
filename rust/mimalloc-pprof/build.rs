@@ -1,7 +1,5 @@
 use std::env;
 
-mod build_target;
-
 fn main() {
     // Everything the compiler needs lives in vendor/: the amalgamated
     // translation unit plus two verbatim support headers it opens via
@@ -24,12 +22,6 @@ fn main() {
         .define("MI_PPROF", "1");
     if env::var("PROFILE").as_deref() == Ok("release") {
         build.define("NDEBUG", None);
-    }
-    if build_target::needs_c11_atomics(env::var("TARGET").ok().as_deref()) {
-        // ARM64 clang-cl does not expose __ldar64/__stlr64, which mimalloc's
-        // plain MSVC C wrapper uses. Keep the translation unit in C mode and
-        // select clang's C11 stdatomic implementation for this package only.
-        build.define("MI_USE_C11_ATOMICS", "1");
     }
     build.compile("mimalloc");
 

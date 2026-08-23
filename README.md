@@ -176,6 +176,38 @@ test suite looks. That risk is real and testing cannot retire it — see
 
 ---
 
+## Release history
+
+Published versions of the [`mimalloc-pprof`](https://crates.io/crates/mimalloc-pprof)
+crate on the v3 line, newest first. Dates are crates.io publish dates (UTC). This table
+is a summary; the full notes, with the reasoning behind each fix, are the record in
+[`rust/mimalloc-pprof/CHANGELOG.md`](rust/mimalloc-pprof/CHANGELOG.md).
+
+| Version | Published | What landed |
+|---|---|---|
+| **0.9.3** | 2026-08-21 | **Fix:** the crate would not build for `aarch64-pc-windows-msvc`. mimalloc's MSVC atomics wrapper reaches for ARM64 `Interlocked` intrinsics that `clang-cl` does not declare, so a `cargo-xwin` cross build failed to compile ([#223](https://github.com/zackees/mimalloc-pprof/issues/223), [#224](https://github.com/zackees/mimalloc-pprof/pull/224)). **Also the first release carrying the v4 line**, merged into `main` after 0.9.2 ([#129](https://github.com/zackees/mimalloc-pprof/pull/129)): upstream engine pin `579f8c0e` -> `bcee5a88` ([#80](https://github.com/zackees/mimalloc-pprof/issues/80), [#113](https://github.com/zackees/mimalloc-pprof/pull/113)), the new experimental `mi_option_purge_zeroes` zero-tracking option ([#67](https://github.com/zackees/mimalloc-pprof/issues/67), [#79](https://github.com/zackees/mimalloc-pprof/pull/79)), the zeroing-`realloc` family exposed from Rust ([#83](https://github.com/zackees/mimalloc-pprof/issues/83), [#108](https://github.com/zackees/mimalloc-pprof/pull/108)), and several allocator fixes. |
+| **0.9.2** | 2026-08-01 | **Fix:** seeded sampling is now actually reproducible. `mi_prof_start_seeded` and `MIMALLOC_PROF_SEED` mixed the ASLR-randomised address of the thread's allocator state into the seed, so a pinned seed produced a different sample sequence in every process while the docs promised determinism ([#91](https://github.com/zackees/mimalloc-pprof/issues/91)). |
+| **0.9.1** | 2026-08-01 | Hardening release, no API change. **Fixes:** a `-DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF` build failed to link, because four test targets hardcoded `mimalloc-static` ([#62](https://github.com/zackees/mimalloc-pprof/issues/62), [#68](https://github.com/zackees/mimalloc-pprof/pull/68)); `-Wmaybe-uninitialized` on `fmt_buf` in `src/profile.c` ([#72](https://github.com/zackees/mimalloc-pprof/pull/72)). Plus five new [CI gates](#ci-gates), each with a positive control proving it can fail. |
+| **0.9.0** | 2026-07-31 | **Features:** first release of the v3 line -- profiler and memory-events ported onto mimalloc v3 ([#29](https://github.com/zackees/mimalloc-pprof/issues/29), [#44](https://github.com/zackees/mimalloc-pprof/pull/44)), v3 promoted to mainline with v2 preserved on the `v2` branch ([#46](https://github.com/zackees/mimalloc-pprof/pull/46)), and the v3 allocator counters exposed in the profile, surfaced from Rust as `ProfStats::heap` ([#43](https://github.com/zackees/mimalloc-pprof/issues/43)). **Fixes:** two upstream mimalloc defects -- MinGW thread-exit cleanup and the `mi_heap_new` / `mi_subproc_new` bootstrap crash (both #43, detailed under [Bugs fixed in older versions](#bugs-fixed-in-older-versions)). |
+
+**0.9.4 -- merged to `main`, not yet released.** The `aarch64-pc-windows-msvc` fix that
+shipped in 0.9.3 was a build-script allowlist matching a single target triple, so it only
+helped consumers building through the Rust crate -- CMake, `src/static.c`, and anyone
+vendoring the C directly still selected the broken path. It is replaced by a capability
+test in `include/mimalloc/atomic.h`: the MSVC atomics wrapper is now gated on
+`MI_HAS_C11_ATOMICS`, derived from `__STDC_VERSION__ >= 201112L &&
+!defined(__STDC_NO_ATOMICS__)` ([#230](https://github.com/zackees/mimalloc-pprof/issues/230), [#231](https://github.com/zackees/mimalloc-pprof/pull/231)). `_MSC_VER` means "claims
+MSVC source compatibility", not "lacks C11 atomics", and `clang-cl` defines it but is
+clang. Real MSVC keeps the wrapper: it omits `__STDC_VERSION__` without `/std:c11`, and
+under `/std:c11` defines `__STDC_NO_ATOMICS__` unless `/experimental:c11atomics` is also
+passed. Until 0.9.4 is published, [Cross-compilation](#cross-compilation) describes the
+mechanism that is actually on crates.io.
+
+The v2 line (0.8.x) is maintained on the
+[`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch.
+
+---
+
 ## Bugs fixed in older versions
 
 This section exists because the bugs below are **defects in upstream

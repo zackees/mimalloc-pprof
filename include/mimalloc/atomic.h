@@ -28,6 +28,23 @@ terms of the MIT license. A copy of the license can be found in the file
 // instead of passing the memory order as a parameter.
 // -----------------------------------------------------------------------------------------------
 
+// Does this compiler provide C11 `<stdatomic.h>`?
+// `_MSC_VER` means "claims MSVC source compatibility", not "lacks C11 atomics".
+// clang-cl defines it for compatibility but is clang and has full C11 atomics,
+// so selecting the MSVC wrapper on `_MSC_VER` alone reaches for Interlocked
+// intrinsics (`__ldar64`/`__stlr64`) that clang-cl does not declare on ARM64.
+// `__STDC_NO_ATOMICS__` is the standard capability test: real MSVC defines it
+// unless built with `/std:c11 /experimental:c11atomics`, and omits
+// `__STDC_VERSION__` entirely without `/std:c11`, so the wrapper keeps exactly
+// the compilers that still need it. Define to 0/1 to override the detection.
+#if !defined(MI_HAS_C11_ATOMICS)
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L) && !defined(__STDC_NO_ATOMICS__)
+#define MI_HAS_C11_ATOMICS 1
+#else
+#define MI_HAS_C11_ATOMICS 0
+#endif
+#endif
+
 #if defined(MI_USE_C11_ATOMICS)
 // Some MSVC-compatible C compilers provide C11 atomics but not every
 // architecture-specific intrinsic used by the plain MSVC wrapper below.
@@ -54,7 +71,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #else
  #define MI_ATOMIC_VAR_INIT(x)    ATOMIC_VAR_INIT(x)
 #endif
-#elif defined(_MSC_VER)
+#elif defined(_MSC_VER) && !MI_HAS_C11_ATOMICS
 // Use MSVC C wrapper for C11 atomics
 #define  _Atomic(tp)              tp
 #define  MI_ATOMIC_VAR_INIT(x)    x
@@ -114,7 +131,7 @@ static inline intptr_t mi_atomic_addi(_Atomic(intptr_t)*p, intptr_t add);
 static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub);
 
 
-#if defined(MI_USE_C11_ATOMICS) || defined(__cplusplus) || !defined(_MSC_VER)
+#if defined(MI_USE_C11_ATOMICS) || defined(__cplusplus) || !defined(_MSC_VER) || MI_HAS_C11_ATOMICS
 
 // In C++/C11 atomics we have polymorphic atomics so can use the typed `ptr` variants (where `tp` is the type of atomic value)
 // We use these macros so we can provide a typed wrapper in MSVC in C compilation mode as well

@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.9.4
+
+Detect C11 atomics instead of allowlisting one target (#230).
+
+- **Fix: clang-cl selected the MSVC atomics wrapper on every target, not just ARM64.**
+  `include/mimalloc/atomic.h` chose its backend on `defined(_MSC_VER)`, which means
+  "claims MSVC source compatibility" rather than "lacks C11 atomics" -- and clang-cl
+  defines it while being clang. The wrapper then reaches for `__ldar64`/`__stlr64`,
+  Interlocked intrinsics clang-cl does not declare on ARM64. The wrapper is now gated on
+  `MI_HAS_C11_ATOMICS`, derived from the standard capability test
+  `__STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)`.
+
+  0.9.3 fixed this from the Rust build script, as a one-triple allowlist
+  (`aarch64-pc-windows-msvc`). That only ever reached consumers who build through the
+  build script -- CMake, `src/static.c`, and anyone vendoring the C directly still hit
+  the bug. It also could not see that `x86_64-pc-windows-msvc` takes the same wrong
+  branch and merely survives because x64 has the intrinsics ARM64 lacks. The allowlist
+  and its `MI_USE_C11_ATOMICS` define are gone; the detection lives in the header, so
+  every consumer gets it.
+
+  Real MSVC is unaffected: it omits `__STDC_VERSION__` entirely without `/std:c11`, and
+  defines `__STDC_NO_ATOMICS__` under `/std:c11` unless `/experimental:c11atomics` is
+  also passed. `MI_USE_C11_ATOMICS` still works as an explicit override, and
+  `MI_HAS_C11_ATOMICS` can be defined to 0/1 to override the detection.
+
+  Verified on CI against the `aarch64-pc-windows-msvc` clang/xwin cross-build with no
+  build-script define, alongside green MSVC and MinGW `ctest` gates proving the wrapper's
+  population is unchanged for real MSVC.
+
 ## 0.9.3
 
 - Fix the Rust crate's bundled allocator build on `aarch64-pc-windows-msvc` by using

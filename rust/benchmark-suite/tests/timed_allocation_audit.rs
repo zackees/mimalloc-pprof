@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use benchmark_suite::execution::{
     execute_cell, execute_latency_cell, set_measured_region_hook, AllocatorAdapter,
@@ -12,6 +12,16 @@ use benchmark_suite::scenarios::{cards, CardId, ScenarioCell, Topology};
 
 static MEASURED: AtomicBool = AtomicBool::new(false);
 static HARNESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+// Serializes the two audits: they share `MEASURED`, `HARNESS_ALLOCATIONS`, and the
+// process-wide measured-region hook, so they cannot overlap.
+//
+// Acquired with `unwrap_or_else(PoisonError::into_inner)`, never `unwrap()`. These
+// tests assert, and an assertion panic while holding the guard poisons the mutex --
+// so a plain `unwrap()` made the *other* test panic on `PoisonError` at its lock
+// line. One real failure was reported as two, the second pointing at a lock
+// acquisition that has nothing to do with allocations. Recovering is correct rather
+// than a workaround: the guard provides mutual exclusion only, and a `()` payload
+// cannot be left in an inconsistent state. See #236.
 static TEST_GATE: Mutex<()> = Mutex::new(());
 
 thread_local! {
@@ -139,7 +149,7 @@ impl AllocatorAdapter for InstrumentedAdapter {
     ignore = "macOS realloc may route through the global allocator"
 )]
 fn ordinary_measured_region_performs_zero_harness_allocations() {
-    let _test_guard = TEST_GATE.lock().unwrap();
+    let _test_guard = TEST_GATE.lock().unwrap_or_else(PoisonError::into_inner);
     let adapter = InstrumentedAdapter {
         layouts: Mutex::new(HashMap::new()),
     };
@@ -196,7 +206,7 @@ fn audit_cell(adapter: &InstrumentedAdapter, cell: &ScenarioCell) {
     ignore = "macOS realloc may route through the global allocator"
 )]
 fn latency_sampling_buffers_do_not_allocate_after_warmup() {
-    let _test_guard = TEST_GATE.lock().unwrap();
+    let _test_guard = TEST_GATE.lock().unwrap_or_else(PoisonError::into_inner);
     let adapter = InstrumentedAdapter {
         layouts: Mutex::new(HashMap::new()),
     };

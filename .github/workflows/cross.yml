@@ -34,10 +34,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             # Plain cargo, not `soldr cargo`: see the comment on cmd= in build-cross.
-            command: cargo test --no-run
+            command: cargo test -p mimalloc-pprof --no-run
             cflags: ""
           - target: aarch64-unknown-linux-gnu
-            command: soldr cargo zigbuild --tests
+            command: soldr cargo zigbuild -p mimalloc-pprof --tests
             cflags: -Wno-error=date-time
     defaults:
       run:
@@ -167,7 +167,7 @@ jobs:
           #
           # Already tested and disproved: build-cache:false, linker:platform-default,
           # and cache:false (the action's own "skip zccache wrapping entirely" switch).
-          cmd="cargo test --no-run"
+          cmd="cargo test -p mimalloc-pprof --no-run"
           if ! run_build "$cmd"; then
             echo "::warning::build failed; retrying with the soldr compile cache bypassed (soldr#1969)"
             run_build "${cmd/soldr/soldr --no-cache}"
@@ -212,7 +212,7 @@ jobs:
         shell: pwsh
         run: |
           $metadata = Join-Path $PWD 'bins.jsonl'
-          soldr --no-cache cargo test --no-run --target x86_64-pc-windows-gnu --release --message-format=json | Tee-Object -FilePath $metadata
+          soldr --no-cache cargo test -p mimalloc-pprof --no-run --target x86_64-pc-windows-gnu --release --message-format=json | Tee-Object -FilePath $metadata
           if ($LASTEXITCODE -ne 0) { throw 'Soldr test build failed' }
           $bins = Get-Content $metadata | ForEach-Object {
             try { $_ | ConvertFrom-Json } catch { $null }

@@ -9,6 +9,10 @@
 //! # Ok(()) }
 //! ```
 //!
+//! Profiling is enabled by default. To build the allocator without profiler
+//! hooks, depend on this crate with `default-features = false`; in that mode the
+//! profiling API remains available but cannot start a profiler.
+//!
 //! See the README's Rust integration guide for frame-pointer and line-table
 //! build flags. Open the resulting profile with `pprof -http=: app.exe heap.prof`.
 
@@ -215,7 +219,8 @@ pub unsafe fn usable_size(p: *const u8) -> usize {
 /// as well, set `MIMALLOC_PROF=1` in the environment instead.
 ///
 /// Returns `false` if profiling was already enabled (the earlier session,
-/// and its sample rate, stay active).
+/// and its sample rate, stay active), or if the crate was built with
+/// `default-features = false`.
 pub fn enable_heap_profiling() -> bool {
     prof::start(0)
 }
@@ -299,7 +304,8 @@ pub struct ProfConfig {
 /// `include/mimalloc/profile.h`.
 ///
 /// Returns `false` if profiling was already enabled (the earlier session
-/// stays active), or if `config.dump_at_exit` is set but is not
+/// stays active), if the crate was built with `default-features = false`, or
+/// if `config.dump_at_exit` is set but is not
 /// representable as a NUL-free C string (non-UTF-8 or an embedded NUL byte)
 /// -- in that case `mi_prof_start_ex` is never called.
 pub fn enable_heap_profiling_with(config: &ProfConfig) -> bool {
@@ -678,14 +684,17 @@ pub mod prof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "pprof")]
     use std::sync::Mutex;
 
     // The profiler is process-global state, and unit tests within this
     // binary may run concurrently by default, so serialize everything that
     // starts/stops it. `unwrap_or_else` rides through a poisoned lock rather
     // than cascading a single panicking test into every other one.
+    #[cfg(feature = "pprof")]
     static PROF_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[cfg(feature = "pprof")]
     fn reset_profiler() {
         if prof::is_enabled() {
             prof::stop();
@@ -693,6 +702,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pprof")]
     fn enable_heap_profiling_with_default_config_starts_profiler() {
         let _guard = PROF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_profiler();
@@ -705,6 +715,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pprof")]
     fn enable_heap_profiling_with_override_mode_sets_sample_interval() {
         let _guard = PROF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_profiler();
@@ -719,6 +730,13 @@ mod tests {
         assert_eq!(prof::stats().sample_rate, 4096);
 
         prof::stop();
+    }
+
+    #[test]
+    #[cfg(not(feature = "pprof"))]
+    fn heap_profiling_is_unavailable_when_compiled_out() {
+        assert!(!enable_heap_profiling_with(&ProfConfig::default()));
+        assert!(!prof::is_enabled());
     }
 
     #[test]

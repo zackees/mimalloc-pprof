@@ -25,6 +25,19 @@ debug = "line-tables-only"
 strip = false
 ```
 
+Profiling hooks are enabled by default, preserving the behavior of earlier
+releases. If an application only needs mimalloc and wants to compile the
+profiler out, opt out of the default feature:
+
+```toml
+[dependencies]
+mimalloc-pprof = { version = "0.9", default-features = false }
+```
+
+With `default-features = false`, the allocator remains available and the
+profiling API is retained for source compatibility, but profiling cannot be
+started (`prof::start` and `enable_heap_profiling` return `false`).
+
 ```rust
 use mimalloc_pprof::{prof, MiMalloc};
 use std::path::Path;

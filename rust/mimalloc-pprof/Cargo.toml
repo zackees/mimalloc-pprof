@@ -15,6 +15,55 @@ build = "build.rs"
 
 [dependencies]
 
+[features]
+# Profiling remains enabled by default for compatibility. Consumers that only
+# need the allocator can compile the profiler out with `default-features = false`.
+default = ["pprof"]
+pprof = []
+
+[[test]]
+name = "t1_smoke"
+required-features = ["pprof"]
+[[test]]
+name = "t2_format"
+required-features = ["pprof"]
+[[test]]
+name = "t3_stats"
+required-features = ["pprof"]
+[[test]]
+name = "t4_accum"
+required-features = ["pprof"]
+[[test]]
+name = "t5_stacks"
+required-features = ["pprof"]
+[[test]]
+name = "t6_concurrency"
+required-features = ["pprof"]
+[[test]]
+name = "t8_query"
+required-features = ["pprof"]
+[[test]]
+name = "t9_stats"
+required-features = ["pprof"]
+[[test]]
+name = "t10_snapshot_concurrency"
+required-features = ["pprof"]
+[[test]]
+name = "t11_enable"
+required-features = ["pprof"]
+[[test]]
+name = "t12_proto"
+required-features = ["pprof"]
+[[test]]
+name = "t14_modules"
+required-features = ["pprof"]
+[[test]]
+name = "t15_heap_stats"
+required-features = ["pprof"]
+[[test]]
+name = "t17_realloc_profiling"
+required-features = ["pprof"]
+
 [build-dependencies]
 cc = "1.2"
 

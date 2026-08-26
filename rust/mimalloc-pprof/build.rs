@@ -17,9 +17,17 @@ fn main() {
         .include("vendor")
         .file("vendor/mimalloc-pprof-amalgamated.c")
         .define("MI_STATIC_LIB", None)
-        // This is a no-op until Phase 1; keeping the define here ensures the
-        // Rust build exercises profiling code as soon as it exists.
-        .define("MI_PPROF", "1");
+        // Preserve the crate's default profiler-enabled behavior, while
+        // allowing allocator-only consumers to compile hooks out with
+        // `default-features = false`.
+        .define(
+            "MI_PPROF",
+            if env::var_os("CARGO_FEATURE_PPROF").is_some() {
+                "1"
+            } else {
+                "0"
+            },
+        );
     if env::var("PROFILE").as_deref() == Ok("release") {
         build.define("NDEBUG", None);
     }

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.5
+
+- Add a default `pprof` feature so allocator-only consumers can compile sampled
+  profiling hooks out with `default-features = false` while retaining linkable
+  no-op profiler stubs.
+- Retain exact DHAT allocation and lifetime profiling in both feature modes.
+- Add package-facing feature-contract coverage for sampled profiling and DHAT.
+
 ## 0.9.4
 
 Detect C11 atomics instead of allowlisting one target (#230).

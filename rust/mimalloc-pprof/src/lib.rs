@@ -272,12 +272,11 @@ pub mod dhat {
 
     /// Serialize the current or stopped measurement window as a DHAT v2 JSON file.
     pub fn dump_file(path: &Path) -> io::Result<()> {
-        let path = path.to_str().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "DHAT path is not UTF-8")
-        })?;
-        let path = CString::new(path).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "DHAT path contains NUL")
-        })?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DHAT path is not UTF-8"))?;
+        let path = CString::new(path)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "DHAT path contains NUL"))?;
         if unsafe { sys::mi_dhat_dump(path.as_ptr()) } {
             Ok(())
         } else {
@@ -771,7 +770,6 @@ pub mod prof {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "pprof")]
     use std::sync::Mutex;
 
     // The profiler is process-global state, and unit tests within this

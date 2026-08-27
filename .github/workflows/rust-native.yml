@@ -6,6 +6,7 @@ on:
   pull_request:
     paths:
       - 'rust/**'
+      - 'ci/check_crate_package.py'
       - '.github/workflows/rust-native.yml'
 
 jobs:
@@ -31,6 +32,9 @@ jobs:
       - run: soldr cargo test --locked
       - name: cargo publish --dry-run (mimalloc-pprof)
         run: soldr cargo publish --dry-run -p mimalloc-pprof --locked
+      - name: Verify publish archive contains feature gate and DHAT
+        shell: bash
+        run: python ../ci/check_crate_package.py target/package
 
   test-win-gnu:
     runs-on: windows-latest

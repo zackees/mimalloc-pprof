@@ -1,6 +1,6 @@
 [package]
 name = "mimalloc-pprof"
-version = "0.9.4"
+version = "0.9.5"
 edition = "2021"
 license = "MIT"
 description = "mimalloc global allocator with pprof-compatible sampled heap profiling"
@@ -63,6 +63,9 @@ required-features = ["pprof"]
 [[test]]
 name = "t17_realloc_profiling"
 required-features = ["pprof"]
+
+[[test]]
+name = "feature_contract"
 
 [build-dependencies]
 cc = "1.2"

@@ -151,10 +151,9 @@ fn amalgamate_c(paths: &Paths) -> String {
     format!("{header}{body}")
 }
 
-/// Amalgamate the three public headers (in this fixed order, sharing one
-/// dedup set so profile.h/memory-events.h's own `#include "mimalloc.h"`
-/// doesn't duplicate content already inlined for mimalloc.h) into one
-/// self-contained public header.
+/// Amalgamate the public headers (in this fixed order, sharing one dedup set
+/// so the extension headers' own `#include "mimalloc.h"` does not duplicate
+/// content already inlined for mimalloc.h) into one self-contained public header.
 fn amalgamate_h(paths: &Paths) -> String {
     let mut visited = HashSet::new();
     let mut body = String::new();
@@ -162,6 +161,7 @@ fn amalgamate_h(paths: &Paths) -> String {
         "mimalloc.h",
         "mimalloc/profile.h",
         "mimalloc/memory-events.h",
+        "mimalloc/dhat.h",
     ] {
         inline_file(
             &paths.include_root.join(rel),
@@ -172,7 +172,7 @@ fn amalgamate_h(paths: &Paths) -> String {
     }
     let header = generated_header(
         paths,
-        "the three public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h)",
+        "the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h)",
         "amalgamate-h",
     );
     format!("{header}{body}")

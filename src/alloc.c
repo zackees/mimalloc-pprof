@@ -361,7 +361,7 @@ void* mi_expand(void* p, size_t newsize) mi_attr_noexcept {
   #if MI_PPROF
   _mi_prof_on_realloc_in_place((mi_page_t*)page, p, newsize);
   #endif
-  _mi_memevt_on_realloc_in_place((mi_page_t*)page, p, newsize);
+  _mi_memevt_on_realloc_in_place((mi_page_t*)page, _mi_page_ptr_unalign(page, p), newsize);
   return p; // it fits
   #endif
 }
@@ -403,7 +403,7 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
         #if MI_PPROF
         _mi_prof_on_realloc_in_place((mi_page_t*)page, p, newsize);
         #endif
-        _mi_memevt_on_realloc_in_place((mi_page_t*)page, p, newsize);
+        _mi_memevt_on_realloc_in_place((mi_page_t*)page, _mi_page_ptr_unalign(page, p), newsize);
         return p;  // reallocation still fits and not more than 50% waste
       }
     }
@@ -417,6 +417,9 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
   // When p == NULL this call behaves as a plain malloc, not a resize: leave it
   // unsuppressed so it naturally emits ALLOCATE like any other malloc.
   const bool memevt_is_resize = (p != NULL);
+  /* Aligned allocations are represented in DHAT by their owning page block,
+     not a possible interior user pointer. */
+  void* const memevt_oldp = (memevt_is_resize ? _mi_page_ptr_unalign(page, p) : NULL);
   const size_t memevt_usable_pre = (memevt_is_resize ? mi_page_usable_block_size(page) : 0);
   size_t memevt_local_usable_post = 0;
   size_t* const memevt_up = (memevt_is_resize && usable_post == NULL ? &memevt_local_usable_post : usable_post);
@@ -441,7 +444,10 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
   }
   if (memevt_is_resize) {
     _mi_memevt_suppress_end();
-    if (newp != NULL) { _mi_memevt_on_resize(memevt_usable_pre, memevt_usable_post, newsize); }
+    if (newp != NULL) {
+      mi_page_t* const memevt_new_page = _mi_ptr_page(newp);
+      _mi_memevt_on_resize(memevt_oldp, _mi_page_ptr_unalign(memevt_new_page, newp), memevt_usable_pre, memevt_usable_post, newsize);
+    }
   }
   return newp;
 }

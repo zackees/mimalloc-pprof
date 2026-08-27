@@ -1183,6 +1183,7 @@ static void mi_process_init_once(void) mi_attr_noexcept {
   #if MI_PPROF
   _mi_prof_process_init();
   #endif
+  _mi_dhat_process_init();
   if (mi_option_is_enabled(mi_option_reserve_huge_os_pages)) {
     size_t pages = mi_option_get_clamp(mi_option_reserve_huge_os_pages, 0, 128*1024);
     int reserve_at  = (int)mi_option_get_clamp(mi_option_reserve_huge_os_pages_at, -1, INT_MAX);
@@ -1237,6 +1238,7 @@ static void mi_process_done_once(void) {
   #if MI_PPROF
   _mi_prof_process_done();
   #endif
+  _mi_dhat_process_done();
 
   // Forcefully release all retained memory; this can be dangerous in general if overriding regular malloc/free
   // since after process_done there might still be other code running that calls `free` (like at_exit routines,

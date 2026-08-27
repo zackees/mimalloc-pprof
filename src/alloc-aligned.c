@@ -39,12 +39,18 @@ static mi_decl_noinline mi_decl_restrict void* mi_theap_malloc_guarded_aligned(m
     return NULL;
   }
   const size_t oversize = size + alignment - 1;
+  /* The allocator needs oversize bytes internally, but observers describe the
+     caller's requested aligned block. Suppress the base allocation event and
+     publish one normalized event below keyed by the actual page block. */
+  _mi_memevt_suppress_begin();
   void* const base = _mi_theap_malloc_guarded(theap, oversize, zero, usable);
+  _mi_memevt_suppress_end();
   if (base==NULL) return NULL;
   void* const p = _mi_align_up_ptr(base, alignment);
   mi_track_align(base, p, (uint8_t*)p - (uint8_t*)base, size);
   mi_assert_internal(mi_usable_size(p) >= size);
   mi_assert_internal(_mi_is_aligned(p, alignment));
+  _mi_memevt_on_alloc(_mi_ptr_page(base), base, size);
   return p;
 }
 
@@ -84,7 +90,9 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap
     }
     oversize = (size <= MI_SMALL_SIZE_MAX ? MI_SMALL_SIZE_MAX + 1 /* ensure we use generic malloc path */ : size);
     // note: no guarded as alignment > 0
+    _mi_memevt_suppress_begin();
     p = _mi_theap_malloc_zero_ex(theap, oversize, zero, alignment, usable); // the page block size should be large enough to align in the single huge page block
+    _mi_memevt_suppress_end();
     if (p == NULL) return NULL;
   }
   else {
@@ -92,7 +100,9 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap
     mi_assert_internal(size <= (MI_MAX_ALLOC_SIZE - MI_PADDING_SIZE) && alignment <= MI_PAGE_MAX_OVERALLOC_ALIGN);
     mi_assert_internal(size < SIZE_MAX - alignment); // `oversize` cannot overflow
     oversize = (size < MI_MAX_ALIGN_SIZE ? MI_MAX_ALIGN_SIZE : size) + alignment - 1;  // adjust for size <= 16; with size 0 and alignment 64k, we would allocate a 64k block and pointing just beyond that.
+    _mi_memevt_suppress_begin();
     p = mi_theap_malloc_zero_no_guarded(theap, oversize, zero, usable);
+    _mi_memevt_suppress_end();
     if (p == NULL) return NULL;
   }
 
@@ -151,6 +161,9 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap
     mi_track_mem_defined(p, sizeof(mi_block_t));
     #endif
   }
+  /* `p` is the page's real allocation identity (and therefore what free hooks
+     receive), while `size` is the public requested size. */
+  _mi_memevt_on_alloc(page, p, size);
   return aligned_p;
 }
 
@@ -344,11 +357,23 @@ static void* mi_theap_realloc_zero_aligned_at(mi_theap_t* theap, void* p, size_t
   if (alignment <= sizeof(uintptr_t) && offset==0) return _mi_theap_realloc_zero(theap,p,newsize,zero,NULL,NULL);
   if (p == NULL) return mi_theap_malloc_zero_aligned_at(theap,newsize,alignment,offset,zero,NULL);
   size_t size = mi_usable_size(p);
+  mi_page_t* const old_page = _mi_ptr_page(p);
+  void* const old_base = _mi_page_ptr_unalign(old_page, p);
+  const size_t old_usable = mi_page_usable_block_size(old_page);
   if (newsize <= size && newsize >= (size - (size / 2)) && (((uintptr_t)p + offset) & (alignment-1)) == 0) {
+    /* Aligned pointers can be interior to the actual page block. Memory-events
+       and DHAT use that stable block address so this in-place resize matches the
+       synthesized aligned-allocation event above. */
+    mi_page_t* const page = _mi_ptr_page(p);
+    void* const base = _mi_page_ptr_unalign(page, p);
+    _mi_memevt_on_realloc_in_place(page, base, newsize);
     return p;  // reallocation still fits, is aligned and not more than 50% waste
   }
   else {
     // note: we don't zero allocate upfront so we only zero initialize the expanded part
+    /* Hide the internal allocation/free pair and expose one identity-preserving
+       resize, exactly like _mi_theap_realloc_zero does for unaligned realloc. */
+    _mi_memevt_suppress_begin();
     void* newp = mi_theap_malloc_aligned_at(theap,newsize,alignment,offset);
     if (newp != NULL) {
       if (zero && newsize > size) {
@@ -358,6 +383,12 @@ static void* mi_theap_realloc_zero_aligned_at(mi_theap_t* theap, void* p, size_t
       }
       _mi_memcpy(newp, p, (newsize > size ? size : newsize)); // cannot be aligned due to abitrary offset... (todo: require offset to be a multiple of sizeof(void*)?)
       mi_free(p); // only free if successful
+    }
+    _mi_memevt_suppress_end();
+    if (newp != NULL) {
+      mi_page_t* const new_page = _mi_ptr_page(newp);
+      void* const new_base = _mi_page_ptr_unalign(new_page, newp);
+      _mi_memevt_on_resize(old_base, new_base, old_usable, mi_page_usable_block_size(new_page), newsize);
     }
     return newp;
   }

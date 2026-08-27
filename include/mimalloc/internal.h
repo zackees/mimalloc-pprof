@@ -353,12 +353,25 @@ void        _mi_memevt_on_free(mi_page_t* page, void* p);
 void        _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size);
 // Called after _mi_memevt_suppress_end, with suppression already lifted, to emit the single
 // synthesized RESIZE event for a moving realloc (see alloc.c's _mi_theap_realloc_zero).
-void        _mi_memevt_on_resize(size_t usable_pre, size_t usable_post, size_t request_size);
+// oldp/newp retain the allocation identity needed by the internal DHAT observer.
+void        _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size);
 // Suppress accounting/dispatch for internal allocate+free pairs that are really one resize
 // (e.g. a moving realloc's internal mi_theap_umalloc+mi_free), and for reentrant calls made
 // from inside a memory-change callback itself.
 void        _mi_memevt_suppress_begin(void);
 void        _mi_memevt_suppress_end(void);
+
+// "dhat.c": exact heap/lifetime observer, independent of MI_PPROF. The event
+// bracketing deliberately captures before the public callback and commits after it.
+bool        _mi_dhat_is_active(void);
+void        _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size);
+void        _mi_dhat_forget_heap(mi_heap_t* heap);
+void        _mi_dhat_begin_free(void* p);
+void        _mi_dhat_begin_resize(void* oldp, void* newp, size_t request_size);
+void        _mi_dhat_finish_event(void);
+void        _mi_dhat_process_init(void);
+void        _mi_dhat_process_done(void);
+size_t      _mi_dhat_stack_capture(void** pcs, size_t capacity);
 
 
 // ------------------------------------------------------

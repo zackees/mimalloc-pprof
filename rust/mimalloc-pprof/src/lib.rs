@@ -199,6 +199,93 @@ pub unsafe fn usable_size(p: *const u8) -> usize {
     unsafe { sys::mi_usable_size(p.cast()) }
 }
 
+/// Exact DHAT v2 heap/lifetime profiling controls.
+///
+/// DHAT records every non-internal allocation from the moment [`start`] succeeds.
+/// It is intended for short diagnostic runs and tests rather than continuous production
+/// telemetry. The generated JSON opens in the standard Valgrind `dh_view.html` viewer.
+/// It is independent of sampled [`prof`] profiling and of `mi_memory_set_callbacks`.
+pub mod dhat {
+    use std::ffi::CString;
+    use std::io;
+    use std::path::Path;
+
+    use crate::sys;
+
+    /// Snapshot of exact DHAT collector state.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct Stats {
+        pub enabled: bool,
+        /// True when raw-OS collector storage hit its configured budget or an internal
+        /// allocation failed. The application allocation still completed, but the
+        /// resulting profile is intentionally marked partial.
+        pub incomplete: bool,
+        pub total_bytes: u64,
+        pub total_blocks: u64,
+        pub live_bytes: u64,
+        pub live_blocks: u64,
+        pub peak_bytes: u64,
+        pub peak_blocks: u64,
+        pub dropped: u64,
+        pub internal_bytes: u64,
+    }
+
+    /// Start exact allocation/lifetime tracking. Returns `false` if it is already active.
+    pub fn start() -> bool {
+        unsafe { sys::mi_dhat_start() }
+    }
+
+    /// Stop observing allocation events. Retained records remain available to [`dump_file`]
+    /// so a caller can stop a measurement window before serializing its report.
+    pub fn stop() {
+        unsafe { sys::mi_dhat_stop() }
+    }
+
+    /// Whether exact DHAT tracking is currently active.
+    pub fn is_enabled() -> bool {
+        unsafe { sys::mi_dhat_is_enabled() }
+    }
+
+    /// Read the collector's exact counters. Returns a zero/default snapshot only if the
+    /// linked C library rejected the versioned ABI structure.
+    pub fn stats() -> Stats {
+        let mut raw: sys::mi_dhat_stats_t = unsafe { core::mem::zeroed() };
+        raw.size = core::mem::size_of::<sys::mi_dhat_stats_t>();
+        raw.version = sys::MI_DHAT_STATS_VERSION;
+        if unsafe { sys::mi_dhat_stats_get(&mut raw) } {
+            Stats {
+                enabled: raw.enabled,
+                incomplete: raw.incomplete,
+                total_bytes: raw.total_bytes,
+                total_blocks: raw.total_blocks,
+                live_bytes: raw.live_bytes,
+                live_blocks: raw.live_blocks,
+                peak_bytes: raw.peak_bytes,
+                peak_blocks: raw.peak_blocks,
+                dropped: raw.dropped,
+                internal_bytes: raw.internal_bytes,
+            }
+        } else {
+            Stats::default()
+        }
+    }
+
+    /// Serialize the current or stopped measurement window as a DHAT v2 JSON file.
+    pub fn dump_file(path: &Path) -> io::Result<()> {
+        let path = path.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "DHAT path is not UTF-8")
+        })?;
+        let path = CString::new(path).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "DHAT path contains NUL")
+        })?;
+        if unsafe { sys::mi_dhat_dump(path.as_ptr()) } {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
 /// Turn on sampled heap profiling at the default sample rate.
 ///
 /// Convenience entry point for wiring profiling to a command-line flag:
@@ -693,6 +780,7 @@ mod tests {
     // than cascading a single panicking test into every other one.
     #[cfg(feature = "pprof")]
     static PROF_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static DHAT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(feature = "pprof")]
     fn reset_profiler() {
@@ -794,5 +882,19 @@ mod tests {
             let p2 = unwrapped_realloc(p, 0, 0);
             assert!(p2.is_null());
         }
+    }
+
+    #[test]
+    fn dhat_controls_report_lifecycle() {
+        let _guard = DHAT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if dhat::is_enabled() {
+            dhat::stop();
+        }
+        assert!(dhat::start());
+        let active = dhat::stats();
+        assert!(active.enabled);
+        dhat::stop();
+        assert!(!dhat::is_enabled());
+        assert!(!dhat::stats().enabled);
     }
 }

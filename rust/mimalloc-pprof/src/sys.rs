@@ -9,6 +9,27 @@ pub type MiProfWriteFun = unsafe extern "C" fn(*mut c_void, *const c_char, usize
 /// Mirrors `MI_PROF_STAT_VERSION` in `include/mimalloc/profile.h`.
 pub const MI_PROF_STAT_VERSION: c_int = 3;
 
+/// Mirrors `MI_DHAT_STATS_VERSION` in `include/mimalloc/dhat.h`.
+pub const MI_DHAT_STATS_VERSION: c_int = 1;
+
+/// Mirrors `mi_dhat_stats_t` (include/mimalloc/dhat.h) field-for-field.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct mi_dhat_stats_t {
+    pub size: usize,
+    pub version: c_int,
+    pub enabled: bool,
+    pub incomplete: bool,
+    pub total_bytes: u64,
+    pub total_blocks: u64,
+    pub live_bytes: u64,
+    pub live_blocks: u64,
+    pub peak_bytes: u64,
+    pub peak_blocks: u64,
+    pub dropped: u64,
+    pub internal_bytes: u64,
+}
+
 /// Mirrors `mi_prof_stats_t` (include/mimalloc/profile.h) field-for-field.
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -138,6 +159,11 @@ unsafe extern "C" {
     /// Grow in place only; returns NULL if the block cannot be extended without moving.
     pub fn mi_expand(p: *mut c_void, newsize: usize) -> *mut c_void;
     pub fn mi_usable_size(p: *const c_void) -> usize;
+    pub fn mi_dhat_start() -> bool;
+    pub fn mi_dhat_stop();
+    pub fn mi_dhat_is_enabled() -> bool;
+    pub fn mi_dhat_stats_get(stats: *mut mi_dhat_stats_t) -> bool;
+    pub fn mi_dhat_dump(path: *const c_char) -> bool;
     pub fn mi_prof_start(sample_rate: usize) -> bool;
     pub fn mi_prof_start_seeded(sample_rate: usize, seed: u64) -> bool;
     pub fn mi_prof_start_ex(config: *const mi_prof_config_t) -> bool;

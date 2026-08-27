@@ -200,42 +200,55 @@ static void memevt_dispatch(mi_memory_change_kind_t kind, int64_t delta_bytes, u
 // disabled path.
 // ---------------------------------------------------------------------------------------
 
+/* DHAT and the public callback table are independent observers.  The detailed
+   identity context is prepared before dispatch, while the allocator still has the
+   original pointers available; it is committed only after the user callback returns.
+   The shared suppression depth excludes callback-internal and moving-realloc internals
+   from both observers. */
 void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
-  MI_UNUSED(p);
+  if (memevt_suppress_depth > 0) return;
+  _mi_dhat_begin_alloc(page, p, request_size);
   size_t state = mi_atomic_load_relaxed(&memevt_state);
-  if mi_likely(state == MEMEVT_DISABLED) return;
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
-  if (state != MEMEVT_ENABLED) return;
-  const size_t usable = mi_page_usable_block_size(page);
-  memevt_dispatch(MI_MEMORY_ALLOCATE, (int64_t)usable, (uint64_t)request_size);
+  if (state == MEMEVT_ENABLED) {
+    const size_t usable = mi_page_usable_block_size(page);
+    memevt_dispatch(MI_MEMORY_ALLOCATE, (int64_t)usable, (uint64_t)request_size);
+  }
+  _mi_dhat_finish_event();
 }
 
 void _mi_memevt_on_free(mi_page_t* page, void* p) {
-  MI_UNUSED(p);
+  if (memevt_suppress_depth > 0) return;
+  _mi_dhat_begin_free(p);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
-  if mi_likely(state == MEMEVT_DISABLED) return;
-  if (state != MEMEVT_ENABLED) return; // MEMEVT_UNINIT: nothing can have been counted yet, nothing to free-account.
-  const size_t usable = mi_page_usable_block_size(page);
-  memevt_dispatch(MI_MEMORY_FREE, -(int64_t)usable, 0);
+  if (state == MEMEVT_ENABLED) {
+    const size_t usable = mi_page_usable_block_size(page);
+    memevt_dispatch(MI_MEMORY_FREE, -(int64_t)usable, 0);
+  }
+  _mi_dhat_finish_event();
 }
 
 void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size) {
-  MI_UNUSED(p);
+  if (memevt_suppress_depth > 0) return;
+  _mi_dhat_begin_resize(p, p, request_size);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
-  if mi_likely(state == MEMEVT_DISABLED) return;
-  if (state != MEMEVT_ENABLED) return;
-  // Same page => same block-size class => usable size is identical before and after;
-  // delta is always exactly 0 (still a real, dispatched RESIZE event, per spec).
-  MI_UNUSED(page);
-  memevt_dispatch(MI_MEMORY_RESIZE, 0, (uint64_t)request_size);
+  if (state == MEMEVT_ENABLED) {
+    // Same page => same block-size class => usable size is identical before and after.
+    MI_UNUSED(page);
+    memevt_dispatch(MI_MEMORY_RESIZE, 0, (uint64_t)request_size);
+  }
+  _mi_dhat_finish_event();
 }
 
-void _mi_memevt_on_resize(size_t usable_pre, size_t usable_post, size_t request_size) {
+void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
+  if (memevt_suppress_depth > 0) return;
+  _mi_dhat_begin_resize(oldp, newp, request_size);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
-  if mi_likely(state == MEMEVT_DISABLED) return;
-  if (state != MEMEVT_ENABLED) return;
-  const int64_t delta = (int64_t)usable_post - (int64_t)usable_pre;
-  memevt_dispatch(MI_MEMORY_RESIZE, delta, (uint64_t)request_size);
+  if (state == MEMEVT_ENABLED) {
+    const int64_t delta = (int64_t)usable_post - (int64_t)usable_pre;
+    memevt_dispatch(MI_MEMORY_RESIZE, delta, (uint64_t)request_size);
+  }
+  _mi_dhat_finish_event();
 }
 
 // ---------------------------------------------------------------------------------------

@@ -476,6 +476,23 @@
       "cleanup": "negative control exits before publication; other modes use thread cleanup",
       "publication": "owner diagnostic runs before zeroing, count update, or mi_thread_locals_set",
       "locks": ["no explicit lock; table is thread-local", "test heap allocation may acquire allocator locks"]
+    },
+    {
+      "id": "dhat-collector-arena-chunk",
+      "path": "src/dhat.c",
+      "callee": "_mi_os_alloc",
+      "args": "_mi_subproc_main(),total,&memid",
+      "occurrence": 1,
+      "owner": "process-global exact DHAT collector arena",
+      "initial_owner": "unpublished process-main raw OS chunk",
+      "owner_transitions": "prepended to dhat_chunks only after its raw OS provenance and bump extent initialize",
+      "destroyable_by": "mi_dhat_start session reset or process teardown; never an application heap",
+      "lifetime": "one exact-DHAT session",
+      "logical_size": "max(DHAT_CHUNK_SIZE, dhat chunk header plus aligned requested object)",
+      "usable_size": "chunk->size and chunk->memid retain the exact raw OS cleanup extent",
+      "cleanup": "dhat_release_locked walks dhat_chunks and calls _mi_os_free",
+      "publication": "dhat_lock serializes publication into dhat_chunks after allocation succeeds",
+      "locks": ["dhat_lock protects the arena list and bump pointer", "raw OS layer may lock internally"]
     }
   ]
 }

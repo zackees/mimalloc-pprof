@@ -364,7 +364,8 @@ void        _mi_memevt_suppress_end(void);
 // "dhat.c": exact heap/lifetime observer, independent of MI_PPROF. The event
 // bracketing deliberately captures before the public callback and commits after it.
 bool        _mi_dhat_is_active(void);
-void        _mi_dhat_begin_alloc(void* p, size_t request_size);
+void        _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size);
+void        _mi_dhat_forget_heap(mi_heap_t* heap);
 void        _mi_dhat_begin_free(void* p);
 void        _mi_dhat_begin_resize(void* oldp, void* newp, size_t request_size);
 void        _mi_dhat_finish_event(void);

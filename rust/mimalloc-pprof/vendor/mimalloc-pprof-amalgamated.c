@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f1c47160 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fb424675 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4344,7 +4344,8 @@ void        _mi_memevt_suppress_end(void);
 // "dhat.c": exact heap/lifetime observer, independent of MI_PPROF. The event
 // bracketing deliberately captures before the public callback and commits after it.
 bool        _mi_dhat_is_active(void);
-void        _mi_dhat_begin_alloc(void* p, size_t request_size);
+void        _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size);
+void        _mi_dhat_forget_heap(mi_heap_t* heap);
 void        _mi_dhat_begin_free(void* p);
 void        _mi_dhat_begin_resize(void* oldp, void* newp, size_t request_size);
 void        _mi_dhat_finish_event(void);
@@ -7444,7 +7445,7 @@ void* mi_expand(void* p, size_t newsize) mi_attr_noexcept {
   #if MI_PPROF
   _mi_prof_on_realloc_in_place((mi_page_t*)page, p, newsize);
   #endif
-  _mi_memevt_on_realloc_in_place((mi_page_t*)page, p, newsize);
+  _mi_memevt_on_realloc_in_place((mi_page_t*)page, _mi_page_ptr_unalign(page, p), newsize);
   return p; // it fits
   #endif
 }
@@ -7486,7 +7487,7 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
         #if MI_PPROF
         _mi_prof_on_realloc_in_place((mi_page_t*)page, p, newsize);
         #endif
-        _mi_memevt_on_realloc_in_place((mi_page_t*)page, p, newsize);
+        _mi_memevt_on_realloc_in_place((mi_page_t*)page, _mi_page_ptr_unalign(page, p), newsize);
         return p;  // reallocation still fits and not more than 50% waste
       }
     }
@@ -7500,6 +7501,9 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
   // When p == NULL this call behaves as a plain malloc, not a resize: leave it
   // unsuppressed so it naturally emits ALLOCATE like any other malloc.
   const bool memevt_is_resize = (p != NULL);
+  /* Aligned allocations are represented in DHAT by their owning page block,
+     not a possible interior user pointer. */
+  void* const memevt_oldp = (memevt_is_resize ? _mi_page_ptr_unalign(page, p) : NULL);
   const size_t memevt_usable_pre = (memevt_is_resize ? mi_page_usable_block_size(page) : 0);
   size_t memevt_local_usable_post = 0;
   size_t* const memevt_up = (memevt_is_resize && usable_post == NULL ? &memevt_local_usable_post : usable_post);
@@ -7524,7 +7528,10 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
   }
   if (memevt_is_resize) {
     _mi_memevt_suppress_end();
-    if (newp != NULL) { _mi_memevt_on_resize(p, newp, memevt_usable_pre, memevt_usable_post, newsize); }
+    if (newp != NULL) {
+      mi_page_t* const memevt_new_page = _mi_ptr_page(newp);
+      _mi_memevt_on_resize(memevt_oldp, _mi_page_ptr_unalign(memevt_new_page, newp), memevt_usable_pre, memevt_usable_post, newsize);
+    }
   }
   return newp;
 }
@@ -14376,6 +14383,7 @@ void mi_heap_delete(mi_heap_t* heap) {
 void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   if (heap==NULL) return;
   mi_heap_free_theaps(heap);
+  _mi_dhat_forget_heap(heap);
   _mi_heap_destroy_pages(heap);
   // Free unless this is the PROCESS main heap (which is statically allocated and must
   // outlive everything). _mi_is_heap_main alone is not the right test: it resolves via
@@ -16422,7 +16430,7 @@ static void memevt_dispatch(mi_memory_change_kind_t kind, int64_t delta_bytes, u
    from both observers. */
 void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
   if (memevt_suppress_depth > 0) return;
-  _mi_dhat_begin_alloc(p, request_size);
+  _mi_dhat_begin_alloc(page, p, request_size);
   size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
   if (state == MEMEVT_ENABLED) {
@@ -16728,6 +16736,7 @@ typedef struct dhat_record_s {
   void* ptr;
   size_t size;
   uint64_t born;
+  mi_page_t* page;
   dhat_pp_t* pp;
 } dhat_record_t;
 
@@ -16739,6 +16748,7 @@ typedef struct dhat_event_s {
   size_t size;
   uint64_t at;
   uint64_t generation;
+  mi_page_t* page;
   dhat_pp_t* pp;
   bool armed;
 } dhat_event_t;
@@ -16754,6 +16764,11 @@ static _Atomic(size_t) dhat_internal_bytes;
 static _Atomic(size_t) dhat_dropped;
 static _Atomic(size_t) dhat_incomplete;
 static mi_msecs_t dhat_started;
+static mi_msecs_t dhat_ended;
+/* Events prepared before stop must commit before the stopped snapshot is frozen. */
+static _Atomic(size_t) dhat_inflight;
+/* Serializes stop's freeze phase against a fresh start. */
+static _Atomic(size_t) dhat_stopping;
 /* Every fresh start gets an epoch so an event prepared before a concurrent
    stop/start can never commit stale pointers into the new collector arena. */
 static uint64_t dhat_generation;
@@ -16767,7 +16782,11 @@ size_t _mi_dhat_stack_capture(void** pcs, size_t capacity);
 
 static uint64_t dhat_hash_ptr(const void* p) {
   uintptr_t x = (uintptr_t)p;
-  x ^= x >> 33; x *= UINT64_C(0xff51afd7ed558ccd); x ^= x >> 33;
+  /* Keep every shift within uintptr_t's width on both 32- and 64-bit targets. */
+  const unsigned shift = (unsigned)(sizeof(uintptr_t) * 4);
+  x ^= x >> shift;
+  x *= (uintptr_t)UINT64_C(0xff51afd7ed558ccd);
+  x ^= x >> shift;
   return (uint64_t)x;
 }
 static uint64_t dhat_hash_stack(void* const* pcs, size_t depth) {
@@ -16794,6 +16813,7 @@ static void dhat_release_locked(void) {
     chunk = next;
   }
   dhat_chunks = NULL; dhat_live_table = NULL; dhat_pp_table = NULL;
+  dhat_ended = 0;
   dhat_total_bytes = dhat_total_blocks = 0;
   dhat_live_bytes = dhat_live_blocks = dhat_peak_bytes = dhat_peak_blocks = dhat_peak_at = 0;
   mi_atomic_store_relaxed(&dhat_internal_bytes, (size_t)0);
@@ -16859,8 +16879,12 @@ static dhat_record_t** dhat_record_slot_locked(void* p) {
   while (*slot != NULL && (*slot)->ptr != p) slot = &(*slot)->next;
   return slot;
 }
+static mi_msecs_t dhat_effective_end(void) {
+  if (!_mi_dhat_is_active() && dhat_ended != 0) return dhat_ended;
+  return _mi_clock_now();
+}
 static uint64_t dhat_elapsed_now(void) {
-  const mi_msecs_t now = _mi_clock_now();
+  const mi_msecs_t now = dhat_effective_end();
   return (now >= dhat_started ? (uint64_t)(now - dhat_started) : 0);
 }
 static void dhat_snapshot_global_peak_locked(void) {
@@ -16876,7 +16900,7 @@ static void dhat_commit_alloc_locked(dhat_event_t* ev) {
   if (*slot != NULL) { dhat_mark_dropped(); return; }
   dhat_record_t* rec = (dhat_record_t*)dhat_arena_alloc(sizeof(*rec));
   if (rec == NULL) { dhat_mark_dropped(); return; }
-  rec->next = NULL; rec->ptr = ev->newp; rec->size = ev->size; rec->born = ev->at; rec->pp = ev->pp; *slot = rec;
+  rec->next = NULL; rec->ptr = ev->newp; rec->size = ev->size; rec->born = ev->at; rec->page = ev->page; rec->pp = ev->pp; *slot = rec;
   ev->pp->tb += ev->size; ev->pp->tbk++; ev->pp->live += ev->size; ev->pp->livek++;
   if (ev->pp->live > ev->pp->mb) ev->pp->mb = ev->pp->live;
   if (ev->pp->livek > ev->pp->mbk) ev->pp->mbk = ev->pp->livek;
@@ -16894,6 +16918,32 @@ static void dhat_commit_free_locked(void* p, uint64_t at) {
   if (dhat_live_blocks != 0) dhat_live_blocks--; else dhat_mark_dropped();
   pp->tl += (at >= rec->born ? at - rec->born : 0);
 }
+/* Heap destruction bypasses individual user free calls. Forget matching live
+   records while their pages are still valid, treating teardown as a free at the
+   current time so addresses cannot poison a later session allocation. */
+void _mi_dhat_forget_heap(mi_heap_t* heap) {
+  if (!_mi_dhat_is_active() || heap == NULL) return;
+  const uint64_t at = (uint64_t)_mi_clock_now();
+  mi_lock_acquire(&dhat_lock);
+  if (dhat_live_table == NULL) { mi_lock_release(&dhat_lock); return; }
+  for (size_t i = 0; i < DHAT_BUCKETS; i++) {
+    dhat_record_t** slot = &dhat_live_table[i];
+    while (*slot != NULL) {
+      dhat_record_t* rec = *slot;
+      if (rec->page != NULL && mi_page_heap(rec->page) == heap) {
+        *slot = rec->next;
+        dhat_pp_t* pp = rec->pp;
+        pp->live -= rec->size; pp->livek--;
+        dhat_live_bytes -= rec->size; dhat_live_blocks--;
+        if (at >= rec->born) pp->tl += at - rec->born;
+      }
+      else {
+        slot = &rec->next;
+      }
+    }
+  }
+  mi_lock_release(&dhat_lock);
+}
 static void dhat_commit_resize_locked(dhat_event_t* ev) {
   dhat_record_t** slot = dhat_record_slot_locked(ev->oldp);
   if (slot == NULL || *slot == NULL) return;
@@ -16903,7 +16953,7 @@ static void dhat_commit_resize_locked(dhat_event_t* ev) {
     *slot = rec->next;
     dhat_record_t** destination = dhat_record_slot_locked(ev->newp);
     if (destination == NULL || *destination != NULL) { dhat_mark_dropped(); return; }
-    rec->ptr = ev->newp; rec->next = NULL; *destination = rec;
+    rec->ptr = ev->newp; rec->page = _mi_ptr_page(ev->newp); rec->next = NULL; *destination = rec;
   }
   rec->size = ev->size;
   dhat_pp_t* pp = rec->pp;
@@ -16959,23 +17009,27 @@ static void dhat_resolve_env(void) {
 }
 
 bool _mi_dhat_is_active(void) { return mi_atomic_load_relaxed(&dhat_state) == DHAT_ENABLED; }
-static void dhat_prepare(dhat_event_kind_t kind, void* oldp, void* newp, size_t size) {
+static void dhat_prepare(dhat_event_kind_t kind, mi_page_t* page, void* oldp, void* newp, size_t size) {
   dhat_event.armed = false;
+  if (dhat_observer_depth != 0) return;
+  /* Register before reading activation so stop can wait for any thread that
+     might have observed the old enabled state. */
+  mi_atomic_increment_acq_rel(&dhat_inflight);
   size_t state = mi_atomic_load_relaxed(&dhat_state);
   if (state == DHAT_UNINIT) { dhat_resolve_env(); state = mi_atomic_load_relaxed(&dhat_state); }
-  if (state != DHAT_ENABLED || dhat_observer_depth != 0) return;
+  if (state != DHAT_ENABLED) { mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
   dhat_observer_depth++;
-  dhat_event.kind = kind; dhat_event.oldp = oldp; dhat_event.newp = newp;
+  dhat_event.kind = kind; dhat_event.page = page; dhat_event.oldp = oldp; dhat_event.newp = newp;
   dhat_event.size = size; dhat_event.at = _mi_clock_now();
   dhat_event.generation = 0; dhat_event.pp = NULL;
   if (kind == DHAT_EVENT_ALLOC) {
     void* pcs[DHAT_STACK_MAX]; const size_t depth = _mi_dhat_stack_capture(pcs, DHAT_STACK_MAX);
-    if (depth == 0) { dhat_mark_dropped(); dhat_observer_depth--; return; }
+    if (depth == 0) { dhat_mark_dropped(); dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
     mi_lock_acquire(&dhat_lock);
     dhat_event.pp = dhat_pp_intern_locked(pcs, depth);
     dhat_event.generation = dhat_generation;
     mi_lock_release(&dhat_lock);
-    if (dhat_event.pp == NULL) { dhat_observer_depth--; return; }
+    if (dhat_event.pp == NULL) { dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
   }
   else {
     mi_lock_acquire(&dhat_lock);
@@ -16984,21 +17038,22 @@ static void dhat_prepare(dhat_event_kind_t kind, void* oldp, void* newp, size_t 
   }
   dhat_event.armed = true;
 }
-void _mi_dhat_begin_alloc(void* p, size_t request_size) { dhat_prepare(DHAT_EVENT_ALLOC, NULL, p, request_size); }
-void _mi_dhat_begin_free(void* p) { dhat_prepare(DHAT_EVENT_FREE, p, NULL, 0); }
-void _mi_dhat_begin_resize(void* oldp, void* newp, size_t request_size) { dhat_prepare(DHAT_EVENT_RESIZE, oldp, newp, request_size); }
+void _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size) { dhat_prepare(DHAT_EVENT_ALLOC, page, NULL, p, request_size); }
+void _mi_dhat_begin_free(void* p) { dhat_prepare(DHAT_EVENT_FREE, NULL, p, NULL, 0); }
+void _mi_dhat_begin_resize(void* oldp, void* newp, size_t request_size) { dhat_prepare(DHAT_EVENT_RESIZE, NULL, oldp, newp, request_size); }
 void _mi_dhat_finish_event(void) {
   if (!dhat_event.armed) return;
   dhat_event_t ev = dhat_event; dhat_event.armed = false; dhat_observer_depth--;
   /* The observer guard is deliberately popped before mutating the ledger: a user memory
      callback runs between begin and finish, and any allocations it makes are excluded. */
   mi_lock_acquire(&dhat_lock);
-  if (_mi_dhat_is_active() && ev.generation == dhat_generation) {
+  if (ev.generation == dhat_generation) {
     if (ev.kind == DHAT_EVENT_ALLOC) dhat_commit_alloc_locked(&ev);
     else if (ev.kind == DHAT_EVENT_FREE) dhat_commit_free_locked(ev.oldp, ev.at);
     else if (ev.kind == DHAT_EVENT_RESIZE) dhat_commit_resize_locked(&ev);
   }
   mi_lock_release(&dhat_lock);
+  mi_atomic_decrement_acq_rel(&dhat_inflight);
 }
 
 bool mi_dhat_start(void) mi_attr_noexcept {
@@ -17010,7 +17065,7 @@ bool mi_dhat_start(void) mi_attr_noexcept {
     _mi_atomic_once_release(&dhat_once);
   }
   mi_lock_acquire(&dhat_lock);
-  if (_mi_dhat_is_active()) { mi_lock_release(&dhat_lock); return false; }
+  if (_mi_dhat_is_active() || mi_atomic_load_relaxed(&dhat_stopping) != 0 || mi_atomic_load_acquire(&dhat_inflight) != 0) { mi_lock_release(&dhat_lock); return false; }
   dhat_release_locked();
   dhat_budget = DHAT_DEFAULT_BUDGET;
   (void)dhat_env_size("MIMALLOC_DHAT_MAX_BYTES", &dhat_budget);
@@ -17019,7 +17074,20 @@ bool mi_dhat_start(void) mi_attr_noexcept {
   mi_atomic_store_release(&dhat_state, DHAT_ENABLED);
   mi_lock_release(&dhat_lock); return true;
 }
-void mi_dhat_stop(void) mi_attr_noexcept { if (dhat_observer_depth == 0) mi_atomic_store_release(&dhat_state, DHAT_DISABLED); }
+void mi_dhat_stop(void) mi_attr_noexcept {
+  if (dhat_observer_depth != 0) return;
+  mi_lock_acquire(&dhat_lock);
+  if (!_mi_dhat_is_active()) { mi_lock_release(&dhat_lock); return; }
+  /* Block a new start while we drain events that already observed this session. */
+  mi_atomic_store_release(&dhat_stopping, (size_t)1);
+  mi_atomic_store_release(&dhat_state, DHAT_DISABLED);
+  mi_lock_release(&dhat_lock);
+  while (mi_atomic_load_acquire(&dhat_inflight) != 0) _mi_prim_thread_yield();
+  mi_lock_acquire(&dhat_lock);
+  dhat_ended = _mi_clock_now();
+  mi_atomic_store_release(&dhat_stopping, (size_t)0);
+  mi_lock_release(&dhat_lock);
+}
 bool mi_dhat_is_enabled(void) mi_attr_noexcept { return _mi_dhat_is_active(); }
 bool mi_dhat_stats_get(mi_dhat_stats_t* out) mi_attr_noexcept {
   if (out == NULL || out->size != sizeof(*out) || out->version != MI_DHAT_STATS_VERSION) return false;
@@ -17077,7 +17145,7 @@ static void dhat_prepare_dump_lifetimes_locked(uint64_t now) {
 }
 static void dhat_write_json_locked(FILE* f) {
   const uint64_t elapsed = dhat_elapsed_now();
-  const uint64_t now = (uint64_t)_mi_clock_now();
+  const uint64_t now = (uint64_t)dhat_effective_end();
   dhat_prepare_dump_lifetimes_locked(now);
   /* The standard viewer accepts producer-specific mode strings and extra keys.
      Keep the required v2 fields conventional; Mtu and tu truthfully say that

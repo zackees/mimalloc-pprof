@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 50ffb71b of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 833f5f1b of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -6442,6 +6442,12 @@ static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was
   }
   #endif
 
+  /* Commit the global memory observers before publishing this block to the
+     owner thread's reusable list. Otherwise the owner can collect and reuse the
+     address while DHAT still holds its old live record. This mirrors the local
+     free ordering: callbacks run without allocator locks, before list reuse. */
+  _mi_memevt_on_free(page, block);
+
   // push atomically on the page thread free list
   mi_thread_free_t tf_new;
   mi_thread_free_t tf_old = mi_atomic_load_relaxed(&page->xthread_free);
@@ -6450,14 +6456,6 @@ static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was
     const bool new_owned = (allow_collect ? true : mi_tf_is_owned(tf_old));    // if allow collection then always try to claim it if the page is abandoned 
     tf_new = mi_tf_create(block, new_owned);
   } while (!mi_atomic_cas_weak_acq_rel(&page->xthread_free, &tf_old, tf_new)); // todo: release is enough?
-
-  // memory-events (issue #20): this is a genuine remote (cross-thread) free that has just
-  // completed (the block is now pushed onto the page's thread-free list) -- hook here,
-  // mirroring mi_free_block_local's placement (definitely-freeing, page/block still valid).
-  // Deliberately NOT paired with _mi_prof_on_free here: the profiler's only remote-free
-  // counting point is inside the free-collect helper (mi_page_thread_collect_to_local),
-  // to avoid double counting.
-  _mi_memevt_on_free(page, block);
 
   // and atomically try to collect the page if it was abandoned
   if (allow_collect) {
@@ -8091,12 +8089,18 @@ static mi_decl_noinline mi_decl_restrict void* mi_theap_malloc_guarded_aligned(m
     return NULL;
   }
   const size_t oversize = size + alignment - 1;
+  /* The allocator needs oversize bytes internally, but observers describe the
+     caller's requested aligned block. Suppress the base allocation event and
+     publish one normalized event below keyed by the actual page block. */
+  _mi_memevt_suppress_begin();
   void* const base = _mi_theap_malloc_guarded(theap, oversize, zero, usable);
+  _mi_memevt_suppress_end();
   if (base==NULL) return NULL;
   void* const p = _mi_align_up_ptr(base, alignment);
   mi_track_align(base, p, (uint8_t*)p - (uint8_t*)base, size);
   mi_assert_internal(mi_usable_size(p) >= size);
   mi_assert_internal(_mi_is_aligned(p, alignment));
+  _mi_memevt_on_alloc(_mi_ptr_page(base), base, size);
   return p;
 }
 
@@ -8136,7 +8140,9 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap
     }
     oversize = (size <= MI_SMALL_SIZE_MAX ? MI_SMALL_SIZE_MAX + 1 /* ensure we use generic malloc path */ : size);
     // note: no guarded as alignment > 0
+    _mi_memevt_suppress_begin();
     p = _mi_theap_malloc_zero_ex(theap, oversize, zero, alignment, usable); // the page block size should be large enough to align in the single huge page block
+    _mi_memevt_suppress_end();
     if (p == NULL) return NULL;
   }
   else {
@@ -8144,7 +8150,9 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap
     mi_assert_internal(size <= (MI_MAX_ALLOC_SIZE - MI_PADDING_SIZE) && alignment <= MI_PAGE_MAX_OVERALLOC_ALIGN);
     mi_assert_internal(size < SIZE_MAX - alignment); // `oversize` cannot overflow
     oversize = (size < MI_MAX_ALIGN_SIZE ? MI_MAX_ALIGN_SIZE : size) + alignment - 1;  // adjust for size <= 16; with size 0 and alignment 64k, we would allocate a 64k block and pointing just beyond that.
+    _mi_memevt_suppress_begin();
     p = mi_theap_malloc_zero_no_guarded(theap, oversize, zero, usable);
+    _mi_memevt_suppress_end();
     if (p == NULL) return NULL;
   }
 
@@ -8203,6 +8211,9 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap
     mi_track_mem_defined(p, sizeof(mi_block_t));
     #endif
   }
+  /* `p` is the page's real allocation identity (and therefore what free hooks
+     receive), while `size` is the public requested size. */
+  _mi_memevt_on_alloc(page, p, size);
   return aligned_p;
 }
 
@@ -8396,11 +8407,23 @@ static void* mi_theap_realloc_zero_aligned_at(mi_theap_t* theap, void* p, size_t
   if (alignment <= sizeof(uintptr_t) && offset==0) return _mi_theap_realloc_zero(theap,p,newsize,zero,NULL,NULL);
   if (p == NULL) return mi_theap_malloc_zero_aligned_at(theap,newsize,alignment,offset,zero,NULL);
   size_t size = mi_usable_size(p);
+  mi_page_t* const old_page = _mi_ptr_page(p);
+  void* const old_base = _mi_page_ptr_unalign(old_page, p);
+  const size_t old_usable = mi_page_usable_block_size(old_page);
   if (newsize <= size && newsize >= (size - (size / 2)) && (((uintptr_t)p + offset) & (alignment-1)) == 0) {
+    /* Aligned pointers can be interior to the actual page block. Memory-events
+       and DHAT use that stable block address so this in-place resize matches the
+       synthesized aligned-allocation event above. */
+    mi_page_t* const page = _mi_ptr_page(p);
+    void* const base = _mi_page_ptr_unalign(page, p);
+    _mi_memevt_on_realloc_in_place(page, base, newsize);
     return p;  // reallocation still fits, is aligned and not more than 50% waste
   }
   else {
     // note: we don't zero allocate upfront so we only zero initialize the expanded part
+    /* Hide the internal allocation/free pair and expose one identity-preserving
+       resize, exactly like _mi_theap_realloc_zero does for unaligned realloc. */
+    _mi_memevt_suppress_begin();
     void* newp = mi_theap_malloc_aligned_at(theap,newsize,alignment,offset);
     if (newp != NULL) {
       if (zero && newsize > size) {
@@ -8410,6 +8433,12 @@ static void* mi_theap_realloc_zero_aligned_at(mi_theap_t* theap, void* p, size_t
       }
       _mi_memcpy(newp, p, (newsize > size ? size : newsize)); // cannot be aligned due to abitrary offset... (todo: require offset to be a multiple of sizeof(void*)?)
       mi_free(p); // only free if successful
+    }
+    _mi_memevt_suppress_end();
+    if (newp != NULL) {
+      mi_page_t* const new_page = _mi_ptr_page(newp);
+      void* const new_base = _mi_page_ptr_unalign(new_page, newp);
+      _mi_memevt_on_resize(old_base, new_base, old_usable, mi_page_usable_block_size(new_page), newsize);
     }
     return newp;
   }
@@ -16751,7 +16780,9 @@ static bool dhat_stack_equal(const dhat_pp_t* pp, uint64_t hash, void* const* pc
   for (size_t i = 0; i < depth; i++) if (pp->pcs[i] != pcs[i]) return false;
   return true;
 }
-static size_t dhat_align(size_t n) { const size_t a = sizeof(void*) - 1; return (n + a) & ~a; }
+/* The raw arena holds uint64_t counters as well as pointers. Use the allocator's
+   max fundamental alignment rather than pointer width for 32-bit strict-alignment ABIs. */
+static size_t dhat_align(size_t n) { const size_t a = MI_MAX_ALIGN_SIZE - 1; return (n + a) & ~a; }
 
 static void dhat_release_locked(void) {
   for (dhat_chunk_t* chunk = dhat_chunks; chunk != NULL; ) {
@@ -16969,7 +17000,12 @@ void _mi_dhat_finish_event(void) {
 
 bool mi_dhat_start(void) mi_attr_noexcept {
   if (dhat_observer_depth != 0) return false;
-  if (_mi_atomic_once_enter(&dhat_once)) _mi_atomic_once_release(&dhat_once);
+  if (_mi_atomic_once_enter(&dhat_once)) {
+    /* Explicit start wins over MIMALLOC_DHAT, but it must still honor the
+       independently useful exit-dump configuration before sealing the once. */
+    (void)_mi_getenv("MIMALLOC_DHAT_DUMP_AT_EXIT", dhat_dump_at_exit, sizeof(dhat_dump_at_exit));
+    _mi_atomic_once_release(&dhat_once);
+  }
   mi_lock_acquire(&dhat_lock);
   if (_mi_dhat_is_active()) { mi_lock_release(&dhat_lock); return false; }
   dhat_release_locked();

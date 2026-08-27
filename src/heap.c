@@ -253,6 +253,7 @@ void mi_heap_delete(mi_heap_t* heap) {
 void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   if (heap==NULL) return;
   mi_heap_free_theaps(heap);
+  _mi_dhat_forget_heap(heap);
   _mi_heap_destroy_pages(heap);
   // Free unless this is the PROCESS main heap (which is statically allocated and must
   // outlive everything). _mi_is_heap_main alone is not the right test: it resolves via

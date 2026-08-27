@@ -207,7 +207,7 @@ static void memevt_dispatch(mi_memory_change_kind_t kind, int64_t delta_bytes, u
    from both observers. */
 void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
   if (memevt_suppress_depth > 0) return;
-  _mi_dhat_begin_alloc(p, request_size);
+  _mi_dhat_begin_alloc(page, p, request_size);
   size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
   if (state == MEMEVT_ENABLED) {

@@ -49,6 +49,7 @@ typedef struct dhat_event_s {
   void* newp;
   size_t size;
   uint64_t at;
+  uint64_t generation;
   dhat_pp_t* pp;
   bool armed;
 } dhat_event_t;
@@ -64,6 +65,9 @@ static _Atomic(size_t) dhat_internal_bytes;
 static _Atomic(size_t) dhat_dropped;
 static _Atomic(size_t) dhat_incomplete;
 static mi_msecs_t dhat_started;
+/* Every fresh start gets an epoch so an event prepared before a concurrent
+   stop/start can never commit stale pointers into the new collector arena. */
+static uint64_t dhat_generation;
 static uint64_t dhat_total_bytes, dhat_total_blocks;
 static uint64_t dhat_live_bytes, dhat_live_blocks, dhat_peak_bytes, dhat_peak_blocks, dhat_peak_at;
 static char dhat_dump_at_exit[1024];
@@ -212,8 +216,24 @@ static void dhat_commit_resize_locked(dhat_event_t* ev) {
   }
   rec->size = ev->size;
   dhat_pp_t* pp = rec->pp;
-  if (ev->size >= oldsize) { const size_t delta = ev->size - oldsize; pp->tb += delta; dhat_total_bytes += delta; pp->live += delta; dhat_live_bytes += delta; }
-  else { const size_t delta = oldsize - ev->size; pp->live -= delta; dhat_live_bytes -= delta; }
+  /* A successful realloc is another allocation call for DHAT's cumulative
+     totals, even though its allocation identity and birth time remain attached
+     to the original program point. */
+  pp->tb += ev->size; pp->tbk++;
+  dhat_total_bytes += ev->size; dhat_total_blocks++;
+  if (ev->size >= oldsize) {
+    const size_t delta = ev->size - oldsize;
+    pp->live += delta; dhat_live_bytes += delta;
+  }
+  else {
+    const size_t delta = oldsize - ev->size;
+    if (pp->live >= delta && dhat_live_bytes >= delta) {
+      pp->live -= delta; dhat_live_bytes -= delta;
+    }
+    else {
+      pp->live = dhat_live_bytes = 0; dhat_mark_dropped();
+    }
+  }
   if (pp->live > pp->mb) pp->mb = pp->live;
   dhat_snapshot_global_peak_locked();
 }
@@ -234,9 +254,16 @@ static void dhat_resolve_env(void) {
        MIMALLOC_MEMORY_EVENTS activation state. */
     const bool env_enabled = (_mi_getenv("MIMALLOC_DHAT", value, sizeof(value)) == 0 && value[0] != 0 && value[0] != '0');
     (void)_mi_getenv("MIMALLOC_DHAT_DUMP_AT_EXIT", dhat_dump_at_exit, sizeof(dhat_dump_at_exit));
+    if (env_enabled) {
+      mi_lock_acquire(&dhat_lock);
+      dhat_budget = DHAT_DEFAULT_BUDGET;
+      (void)dhat_env_size("MIMALLOC_DHAT_MAX_BYTES", &dhat_budget);
+      dhat_started = _mi_clock_now();
+      dhat_generation++;
+      mi_lock_release(&dhat_lock);
+    }
     mi_atomic_store_release(&dhat_state, (size_t)(env_enabled ? DHAT_ENABLED : DHAT_DISABLED));
     _mi_atomic_once_release(&dhat_once);
-    if (env_enabled) { mi_lock_acquire(&dhat_lock); dhat_budget = DHAT_DEFAULT_BUDGET; (void)dhat_env_size("MIMALLOC_DHAT_MAX_BYTES", &dhat_budget); dhat_started = _mi_clock_now(); mi_lock_release(&dhat_lock); }
   }
 }
 
@@ -247,12 +274,22 @@ static void dhat_prepare(dhat_event_kind_t kind, void* oldp, void* newp, size_t 
   if (state == DHAT_UNINIT) { dhat_resolve_env(); state = mi_atomic_load_relaxed(&dhat_state); }
   if (state != DHAT_ENABLED || dhat_observer_depth != 0) return;
   dhat_observer_depth++;
-  dhat_event.kind = kind; dhat_event.oldp = oldp; dhat_event.newp = newp; dhat_event.size = size; dhat_event.at = _mi_clock_now(); dhat_event.pp = NULL;
+  dhat_event.kind = kind; dhat_event.oldp = oldp; dhat_event.newp = newp;
+  dhat_event.size = size; dhat_event.at = _mi_clock_now();
+  dhat_event.generation = 0; dhat_event.pp = NULL;
   if (kind == DHAT_EVENT_ALLOC) {
     void* pcs[DHAT_STACK_MAX]; const size_t depth = _mi_dhat_stack_capture(pcs, DHAT_STACK_MAX);
     if (depth == 0) { dhat_mark_dropped(); dhat_observer_depth--; return; }
-    mi_lock_acquire(&dhat_lock); dhat_event.pp = dhat_pp_intern_locked(pcs, depth); mi_lock_release(&dhat_lock);
+    mi_lock_acquire(&dhat_lock);
+    dhat_event.pp = dhat_pp_intern_locked(pcs, depth);
+    dhat_event.generation = dhat_generation;
+    mi_lock_release(&dhat_lock);
     if (dhat_event.pp == NULL) { dhat_observer_depth--; return; }
+  }
+  else {
+    mi_lock_acquire(&dhat_lock);
+    dhat_event.generation = dhat_generation;
+    mi_lock_release(&dhat_lock);
   }
   dhat_event.armed = true;
 }
@@ -265,7 +302,7 @@ void _mi_dhat_finish_event(void) {
   /* The observer guard is deliberately popped before mutating the ledger: a user memory
      callback runs between begin and finish, and any allocations it makes are excluded. */
   mi_lock_acquire(&dhat_lock);
-  if (_mi_dhat_is_active()) {
+  if (_mi_dhat_is_active() && ev.generation == dhat_generation) {
     if (ev.kind == DHAT_EVENT_ALLOC) dhat_commit_alloc_locked(&ev);
     else if (ev.kind == DHAT_EVENT_FREE) dhat_commit_free_locked(ev.oldp, ev.at);
     else if (ev.kind == DHAT_EVENT_RESIZE) dhat_commit_resize_locked(&ev);
@@ -278,7 +315,11 @@ bool mi_dhat_start(void) mi_attr_noexcept {
   if (_mi_atomic_once_enter(&dhat_once)) _mi_atomic_once_release(&dhat_once);
   mi_lock_acquire(&dhat_lock);
   if (_mi_dhat_is_active()) { mi_lock_release(&dhat_lock); return false; }
-  dhat_release_locked(); dhat_budget = DHAT_DEFAULT_BUDGET; (void)dhat_env_size("MIMALLOC_DHAT_MAX_BYTES", &dhat_budget); dhat_started = _mi_clock_now();
+  dhat_release_locked();
+  dhat_budget = DHAT_DEFAULT_BUDGET;
+  (void)dhat_env_size("MIMALLOC_DHAT_MAX_BYTES", &dhat_budget);
+  dhat_started = _mi_clock_now();
+  dhat_generation++;
   mi_atomic_store_release(&dhat_state, DHAT_ENABLED);
   mi_lock_release(&dhat_lock); return true;
 }
@@ -324,15 +365,31 @@ static size_t dhat_frame_index_locked(const dhat_pp_t* wanted, size_t wanted_fra
   }
   return 0;
 }
+static uint64_t dhat_live_lifetime_locked(const dhat_pp_t* pp, uint64_t now) {
+  uint64_t total = 0;
+  if (dhat_live_table == NULL) return 0;
+  for (size_t i = 0; i < DHAT_BUCKETS; i++) {
+    for (dhat_record_t* rec = dhat_live_table[i]; rec != NULL; rec = rec->next) {
+      if (rec->pp == pp && now >= rec->born) total += now - rec->born;
+    }
+  }
+  return total;
+}
 static void dhat_write_json_locked(FILE* f) {
   const uint64_t elapsed = dhat_elapsed_now();
+  const uint64_t now = (uint64_t)_mi_clock_now();
   /* The standard viewer accepts producer-specific mode strings and extra keys.
      Keep the required v2 fields conventional; Mtu and tu truthfully say that
      these are monotonic wall-clock milliseconds rather than Valgrind instructions. */
   fprintf(f, "{\n  \"dhatFileVersion\": 2,\n  \"mode\": \"mimalloc-heap\",\n  \"verb\": \"Allocated\",\n  \"bklt\": true,\n  \"bkacc\": false,\n  \"tu\": \"ms\",\n  \"Mtu\": \"ms\",\n  \"tuth\": 1,\n  \"cmd\": \"\",\n  \"pid\": 0,\n  \"tg\": %llu,\n  \"te\": %llu,\n  \"mi_dhat_incomplete\": %s,\n  \"pps\": [\n", (unsigned long long)dhat_peak_at, (unsigned long long)elapsed, (mi_atomic_load_relaxed(&dhat_incomplete) ? "true" : "false"));
+  if (dhat_pp_table == NULL) {
+    fprintf(f, "\n  ],\n  \"ftbl\": []\n}\n");
+    return;
+  }
   bool first_pp = true;
   for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
-    fprintf(f, "%s    {\"tb\": %llu, \"tbk\": %llu, \"tl\": %llu, \"mb\": %llu, \"mbk\": %llu, \"gb\": %llu, \"gbk\": %llu, \"eb\": %llu, \"ebk\": %llu, \"fs\": [", first_pp ? "" : ",\n", (unsigned long long)pp->tb, (unsigned long long)pp->tbk, (unsigned long long)pp->tl, (unsigned long long)pp->mb, (unsigned long long)pp->mbk, (unsigned long long)pp->gb, (unsigned long long)pp->gbk, (unsigned long long)pp->live, (unsigned long long)pp->livek);
+    const uint64_t total_lifetime = pp->tl + dhat_live_lifetime_locked(pp, now);
+    fprintf(f, "%s    {\"tb\": %llu, \"tbk\": %llu, \"tl\": %llu, \"mb\": %llu, \"mbk\": %llu, \"gb\": %llu, \"gbk\": %llu, \"eb\": %llu, \"ebk\": %llu, \"fs\": [", first_pp ? "" : ",\n", (unsigned long long)pp->tb, (unsigned long long)pp->tbk, (unsigned long long)total_lifetime, (unsigned long long)pp->mb, (unsigned long long)pp->mbk, (unsigned long long)pp->gb, (unsigned long long)pp->gbk, (unsigned long long)pp->live, (unsigned long long)pp->livek);
     for (size_t frame = 0; frame < pp->depth; frame++) fprintf(f, "%s%llu", frame == 0 ? "" : ", ", (unsigned long long)dhat_frame_index_locked(pp, frame));
     fprintf(f, "]}"); first_pp = false;
   }

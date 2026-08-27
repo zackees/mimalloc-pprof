@@ -30,6 +30,9 @@ int main(void) {
   callback_counts_t callbacks = { 0, 0, 0 };
   install_callbacks(&callbacks);
   assert(mi_dhat_start());
+  /* Empty and budget-exhausted sessions still need a valid, fail-soft JSON dump. */
+  assert(mi_dhat_dump("test-dhat-empty.json"));
+  assert(remove("test-dhat-empty.json") == 0);
 
   void* p = mi_malloc(16); assert(p != NULL);
   void* q = mi_malloc(32); assert(q != NULL);
@@ -39,7 +42,9 @@ int main(void) {
   mi_dhat_stats_t_decl(mid);
   assert(mi_dhat_stats_get(&mid));
   assert(mid.enabled && !mid.incomplete);
-  assert(mid.total_blocks == 2 && mid.total_bytes == 52);
+  /* realloc is a second allocation call for DHAT totals while retaining p's
+     identity/lifetime, so the 20-byte request adds one block and 20 bytes. */
+  assert(mid.total_blocks == 3 && mid.total_bytes == 68);
   assert(mid.live_blocks == 1 && mid.live_bytes == 20);
   assert(mid.peak_bytes >= 48 && mid.peak_bytes >= mid.live_bytes);
   assert(callbacks.alloc == 2 && callbacks.free == 1 && callbacks.resize == 1);
@@ -51,7 +56,7 @@ int main(void) {
   mi_dhat_stats_t_decl(done);
   assert(mi_dhat_stats_get(&done));
   assert(done.live_blocks == 0 && done.live_bytes == 0);
-  assert(done.total_blocks == 2 && done.total_bytes == 52);
+  assert(done.total_blocks == 3 && done.total_bytes == 68);
 
   mi_dhat_stop();
   assert(!mi_dhat_is_enabled());

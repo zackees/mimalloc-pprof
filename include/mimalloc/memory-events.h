@@ -31,6 +31,9 @@
      is suppressed: no accounting update and no nested callback invocation. This bounds
      stack depth and avoids double-counting/re-entrant surprises; it also means bytes
      allocated or freed *from inside* a callback are not reflected in the running totals.
+   - Callbacks must return normally. A C `longjmp` or C++ exception that escapes a
+     callback skips the recursion-guard cleanup and is unsupported; callback code that
+     needs non-local control flow must defer it until after the callback returns.
    - `arg` pointers in `mi_memory_callbacks_t` are caller-owned: the caller must keep
      them valid for as long as the callback might still be invoked (i.e. until a
      subsequent `mi_memory_set_callbacks` call replaces/clears them, or tracking is

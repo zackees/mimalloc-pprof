@@ -85,6 +85,8 @@ set(mi_sources
     src/init.c
     src/libc.c
     src/memory-events.c
+    src/dhat.c
+    src/dhat-stack.c
     src/options.c
     src/os.c
     src/page.c
@@ -800,6 +802,7 @@ install(FILES include/mimalloc-new-delete.h DESTINATION ${mi_install_incdir})
 install(FILES include/mimalloc-stats.h DESTINATION ${mi_install_incdir})
 install(FILES include/mimalloc/profile.h DESTINATION ${mi_install_incdir}/mimalloc)
 install(FILES include/mimalloc/memory-events.h DESTINATION ${mi_install_incdir}/mimalloc)
+install(FILES include/mimalloc/dhat.h DESTINATION ${mi_install_incdir}/mimalloc)
 install(FILES cmake/mimalloc-config.cmake DESTINATION ${mi_install_cmakedir})
 install(FILES cmake/mimalloc-config-version.cmake DESTINATION ${mi_install_cmakedir})
 
@@ -1069,6 +1072,18 @@ if (MI_BUILD_TESTS)
   add_test(NAME test-memory-events COMMAND mimalloc-test-memory-events)
   add_test(NAME test-memory-events-env-enabled COMMAND mimalloc-test-memory-events --env-enabled-check)
   set_tests_properties(test-memory-events-env-enabled PROPERTIES ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
+
+  # Exact DHAT v2 observer (issue #238): intentionally independent of MI_PPROF.
+  add_executable(mimalloc-test-dhat test/test-dhat.c)
+  target_compile_definitions(mimalloc-test-dhat PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-dhat PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-dhat PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-dhat PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-dhat PRIVATE mimalloc ${mi_libraries})
+  endif()
+  add_test(NAME test-dhat COMMAND mimalloc-test-dhat)
 
   # thread-local slot array provenance (issue #128 B3): the array must not be
   # allocated from whatever heap the application happens to have set as its default,

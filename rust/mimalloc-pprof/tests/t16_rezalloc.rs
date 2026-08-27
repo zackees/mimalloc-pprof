@@ -16,9 +16,7 @@
 //! `mi_usable_size: invalid pointer`. The first draft of this test made exactly that
 //! mistake and crashed, which is why `rezalloc`'s safety docs now name the family.
 
-mod common;
-
-use mimalloc_pprof::{prof, sys};
+use mimalloc_pprof::sys;
 
 /// The zeroing contract, stated the way mimalloc actually implements it.
 ///

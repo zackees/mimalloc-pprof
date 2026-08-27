@@ -36,8 +36,7 @@ fn msvc_wrapper_is_gated_on_missing_c11_atomics() {
          take it and fail on __ldar64/__stlr64 for ARM64"
     );
     assert!(
-        AMALGAMATION
-            .contains("|| !defined(_MSC_VER) || MI_HAS_C11_ATOMICS"),
+        AMALGAMATION.contains("|| !defined(_MSC_VER) || MI_HAS_C11_ATOMICS"),
         "the typed-ptr chain no longer tracks the backend selection; clang-cl \
          would get C11 atomics in one chain and Interlocked in the other"
     );

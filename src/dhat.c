@@ -63,7 +63,7 @@ static size_t dhat_budget;
 static _Atomic(size_t) dhat_internal_bytes;
 static _Atomic(size_t) dhat_dropped;
 static _Atomic(size_t) dhat_incomplete;
-static uint64_t dhat_started;
+static mi_msecs_t dhat_started;
 static uint64_t dhat_total_bytes, dhat_total_blocks;
 static uint64_t dhat_live_bytes, dhat_live_blocks, dhat_peak_bytes, dhat_peak_blocks, dhat_peak_at;
 static char dhat_dump_at_exit[1024];
@@ -164,10 +164,14 @@ static dhat_record_t** dhat_record_slot_locked(void* p) {
   while (*slot != NULL && (*slot)->ptr != p) slot = &(*slot)->next;
   return slot;
 }
+static uint64_t dhat_elapsed_now(void) {
+  const mi_msecs_t now = _mi_clock_now();
+  return (now >= dhat_started ? (uint64_t)(now - dhat_started) : 0);
+}
 static void dhat_snapshot_global_peak_locked(void) {
   if (dhat_live_bytes <= dhat_peak_bytes) return;
   dhat_peak_bytes = dhat_live_bytes; dhat_peak_blocks = dhat_live_blocks;
-  dhat_peak_at = _mi_clock_now() - dhat_started;
+  dhat_peak_at = dhat_elapsed_now();
   for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) { pp->gb = pp->live; pp->gbk = pp->livek; }
 }
 static void dhat_commit_alloc_locked(dhat_event_t* ev) {
@@ -215,9 +219,13 @@ static void dhat_commit_resize_locked(dhat_event_t* ev) {
 }
 
 static bool dhat_env_size(const char* name, size_t* out) {
-  char buf[64]; if (_mi_getenv(name, buf, sizeof(buf)) != 0 || buf[0] == 0) return false;
-  char* end = NULL; unsigned long long v = strtoull(buf, &end, 10);
-  if (end == buf || *end != 0 || v > SIZE_MAX) return false; *out = (size_t)v; return true;
+  char buf[64];
+  if (_mi_getenv(name, buf, sizeof(buf)) != 0 || buf[0] == 0) return false;
+  char* end = NULL;
+  const unsigned long long v = strtoull(buf, &end, 10);
+  if (end == buf || *end != 0 || v > SIZE_MAX) return false;
+  *out = (size_t)v;
+  return true;
 }
 static void dhat_resolve_env(void) {
   if (_mi_atomic_once_enter(&dhat_once)) {
@@ -317,7 +325,7 @@ static size_t dhat_frame_index_locked(const dhat_pp_t* wanted, size_t wanted_fra
   return 0;
 }
 static void dhat_write_json_locked(FILE* f) {
-  const uint64_t elapsed = (_mi_clock_now() >= dhat_started ? _mi_clock_now() - dhat_started : 0);
+  const uint64_t elapsed = dhat_elapsed_now();
   /* The standard viewer accepts producer-specific mode strings and extra keys.
      Keep the required v2 fields conventional; Mtu and tu truthfully say that
      these are monotonic wall-clock milliseconds rather than Valgrind instructions. */

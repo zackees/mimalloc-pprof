@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3bc4b3e6 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 50ffb71b of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -17065,12 +17065,20 @@ bool mi_dhat_dump(const char* path) mi_attr_noexcept {
      report's actual live records untouched; otherwise a reentrant hook could attempt
      to take dhat_lock while serialization already owns it. */
   dhat_observer_depth++;
+  /* Suppress the public dispatcher too: a callback invoked by a lazy stdio
+     allocation could otherwise call a DHAT API while dhat_lock is held. */
+  _mi_memevt_suppress_begin();
   FILE* f = fopen(path, "wb");
-  if (f == NULL) { dhat_observer_depth--; return false; }
+  if (f == NULL) {
+    _mi_memevt_suppress_end();
+    dhat_observer_depth--;
+    return false;
+  }
   mi_lock_acquire(&dhat_lock);
   dhat_write_json_locked(f);
   mi_lock_release(&dhat_lock);
   const bool ok = (fclose(f) == 0);
+  _mi_memevt_suppress_end();
   dhat_observer_depth--;
   return ok;
 }

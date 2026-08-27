@@ -82,6 +82,12 @@ static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was
   }
   #endif
 
+  /* Commit the global memory observers before publishing this block to the
+     owner thread's reusable list. Otherwise the owner can collect and reuse the
+     address while DHAT still holds its old live record. This mirrors the local
+     free ordering: callbacks run without allocator locks, before list reuse. */
+  _mi_memevt_on_free(page, block);
+
   // push atomically on the page thread free list
   mi_thread_free_t tf_new;
   mi_thread_free_t tf_old = mi_atomic_load_relaxed(&page->xthread_free);
@@ -90,14 +96,6 @@ static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was
     const bool new_owned = (allow_collect ? true : mi_tf_is_owned(tf_old));    // if allow collection then always try to claim it if the page is abandoned 
     tf_new = mi_tf_create(block, new_owned);
   } while (!mi_atomic_cas_weak_acq_rel(&page->xthread_free, &tf_old, tf_new)); // todo: release is enough?
-
-  // memory-events (issue #20): this is a genuine remote (cross-thread) free that has just
-  // completed (the block is now pushed onto the page's thread-free list) -- hook here,
-  // mirroring mi_free_block_local's placement (definitely-freeing, page/block still valid).
-  // Deliberately NOT paired with _mi_prof_on_free here: the profiler's only remote-free
-  // counting point is inside the free-collect helper (mi_page_thread_collect_to_local),
-  // to avoid double counting.
-  _mi_memevt_on_free(page, block);
 
   // and atomically try to collect the page if it was abandoned
   if (allow_collect) {

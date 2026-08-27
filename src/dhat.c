@@ -94,7 +94,9 @@ static bool dhat_stack_equal(const dhat_pp_t* pp, uint64_t hash, void* const* pc
   for (size_t i = 0; i < depth; i++) if (pp->pcs[i] != pcs[i]) return false;
   return true;
 }
-static size_t dhat_align(size_t n) { const size_t a = sizeof(void*) - 1; return (n + a) & ~a; }
+/* The raw arena holds uint64_t counters as well as pointers. Use the allocator's
+   max fundamental alignment rather than pointer width for 32-bit strict-alignment ABIs. */
+static size_t dhat_align(size_t n) { const size_t a = MI_MAX_ALIGN_SIZE - 1; return (n + a) & ~a; }
 
 static void dhat_release_locked(void) {
   for (dhat_chunk_t* chunk = dhat_chunks; chunk != NULL; ) {
@@ -312,7 +314,12 @@ void _mi_dhat_finish_event(void) {
 
 bool mi_dhat_start(void) mi_attr_noexcept {
   if (dhat_observer_depth != 0) return false;
-  if (_mi_atomic_once_enter(&dhat_once)) _mi_atomic_once_release(&dhat_once);
+  if (_mi_atomic_once_enter(&dhat_once)) {
+    /* Explicit start wins over MIMALLOC_DHAT, but it must still honor the
+       independently useful exit-dump configuration before sealing the once. */
+    (void)_mi_getenv("MIMALLOC_DHAT_DUMP_AT_EXIT", dhat_dump_at_exit, sizeof(dhat_dump_at_exit));
+    _mi_atomic_once_release(&dhat_once);
+  }
   mi_lock_acquire(&dhat_lock);
   if (_mi_dhat_is_active()) { mi_lock_release(&dhat_lock); return false; }
   dhat_release_locked();

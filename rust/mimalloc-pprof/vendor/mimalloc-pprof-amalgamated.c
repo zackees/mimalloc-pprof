@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 766f35dc of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 00859e98 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -17000,9 +17000,19 @@ static void dhat_write_json_locked(FILE* f) {
 }
 bool mi_dhat_dump(const char* path) mi_attr_noexcept {
   if (path == NULL || dhat_observer_depth != 0) return false;
-  FILE* f = fopen(path, "wb"); if (f == NULL) return false;
-  mi_lock_acquire(&dhat_lock); dhat_write_json_locked(f); mi_lock_release(&dhat_lock);
-  const bool ok = (fclose(f) == 0); return ok;
+  /* stdio can allocate (and applications can override those calls with mimalloc).
+     Suppress this thread's dump-time traffic before fopen/fprintf while leaving the
+     report's actual live records untouched; otherwise a reentrant hook could attempt
+     to take dhat_lock while serialization already owns it. */
+  dhat_observer_depth++;
+  FILE* f = fopen(path, "wb");
+  if (f == NULL) { dhat_observer_depth--; return false; }
+  mi_lock_acquire(&dhat_lock);
+  dhat_write_json_locked(f);
+  mi_lock_release(&dhat_lock);
+  const bool ok = (fclose(f) == 0);
+  dhat_observer_depth--;
+  return ok;
 }
 void _mi_dhat_process_init(void) { dhat_resolve_env(); }
 void _mi_dhat_process_done(void) { if (dhat_dump_at_exit[0] != 0) { const bool dumped = mi_dhat_dump(dhat_dump_at_exit); MI_UNUSED(dumped); } }

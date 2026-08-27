@@ -30,6 +30,9 @@ typedef struct dhat_pp_s {
   uint64_t hash;
   uint32_t depth;
   uint64_t tb, tbk, tl;
+  /* Scratch refreshed under dhat_lock for dump serialization; it folds still-live
+     record ages into tl without changing the ledger's completed-lifetime total. */
+  uint64_t dump_tl;
   uint64_t live, livek, mb, mbk, gb, gbk;
   void* pcs[];
 } dhat_pp_t;
@@ -372,19 +375,24 @@ static size_t dhat_frame_index_locked(const dhat_pp_t* wanted, size_t wanted_fra
   }
   return 0;
 }
-static uint64_t dhat_live_lifetime_locked(const dhat_pp_t* pp, uint64_t now) {
-  uint64_t total = 0;
-  if (dhat_live_table == NULL) return 0;
+/* Compute every live record's contribution once, rather than scanning the full
+   live table for each program point while the global collector lock is held. */
+static void dhat_prepare_dump_lifetimes_locked(uint64_t now) {
+  if (dhat_pp_table == NULL) return;
+  for (size_t i = 0; i < DHAT_BUCKETS; i++) {
+    for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) pp->dump_tl = pp->tl;
+  }
+  if (dhat_live_table == NULL) return;
   for (size_t i = 0; i < DHAT_BUCKETS; i++) {
     for (dhat_record_t* rec = dhat_live_table[i]; rec != NULL; rec = rec->next) {
-      if (rec->pp == pp && now >= rec->born) total += now - rec->born;
+      if (now >= rec->born) rec->pp->dump_tl += now - rec->born;
     }
   }
-  return total;
 }
 static void dhat_write_json_locked(FILE* f) {
   const uint64_t elapsed = dhat_elapsed_now();
   const uint64_t now = (uint64_t)_mi_clock_now();
+  dhat_prepare_dump_lifetimes_locked(now);
   /* The standard viewer accepts producer-specific mode strings and extra keys.
      Keep the required v2 fields conventional; Mtu and tu truthfully say that
      these are monotonic wall-clock milliseconds rather than Valgrind instructions. */
@@ -395,8 +403,7 @@ static void dhat_write_json_locked(FILE* f) {
   }
   bool first_pp = true;
   for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
-    const uint64_t total_lifetime = pp->tl + dhat_live_lifetime_locked(pp, now);
-    fprintf(f, "%s    {\"tb\": %llu, \"tbk\": %llu, \"tl\": %llu, \"mb\": %llu, \"mbk\": %llu, \"gb\": %llu, \"gbk\": %llu, \"eb\": %llu, \"ebk\": %llu, \"fs\": [", first_pp ? "" : ",\n", (unsigned long long)pp->tb, (unsigned long long)pp->tbk, (unsigned long long)total_lifetime, (unsigned long long)pp->mb, (unsigned long long)pp->mbk, (unsigned long long)pp->gb, (unsigned long long)pp->gbk, (unsigned long long)pp->live, (unsigned long long)pp->livek);
+    fprintf(f, "%s    {\"tb\": %llu, \"tbk\": %llu, \"tl\": %llu, \"mb\": %llu, \"mbk\": %llu, \"gb\": %llu, \"gbk\": %llu, \"eb\": %llu, \"ebk\": %llu, \"fs\": [", first_pp ? "" : ",\n", (unsigned long long)pp->tb, (unsigned long long)pp->tbk, (unsigned long long)pp->dump_tl, (unsigned long long)pp->mb, (unsigned long long)pp->mbk, (unsigned long long)pp->gb, (unsigned long long)pp->gbk, (unsigned long long)pp->live, (unsigned long long)pp->livek);
     for (size_t frame = 0; frame < pp->depth; frame++) fprintf(f, "%s%llu", frame == 0 ? "" : ", ", (unsigned long long)dhat_frame_index_locked(pp, frame));
     fprintf(f, "]}"); first_pp = false;
   }

@@ -50,7 +50,9 @@ int main(void) {
   assert(callbacks.alloc == 2 && callbacks.free == 1 && callbacks.resize == 1);
   /* Dump while active: stdio itself may allocate, so this also verifies dump-time
      recursion suppression and that serialization never re-enters its own lock. */
+  const callback_counts_t callbacks_before_dump = callbacks;
   assert(mi_dhat_dump("test-dhat-output.json"));
+  assert(memcmp(&callbacks, &callbacks_before_dump, sizeof(callbacks)) == 0);
 
   mi_free(p);
   mi_dhat_stats_t_decl(done);

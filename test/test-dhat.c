@@ -32,7 +32,6 @@ int main(void) {
   assert(mi_dhat_start());
   /* Empty and budget-exhausted sessions still need a valid, fail-soft JSON dump. */
   assert(mi_dhat_dump("test-dhat-empty.json"));
-  assert(remove("test-dhat-empty.json") == 0);
 
   void* p = mi_malloc(16); assert(p != NULL);
   void* q = mi_malloc(32); assert(q != NULL);
@@ -69,6 +68,7 @@ int main(void) {
 
   mi_dhat_stop();
   assert(!mi_dhat_is_enabled());
+  assert(remove("test-dhat-empty.json") == 0);
   assert(mi_dhat_dump("test-dhat-output.json"));
   FILE* f = fopen("test-dhat-output.json", "rb"); assert(f != NULL);
   char json[8192]; const size_t n = fread(json, 1, sizeof(json) - 1, f); fclose(f); json[n] = 0;

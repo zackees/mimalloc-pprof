@@ -43,6 +43,9 @@ int main(void) {
   assert(mid.live_blocks == 1 && mid.live_bytes == 20);
   assert(mid.peak_bytes >= 48 && mid.peak_bytes >= mid.live_bytes);
   assert(callbacks.alloc == 2 && callbacks.free == 1 && callbacks.resize == 1);
+  /* Dump while active: stdio itself may allocate, so this also verifies dump-time
+     recursion suppression and that serialization never re-enters its own lock. */
+  assert(mi_dhat_dump("test-dhat-output.json"));
 
   mi_free(p);
   mi_dhat_stats_t_decl(done);

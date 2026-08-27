@@ -55,10 +55,17 @@ int main(void) {
   assert(memcmp(&callbacks, &callbacks_before_dump, sizeof(callbacks)) == 0);
 
   mi_free(p);
+
+  /* Force the over-aligned fallback, then exercise its in-place resize. DHAT
+     must report caller requests (16 and 12), never the internal over-allocation. */
+  void* aligned = mi_malloc_aligned(16, 64); assert(aligned != NULL);
+  aligned = mi_realloc_aligned(aligned, 12, 64); assert(aligned != NULL);
+  mi_free(aligned);
+
   mi_dhat_stats_t_decl(done);
   assert(mi_dhat_stats_get(&done));
   assert(done.live_blocks == 0 && done.live_bytes == 0);
-  assert(done.total_blocks == 3 && done.total_bytes == 68);
+  assert(done.total_blocks == 5 && done.total_bytes == 96);
 
   mi_dhat_stop();
   assert(!mi_dhat_is_enabled());

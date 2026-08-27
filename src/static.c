@@ -33,6 +33,8 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "init.c"
 #include "libc.c"
 #include "memory-events.c"
+#include "dhat.c"
+#include "dhat-stack.c"
 #include "options.c"
 #include "os.c"
 #include "page.c"           // includes page-queue.c

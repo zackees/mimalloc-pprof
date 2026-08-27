@@ -441,7 +441,7 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
   }
   if (memevt_is_resize) {
     _mi_memevt_suppress_end();
-    if (newp != NULL) { _mi_memevt_on_resize(memevt_usable_pre, memevt_usable_post, newsize); }
+    if (newp != NULL) { _mi_memevt_on_resize(p, newp, memevt_usable_pre, memevt_usable_post, newsize); }
   }
   return newp;
 }

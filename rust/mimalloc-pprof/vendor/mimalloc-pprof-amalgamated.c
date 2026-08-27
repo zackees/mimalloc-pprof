@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit c92c0d2f of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fb424675 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -16767,6 +16767,8 @@ static mi_msecs_t dhat_started;
 static mi_msecs_t dhat_ended;
 /* Events prepared before stop must commit before the stopped snapshot is frozen. */
 static _Atomic(size_t) dhat_inflight;
+/* Serializes stop's freeze phase against a fresh start. */
+static _Atomic(size_t) dhat_stopping;
 /* Every fresh start gets an epoch so an event prepared before a concurrent
    stop/start can never commit stale pointers into the new collector arena. */
 static uint64_t dhat_generation;
@@ -16951,7 +16953,7 @@ static void dhat_commit_resize_locked(dhat_event_t* ev) {
     *slot = rec->next;
     dhat_record_t** destination = dhat_record_slot_locked(ev->newp);
     if (destination == NULL || *destination != NULL) { dhat_mark_dropped(); return; }
-    rec->ptr = ev->newp; rec->next = NULL; *destination = rec;
+    rec->ptr = ev->newp; rec->page = _mi_ptr_page(ev->newp); rec->next = NULL; *destination = rec;
   }
   rec->size = ev->size;
   dhat_pp_t* pp = rec->pp;
@@ -17012,22 +17014,22 @@ static void dhat_prepare(dhat_event_kind_t kind, mi_page_t* page, void* oldp, vo
   if (dhat_observer_depth != 0) return;
   /* Register before reading activation so stop can wait for any thread that
      might have observed the old enabled state. */
-  mi_atomic_increment_relaxed(&dhat_inflight);
+  mi_atomic_increment_acq_rel(&dhat_inflight);
   size_t state = mi_atomic_load_relaxed(&dhat_state);
   if (state == DHAT_UNINIT) { dhat_resolve_env(); state = mi_atomic_load_relaxed(&dhat_state); }
-  if (state != DHAT_ENABLED) { mi_atomic_decrement_relaxed(&dhat_inflight); return; }
+  if (state != DHAT_ENABLED) { mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
   dhat_observer_depth++;
   dhat_event.kind = kind; dhat_event.page = page; dhat_event.oldp = oldp; dhat_event.newp = newp;
   dhat_event.size = size; dhat_event.at = _mi_clock_now();
   dhat_event.generation = 0; dhat_event.pp = NULL;
   if (kind == DHAT_EVENT_ALLOC) {
     void* pcs[DHAT_STACK_MAX]; const size_t depth = _mi_dhat_stack_capture(pcs, DHAT_STACK_MAX);
-    if (depth == 0) { dhat_mark_dropped(); dhat_observer_depth--; mi_atomic_decrement_relaxed(&dhat_inflight); return; }
+    if (depth == 0) { dhat_mark_dropped(); dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
     mi_lock_acquire(&dhat_lock);
     dhat_event.pp = dhat_pp_intern_locked(pcs, depth);
     dhat_event.generation = dhat_generation;
     mi_lock_release(&dhat_lock);
-    if (dhat_event.pp == NULL) { dhat_observer_depth--; mi_atomic_decrement_relaxed(&dhat_inflight); return; }
+    if (dhat_event.pp == NULL) { dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
   }
   else {
     mi_lock_acquire(&dhat_lock);
@@ -17051,7 +17053,7 @@ void _mi_dhat_finish_event(void) {
     else if (ev.kind == DHAT_EVENT_RESIZE) dhat_commit_resize_locked(&ev);
   }
   mi_lock_release(&dhat_lock);
-  mi_atomic_decrement_relaxed(&dhat_inflight);
+  mi_atomic_decrement_acq_rel(&dhat_inflight);
 }
 
 bool mi_dhat_start(void) mi_attr_noexcept {
@@ -17063,7 +17065,7 @@ bool mi_dhat_start(void) mi_attr_noexcept {
     _mi_atomic_once_release(&dhat_once);
   }
   mi_lock_acquire(&dhat_lock);
-  if (_mi_dhat_is_active() || mi_atomic_load_relaxed(&dhat_inflight) != 0) { mi_lock_release(&dhat_lock); return false; }
+  if (_mi_dhat_is_active() || mi_atomic_load_relaxed(&dhat_stopping) != 0 || mi_atomic_load_acquire(&dhat_inflight) != 0) { mi_lock_release(&dhat_lock); return false; }
   dhat_release_locked();
   dhat_budget = DHAT_DEFAULT_BUDGET;
   (void)dhat_env_size("MIMALLOC_DHAT_MAX_BYTES", &dhat_budget);
@@ -17074,12 +17076,16 @@ bool mi_dhat_start(void) mi_attr_noexcept {
 }
 void mi_dhat_stop(void) mi_attr_noexcept {
   if (dhat_observer_depth != 0) return;
-  mi_atomic_store_release(&dhat_state, DHAT_DISABLED);
-  /* An event that already reached a downstream callback belongs to this session.
-     Wait until it commits before freezing elapsed/lifetime time for a stopped dump. */
-  while (mi_atomic_load_relaxed(&dhat_inflight) != 0) _mi_prim_thread_yield();
   mi_lock_acquire(&dhat_lock);
-  if (dhat_ended == 0) dhat_ended = _mi_clock_now();
+  if (!_mi_dhat_is_active()) { mi_lock_release(&dhat_lock); return; }
+  /* Block a new start while we drain events that already observed this session. */
+  mi_atomic_store_release(&dhat_stopping, (size_t)1);
+  mi_atomic_store_release(&dhat_state, DHAT_DISABLED);
+  mi_lock_release(&dhat_lock);
+  while (mi_atomic_load_acquire(&dhat_inflight) != 0) _mi_prim_thread_yield();
+  mi_lock_acquire(&dhat_lock);
+  dhat_ended = _mi_clock_now();
+  mi_atomic_store_release(&dhat_stopping, (size_t)0);
   mi_lock_release(&dhat_lock);
 }
 bool mi_dhat_is_enabled(void) mi_attr_noexcept { return _mi_dhat_is_active(); }

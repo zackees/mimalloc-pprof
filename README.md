@@ -197,6 +197,10 @@ stack-flag guidance, cross-compilation — is in
 **[docs/c-integration.md](docs/c-integration.md)** and
 **[docs/rust-integration.md](docs/rust-integration.md)**.
 
+The sampled profiler is one of four instruments here — exact allocator
+counters, DHAT-style exact heap/lifetime profiling, and a memory-events API
+are covered in [Profiling and observability](#profiling-and-observability).
+
 ---
 
 ## Performance

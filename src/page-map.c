@@ -214,13 +214,18 @@ mi_decl_nodiscard mi_decl_export bool mi_is_in_heap_region(const void* p) mi_att
 // A 2-level page map
 #define MI_PAGE_MAP_SUB_SIZE          (MI_PAGE_MAP_SUB_COUNT * sizeof(mi_page_t*))
 
-// Use an initial empty page map so `free(NULL)` works even if mimalloc is not yet initialized (issue #1341)
-static mi_page_map_t mi_page_map_empty = {
+// Use an initial empty page map so `free(NULL)` works even if mimalloc is not yet initialized (issue #1341).
+// The first submap must be a real (all-NULL) table: `_mi_unchecked_ptr_page` indexes `submaps[0][0]` for
+// `p==NULL` without checking the submap, so a NULL entry here makes `free(NULL)` before initialization
+// fault at address 0 (glibc 2.44's `__newlocale` does exactly that from the loader, before any constructor).
+// imported from oven-sh/mimalloc @ 942b8342 (commit 7ac561ab), MIT -- see #266.
+static mi_page_t*     mi_submap_empty[MI_PAGE_MAP_SUB_COUNT];   // zero-initialized: every lookup yields no page
+static mi_page_map_t  mi_page_map_empty = {
   MI_ATOMIC_VAR_INIT(1),
   sizeof(mi_page_map_t),
   MI_MEMID_STATIC,
   MI_LOCK_INITIALIZER,
-  { MI_ATOMIC_VAR_INIT(NULL) }
+  { MI_ATOMIC_VAR_INIT(mi_submap_empty) }
 };
 
 mi_decl_hidden mi_decl_cache_align _Atomic(mi_page_map_t*) __mi_page_map  = MI_ATOMIC_VAR_INIT(&mi_page_map_empty);

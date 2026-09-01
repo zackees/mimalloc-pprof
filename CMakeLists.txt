@@ -1294,6 +1294,31 @@ if (MI_BUILD_TESTS)
       add_test(NAME test-stress-dynamic COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_VERBOSE=1 ${LD_PRELOAD}=$<TARGET_FILE:mimalloc> $<TARGET_FILE:mimalloc-test-stress-dynamic>)
     endif()
   endif()
+
+  # imported from oven-sh/mimalloc @ 942b8342 (commit 7ac561ab), MIT -- see #266.
+  # free(NULL) before any constructor has run (glibc 2.44's __newlocale does this from the
+  # loader) must not dereference the page map's initial empty submap. The test's explicit
+  # mi_free(NULL)/mi_malloc(64) calls are what exercise the bug directly; its plain
+  # free(NULL)/malloc(64) calls only reach mi_free/mi_malloc when malloc is separately
+  # overridden (e.g. via mimalloc-override.h or LD_PRELOAD), which this target does not
+  # set up -- MI_OVERRIDE is a build-time default (option MI_OVERRIDE, line 9), not
+  # something a directly-linked consumer gets automatically.
+  # Link the static lib (not the MI_OVERRIDE=ON shared one): the dynamic target compiles
+  # with MI_FREE_IS_CHECKED=1 (line ~419), which makes mi_free NULL-safe unconditionally
+  # via _mi_checked_ptr_page and would never exercise the unchecked page-map path the bug
+  # is in.
+  if(NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-free-before-init test/test-free-before-init.c)
+    target_compile_definitions(mimalloc-test-free-before-init PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-free-before-init PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-free-before-init PRIVATE include)
+    if(MI_BUILD_STATIC)
+      target_link_libraries(mimalloc-test-free-before-init PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-free-before-init PRIVATE mimalloc ${mi_libraries})
+    endif()
+    add_test(NAME test-free-before-init COMMAND mimalloc-test-free-before-init)
+  endif()
 endif()
 
 # -----------------------------------------------------------------------------

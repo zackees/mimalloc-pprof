@@ -117,9 +117,19 @@ through to env-then-default. It can force them on.
 
 ## Allocator statistics in the profile (v3 only)
 
-v3 exposes per-heap and per-subprocess counters (`mi_heap_stats_get`,
-`mi_subproc_stats_get`) that v2 had no API for. The profiler surfaces them in two
-places:
+v3 exposes per-heap and per-"subprocess" counters (`mi_heap_stats_get`,
+`mi_subproc_stats_get`) that v2 had no API for.
+
+> **"Subprocess" does not mean an OS child process.** Despite the name, a mimalloc
+> `mi_subproc_t` is an **in-process partition**: a walled-off set of arenas and heaps
+> inside one OS process, whose threads never share or reclaim pages across the wall.
+> Upstream added it so an embedder like CPython can quarantine each subinterpreter's
+> allocations within a single process. Nothing spans OS process boundaries — an
+> actual child process gets its own independent allocator, as always. Every process
+> starts with exactly one default partition, so unless you call `mi_subproc_new`,
+> "per-subprocess" totals and process-wide totals are the same numbers.
+
+The profiler surfaces these counters in two places:
 
 **1. `mi_prof_stats_t` v3 fields** (`MI_PROF_STAT_VERSION` 3) — `heap_committed`,
 `heap_reserved`, `heap_malloc_requested`, `heap_pages`, `heap_pages_abandoned`,

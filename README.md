@@ -187,7 +187,7 @@ so switching is a version bump, not a code change.
 | Lives on | `main` | the [`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch |
 | Upstream base | mimalloc v3 (`upstream/dev3`) | mimalloc v2 (`upstream/main`) |
 | Allocator design | arena-of-slices + page-map; `mi_heap_t`/`mi_theap_t` split | segment allocator |
-| Allocator statistics | **per-heap and per-subprocess** | process-wide totals only |
+| Allocator statistics | **per-heap and per-partition** (a "subproc" — mimalloc's in-process isolation domain, *not* an OS child process) | process-wide totals only |
 | Memory under thread churn (MinGW) | **flat** | leaked in published 0.8.0; fixed on the `v2` branch — [bug 1](docs/upstream-bugs.md#bug-1-thread-exit-cleanup-never-runs-on-mingw--unbounded-memory-leak) |
 
 **Use v3 (0.9.x)** unless you have a specific reason not to. It has strictly more

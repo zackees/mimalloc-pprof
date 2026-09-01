@@ -166,9 +166,34 @@ are bootstrap confidence intervals at 95%, expressed relative to upstream
 mimalloc; and profiling is disabled during measurement so the allocator runs in
 its natural configuration.
 
+### Thread scaling by allocation pattern
+
+Aggregate throughput as worker threads go from 1 to 4 to 16, for four allocation
+patterns. Each pattern is a seeded random operation stream, so all four
+allocators replay one identical stream inside each paired block.
+
+> **Coverage mode: reduced statistical rigor (3 blocks per cell).** These panels
+> trade statistical rigor for thread coverage — no confidence intervals, no noise
+> gating; read them for shape. The runner allows 4 logical CPUs, so the 16-thread
+> point is 4× oversubscribed and describes contention, not core scaling — it is
+> shaded on every chart.
+
+[![Tiny hot path: aggregate throughput by worker count for all four allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-tiny-hot.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
 [![General mix including realloc: aggregate throughput by worker count for all four allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-mixed-general.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
-Full methodology, the other thread-scaling panels, and the pending metric roadmap:
+[![Large page-touched buffers: aggregate throughput by worker count for all four allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-buffers.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+[![Cross-thread producer/consumer handoff: aggregate throughput by worker count for all four allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-cross-thread.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+| Pattern | Sizes | What it stresses |
+|---|---|---|
+| Tiny hot path | 16–64 B | small-object fast path, high alloc/free rate, small live set |
+| General mix | 8 B–4 KiB log-uniform | everyday mix including realloc, medium live set |
+| Large buffers | 64 KiB–4 MiB | large allocations with one-byte-per-page touching |
+| Cross-thread handoff | 16–512 B | remote-free pressure; blocks are freed by another worker |
+
+Full methodology, per-cell tables, and the pending metric roadmap:
 **[docs/benchmarks.md](docs/benchmarks.md)**.
 
 ---

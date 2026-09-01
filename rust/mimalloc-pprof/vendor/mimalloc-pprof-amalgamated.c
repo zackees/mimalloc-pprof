@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fb424675 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8af2f9d7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -27,7 +27,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MIMALLOC_H
 #define MIMALLOC_H
 
-#define MI_MALLOC_VERSION 30403   // major + 2 digits minor + 2 digits patch
+#define MI_MALLOC_VERSION 30500   // major + 2 digits minor + 2 digits patch
 
 // ------------------------------------------------------
 // Compiler specific attributes
@@ -152,6 +152,9 @@ mi_decl_nodiscard mi_decl_export void* mi_reallocf(void* p, size_t newsize)     
 mi_decl_nodiscard mi_decl_export size_t mi_usable_size(const void* p) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export size_t mi_good_size(size_t size)     mi_attr_noexcept;
 
+// `mi_free_size` can be more efficient (as at calls mi_free_small internally).
+mi_decl_export void mi_free_size(void* p, size_t size) mi_attr_noexcept;
+
 // `mi_free_small` is for special applications like language runtimes.
 // it should only be used to free objects from `mi_(heap_)(m|z)alloc_small` and is potentially a tiny bit faster than `mi_free`
 mi_decl_export void mi_free_small(void* p) mi_attr_noexcept;  
@@ -176,12 +179,13 @@ mi_decl_nodiscard mi_decl_export void* mi_realloc_aligned_at(void* p, size_t new
 // Typed allocation, the type is always the first parameter
 // ------------------------------------------------------
 
-#define mi_malloc_tp(tp)                 ((tp*)mi_malloc(sizeof(tp)))
-#define mi_zalloc_tp(tp)                 ((tp*)mi_zalloc(sizeof(tp)))
+#define mi_malloc_tp(tp)                 ((tp*)mi_malloc_csize(sizeof(tp)))
+#define mi_zalloc_tp(tp)                 ((tp*)mi_zalloc_csize(sizeof(tp)))
 #define mi_calloc_tp(tp,n)               ((tp*)mi_calloc(n,sizeof(tp)))
 #define mi_mallocn_tp(tp,n)              ((tp*)mi_mallocn(n,sizeof(tp)))
 #define mi_reallocn_tp(tp,p,n)           ((tp*)mi_reallocn(p,n,sizeof(tp)))
 #define mi_recalloc_tp(tp,p,n)           ((tp*)mi_recalloc(p,n,sizeof(tp)))
+#define mi_free_tp(tp,p)                 (mi_free_csize(p,sizeof(tp)))
 
 #define mi_heap_malloc_tp(tp,hp)         ((tp*)mi_heap_malloc(hp,sizeof(tp)))
 #define mi_heap_zalloc_tp(tp,hp)         ((tp*)mi_heap_zalloc(hp,sizeof(tp)))
@@ -435,8 +439,29 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_calloc(mi_theap
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_malloc_small(mi_theap_t* theap, size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2);
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_zalloc_small(mi_theap_t* theap, size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2);
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_malloc_aligned(mi_theap_t* theap, size_t size, size_t alignment) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2) mi_attr_alloc_align(3);
+mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_zalloc_aligned(mi_theap_t* theap, size_t size, size_t alignment) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2) mi_attr_alloc_align(3);
 mi_decl_nodiscard mi_decl_export                  void* mi_theap_realloc(mi_theap_t* theap, void* p, size_t newsize)              mi_attr_noexcept mi_attr_alloc_size(3);
+mi_decl_nodiscard mi_decl_export                  void* mi_theap_rezalloc(mi_theap_t* theap, void* p, size_t newsize)             mi_attr_noexcept mi_attr_alloc_size(3);
 
+// ------------------------------------------------------
+// Fast constant size allocations.
+// ------------------------------------------------------
+
+static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexcept {
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_malloc_small(size); } else { return mi_malloc(size); }
+}
+static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_zalloc_small(size); } else { return mi_zalloc(size); }
+}
+static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_malloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
+}
+static inline mi_decl_restrict void* mi_theap_zalloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_zalloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
+}
+static inline void mi_free_csize(void* p, size_t size) mi_attr_noexcept {
+  if (size <= MI_SMALL_SIZE_MAX) { mi_free_small(p); } else { mi_free(p); }
+}
 
 // ------------------------------------------------------
 // Experimental
@@ -591,7 +616,6 @@ mi_decl_nodiscard mi_decl_export int   mi_reallocarr(void* ptrp, size_t count, s
 mi_decl_nodiscard mi_decl_export void* mi_aligned_recalloc(void* p, size_t newcount, size_t size, size_t alignment) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export void* mi_aligned_offset_recalloc(void* p, size_t newcount, size_t size, size_t alignment, size_t offset) mi_attr_noexcept;
 
-mi_decl_export void mi_free_size(void* p, size_t size)                           mi_attr_noexcept;
 mi_decl_export void mi_free_size_aligned(void* p, size_t size, size_t alignment) mi_attr_noexcept;
 mi_decl_export void mi_free_aligned(void* p, size_t alignment)                   mi_attr_noexcept;
 mi_decl_export int  mi_dupenv_s(char** buf, size_t* size, const char* name)      mi_attr_noexcept;
@@ -1274,7 +1298,7 @@ typedef int32_t  mi_ssize_t;
 
 // use a flat page-map or a 2-level one
 #ifndef MI_PAGE_MAP_FLAT
-#if MI_MAX_VABITS <= 40 && !defined(__APPLE__) && MI_SECURE==0 && !MI_PAGE_META_IS_SEPARATED
+#if MI_MAX_VABITS <= 40 && !defined(__APPLE__) && MI_SECURE==0 // && !MI_PAGE_META_IS_SEPARATED
 #define MI_PAGE_MAP_FLAT  1
 #else
 #define MI_PAGE_MAP_FLAT  0
@@ -1501,12 +1525,13 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_ATOMIC_H
 
 // include windows.h or pthreads.h
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__CYGWIN__)  // we use windows locks on cygwin, but otherwise treat it at unix
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#elif MI_TLS_MODEL_PTHREADS || (!defined(__wasi__) && (!defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)))
+#endif
+#if MI_TLS_MODEL_PTHREADS || (!defined(_WIN32) && !defined(__wasi__) && (!defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)))
 #define  MI_USE_PTHREADS        1
 #include <pthread.h>
 #endif
@@ -1876,17 +1901,17 @@ static inline bool mi_atomic_casi64_strong_acq_rel(volatile _Atomic(int64_t)* p,
 }
 
 // The pointer macros cast to `uintptr_t`.
-#define mi_atomic_load_ptr_acquire(tp,p)                (tp*)mi_atomic_load_acquire((_Atomic(uintptr_t)*)(p))
-#define mi_atomic_load_ptr_relaxed(tp,p)                (tp*)mi_atomic_load_relaxed((_Atomic(uintptr_t)*)(p))
+#define mi_atomic_load_ptr_acquire(tp,p)                ((tp*)mi_atomic_load_acquire((_Atomic(uintptr_t)*)(p)))
+#define mi_atomic_load_ptr_relaxed(tp,p)                ((tp*)mi_atomic_load_relaxed((_Atomic(uintptr_t)*)(p)))
 #define mi_atomic_store_ptr_release(tp,p,x)             mi_atomic_store_release((_Atomic(uintptr_t)*)(p),(uintptr_t)(x))
 #define mi_atomic_store_ptr_relaxed(tp,p,x)             mi_atomic_store_relaxed((_Atomic(uintptr_t)*)(p),(uintptr_t)(x))
 #define mi_atomic_cas_ptr_weak_release(tp,p,exp,des)    mi_atomic_cas_weak_release((_Atomic(uintptr_t)*)(p),(uintptr_t*)exp,(uintptr_t)des)
 #define mi_atomic_cas_ptr_weak_acq_rel(tp,p,exp,des)    mi_atomic_cas_weak_acq_rel((_Atomic(uintptr_t)*)(p),(uintptr_t*)exp,(uintptr_t)des)
 #define mi_atomic_cas_ptr_strong_release(tp,p,exp,des)  mi_atomic_cas_strong_release((_Atomic(uintptr_t)*)(p),(uintptr_t*)exp,(uintptr_t)des)
 #define mi_atomic_cas_ptr_strong_acq_rel(tp,p,exp,des)  mi_atomic_cas_strong_acq_rel((_Atomic(uintptr_t)*)(p),(uintptr_t*)exp,(uintptr_t)des)
-#define mi_atomic_exchange_ptr_relaxed(tp,p,x)          (tp*)mi_atomic_exchange_relaxed((_Atomic(uintptr_t)*)(p),(uintptr_t)x)
-#define mi_atomic_exchange_ptr_release(tp,p,x)          (tp*)mi_atomic_exchange_release((_Atomic(uintptr_t)*)(p),(uintptr_t)x)
-#define mi_atomic_exchange_ptr_acq_rel(tp,p,x)          (tp*)mi_atomic_exchange_acq_rel((_Atomic(uintptr_t)*)(p),(uintptr_t)x)
+#define mi_atomic_exchange_ptr_relaxed(tp,p,x)          ((tp*)mi_atomic_exchange_relaxed((_Atomic(uintptr_t)*)(p),(uintptr_t)x))
+#define mi_atomic_exchange_ptr_release(tp,p,x)          ((tp*)mi_atomic_exchange_release((_Atomic(uintptr_t)*)(p),(uintptr_t)x))
+#define mi_atomic_exchange_ptr_acq_rel(tp,p,x)          ((tp*)mi_atomic_exchange_acq_rel((_Atomic(uintptr_t)*)(p),(uintptr_t)x))
 
 #define mi_atomic_loadi64_acquire(p)    mi_atomic(loadi64_explicit)(p,mi_memory_order(acquire))
 #define mi_atomic_loadi64_relaxed(p)    mi_atomic(loadi64_explicit)(p,mi_memory_order(relaxed))
@@ -1952,7 +1977,7 @@ void _mi_lock_debug_done(const void* lock, const _Atomic(uintptr_t)* owner,
 #endif
 
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__CYGWIN__)
 
 typedef struct mi_lock_s {
   SRWLOCK mutex;    // slim reader-writer lock
@@ -2257,7 +2282,7 @@ void _mi_atomic_once_release(mi_atomic_once_t* once);      // defined in `libc.c
 #endif
 
 // Enable guard pages behind objects of a certain size (set by the MIMALLOC_GUARDED_MIN/MAX/SAMPLE_RATE options)
-#if !defined(MI_GUARDED) && MI_DEBUG && !defined(NDEBUG) && !MI_PAGE_META_ALIGNED_FREE_SMALL
+#if !defined(MI_GUARDED) && MI_DEBUG && !defined(NDEBUG) && !MI_OPT_FREE_SMALL
 #define MI_GUARDED  1
 #endif
 
@@ -2305,7 +2330,9 @@ void _mi_atomic_once_release(mi_atomic_once_t* once);      // defined in `libc.c
 // We can choose to only put page info of small pages at the start of the page area.
 // This can be used to have a slightly faster `mi_free_small` function for specialized
 // cases (like language runtime systems).
-#if !defined(MI_PAGE_META_ALIGNED_FREE_SMALL)
+#if MI_OPT_FREE_SMALL && !defined(MI_PAGE_META_ALIGNED_FREE_SMALL)
+#define MI_PAGE_META_ALIGNED_FREE_SMALL   1
+#elif !defined(MI_PAGE_META_ALIGNED_FREE_SMALL)
 #define MI_PAGE_META_ALIGNED_FREE_SMALL   0
 #endif
 
@@ -2314,7 +2341,7 @@ void _mi_atomic_once_release(mi_atomic_once_t* once);      // defined in `libc.c
 #error "secure mode should use separated page infos"
 #endif
 #if MI_PAGE_META_ALIGNED_FREE_SMALL && MI_SECURE
-#error "secure mode cannot use MI_PAGE_META_ALIGNED_FREE_SMALL"
+#error "secure mode cannot use MI_OPT_FREE_SMALL (MI_PAGE_META_ALIGNED_FREE_SMALL)"
 #endif
 #if MI_PAGE_META_IS_SEPARATED && MI_PAGE_MAP_FLAT
 #error "cannot have a flat page map with separated page infos"
@@ -2382,8 +2409,8 @@ void _mi_atomic_once_release(mi_atomic_once_t* once);      // defined in `libc.c
 // We never allocate more than PTRDIFF_MAX (see also <https://sourceware.org/ml/libc-announce/2019/msg00001.html>)
 #define MI_MAX_ALLOC_SIZE        PTRDIFF_MAX
 
-// Minimal commit for a page on-demand commit (should be >= OS page size)
-#define MI_PAGE_MIN_COMMIT_SIZE  MI_ARENA_SLICE_SIZE
+// Minimal commit for a page on-demand commit 
+#define MI_PAGE_MIN_COMMIT_SIZE  (16*MI_KiB) /* MI_ARENA_SLICE_SIZE */
 
 
 // ------------------------------------------------------
@@ -2422,15 +2449,14 @@ typedef struct mi_subproc_s mi_subproc_t;
 // Memory can reside in arena's, direct OS allocated, meta-data pages, or statically allocated.
 // The memid keeps track of this.
 typedef enum mi_memkind_e {
-  MI_MEM_NONE,      // not allocated
+  MI_MEM_NONE,      // not allocated (or static)
   MI_MEM_EXTERNAL,  // not owned by mimalloc but provided externally (via `mi_manage_os_memory` for example)
   MI_MEM_STATIC,    // allocated in a static area and should not be freed (the initial main theap data for example (`init.c`))
-  MI_MEM_META,      // allocated with the meta data allocator (`arena-meta.c`)
   MI_MEM_OS,        // allocated from the OS
   MI_MEM_OS_HUGE,   // allocated as huge OS pages (usually 1GiB, pinned to physical memory)
   MI_MEM_OS_REMAP,  // allocated in a remapable area (i.e. using `mremap`)
   MI_MEM_ARENA,     // allocated from an arena (the usual case) (`arena.c`)
-  MI_MEM_HEAP_MAIN  // allocated in the main heap (for theaps)
+  MI_MEM_MALLOC     // allocated with mi_malloc
 } mi_memkind_t;
 
 static inline bool mi_memkind_is_os(mi_memkind_t memkind) {
@@ -2455,17 +2481,16 @@ typedef struct mi_memid_arena_info {
   uint32_t      slice_count;        // allocated slices
 } mi_memid_arena_info_t;
 
-typedef struct mi_memid_meta_info {
-  mi_meta_page_t* meta_page;        // meta-page that contains the block
-  uint32_t        block_index;      // block index in the meta-data page
-  uint32_t        block_count;      // allocated blocks
-} mi_memid_meta_info_t;
+typedef struct mi_memid_malloc_info {
+  void*         base;               // returned pointer
+  size_t        size;               // allocated size
+} mi_memid_malloc_info_t;
 
 typedef struct mi_memid_s {
   union {
-    mi_memid_os_info_t    os;       // only used for MI_MEM_OS
-    mi_memid_arena_info_t arena;    // only used for MI_MEM_ARENA
-    mi_memid_meta_info_t  meta;     // only used for MI_MEM_META
+    mi_memid_os_info_t     os;       // only used for MI_MEM_OS(_HUGE/_REMAP)
+    mi_memid_arena_info_t  arena;    // only used for MI_MEM_ARENA
+    mi_memid_malloc_info_t malloc;   // only used for MI_MEM_MALLOC
   } mem;
   mi_memkind_t  memkind;
   bool          is_pinned;          // `true` if we cannot decommit/reset/protect in this memory (e.g. when allocated using large (2Mib) or huge (1GiB) OS pages)
@@ -2473,6 +2498,8 @@ typedef struct mi_memid_s {
   bool          initially_zero;     // `true` if the memory was originally zero initialized
 } mi_memid_t;
 
+#define MI_MEMID_INIT(kind)   {{{NULL,0}}, kind, true /* pinned */, true /* committed */, false /* zero */ }
+#define MI_MEMID_STATIC       MI_MEMID_INIT(MI_MEM_STATIC)
 
 static inline bool mi_memid_is_os(mi_memid_t memid) {
   return mi_memkind_is_os(memid.memkind);
@@ -2510,6 +2537,7 @@ typedef struct mi_block_s {
 #define MI_PAGE_IN_FULL_QUEUE           MI_ZU(0x01)
 #define MI_PAGE_HAS_INTERIOR_POINTERS   MI_ZU(0x02)
 #define MI_PAGE_FLAG_MASK               MI_ZU(0x03)
+#define MI_PAGE_FLAG_BITS               (2)
 typedef size_t mi_page_flags_t;
 
 // There are two special threadid's: 0 for pages that are abandoned (and not in a theap queue),
@@ -2517,7 +2545,8 @@ typedef size_t mi_page_flags_t;
 // in an arena (in `mi_heap_t.arena_pages.pages_abandoned`) so these can be quickly found for reuse.
 // Abandoning partially used pages allows for sharing of this memory between threads (in particular if threads are blocked)
 #define MI_THREADID_ABANDONED           MI_ZU(0)
-#define MI_THREADID_ABANDONED_MAPPED    (MI_PAGE_FLAG_MASK + 1)
+#define MI_THREADID_ABANDONED_MAPPED    (MI_ZU(1) << MI_PAGE_FLAG_BITS)
+#define MI_THREADID_DETACHED            (MI_ZU(2) << MI_PAGE_FLAG_BITS)
 
 // Thread free list.
 // Points to a list of blocks that are freed by other threads.
@@ -2560,29 +2589,29 @@ typedef struct mi_page_s {
   _Atomic(mi_threadid_t)    xthread_id;        // thread this page belongs to. (= `theap->thread_id (or 0 or 4 if abandoned) | page_flags`)
 
   mi_block_t*               free;              // list of available free blocks (`malloc` allocates from this list)
-  uint16_t                  used;              // number of blocks in use (including blocks in `thread_free`)
+  uint32_t                  used;              // number of blocks in use (including blocks in `thread_free`)
   uint16_t                  capacity;          // number of blocks committed
-  uint16_t                  reserved;          // number of blocks reserved in memory
   uint8_t                   retire_expire;     // expiration count for retired blocks
   bool                      free_is_zero;      // `true` if the blocks in the free list are zero initialized
-
+  
   mi_block_t*               local_free;        // list of deferred free blocks by this thread (migrates to `free`)
   _Atomic(mi_thread_free_t) xthread_free;      // list of deferred free blocks freed by other threads (= `mi_block_t* | (1 if owned)`)
 
   size_t                    block_size;        // const: size available in each block (always `>0`)
   uint32_t                  page_ma_offset;    // const: offset relative to the page (in MI_MAX_ALIGN_SIZE parts) to the start of the blocks
-  uint32_t                  slice_committed;   // committed size relative to the first arena slice of the page data (or 0 if the page is fully committed already)
-
-  #if (MI_ENCODE_FREELIST || MI_PADDING)
-  uintptr_t                 keys[2];           // const: two random keys to encode the free lists (see `_mi_block_next`) or padding canary
-  #endif
-
+  uint16_t                  slice_pcommitted;  // committed size in OS page sizes relative to the first arena slice of the page data (or 0 if the page is fully committed already)
+  uint16_t                  reserved;          // number of blocks reserved in memory
+  
   mi_theap_t*               theap;             // the theap owning this page (may not be valid or NULL for abandoned pages)
   mi_heap_t*                heap;              // const: the heap owning this page
 
   struct mi_page_s*         next;              // next page owned by the theap with the same `block_size`
   struct mi_page_s*         prev;              // previous page owned by the theap with the same `block_size`
   mi_memid_t                memid;             // const: provenance of the page memory
+
+  #if (MI_ENCODE_FREELIST || MI_PADDING)
+  uintptr_t                 keys[2];           // const: two random keys to encode the free lists (see `_mi_block_next`) or padding canary
+  #endif
 
   struct mi_prof_record_s*  metadata;          // sampled live allocation records, or NULL (MI_PPROF)
   bool                      has_metadata;      // `true` if profiler records are attached to this page
@@ -2678,7 +2707,7 @@ typedef struct mi_random_cxt_s {
 #if MI_PADDING
 typedef struct mi_padding_s {
   uint32_t canary; // encoded block value to check validity of the padding (in case of overflow)
-  uint32_t delta;  // padding bytes before the block. (mi_usable_size(p) - delta == exact allocated bytes)
+  uint32_t delta;  // padding bytes before the block. (mi_full_usable_size(p) - delta == exact allocated bytes)
 } mi_padding_t;
 #define MI_PADDING_SIZE   (sizeof(mi_padding_t))
 #define MI_PADDING_WSIZE  ((MI_PADDING_SIZE + MI_INTPTR_SIZE - 1) / MI_INTPTR_SIZE)
@@ -2696,7 +2725,7 @@ struct mi_theap_s {
   _Atomic(mi_heap_t*)   heap;                                // the heap this theap belongs to.
   _Atomic(mi_subproc_t*)subproc;                             // subproc this belongs too (always `subproc == heap->subproc` but needed for safe destruction)
   _Atomic(size_t)       refcount;                            // reference count
-  _Atomic(size_t)       freed;                               // ensure atomic free-ing
+  
   unsigned long long    heartbeat;                           // monotonic heartbeat count
   uintptr_t             cookie;                              // random cookie to verify pointers (see `_mi_ptr_cookie`)
   mi_random_ctx_t       random;                              // random number context used for secure allocation
@@ -2715,6 +2744,7 @@ struct mi_theap_s {
   long                  page_full_retain;                    // how many full pages can be retained per queue (before abandoning them)
   bool                  allow_page_reclaim;                  // `true` if this theap can reclaim abandoned pages
   bool                  allow_page_abandon;                  // `true` if this theap can abandon pages to reduce memory footprint
+  bool                  is_detached;                         // `true` if `tld->thread_id == MI_THREADID_DETACHED`
   #if MI_GUARDED
   size_t                guarded_size_min;                    // minimal size for guarded objects
   size_t                guarded_size_max;                    // maximal size for guarded objects
@@ -2764,7 +2794,7 @@ typedef struct mi_heap_s {
 
   _Atomic(mi_arena_pages_t*) arena_pages[MI_MAX_ARENAS]; // track owned and abandoned pages in the arenas (entries can be NULL)
   mi_lock_t             arena_pages_lock;                // lock to update the arena_pages array
-
+  mi_memid_t            memid;                           // provenance of the heap memory
   mi_stats_t            stats;                           // statistics for this heap; periodically updated by merging from each theap
 } mi_heap_t;
 
@@ -2793,6 +2823,9 @@ struct mi_subproc_s {
   _Atomic(mi_heap_t*)   heap_main;                      // main heap for this sub process
   mi_heap_t*            heaps;                          // heaps belonging to this sub-process
   mi_lock_t             heaps_lock;
+
+  mi_theap_t*           theap_meta;                     // detached theap for allocating meta-data
+  mi_lock_t             theap_meta_lock;                // all allocations in theap_meta need a lock
 
   _Atomic(size_t)       thread_count;                   // current threads associated with this sub-process
   _Atomic(size_t)       thread_total_count;             // total created threads associated with this sub-process
@@ -4030,7 +4063,11 @@ _mcgen_PASTE2(McTemplateU0xx_, MCGEN_EVENTWRITETRANSFER)(
 #define mi_decl_thread          __thread
 #define mi_decl_noreturn        __attribute__((noreturn))
 #define mi_decl_weak            __attribute__((weak))
+#if defined(__MINGW32__) || defined(__CYGWIN__)
+#define mi_decl_hidden
+#else
 #define mi_decl_hidden          __attribute__((visibility("hidden")))
+#endif
 #if (__GNUC__ >= 4) || defined(__clang__)
 #define mi_decl_cold            __attribute__((cold))
 #else
@@ -4078,10 +4115,13 @@ _mcgen_PASTE2(McTemplateU0xx_, MCGEN_EVENTWRITETRANSFER)(
 #endif
 
 #if defined(__cplusplus)
-#define mi_decl_externc     extern "C"
+#define mi_decl_externc         extern "C"
+#define mi_init_struct_zero     { }
 #else
 #define mi_decl_externc
+#define mi_init_struct_zero     { 0 }
 #endif
+
 
 #if defined(__EMSCRIPTEN__) && !defined(__wasi__)
 #define __wasi__
@@ -4106,6 +4146,7 @@ size_t        _mi_strnlen(const char* s, size_t max_len);
 char*         _mi_strnstr(char* s, size_t max_len, const char* pat);
 bool          _mi_streq(const char* s, const char* t);
 int           _mi_getenv(const char* name, char* result, size_t result_size);
+void          _mi_detect_cpu_features(void);
 
 // "options.c"
 void          _mi_fputs(mi_output_fun* out, void* arg, const char* prefix, const char* message);
@@ -4129,28 +4170,42 @@ uintptr_t     _mi_theap_random_next(mi_theap_t* theap);
 uintptr_t     _mi_os_random_weak(uintptr_t extra_seed);
 static inline uintptr_t _mi_random_shuffle(uintptr_t x);
 
+// prim-tls.c
+void          _mi_tls_slots_init(void);
+void          _mi_tls_slots_done(void);
+mi_threadid_t _mi_thread_id(void) mi_attr_noexcept;
+void          _mi_theap_default_set(mi_theap_t* theap);
+void          _mi_theap_cached_set(mi_theap_t* theap);
+
+// subproc.c
+mi_subproc_t* _mi_subproc_main_init(void);
+void          _mi_subproc_main_done(void);
+mi_subproc_t* _mi_subproc_main(void);
+bool          _mi_subproc_is_main(mi_subproc_t* subproc);
+mi_subproc_t* _mi_subproc(void);          // current subproc of this thread
+mi_heap_t*    _mi_subproc_heap_main(mi_subproc_t* subproc);
+mi_subproc_t* _mi_subproc_from_id(mi_subproc_id_t subproc_id);
+void          _mi_subprocs_unsafe_destroy_all(void);
+
+void*         _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid );
+void*         _mi_meta_rezalloc( mi_subproc_t* subproc, void* p, size_t newsize, mi_memid_t* memid );
+void*         _mi_meta_zalloc_aligned( mi_subproc_t* subproc, size_t size, size_t alignment, mi_memid_t* memid );
+void          _mi_meta_free(mi_subproc_t* subproc, void* p, mi_memid_t memid);
+bool          _mi_meta_is_meta_page(const mi_subproc_t* subproc, const mi_page_t* p);
+
+
 // init.c
-extern mi_decl_hidden mi_decl_cache_align const mi_page_t  _mi_page_empty;
+mi_page_t*    _mi_page_empty_get(void);
 void          _mi_auto_process_init(void);
 void mi_cdecl _mi_auto_process_done(void) mi_attr_noexcept;
 bool          _mi_is_redirected(void);
 bool          _mi_allocator_init(const char** message);
 void          _mi_allocator_done(void);
-bool          _mi_is_main_thread(void);
-bool          _mi_is_process_heap_main(const mi_heap_t* heap);
 bool          _mi_preloading(void);           // true while the C runtime is not initialized yet
 void          _mi_thread_done(mi_theap_t* theap);
 mi_theap_t*   _mi_thread_init(void);
+mi_theap_t*   _mi_thread_init_with_heap(mi_heap_t* heap);
 bool          _mi_is_empty_theap(const mi_theap_t* theap);
-
-mi_subproc_t* _mi_subproc(void);
-mi_subproc_t* _mi_subproc_main(void);
-mi_heap_t*    _mi_subproc_heap_main(mi_subproc_t* subproc);
-mi_subproc_t* _mi_subproc_from_id(mi_subproc_id_t subproc_id);
-
-mi_threadid_t _mi_thread_id(void) mi_attr_noexcept;
-void          _mi_theap_guarded_init(mi_theap_t* theap);
-void          _mi_theap_options_init(mi_theap_t* theap);
 
 // os.c
 void          _mi_os_init(void);                                            // called from process init
@@ -4222,11 +4277,6 @@ void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
 
-// arena-meta.c
-void*         _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid );
-void          _mi_meta_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid);
-bool          _mi_meta_is_meta_page(mi_subproc_t* subproc, void* p);
-
 // "page-map.c"
 bool          _mi_page_map_init(void);
 mi_decl_nodiscard bool _mi_page_map_register(mi_page_t* page);
@@ -4236,7 +4286,7 @@ mi_page_t*    _mi_safe_ptr_page(const void* p);
 void          _mi_page_map_unsafe_destroy(void);
 
 // "page.c"
-void*         _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignment, size_t* usable)  mi_attr_noexcept mi_attr_malloc;
+void*         _mi_malloc_generic(mi_theap_t* heap, size_t size, size_t zero_huge_alignment, mi_page_t** ppage)  mi_attr_noexcept mi_attr_malloc;
 
 void          _mi_page_retire(mi_page_t* page) mi_attr_noexcept;       // free the page if there are no other pages with many free blocks
 void          _mi_page_unfull(mi_page_t* page);
@@ -4253,18 +4303,22 @@ size_t        _mi_bin_size(size_t bin);                  // for stats
 size_t        _mi_bin(size_t size);                      // for stats
 
 // "theap.c"
+void          _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld);
+mi_theap_t*   _mi_theap_alloc(mi_heap_t* heap, mi_tld_t* tld);
 mi_theap_t*   _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld);
-void          _mi_theap_default_set(mi_theap_t* theap);
-void          _mi_theap_cached_set(mi_theap_t* theap);
 void          _mi_theap_collect_retired(mi_theap_t* theap, bool force);
 void          _mi_theap_collect_abandon(mi_theap_t* theap);
 bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi_block_visit_fun* visitor, void* arg);
 void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
-bool          _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acquire_tld_theaps_lock);
+
+void          _mi_heap_detach_theaps( mi_heap_t* heap );
+void          _mi_tld_detach_theaps( mi_tld_t* tld );
 void          _mi_theap_incref(mi_theap_t* theap);
 void          _mi_theap_decref(mi_theap_t* theap);
+void          _mi_theap_merge_stats(mi_theap_t* theap);
 
 // "heap.c"
+void          _mi_heap_init(mi_heap_t* heap, mi_thread_local_t theap, mi_subproc_t* subproc, mi_arena_id_t exclusive_arena_id);
 void          _mi_heap_area_init(mi_heap_area_t* area, mi_page_t* page);
 mi_decl_cold  mi_theap_t* _mi_heap_theap_get_or_init(const mi_heap_t* heap);  // get (and possible create) the theap belonging to a heap
 void          _mi_heap_move_pages(mi_heap_t* heap_from, mi_heap_t* heap_to);  // in "arena.c"
@@ -4283,15 +4337,18 @@ mi_msecs_t    _mi_clock_start(void);
 
 // "alloc.c"
 void*         _mi_page_malloc_zero(mi_theap_t* theap, mi_page_t* page, size_t size, bool zero) mi_attr_noexcept;                  // called from `_mi_theap_malloc_aligned`
-void*         _mi_theap_malloc_zero(mi_theap_t* theap, size_t size, bool zero, size_t* usable) mi_attr_noexcept;
-void*         _mi_theap_malloc_zero_ex(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, size_t* usable) mi_attr_noexcept;     // called from `_mi_theap_malloc_aligned`
-void*         _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool zero, size_t* usable_pre, size_t* usable_post) mi_attr_noexcept;
+void*         _mi_theap_malloc_zero(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept;
+void*         _mi_theap_malloc_zero_ex(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) mi_attr_noexcept;     // called from `_mi_theap_malloc_aligned`
+void*         _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool zero) mi_attr_noexcept;
 mi_block_t*   _mi_page_ptr_unalign(const mi_page_t* page, const void* p);
 void          _mi_padding_shrink(const mi_page_t* page, const mi_block_t* block, const size_t min_size);
 
 // "free.c"
-void          _mi_free_subproc_safe(void* p);
+void          _mi_free_in_page(void* p, mi_page_t* page) mi_attr_noexcept;
+void          _mi_free_subproc_safe_in_page(void* p, mi_page_t* page) mi_attr_noexcept;
+void          _mi_free_subproc_safe(void* p) mi_attr_noexcept;
 void          _mi_page_unguard_all(mi_page_t* page);
+size_t        _mi_page_usable_size(const mi_page_t* page, const void* p) mi_attr_noexcept;
 
 #if MI_DEBUG>1
 bool          _mi_page_is_valid(mi_page_t* page);
@@ -4456,7 +4513,7 @@ static inline void* mi_pthread_key_get(pthread_key_t key) {
   #if !MI_PTHREADS_GET_INVALID_KEY_IS_NULL
   if mi_unlikely(key==MI_PTHREAD_KEY_INVALID) return NULL;
   #endif
-  return pthread_getspecific(key);  
+  return pthread_getspecific(key);
 }
 
 static inline bool mi_pthread_key_set(pthread_key_t* pkey, void* val) {
@@ -4526,7 +4583,7 @@ static inline bool _mi_is_power_of_two(uintptr_t x) {
 
 // valid alignment values are as posix memalign: <https://en.cppreference.com/c/memory/aligned_alloc#Notes>
 static inline bool mi_alignment_is_valid(size_t alignment) {
-  return ((alignment!=0) && _mi_is_power_of_two(alignment)); 
+  return ((alignment!=0) && _mi_is_power_of_two(alignment));
 }
 
 // Is a pointer aligned?
@@ -4537,7 +4594,7 @@ static inline bool _mi_is_aligned(const void* p, size_t alignment) {
 // Align upwards
 static inline uintptr_t _mi_align_up(uintptr_t sz, size_t alignment) {
   mi_assert_internal(alignment != 0);
-  uintptr_t mask = alignment - 1;
+  const uintptr_t mask = alignment - 1;
   if ((alignment & mask) == 0) {  // power of two?
     return ((sz + mask) & ~mask);
   }
@@ -4551,18 +4608,19 @@ static inline void* _mi_align_up_ptr(const void* p, size_t alignment) {
   return (void*)_mi_align_up((uintptr_t)p, alignment);
 }
 
+// Align down
 static inline uintptr_t _mi_align_down(uintptr_t sz, size_t alignment) {
   mi_assert_internal(alignment != 0);
-  uintptr_t mask = alignment - 1;
-  if ((alignment & mask) == 0) { // power of two?
+  const uintptr_t mask = alignment - 1;
+  if ((alignment & mask) == 0) {  // power of two?
     return (sz & ~mask);
   }
   else {
-    return ((sz / alignment) * alignment);
+    return ((sz/alignment)*alignment);
   }
 }
 
-// align a pointer downwards
+// Align a pointer downwards
 static inline void* _mi_align_down_ptr(const void* p, size_t alignment) {
   return (void*)_mi_align_down((uintptr_t)p, alignment);
 }
@@ -4646,8 +4704,8 @@ static inline bool mi_count_size_overflow(size_t count, size_t size, size_t* tot
   Heap functions
 ------------------------------------------------------------------------------------------- */
 
-extern mi_decl_hidden const mi_theap_t _mi_theap_empty;       // read-only empty theap, initial value of the thread local default theap (in the MI_TLS_MODEL_LOCAL)
-extern mi_decl_hidden const mi_theap_t _mi_theap_empty_wrong; // read-only empty theap used to signal that a theap for a heap could not be allocated
+extern mi_decl_hidden const mi_theap_t _mi_theap_empty; // read-only empty theap, initial value of the thread local default theap (in the MI_TLS_MODEL_LOCAL)
+extern mi_decl_hidden mi_theap_t _mi_theap_empty_wrong; // read-only empty theap used to signal that a theap for a heap could not be allocated
 
 
 static inline mi_heap_t* _mi_theap_heap_peek(const mi_theap_t* theap) {
@@ -4677,12 +4735,14 @@ static inline mi_page_t* _mi_theap_get_free_small_page(mi_theap_t* theap, size_t
   return theap->pages_free_direct[idx];
 }
 
-//static inline uintptr_t _mi_ptr_cookie(const void* p) {
-//  extern mi_theap_t _mi_theap_main;
-//  mi_assert_internal(_mi_theap_main.cookie != 0);
-//  return ((uintptr_t)p ^ _mi_theap_main.cookie);
-//}
+static inline bool mi_theap_is_detached(mi_theap_t* theap) {
+  return (theap!=NULL && theap->tld->thread_id == MI_THREADID_DETACHED);
+}
 
+static inline bool mi_theap_matches_thread(mi_theap_t* theap) {
+  const mi_threadid_t tid = _mi_thread_id();
+  return (theap==NULL || theap->tld->thread_id == tid || mi_theap_is_detached(theap));
+}
 
 /* -----------------------------------------------------------
   The page map maps addresses to `mi_page_t` pointers
@@ -4738,11 +4798,17 @@ static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
 #define MI_PAGE_MAP_SUB_SHIFT     (13)
 #define MI_PAGE_MAP_SUB_COUNT     (MI_ZU(1) << MI_PAGE_MAP_SUB_SHIFT)
 #define MI_PAGE_MAP_SHIFT         (MI_MAX_VABITS - MI_PAGE_MAP_SUB_SHIFT - MI_ARENA_SLICE_SHIFT)
-#define MI_PAGE_MAP_COUNT         (MI_ZU(1) << MI_PAGE_MAP_SHIFT)
 
 typedef mi_page_t**   mi_submap_t;
-extern mi_decl_hidden _Atomic(mi_submap_t)* _mi_page_map;
-extern mi_decl_hidden _Atomic(void*) _mi_page_map_max_address;
+typedef struct mi_page_map_s {  
+  _Atomic(size_t)      committed_count;  // currently committed entries
+  size_t               reserved_size;    // full reserved size (mi_page_map_t + submaps)
+  mi_memid_t           memid;            // provenance
+  mi_lock_t            lock;             // used when allocating new submaps
+  mi_decl_cache_align _Atomic(mi_submap_t) submaps[1];
+} mi_page_map_t;
+
+extern mi_decl_hidden _Atomic(mi_page_map_t*) __mi_page_map;
 
 static inline size_t _mi_page_map_index(const void* p, size_t* sub_idx) {
   const size_t u = (size_t)((uintptr_t)p / MI_ARENA_SLICE_SIZE);
@@ -4750,25 +4816,28 @@ static inline size_t _mi_page_map_index(const void* p, size_t* sub_idx) {
   return (u / MI_PAGE_MAP_SUB_COUNT);
 }
 
-static inline mi_submap_t _mi_page_map_at(size_t idx) {
-  return mi_atomic_load_ptr_relaxed(mi_page_t*, &_mi_page_map[idx]);
+static inline mi_page_map_t* _mi_page_map(void) {
+  return mi_atomic_load_ptr_relaxed(mi_page_map_t,&__mi_page_map);
+}
+
+static inline mi_submap_t _mi_page_map_at(const mi_page_map_t* pmap, size_t idx) {
+  return mi_atomic_load_ptr_relaxed(mi_page_t*, &pmap->submaps[idx]);
 }
 
 static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
+  const mi_page_map_t* pmap = _mi_page_map();
   size_t sub_idx;
   const size_t idx = _mi_page_map_index(p, &sub_idx);
-  return (_mi_page_map_at(idx))[sub_idx];  // NULL if p==NULL
+  return _mi_page_map_at(pmap,idx)[sub_idx];  // NULL if p==NULL
 }
 
 static inline mi_page_t* _mi_checked_ptr_page(const void* p) {
-  #if MI_MIN_VABITS < MI_INTPTR_BITS
-  if mi_unlikely(((uintptr_t)p >> MI_MIN_VABITS) != 0) {
-    if (p > mi_atomic_load_ptr_relaxed(void, &_mi_page_map_max_address)) return NULL;
-  }
-  #endif
+  const mi_page_map_t* pmap = _mi_page_map();
+  const size_t committed_count = mi_atomic_load_relaxed(&pmap->committed_count);
   size_t sub_idx;
   const size_t idx = _mi_page_map_index(p, &sub_idx);
-  mi_submap_t const sub = _mi_page_map_at(idx);
+  if mi_unlikely(idx > committed_count) return NULL;
+  mi_submap_t const sub = _mi_page_map_at(pmap,idx);
   if mi_unlikely(sub == NULL) return NULL;
   return sub[sub_idx];
 }
@@ -4856,9 +4925,15 @@ static inline size_t mi_page_slice_offset_of(const mi_page_t* page, size_t offse
   return (mi_page_start(page) - mi_page_slice_start(page)) + offset_relative_to_page_start;
 }
 
+// How much of the page is committed relative to the slice start? (or 0 if fully committed already)
+static inline size_t mi_page_slice_committed(const mi_page_t* page) {
+  return ((size_t)page->slice_pcommitted * _mi_os_page_size());
+}
+
 // Currently committed part of a page
 static inline size_t mi_page_committed(const mi_page_t* page) {
-  return (page->slice_committed == 0 ? mi_page_size(page) : page->slice_committed - mi_page_slice_offset_of(page,0));
+  const size_t slice_committed = mi_page_slice_committed(page);
+  return (slice_committed == 0 ? mi_page_size(page) : slice_committed - mi_page_slice_offset_of(page,0));
 }
 
 // are all blocks in a page freed?
@@ -4942,6 +5017,10 @@ static inline mi_page_queue_t* mi_page_queue(const mi_theap_t* theap, size_t siz
   return pq;
 }
 
+static inline size_t mi_page_min_commit_size(void) {
+  const size_t psize = _mi_os_page_size();
+  return (MI_PAGE_MIN_COMMIT_SIZE >= psize ? MI_PAGE_MIN_COMMIT_SIZE : psize);
+}
 
 //-----------------------------------------------------------
 // Page thread id and flags
@@ -4979,11 +5058,8 @@ static inline void mi_page_set_in_full(mi_page_t* page, bool in_full) {
     mi_theap_t* const theap = page->theap;
     mi_assert_internal(theap!=NULL);
     if (theap != NULL) {
-      // NEXT PIN BUMP: upstream `1fb345674` / `f9a74121f` change `capacity` to
-      // `reserved` here (#128 A2). Not cherry-picked, because `pages_full_size` is
-      // write-only at this pin -- nothing reads it, so a wrong value has no release-build
-      // effect. It arrives with the bump; confirm it did and drop this comment then.
-      const size_t size = page->capacity * mi_page_block_size(page);
+      mi_assert_internal(page->capacity==page->reserved);
+      const size_t size = page->reserved * mi_page_block_size(page);
       if (in_full) { theap->pages_full_size += size; }
               else { mi_assert_internal(size <= theap->pages_full_size); theap->pages_full_size -= size; }
     }
@@ -5069,7 +5145,10 @@ static inline bool _mi_is_heap_main(const mi_heap_t* heap) {
   return (mi_heap_get_heap_main(heap) == heap);
 }
 
-
+static inline bool _mi_is_process_heap_main(const mi_heap_t* heap) {
+  mi_assert_internal(heap!=NULL);
+  return (_mi_subproc_main()->heap_main == heap);
+}
 
 //-----------------------------------------------------------
 // Thread free list and ownership
@@ -5137,15 +5216,15 @@ static inline bool mi_theap_malloc_use_guarded(mi_theap_t* theap, size_t size) {
     // no sample
     theap->guarded_sample_count = count;
     return false;
-  }  
-  else { 
+  }
+  else {
     // count == 0
     const size_t rate = theap->guarded_sample_rate;
     if (rate == 0) {
       return false; // don't write to an empty theap
     }
     else if (size >= theap->guarded_size_min && size <= theap->guarded_size_max) {
-      // use guarded allocation        
+      // use guarded allocation
       theap->guarded_sample_count = rate;  // reset
       return true;
     }
@@ -5157,7 +5236,7 @@ static inline bool mi_theap_malloc_use_guarded(mi_theap_t* theap, size_t size) {
   }
 }
 
-mi_decl_restrict void* _mi_theap_malloc_guarded(mi_theap_t* theap, size_t size, bool zero, size_t* usable) mi_attr_noexcept;
+mi_decl_restrict void* _mi_theap_malloc_guarded(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept;
 #endif
 
 /* -------------------------------------------------------------------
@@ -5302,17 +5381,40 @@ static inline mi_memid_t _mi_memid_create_os(void* base, size_t size, bool commi
   return memid;
 }
 
-static inline mi_memid_t _mi_memid_create_meta(mi_meta_page_t* mpage, size_t block_idx, size_t block_count) {
-  mi_memid_t memid = _mi_memid_create(MI_MEM_META);
-  memid.mem.meta.meta_page = mpage;
-  memid.mem.meta.block_index = (uint32_t)block_idx;
-  memid.mem.meta.block_count = (uint32_t)block_count;
+static inline mi_memid_t _mi_memid_create_static(void* p, size_t size) {
+  mi_memid_t memid = _mi_memid_create(MI_MEM_STATIC);
+  memid.mem.malloc.base = p;
+  memid.mem.malloc.size = size;
   memid.initially_committed = true;
-  memid.initially_zero = true;
   memid.is_pinned = true;
   return memid;
 }
 
+static inline mi_memid_t _mi_memid_create_malloc(void* p, size_t size, bool iszero) {
+  mi_memid_t memid = _mi_memid_create(MI_MEM_MALLOC);
+  memid.mem.malloc.base = p;
+  memid.mem.malloc.size = size;
+  memid.initially_committed = true;
+  memid.initially_zero = iszero;
+  memid.is_pinned = true;
+  return memid;
+}
+
+static inline size_t _mi_memid_size(mi_memid_t memid) {
+  if (mi_memid_is_os(memid)) {
+    return memid.mem.os.size;
+  }
+  else if (memid.memkind == MI_MEM_ARENA) {
+    return mi_size_of_slices(memid.mem.arena.slice_count);
+  }
+  else if (memid.memkind == MI_MEM_MALLOC) {
+    return memid.mem.malloc.size;
+  }
+  else {
+    mi_assert_internal(mi_memid_needs_no_free(memid));
+    return 0;
+  }  
+}
 
 // -------------------------------------------------------------------
 // Fast "random" shuffle
@@ -5481,19 +5583,20 @@ terms of the MIT license. A copy of the license can be found in the file
 // to a thread-local theap pointer (in `alloc.c:mi_malloc`).
 //
 // For performance, we tend to use specialized code for various platforms.
-// This leads to quite a few ifdefs but it is just for performance and there 
+// This leads to quite a few ifdefs but it is just for performance and there
 // is always a portable fallback (based on regular thread local variables).
 //
 // Windows          : use NtCurrentTeB and TlsAlloc (MI_TLS_MODEL_WIN32)
-// Linux,FreeBSD    : use thread locals with the initial-exec model  (MI_TLS_MODEL_LOCAL)  
-// macOS            : use pthread locals with assembly for the thread-id  (MI_TLS_MODEL_PTHREADS) 
+// Linux,FreeBSD    : use thread locals with the initial-exec model  (MI_TLS_MODEL_LOCAL)
+// macOS            : use pthread locals with assembly for the thread-id  (MI_TLS_MODEL_PTHREADS)
 // Android,OpenBSD  : use pthread locals (MI_TLS_MODEL_PTHREADS). todo: maybe on Android MI_TLS_MODEL_LOCAL is better?
 // --------------------------------------------------------------------------
 
-// static inline void*         mi_prim_tls_slot(size_t slot) mi_attr_noexcept;  // directly read an entry from the thread local storage (or thread control block)
-// static inline void          mi_prim_tls_slot_set(size_t slot, void* value) mi_attr_noexcept;
+// static inline void** mi_prim_thread_pointer(void);   // get a pointer to the thread local storage
+// static inline void*  mi_prim_tls_slot(size_t slot);  // directly read an entry from the thread local storage block
+// static inline void   mi_prim_tls_slot_set(size_t slot, void* value);
 
-static inline mi_threadid_t _mi_prim_thread_id(void) mi_attr_noexcept;       // get a unique id for a thread
+static inline mi_threadid_t _mi_prim_thread_id(void);                        // get a unique id for a thread
 static inline mi_theap_t*   _mi_theap_default(void);                         // the default thread local theap
 static inline mi_theap_t*   _mi_theap_cached(void);                          // last used thread local theap using the _heap_ api
 static inline bool          _mi_thread_is_initialized(void);                 // a thread is initialized if it has a default theap
@@ -5515,123 +5618,7 @@ static inline mi_theap_t*   _mi_page_associated_theap_peek(mi_page_t* page); // 
 
 
 //-------------------------------------------------------------------
-// Access to TLS (thread local storage) slots.
-//-------------------------------------------------------------------
-
-// On some libc + platform combinations we can directly access a thread-local storage (TLS) slot.
-// The TLS layout depends on both the OS and libc implementation so we use specific tests for each main platform.
-// If you test on another platform and it works please send a PR :-)
-// see also https://akkadia.org/drepper/tls.pdf for more info on the TLS register.
-//
-// Note: we would like to prefer `__builtin_thread_pointer()` nowadays instead of using assembly,
-// but unfortunately we can not detect support reliably (see issue #883)
-#if (defined(_WIN32)) || \
-    (defined(__GNUC__) && ( \
-           (defined(__GLIBC__)   && (defined(__x86_64__) || defined(__i386__) || (defined(__arm__) && __ARM_ARCH >= 7) || defined(__aarch64__) || defined(__riscv))) \
-        || (defined(__APPLE__)   && (defined(__x86_64__) || defined(__aarch64__) || defined(__POWERPC__))) \
-        || (defined(__BIONIC__)  && (defined(__x86_64__) || defined(__i386__) || (defined(__arm__) && __ARM_ARCH >= 7) || defined(__aarch64__))) \
-        || (defined(__FreeBSD__) && (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__))) \
-        || (defined(__OpenBSD__) && (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__))) \
-      ))
-
-static inline void* mi_prim_tls_slot(size_t slot) mi_attr_noexcept {
-  void* res;
-  const size_t ofs = (slot*sizeof(void*));
-  #if defined(_WIN32)  
-    #if (_M_X64 || _M_AMD64) && !defined(_M_ARM64EC)
-      res = (void*)__readgsqword((unsigned long)ofs);   // direct load at offset from gs
-    #elif _M_IX86 && !defined(_M_ARM64EC)
-      res = (void*)__readfsdword((unsigned long)ofs);   // direct load at offset from fs
-    #else
-      res = ((void**)NtCurrentTeb())[slot]; MI_UNUSED(ofs);
-    #endif
-  #elif defined(__i386__)
-    __asm__("movl %%gs:%1, %0" : "=r" (res) : "m" (*((void**)ofs)) : );  // x86 32-bit always uses GS
-  #elif defined(__APPLE__) && defined(__x86_64__)
-    __asm__("movq %%gs:%1, %0" : "=r" (res) : "m" (*((void**)ofs)) : );  // x86_64 macOSX uses GS
-  #elif defined(__x86_64__) && (MI_INTPTR_SIZE==4)
-    __asm__("movl %%fs:%1, %0" : "=r" (res) : "m" (*((void**)ofs)) : );  // x32 ABI
-  #elif defined(__x86_64__)
-    __asm__("movq %%fs:%1, %0" : "=r" (res) : "m" (*((void**)ofs)) : );  // x86_64 Linux, BSD uses FS
-  #elif defined(__arm__)
-    void** tcb; MI_UNUSED(ofs);
-    __asm__ volatile ("mrc p15, 0, %0, c13, c0, 3\nbic %0, %0, #3" : "=r" (tcb));
-    res = tcb[slot];
-  #elif defined(__aarch64__)
-    void** tcb; MI_UNUSED(ofs);
-    #if defined(__APPLE__) // M1, issue #343
-    __asm__ volatile ("mrs %0, tpidrro_el0\nbic %0, %0, #7" : "=r" (tcb));
-    #else
-    __asm__ volatile ("mrs %0, tpidr_el0" : "=r" (tcb));
-    #endif
-    res = tcb[slot];
-  #elif defined(__riscv)
-    void** tcb; MI_UNUSED(ofs);
-    __asm__ volatile ("mv %0, tp" : "=r" (tcb));
-    res = tcb[slot];
-  #elif defined(__APPLE__) && defined(__POWERPC__) // ppc, issue #781
-    MI_UNUSED(ofs);
-    res = pthread_getspecific(slot);
-  #else
-    #define MI_HAS_TLS_SLOT 0
-    MI_UNUSED(ofs);
-    res = NULL;
-  #endif
-  return res;
-}
-
-#ifndef MI_HAS_TLS_SLOT
-#define MI_HAS_TLS_SLOT 1
-#endif
-
-// setting a tls slot is only used with TLS_MODEL_FIXED (which is not used by default on any platform)
-static inline void mi_prim_tls_slot_set(size_t slot, void* value) mi_attr_noexcept {
-  const size_t ofs = (slot*sizeof(void*));
-  #if defined(_WIN32)
-    ((void**)NtCurrentTeb())[slot] = value; MI_UNUSED(ofs);
-  #elif defined(__i386__)
-    __asm__("movl %1,%%gs:%0" : "=m" (*((void**)ofs)) : "rn" (value) : );  // 32-bit always uses GS
-  #elif defined(__APPLE__) && defined(__x86_64__)
-    __asm__("movq %1,%%gs:%0" : "=m" (*((void**)ofs)) : "rn" (value) : );  // x86_64 macOS uses GS
-  #elif defined(__x86_64__) && (MI_INTPTR_SIZE==4)
-    __asm__("movl %1,%%fs:%0" : "=m" (*((void**)ofs)) : "rn" (value) : );  // x32 ABI
-  #elif defined(__x86_64__)
-    __asm__("movq %1,%%fs:%0" : "=m" (*((void**)ofs)) : "rn" (value) : );  // x86_64 Linux, BSD uses FS
-  #elif defined(__arm__)
-    void** tcb; MI_UNUSED(ofs);
-    __asm__ volatile ("mrc p15, 0, %0, c13, c0, 3\nbic %0, %0, #3" : "=r" (tcb));
-    tcb[slot] = value;
-  #elif defined(__aarch64__)
-    void** tcb; MI_UNUSED(ofs);
-    #if defined(__APPLE__) // M1, issue #343
-    __asm__ volatile ("mrs %0, tpidrro_el0\nbic %0, %0, #7" : "=r" (tcb));
-    #else
-    __asm__ volatile ("mrs %0, tpidr_el0" : "=r" (tcb));
-    #endif
-    tcb[slot] = value;
-  #elif defined(__riscv)
-    void** tcb; MI_UNUSED(ofs);
-    __asm__ volatile ("mv %0, tp" : "=r" (tcb));
-    tcb[slot] = value;
-  #elif defined(__APPLE__) && defined(__POWERPC__) // ppc, issue #781
-    MI_UNUSED(ofs);
-    pthread_setspecific(slot, value);
-  #else
-    MI_UNUSED(ofs); MI_UNUSED(value);
-  #endif
-}
-
-#endif
-
-
-//-------------------------------------------------------------------
-// Get a fast unique thread id.
-//
-// Getting the thread id should be performant as it is called in the
-// fast path of `_mi_free` and we specialize for various platforms as
-// inlined definitions. Regular code should call `init.c:_mi_thread_id()`.
-// We only require _mi_prim_thread_id() to return a unique id
-// for each thread (unequal to zero) with the bottom 2 bits clear.
+// Access to the thread pointer
 //-------------------------------------------------------------------
 
 // Do we have __builtin_thread_pointer? This would be the preferred way to get a unique thread id
@@ -5652,69 +5639,122 @@ static inline void mi_prim_tls_slot_set(size_t slot, void* value) mi_attr_noexce
   #endif
 #endif
 
-static inline mi_threadid_t __mi_prim_thread_id(void) mi_attr_noexcept;
-
-static inline mi_threadid_t _mi_prim_thread_id(void) mi_attr_noexcept {
-  const mi_threadid_t tid = __mi_prim_thread_id();
-  mi_assert_internal(tid > 1);
-  mi_assert_internal((tid & MI_PAGE_FLAG_MASK) == 0);  // bottom 2 bits are clear?
-  return tid;
+#if defined(MI_PRIM_THREAD_POINTER)  // potential user override
+static inline void** mi_prim_thread_pointer(void) {
+  return MI_PRIM_THREAD_POINTER();
 }
-
-// Get a unique id for the current thread.
-#if defined(MI_PRIM_THREAD_ID)
-
-static inline mi_threadid_t __mi_prim_thread_id(void) mi_attr_noexcept {
-  return MI_PRIM_THREAD_ID();  // used for example by CPython for a free threaded build (see python/cpython#115488)
-}
-
 #elif defined(_WIN32)
-
-static inline mi_threadid_t __mi_prim_thread_id(void) mi_attr_noexcept {
-  // Windows: works on Intel and ARM in both 32- and 64-bit
-  return (uintptr_t)NtCurrentTeb();
+static inline void** mi_prim_thread_pointer(void) {
+  return (void**)NtCurrentTeb();
 }
-
 #elif MI_USE_BUILTIN_THREAD_POINTER
-
-static inline mi_threadid_t __mi_prim_thread_id(void) mi_attr_noexcept {
-  // Works on most Unix based platforms with recent compilers
-  return (uintptr_t)__builtin_thread_pointer();
+static inline void** mi_prim_thread_pointer(void) {
+  return (void**)__builtin_thread_pointer();
 }
-
-#elif MI_HAS_TLS_SLOT
-
-static inline mi_threadid_t __mi_prim_thread_id(void) mi_attr_noexcept {
-  #if defined(__BIONIC__)
-    // issue #384, #495: on the Bionic libc (Android), slot 1 is the thread id
-    // see: https://github.com/aosp-mirror/platform_bionic/blob/c44b1d0676ded732df4b3b21c5f798eacae93228/libc/platform/bionic/tls_defines.h#L86
-    return (uintptr_t)mi_prim_tls_slot(1);
+#elif defined(__GNUC__) && !defined(__CYGWIN__)
+  #if defined(__aarch64__)
+  static inline void** mi_prim_thread_pointer(void) {
+    void** tcb;
+    #if defined(__APPLE__) // M1, issue rgb(62, 76, 62)
+    __asm__ volatile ("mrs %0, tpidrro_el0\nbic %0, %0, #7" : "=r" (tcb));
+    #else
+    __asm__ volatile ("mrs %0, tpidr_el0" : "=r" (tcb));
+    #endif
+    return tcb;
+  }
+  #elif defined(__riscv)
+  static inline void** mi_prim_thread_pointer(void) {
+    void** tcb;
+    __asm__ volatile ("mv %0, tp" : "=r" (tcb));
+    return tcb;
+  }
+  #elif defined(__arm__)
+  static inline void** mi_prim_thread_pointer(void) {
+    void** tcb;
+    __asm__ volatile ("mrc p15, 0, %0, c13, c0, 3\nbic %0, %0, #3" : "=r" (tcb));
+    return tcb;
+  }
+  #elif defined(__i386__)
+  static inline void** mi_prim_thread_pointer(void) {
+    void** tcb;
+    __asm__("movl %%gs:0, %0" : "=r" (tcb) : : );  // x86 32-bit always uses GS
+    return tcb;
+  }
+  #elif defined(__x86_64__)
+  static inline void** mi_prim_thread_pointer(void) {
+    void** tcb;
+    #if defined(__APPLE__)
+    __asm__("movq %%gs:0, %0" : "=r" (tcb) : : );  // x86_64 macOSX uses GS
+    #elif (MI_INTPTR_SIZE==4)
+    __asm__("movl %%fs:0, %0" : "=r" (tcb) : : );  // x32 ABI
+    #else
+    __asm__("movq %%fs:0, %0" : "=r" (tcb) : : );  // x86_64 Linux, BSD uses FS
+    #endif
+    return tcb;
+  }
   #else
-    // in all our other targets, slot 0 is the thread id
-    // glibc: https://sourceware.org/git/?p=glibc.git;a=blob_plain;f=sysdeps/x86_64/nptl/tls.h
-    // apple: https://github.com/apple/darwin-xnu/blob/main/libsyscall/os/tsd.h#L36
-    return (uintptr_t)mi_prim_tls_slot(0);
+  #define MI_NO_THREAD_POINTER (1)
+  #endif
+#elif MI_USE_PTHREADS && defined(__APPLE__)
+static inline void** mi_prim_thread_pointer(void) {
+  return (void**)pthread_self();
+}
+#else
+#define MI_NO_THREAD_POINTER (1)
+#endif
+
+#if !MI_NO_THREAD_POINTER
+#define MI_HAS_TLS_SLOT  (1)
+static inline void* mi_prim_tls_slot(size_t slot) {
+  #if defined(_WIN32)
+    #if (_M_X64 || _M_AMD64) && !defined(_M_ARM64EC)
+      return (void*)__readgsqword((unsigned long)(slot*sizeof(void*)));   // direct load at offset from gs
+    #elif _M_IX86 && !defined(_M_ARM64EC)
+      return (void*)__readfsdword((unsigned long)(slot*sizeof(void*)));   // direct load at offset from fs
+    #else
+      return mi_prim_thread_pointer()[slot];
+    #endif
+  #else
+    return mi_prim_thread_pointer()[slot];
   #endif
 }
 
-#elif defined(MI_USE_PTHREADS) && defined(__APPLE__)
-
-// on macOS, pthread_t is pointer
-static inline mi_threadid_t __mi_prim_thread_id(void) mi_attr_noexcept {
-  return (uintptr_t)((void*)pthread_self());
+static inline void mi_prim_tls_slot_set(size_t slot, void* value) {
+  mi_prim_thread_pointer()[slot] = value;
 }
-
-#else
-
-extern mi_decl_hidden mi_decl_thread void* __mi_thread_id_helper;
-
-// otherwise use portable C, taking the address of a thread local variable (this is still very fast on most platforms).
-static inline mi_threadid_t __mi_prim_thread_id(void) mi_attr_noexcept {
-  return (uintptr_t)&__mi_thread_id_helper;
-}
-
 #endif
 
+/* ----------------------------------------------------------------------------------------
+  Get a unique thread-id for a thread
+---------------------------------------------------------------------------------------- */
+
+// Get a unique id for the current thread.
+#if defined(MI_PRIM_THREAD_ID)
+static inline mi_threadid_t __mi_prim_thread_id(void) {
+  return MI_PRIM_THREAD_ID();  // used for example by CPython for a free threaded build (see python/cpython#115488)
+}
+#elif !MI_NO_THREAD_POINTER
+static inline mi_threadid_t __mi_prim_thread_id(void) {
+  #if defined(__BIONIC__)
+  return (mi_threadid_t)mi_prim_tls_slot(1);
+  #else
+  return (mi_threadid_t)mi_prim_thread_pointer();
+  #endif
+}
+#else
+// otherwise use portable C, taking the address of a thread local variable (this is still very fast on most platforms).
+extern mi_decl_hidden mi_decl_thread void* __mi_thread_id_helper;
+static inline mi_threadid_t __mi_prim_thread_id(void) {
+  return (uintptr_t)&__mi_thread_id_helper;
+}
+#endif
+
+static inline mi_threadid_t _mi_prim_thread_id(void) {
+  const mi_threadid_t tid = __mi_prim_thread_id();
+  mi_assert_internal(tid > MI_THREADID_DETACHED);
+  mi_assert_internal((tid & MI_PAGE_FLAG_MASK) == 0);  // bottom 2 bits are clear?
+  return tid;
+}
 
 
 /* ----------------------------------------------------------------------------------------
@@ -5742,7 +5782,7 @@ We have 4 models:
     where the underlying TLS implementation (or the loader) will call itself `malloc`
     on a first access to a thread local (and recurse in the MI_TLS_MODEL_LOCAL).
     This goes wrong though if the OS or a library uses the same fixed slot, and also
-    prevents multiple instances of mimalloc in the same process. 
+    prevents multiple instances of mimalloc in the same process.
 
 - MI_TLS_MODEL_WIN32: use a dynamically allocated slot with TlsAlloc. (default on Windows)
     We use TlsAlloc'd slot. First tries to use one of the "direct" first 64 slots which
@@ -5796,26 +5836,28 @@ static inline mi_theap_t* _mi_theap_cached(void) {
 // can be avoided with pthreads.
 #define MI_THEAP_INITASNULL  1
 
-extern mi_decl_hidden pthread_key_t _mi_theap_default_key;
-extern mi_decl_hidden pthread_key_t _mi_theap_cached_key;
+extern mi_decl_hidden _Atomic(pthread_key_t) _mi_theap_default_key;
+extern mi_decl_hidden _Atomic(pthread_key_t) _mi_theap_cached_key;
 
 static inline mi_theap_t* _mi_theap_default(void) {
+  pthread_key_t key = mi_atomic_load_relaxed(&_mi_theap_default_key);
   #if defined(__APPLE__) && defined(__aarch64__) && MI_HAS_TLS_SLOT
   // on apple arm64, the pthread specific slots are direct slots; inline it to avoid a stack frame setup in `mi_malloc`
-  // todo: this is probably also the case on x64 and power pc?
-  if (_mi_theap_default_key == MI_PTHREAD_KEY_INVALID) return NULL;
-  return (mi_theap_t*)mi_prim_tls_slot(_mi_theap_default_key);
+  // todo: this is probably also the case on x64 and power pc?  
+  if (key == MI_PTHREAD_KEY_INVALID) return NULL;
+  return (mi_theap_t*)mi_prim_tls_slot(key);
   #else
-  return (mi_theap_t*)mi_pthread_key_get(_mi_theap_default_key);  
+  return (mi_theap_t*)mi_pthread_key_get(key);
   #endif
 }
 
 static inline mi_theap_t* _mi_theap_cached(void) {
+  pthread_key_t key = mi_atomic_load_relaxed(&_mi_theap_cached_key);
   #if defined(__APPLE__) && defined(__aarch64__) && MI_HAS_TLS_SLOT
-  if (_mi_theap_cached_key == MI_PTHREAD_KEY_INVALID) return NULL;
-  return (mi_theap_t*)mi_prim_tls_slot(_mi_theap_cached_key);
+  if (key == MI_PTHREAD_KEY_INVALID) return NULL;
+  return (mi_theap_t*)mi_prim_tls_slot(key);
   #else
-  return (mi_theap_t*)mi_pthread_key_get(_mi_theap_cached_key);
+  return (mi_theap_t*)mi_pthread_key_get(key);
   #endif
 }
 
@@ -5866,7 +5908,7 @@ static inline mi_theap_t* _mi_theap_cached(void) {
 
 #elif MI_TLS_MODEL_FIXED
 // Fixed TLS slot. Can be the fastest approach, but does not work if there are multiple instances of
-// mimalloc in the same process. Most OS's do not have official user reserved fixed slots so this cannot be 
+// mimalloc in the same process. Most OS's do not have official user reserved fixed slots so this cannot be
 // guaranteed to work in general.
 #define MI_THEAP_INITASNULL  1
 
@@ -5941,7 +5983,8 @@ static inline mi_theap_t* _mi_page_associated_theap_peek(mi_page_t* page) {
   mi_theap_t* const theap = (mi_theap_t*)_mi_thread_local_get(heap->theap);
   if (theap==NULL) return NULL;
   if (theap->heap != heap) return NULL; // should never happen, but can happen for a free across subprocesses, which can happen during pthread tls storage deallocation
-  mi_assert_internal(!_mi_is_empty_theap(theap) && _mi_thread_id()==theap->tld->thread_id);
+  mi_assert_internal(!_mi_is_empty_theap(theap) && mi_theap_matches_thread(theap));
+  // note: for pages allocated by a detached theap, the returned theap may not be detached
   return theap;
 }
 
@@ -6558,14 +6601,14 @@ static inline mi_page_t* mi_validate_ptr_page(const void* p, const char* msg)
 
 // Free a block
 // Fast path written carefully to prevent register spilling on the stack
-static mi_decl_forceinline void mi_free_ex(void* p, size_t* usable, mi_page_t* page, bool allow_collect)  
+static mi_decl_forceinline void mi_free_ex(void* p, mi_page_t* page, size_t* pblock_size, bool allow_collect)  
 {
   if mi_unlikely(page==NULL) { // page will be NULL if p==NULL
-    if (usable!=NULL) { *usable = 0; }
+    if (pblock_size!=NULL) { *pblock_size = 0; }
     return;  
   }
   mi_assert_internal(p!=NULL && page!=NULL);
-  if (usable!=NULL) { *usable = mi_page_usable_block_size(page); }
+  if (pblock_size!=NULL) { *pblock_size = mi_page_block_size(page); }
 
   const mi_threadid_t xtid = (_mi_prim_thread_id() ^ mi_page_xthread_id(page));
   if mi_likely(xtid == 0) {                        // `tid == mi_page_thread_id(page) && mi_page_flags(page) == 0`
@@ -6589,14 +6632,18 @@ static mi_decl_forceinline void mi_free_ex(void* p, size_t* usable, mi_page_t* p
   }
 }
 
-void mi_free(void* p) mi_attr_noexcept {
-  mi_page_t* const page = mi_validate_ptr_page(p,"mi_free");  
-  mi_free_ex(p, NULL, page, true);
+void _mi_free_in_page(void* p, mi_page_t* page) mi_attr_noexcept {
+  mi_free_ex(p, page, NULL, true);
 }
 
-void mi_ufree(void* p, size_t* usable) mi_attr_noexcept {
+void mi_free(void* p) mi_attr_noexcept {
+  mi_page_t* const page = mi_validate_ptr_page(p,"mi_free");  
+  mi_free_ex(p, page, NULL, true);
+}
+
+void mi_ufree(void* p, size_t* pblock_size) mi_attr_noexcept {
   mi_page_t* const page = mi_validate_ptr_page(p,"mi_ufree");  
-  mi_free_ex(p, usable, page, true);
+  mi_free_ex(p, page, pblock_size, true);
 }
 
 void mi_free_small(void* p) mi_attr_noexcept {
@@ -6605,27 +6652,31 @@ void mi_free_small(void* p) mi_attr_noexcept {
   // just by aligning down the pointer instead of looking it up in the page map.
   #if MI_PAGE_META_ALIGNED_FREE_SMALL 
     #if MI_GUARDED 
-    #warning "MI_PAGE_META_ALIGNED_FREE_SMALL ignored as MI_GUARDED is defined"
+    #warning "MI_OPT_FREE_SMALL (MI_PAGE_META_ALIGNED_FREE_SMALL) ignored as MI_GUARDED is defined"
     mi_free(p);
     #elif MI_ARENA_SLICE_ALIGN < MI_SMALL_PAGE_SIZE
-    #warning "MI_PAGE_META_ALIGNED_FREE_SMALL ignored as the MI_ARENA_SLICE_ALIGN is less than the small page size"
+    #warning "MI_OPT_FREE_SMALL (MI_PAGE_META_ALIGNED_FREE_SMALL) ignored as the MI_ARENA_SLICE_ALIGN is less than the small page size"
     mi_free(p);
     #else
       mi_page_t* const page = (mi_page_t*)_mi_align_down_ptr(p,MI_SMALL_PAGE_SIZE);
       mi_assert(page == mi_validate_ptr_page(p,"mi_free_small"));
       mi_assert((void*)page == _mi_align_down_ptr(mi_page_start(page),MI_SMALL_PAGE_SIZE));
-      mi_assert(page->block_size <= MI_SMALL_SIZE_MAX);  // note: not `MI_SMALL_MAX_OBJ_SIZE` as we need to match `mi_(heap_)malloc_small`
-      mi_free_ex(p, NULL, page, true);
+      mi_assert(page->block_size <= mi_good_size(MI_SMALL_SIZE_MAX));  // note: not `MI_SMALL_MAX_OBJ_SIZE` as we need to match `mi_(heap_)malloc_small`
+      mi_free_ex(p, page, NULL, true);
     #endif
   #else
-  mi_free(p);
+    mi_free(p);
   #endif  
 }
 
+void _mi_free_subproc_safe_in_page(void* p, mi_page_t* page) mi_attr_noexcept {
+  mi_free_ex(p, page, NULL, false);
+}
+
 // Free a pointer that is potentially allocated in a different sub-process
-void _mi_free_subproc_safe(void* p) {
+void _mi_free_subproc_safe(void* p) mi_attr_noexcept {
   mi_page_t* const page = mi_validate_ptr_page(p,"_mi_free_subproc_safe");  
-  mi_free_ex(p, NULL, page, false);
+  mi_free_ex(p, page, NULL, false);
 }
 
 
@@ -6799,8 +6850,9 @@ static size_t mi_decl_noinline mi_page_usable_aligned_size_of(const mi_page_t* p
   return aligned_size;
 }
 
-static inline size_t _mi_usable_size(const void* p, const mi_page_t* page) mi_attr_noexcept {
+size_t _mi_page_usable_size(const mi_page_t* page, const void* p) mi_attr_noexcept {
   if mi_unlikely(page==NULL) return 0;
+  mi_assert_internal(mi_validate_ptr_page(p,"_mi_page_usable_size") == page);
   if mi_likely(!mi_page_has_interior_pointers(page)) {
     const mi_block_t* block = mi_validate_block_from_ptr(page,p);
     return mi_page_usable_size_of(page, block, false /* is guarded */);
@@ -6813,7 +6865,7 @@ static inline size_t _mi_usable_size(const void* p, const mi_page_t* page) mi_at
 
 mi_decl_nodiscard size_t mi_usable_size(const void* p) mi_attr_noexcept {
   const mi_page_t* const page = mi_validate_ptr_page(p,"mi_usable_size");
-  return _mi_usable_size(p,page);
+  return _mi_page_usable_size(page,p);
 }
 
 
@@ -6824,11 +6876,30 @@ mi_decl_nodiscard size_t mi_usable_size(const void* p) mi_attr_noexcept {
 void mi_free_size(void* p, size_t size) mi_attr_noexcept {
   MI_UNUSED_RELEASE(size);
   #if MI_DEBUG
-  const mi_page_t* const page = mi_validate_ptr_page(p,"mi_free_size");  
-  const size_t available = _mi_usable_size(p,page);
-  mi_assert(p == NULL || size <= available || available == 0 /* invalid pointer */ );
+  const mi_page_t* const page = mi_validate_ptr_page(p,"mi_free_size");
+  if (page==NULL) return;
+  mi_assert(p!=NULL);
+  const size_t usable = _mi_page_usable_size(page,p);
+  if (size > usable) { 
+    _mi_error_message(EINVAL, "pointer %p is freed with mi_free_size but the size %zu is greater than the usable size %zu\n", p, size, usable);
+    mi_free(p);
+    return;
+  }
+  else if (size <= MI_SMALL_SIZE_MAX && mi_page_block_size(page) > mi_good_size(MI_SMALL_SIZE_MAX)) { 
+    _mi_error_message(EINVAL, "pointer %p is freed with mi_free_size but the given size %zu is less than the allocated block size %zu\n", p, size, mi_page_block_size(page));
+    mi_free(p);
+    return;
+  }
   #endif
-  mi_free(p);
+  #if MI_OPT_FREE_SMALL
+  if mi_likely(size <= MI_SMALL_SIZE_MAX) {
+    mi_free_small(p); 
+  }
+  else 
+  #endif
+  {
+    mi_free(p);
+  }
 }
 
 void mi_free_size_aligned(void* p, size_t size, size_t alignment) mi_attr_noexcept {
@@ -6841,6 +6912,17 @@ void mi_free_aligned(void* p, size_t alignment) mi_attr_noexcept {
   MI_UNUSED_RELEASE(alignment);
   mi_assert(((uintptr_t)p % alignment) == 0);
   mi_free(p);
+}
+
+// checked free
+void mi_cfree(void* p) mi_attr_noexcept {
+  mi_page_t* const page = _mi_checked_ptr_page(p);
+  if mi_likely(page!=NULL) {
+    _mi_free_in_page(p,page);
+  }
+  // if (mi_is_in_heap_region(p)) {
+  //   mi_free(p);
+  // }
 }
 
 
@@ -7045,9 +7127,18 @@ static void mi_check_padding(const mi_page_t* page, const mi_block_t* block) {
 // only maintain stats for smaller objects if requested
 #if (MI_STAT>0)
 static void mi_stat_free(const mi_page_t* page, const mi_block_t* block) {
-  MI_UNUSED(block);
-  mi_theap_t* const theap = _mi_theap_default();
-  if (!mi_theap_is_initialized(theap)) return; // (for now) skip statistics if free'd after thread_done was called (usually a thread cleanup call by the OS)
+  MI_UNUSED(block);  
+  mi_theap_t* theap = _mi_theap_default();
+  mi_lock_t* lock = NULL;
+  mi_subproc_t* const subproc = mi_page_subproc(page);
+  mi_theap_t* const theap_meta = subproc->theap_meta;
+  if mi_unlikely(!mi_theap_is_initialized(theap) || // can happen if free'd after thread_done was called (usually a thread cleanup call by the OS)
+                  // page->theap == subproc->theap_meta  .. but we cannot read `theap` if we don't own the page
+                  (theap_meta != NULL && mi_page_thread_id(page) == theap_meta->tld->thread_id)) { 
+    theap = theap_meta;
+    lock = &subproc->theap_meta_lock;
+    mi_lock_acquire(lock);
+  }
 
   const size_t bsize = mi_page_usable_block_size(page);
   // #if (MI_STAT>1)
@@ -7063,6 +7154,10 @@ static void mi_stat_free(const mi_page_t* page, const mi_block_t* block) {
   else {
     const size_t bpsize = mi_page_block_size(page);  // match stat in page.c:mi_huge_page_alloc
     mi_theap_stat_decrease(theap, malloc_huge, bpsize);
+  }
+
+  if mi_unlikely(lock!=NULL) {
+    mi_lock_release(lock);
   }
 }
 #else
@@ -7113,7 +7208,7 @@ void _mi_page_unguard_all(mi_page_t* page) {
 // Fast allocation in a page: just pop from the free list.
 // Fall back to generic allocation only if the list is empty.
 // Note: in release mode the (inlined) routine is about 7 instructions with a single test.
-static mi_decl_forceinline void* mi_page_malloc_zero(mi_theap_t* theap, mi_page_t* page, size_t size, bool zero, size_t* usable) mi_attr_noexcept
+static mi_decl_forceinline void* mi_page_malloc_zero(mi_theap_t* theap, mi_page_t* page, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
   if (page->block_size != 0) { // not the empty theap
     mi_assert_internal(mi_page_block_size(page) >= size);
@@ -7124,10 +7219,10 @@ static mi_decl_forceinline void* mi_page_malloc_zero(mi_theap_t* theap, mi_page_
   // check the free list
   mi_block_t* const block = page->free;
   if mi_unlikely(block == NULL) {
-    return _mi_malloc_generic(theap, size, (zero ? 1 : 0), usable);
+    return _mi_malloc_generic(theap, size, (zero ? 1 : 0), ppage);
   }
   mi_assert_internal(block != NULL && _mi_ptr_page(block) == page);
-  if (usable != NULL) { *usable = mi_page_usable_block_size(page); };
+  if (ppage != NULL) { *ppage = page; };
 
   // pop from the free list
   page->free = mi_block_next(page, block);
@@ -7211,26 +7306,25 @@ extern void* _mi_page_malloc_zero(mi_theap_t* theap, mi_page_t* page, size_t siz
 // main allocation primitives for small and generic allocation
 
 // internal small size allocation
-static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_nonnull(mi_theap_t* theap, size_t size, bool zero, size_t* usable) mi_attr_noexcept
+static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_nonnull(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
   mi_assert(theap != NULL);
   mi_assert(size <= MI_SMALL_SIZE_MAX);
   #if MI_DEBUG
-  const uintptr_t tid = _mi_thread_id();
-  mi_assert(theap->tld->thread_id == 0 || theap->tld->thread_id == tid); // theaps are thread local
+  mi_assert(mi_theap_matches_thread(theap)); // theaps are thread local
   #endif
   #if (MI_PADDING || MI_GUARDED)
   if mi_unlikely(size == 0) { size = sizeof(void*); }
   #endif
   #if MI_GUARDED
   if mi_unlikely(mi_theap_malloc_use_guarded(theap,size)) {
-    return _mi_theap_malloc_guarded(theap, size, zero, usable);
+    return _mi_theap_malloc_guarded(theap, size, zero, ppage);
   }
   #endif
 
   // get page in constant time, and allocate from it
   mi_page_t* page = _mi_theap_get_free_small_page(theap, size + MI_PADDING_SIZE);
-  void* const p = mi_page_malloc_zero(theap, page, size + MI_PADDING_SIZE, zero, usable);
+  void* const p = mi_page_malloc_zero(theap, page, size + MI_PADDING_SIZE, zero, ppage);
   mi_track_malloc(p,size,zero);
 
   #if MI_DEBUG>3
@@ -7242,22 +7336,22 @@ static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_non
 }
 
 // internal generic allocation
-static mi_decl_forceinline void* mi_theap_malloc_generic(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, size_t* usable) mi_attr_noexcept
+static mi_decl_forceinline void* mi_theap_malloc_generic(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) mi_attr_noexcept
 {
   #if MI_GUARDED
   #if MI_THEAP_INITASNULL
   if (theap!=NULL)
   #endif
   if (huge_alignment==0 && mi_theap_malloc_use_guarded(theap, size)) {
-    return _mi_theap_malloc_guarded(theap, size, zero, usable);
+    return _mi_theap_malloc_guarded(theap, size, zero, ppage);
   }
   #endif
   #if !MI_THEAP_INITASNULL
   mi_assert(theap!=NULL);
   #endif
-  mi_assert(theap==NULL || theap->tld->thread_id == 0 || theap->tld->thread_id == _mi_thread_id());   // theaps are thread local
+  mi_assert(mi_theap_matches_thread(theap));   // theaps are thread local
   mi_assert((huge_alignment & 1)==0);
-  void* const p = _mi_malloc_generic(theap, size + MI_PADDING_SIZE, (zero ? 1 : 0) | huge_alignment, usable);  // note: size can overflow but it is detected in malloc_generic
+  void* const p = _mi_malloc_generic(theap, size + MI_PADDING_SIZE, (zero ? 1 : 0) | huge_alignment, ppage);  // note: size can overflow but it is detected in malloc_generic
   mi_track_malloc(p, size, zero);
 
   #if MI_DEBUG>3
@@ -7269,16 +7363,16 @@ static mi_decl_forceinline void* mi_theap_malloc_generic(mi_theap_t* theap, size
 }
 
 // internal small allocation
-static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero(mi_theap_t* theap, size_t size, bool zero, size_t* usable) mi_attr_noexcept {
+static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept {
   #if MI_THEAP_INITASNULL
   if (theap!=NULL) {
-    return mi_theap_malloc_small_zero_nonnull(theap, size, zero, usable);
+    return mi_theap_malloc_small_zero_nonnull(theap, size, zero, ppage);
   }
   else {
-    return mi_theap_malloc_generic(theap, size, zero, 0, usable); // tailcall
+    return mi_theap_malloc_generic(theap, size, zero, 0, ppage); // tailcall
   }
   #else
-  return mi_theap_malloc_small_zero_nonnull(theap, size, zero, usable);
+  return mi_theap_malloc_small_zero_nonnull(theap, size, zero, ppage);
   #endif
 }
 
@@ -7297,18 +7391,18 @@ mi_decl_nodiscard mi_decl_restrict void* mi_heap_malloc_small(mi_heap_t* heap, s
 }
 
 // The main internal allocation functions
-static mi_decl_forceinline void* mi_theap_malloc_zero_nonnull(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, size_t* usable) mi_attr_noexcept {
+static mi_decl_forceinline void* mi_theap_malloc_zero_nonnull(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) mi_attr_noexcept {
   // fast path for small objects
   if mi_likely(size <= MI_SMALL_SIZE_MAX) {
     mi_assert_internal(huge_alignment == 0);
-    return mi_theap_malloc_small_zero_nonnull(theap, size, zero, usable);
+    return mi_theap_malloc_small_zero_nonnull(theap, size, zero, ppage);
   }
   else {
-    return mi_theap_malloc_generic(theap, size, zero, huge_alignment, usable);
+    return mi_theap_malloc_generic(theap, size, zero, huge_alignment, ppage);
   }
 }
 
-extern mi_decl_forceinline void* _mi_theap_malloc_zero_ex(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, size_t* usable) mi_attr_noexcept {
+extern mi_decl_forceinline void* _mi_theap_malloc_zero_ex(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) mi_attr_noexcept {
   // fast path for small objects
   #if MI_THEAP_INITASNULL
   if mi_likely(theap!=NULL && size <= MI_SMALL_SIZE_MAX)
@@ -7317,22 +7411,22 @@ extern mi_decl_forceinline void* _mi_theap_malloc_zero_ex(mi_theap_t* theap, siz
   #endif
   {
     mi_assert_internal(huge_alignment == 0);
-    return mi_theap_malloc_small_zero_nonnull(theap, size, zero, usable);
+    return mi_theap_malloc_small_zero_nonnull(theap, size, zero, ppage);
   }
   else {
-    return mi_theap_malloc_generic(theap, size, zero, huge_alignment, usable);
+    return mi_theap_malloc_generic(theap, size, zero, huge_alignment, ppage);
   }
 }
 
-void* _mi_theap_malloc_zero(mi_theap_t* theap, size_t size, bool zero, size_t* usable) mi_attr_noexcept {
-  return _mi_theap_malloc_zero_ex(theap, size, zero, 0, usable);
+inline void* _mi_theap_malloc_zero(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept {
+  return _mi_theap_malloc_zero_ex(theap, size, zero, 0, ppage);
 }
 
 
 // Main allocation functions
 
 mi_decl_nodiscard extern inline mi_decl_restrict void* mi_theap_malloc(mi_theap_t* theap, size_t size) mi_attr_noexcept {
-  return _mi_theap_malloc_zero(theap, size, false, NULL);
+  return _mi_theap_malloc_zero_ex(theap, size, false, 0, NULL);
 }
 
 mi_decl_nodiscard mi_decl_restrict void* mi_malloc(size_t size) mi_attr_noexcept {
@@ -7386,31 +7480,43 @@ mi_decl_nodiscard mi_decl_restrict void* mi_heap_calloc(mi_heap_t* heap, size_t 
   return mi_heap_zalloc(heap, total);
 }
 
+static void* mi_ublock_size( void* p, mi_page_t* page, size_t* pblock_size ) {
+  mi_assert_internal(page == _mi_ptr_page(p));
+  if (pblock_size!=NULL) {
+    if (p!=NULL) { *pblock_size = mi_page_block_size(page); }
+  }
+  return p;
+}
+
 // Return usable size
-mi_decl_nodiscard mi_decl_restrict void* mi_umalloc_small(size_t size, size_t* usable) mi_attr_noexcept {
-  return mi_theap_malloc_small_zero(_mi_theap_default(), size, false, usable);
+mi_decl_nodiscard mi_decl_restrict void* mi_umalloc_small(size_t size, size_t* pblock_size) mi_attr_noexcept {  
+  mi_page_t* page;
+  void* p = mi_theap_malloc_small_zero(_mi_theap_default(), size, false, &page);
+  return mi_ublock_size(p,page,pblock_size);
 }
 
-mi_decl_nodiscard mi_decl_restrict void* mi_uzalloc_small(size_t size, size_t* usable) mi_attr_noexcept {
-  return mi_theap_malloc_small_zero(_mi_theap_default(), size, true, usable);
+mi_decl_nodiscard mi_decl_restrict void* mi_uzalloc_small(size_t size, size_t* pblock_size) mi_attr_noexcept {
+  mi_page_t* page;
+  void* p = mi_theap_malloc_small_zero(_mi_theap_default(), size, true, &page);
+  return mi_ublock_size(p,page,pblock_size);
 }
 
-mi_decl_nodiscard mi_decl_restrict void* mi_theap_umalloc(mi_theap_t* theap, size_t size, size_t* usable) mi_attr_noexcept {
-  return _mi_theap_malloc_zero_ex(theap, size, false, 0, usable);
+mi_decl_nodiscard mi_decl_restrict void* mi_umalloc(size_t size, size_t* pblock_size) mi_attr_noexcept {
+  mi_page_t* page;
+  void* p = _mi_theap_malloc_zero(_mi_theap_default(), size, false, &page);
+  return mi_ublock_size(p,page,pblock_size);
 }
 
-mi_decl_nodiscard mi_decl_restrict void* mi_umalloc(size_t size, size_t* usable) mi_attr_noexcept {
-  return mi_theap_umalloc(_mi_theap_default(), size, usable);
+mi_decl_nodiscard mi_decl_restrict void* mi_uzalloc(size_t size, size_t* pblock_size) mi_attr_noexcept {
+  mi_page_t* page;
+  void* p = _mi_theap_malloc_zero(_mi_theap_default(), size, true, &page);
+  return mi_ublock_size(p,page,pblock_size);
 }
 
-mi_decl_nodiscard mi_decl_restrict void* mi_uzalloc(size_t size, size_t* usable) mi_attr_noexcept {
-  return _mi_theap_malloc_zero_ex(_mi_theap_default(), size, true, 0, usable);
-}
-
-mi_decl_nodiscard mi_decl_restrict void* mi_ucalloc(size_t count, size_t size, size_t* usable) mi_attr_noexcept {
+mi_decl_nodiscard mi_decl_restrict void* mi_ucalloc(size_t count, size_t size, size_t* pblock_size) mi_attr_noexcept {
   size_t total;
   if (mi_count_size_overflow(count,size,&total)) return NULL;
-  return mi_uzalloc(total, usable);
+  return mi_uzalloc(total, pblock_size);
 }
 
 // Uninitialized `calloc`
@@ -7439,8 +7545,8 @@ void* mi_expand(void* p, size_t newsize) mi_attr_noexcept {
   return NULL;
   #else
   if (p == NULL) return NULL;
-  const mi_page_t* const page = mi_validate_ptr_page(p,"mi_expand");
-  const size_t size = _mi_usable_size(p,page);
+  const mi_page_t* const page = mi_validate_ptr_page(p,"mi_expand");  
+  const size_t size = _mi_page_usable_size(page,p);
   if (newsize > size) return NULL;
   #if MI_PPROF
   _mi_prof_on_realloc_in_place((mi_page_t*)page, p, newsize);
@@ -7450,7 +7556,7 @@ void* mi_expand(void* p, size_t newsize) mi_attr_noexcept {
   #endif
 }
 
-void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool zero, size_t* usable_pre, size_t* usable_post) mi_attr_noexcept {
+static mi_decl_forceinline void* mi_theap_realloc_zero_ex(mi_theap_t* theap, void* p, size_t newsize, bool zero, size_t* pblock_size_pre, size_t* pblock_size_post) mi_attr_noexcept {
   // if p == NULL then behave as malloc.
   // else if size == 0 then reallocate to a zero-sized block (and don't return NULL, just as mi_malloc(0)).
   // (this means that returning NULL always indicates an error, and `p` will not have been freed in that case.)
@@ -7459,17 +7565,17 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
   if (p==NULL) {
     page = NULL;
     size = 0;
-    if (usable_pre!=NULL) { *usable_pre = 0; }
+    if (pblock_size_pre!=NULL) { *pblock_size_pre = 0; }
   }
   else {    
     page = mi_validate_ptr_page(p,"mi_realloc"); 
     if mi_unlikely(page==NULL) {  // invalid pointer
-      if (usable_pre!=NULL) { *usable_pre = 0; }
-      if (usable_post!=NULL) { *usable_post = 0; }  
+      if (pblock_size_pre!=NULL) { *pblock_size_pre = 0; }
+      if (pblock_size_post!=NULL) { *pblock_size_post = 0; }  
       return NULL;
     } 
-    size = _mi_usable_size(p,page);
-    if (usable_pre!=NULL) { *usable_pre = mi_page_usable_block_size(page); }
+    size = _mi_page_usable_size(page,p);
+    if (pblock_size_pre!=NULL) { *pblock_size_pre = mi_page_block_size(page); }
   }
   // check if we can reuse the existing block
   if mi_unlikely(newsize<=size && newsize>=(size/2) && newsize>0) { // note: newsize must be > 0 or otherwise we return NULL for realloc(NULL,0)                 
@@ -7483,7 +7589,7 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
         // todo: do not track as the usable size is still the same in the free; adjust potential padding?
         // mi_track_resize(p,size,newsize)
         // if (newsize < size) { mi_track_mem_noaccess((uint8_t*)p + newsize, size - newsize); }
-        if (usable_post!=NULL) { *usable_post = mi_page_usable_block_size(page); }
+        if (pblock_size_post!=NULL) { *pblock_size_post = mi_page_block_size(page); }
         #if MI_PPROF
         _mi_prof_on_realloc_in_place((mi_page_t*)page, p, newsize);
         #endif
@@ -7505,25 +7611,27 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
      not a possible interior user pointer. */
   void* const memevt_oldp = (memevt_is_resize ? _mi_page_ptr_unalign(page, p) : NULL);
   const size_t memevt_usable_pre = (memevt_is_resize ? mi_page_usable_block_size(page) : 0);
-  size_t memevt_local_usable_post = 0;
-  size_t* const memevt_up = (memevt_is_resize && usable_post == NULL ? &memevt_local_usable_post : usable_post);
   if (memevt_is_resize) _mi_memevt_suppress_begin();
-  void* newp = mi_theap_umalloc(theap,newsize,memevt_up);
-  const size_t memevt_usable_post = (memevt_up != NULL ? *memevt_up : 0);
+  // note: we don't zero allocate upfront so we only zero initialize the expanded part
+  mi_page_t* newpage; // use block_size for zero-ing, issue #763
+  void* const newp = _mi_theap_malloc_zero(theap,newsize,false /* no zero */,&newpage);
+  const size_t memevt_usable_post = (newp != NULL ? mi_page_usable_block_size(newpage) : 0);
   if mi_likely(newp != NULL) {
-    if (zero && newsize > size) {
-      // also set last word in the previous allocation to zero to ensure any padding is zero-initialized
-      const size_t start = (size >= sizeof(intptr_t) ? size - sizeof(intptr_t) : 0);
-      _mi_memzero((uint8_t*)newp + start, newsize - start);
+    if (pblock_size_post!=NULL) { *pblock_size_post = mi_page_block_size(newpage); }  
+    const size_t copy_size  = (newsize > size ? size : newsize);
+    const size_t zero_start = _mi_align_down( (copy_size >= sizeof(intptr_t) ? copy_size - sizeof(intptr_t) : 0), sizeof(intptr_t)); // also set last word in the previous allocation to zero to ensure any padding is zero-initialized
+    const size_t usable = _mi_page_usable_size(newpage,newp); 
+    mi_assert_internal(usable >= newsize);     
+    if (zero && usable > zero_start) {      
+      _mi_memzero_aligned((uint8_t*)newp + zero_start, usable - zero_start);
     }
     else if (newsize == 0) {
       ((uint8_t*)newp)[0] = 0; // work around for applications that expect zero-reallocation to be zero initialized (issue #725)
     }
     if mi_likely(p != NULL) {
-      const size_t copysize = (newsize > size ? size : newsize);
-      mi_track_mem_defined(p,copysize);  // _mi_useable_size may be too large for byte precise memory tracking..
-      _mi_memcpy(newp, p, copysize);
-      mi_free(p); // only free the original pointer if successful  // todo: optimize since page is known?
+      mi_track_mem_defined(p,copy_size);  // _mi_useable_size may be too large for byte precise memory tracking..
+      _mi_memcpy_aligned(newp, p, copy_size);
+      mi_free(p); // only free the original pointer if successful
     }
   }
   if (memevt_is_resize) {
@@ -7536,8 +7644,18 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
   return newp;
 }
 
+void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool zero) mi_attr_noexcept {
+  return mi_theap_realloc_zero_ex(theap,p,newsize,zero,NULL,NULL);
+}
+
 mi_decl_nodiscard void* mi_theap_realloc(mi_theap_t* theap, void* p, size_t newsize) mi_attr_noexcept {
-  return _mi_theap_realloc_zero(theap, p, newsize, false, NULL, NULL);
+  // optimize p==NULL 
+  if (p==NULL) {
+    return mi_theap_malloc(theap,newsize);
+  }
+  else {
+    return _mi_theap_realloc_zero(theap, p, newsize, false);
+  }
 }
 
 static void* mi_theap_reallocn(mi_theap_t* theap, void* p, size_t count, size_t size) mi_attr_noexcept {
@@ -7554,8 +7672,14 @@ static void* mi_theap_reallocf(mi_theap_t* theap, void* p, size_t newsize) mi_at
   return newp;
 }
 
-static void* mi_theap_rezalloc(mi_theap_t* theap, void* p, size_t newsize) mi_attr_noexcept {
-  return _mi_theap_realloc_zero(theap, p, newsize, true, NULL, NULL);
+mi_decl_nodiscard void* mi_theap_rezalloc(mi_theap_t* theap, void* p, size_t newsize) mi_attr_noexcept {
+  // optimize p==NULL 
+  if (p==NULL) {
+    return mi_theap_zalloc(theap,newsize);
+  }
+  else {
+    return _mi_theap_realloc_zero(theap, p, newsize, true);
+  }
 }
 
 static void* mi_theap_recalloc(mi_theap_t* theap, void* p, size_t count, size_t size) mi_attr_noexcept {
@@ -7573,8 +7697,8 @@ mi_decl_nodiscard void* mi_reallocn(void* p, size_t count, size_t size) mi_attr_
   return mi_theap_reallocn(_mi_theap_default(),p,count,size);
 }
 
-mi_decl_nodiscard void* mi_urealloc(void* p, size_t newsize, size_t* usable_pre, size_t* usable_post) mi_attr_noexcept {
-  return _mi_theap_realloc_zero(_mi_theap_default(),p,newsize, false, usable_pre, usable_post);
+mi_decl_nodiscard void* mi_urealloc(void* p, size_t newsize, size_t* pblock_size_pre, size_t* pblock_size_post) mi_attr_noexcept {
+  return mi_theap_realloc_zero_ex(_mi_theap_default(),p,newsize, false, pblock_size_pre, pblock_size_post);
 }
 
 // Reallocate but free `p` on errors
@@ -7992,7 +8116,7 @@ static void* mi_block_ptr_set_guarded(mi_block_t* block, size_t obj_size, size_t
   return p;
 }
 
-mi_decl_restrict void* _mi_theap_malloc_guarded(mi_theap_t* theap, size_t size, bool zero, size_t* usable) mi_attr_noexcept
+mi_decl_restrict void* _mi_theap_malloc_guarded(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
   // allocate multiple of page size ending in a guard page
   // ensure minimal alignment requirement?
@@ -8004,13 +8128,13 @@ mi_decl_restrict void* _mi_theap_malloc_guarded(mi_theap_t* theap, size_t size, 
   const size_t obj_size = (mi_option_is_enabled(mi_option_guarded_precise) ? size : _mi_align_up(size, MI_MAX_ALIGN_SIZE));
   const size_t bsize    = _mi_align_up(_mi_align_up(obj_size, MI_MAX_ALIGN_SIZE) + sizeof(mi_block_t), MI_MAX_ALIGN_SIZE);
   const size_t req_size = _mi_align_up(bsize + os_page_size, os_page_size);  
-  mi_block_t* const block = (mi_block_t*)_mi_malloc_generic(theap, req_size, 0 /* don't zero */, usable);
+  mi_block_t* const block = (mi_block_t*)_mi_malloc_generic(theap, req_size, 0 /* don't zero */, ppage);
   if (block==NULL) return NULL;
   size_t usable_size = 0;
   void* const p = mi_block_ptr_set_guarded(block, obj_size, &usable_size);
-  if (p == NULL) return p;
-  if (zero) { 
-    _mi_memzero_aligned(p,obj_size);  // we have to zero here as padding might have written here (if the blocksize > reqsize + os_page_size)
+  if (p == NULL) return NULL;
+  if (zero) {
+    _mi_memzero(p,obj_size);  // we have to zero afterwards as padding might have written inside the block (if the `blocksize > reqsize + os_page_size`)
   }
 
   // stats
@@ -8085,7 +8209,7 @@ static bool mi_malloc_is_naturally_aligned( size_t size, size_t alignment ) {
 }
 
 #if MI_GUARDED
-static mi_decl_noinline mi_decl_restrict void* mi_theap_malloc_guarded_aligned(mi_theap_t* theap, size_t size, size_t alignment, bool zero, size_t* usable) mi_attr_noexcept {
+static mi_decl_noinline mi_decl_restrict void* mi_theap_malloc_guarded_aligned(mi_theap_t* theap, size_t size, size_t alignment, bool zero, mi_page_t** ppage) mi_attr_noexcept {
   // use over allocation for guarded blocksl
   #if MI_THEAP_INITASNULL
   if mi_unlikely(theap==NULL) { theap = _mi_theap_empty_get(); }
@@ -8100,7 +8224,7 @@ static mi_decl_noinline mi_decl_restrict void* mi_theap_malloc_guarded_aligned(m
      caller's requested aligned block. Suppress the base allocation event and
      publish one normalized event below keyed by the actual page block. */
   _mi_memevt_suppress_begin();
-  void* const base = _mi_theap_malloc_guarded(theap, oversize, zero, usable);
+  void* const base = _mi_theap_malloc_guarded(theap, oversize, zero, ppage);
   _mi_memevt_suppress_end();
   if (base==NULL) return NULL;
   void* const p = _mi_align_up_ptr(base, alignment);
@@ -8111,31 +8235,32 @@ static mi_decl_noinline mi_decl_restrict void* mi_theap_malloc_guarded_aligned(m
   return p;
 }
 
-static void* mi_theap_malloc_zero_no_guarded(mi_theap_t* theap, size_t size, bool zero, size_t* usable) {
+static void* mi_theap_malloc_zero_no_guarded(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) {
   #if MI_THEAP_INITASNULL
   if mi_unlikely(theap==NULL) { theap = _mi_theap_empty_get(); }
   #endif
   const size_t rate = theap->guarded_sample_rate;
   // only write if `rate!=0` so we don't write to the constant `_mi_theap_empty`
   if (rate != 0) { theap->guarded_sample_rate = 0; }
-  void* p = _mi_theap_malloc_zero(theap, size, zero, usable);
+  void* p = _mi_theap_malloc_zero(theap, size, zero, ppage);
   if (rate != 0) { theap->guarded_sample_rate = rate; }
   return p;
 }
 #else
-static void* mi_theap_malloc_zero_no_guarded(mi_theap_t* theap, size_t size, bool zero, size_t* usable) {
-  return _mi_theap_malloc_zero(theap, size, zero, usable);
+static void* mi_theap_malloc_zero_no_guarded(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) {
+  return _mi_theap_malloc_zero(theap, size, zero, ppage);
 }
 #endif
 
 // Fallback aligned allocation that over-allocates -- split out for better codegen
-static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap_t* const theap, const size_t size, const size_t alignment, const size_t offset, const bool zero, size_t* usable) mi_attr_noexcept
+static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap_t* const theap, const size_t size, const size_t alignment, const size_t offset, const bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
   mi_assert_internal(size <= (MI_MAX_ALLOC_SIZE - MI_PADDING_SIZE));
   mi_assert_internal(mi_alignment_is_valid(alignment));
 
   void* p;
   size_t oversize;
+  mi_page_t* page;
   if mi_unlikely(alignment > MI_PAGE_MAX_OVERALLOC_ALIGN) {
     // use OS allocation for large alignments and allocate inside a singleton page (not in an arena)
     // This can support alignments >= MI_PAGE_ALIGN by ensuring the object can be aligned
@@ -8148,7 +8273,7 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap
     oversize = (size <= MI_SMALL_SIZE_MAX ? MI_SMALL_SIZE_MAX + 1 /* ensure we use generic malloc path */ : size);
     // note: no guarded as alignment > 0
     _mi_memevt_suppress_begin();
-    p = _mi_theap_malloc_zero_ex(theap, oversize, zero, alignment, usable); // the page block size should be large enough to align in the single huge page block
+    p = _mi_theap_malloc_zero_ex(theap, oversize, zero, alignment, &page); // the page block size should be large enough to align in the single huge page block
     _mi_memevt_suppress_end();
     if (p == NULL) return NULL;
   }
@@ -8158,10 +8283,12 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap
     mi_assert_internal(size < SIZE_MAX - alignment); // `oversize` cannot overflow
     oversize = (size < MI_MAX_ALIGN_SIZE ? MI_MAX_ALIGN_SIZE : size) + alignment - 1;  // adjust for size <= 16; with size 0 and alignment 64k, we would allocate a 64k block and pointing just beyond that.
     _mi_memevt_suppress_begin();
-    p = mi_theap_malloc_zero_no_guarded(theap, oversize, zero, usable);
+    p = mi_theap_malloc_zero_no_guarded(theap, oversize, zero, &page);
     _mi_memevt_suppress_end();
     if (p == NULL) return NULL;
   }
+  mi_assert_internal(page == _mi_ptr_page(p));
+  if (ppage!=NULL) { *ppage = page; }
 
   // .. and align within the allocation
   const uintptr_t align_mask = alignment - 1;  // for any x, `(x & align_mask) == (x % alignment)`
@@ -8174,14 +8301,13 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap
   // and we no longer own it. We should be careful to only read constant fields in the page,
   // or use safe atomic access as in `mi_page_set_has_interior_pointers`.
   // (we can access the page though since the just allocated pointer keeps it alive)
-  mi_page_t* page = _mi_ptr_page(p);
   if (aligned_p != p) {
     mi_page_set_has_interior_pointers(page, true);
-    if (usable!=NULL) { 
-      mi_assert_internal(*usable > adjust);
-      if (*usable > adjust) { *usable = *usable - adjust; }
-      mi_assert_internal(*usable >= size);
-    }
+    // if (usable!=NULL) { 
+    //   mi_assert_internal(*usable > adjust);
+    //   if (*usable > adjust) { *usable = *usable - adjust; }
+    //   mi_assert_internal(*usable >= size);
+    // }
     #if MI_GUARDED
     // set tag to aligned so mi_usable_size works with guard pages
     if (adjust >= sizeof(mi_block_t)) {
@@ -8225,7 +8351,7 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap
 }
 
 // Generic primitive aligned allocation -- split out for better codegen
-static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_generic(mi_theap_t* const theap, const size_t size, const size_t alignment, const size_t offset, const bool zero, size_t* usable) mi_attr_noexcept
+static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_generic(mi_theap_t* const theap, const size_t size, const size_t alignment, const size_t offset, const bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
   mi_assert_internal(mi_alignment_is_valid(alignment));
   // we don't allocate more than MI_MAX_ALLOC_SIZE (see <https://sourceware.org/ml/libc-announce/2019/msg00001.html>)
@@ -8238,7 +8364,7 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_generic(mi_theap_t
   // this is important to try as the fast path in `mi_theap_malloc_zero_aligned` only works when there exist
   // a page with the right block size, and if we always use the over-alloc fallback that would never happen.
   if (offset == 0 && mi_malloc_is_naturally_aligned(size,alignment)) {
-    void* p = mi_theap_malloc_zero_no_guarded(theap, size, zero, usable);
+    void* p = mi_theap_malloc_zero_no_guarded(theap, size, zero, ppage);
     mi_assert_internal(p == NULL || ((uintptr_t)p % alignment) == 0);
     const bool is_aligned_or_null = (((uintptr_t)p) & (alignment-1))==0;
     if mi_likely(is_aligned_or_null) {
@@ -8252,7 +8378,7 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_generic(mi_theap_t
   }
 
   // fall back to over-allocation
-  return mi_theap_malloc_zero_aligned_at_overalloc(theap,size,alignment,offset,zero,usable);
+  return mi_theap_malloc_zero_aligned_at_overalloc(theap,size,alignment,offset,zero,ppage);
 }
 
 
@@ -8262,7 +8388,7 @@ static mi_decl_cold mi_decl_noinline void* mi_error_bad_alignment(size_t size, s
 }
 
 // Primitive aligned allocation
-static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, const size_t size, const size_t alignment, const size_t offset, const bool zero, size_t* usable) mi_attr_noexcept
+static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, const size_t size, const size_t alignment, const size_t offset, const bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
   // note: we don't require `size > offset`, we just guarantee that the address at offset is aligned regardless of the allocated size.
   if mi_unlikely(!mi_alignment_is_valid(alignment)) { // require power-of-two and multiple of void* (see <https://en.cppreference.com/w/c/memory/aligned_alloc#Notes>)
@@ -8274,7 +8400,7 @@ static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, con
   if mi_likely(theap!=NULL)
   #endif
   if (offset==0 && alignment < MI_PAGE_MAX_OVERALLOC_ALIGN && mi_theap_malloc_use_guarded(theap,size)) {
-    return mi_theap_malloc_guarded_aligned(theap, size, alignment, zero, usable);
+    return mi_theap_malloc_guarded_aligned(theap, size, alignment, zero, ppage);
   }
   #endif
 
@@ -8293,7 +8419,7 @@ static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, con
         const bool is_aligned = (((uintptr_t)page->free + offset) & align_mask)==0;
         if mi_likely(is_aligned)
         {
-          if (usable!=NULL) { *usable = mi_page_usable_block_size(page); }
+          if (ppage!=NULL) { *ppage = page; }
           void* p = _mi_page_malloc_zero(theap, page, padsize, zero);
           mi_assert_internal(p != NULL);
           mi_assert_internal(((uintptr_t)p + offset) % alignment == 0);
@@ -8305,7 +8431,7 @@ static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, con
   }
 
   // fallback to generic aligned allocation
-  return mi_theap_malloc_zero_aligned_at_generic(theap, size, alignment, offset, zero, usable);
+  return mi_theap_malloc_zero_aligned_at_generic(theap, size, alignment, offset, zero, ppage);
 }
 
 
@@ -8325,7 +8451,7 @@ static mi_decl_restrict void* mi_theap_zalloc_aligned_at(mi_theap_t* theap, size
   return mi_theap_malloc_zero_aligned_at(theap, size, alignment, offset, true, NULL);
 }
 
-static mi_decl_restrict void* mi_theap_zalloc_aligned(mi_theap_t* theap, size_t size, size_t alignment) mi_attr_noexcept {
+mi_decl_restrict void* mi_theap_zalloc_aligned(mi_theap_t* theap, size_t size, size_t alignment) mi_attr_noexcept {
   return mi_theap_zalloc_aligned_at(theap, size, alignment, 0);
 }
 
@@ -8352,8 +8478,11 @@ mi_decl_nodiscard mi_decl_restrict void* mi_malloc_aligned(size_t size, size_t a
   return mi_theap_malloc_aligned(_mi_theap_default(), size, alignment);
 }
 
-mi_decl_nodiscard mi_decl_restrict void* mi_umalloc_aligned(size_t size, size_t alignment, size_t* block_size) mi_attr_noexcept {
-  return mi_theap_malloc_zero_aligned_at(_mi_theap_default(), size, alignment, 0, false, block_size);
+mi_decl_nodiscard mi_decl_restrict void* mi_umalloc_aligned(size_t size, size_t alignment, size_t* pblock_size) mi_attr_noexcept {
+  mi_page_t* page;
+  void* p = mi_theap_malloc_zero_aligned_at(_mi_theap_default(), size, alignment, 0, false, &page);
+  if (p!=NULL && pblock_size!=NULL) { *pblock_size = mi_page_block_size(page); }
+  return p;
 }
 
 mi_decl_nodiscard mi_decl_restrict void* mi_zalloc_aligned_at(size_t size, size_t alignment, size_t offset) mi_attr_noexcept {
@@ -8364,8 +8493,11 @@ mi_decl_nodiscard mi_decl_restrict void* mi_zalloc_aligned(size_t size, size_t a
   return mi_theap_zalloc_aligned(_mi_theap_default(), size, alignment);
 }
 
-mi_decl_nodiscard mi_decl_restrict void* mi_uzalloc_aligned(size_t size, size_t alignment, size_t* block_size) mi_attr_noexcept {
-  return mi_theap_malloc_zero_aligned_at(_mi_theap_default(), size, alignment, 0, true, block_size);
+mi_decl_nodiscard mi_decl_restrict void* mi_uzalloc_aligned(size_t size, size_t alignment, size_t* pblock_size) mi_attr_noexcept {
+  mi_page_t* page;
+  void* p = mi_theap_malloc_zero_aligned_at(_mi_theap_default(), size, alignment, 0, true, &page);
+  if (p!=NULL && pblock_size!=NULL) { *pblock_size = mi_page_block_size(page); }
+  return p;
 }
 
 mi_decl_nodiscard mi_decl_restrict void* mi_calloc_aligned_at(size_t count, size_t size, size_t alignment, size_t offset) mi_attr_noexcept {
@@ -8411,9 +8543,9 @@ static void* mi_theap_realloc_zero_aligned_at(mi_theap_t* theap, void* p, size_t
   if mi_unlikely(!mi_alignment_is_valid(alignment)) { // require power-of-two (see <https://en.cppreference.com/w/c/memory/aligned_alloc>)
     return mi_error_bad_alignment(newsize,alignment,offset);
   }
-  if (alignment <= sizeof(uintptr_t) && offset==0) return _mi_theap_realloc_zero(theap,p,newsize,zero,NULL,NULL);
+  if (alignment <= sizeof(uintptr_t) && offset==0) return _mi_theap_realloc_zero(theap,p,newsize,zero);
   if (p == NULL) return mi_theap_malloc_zero_aligned_at(theap,newsize,alignment,offset,zero,NULL);
-  size_t size = mi_usable_size(p);
+  const size_t size = mi_usable_size(p);
   mi_page_t* const old_page = _mi_ptr_page(p);
   void* const old_base = _mi_page_ptr_unalign(old_page, p);
   const size_t old_usable = mi_page_usable_block_size(old_page);
@@ -8427,18 +8559,22 @@ static void* mi_theap_realloc_zero_aligned_at(mi_theap_t* theap, void* p, size_t
     return p;  // reallocation still fits, is aligned and not more than 50% waste
   }
   else {
-    // note: we don't zero allocate upfront so we only zero initialize the expanded part
+    // note: we don't zero allocate upfront so we only zero initialize the expanded part (at the cost of calling mi_usable_size)
     /* Hide the internal allocation/free pair and expose one identity-preserving
        resize, exactly like _mi_theap_realloc_zero does for unaligned realloc. */
     _mi_memevt_suppress_begin();
-    void* newp = mi_theap_malloc_aligned_at(theap,newsize,alignment,offset);
+    mi_page_t* newpage;
+    void* const newp = mi_theap_malloc_zero_aligned_at(theap,newsize,alignment,offset,false/*zero?*/,&newpage);
     if (newp != NULL) {
-      if (zero && newsize > size) {
+      const size_t copy_size  = (newsize > size ? size : newsize);
+      const size_t zero_start = (copy_size >= sizeof(intptr_t) ? copy_size - sizeof(intptr_t) : 0); // also set last word in the previous allocation to zero to ensure any padding is zero-initialized    
+      const size_t usable     = _mi_page_usable_size(newpage,newp);
+      mi_assert_internal(usable >= newsize); // use usable for zero'ing, issue #763
+      if (zero && usable > zero_start) {
         // also set last word in the previous allocation to zero to ensure any padding is zero-initialized
-        size_t start = (size >= sizeof(intptr_t) ? size - sizeof(intptr_t) : 0);
-        _mi_memzero((uint8_t*)newp + start, newsize - start);
+        _mi_memzero((uint8_t*)newp + zero_start, usable - zero_start);
       }
-      _mi_memcpy(newp, p, (newsize > size ? size : newsize)); // cannot be aligned due to abitrary offset... (todo: require offset to be a multiple of sizeof(void*)?)
+      _mi_memcpy(newp, p, copy_size); // cannot be aligned due to abitrary offset... (todo: require offset to be a multiple of sizeof(void*)?)
       mi_free(p); // only free if successful
     }
     _mi_memevt_suppress_end();
@@ -8453,7 +8589,7 @@ static void* mi_theap_realloc_zero_aligned_at(mi_theap_t* theap, void* p, size_t
 
 static void* mi_theap_realloc_zero_aligned(mi_theap_t* theap, void* p, size_t newsize, size_t alignment, bool zero) mi_attr_noexcept {
   mi_assert(alignment > 0);
-  if (alignment <= sizeof(uintptr_t)) return _mi_theap_realloc_zero(theap,p,newsize,zero,NULL,NULL);
+  if (alignment <= sizeof(uintptr_t)) return _mi_theap_realloc_zero(theap,p,newsize,zero);
   return mi_theap_realloc_zero_aligned_at(theap,p,newsize,alignment,0,zero);
 }
 
@@ -8571,12 +8707,6 @@ terms of the MIT license. A copy of the license can be found in the file
 
 mi_decl_nodiscard size_t mi_malloc_good_size(size_t size) mi_attr_noexcept {
   return mi_good_size(size);
-}
-
-void mi_cfree(void* p) mi_attr_noexcept {
-  if (mi_is_in_heap_region(p)) {
-    mi_free(p);
-  }
 }
 
 int mi_posix_memalign(void** p, size_t alignment, size_t size) {  // mi_attr_noexcept (issue #794)
@@ -9683,7 +9813,7 @@ void* _mi_arenas_alloc(mi_heap_t* heap, size_t size, bool commit, bool allow_lar
 static bool mi_abandoned_page_unown(mi_page_t* page, mi_theap_t* current_theap) {
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(_mi_thread_id()==current_theap->tld->thread_id);
+  mi_assert_internal(mi_theap_matches_thread(current_theap));
   mi_thread_free_t tf_new;
   mi_thread_free_t tf_old = mi_atomic_load_relaxed(&page->xthread_free);
   do {
@@ -9816,7 +9946,7 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
 
         _mi_page_free_collect(page, false);  // update `used` count
         mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
-        mi_assert_internal(page->slice_committed > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
+        mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
         mi_assert_internal(mi_bitmap_is_setN(arena->slices_dirty, slice_index, slice_count));
         mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
         mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
@@ -9980,7 +10110,7 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
   // commit first block?
   size_t commit_size = 0;
   if (!memid.initially_committed) {
-    commit_size = _mi_align_up(block_start + block_size, MI_PAGE_MIN_COMMIT_SIZE);
+    commit_size = _mi_align_up(block_start + block_size, mi_page_min_commit_size());
     if (commit_size > page_noguard_size) { commit_size = page_noguard_size; }
     bool is_zero = false;
     if mi_unlikely(!mi_arena_commit( _mi_theap_subproc(theap), mi_memid_arena(memid), slice_start, commit_size, &is_zero, 0)) {
@@ -10034,8 +10164,8 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
   page->memid = memid;
   page->free_is_zero = memid.initially_zero;
 
-  mi_assert_internal((commit && commit_size==0) || (!commit && commit_size < UINT32_MAX));
-  page->slice_committed = (uint32_t)commit_size;
+  mi_assert_internal((commit && commit_size==0) || (!commit && (commit_size <= UINT16_MAX * _mi_os_page_size())));
+  page->slice_pcommitted = (uint16_t)(commit_size / _mi_os_page_size());
 
   page->heap = _mi_theap_heap(theap);
   mi_page_set_theap(page,theap);
@@ -10085,8 +10215,8 @@ static mi_page_t* mi_arenas_page_regular_alloc(mi_theap_t* theap, size_t slice_c
 
   // 2. find a free block, potentially allocating a new arena
   const long commit_on_demand = mi_option_get(mi_option_page_commit_on_demand);
-  const bool commit = (slice_count <= mi_slice_count_of_size(MI_PAGE_MIN_COMMIT_SIZE) ||  // always commit small pages
-                       (slice_count >= mi_slice_count_of_size(UINT32_MAX)) ||             // always commit pages too large to hold a 32-bit slice_committed
+  const bool commit = (slice_count <= mi_slice_count_of_size(mi_page_min_commit_size()) ||           // always commit small pages
+                       (slice_count >= mi_slice_count_of_size(UINT16_MAX * _mi_os_page_size())) ||   // always commit pages too large to hold a 32-bit slice_committed
                         (commit_on_demand == 2 && _mi_os_has_overcommit()) || (commit_on_demand == 0));
   page = mi_arenas_page_alloc_fresh(theap, slice_count, block_size, 1, commit);
   if (page == NULL) return NULL;
@@ -10116,22 +10246,7 @@ static mi_page_t* mi_arenas_page_singleton_alloc(mi_theap_t* theap, size_t block
 
   mi_assert(page->reserved == 1);
   if (!_mi_page_init(theap, page)) {
-    // NEXT PIN BUMP: upstream `b0ac42ebc` replaces this raw `_mi_arenas_free` with
-    // `_mi_arenas_page_free` (#128 A1). Both sibling failure paths already use the
-    // latter; this one skips `_mi_page_map_unregister`, the arena pages-bitmap clear and
-    // the page-stat decrements, and passes the wrong pointer under
-    // MI_PAGE_META_IS_SEPARATED.
-    //
-    // Deliberately NOT cherry-picked: it is unreachable at this pin, so taking it early
-    // would only create merge friction when the pin moves. Verified rather than assumed
-    // -- mi_page_extend_free's commit-on-demand block (and the only `return false` on
-    // this path) is gated on `page->slice_committed > 0`, and singletons are allocated
-    // with commit=true just above, so slice_committed is 0 and _mi_page_init cannot fail
-    // here.
-    //
-    // When the pin moves: confirm this became `_mi_arenas_page_free`, and delete this
-    // comment. If a future change ever allows uncommitted singletons, it becomes live.
-    _mi_arenas_free( _mi_theap_subproc(theap), page, mi_page_full_size(page), page->memid);
+    _mi_arenas_page_free(page,theap);
     return NULL;
   }
 
@@ -10187,7 +10302,7 @@ static void mi_arenas_page_free_prim(mi_page_t* page) {
     mi_arena_pages_t* arena_pages = NULL;
     mi_arena_t* const arena = mi_page_arena_pages(page, &slice_index, &slice_count, &arena_pages);
     mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
-    mi_assert_internal(page->slice_committed > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
+    mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
     mi_assert_internal(bin >= MI_ARENA_BIN_COUNT || mi_bitmap_is_clearN(arena_pages->pages_abandoned[bin], slice_index, 1));
     mi_assert_internal(mi_bitmap_is_setN(arena_pages->pages, slice_index, 1));
     // note: we cannot check for `!mi_page_is_abandoned_and_mapped` since that may
@@ -10216,17 +10331,18 @@ static void mi_arenas_page_free_prim(mi_page_t* page) {
     mi_assert_internal(arena_pages!=NULL);
     mi_assert_internal(arena->subproc == mi_page_subproc(page));
     mi_bitmap_clear(arena_pages->pages, slice_index);
-    if (page->slice_committed > 0) {
+    const size_t slice_committed = mi_page_slice_committed(page);
+    if (slice_committed > 0) {
       // if committed on-demand, set the commit bits to account commit properly
-      mi_assert_internal(mi_page_full_size(page) >= page->slice_committed);
-      const size_t total_slices = page->slice_committed / MI_ARENA_SLICE_SIZE;  // conservative
+      mi_assert_internal(mi_page_full_size(page) >= slice_committed);
+      const size_t total_slices = slice_committed / MI_ARENA_SLICE_SIZE;  // conservative
       //mi_assert_internal(mi_bitmap_is_clearN(arena->slices_committed, slice_index, total_slices));
       mi_assert_internal(slice_count >= total_slices);
       if (total_slices > 0) {
         mi_bitmap_setN(arena->slices_committed, slice_index, total_slices, NULL);
       }
       // any left over?
-      const size_t extra = page->slice_committed % MI_ARENA_SLICE_SIZE;
+      const size_t extra = slice_committed % MI_ARENA_SLICE_SIZE;
       if (extra > 0) {
         // pretend it was decommitted already
         mi_subproc_stat_decrease(arena->subproc, committed, extra);
@@ -10247,7 +10363,7 @@ void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
   mi_assert_internal(mi_page_all_free(page));
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(page->next==NULL && page->prev==NULL);
-  mi_assert_internal(current_theapx == NULL || _mi_thread_id()==current_theapx->tld->thread_id);
+  mi_assert_internal(mi_theap_matches_thread(current_theapx));
 
   if (current_theapx != NULL) {
     mi_theap_stat_decrease(current_theapx, page_bins[_mi_page_stats_bin(page)], 1);
@@ -10272,7 +10388,7 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(!mi_page_all_free(page));
   mi_assert_internal(page->next==NULL && page->prev == NULL);
-  mi_assert_internal(_mi_thread_id()==current_theap->tld->thread_id);
+  mi_assert_internal(mi_theap_matches_thread(current_theap));
   // mi_assert_internal(current_theap == _mi_page_associated_theap(page));
 
   // add to abandoned?
@@ -10290,7 +10406,7 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
 
       mi_assert_internal(!mi_page_is_singleton(page));
       mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
-      mi_assert_internal(page->slice_committed > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
+      mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
       mi_assert_internal(mi_bitmap_is_setN(arena->slices_dirty, slice_index, slice_count));
 
       mi_page_set_abandoned_mapped(page);
@@ -10354,7 +10470,7 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(current_theapx==NULL || _mi_thread_id()==current_theapx->tld->thread_id);
+  mi_assert_internal(mi_theap_matches_thread(current_theapx));
 
   mi_heap_t* const heap = mi_page_heap(page);
   if (mi_page_is_abandoned_mapped(page)) {
@@ -10368,7 +10484,7 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
     mi_arena_t* arena = mi_page_arena_pages(page, &slice_index, &slice_count, &arena_pages);  MI_UNUSED(arena);
 
     mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
-    mi_assert_internal(page->slice_committed > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
+    mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
 
     // this busy waits until a concurrent reader (from alloc_abandoned) is done
     mi_bitmap_clear_once_set(arena->subproc, arena_pages->pages_abandoned[bin], slice_index);
@@ -10450,8 +10566,8 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
       return;
     };
   }
-  else if (memid.memkind == MI_MEM_META) {
-    _mi_meta_free(subproc, p, size, memid);
+  else if (memid.memkind == MI_MEM_MALLOC) {
+    _mi_free_subproc_safe(p);
   }
   else {
     // arena was none, external, or static; nothing to do
@@ -10925,7 +11041,6 @@ static void mi_debug_color(char* buf, size_t* k, mi_ansi_color_t color) {
 }
 
 static int mi_page_commit_usage(mi_page_t* page) {
-  // if (mi_page_size(page) <= MI_PAGE_MIN_COMMIT_SIZE) return 100;
   const size_t committed_size = mi_page_committed(page);
   const size_t used_size = page->used * mi_page_block_size(page);
   return (int)(used_size * 100 / committed_size);
@@ -10946,7 +11061,8 @@ static size_t mi_debug_show_page_bfield(char* buf, size_t* k, mi_arena_t* arena,
       bit_set_count++;
       c = 'p';
       color = MI_GRAY;
-      if (mi_page_is_singleton(page)) { c = 's'; }
+      if (_mi_meta_is_meta_page(arena->subproc,page))  { c = 'm'; }
+      else if (mi_page_is_singleton(page)) { c = 's'; }
       else if (mi_page_is_full(page)) { c = 'f'; }
       if (!mi_page_is_abandoned(page)) { c = _mi_toupper(c); }
       int commit_usage = mi_page_commit_usage(page);
@@ -10959,7 +11075,7 @@ static size_t mi_debug_show_page_bfield(char* buf, size_t* k, mi_arena_t* arena,
     else {
       c = '?';
       if (bit_of_page > 0) { c = '-'; }
-      else if (_mi_meta_is_meta_page(arena->subproc,start)) { c = 'm'; color = MI_GRAY; }
+      // else if (_mi_meta_is_meta_page(arena->subproc,start)) { c = 'm'; color = MI_GRAY; }
       else if (slice_index + bit < arena->info_slices) { c = 'i'; color = MI_GRAY; }
       // else if (mi_bitmap_is_setN(arena->pages_purge, slice_index + bit, NULL)) { c = '*'; }
       else if (mi_bbitmap_is_setN(arena->slices_free, slice_index+bit,1)) {
@@ -11088,7 +11204,7 @@ static void mi_debug_show_arenas_ex(mi_heap_t* heap, bool show_pages, bool narro
       // mi_arena_pages_t* arena_pages = mi_heap_arena_pages(heap, arena);
       // if (arena_pages != NULL)
       {
-        const char* header1 = "chunks (p:page, f:full, s:singleton, P,F,S:not abandoned, i:arena-info, m:meta-data, ~:free-purgable, _:free-committed, .:free-reserved)";
+        const char* header1 = "chunks (p:page, f:full, s:single, m:meta-data, i:arena-info, P,F,S,M:not abandoned, ~:free-purgable, _:free-committed, .:free-reserved)";
         const char* header2 = (narrow ? "\n       " : " ");
         const char* header3 = "(chunk bin: S:small, M : medium, L : large, X : other)";
         page_total += mi_debug_show_chunks(header1, header2, header3, arena->slice_count,
@@ -11702,191 +11818,9 @@ mi_decl_export bool mi_arena_reload(void* start, size_t size, mi_commit_fun_t* c
 
 */
 /* ---- end inlined: src/arena.c ---- */
-/* ---- begin inlined: src/arena-meta.c ---- */
-/* ----------------------------------------------------------------------------
-Copyright (c) 2019-2024, Microsoft Research, Daan Leijen
-This is free software; you can redistribute it and/or modify it under the
-terms of the MIT license. A copy of the license can be found in the file
-"LICENSE" at the root of this distribution.
------------------------------------------------------------------------------*/
-
-/* ----------------------------------------------------------------------------
-  We have a special "mini" allocator just for allocation of meta-data like
-  the theap (`mi_theap_t`) or thread-local data (`mi_tld_t`).
-
-  We reuse the bitmap of the arena's for allocation of 64b blocks inside
-  an arena slice (64KiB).
-  We always ensure that meta data is zero'd (we zero on `free`)
------------------------------------------------------------------------------*/
-
-
-/* -----------------------------------------------------------
-  Meta data allocation
------------------------------------------------------------ */
-
-#define MI_META_PAGE_SIZE         MI_ARENA_SLICE_SIZE
-#define MI_META_PAGE_ALIGN        MI_ARENA_SLICE_ALIGN
-
-// large enough such that META_MAX_SIZE > 4k (even on 32-bit)
-#define MI_META_BLOCK_SIZE        (1 << (16 - MI_BCHUNK_BITS_SHIFT))        // 128 on 64-bit
-#define MI_META_BLOCK_ALIGN       MI_META_BLOCK_SIZE
-#define MI_META_BLOCKS_PER_PAGE   (MI_META_PAGE_SIZE / MI_META_BLOCK_SIZE)  // 512
-#define MI_META_MAX_SIZE          (MI_BCHUNK_SIZE * MI_META_BLOCK_SIZE)
-
-#if MI_META_MAX_SIZE <= 4096
-#error "max meta object size should be at least 4KiB"
-#endif
-#if MI_META_BLOCK_ALIGN < MI_BCHUNK_SIZE 
-#error "minimal meta object alignment should be at least MI_BCHUNK_SIZE (for thread locals)"
-#endif
-
-struct mi_meta_page_s  {
-  _Atomic(struct mi_meta_page_s*)  next;        // a linked list of meta-data pages (never released)
-  mi_memid_t                       memid;       // provenance of the meta-page memory itself
-  // mi_subproc_t*                    subproc;     // subprocess this page belongs to            
-  mi_bbitmap_t                     blocks_free; // a small bitmap with 1 bit per block.
-};
-
-#if MI_DEBUG > 1
-static mi_meta_page_t* mi_meta_page_of_ptr(void* p, size_t* block_idx) {
-  mi_meta_page_t* mpage = (mi_meta_page_t*)((uint8_t*)_mi_align_down_ptr(p,MI_META_PAGE_ALIGN) + _mi_os_secure_guard_page_size());
-  if (block_idx != NULL) {
-    *block_idx = ((uint8_t*)p - (uint8_t*)mpage) / MI_META_BLOCK_SIZE;
-  }
-  return mpage;
-}
-#endif
-
-static mi_meta_page_t* mi_meta_page_next( mi_meta_page_t* mpage ) {
-  return mi_atomic_load_ptr_acquire(mi_meta_page_t, &mpage->next);
-}
-
-static void* mi_meta_block_start( mi_meta_page_t* mpage, size_t block_idx ) {
-  mi_assert_internal(_mi_is_aligned((uint8_t*)mpage - _mi_os_secure_guard_page_size(), MI_META_PAGE_ALIGN));
-  mi_assert_internal(block_idx < MI_META_BLOCKS_PER_PAGE);
-  void* p = ((uint8_t*)mpage - _mi_os_secure_guard_page_size() + (block_idx * MI_META_BLOCK_SIZE));
-  mi_assert_internal(mpage == mi_meta_page_of_ptr(p,NULL));
-  return p;
-}
-
-// allocate a fresh meta page and add it to the global list.
-static mi_meta_page_t* mi_meta_page_zalloc(mi_subproc_t* subproc) {
-  mi_assert_internal(subproc!=NULL);
-  mi_assert_internal(subproc->heap_main!=NULL);
-  // allocate a fresh arena slice
-  // note: careful with _mi_subproc as it may recurse into mi_tld and meta_page_zalloc again.. (same with _mi_os_numa_node()...)
-  mi_memid_t memid;
-  uint8_t* base = (uint8_t*)_mi_arenas_alloc_aligned(subproc->heap_main, MI_META_PAGE_SIZE, MI_META_PAGE_ALIGN, 0,
-                                                                    true /* commit*/, (MI_SECURE==0) /* allow large? */,
-                                                                    NULL /* req arena */, 0 /* thread_seq */, -1 /* numa node */, &memid);
-  if (base == NULL) return NULL;
-  mi_assert_internal(_mi_is_aligned(base,MI_META_PAGE_ALIGN));
-  if (!memid.initially_zero) {
-    _mi_memzero_aligned(base, MI_ARENA_SLICE_SIZE);
-  }
-
-  // guard pages
-  #if MI_SECURE >= 1
-  _mi_os_secure_guard_page_set_at(subproc, base, memid);
-  _mi_os_secure_guard_page_set_before(subproc, base + MI_META_PAGE_SIZE, memid);
-  #endif
-
-  // initialize the page and free block bitmap
-  mi_meta_page_t* mpage = (mi_meta_page_t*)(base + _mi_os_secure_guard_page_size());
-  mpage->memid = memid;
-  mi_bbitmap_init(subproc, &mpage->blocks_free, MI_META_BLOCKS_PER_PAGE, true /* already_zero */);
-  const size_t mpage_size  = offsetof(mi_meta_page_t,blocks_free) + mi_bbitmap_size(MI_META_BLOCKS_PER_PAGE, NULL);
-  const size_t info_blocks = _mi_divide_up(mpage_size,MI_META_BLOCK_SIZE);
-  const size_t guard_blocks = _mi_divide_up(_mi_os_secure_guard_page_size(), MI_META_BLOCK_SIZE);
-  mi_assert_internal(info_blocks + 2*guard_blocks < MI_META_BLOCKS_PER_PAGE);
-  mi_bbitmap_unsafe_setN(&mpage->blocks_free, info_blocks + guard_blocks, MI_META_BLOCKS_PER_PAGE - info_blocks - 2*guard_blocks);
-
-  // push atomically in front of the meta page list
-  // (note: there is no ABA issue since we never free meta-pages)
-  mi_meta_page_t* old = mi_atomic_load_ptr_acquire(mi_meta_page_t,&subproc->meta_pages);
-  do {
-    mi_atomic_store_ptr_release(mi_meta_page_t, &mpage->next, old);
-  } while(!mi_atomic_cas_ptr_weak_acq_rel(mi_meta_page_t,&subproc->meta_pages,&old,mpage));
-  return mpage;
-}
-
-
-// allocate meta-data
-mi_decl_noinline void* _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* pmemid )
-{
-  mi_assert_internal(pmemid != NULL);
-  mi_assert_internal(subproc!=NULL);
-  size = _mi_align_up(size,MI_META_BLOCK_SIZE);
-  if (size == 0 || size > MI_META_MAX_SIZE) return NULL;
-  const size_t block_count = _mi_divide_up(size,MI_META_BLOCK_SIZE);
-  mi_assert_internal(block_count > 0 && block_count < MI_BCHUNK_BITS);
-  mi_meta_page_t* mpage0 = mi_atomic_load_ptr_acquire(mi_meta_page_t,&subproc->meta_pages);
-  mi_meta_page_t* mpage = mpage0;
-  while (mpage != NULL) {
-    size_t block_idx;
-    if (mi_bbitmap_try_find_and_clearN(&mpage->blocks_free, 0, block_count, &block_idx)) {
-      // found and claimed `block_count` blocks
-      *pmemid = _mi_memid_create_meta(mpage, block_idx, block_count);
-      return mi_meta_block_start(mpage,block_idx);
-    }
-    else {
-      mpage = mi_meta_page_next(mpage);
-    }
-  }
-  // failed to find space in existing pages
-  if (mi_atomic_load_ptr_acquire(mi_meta_page_t,&subproc->meta_pages) != mpage0) {
-    // the page list was updated by another thread in the meantime, retry
-    return _mi_meta_zalloc(subproc,size,pmemid);
-  }
-  // otherwise, allocate a fresh metapage and try once more
-  mpage = mi_meta_page_zalloc(subproc);
-  if (mpage != NULL) {
-    size_t block_idx;
-    if (mi_bbitmap_try_find_and_clearN(&mpage->blocks_free, 0, block_count, &block_idx)) {
-      // found and claimed `block_count` blocks
-      *pmemid = _mi_memid_create_meta(mpage, block_idx, block_count);
-      return mi_meta_block_start(mpage,block_idx);
-    }
-  }
-  // if all this failed, allocate from the OS
-  return _mi_os_zalloc(subproc, size, pmemid);
-}
-
-// free meta-data
-mi_decl_noinline void _mi_meta_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid) {
-  if (p==NULL) return;
-  if (memid.memkind == MI_MEM_META) {
-    mi_assert_internal(_mi_divide_up(size, MI_META_BLOCK_SIZE) == memid.mem.meta.block_count);
-    const size_t block_count = memid.mem.meta.block_count;
-    const size_t block_idx   = memid.mem.meta.block_index;
-    mi_meta_page_t* mpage = (mi_meta_page_t*)memid.mem.meta.meta_page;
-    mi_assert_internal(mi_meta_page_of_ptr(p,NULL) == mpage);
-    mi_assert_internal(block_idx + block_count <= MI_META_BLOCKS_PER_PAGE);
-    mi_assert_internal(mi_bbitmap_is_clearN(&mpage->blocks_free, block_idx, block_count));
-    // we zero on free (and on the initial page allocation) so we don't need a "dirty" map
-    _mi_memzero_aligned(mi_meta_block_start(mpage, block_idx), block_count*MI_META_BLOCK_SIZE);
-    mi_bbitmap_setN(&mpage->blocks_free, block_idx, block_count);
-  }
-  else {
-    _mi_arenas_free(subproc, p, size, memid);
-  }
-}
-
-// used for debug output
-bool _mi_meta_is_meta_page(mi_subproc_t* subproc, void* p)
-{
-  mi_meta_page_t* mpage0 = mi_atomic_load_ptr_acquire(mi_meta_page_t, &subproc->meta_pages);
-  mi_meta_page_t* mpage = mpage0;
-  while (mpage != NULL) {
-    if ((void*)mpage == p) return true;
-    mpage = mi_meta_page_next(mpage);
-  }
-  return false;
-}
-/* ---- end inlined: src/arena-meta.c ---- */
 /* ---- begin inlined: src/bitmap.c ---- */
 /* ----------------------------------------------------------------------------
-Copyright (c) 2019-2024 Microsoft Research, Daan Leijen
+Copyright (c) 2019-2026 Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -11922,7 +11856,7 @@ terms of the MIT license. A copy of the license can be found in the file
 // OS memory configuration
 typedef struct mi_os_mem_config_s {
   size_t  page_size;              // default to 4KiB
-  size_t  large_page_size;        // 0 if not supported, usually 2MiB (4MiB on Windows)
+  size_t  large_page_size;        // 0 if not supported, usually 2MiB 
   size_t  alloc_granularity;      // smallest allocation size (usually 4KiB, on Windows 64KiB)
   size_t  physical_memory_in_kib; // physical memory size in KiB
   size_t  virtual_address_bits;   // usually 48 or 56 bits on 64-bit systems. (used to determine secure randomization)
@@ -12126,8 +12060,8 @@ static inline bool mi_bfield_atomic_clear(_Atomic(mi_bfield_t)*b, size_t idx, bo
 }
 
 // Clear a bit but only when/once it is set. This is used by concurrent free's while
-// the page is abandoned and mapped. This can incure a busy wait :-( but it should
-// happen almost never (and is accounted for in the stats)
+// the page is abandoned and mapped. This can incur a busy wait :-( but it should
+// be quite rare (and is accounted for in the stats)
 static inline void mi_bfield_atomic_clear_once_set(mi_subproc_t* subproc, _Atomic(mi_bfield_t)*b, size_t idx) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
   const mi_bfield_t mask = mi_bfield_mask(1, idx);;
@@ -12152,8 +12086,7 @@ static inline void mi_bfield_atomic_clear_once_set(mi_subproc_t* subproc, _Atomi
 // statistics correctly).
 static inline bool mi_bfield_atomic_set_mask(_Atomic(mi_bfield_t)*b, mi_bfield_t mask, size_t* already_set) {
   mi_assert_internal(mask != 0);
-  mi_bfield_t old = mi_atomic_load_relaxed(b);
-  while (!mi_atomic_cas_weak_acq_rel(b, &old, old|mask)) {};  // try to atomically set the mask bits until success
+  const mi_bfield_t old = mi_atomic_or_acq_rel(b,mask);
   if (already_set!=NULL) { *already_set = mi_bfield_popcount(old&mask); }
   return ((old&mask) == 0);
 }
@@ -12162,8 +12095,7 @@ static inline bool mi_bfield_atomic_set_mask(_Atomic(mi_bfield_t)*b, mi_bfield_t
 // `all_clear` is set to `true` if the new bfield became zero.
 static inline bool mi_bfield_atomic_clear_mask(_Atomic(mi_bfield_t)*b, mi_bfield_t mask, bool* all_clear) {
   mi_assert_internal(mask != 0);
-  mi_bfield_t old = mi_atomic_load_relaxed(b);
-  while (!mi_atomic_cas_weak_acq_rel(b, &old, old&~mask)) {};  // try to atomically clear the mask bits until success
+  const mi_bfield_t old = mi_atomic_and_acq_rel(b,~mask);  
   if (all_clear != NULL) { *all_clear = ((old&~mask)==0); }
   return ((old&mask) == mask);
 }
@@ -12174,65 +12106,79 @@ static inline bool mi_bfield_atomic_setX(_Atomic(mi_bfield_t)*b, size_t* already
   return (old==0);
 }
 
-// static inline bool mi_bfield_atomic_clearX(_Atomic(mi_bfield_t)*b, bool* all_clear) {
-//   const mi_bfield_t old = mi_atomic_exchange_release(b, mi_bfield_zero());
-//   if (all_clear!=NULL) { *all_clear = true; }
-//   return (~old==0);
-// }
 
 // ------- mi_bfield_atomic_try_clear ---------------------------------------
 
-
 // Tries to clear a mask atomically, and returns true if the mask bits atomically transitioned from mask to 0
-// and false otherwise (leaving the bit field as is).
+// and false otherwise (leaving the bit field as is). Returns the acquired value back in `expect` (regardless of success).
 // `all_clear` is set to `true` if the new bfield became zero.
-static inline bool mi_bfield_atomic_try_clear_mask_of(_Atomic(mi_bfield_t)*b, mi_bfield_t mask, mi_bfield_t expect, bool* all_clear) {
+// `did_temp_clear_bits` is set to `true` some bits were temporarily cleared.
+static inline bool mi_bfield_atomic_try_clear_mask_optimistic(_Atomic(mi_bfield_t)*b, mi_bfield_t mask, mi_bfield_t* previous, bool* did_temp_clear_bits) {
   mi_assert_internal(mask != 0);
+  // note: we could also use a strong cas but generally an optimistic atomic and/or is more efficient (at least on arm64)
   // try to atomically clear the mask bits
-  do {
-    if ((expect & mask) != mask) {  // are all bits still set?
-      if (all_clear != NULL) { *all_clear = (expect == 0); }
-      return false;
+  mi_bfield_t old = mi_atomic_and_acq_rel(b,~mask);
+  if (previous!=NULL) { *previous = old; }    
+  if mi_likely((old&mask)==mask) {
+    // all bits in the mask transitioned from 1 to 0 atomically
+    return true;
+  }
+  else {
+    // failed to transition all
+    if ((old&mask)!=0) {
+      // restore accidentally cleared ones
+      mi_atomic_or_acq_rel(b, old&mask);
+      if (did_temp_clear_bits!=NULL) { *did_temp_clear_bits = true; }      
     }
-  } while (!mi_atomic_cas_weak_acq_rel(b, &expect, expect & ~mask));
-  if (all_clear != NULL) { *all_clear = ((expect & ~mask) == 0);  }
-  return true;
+    return false;
+  }
 }
 
-static inline bool mi_bfield_atomic_try_clear_mask(_Atomic(mi_bfield_t)* b, mi_bfield_t mask, bool* all_clear) {
-  mi_assert_internal(mask != 0);
-  const mi_bfield_t expect = mi_atomic_load_relaxed(b);
-  return mi_bfield_atomic_try_clear_mask_of(b, mask, expect, all_clear);
-}
-
-// Tries to clear a bit atomically. Returns `true` if the bit transitioned from 1 to 0
-// and `false` otherwise leaving the bfield `b` as-is.
+// Tries to clear a bit atomically. For performance, it assumes there is a good chance of success. 
+// Returns `true` if the bit transitioned from 1 to 0
+// and `false` otherwise (leaving the bfield `b` as-is).
 // `all_clear` is set to true if the new bfield became zero (and false otherwise)
-mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear(_Atomic(mi_bfield_t)* b, size_t idx, bool* all_clear) {
+mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear_optimistic(_Atomic(mi_bfield_t)* b, size_t idx, mi_bfield_t* previous) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
-  const mi_bfield_t mask = mi_bfield_one()<<idx;
-  return mi_bfield_atomic_try_clear_mask(b, mask, all_clear);
+  const mi_bfield_t mask = ((mi_bfield_t)1<<idx);
+  return mi_bfield_atomic_try_clear_mask_optimistic(b, mask, previous, NULL);  // single bit never clears temporarily
 }
 
-// Tries to clear a byte atomically, and returns true if the byte atomically transitioned from 0xFF to 0
+// Tries to clear a byte atomically. For performance, it assumes there is a good chance of success.  
+// Returns true if the byte atomically transitioned from 0xFF to 0
 // `all_clear` is set to true if the new bfield became zero (and false otherwise)
-mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear8(_Atomic(mi_bfield_t)*b, size_t idx, bool* all_clear) {
+mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear8_optimistic(_Atomic(mi_bfield_t)*b, size_t idx, mi_bfield_t* previous, bool* did_temp_clear_bits) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
   mi_assert_internal((idx%8)==0);
   const mi_bfield_t mask = ((mi_bfield_t)0xFF)<<idx;
-  return mi_bfield_atomic_try_clear_mask(b, mask, all_clear);
+  return mi_bfield_atomic_try_clear_mask_optimistic(b, mask, previous, did_temp_clear_bits);
+}
+
+// Try to clear a mask of bits atomically. For performance, it assumes these is a good chance of success. 
+// Returns true all bits transitioned from all 1's to 0's.
+// and false otherwise leaving the bit field as-is. `all_clear` is set to true if the new bfield became zero.
+static inline bool mi_bfield_atomic_try_clear_mask(_Atomic(mi_bfield_t)* b, mi_bfield_t mask, bool* all_clear, bool* did_temp_clear_bits) {
+  mi_assert_internal(mask != 0);
+  mi_bfield_t old = mi_atomic_load_relaxed(b);  // check first if there is a good chance the mask bits are all set
+  bool cleared = false;
+  if ((old&mask)==mask) {  
+    cleared = mi_bfield_atomic_try_clear_mask_optimistic(b, mask, &old, did_temp_clear_bits);
+  }
+  if (all_clear != NULL) { *all_clear = ((cleared ? old&~mask : old) == 0); }
+  return cleared;
 }
 
 // Try to clear a full field of bits atomically, and return true all bits transitioned from all 1's to 0's.
 // and false otherwise leaving the bit field as-is.
 // `all_clear` is set to true if the new bfield became zero (which is always the case if successful).
 static inline bool mi_bfield_atomic_try_clearX(_Atomic(mi_bfield_t)*b, bool* all_clear) {
-  mi_bfield_t old = mi_bfield_all_set();
-  if (mi_atomic_cas_strong_acq_rel(b, &old, mi_bfield_zero())) {
-    if (all_clear != NULL) { *all_clear = true; }
-    return true;
+  mi_bfield_t old = mi_atomic_load_relaxed(b);  // check first if there is a good chance the bits are all set
+  bool cleared = false;
+  if (old==mi_bfield_all_set()) {
+    cleared = mi_atomic_cas_strong_acq_rel(b,&old,mi_bfield_zero());
   }
-  else return false;
+  if (all_clear != NULL) { *all_clear = (cleared ? true : (old==0)); }
+  return cleared;
 }
 
 
@@ -12471,7 +12417,7 @@ static inline bool mi_bchunk_try_clearNX(mi_bchunk_t* chunk, size_t cidx, size_t
   const size_t idx = cidx % MI_BFIELD_BITS;
   if mi_likely(idx + n <= MI_BFIELD_BITS) {
     // within one field
-    return mi_bfield_atomic_try_clear_mask(&chunk->bfields[i], mi_bfield_mask(n, idx), pmaybe_all_clear);
+    return mi_bfield_atomic_try_clear_mask(&chunk->bfields[i], mi_bfield_mask(n, idx), pmaybe_all_clear, did_temp_clear_bits);
   }
   else {
     // spanning two fields (todo: use double-word atomic ops?)
@@ -12479,12 +12425,12 @@ static inline bool mi_bchunk_try_clearNX(mi_bchunk_t* chunk, size_t cidx, size_t
     mi_assert_internal(m < n);
     mi_assert_internal(i < MI_BCHUNK_FIELDS - 1);
     bool field1_is_clear;
-    if (!mi_bfield_atomic_try_clear_mask(&chunk->bfields[i], mi_bfield_mask(m, idx), &field1_is_clear)) return false;
+    if (!mi_bfield_atomic_try_clear_mask(&chunk->bfields[i], mi_bfield_mask(m, idx), &field1_is_clear, did_temp_clear_bits)) return false;
     // try the second field as well
     mi_assert_internal(n - m > 0);
     mi_assert_internal(n - m < MI_BFIELD_BITS);
     bool field2_is_clear;
-    if (!mi_bfield_atomic_try_clear_mask(&chunk->bfields[i+1], mi_bfield_mask(n - m, 0), &field2_is_clear)) {
+    if (!mi_bfield_atomic_try_clear_mask(&chunk->bfields[i+1], mi_bfield_mask(n - m, 0), &field2_is_clear, did_temp_clear_bits)) {
       // we failed to clear the second field, restore the first one
       mi_bfield_atomic_set_mask(&chunk->bfields[i], mi_bfield_mask(m, idx), NULL);
       if (did_temp_clear_bits != NULL) { *did_temp_clear_bits = true; }
@@ -12524,7 +12470,7 @@ mi_decl_noinline static bool mi_bchunk_try_clearNC(mi_bchunk_t* chunk, size_t ci
   mi_assert_internal(start_field < MI_BCHUNK_FIELDS);
   const mi_bfield_t mask_start = mi_bfield_mask(m, start_idx);
   bool maybe_all_clear;
-  if (!mi_bfield_atomic_try_clear_mask(&chunk->bfields[field], mask_start, &maybe_all_clear)) return false;
+  if (!mi_bfield_atomic_try_clear_mask(&chunk->bfields[field], mask_start, &maybe_all_clear, did_temp_clear_bits)) return false;
 
   // done?
   mi_assert_internal(m <= n);
@@ -12548,7 +12494,7 @@ mi_decl_noinline static bool mi_bchunk_try_clearNC(mi_bchunk_t* chunk, size_t ci
     mi_assert_internal(field < MI_BCHUNK_FIELDS);
     const mi_bfield_t mask_end = mi_bfield_mask(n, 0);
     bool field_is_clear;
-    if (!mi_bfield_atomic_try_clear_mask(&chunk->bfields[field], mask_end, &field_is_clear)) goto restore;
+    if (!mi_bfield_atomic_try_clear_mask(&chunk->bfields[field], mask_end, &field_is_clear, did_temp_clear_bits)) goto restore;
     maybe_all_clear = maybe_all_clear && field_is_clear;
   }
 
@@ -12597,19 +12543,24 @@ mi_decl_maybe_unused static inline bool mi_mm256_is_zero( __m256i vec) {
 }
 #endif
 
+
 static inline bool mi_bchunk_try_find_and_clear_at(mi_bchunk_t* chunk, size_t chunk_idx, size_t* pidx) {
   mi_assert_internal(chunk_idx < MI_BCHUNK_FIELDS);
-  // note: this must be acquire (and not relaxed), or otherwise the AVX code below can loop forever
-  // as the compiler won't reload the registers vec1 and vec2 from memory again.
-  const mi_bfield_t b = mi_atomic_load_acquire(&chunk->bfields[chunk_idx]);
-  size_t idx;
-  if (mi_bfield_find_least_bit(b, &idx)) {           // find the least bit
-    if mi_likely(mi_bfield_atomic_try_clear_mask_of(&chunk->bfields[chunk_idx], mi_bfield_mask(1,idx), b, NULL)) {  // clear it atomically
-      *pidx = (chunk_idx*MI_BFIELD_BITS) + idx;
+  _Atomic(mi_bfield_t)* const bfield = &chunk->bfields[chunk_idx];
+  mi_bfield_t b = mi_atomic_load_relaxed(bfield);
+  if (b==0) return false;
+  int tries = 0;
+  do {  
+    const mi_bfield_t mask = (b & (~b+1));    // == (b & -b) but avoids a compiler warning -- clear all bits except the least-significant one
+    b = mi_atomic_and_acq_rel(bfield,~mask);  // clear the bit and set `b` to the previous value
+    if mi_likely((b&mask)==mask) {            // if we transitioned from 1 to 0, we actually cleared it
+      size_t bitidx = 0;
+      mi_bfield_find_least_bit(mask,&bitidx);
+      *pidx = (chunk_idx*MI_BFIELD_BITS) + bitidx;
       mi_assert_internal(*pidx < MI_BCHUNK_BITS);
       return true;
-    }
-  }
+    }    
+  } while (b!=0 && ++tries <= 4); // limit tries to reduce possible contention
   return false;
 }
 
@@ -12712,23 +12663,31 @@ static inline bool mi_bchunk_try_find_and_clear_1(mi_bchunk_t* chunk, size_t n, 
   return mi_bchunk_try_find_and_clear(chunk, pidx);
 }
 
-mi_decl_maybe_unused static inline bool mi_bchunk_try_find_and_clear8_at(mi_bchunk_t* chunk, size_t chunk_idx, size_t* pidx) {
-  const mi_bfield_t b = mi_atomic_load_relaxed(&chunk->bfields[chunk_idx]);
-  // has_set8 has low bit in each byte set if the byte in x == 0xFF
-  const mi_bfield_t has_set8 =
-    ((~b - MI_BFIELD_LO_BIT8) &      // high bit set if byte in x is 0xFF or < 0x7F
-     (b  & MI_BFIELD_HI_BIT8))       // high bit set if byte in x is >= 0x80
-     >> 7;                           // shift high bit to low bit
-  size_t idx;
-  if (mi_bfield_find_least_bit(has_set8, &idx)) { // find least 1-bit
-    mi_assert_internal(idx <= (MI_BFIELD_BITS - 8));
-    mi_assert_internal((idx%8)==0);
-    if mi_likely(mi_bfield_atomic_try_clear_mask_of(&chunk->bfields[chunk_idx], (mi_bfield_t)0xFF << idx, b, NULL)) {  // unset the byte atomically
-      *pidx = (chunk_idx*MI_BFIELD_BITS) + idx;
-      mi_assert_internal(*pidx + 8 <= MI_BCHUNK_BITS);
-      return true;
+mi_decl_maybe_unused static inline bool mi_bchunk_try_find_and_clear8_at(mi_bchunk_t* chunk, size_t chunk_idx, size_t* pidx, bool* did_temp_clear_bits) {
+  _Atomic(mi_bfield_t)* const bfield = &chunk->bfields[chunk_idx];  
+  mi_bfield_t b = mi_atomic_load_relaxed(bfield);
+  if (b==0) return false;
+  int tries = 0;
+  do {
+    // has_set8 has low bit in each byte set if the byte in x == 0xFF
+    const mi_bfield_t has_set8 =  
+      ((~b - MI_BFIELD_LO_BIT8) &     // high bit set if byte in x is 0xFF or < 0x7F
+      (b  & MI_BFIELD_HI_BIT8))       // high bit set if byte in x is >= 0x80
+      >> 7;                           // shift high bit to low bit
+    size_t bitidx;
+    if (mi_bfield_find_least_bit(has_set8, &bitidx)) { // find least 1-bit
+      mi_assert_internal(bitidx <= (MI_BFIELD_BITS - 8));
+      mi_assert_internal((bitidx%8)==0);
+      if mi_likely(mi_bfield_atomic_try_clear8_optimistic(bfield,bitidx,&b,did_temp_clear_bits)) { // try to clear atomically (and update b)
+        *pidx = (chunk_idx*MI_BFIELD_BITS) + bitidx;
+        mi_assert_internal(*pidx + 8 <= MI_BCHUNK_BITS);
+        return true;
+      }
     }
-  }
+    else {
+      return false;
+    }
+  } while(b!=0 && ++tries <= 4); // limit tries to reduce possible contention
   return false;
 }
 
@@ -12736,9 +12695,9 @@ mi_decl_maybe_unused static inline bool mi_bchunk_try_find_and_clear8_at(mi_bchu
 // set `*pidx` to its bit index (0 <= *pidx < MI_BCHUNK_BITS) on success.
 // Used to find medium size pages in the free blocks.
 // todo: try neon version
-static mi_decl_noinline bool mi_bchunk_try_find_and_clear8(mi_bchunk_t* chunk, size_t* pidx) {
+static mi_decl_noinline bool mi_bchunk_try_find_and_clear8(mi_bchunk_t* chunk, size_t* pidx, bool* did_temp_clear_bits) {
   #if MI_OPT_SIMD && defined(__AVX2__) && (MI_BCHUNK_BITS==512)
-  while (true) {
+  for(int tries=0; tries<4; tries++) {   // paranoia: at most 4 tries
     // since a cache-line is 64b, load all at once
     const __m256i vec1 = _mm256_load_si256((const __m256i*)chunk->bfields);
     const __m256i vec2 = _mm256_load_si256((const __m256i*)chunk->bfields+1);
@@ -12754,25 +12713,29 @@ static mi_decl_noinline bool mi_bchunk_try_find_and_clear8(mi_bchunk_t* chunk, s
     const size_t chunk_idx = bidx / 8;
     const size_t idx = (bidx % 8)*8;
     mi_assert_internal(chunk_idx < MI_BCHUNK_FIELDS);
-    if mi_likely(mi_bfield_atomic_try_clear8(&chunk->bfields[chunk_idx], idx, NULL)) {  // clear it atomically
+    if mi_likely(mi_bfield_atomic_try_clear8_optimistic(&chunk->bfields[chunk_idx], idx, NULL, did_temp_clear_bits)) {  // clear it atomically
       *pidx = (chunk_idx*MI_BFIELD_BITS) + idx;
       mi_assert_internal(*pidx + 8 <= MI_BCHUNK_BITS);
       return true;
     }
     // try again
-    // note: there must be an atomic release/acquire in between or otherwise the registers may not be reloaded  }
+    // note: there must be an atomic release/acquire in between or otherwise the registers may not be reloaded
+    // we add an explicit memory barrier as older gcc compilers do not reload the registers even with an atomic acquire (issue #1206)
+    #if defined(__GNUC__)
+    __asm __volatile ("" : : "g"(chunk) : "memory");
+    #endif
   }
   #else
     for (int i = 0; i < MI_BCHUNK_FIELDS; i++) {
-      if (mi_bchunk_try_find_and_clear8_at(chunk, i, pidx)) return true;
+      if (mi_bchunk_try_find_and_clear8_at(chunk, i, pidx, did_temp_clear_bits)) return true;
     }
-    return false;
   #endif
+  return false;
 }
 
 static inline bool mi_bchunk_try_find_and_clear_8(mi_bchunk_t* chunk, size_t n, size_t* pidx, bool* did_temp_clear_bits) {
   mi_assert_internal(n==8); MI_UNUSED(n); MI_UNUSED(did_temp_clear_bits);
-  return mi_bchunk_try_find_and_clear8(chunk, pidx);
+  return mi_bchunk_try_find_and_clear8(chunk, pidx, did_temp_clear_bits);
 }
 
 
@@ -12796,7 +12759,7 @@ mi_decl_noinline static bool mi_bchunk_try_find_and_clearNX(mi_bchunk_t* chunk, 
       const size_t bmask = mask<<idx;
       mi_assert_internal(bmask>>idx == mask);
       if ((b&bmask) == bmask) { // found a match with all bits set, try clearing atomically
-        if mi_likely(mi_bfield_atomic_try_clear_mask_of(&chunk->bfields[i], bmask, b0, NULL)) {
+        if mi_likely(mi_bfield_atomic_try_clear_mask_optimistic(&chunk->bfields[i], bmask, &b0, did_temp_clear_bits)) {  // updates b0 with the previous value        
           *pidx = (i*MI_BFIELD_BITS) + idx;
           mi_assert_internal(*pidx < MI_BCHUNK_BITS);
           mi_assert_internal(*pidx + n <= MI_BCHUNK_BITS);
@@ -12804,7 +12767,7 @@ mi_decl_noinline static bool mi_bchunk_try_find_and_clearNX(mi_bchunk_t* chunk, 
         }
         else {
           // if we failed to atomically commit, reload b and try again from the start
-          b = b0 = mi_atomic_load_acquire(&chunk->bfields[i]);
+          b = b0; // = mi_atomic_load_acquire(&chunk->bfields[i]);
         }
       }
       else {
@@ -13788,7 +13751,7 @@ typedef bool (mi_bchunk_try_find_and_clear_fun_t)(mi_bchunk_t* chunk, size_t n, 
 //
 // This is used for finding free blocks and it is important to be efficient (with 2-level bitscan)
 // but also reduce fragmentation (through size bins).
-static inline bool mi_bbitmap_try_find_and_clear_generic(mi_bbitmap_t* bbitmap, size_t tseq, size_t n, size_t* pidx, mi_bchunk_try_find_and_clear_fun_t* on_find)
+static bool mi_bbitmap_try_find_and_clear_generic(mi_bbitmap_t* bbitmap, size_t tseq, size_t n, size_t* pidx, mi_bchunk_try_find_and_clear_fun_t* on_find)
 {
   // we space out threads to reduce contention
   const size_t cmap_max_count  = _mi_divide_up(mi_bbitmap_chunk_count(bbitmap),MI_BFIELD_BITS);
@@ -13853,8 +13816,10 @@ static inline bool mi_bbitmap_try_find_and_clear_generic(mi_bbitmap_t* bbitmap, 
           return true;
         }
         else {
+          // note: we may find that all are cleared only on a second iteration (when we fail to clear any bits)
+          //       but that is ok as the chunkmap is a conservative approximation.
           // todo: should _on_find_ return a boolean if there is a chance all are clear to avoid calling `try_clear?`
-          // we may find that all are cleared only on a second iteration but that is ok as the chunkmap is a conservative approximation.
+          //       probably not as we already only call `try_clear` once we fail to clear any bits.
           if (did_temp_clear_bits) {
             // a concurrent find_and_claim may have cleared the chunkmap bit, restore it now
             mi_bbitmap_chunkmap_set(bbitmap, chunk_idx, false);
@@ -14192,14 +14157,6 @@ static mi_decl_noinline mi_theap_t* mi_heap_init_theap(const mi_heap_t* const_he
   mi_heap_t* heap = (mi_heap_t*)const_heap;
   mi_assert_internal(heap!=NULL);
 
-  // if (_mi_is_process_heap_main(heap)) {
-  //   // this can be called if the (main) thread is not yet initialized (as no allocation happened)
-  //   // but `theap_main_init_get()` will call `mi_thread_init()`
-  //   mi_theap_t* const theap = _mi_theap_main_safe();
-  //   mi_assert_internal(theap!=NULL && _mi_is_heap_main(_mi_theap_heap(theap)));
-  //   return theap;
-  // }
-
   // initialize thread first in case this is the main heap
   // (which may allocate the default theap already for the main heap)
   if (!_mi_thread_is_initialized()) {
@@ -14237,7 +14194,7 @@ mi_theap_t* _mi_heap_theap_get_or_init(const mi_heap_t* heap)
   return theap;
 }
 
-static void mi_heap_initialize(mi_heap_t* heap, mi_thread_local_t theap_slot, mi_subproc_t* subproc, mi_arena_id_t exclusive_arena_id)
+void _mi_heap_init(mi_heap_t* heap, mi_thread_local_t theap_slot, mi_subproc_t* subproc, mi_arena_id_t exclusive_arena_id)
 {
   // init fields
   heap->theap = theap_slot;
@@ -14281,7 +14238,7 @@ mi_heap_t* _mi_heap_new_for_subproc(mi_subproc_t* subproc, mi_arena_id_t exclusi
     mi_assert_internal(subproc->heap_main == NULL);
     subproc->heap_main = heap;
   }
-  mi_heap_initialize(heap, theap_slot, subproc, exclusive_arena_id);
+  _mi_heap_init(heap, theap_slot, subproc, exclusive_arena_id);
   return heap;
 }
 
@@ -14304,31 +14261,26 @@ mi_heap_t* mi_heap_new(void) {
 static void mi_heap_free_theaps(mi_heap_t* heap) {
   // This can run concurrently with a thread that terminates (see `init.c:mi_thread_theaps_done`),
   // and we need to ensure we free theaps atomically.
-  // We do this in a loop where we release the theaps_lock at every potential re-iteration to unblock
-  // potential concurrent thread termination which tries to remove the theap from our theaps list.
-  bool all_freed;
-  do {
-    all_freed = true;
-    mi_theap_t* theap = NULL;
-    mi_lock(&heap->theaps_lock) {
-      theap = heap->theaps;
-      while(theap != NULL) {
-        mi_theap_t* next = theap->hnext;
-        if (!_mi_theap_free(theap, false /* dont re-acquire the heap->theaps_lock */, true /* acquire the tld->theaps_lock though */ )) {
-          all_freed = false;
-        }
-        theap = next;
-      }
+
+  // We first detach our theaps list from any thread local lists
+  _mi_heap_detach_theaps(heap);
+
+  // Now we can safely free the theaps
+  mi_lock(&heap->theaps_lock) { // paranoia
+    mi_theap_t* theap = heap->theaps;
+    heap->theaps = NULL;
+    while(theap != NULL) {
+      mi_theap_t* next = theap->hnext;
+      theap->hnext = NULL;
+      theap->hprev = NULL;
+      mi_assert_internal(theap->tld==NULL);
+      // merge stats into the owning heap stats
+      _mi_stats_merge_into(&heap->stats, &theap->stats);
+      // and free
+      _mi_theap_decref(theap);  // a cached entry can still point to the theap
+      theap = next;
     }
-    if (!all_freed) {
-      mi_heap_stat_counter_increase(heap,heaps_delete_wait,1);
-      _mi_prim_thread_yield();
-    }
-    else {
-      mi_assert_internal(heap->theaps==NULL);
-    }
-  }
-  while(!all_freed);
+  }  
 }
 
 // free the heap resources (assuming the pages are already moved/destroyed, and all theaps have been freed)
@@ -14341,18 +14293,26 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
   mi_assert_internal(heap!=NULL && !(_mi_is_heap_main(heap) && heap->subproc == _mi_subproc_main()));
 
   // free all arena pages infos
-  mi_lock(&heap->arena_pages_lock) {
-    for (size_t i = 0; i < MI_MAX_ARENAS; i++) {
-      mi_arena_pages_t* arena_pages = mi_atomic_load_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i]);
-      if (arena_pages!=NULL) {
-        mi_atomic_store_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i], NULL);
-        _mi_free_subproc_safe(arena_pages);
+  const bool is_main = _mi_is_heap_main(heap);
+  if (!is_main) {  // pages for the main heap are pre-allocated in the arenas
+    mi_lock(&heap->arena_pages_lock) {
+      for (size_t i = 0; i < MI_MAX_ARENAS; i++) {
+        mi_arena_pages_t* arena_pages = mi_atomic_load_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i]);
+        if (arena_pages!=NULL) {
+          mi_atomic_store_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i], NULL);
+          _mi_free_subproc_safe(arena_pages);
+        }
       }
     }
   }
 
   // remove the heap from the subproc
-  mi_heap_stats_merge_to_main(heap);
+  if (!is_main) { 
+    mi_heap_stats_merge_to_main(heap); 
+  }
+  else {
+    _mi_stats_merge_into(&heap->subproc->stats,&heap->stats);
+  }
   mi_atomic_decrement_relaxed(&heap->subproc->heap_count);
   mi_subproc_stat_decrease(heap->subproc, heaps, 1);
   mi_lock_maybe(&heap->subproc->heaps_lock, acquire_heaps_lock) {
@@ -14361,11 +14321,13 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
                      else { heap->subproc->heaps = heap->next; }
   }
 
-  _mi_thread_local_free(heap->theap);
   mi_lock_done(&heap->theaps_lock);
   mi_lock_done(&heap->os_abandoned_pages_lock);
   mi_lock_done(&heap->arena_pages_lock);
-  _mi_free_subproc_safe(heap);
+  if (!_mi_is_process_heap_main(heap)) { 
+    _mi_thread_local_free(heap->theap);
+    _mi_free_subproc_safe(heap); 
+  }
 }
 
 void mi_heap_delete(mi_heap_t* heap) {
@@ -14459,35 +14421,32 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <string.h>  // memcpy, memset
 #include <stdlib.h>  // atexit
 
-#define MI_MEMID_INIT(kind)   {{{NULL,0}}, kind, true /* pinned */, true /* committed */, false /* zero */ }
-#define MI_MEMID_STATIC       MI_MEMID_INIT(MI_MEM_STATIC)
-
 // Empty page used to initialize the small free pages array
-const mi_page_t _mi_page_empty = {
+static const mi_page_t mi_page_empty = {
   MI_ATOMIC_VAR_INIT(0),  // xthread_id
   NULL,                   // free
   0,                      // used
   0,                      // capacity
-  0,                      // reserved capacity
   0,                      // retire_expire
   false,                  // is_zero
   NULL,                   // local_free
   MI_ATOMIC_VAR_INIT(0),  // xthread_free
   0,                      // block_size
-  0,                      // page_woffset
-  MI_ARENA_SLICE_SIZE,    // page_committed
-  #if (MI_PADDING || MI_ENCODE_FREELIST)
-  { 0, 0 },               // keys
-  #endif
+  0,                      // page_ma_offset
+  0,                      // slice_pcommitted
+  0,                      // reserved capacity
   NULL,                   // theap
   NULL,                   // heap
   NULL, NULL,             // next, prev
   MI_MEMID_STATIC,        // memid
+  #if (MI_PADDING || MI_ENCODE_FREELIST)
+  { 0, 0 },                // keys
+  #endif
   NULL,                   // metadata (MI_PPROF)
   false                   // has_metadata
 };
 
-#define MI_PAGE_EMPTY() ((mi_page_t*)&_mi_page_empty)
+#define MI_PAGE_EMPTY() ((mi_page_t*)&mi_page_empty)
 
 #if (MI_PADDING>0) && (MI_INTPTR_SIZE >= 8)
 #define MI_SMALL_PAGES_EMPTY  { MI_INIT128(MI_PAGE_EMPTY), MI_PAGE_EMPTY(), MI_PAGE_EMPTY() }
@@ -14520,15 +14479,16 @@ const mi_page_t _mi_page_empty = {
 #define MI_STAT_COUNT(stat)     {0,0,0},
 #define MI_STAT_COUNTER(stat)   {0},
 
-#define MI_STATS_NULL  \
-  MI_STAT_FIELDS() \
-  \
-  { MI_INIT4(MI_STAT_COUNT_NULL) }, \
-  { { 0 }, { 0 }, { 0 }, { 0 } }, \
-  \
-  { MI_INIT74(MI_STAT_COUNT_NULL) }, \
-  { MI_INIT74(MI_STAT_COUNT_NULL) }, \
-  { MI_INIT5(MI_STAT_COUNT_NULL) }
+#define MI_STATS_FIELDS_NULL  \
+  MI_STAT_FIELDS()                    /* regular stat fields */ \
+  { MI_INIT4(MI_STAT_COUNT_NULL) },   /* stat reserved */ \
+  { { 0 }, { 0 }, { 0 }, { 0 } },     /* stat counter reserved */ \
+  { MI_INIT74(MI_STAT_COUNT_NULL) },  /* malloc_bins */ \
+  { MI_INIT74(MI_STAT_COUNT_NULL) },  /* page bins   */ \
+  { MI_INIT5(MI_STAT_COUNT_NULL) }    /* chunk bins  */
+
+#define MI_STATS_NULL \
+  { sizeof(mi_stats_t), MI_STAT_VERSION, MI_STATS_FIELDS_NULL }
 
 // --------------------------------------------------------
 // Statically allocate an empty theap as the initial
@@ -14539,21 +14499,11 @@ const mi_page_t _mi_page_empty = {
 // may lead to allocation itself on some platforms)
 // --------------------------------------------------------
 
-static mi_decl_cache_align mi_subproc_t subproc_main
-#if __cplusplus
-  = { };     // empty initializer to prevent running the constructor (with msvc)
-#else
-  = { 0 };   // C zero initialize
-#endif
-
-static mi_subproc_t* subprocs = &subproc_main;
-static mi_lock_t     subprocs_lock;
-
-static mi_decl_cache_align mi_tld_t tld_empty = {
-  0,                      // thread_id
+static mi_decl_cache_align mi_tld_t mi_tld_detached = {
+  MI_THREADID_DETACHED,   // thread_id
   0,                      // thread_seq
   0,                      // default numa node
-  &subproc_main,          // subproc
+  NULL,                   // subproc
   NULL,                   // theaps list
   MI_LOCK_INITIALIZER,    // theaps lock
   false,                  // recurse
@@ -14562,12 +14512,11 @@ static mi_decl_cache_align mi_tld_t tld_empty = {
   { 0, 0, 0, 0 }          // profiler (MI_PPROF)
 };
 
-mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
-  &tld_empty,             // tld
+mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
+  &mi_tld_detached,       // tld
   MI_ATOMIC_VAR_INIT(NULL), // heap
   MI_ATOMIC_VAR_INIT(NULL), // subproc
   MI_ATOMIC_VAR_INIT(1),  // refcount
-  MI_ATOMIC_VAR_INIT(0),  // freed
   0,                      // heartbeat
   0,                      // cookie
   { {0}, {0}, 0, true },  // random
@@ -14580,156 +14529,43 @@ mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   0,                      // full page retain
   false,                  // allow reclaim
   true,                   // allow abandon
+  true,                   // is_detached
   #if MI_GUARDED
   0, 0, 0, 1,             // rate is 0 and count is 1 so we never write to it (see `internal.h:mi_heap_malloc_use_guarded`)
   #endif
   MI_SMALL_PAGES_EMPTY,
   MI_PAGE_QUEUES_EMPTY,
   MI_MEMID_STATIC,
-  { sizeof(mi_stats_t), MI_STAT_VERSION, MI_STATS_NULL },      // stats
+  MI_STATS_NULL,          // stats
 };
-
-mi_decl_cache_align const mi_theap_t _mi_theap_empty_wrong = {
-  &tld_empty,             // tld
-  MI_ATOMIC_VAR_INIT(NULL), // heap
-  MI_ATOMIC_VAR_INIT(NULL), // subproc
-  MI_ATOMIC_VAR_INIT(1),  // refcount
-  MI_ATOMIC_VAR_INIT(0),  // freed
-  0,                      // heartbeat
-  1,                      // cookie  (see issue #1343)
-  { {0}, {0}, 0, true },  // random
-  0,                      // page count
-  MI_BIN_FULL, 0,         // page retired min/max
-  0,                      // pages_full_size
-  0, 0,                   // generic count
-  NULL, NULL,             // tnext, tprev
-  NULL, NULL,             // hnext, hprev
-  0,                      // full page retain
-  false,                  // allow reclaim
-  true,                   // allow abandon
-  #if MI_GUARDED
-  0, 0, 0, 1,             // rate is 0 and count is 1 so we never write to it (see `internal.h:mi_heap_malloc_use_guarded`)
-  #endif
-  MI_SMALL_PAGES_EMPTY,
-  MI_PAGE_QUEUES_EMPTY,
-  MI_MEMID_STATIC,
-  { sizeof(mi_stats_t), MI_STAT_VERSION, MI_STATS_NULL },      // stats
-};
-
-// Heap for the main thread
-
-#define MI_THREADID_INVALID ((mi_threadid_t)(~0))
-
-extern mi_decl_hidden mi_decl_cache_align mi_theap_t mi_theap_main;         // theap of the main thread (belonging to the `mi_process_heap_main`)
-extern mi_decl_hidden mi_decl_cache_align mi_heap_t  mi_process_heap_main;  // main heap of the main subproc
-
-static mi_decl_cache_align mi_tld_t mi_process_tld_main = {
-  0,                      // thread_id
-  0,                      // thread_seq
-  0,                      // numa node
-  &subproc_main,          // subproc
-  &mi_theap_main, // theaps list
-  MI_LOCK_INITIALIZER,    // theaps lock
-  false,                  // recurse
-  false,                  // is_in_threadpool
-  MI_MEMID_STATIC,        // memid
-  { 0, 0, 0, 0 }          // profiler (MI_PPROF)
-};
-
-mi_decl_cache_align mi_theap_t mi_theap_main = {
-  &mi_process_tld_main,              // thread local data
-  MI_ATOMIC_VAR_INIT(&mi_process_heap_main), // main heap
-  MI_ATOMIC_VAR_INIT(&subproc_main),         // main subproc
-  MI_ATOMIC_VAR_INIT(1),  // refcount
-  MI_ATOMIC_VAR_INIT(0),  // freed
-  0,                      // heartbeat
-  0,                      // initial cookie
-  { {0x846ca68b}, {0}, 0, true },  // random
-  0,                      // page count
-  MI_BIN_FULL, 0,         // page retired min/max
-  0,                      // pages_full_size
-  0, 0,                   // generic count
-  NULL, NULL,             // tnext, tprev
-  NULL, NULL,             // hnext, hprev
-  2,                      // full page retain
-  true,                   // allow page reclaim
-  true,                   // allow page abandon
-  #if MI_GUARDED
-  0, 0, 0, 0,
-  #endif
-  MI_SMALL_PAGES_EMPTY,
-  MI_PAGE_QUEUES_EMPTY,
-  MI_MEMID_STATIC,
-  { sizeof(mi_stats_t), MI_STAT_VERSION, MI_STATS_NULL },      // stats
-};
-
-mi_decl_cache_align mi_heap_t mi_process_heap_main
-#if __cplusplus
-  = { };     // empty initializer to prevent running the constructor (with msvc)
-#else
-  = { 0 };   // C zero initialize
-#endif
-
-mi_threadid_t _mi_thread_id(void) mi_attr_noexcept {
-  const mi_threadid_t tid = _mi_prim_thread_id();
-  mi_assert_internal( (tid & 0x03) == 0 ); // mimalloc reserves the bottom 2 bits
-  return tid;
-}
-
-mi_decl_hidden mi_decl_thread void* __mi_thread_id_helper = NULL;
-
-#if MI_TLS_MODEL_LOCAL
-// the thread-local main theap for allocation
-mi_decl_hidden mi_decl_thread mi_theap_t* __mi_theap_default = (mi_theap_t*)&_mi_theap_empty;
-// the last used non-main theap
-mi_decl_hidden mi_decl_thread mi_theap_t* __mi_theap_cached = (mi_theap_t*)&_mi_theap_empty;
-#endif
-
-mi_decl_hidden bool _mi_process_is_initialized = false;  // set to `true` in `mi_process_init`.
-
-mi_stats_t _mi_stats_main = { sizeof(mi_stats_t), MI_STAT_VERSION, MI_STATS_NULL };
 
 #undef MI_STAT_COUNT
 #undef MI_STAT_COUNTER
 
 
-#if MI_GUARDED
-mi_decl_export void mi_theap_guarded_set_sample_rate(mi_theap_t* theap, size_t sample_rate, size_t seed) {
-  theap->guarded_sample_rate  = sample_rate;
-  theap->guarded_sample_count = sample_rate;  // count down samples
-  if (theap->guarded_sample_rate > 1) {
-    if (seed == 0) {
-      seed = _mi_theap_random_next(theap);
-    }
-    theap->guarded_sample_count = (seed % theap->guarded_sample_rate) + 1;  // start at random count between 1 and `sample_rate`
-  }
+// pre-allocate the process heap, and meta-data theap
+static mi_decl_cache_align mi_heap_t    mi_process_heap_main  = mi_init_struct_zero;
+static mi_decl_cache_align mi_theap_t   mi_process_theap_meta = mi_init_struct_zero;
+
+// pre-allocate the initial tld and theap for the main thread (this is not strictly needed but nice for stats)
+static mi_decl_cache_align mi_tld_t     mi_process_tld_main   = mi_init_struct_zero;
+static mi_decl_cache_align mi_theap_t   mi_process_theap_main = mi_init_struct_zero;
+
+mi_decl_hidden mi_decl_cache_align mi_theap_t _mi_theap_empty_wrong = mi_init_struct_zero;  // used for error paths
+mi_decl_hidden bool _mi_process_is_initialized = false;  // set to `true` in `mi_process_init`.
+
+
+mi_page_t* _mi_page_empty_get(void) {
+  return (mi_page_t*)&mi_page_empty;
 }
 
-mi_decl_export void mi_theap_guarded_set_size_bound(mi_theap_t* theap, size_t min, size_t max) {
-  theap->guarded_size_min = min;
-  theap->guarded_size_max = (min > max ? min : max);
+mi_decl_cold mi_decl_noinline mi_theap_t* _mi_theap_empty_get(void) {
+  return (mi_theap_t*)&_mi_theap_empty;
 }
 
-void _mi_theap_guarded_init(mi_theap_t* theap) {
-  mi_theap_guarded_set_sample_rate(theap,
-    (size_t)mi_option_get_clamp(mi_option_guarded_sample_rate, 0, LONG_MAX),
-    (size_t)mi_option_get(mi_option_guarded_sample_seed));
-  mi_theap_guarded_set_size_bound(theap,
-    (size_t)mi_option_get_clamp(mi_option_guarded_min, 0, LONG_MAX),
-    (size_t)mi_option_get_clamp(mi_option_guarded_max, 0, LONG_MAX) );
+bool _mi_is_empty_theap(const mi_theap_t* theap) {
+  return (theap == &_mi_theap_empty);
 }
-#else
-mi_decl_export void mi_theap_guarded_set_sample_rate(mi_theap_t* theap, size_t sample_rate, size_t seed) {
-  MI_UNUSED(theap); MI_UNUSED(sample_rate); MI_UNUSED(seed);
-}
-
-mi_decl_export void mi_theap_guarded_set_size_bound(mi_theap_t* theap, size_t min, size_t max) {
-  MI_UNUSED(theap); MI_UNUSED(min); MI_UNUSED(max);
-}
-void _mi_theap_guarded_init(mi_theap_t* theap) {
-  MI_UNUSED(theap);
-}
-#endif
 
 /* -----------------------------------------------------------
   Initialization
@@ -14737,135 +14573,38 @@ void _mi_theap_guarded_init(mi_theap_t* theap) {
   can cause allocation and induce recursion during initialization.
 ----------------------------------------------------------- */
 
-
-// Initialize main subproc
-static void mi_subproc_main_init(void) {
-  if (subproc_main.memid.memkind != MI_MEM_STATIC) {
-    subproc_main.memid = _mi_memid_create(MI_MEM_STATIC);
-    subproc_main.heaps = &mi_process_heap_main;
-    subproc_main.heap_total_count = 1;
-    subproc_main.heap_count = 1;
-    mi_atomic_store_ptr_release(mi_heap_t, &subproc_main.heap_main, &mi_process_heap_main);
-    __mi_stat_increase_mt(&subproc_main.stats.heaps, 1);
-    mi_stats_header_init(&subproc_main.stats);
-    mi_lock_init(&subproc_main.arena_reserve_lock);
-    mi_lock_init(&subproc_main.heaps_lock);
-    mi_lock_init(&subprocs_lock);
-    mi_lock_init(&tld_empty.theaps_lock);
-  }
-}
-
-// Initialize main tld
-static void mi_tld_main_init(void) {
-  if (mi_process_tld_main.thread_id == 0) {
-    mi_process_tld_main.thread_id = _mi_prim_thread_id();
-    mi_lock_init(&mi_process_tld_main.theaps_lock);
-  }
-}
-
-void _mi_theap_options_init(mi_theap_t* theap) {
-  theap->allow_page_reclaim = (mi_option_get(mi_option_page_reclaim_on_free) >= 0);
-  theap->allow_page_abandon = (mi_option_get(mi_option_page_full_retain) >= 0);
-  theap->page_full_retain = mi_option_get_clamp(mi_option_page_full_retain, -1, 32);
-}
-
-// Initialization of the (statically allocated) main theap, and the main tld and subproc.
-static void mi_theap_main_init(void) {
-  if mi_unlikely(mi_theap_main.memid.memkind != MI_MEM_STATIC) {
-    // theap
-    mi_theap_main.memid = _mi_memid_create(MI_MEM_STATIC);
-    #if defined(__APPLE__) || (defined(_WIN32) && !defined(MI_SHARED_LIB))
-      _mi_random_init_weak(&mi_theap_main.random);    // prevent allocation failure during bcrypt dll initialization with static linking (issue #1185)
-    #else
-      _mi_random_init(&mi_theap_main.random);
-    #endif
-    mi_theap_main.cookie  = _mi_theap_random_next(&mi_theap_main);
-    _mi_theap_options_init(&mi_theap_main);
-    _mi_theap_guarded_init(&mi_theap_main);
-  }
-}
+static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc);
 
 // Initialize main heap
+static void mi_heap_main_init_once(void) {
+  mi_memid_t memid_static = _mi_memid_create(MI_MEM_STATIC);
+  _mi_memcpy(&_mi_theap_empty_wrong,&_mi_theap_empty,sizeof(_mi_theap_empty_wrong));
+
+  // initialize the main subprocess
+  mi_subproc_t* subproc_main = _mi_subproc_main_init();
+
+  // detached tld for mi_theap_empty (and theap_meta)
+  mi_tld_detached.memid = memid_static;
+  mi_tld_init(&mi_tld_detached, 0, subproc_main);
+
+  // main process heap
+  mi_process_heap_main.memid = memid_static;
+  mi_atomic_store_ptr_release(mi_heap_t,&subproc_main->heap_main,&mi_process_heap_main);
+  _mi_heap_init(&mi_process_heap_main,mi_thread_local_key_fast,subproc_main,0);
+
+  // detached theap for allocating meta-data (we can allocate on this without having an initialized thread)
+  mi_process_theap_meta.memid = memid_static;
+  _mi_theap_init(&mi_process_theap_meta,&mi_process_heap_main,&mi_tld_detached);
+  mi_process_theap_meta.allow_page_abandon = false;  // for security, don't share with other threads
+  mi_process_theap_meta.page_full_retain = 2;
+  subproc_main->theap_meta = &mi_process_theap_meta;
+
+  // mi_heap_theap_set(&mi_process_heap_main,&mi_process_theap_main); // set in `mi_thread_init(_theap_default)`
+}
+
 static void mi_heap_main_init(void) {
-  if mi_unlikely(mi_process_heap_main.subproc == NULL) {
-    mi_process_heap_main.subproc = &subproc_main;
-    mi_process_heap_main.theaps  = &mi_theap_main;
-    mi_process_heap_main.theap   = mi_thread_local_key_fast;
-
-    mi_theap_main_init();
-    mi_subproc_main_init();
-    mi_tld_main_init();
-    // mi_heap_theap_set(&mi_process_heap_main,&mi_theap_main); // set in `mi_thread_init(_theap_default)`
-
-    mi_lock_init(&mi_process_heap_main.theaps_lock);
-    mi_lock_init(&mi_process_heap_main.os_abandoned_pages_lock);
-    mi_lock_init(&mi_process_heap_main.arena_pages_lock);
-  }
-}
-
-
-/* -----------------------------------------------------------
-  Thread local data
------------------------------------------------------------ */
-
-// Allocate fresh tld
-static mi_tld_t* mi_tld_alloc(mi_subproc_t* subproc) {
-  // if (_mi_is_main_thread()) {
-  //   mi_atomic_increment_relaxed(&tld_main.subproc->thread_count);
-  //   return &tld_main;
-  // }
-  // else
-  {
-    // allocate tld meta-data
-    // note: we need to be careful to not access the tld from `_mi_meta_zalloc`
-    // (and in turn from `_mi_arena_alloc_aligned` and `_mi_os_alloc_aligned`).
-    mi_memid_t memid;
-    mi_tld_t* tld = (mi_tld_t*)_mi_meta_zalloc(subproc, sizeof(mi_tld_t), &memid);
-    if (tld==NULL) {
-      _mi_error_message(ENOMEM, "unable to allocate memory for thread local data\n");
-      return NULL;
-    }
-    tld->memid = memid;
-    tld->theaps = NULL;
-    mi_lock_init(&tld->theaps_lock);
-    tld->subproc = subproc;
-    tld->numa_node = _mi_os_numa_node();
-    tld->thread_id = _mi_prim_thread_id();
-    tld->thread_seq = mi_atomic_increment_relaxed(&tld->subproc->thread_total_count);
-    tld->is_in_threadpool = _mi_prim_thread_is_in_threadpool();
-    mi_atomic_increment_relaxed(&tld->subproc->thread_count);
-    return tld;
-  }
-}
-
-#define MI_TLD_INVALID  ((mi_tld_t*)1)
-
-mi_decl_noinline static void mi_tld_free(mi_tld_t* tld) {
-  if (tld==NULL || tld==MI_TLD_INVALID) return;
-  mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
-  tld->thread_id = MI_THREADID_INVALID;              // note: not 0 as that would re-initialize tld_main
-                                                     // we also need to set an invalid tid for tld_main as sometimes the same thread-id
-                                                     // is reused by the OS after a thread has terminated. (see issue #1287)
-  mi_lock_done(&tld->theaps_lock);
-  _mi_meta_free(tld->subproc, tld, sizeof(mi_tld_t), tld->memid);  // note: safe for static tld_main
-}
-
-
-mi_subproc_t* _mi_subproc_main(void) {
-  return &subproc_main;
-}
-
-mi_subproc_t* _mi_subproc(void) {
-  // should work without doing initialization (as it may be called from `_mi_tld -> mi_tld_alloc ... -> os_alloc -> _mi_subproc()`
-  // todo: this will still fail on OS systems where the first access to a thread-local causes allocation.
-  //       on such systems we can check for this with the _mi_prim_get_default_theap as those are protected (by being
-  //       stored in a TLS slot for example)
-  mi_theap_t* theap = _mi_theap_default();
-  if (theap == NULL || theap->tld == NULL) {  // see issue #1289
-    return _mi_subproc_main();
-  }
-  else {
-    return theap->tld->subproc;  // avoid using thread local storage (`thread_tld`)
+  mi_atomic_do_once {
+    mi_heap_main_init_once();
   }
 }
 
@@ -14874,7 +14613,7 @@ mi_heap_t* _mi_subproc_heap_main(mi_subproc_t* subproc) {
   if mi_likely(heap!=NULL) {
     return heap;
   }
-  else if (subproc==_mi_subproc_main()) {
+  else if (_mi_subproc_is_main(subproc)) {
     mi_heap_main_init();
     mi_assert_internal(mi_atomic_load_ptr_acquire(mi_heap_t,&subproc->heap_main) != NULL);
     return mi_atomic_load_ptr_acquire(mi_heap_t,&subproc->heap_main);
@@ -14885,182 +14624,64 @@ mi_heap_t* _mi_subproc_heap_main(mi_subproc_t* subproc) {
   }
 }
 
-mi_heap_t* mi_heap_main(void) {
-  return _mi_subproc_heap_main(_mi_subproc()); // don't use mi_theap_main_init_get() so this call works during process_init
-}
-
-bool _mi_is_process_heap_main(const mi_heap_t* heap) {
-  return (heap == NULL || heap == &mi_process_heap_main);
-}
-
-
 /* -----------------------------------------------------------
-  Sub process
+  Thread local data
 ----------------------------------------------------------- */
 
-
-mi_subproc_t* _mi_subproc_from_id(mi_subproc_id_t subproc_id) {
-  return (mi_subproc_t*)(subproc_id._mi_subproc_id);
-}
-
-mi_subproc_id_t _mi_subproc_to_id(mi_subproc_t* subproc) {
-  mi_subproc_id_t id = { subproc };
-  return id;
-}
-
-mi_subproc_id_t mi_subproc_main(void) {
-  return _mi_subproc_to_id(_mi_subproc_main());
-}
-
-mi_subproc_id_t mi_subproc_current(void) {
-  return _mi_subproc_to_id(_mi_subproc());
-}
-
-mi_subproc_id_t mi_subproc_new(void) {
-  static _Atomic(size_t) subproc_total_count;
-  // As in `mi_heap_new_in_arena`: this can be the first mimalloc call in a process, and
-  // `_mi_meta_zalloc` below allocates out of the parent's main heap, which must exist.
-  mi_thread_init();
-  mi_subproc_t* const parent = _mi_subproc();
-  mi_memid_t memid;
-  mi_subproc_t* subproc = (mi_subproc_t*)_mi_meta_zalloc(parent, sizeof(mi_subproc_t),&memid);
-  if (subproc == NULL) { return _mi_subproc_to_id(NULL); }
-
-  // init subproc
-  subproc->memid = memid;
-  subproc->parent = parent;
-  subproc->subproc_seq = mi_atomic_increment_relaxed(&subproc_total_count) + 1;
-  mi_stats_header_init(&subproc->stats);
-  mi_lock_init(&subproc->arena_reserve_lock);
-  mi_lock_init(&subproc->heaps_lock);
-  mi_lock(&subprocs_lock) {
-    // push on subproc list
-    subproc->next = subprocs;
-    if (subprocs!=NULL) { subprocs->prev = subproc; }
-    subprocs = subproc;
-  }
-
-  // init main heap
-  mi_heap_t* heap_main = _mi_heap_new_for_subproc(subproc,0,true);
-  if (heap_main==NULL) {
-    mi_subproc_destroy(_mi_subproc_to_id(subproc));
-    return _mi_subproc_to_id(NULL);
-  }
-  mi_assert_internal(subproc->heap_main == heap_main);
-
-  return _mi_subproc_to_id(subproc);
-}
-
-// destroy all subproc resources including arena's, heap's etc.
-static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subprocs_lock)
-{
-  if (subproc==NULL) return;
-
-  // remove from the subproc list
-  mi_lock_maybe(&subprocs_lock, acquire_subprocs_lock) {
-    if (subproc->next!=NULL) { subproc->next->prev = subproc->prev;  }
-    if (subproc->prev!=NULL) { subproc->prev->next = subproc->next;  }
-                        else { mi_assert_internal(subprocs==subproc);  subprocs = subproc->next; }
-  }
-
-  // destroy all subproc heaps
-  mi_lock(&subproc->heaps_lock) {
-    mi_heap_t* heap = subproc->heaps;
-    while (heap != NULL) {
-      mi_heap_t* next = heap->next;
-      if (heap!=subproc->heap_main) { _mi_heap_force_destroy(heap,false /* do not re-acquire the heaps_lock */); }
-      heap = next;
-    }
-    mi_assert_internal(subproc->heap_main==NULL || subproc->heaps == subproc->heap_main);
-    if (subproc->heap_main!=NULL) {
-      _mi_heap_force_destroy(subproc->heap_main,false /* do not re-acquire the heaps_lock */);  // no warning if destroying the main heap
-    }
-  }
-
-  if (subproc==&subproc_main) {
-    // for the main subproc, release the thread locals now (as they may free memory)
-    _mi_thread_locals_done();
-  }
-
-  // remove associated arenas
-  _mi_arenas_unsafe_destroy_all(subproc);
-
-  // merge stats back into the main subproc?
-  if (subproc!=&subproc_main) {
-    _mi_stats_merge_into(&subproc_main.stats, &subproc->stats);
-  }
-
-  // safe to release
-  // todo: should we refcount subprocesses?
-  mi_lock_done(&subproc->arena_reserve_lock);
-  mi_lock_done(&subproc->heaps_lock);
-  if (subproc!=&subproc_main) {
-    _mi_meta_free( subproc->parent, subproc, sizeof(mi_subproc_t), subproc->memid);
+static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc) {
+  tld->subproc = subproc;
+  tld->theaps = NULL;
+  mi_lock_init(&tld->theaps_lock);
+  if (tld->thread_id == MI_THREADID_DETACHED) {
+    tld->numa_node = -1;
   }
   else {
-    // for the main subproc, also release the global page map
-    _mi_page_map_unsafe_destroy();
+    tld->numa_node = _mi_os_numa_node();
+    tld->thread_id = _mi_prim_thread_id();
+    tld->is_in_threadpool = _mi_prim_thread_is_in_threadpool();
+    tld->thread_seq = tseq;
+    mi_atomic_increment_relaxed(&tld->subproc->thread_count);
   }
+  return tld;
 }
 
-void mi_subproc_destroy(mi_subproc_id_t subproc_id) {
-  mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
-  if (subproc==NULL || subproc==&subproc_main) return;
-  mi_subproc_unsafe_destroy(subproc, true /* take lock */);
+// Allocate fresh tld
+static mi_tld_t* mi_tld_create(mi_subproc_t* subproc) {
+  mi_assert_internal(subproc->theap_meta != NULL); // should be initialized on the main thread before other threads allocate
+  const size_t tseq = mi_atomic_increment_relaxed(&subproc->thread_total_count);
+
+  mi_memid_t memid;
+  mi_tld_t* tld;
+  if (_mi_subproc_is_main(subproc) && tseq==0 /* first tld */) {
+    tld = &mi_process_tld_main;
+    memid = _mi_memid_create_static(tld,sizeof(*tld));
+  }
+  else {
+    tld  = (mi_tld_t*)_mi_meta_zalloc(subproc, sizeof(mi_tld_t), &memid);
+  }
+  if (tld==NULL) {
+    _mi_error_message(ENOMEM, "unable to allocate memory for thread local data\n");
+    return NULL;
+  }
+  tld->memid = memid;
+  return mi_tld_init(tld,tseq,subproc);
 }
 
-static void mi_subprocs_unsafe_destroy_all(void) {
-  mi_lock(&subprocs_lock) {
-    mi_subproc_t* subproc = subprocs;
-    while (subproc!=NULL) {
-      mi_subproc_t* next = subproc->next;
-      if (subproc!=&subproc_main) {
-        mi_subproc_unsafe_destroy(subproc, false /* take subprocs lock */);
-      }
-      subproc = next;
-    }
-  }
-  mi_subproc_unsafe_destroy(&subproc_main, true /* take subprocs lock */);
-}
-
-static mi_theap_t* mi_thread_init_ex(mi_heap_t* heap_main) mi_attr_noexcept;
-
-void mi_subproc_add_current_thread(mi_subproc_id_t subproc_id) {
-  mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
-  mi_assert_internal(subproc!=NULL);
-  if (subproc==NULL) return;
-  mi_assert_internal(subproc->heap_main!=NULL);
-  if (subproc->heap_main==NULL) return;
-  mi_theap_t* theap = _mi_theap_default();
-  if (mi_theap_is_initialized(theap)) {
-    if (theap->tld!=NULL && theap->tld->subproc != subproc) {
-      _mi_warning_message("unable to add thread to the subprocess as it was already in another subprocess (at %p)\n", theap->tld->subproc);
-    }
-    return;
-  }
-
-  // initialize this thread tld & theap
-  mi_thread_init_ex(subproc->heap_main);
-}
-
-
-bool mi_subproc_visit_heaps(mi_subproc_id_t subproc_id, mi_heap_visit_fun* visitor, void* arg) {
-  mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
-  if (subproc==NULL) return false;
-  bool ok = true;
-  mi_lock(&subproc->heaps_lock) {
-    for (mi_heap_t* heap = subproc->heaps; heap!=NULL && ok; heap = heap->next) {
-      ok = (*visitor)(heap, arg);
-    }
-  }
-  return ok;
+mi_decl_noinline static void mi_tld_free(mi_tld_t* tld) {
+  if (tld==NULL) return;
+  mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
+  tld->thread_id = (mi_threadid_t)(~0);          // it is best to set an invalid tid for tld_main as sometimes the same thread-id
+                                                 // is reused by the OS after a thread has terminated. (see issue #1287)
+  mi_lock_done(&tld->theaps_lock);
+  _mi_meta_free(tld->subproc, tld, tld->memid);  // note: safe for static tld
 }
 
 
 /* -----------------------------------------------------------
-  Allocate theap data
+  Thread Init
 ----------------------------------------------------------- */
 
+#if MI_DEBUG || defined(MI_TLS_RECURSE_GUARD)
 static mi_theap_t* mi_heap_check_for_existing_theap(mi_heap_t* heap) {
   const mi_threadid_t tid = _mi_thread_id();
   mi_theap_t* thread_theap = NULL;
@@ -15074,52 +14695,79 @@ static mi_theap_t* mi_heap_check_for_existing_theap(mi_heap_t* heap) {
   }
   return thread_theap;
 }
+#endif
 
-// Initialize the thread local default theap, called from `mi_thread_init`
-static mi_theap_t* _mi_thread_init_theap_default(mi_heap_t* heap_main) {
+// Initialize thread
+mi_theap_t* _mi_thread_init_with_heap(mi_heap_t* heap_main)
+{
+  // ensure our process has started already
+  mi_process_init();
+
+  // if the theap_default is already set we have already initialized
   mi_theap_t* theap = _mi_theap_default();
   if (mi_theap_is_initialized(theap)) return theap;
-  if (_mi_is_main_thread() && heap_main==NULL) {
-    heap_main = &mi_process_heap_main;
-    theap = &mi_theap_main;
-    mi_heap_main_init();
-  }
-  else {
-    // allocates tld data
-    // note: we cannot access thread-locals yet as that can cause (recursive) allocation
-    // (on macOS <= 14 for example where the loader allocates thread-local data on demand).
-    if (heap_main==NULL) {
-      heap_main = mi_heap_main();
-      mi_assert_internal(heap_main == &mi_process_heap_main);
-    }
-    mi_assert_internal(heap_main!=NULL);
-    theap = mi_heap_check_for_existing_theap(heap_main);
-    if (theap==NULL)
-    {
-      // allocated the tld
-      mi_tld_t* tld = mi_tld_alloc(heap_main->subproc);
-      if (tld==NULL) return NULL;    // out-of-memory on tld allocation
 
-      // allocate and initialize the theap for the main heap
-      theap = _mi_theap_create( heap_main, tld);
-      if (theap==NULL) {
-        mi_tld_free(tld);
-        return NULL;  // out-of-memory on theap allocation
-      }
-    }
+  // initialize the default theap
+  // note: we cannot access thread-locals yet as that can cause (recursive) allocation
+  // (on macOS <= 14 for example where the loader allocates thread-local data on demand).
+  if (heap_main==NULL) {
+    heap_main = mi_heap_main();
+    mi_assert_internal(heap_main == &mi_process_heap_main);
   }
+  mi_assert_internal(heap_main!=NULL);
+
+  #if MI_DEBUG || defined(MI_TLS_RECURSE_GUARD)
+  theap = mi_heap_check_for_existing_theap(heap_main);  // recursion check
+  #if !defined(MI_TLS_RECURSE_GUARD)
+  mi_assert_internal(theap==NULL);
+  #endif
+  #else
+  theap = NULL;
+  #endif
+
+  if (theap==NULL) {
+    // allocated the tld
+    mi_tld_t* tld = mi_tld_create(heap_main->subproc);
+    if (tld==NULL) return NULL;    // out-of-memory on tld allocation
+    // allocate and initialize the theap for the main heap
+    if (tld==&mi_process_tld_main) {
+      theap = &mi_process_theap_main;          // initial theap is pre-allocated
+      theap->memid = _mi_memid_create_static(theap,sizeof(*theap));
+    }
+    else {
+      theap = _mi_theap_alloc(heap_main,tld);  // otherwise meta allocate
+      if (theap==NULL) { mi_tld_free(tld); return NULL; } // out-of-memory on theap allocation
+    }
+    _mi_theap_init(theap,heap_main,tld);
+  }
+
   // now initialize the thread
   _mi_theap_default_set(theap);
-
   // and only then set the heap_theap field as that accesses thread locals
   _mi_heap_theap_set(heap_main, theap);  // todo: can fail!
 
   mi_assert_internal(mi_theap_is_initialized(theap));
   mi_theap_t* const heap_theap = (heap_main==NULL ? NULL : (mi_theap_t*)_mi_thread_local_get(heap_main->theap));
   mi_assert_internal(heap_main==NULL || heap_theap == theap); MI_UNUSED_RELEASE(heap_theap);
+
+  mi_subproc_stat_increase(_mi_theap_subproc(theap), threads, 1);  // or theap stats and wait for merge?
+  // _mi_verbose_message("thread init: 0x%zx\n", _mi_thread_id());
   return theap;
 }
 
+mi_theap_t* _mi_thread_init(void) {
+  return _mi_thread_init_with_heap(NULL);
+}
+
+void mi_decl_noinline mi_thread_init(void) mi_attr_noexcept {
+  _mi_thread_init();
+}
+
+
+
+/* -----------------------------------------------------------
+  Theaps done
+----------------------------------------------------------- */
 
 // Free the thread local theaps
 static void mi_thread_theaps_done(mi_tld_t* tld)
@@ -15143,32 +14791,26 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
   _mi_theap_default_set((mi_theap_t*)&_mi_theap_empty);
   _mi_theap_cached_set((mi_theap_t*)&_mi_theap_empty);
 
-  // free the theaps of this thread.
-  // This can run concurrently with a `mi_heap_free_theaps` and we need to ensure we free theaps atomically.
-  // We do this in a loop where we release the theaps_lock at every potential re-iteration to unblock
-  // potential concurrent `mi_heap_free_theaps` which tries to remove the theap from our theaps list.
-  bool all_freed;
-  do {
-    all_freed = true;
-    mi_lock(&tld->theaps_lock) {
-      mi_theap_t* theap = tld->theaps;
-      while (theap != NULL) {
-        mi_theap_t* next = theap->tnext;
-        mi_assert_internal(theap->page_count==0);
-        if (!_mi_theap_free(theap, true /* acquire heap->theaps_lock */, false /* dont re-acquire the tld->theaps_lock*/ )) {
-          all_freed = false;
-        }
-        theap = next;
-      }
+  // We might run concurrently with a `mi_heap_free_theaps` and we need to ensure we free theaps atomically.
+  // we first detach our theaps list from any heaps
+  _mi_tld_detach_theaps(tld);
+
+  // no heaps point to our theaps anymore, free them
+  mi_lock(&tld->theaps_lock) { // paranoia
+    mi_theap_t* theap = tld->theaps;
+    tld->theaps = NULL;
+    while (theap != NULL) {
+      mi_theap_t* next = theap->tnext;
+      mi_assert_internal(theap->page_count==0);
+      mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);
+      theap->tld = NULL;
+      theap->tnext = NULL;
+      theap->tprev = NULL;
+      mi_assert_internal(mi_atomic_load_relaxed(&theap->refcount) == 1); // as the cached entry is set to empty
+      _mi_theap_decref(theap);
+      theap = next;
     }
-    if (!all_freed) {
-      mi_subproc_stat_counter_increase(tld->subproc,heaps_delete_wait,1);
-      _mi_prim_thread_yield();
-    }
-    else {
-      mi_assert_internal(tld->theaps==NULL);
-    }
-  } while (!all_freed);
+  }
 
   mi_assert(_mi_theap_default()==(mi_theap_t*)&_mi_theap_empty); // careful to not re-initialize the default theap during theap_delete
   mi_assert(!mi_theap_is_initialized(_mi_theap_default()));
@@ -15191,44 +14833,11 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
 // to set up the thread local keys.
 // --------------------------------------------------------
 
-// Set up handlers so `mi_thread_done` is called automatically
+// Set up hooks so `mi_thread_done` is called automatically
 static void mi_process_setup_auto_thread_done(void) {
   mi_atomic_do_once {
     _mi_prim_thread_init_auto_done();
-    _mi_theap_default_set(&mi_theap_main);
   }
-}
-
-
-bool _mi_is_main_thread(void) {
-  return (mi_process_tld_main.thread_id==0 || mi_process_tld_main.thread_id == _mi_thread_id());
-}
-
-// Initialize thread
-static mi_theap_t* mi_thread_init_ex(mi_heap_t* heap_main) mi_attr_noexcept
-{
-  // ensure our process has started already
-  mi_process_init();
-
-  // if the theap_default is already set we have already initialized
-  mi_theap_t* theap = _mi_theap_default();
-  if (mi_theap_is_initialized(theap)) return theap;
-
-  // otherwise initialize the default theap
-  theap = _mi_thread_init_theap_default(heap_main);
-  if (theap == NULL) return NULL; // out-of-memory on tld/theap allocation
-
-  mi_subproc_stat_increase(_mi_theap_subproc(theap), threads, 1);  // or theap stats and wait for merge?
-  // _mi_verbose_message("thread init: 0x%zx\n", _mi_thread_id());
-  return theap;
-}
-
-mi_theap_t* _mi_thread_init(void) {
-  return mi_thread_init_ex(NULL);
-}
-
-void mi_decl_noinline mi_thread_init(void) mi_attr_noexcept {
-  _mi_thread_init();
 }
 
 void mi_thread_done(void) mi_attr_noexcept {
@@ -15247,7 +14856,7 @@ void _mi_thread_done(mi_theap_t* _theap_main)
     return;
   }
 
-  // note: we store the tld as we should avoid reading `thread_tld` at this point (to avoid reinitializing the thread local storage)
+  // get the current tld
   mi_tld_t* const tld = _theap_main->tld;
 
   // release dynamic thread_local's
@@ -15266,229 +14875,16 @@ void _mi_thread_done(mi_theap_t* _theap_main)
   mi_tld_free(tld);
 }
 
-
-mi_decl_cold mi_decl_noinline mi_theap_t* _mi_theap_empty_get(void) {
-  return (mi_theap_t*)&_mi_theap_empty;
-}
-
-bool _mi_is_empty_theap(const mi_theap_t* theap) {
-  return (theap == &_mi_theap_empty);
-}
-
-
-#if MI_TLS_MODEL_WIN32
-
-// If we can, we use one of the 64 direct TLS slots (but fall back to expansion slots if needed)
-// See <https://en.wikipedia.org/wiki/Win32_Thread_Information_Block> for the offsets.
-#if MI_SIZE_SIZE==4
-#define MI_TLS_DIRECT_FIRST             (0x0E10 / MI_INTPTR_SIZE)
-#else
-#define MI_TLS_DIRECT_FIRST             (0x1480 / MI_INTPTR_SIZE)
-#endif
-#define MI_TLS_DIRECT_SLOTS             (64)
-#define MI_TLS_EXPANSION_SLOTS          (1024)
-
-#if !MI_WIN_DIRECT_TLS
-// We initially use the last of the expansion slots as the default NULL.
-// note: this will fail if the program allocates exactly 1024+64 slots with TlsAlloc 
-// before we are initialized :-( (but this seems quite unlikely).
-// (todo: another approach could be to use slot 7 (EnvironmentPointer) as the initial slot as that seems to be always NULL)
-#define MI_TLS_INITIAL_SLOT             MI_TLS_EXPANSION_SLOT
-#define MI_TLS_INITIAL_EXPANSION_SLOT   (MI_TLS_EXPANSION_SLOTS-1)
-#else
-// With direct tls we need an initial NULL slot outside the expansion slots
-#define MI_TLS_INITIAL_SLOT             (5)  // Arbitrary user pointer
-#define MI_TLS_INITIAL_EXPANSION_SLOT   (MI_TLS_EXPANSION_SLOTS-1)  // unused
-#endif
-
-// in case of errors assign fixed slots (but since we use EFAULT the program should fail anyways)
-#define MI_TLS_ERROR_SLOT               (5)   // arbitrary user pointer
-#define MI_TLS_ERROR_EXPANSION_SLOT     (7)   // environment pointer (only used for OS/2 emulation)
-
-
-mi_decl_hidden mi_decl_cache_align _Atomic(size_t) _mi_theap_default_slot = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_SLOT);
-mi_decl_hidden _Atomic(size_t) _mi_theap_default_expansion_slot = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_EXPANSION_SLOT);
-mi_decl_hidden _Atomic(size_t) _mi_theap_cached_slot            = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_SLOT);
-mi_decl_hidden _Atomic(size_t) _mi_theap_cached_expansion_slot  = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_EXPANSION_SLOT);
-
-static DWORD mi_tls_raw_index_default = TLS_OUT_OF_INDEXES;
-static DWORD mi_tls_raw_index_cached  = TLS_OUT_OF_INDEXES;
-
-static bool mi_win_tls_slot_alloc(_Atomic(size_t)* slot, _Atomic(size_t)* extended, DWORD* raw_index) {
-  // always write slot before extended due to concurrent readers
-  const DWORD index = TlsAlloc();
-  *raw_index = index;
-  if (index==TLS_OUT_OF_INDEXES) {
-    mi_atomic_store_release(slot,MI_TLS_ERROR_SLOT);
-    mi_atomic_store_release(extended,MI_TLS_ERROR_EXPANSION_SLOT);
-    return false;
-  }
-  else if (index<MI_TLS_DIRECT_SLOTS) {
-    mi_atomic_store_release(slot,index + MI_TLS_DIRECT_FIRST);
-    mi_atomic_store_release(extended,0);
-    return true;
-  }
-  #if !MI_WIN_DIRECT_TLS
-  else if (index < MI_TLS_DIRECT_SLOTS + MI_TLS_EXPANSION_SLOTS - 1) { // check maximum number of expansion slots - 1 (as we use the last one as the default)
-    mi_atomic_store_release(slot, MI_TLS_EXPANSION_SLOT);
-    mi_atomic_store_release(extended,index - MI_TLS_DIRECT_SLOTS);
-    return true;
-  }
-  #endif
-  else {
-    // to high an index for us
-    _mi_error_message(EFAULT, "returned TLS index was too high (%u)\n", index);
-    TlsFree(index);
-    *raw_index = TLS_OUT_OF_INDEXES;
-    mi_atomic_store_release(slot, MI_TLS_ERROR_SLOT);
-    mi_atomic_store_release(extended,MI_TLS_ERROR_EXPANSION_SLOT);
-    return false;
-  }
-}
-
-static void mi_win_tls_slot_free(_Atomic(size_t)*slot, _Atomic(size_t)*extended, DWORD* raw_index) {
-  if (*raw_index != TLS_OUT_OF_INDEXES) {
-    mi_atomic_store_release(slot, MI_TLS_ERROR_SLOT);
-    mi_atomic_store_release(extended, MI_TLS_ERROR_EXPANSION_SLOT);
-    TlsFree(*raw_index);
-    *raw_index = TLS_OUT_OF_INDEXES;
-  }
-}
-
-static void mi_tls_slots_init(void) {
-  mi_atomic_do_once {
-    bool ok = mi_win_tls_slot_alloc(&_mi_theap_default_slot, &_mi_theap_default_expansion_slot, &mi_tls_raw_index_default);
-    if (ok) {
-      ok = mi_win_tls_slot_alloc(&_mi_theap_cached_slot, &_mi_theap_cached_expansion_slot, &mi_tls_raw_index_cached);
-    }
-    if (!ok) {
-      _mi_error_message(EFAULT, "unable to allocate a fast TLS user slot.\n");
-    }
-  }
-}
-
-static void mi_tls_slots_done(void) {
-  mi_win_tls_slot_free(&_mi_theap_default_slot, &_mi_theap_default_expansion_slot, &mi_tls_raw_index_default);
-  mi_win_tls_slot_free(&_mi_theap_cached_slot, &_mi_theap_cached_expansion_slot, &mi_tls_raw_index_cached );
-}
-
-static void mi_win_tls_slot_set(size_t slot, size_t extended_slot, void* value) {
-  mi_assert_internal((slot >= MI_TLS_DIRECT_FIRST && slot < MI_TLS_DIRECT_FIRST + MI_TLS_DIRECT_SLOTS) || slot == MI_TLS_EXPANSION_SLOT);
-  if (slot < MI_TLS_DIRECT_FIRST + MI_TLS_DIRECT_SLOTS) {
-    mi_prim_tls_slot_set(slot, value);
-  }
-  else {
-    mi_assert_internal(extended_slot < MI_TLS_EXPANSION_SLOTS);
-    TlsSetValue((DWORD)(extended_slot + MI_TLS_DIRECT_SLOTS), value);  // use TlsSetValue to initialize the TlsExpansion array if needed
-  }
-}
-
-#elif MI_TLS_MODEL_PTHREADS
-
-// only for pthreads for now
-mi_decl_hidden pthread_key_t _mi_theap_default_key = MI_PTHREAD_KEY_INVALID;
-mi_decl_hidden pthread_key_t _mi_theap_cached_key = MI_PTHREAD_KEY_INVALID;
-
-static void mi_theap_cached_key_destroy(void* theapv) {
-  mi_theap_t* theap = (mi_theap_t*)theapv;
-  if (theap!=NULL) {
-    _mi_theap_decref(theap);
-  }
-}
-
-static void mi_tls_slots_init(void) {
-  mi_atomic_do_once {
-    _mi_pthread_key_create(&_mi_theap_default_key,NULL,NULL);
-    _mi_pthread_key_create(&_mi_theap_cached_key,&mi_theap_cached_key_destroy,NULL);
-  }  
-}
-
-static void mi_tls_slots_done(void) {
-  mi_pthread_key_delete(&_mi_theap_default_key);
-  mi_pthread_key_delete(&_mi_theap_cached_key);
-}
-
-#elif MI_TLS_MODEL_FIXED 
-
-static void mi_tls_slots_init(void) {
-  mi_atomic_do_once {
-    mi_theap_t* theap = _mi_theap_default();
-    if (theap!=NULL) {
-      _mi_error_message(EINVAL,"fixed TLS slot is already in use (slot %d = %p)", MI_TLS_MODEL_FIXED_DEFAULT, theap);
-    }
-    theap = _mi_theap_cached();
-    if (theap!=NULL) {
-      _mi_error_message(EINVAL,"fixed TLS slot is already in use (slot %d = %p)", MI_TLS_MODEL_FIXED_CACHED, theap);
-    }
-  }
-}
-
-static void mi_tls_slots_done(void) {
-  // nothing
-}
-
-
-#else
-
-static void mi_tls_slots_init(void) {
-  // nothing
-}
-
-static void mi_tls_slots_done(void) {
-  // nothing
-}
-
-#endif
-
-void _mi_theap_cached_set(mi_theap_t* theap) {
-  mi_theap_t* prev = _mi_theap_cached();
-  if (prev==theap) return;
-  // set
-  mi_tls_slots_init();
-  #if MI_TLS_MODEL_LOCAL
-    __mi_theap_cached = theap;
-  #elif MI_TLS_MODEL_FIXED
-    mi_prim_tls_slot_set(MI_TLS_MODEL_FIXED_CACHED, theap);
-  #elif MI_TLS_MODEL_WIN32
-    mi_win_tls_slot_set(_mi_theap_cached_slot, _mi_theap_cached_expansion_slot, theap);
-  #elif MI_TLS_MODEL_PTHREADS
-    mi_pthread_key_set(&_mi_theap_cached_key, theap);
-  #endif
-  // update refcounts (so cached theap memory keeps available until no longer cached)
-  _mi_theap_incref(theap);
-  _mi_theap_decref(prev);
-}
-
-void _mi_theap_default_set(mi_theap_t* theap)  {
-  mi_assert_internal(theap != NULL);
-  mi_assert_internal(theap->tld != NULL);
-  mi_assert_internal(theap->tld->thread_id==0 || theap->tld->thread_id==_mi_thread_id());
-  mi_tls_slots_init();
-  #if MI_TLS_MODEL_LOCAL
-    __mi_theap_default = theap;
-  #elif MI_TLS_MODEL_FIXED
-    mi_prim_tls_slot_set(MI_TLS_MODEL_FIXED_DEFAULT, theap);
-  #elif MI_TLS_MODEL_WIN32
-    mi_win_tls_slot_set(_mi_theap_default_slot, _mi_theap_default_expansion_slot, theap);
-  #elif MI_TLS_MODEL_PTHREADS
-    mi_pthread_key_set(&_mi_theap_default_key, theap);
-  #endif
-
-  // set theap main if needed
-  if (mi_theap_is_initialized(theap)) {
-    // ensure the default theap is passed to `_mi_thread_done` as on some platforms we cannot access TLS at thread termination (as it would allocate again)
-    _mi_prim_thread_associate_default_theap(theap);
-  }
-}
-
 void mi_thread_set_in_threadpool(void) mi_attr_noexcept {
   mi_theap_t* theap = mi_theap_get_default();
   theap->tld->is_in_threadpool = true;
 }
 
+
 // --------------------------------------------------------
-// Run functions on process init/done, and thread init/done
+// Process init and done
 // --------------------------------------------------------
+
 static bool os_preloading = true;    // true until this module is initialized
 
 // Returns true if this module has not been initialized; Don't use C runtime routines until it returns false.
@@ -15501,21 +14897,12 @@ mi_decl_nodiscard bool mi_is_redirected(void) mi_attr_noexcept {
   return _mi_is_redirected();
 }
 
-// Called once by the process loader from `src/prim/prim.c`
+// Called once by the process loader from `src/prim/prim.c` before `main` is called.
 void _mi_auto_process_init(void) {
-  // mi_heap_main_init();
-  // #if defined(__APPLE__) || defined(MI_TLS_RECURSE_GUARD)
-  // volatile mi_theap_t* dummy = __mi_theap_default; // access TLS to allocate it before setting tls_initialized to true;
-  // if (dummy == NULL) return;                       // use dummy or otherwise the access may get optimized away (issue #697)
-  // #endif
-
   os_preloading = false;
-  mi_assert_internal(_mi_is_main_thread());
 
   mi_process_init();
-  mi_tls_slots_init();
   mi_process_setup_auto_thread_done();
-  _mi_thread_locals_init();
 
   _mi_options_post_init();  // now we can print to stderr
   if (_mi_is_redirected()) _mi_verbose_message("malloc is redirected.\n");
@@ -15528,94 +14915,38 @@ void _mi_auto_process_init(void) {
   }
 
   // reseed random
-  _mi_random_reinit_if_weak(&mi_theap_main.random);
-}
-
-// CPU features
-mi_decl_cache_align size_t _mi_cpu_movsb_max = 0;  // for size <= max, rep movsb is fast
-mi_decl_cache_align size_t _mi_cpu_stosb_max = 0;  // for size <= max, rep stosb is fast
-mi_decl_cache_align bool _mi_cpu_has_popcnt = false;
-
-#if (MI_ARCH_X64 || MI_ARCH_X86)
-#if defined(__GNUC__)
-// #include <cpuid.h>
-static bool mi_cpuid(uint32_t* regs4, uint32_t level, uint32_t sublevel) {
-  // note: use explicit assembly instead of __get_cpuid as we need the sublevel (in ecx)
-  // (on Ubuntu 22 with WSL the __get_cpuid does not clear ecx for level 7 which is incorrect).
-  uint32_t eax, ebx, ecx, edx;
-  __asm __volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(level), "c"(sublevel) : );
-  regs4[0] = eax;
-  regs4[1] = ebx;
-  regs4[2] = ecx;
-  regs4[3] = edx;
-  return true;
-}
-
-#elif defined(_MSC_VER)
-static bool mi_cpuid(uint32_t* regs4, uint32_t level, uint32_t sublevel) {
-  __cpuidex((int32_t*)regs4, (int32_t)level, (int32_t)sublevel);
-  return true;
-}
-#else
-static bool mi_cpuid(uint32_t* regs4, uint32_t level, uint32_t sublevel) {
-  MI_UNUSED(regs4); MI_UNUSED(level); MI_UNUSED(sublevel);
-  return false;
-}
-#endif
-
-static void mi_detect_cpu_features(void) {
-  // FSRM for fast short rep movsb support (AMD Zen3+ (~2020) or Intel Ice Lake+ (~2017))
-  // EMRS for fast enhanced rep movsb/stosb support (not used at the moment, memcpy always seems faster?)
-  // FSRS for fast short rep stosb
-  bool amd = false;
-  bool fsrm = false;
-  // bool erms = false;
-  bool fsrs = false;
-  uint32_t cpu_info[4];
-  if (mi_cpuid(cpu_info, 0, 0)) {
-    amd = (cpu_info[2]==0x444d4163); // (Auth enti cAMD)
-  }
-  if (mi_cpuid(cpu_info, 7, 0)) {
-    fsrm = ((cpu_info[3] & (1 << 4)) != 0); // bit 4 of EDX : see <https://en.wikipedia.org/wiki/CPUID#EAX=7,_ECX=0:_Extended_Features>
-    // erms = ((cpu_info[1] & (1 << 9)) != 0); // bit 9 of EBX : see <https://en.wikipedia.org/wiki/CPUID#EAX=7,_ECX=0:_Extended_Features>
-  }
-  if (mi_cpuid(cpu_info, 7, 1)) {
-    fsrs = ((cpu_info[1] & (1 << 11)) != 0); // bit 11 of EBX: see <https://en.wikipedia.org/wiki/CPUID#EAX=7,_ECX=1:_Extended_Features>
-  }
-  if (mi_cpuid(cpu_info, 1, 0)) {
-    _mi_cpu_has_popcnt = ((cpu_info[2] & (1 << 23)) != 0); // bit 23 of ECX : see <https://en.wikipedia.org/wiki/CPUID#EAX=1:_Processor_Info_and_Feature_Bits>
-  }
-
-  if (fsrm) {
-    _mi_cpu_movsb_max = 127;
-  }
-  if (fsrs || (amd && fsrm)) {  // fsrm on amd implies fsrs, see: https://marc.info/?l=git-commits-head&m=168186277717803
-    _mi_cpu_stosb_max = 127;
+  mi_theap_t* theap = _mi_theap_default();
+  if (theap != NULL) {
+    _mi_random_reinit_if_weak(&theap->random);
+    mi_subproc_t* subproc = _mi_theap_subproc(theap);
+    if (subproc->theap_meta != NULL) {
+      mi_lock(&subproc->theap_meta_lock) {
+        _mi_random_reinit_if_weak(&subproc->theap_meta->random);
+      }
+    }
   }
 }
 
-#else
-static void mi_detect_cpu_features(void) {
-  #if MI_ARCH_ARM64
-  _mi_cpu_has_popcnt = true;
+
+// Initialize the process; called by thread_init, the process loader, or an initial allocation (perhaps by the loader or a system library)
+static void mi_process_init_once(void) {
+  #if defined(__CYGWIN__)   // we need to kickstart the cygwin runtime
+  __mi_thread_id_helper = NULL;
   #endif
-}
-#endif
-
-
-// Initialize the process; called by thread_init or the process loader
-static void mi_process_init_once(void) mi_attr_noexcept {
   _mi_verbose_message("process init: 0x%zx\n", _mi_thread_id());
 
-  mi_detect_cpu_features();
-  _mi_options_init();
-  _mi_stats_init();
-  _mi_os_init();
-  // the following can potentially allocate (on freeBSD for pthread keys)
-  // todo: do 2-phase so we can use stats at first, then later init the keys?
-  mi_heap_main_init(); // before page_map_init so stats are working
-  _mi_page_map_init(); // todo: this could fail.. should we abort in that case?
+  _mi_detect_cpu_features();
+  _mi_options_init();        // read environment (if possible)
+  _mi_stats_init();          // start timer
+  _mi_os_init();             // primitive dependent
+
+  mi_heap_main_init();       // before page_map_init so stats are working
+  _mi_page_map_init();       // todo: this could fail.. should we abort in that case?
   mi_thread_init();
+
+  // the following can potentially allocate (on freeBSD for pthread keys)
+  _mi_tls_slots_init();      // pthread key create
+  _mi_thread_locals_init();  // pthread key create
   _mi_process_is_initialized = true;
 
   #if defined(_WIN32) && defined(MI_WIN_INIT_USE_FLS)
@@ -15650,9 +14981,6 @@ static void mi_process_init_once(void) mi_attr_noexcept {
 
 // Initialize the process; called by thread_init or the process loader
 void mi_process_init(void) mi_attr_noexcept {
-  // #if _MSC_VER < 1920
-	// mi_heap_main_init(); // vs2017 can dynamically re-initialize _mi_heap_main
-	// #endif
   mi_atomic_do_once {
     mi_process_init_once();
   }
@@ -15667,7 +14995,10 @@ static void mi_process_done_once(void) {
   static bool process_done = false;
   if (process_done) return;
   process_done = true;
-  
+
+  // decref any cached theap
+  _mi_theap_cached_set(_mi_theap_empty_get());
+
   // release any thread specific resources and ensure _mi_thread_done is called on all but the main thread
   _mi_prim_thread_done_auto_done();
 
@@ -15690,51 +15021,55 @@ static void mi_process_done_once(void) {
   // Forcefully release all retained memory; this can be dangerous in general if overriding regular malloc/free
   // since after process_done there might still be other code running that calls `free` (like at_exit routines,
   // or C-runtime termination code.
+  mi_subproc_t* subproc_main = _mi_subproc_main();
   if (mi_option_is_enabled(mi_option_destroy_on_exit)) {
-    mi_subprocs_unsafe_destroy_all(); // destroys all subprocs, arenas, thread locals, and the page_map!
+    _mi_subprocs_unsafe_destroy_all(); // destroys all mi_subprocs, arenas, thread locals, and the page_map!
   }
   else {
     // free dynamic thread locals (if used at all)
+    _mi_thread_locals_thread_done();
     _mi_thread_locals_done();
-    if (subproc_main.heap_main != NULL) {
-      mi_heap_stats_merge_to_subproc(subproc_main.heap_main);
+    if (subproc_main->heap_main != NULL) {
+      if (mi_option_is_enabled(mi_option_show_stats) || mi_option_is_enabled(mi_option_verbose)) {
+        _mi_theap_merge_stats(subproc_main->theap_meta);
+        _mi_theap_merge_stats(_mi_theap_default());  // _mi_thread_locals_done can free
+        mi_heap_stats_merge_to_subproc(subproc_main->heap_main);
+        mi_subproc_stats_print_out(mi_subproc_main(), NULL, NULL);
+      }
     }
   }
 
-  // careful now to no longer access any allocator functionality
-  if (mi_option_is_enabled(mi_option_show_stats) || mi_option_is_enabled(mi_option_verbose)) {
-    mi_subproc_stats_print_out(mi_subproc_main(), NULL, NULL);
-  }
-  mi_lock_done(&subprocs_lock);
-  mi_tls_slots_done();
+  _mi_tls_slots_done();
+  _mi_subproc_main_done();
   _mi_allocator_done();
-  _mi_verbose_message("process done: 0x%zx\n", mi_process_tld_main.thread_id);
+  _mi_verbose_message("process done\n"); // : 0x%zx\n", mi_process_tld_main.thread_id);
   os_preloading = true; // don't call the C runtime anymore
 }
 
 
-// Called when the process is done (cdecl as it is used with `at_exit` on some platforms)
+// Call when the process is done (cdecl as it is used with `at_exit` on some platforms)
 void mi_cdecl mi_process_done(void) mi_attr_noexcept {
   mi_atomic_do_once {
     mi_process_done_once();
   }
 }
 
+// Called automatically when the process is done (cdecl as it is used with `at_exit` on some platforms)
 void mi_cdecl _mi_auto_process_done(void) mi_attr_noexcept {
-  if (_mi_option_get_fast(mi_option_destroy_on_exit)>1) return;
+  if (_mi_option_get_fast(mi_option_destroy_on_exit)>=2) return;  // allow disabling auto process done
   mi_process_done();
 }
 /* ---- end inlined: src/init.c ---- */
 /* ---- begin inlined: src/libc.c ---- */
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2024, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
 
 // --------------------------------------------------------
-// This module defines various std libc functions to reduce
+// This module defines various standard libc functions to reduce
 // the dependency on libc, and also prevent errors caused
 // by some libc implementations when called before `main`
 // executes (due to malloc redirection)
@@ -15844,7 +15179,7 @@ bool _mi_atomic_once_enter(mi_atomic_once_t* once) {
   }
   const mi_threadid_t current_tid = _mi_thread_id();
   if (once_tid == current_tid) {
-    return false; // recursive invocation; we need this for process_init for example
+    return false; // recursive invocation; don't block on ourselves
   }
 
   mi_lock_acquire(&once->lock);
@@ -15879,6 +15214,79 @@ mi_decl_noinline bool _mi_pthread_key_create(pthread_key_t* pkey, void (*destruc
   };
   mi_assert_internal(pthread_getspecific(*pkey)==init);
   return true;
+}
+#endif
+
+// --------------------------------------------------------
+// Detect CPU features
+// --------------------------------------------------------
+mi_decl_cache_align size_t _mi_cpu_movsb_max = 0;  // for size <= max, rep movsb is fast
+mi_decl_cache_align size_t _mi_cpu_stosb_max = 0;  // for size <= max, rep stosb is fast
+mi_decl_cache_align bool   _mi_cpu_has_popcnt = false;
+
+#if (MI_ARCH_X64 || MI_ARCH_X86)
+#if defined(__GNUC__)
+// #include <cpuid.h>
+static bool mi_cpuid(uint32_t* regs4, uint32_t level, uint32_t sublevel) {
+  // note: use explicit assembly instead of __get_cpuid as we need the sublevel (in ecx)
+  // (on Ubuntu 22 with WSL the __get_cpuid does not clear ecx for level 7 which is incorrect).
+  uint32_t eax, ebx, ecx, edx;
+  __asm __volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(level), "c"(sublevel) : );
+  regs4[0] = eax;
+  regs4[1] = ebx;
+  regs4[2] = ecx;
+  regs4[3] = edx;
+  return true;
+}
+
+#elif defined(_MSC_VER)
+static bool mi_cpuid(uint32_t* regs4, uint32_t level, uint32_t sublevel) {
+  __cpuidex((int32_t*)regs4, (int32_t)level, (int32_t)sublevel);
+  return true;
+}
+#else
+static bool mi_cpuid(uint32_t* regs4, uint32_t level, uint32_t sublevel) {
+  MI_UNUSED(regs4); MI_UNUSED(level); MI_UNUSED(sublevel);
+  return false;
+}
+#endif
+
+void _mi_detect_cpu_features(void) {
+  // FSRM for fast short rep movsb support (AMD Zen3+ (~2020) or Intel Ice Lake+ (~2017))
+  // EMRS for fast enhanced rep movsb/stosb support (not used at the moment, memcpy always seems faster?)
+  // FSRS for fast short rep stosb
+  bool amd = false;
+  bool fsrm = false;
+  // bool erms = false;
+  bool fsrs = false;
+  uint32_t cpu_info[4];
+  if (mi_cpuid(cpu_info, 0, 0)) {
+    amd = (cpu_info[2]==0x444d4163); // (Auth enti cAMD)
+  }
+  if (mi_cpuid(cpu_info, 7, 0)) {
+    fsrm = ((cpu_info[3] & (1 << 4)) != 0); // bit 4 of EDX : see <https://en.wikipedia.org/wiki/CPUID#EAX=7,_ECX=0:_Extended_Features>
+    // erms = ((cpu_info[1] & (1 << 9)) != 0); // bit 9 of EBX : see <https://en.wikipedia.org/wiki/CPUID#EAX=7,_ECX=0:_Extended_Features>
+  }
+  if (mi_cpuid(cpu_info, 7, 1)) {
+    fsrs = ((cpu_info[1] & (1 << 11)) != 0); // bit 11 of EBX: see <https://en.wikipedia.org/wiki/CPUID#EAX=7,_ECX=1:_Extended_Features>
+  }
+  if (mi_cpuid(cpu_info, 1, 0)) {
+    _mi_cpu_has_popcnt = ((cpu_info[2] & (1 << 23)) != 0); // bit 23 of ECX : see <https://en.wikipedia.org/wiki/CPUID#EAX=1:_Processor_Info_and_Feature_Bits>
+  }
+
+  if (fsrm) {
+    _mi_cpu_movsb_max = 127;
+  }
+  if (fsrs || (amd && fsrm)) {  // fsrm on amd implies fsrs, see: https://marc.info/?l=git-commits-head&m=168186277717803
+    _mi_cpu_stosb_max = 127;
+  }
+}
+
+#else
+void _mi_detect_cpu_features(void) {
+  #if MI_ARCH_ARM64
+  _mi_cpu_has_popcnt = true;
+  #endif
 }
 #endif
 
@@ -17322,7 +16730,7 @@ int mi_version(void) {
 #endif
 
 #ifndef MI_DEFAULT_PAGEMAP_COMMIT
-#if defined(__APPLE__)  // when overloading malloc, we still get mixed pointers sometimes on macOS; this avoids a bad access
+#if defined(__APPLE__) && MI_PAGE_MAP_FLAT  // when overloading malloc, we still get mixed pointers sometimes on macOS; this avoids a bad access
 #define MI_DEFAULT_PAGEMAP_COMMIT 1
 #else
 #define MI_DEFAULT_PAGEMAP_COMMIT 0
@@ -17462,7 +16870,7 @@ mi_decl_export void mi_options_print_out(mi_output_fun* out, void* arg) mi_attr_
   const int vermajor = MI_MALLOC_VERSION/10000;
   const int verminor = (MI_MALLOC_VERSION%10000)/100;
   const int verpatch = (MI_MALLOC_VERSION%100);
-  _mi_fprintf(out, arg, "v%i.%i.%i%s%s (built on %s, %s)\n", vermajor, verminor, verpatch,
+  _mi_fprintf(out, arg, "v%i.%i.%i%s%s\n", vermajor, verminor, verpatch,
       #if defined(MI_CMAKE_BUILD_TYPE)
       ", " mi_stringify(MI_CMAKE_BUILD_TYPE)
       #else
@@ -17474,7 +16882,7 @@ mi_decl_export void mi_options_print_out(mi_output_fun* out, void* arg) mi_attr_
       #else
       ""
       #endif
-      , __DATE__, __TIME__);
+      );
 
   // show options
   for (int i = 0; i < _mi_option_last; i++) {
@@ -17762,7 +17170,7 @@ void _mi_fprintf( mi_output_fun* out, void* arg, const char* fmt, ... ) {
 }
 
 static void mi_vfprintf_thread(mi_output_fun* out, void* arg, const char* prefix, const char* fmt, va_list args) {
-  if (prefix != NULL && _mi_strnlen(prefix,33) <= 32 && !_mi_is_main_thread()) {
+  if (prefix != NULL && _mi_strnlen(prefix,33) <= 32) { // && !_mi_is_main_thread()) {
     char tprefix[64];
     _mi_snprintf(tprefix, sizeof(tprefix), "%sthread 0x%tx: ", prefix, (uintptr_t)_mi_thread_id());
     mi_vfprintf(out, arg, tprefix, fmt, args);
@@ -17845,7 +17253,7 @@ static void mi_error_default(int err) {
     }
   #endif
   #if defined(MI_XMALLOC)
-    if (err==ENOMEM || err==EOVERFLOW || err=EINVAL) { // abort on memory allocation fails in xmalloc mode
+    if (err==ENOMEM || err==EOVERFLOW || err==EINVAL) { // abort on memory allocation fails in xmalloc mode
       abort();
     }
   #endif
@@ -18471,6 +17879,7 @@ void* _mi_os_alloc_aligned_at_offset(mi_subproc_t* subproc, size_t size, size_t 
     void* const p = (uint8_t*)start + extra;
     mi_assert(_mi_is_aligned((uint8_t*)p + offset, alignment));
     // decommit the overallocation at the start
+    // note: this double counts the decommit when freeing `memid`. Should we keep commit size in the memid as well?
     if (commit && extra >= _mi_os_page_size()) {
       _mi_os_decommit(subproc, start, extra);
     }
@@ -18974,7 +18383,7 @@ static inline size_t mi_page_queue_count(const mi_page_queue_t* pq) {
 // Returns MI_BIN_HUGE if the size is too large.
 // We use `wsize` for the size in "machine word sizes",
 // i.e. byte size == `wsize*sizeof(void*)`.
-static mi_decl_noinline size_t mi_bin(size_t size) {
+static size_t mi_bin(size_t size) {
   size_t wsize = _mi_wsize_from_size(size);
 #if defined(MI_ALIGN4W)
   if mi_likely(wsize <= 4) {
@@ -19125,7 +18534,7 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
   if (size > MI_SMALL_SIZE_MAX) return;
 
   mi_page_t* page = pq->first;
-  if (pq->first == NULL) page = (mi_page_t*)&_mi_page_empty;
+  if (pq->first == NULL) page = _mi_page_empty_get();
 
   // find index in the right direct page array
   const size_t idx = _mi_wsize_from_size(size);
@@ -19400,7 +18809,7 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   
   mi_assert_internal(page->heap!=NULL);
   mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
-  mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap);
+  mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED);
 
   // const size_t bsize = mi_page_block_size(page);
   // uint8_t* start = mi_page_start(page);
@@ -19442,7 +18851,7 @@ bool _mi_page_is_valid(mi_page_t* page) {
     //mi_assert_internal(!_mi_process_is_initialized);
     mi_assert_internal(page->heap!=NULL);
     mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
-    mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap);
+    mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED);
     {
       mi_page_queue_t* pq = mi_page_queue_of(page);
       mi_assert_internal(mi_page_queue_contains(pq, page));
@@ -19521,8 +18930,8 @@ static void mi_page_thread_free_collect(mi_page_t* page)
 }
 
 // returns `true` if after collection `mi_page_immediate_available` is true.
-static bool mi_page_free_quick_collect(mi_page_t* page) {
-  if (page->free != NULL) return true;
+static inline bool mi_page_free_quick_collect(mi_page_t* page) {
+  if mi_likely(page->free != NULL) return true;
   if (page->local_free == NULL) return false;
   // move local_free to free
   page->free = page->local_free;
@@ -19619,7 +19028,7 @@ void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
     mi_page_set_theap(page, NULL);
     page->theap = theap; // don't actually set theap to NULL so we can reclaim_on_free within the same theap
     _mi_arenas_page_abandon(page, theap);
-    _mi_arenas_collect(false, false, theap->tld); // allow purging
+    // _mi_arenas_collect(false, false, theap->tld); // allow purging
   }
 }
 
@@ -19728,7 +19137,7 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
   mi_theap_t* theap = mi_page_theap(page); mi_assert_internal(theap!=NULL);
   mi_page_set_theap(page,NULL);
   _mi_arenas_page_free(page, theap);
-  _mi_arenas_collect(false, false, theap->tld);  // allow purging
+  // _mi_arenas_collect(false, false, theap->tld);  // allow purging
 }
 
 #define MI_RETIRE_CYCLES      (16)
@@ -19777,34 +19186,6 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   _mi_page_free(page, pq);
 }
 
-// free retired pages: we don't need to look at the entire queues
-// since we only retire pages that are at the head position in a queue.
-void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
-  size_t min = MI_BIN_FULL;
-  size_t max = 0;
-  for(size_t bin = theap->page_retired_min; bin <= theap->page_retired_max; bin++) {
-    mi_page_queue_t* pq   = &theap->pages[bin];
-    mi_page_t*       page = pq->first;
-    if (page != NULL && page->retire_expire != 0) {
-      if (mi_page_all_free(page)) {
-        page->retire_expire--;
-        if (page->retire_expire == 0 || force) {
-          _mi_page_free(page, pq);
-        }
-        else {
-          // keep retired, update min/max
-          if (bin < min) min = bin;
-          if (bin > max) max = bin;
-        }
-      }
-      else {
-        page->retire_expire = 0;
-      }
-    }
-  }
-  theap->page_retired_min = min;
-  theap->page_retired_max = max;
-}
 
 /* Stays commented out deliberately -- see issue #128 B2 and C1.
 
@@ -19856,6 +19237,40 @@ static void mi_theap_collect_full_pages(mi_theap_t* theap) {
   }
 }
 */
+
+// free retired pages: we don't need to look at the entire queues
+// since we only retire pages that are at the head position in a queue.
+void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
+  size_t min = MI_BIN_FULL;
+  size_t max = 0;
+  for(size_t bin = theap->page_retired_min; bin <= theap->page_retired_max; bin++) {
+    mi_page_queue_t* pq   = &theap->pages[bin];
+    mi_page_t*       page = pq->first;
+    if (page != NULL && page->retire_expire != 0) {
+      if (mi_page_all_free(page)) {
+        page->retire_expire--;
+        if (page->retire_expire == 0 || force) {
+          _mi_page_free(page, pq);
+        }
+        else {
+          // keep retired, update min/max
+          if (bin < min) min = bin;
+          if (bin > max) max = bin;
+        }
+      }
+      else {
+        page->retire_expire = 0;
+      }
+    }
+  }
+  theap->page_retired_min = min;
+  theap->page_retired_max = max;
+  // NOTE: not calling `mi_theap_collect_full_pages` here -- see issue #128 B2/C1
+  // comment above; upstream `bf054991` un-commented it but the fork deliberately
+  // keeps it disabled (measured: no reachable leak at this pin).
+}
+
+
 
 
 /* -----------------------------------------------------------
@@ -20000,7 +19415,8 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   mi_assert_internal(extend < (1UL<<16));
 
   // commit on demand?
-  if (page->slice_committed > 0) {
+  const size_t slice_committed = mi_page_slice_committed(page);
+  if (slice_committed > 0) {
     // reduce extend if it commits more than an arena slice
     if ((extend * bsize) > MI_ARENA_SLICE_SIZE) {
       extend = _mi_divide_up(MI_ARENA_SLICE_SIZE, bsize);
@@ -20008,7 +19424,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
     // commit required size
     const size_t needed_size = (page->capacity + extend)*bsize;
     mi_assert_internal(needed_size <= page_size);
-    size_t needed_commit = _mi_align_up( mi_page_slice_offset_of(page, needed_size), MI_PAGE_MIN_COMMIT_SIZE );
+    size_t needed_commit = _mi_align_up( mi_page_slice_offset_of(page, needed_size), mi_page_min_commit_size());
     #if MI_SECURE>=5
     // the previous alignup could extend the commit into the guard page; re-adjust if needed
     const size_t page_size_commit = _mi_align_up( mi_page_slice_offset_of(page, page_size), _mi_os_page_size() );    
@@ -20016,13 +19432,13 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
       needed_commit = page_size_commit;
     }
     #endif
-    if (needed_commit > page->slice_committed) {
-      mi_assert_internal(((needed_commit - page->slice_committed) % _mi_os_page_size()) == 0);
-      if (!_mi_os_commit(_mi_theap_subproc(theap), mi_page_slice_start(page) + page->slice_committed, needed_commit - page->slice_committed, NULL)) {
+    if (needed_commit > slice_committed) {
+      mi_assert_internal(((needed_commit - slice_committed) % _mi_os_page_size()) == 0);
+      if (!_mi_os_commit(_mi_theap_subproc(theap), mi_page_slice_start(page) + slice_committed, needed_commit - slice_committed, NULL)) {
         return false;
       }
-      mi_assert_internal(needed_commit < UINT32_MAX);
-      page->slice_committed = (uint32_t)needed_commit;
+      mi_assert_internal(needed_commit <= UINT16_MAX * _mi_os_page_size());
+      page->slice_pcommitted = (uint16_t)(needed_commit / _mi_os_page_size());
     }
   }
 
@@ -20187,7 +19603,7 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
 
   if (page == NULL) {
     _mi_theap_collect_retired(theap, false); // perhaps make a page available
-    page = mi_page_fresh(theap, pq);
+    page = mi_page_fresh(theap, pq);         
     mi_assert_internal(page == NULL || mi_page_immediate_available(page));
     if (page == NULL && first_try) {
       // out-of-memory _or_ an abandoned page with free blocks was reclaimed, try once again
@@ -20208,29 +19624,105 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   return page;
 }
 
-
-
-// Find a page with free blocks of `size`.
-static mi_page_t* mi_find_free_page(mi_theap_t* theap, mi_page_queue_t* pq) {
-  // mi_page_queue_t* pq = mi_page_queue(theap, size);
+// Look for a page with free blocks of `size` but don't try to search or allocate
+static inline mi_page_t* mi_page_queue_lookup_free_first(mi_theap_t* theap, mi_page_queue_t* pq) {
   mi_assert_internal(!mi_page_queue_is_huge(pq));
-
-  // check the first page: we even do this with candidate search or otherwise we re-search every time
   mi_page_t* page = pq->first;
-  if mi_likely(page != NULL && mi_page_free_quick_collect(page)) {
+  if mi_likely(page!=NULL && mi_page_free_quick_collect(page)) {
+    // fast path
     #if (MI_SECURE>=2) // in secure mode, we extend half the time to increase randomness
     if (page->capacity < page->reserved && ((_mi_theap_random_next(theap) & 1) == 1)) {
       (void)mi_page_extend_free(theap, page);  // ok if this fails
       mi_assert_internal(mi_page_immediate_available(page));
     }
+    #else
+    MI_UNUSED(theap);
     #endif
     page->retire_expire = 0;
-    return page; // fast path
+    mi_assert_internal(mi_page_immediate_available(page));
+    mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+    mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
+    return page;
   }
   else {
-    return mi_page_queue_find_free_ex(theap, pq, true);
+    return NULL;
   }
 }
+
+// Find a page with free blocks of `size`.
+static inline mi_page_t* mi_page_queue_find_free(mi_theap_t* theap, mi_page_queue_t* pq) {
+  // mi_page_queue_t* pq = mi_page_queue(theap, size);
+  mi_assert_internal(!mi_page_queue_is_huge(pq));
+
+  // check the first page: we even do this with candidate search or otherwise we re-search every time
+  mi_page_t* page = mi_page_queue_lookup_free_first(theap,pq);
+  if (page==NULL) {
+    page = mi_page_queue_find_free_ex(theap, pq, true);
+    if (page==NULL) return NULL;
+  }  
+  mi_assert_internal(mi_page_immediate_available(page));
+  mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
+  return page;
+}
+
+// Huge pages contain just one block, and the segment contains just that page.
+// Huge pages are also use if the requested alignment is very large (> MI_BLOCK_ALIGNMENT_MAX)
+// so their size is not always `> MI_LARGE_OBJ_SIZE_MAX`.
+static mi_page_t* mi_huge_page_alloc(mi_theap_t* theap, size_t size, size_t page_alignment, mi_page_queue_t* pq) {
+  const size_t block_size = _mi_os_good_alloc_size(size);
+  // mi_assert_internal(mi_bin(block_size) == MI_BIN_HUGE || page_alignment > 0);
+  #if MI_HUGE_PAGE_ABANDON
+  #error todo.
+  #else
+  // mi_page_queue_t* pq = mi_page_queue(theap, MI_LARGE_MAX_OBJ_SIZE+1);  // always in the huge queue regardless of the block size
+  mi_assert_internal(mi_page_queue_is_huge(pq));
+  #endif
+  mi_page_t* page = mi_page_fresh_alloc(theap, pq, block_size, page_alignment);
+  if (page != NULL) {
+    mi_assert_internal(mi_page_block_size(page) >= size);
+    mi_assert_internal(mi_page_immediate_available(page));
+    mi_assert_internal(mi_page_is_huge(page));
+    mi_assert_internal(mi_page_is_singleton(page));
+    #if MI_HUGE_PAGE_ABANDON
+    mi_assert_internal(mi_page_is_abandoned(page));
+    mi_page_set_theap(page, NULL);
+    #endif
+    mi_theap_stat_increase(theap, malloc_huge, mi_page_block_size(page));
+    mi_theap_stat_counter_increase(theap, malloc_huge_count, 1);
+  }
+  return page;
+}
+
+// Allocate a page
+// Note: in debug mode the size includes MI_PADDING_SIZE and might have overflowed.
+static mi_page_t* mi_find_page(mi_theap_t* theap, size_t size, size_t huge_alignment) mi_attr_noexcept {
+  const size_t req_size = size - MI_PADDING_SIZE;  // correct for padding_size in case of an overflow on `size`
+  if mi_unlikely(req_size > MI_MAX_ALLOC_SIZE) {
+    _mi_error_message(EOVERFLOW, "allocation request is too large (%zu bytes)\n", req_size);
+    return NULL;
+  }
+  mi_page_queue_t* pq = mi_page_queue(theap, (huge_alignment > 0 ? MI_LARGE_MAX_OBJ_SIZE+1 : size));
+  mi_page_t* page;
+  // huge allocation?
+  if mi_unlikely(mi_page_queue_is_huge(pq) || req_size > MI_MAX_ALLOC_SIZE) {
+    page = mi_huge_page_alloc(theap,size,huge_alignment,pq);
+  }
+  else {
+    // otherwise find a page with free blocks in our size segregated queues
+    #if MI_PADDING
+    mi_assert_internal(size >= MI_PADDING_SIZE);
+    #endif
+    page = mi_page_queue_find_free(theap,pq);
+  }
+  if (page==NULL) return NULL;
+  mi_assert_internal(mi_page_block_size(page) >= size);
+  mi_assert_internal(mi_page_immediate_available(page));
+  mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
+  return page;
+}
+
 
 
 /* -----------------------------------------------------------
@@ -20262,77 +19754,11 @@ void mi_register_deferred_free(mi_deferred_free_fun* fn, void* arg) mi_attr_noex
 
 
 /* -----------------------------------------------------------
-  General allocation
+  Admin
 ----------------------------------------------------------- */
 
-// Huge pages contain just one block, and the segment contains just that page.
-// Huge pages are also use if the requested alignment is very large (> MI_BLOCK_ALIGNMENT_MAX)
-// so their size is not always `> MI_LARGE_OBJ_SIZE_MAX`.
-static mi_page_t* mi_huge_page_alloc(mi_theap_t* theap, size_t size, size_t page_alignment, mi_page_queue_t* pq) {
-  const size_t block_size = _mi_os_good_alloc_size(size);
-  // mi_assert_internal(mi_bin(block_size) == MI_BIN_HUGE || page_alignment > 0);
-  #if MI_HUGE_PAGE_ABANDON
-  #error todo.
-  #else
-  // mi_page_queue_t* pq = mi_page_queue(theap, MI_LARGE_MAX_OBJ_SIZE+1);  // always in the huge queue regardless of the block size
-  mi_assert_internal(mi_page_queue_is_huge(pq));
-  #endif
-  mi_page_t* page = mi_page_fresh_alloc(theap, pq, block_size, page_alignment);
-  if (page != NULL) {
-    mi_assert_internal(mi_page_block_size(page) >= size);
-    mi_assert_internal(mi_page_immediate_available(page));
-    mi_assert_internal(mi_page_is_huge(page));
-    mi_assert_internal(mi_page_is_singleton(page));
-    #if MI_HUGE_PAGE_ABANDON
-    mi_assert_internal(mi_page_is_abandoned(page));
-    mi_page_set_theap(page, NULL);
-    #endif
-    mi_theap_stat_increase(theap, malloc_huge, mi_page_block_size(page));
-    mi_theap_stat_counter_increase(theap, malloc_huge_count, 1);
-  }
-  return page;
-}
-
-
-// Allocate a page
-// Note: in debug mode the size includes MI_PADDING_SIZE and might have overflowed.
-static mi_page_t* mi_find_page(mi_theap_t* theap, size_t size, size_t huge_alignment) mi_attr_noexcept {
-  const size_t req_size = size - MI_PADDING_SIZE;  // correct for padding_size in case of an overflow on `size`
-  if mi_unlikely(req_size > MI_MAX_ALLOC_SIZE) {
-    _mi_error_message(EOVERFLOW, "allocation request is too large (%zu bytes)\n", req_size);
-    return NULL;
-  }
-  mi_page_queue_t* pq = mi_page_queue(theap, (huge_alignment > 0 ? MI_LARGE_MAX_OBJ_SIZE+1 : size));
-  // huge allocation?
-  if mi_unlikely(mi_page_queue_is_huge(pq) || req_size > MI_MAX_ALLOC_SIZE) {
-    return mi_huge_page_alloc(theap,size,huge_alignment,pq);
-  }
-  else {
-    // otherwise find a page with free blocks in our size segregated queues
-    #if MI_PADDING
-    mi_assert_internal(size >= MI_PADDING_SIZE);
-    #endif
-    return mi_find_free_page(theap, pq);
-  }
-}
-
-
-// Generic allocation routine if the fast path (`alloc.c:mi_page_malloc`) does not succeed.
-// Note: in debug mode the size includes MI_PADDING_SIZE and might have overflowed.
-// The `huge_alignment` is normally 0 but is set to a multiple of MI_SLICE_SIZE for
-// very large requested alignments in which case we use a huge singleton page.
-// Note: we put `bool zero, size_t huge_alignment` into one parameter (with zero in the low bit)
-// to use 4 parameters which compiles better on msvc for the malloc fast path.
-void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignment, size_t* usable) mi_attr_noexcept
+static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap) 
 {
-  const bool zero = ((zero_huge_alignment & 1) != 0);
-  const size_t huge_alignment = (zero_huge_alignment & ~1);
-
-  #if !MI_THEAP_INITASNULL
-  mi_assert_internal(theap != NULL);
-  #endif
-
-  // initialize if necessary
   if mi_unlikely(!mi_theap_is_initialized(theap)) {
     if (theap==&_mi_theap_empty_wrong) {
       // we were unable to allocate a theap for a first-class heap
@@ -20345,22 +19771,35 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   mi_assert_internal(mi_theap_is_initialized(theap));
 
   // do administrative tasks every N generic mallocs
-  if mi_unlikely(++theap->generic_count >= 1000) {
+  if mi_unlikely(theap->generic_count >= 1000) {
     theap->generic_collect_count += theap->generic_count;
     theap->generic_count = 0;
-    // call potential deferred free routines
-    _mi_deferred_free(theap, false);
-    // free retired pages
-    _mi_theap_collect_retired(theap, false);
-
-    // collect every once in a while (10000 by default)
+    
+    // do a full theap collect every once in a while (10000 by default)
     const long generic_collect = mi_option_get_clamp(mi_option_generic_collect, 1, 1000000L);
     if (theap->generic_collect_count >= generic_collect) {
       theap->generic_collect_count = 0;
       mi_theap_collect(theap, false /* force? */);
     }
+    else {
+      // otherwise we do a mini-collect
+      _mi_deferred_free(theap, false);         // call potential deferred free routines      
+      _mi_theap_collect_retired(theap, false); // free retired pages      
+    }
   }
+  return theap;
+}
 
+/* -----------------------------------------------------------
+  Generic allocation
+----------------------------------------------------------- */
+
+static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) 
+{  
+  // initialize if necessary
+  theap = mi_malloc_generic_admin(theap);
+  if (theap==NULL) return NULL;
+  
   // find (or allocate) a page of the right size
   mi_page_t* page = mi_find_page(theap, size, huge_alignment);
   if mi_unlikely(page == NULL) { // first time out of memory, try to collect and retry the allocation once more
@@ -20380,7 +19819,7 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
 
   // and try again, this time succeeding! (i.e. this should never recurse through _mi_page_malloc)
-  if (usable!=NULL) { *usable = mi_page_usable_block_size(page); }
+  if (ppage!=NULL) { *ppage = page; }
   void* const p = _mi_page_malloc_zero(theap,page,size,zero);
   mi_assert_internal(p != NULL);
 
@@ -20389,6 +19828,41 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
     mi_page_to_full(page, mi_page_queue_of(page));
   }
   return p;
+}
+
+
+// Generic allocation routine if the fast path (`alloc.c:mi_page_malloc`) does not succeed.
+// Note: in debug mode the size includes MI_PADDING_SIZE and might have overflowed.
+// The `huge_alignment` is normally 0 but is set to a multiple of MI_SLICE_SIZE for
+// very large requested alignments in which case we use a huge singleton page.
+// Note: we put `bool zero, size_t huge_alignment` into one parameter (with zero in the low bit)
+// to use 4 parameters which compiles better on msvc for the malloc fast path.
+void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignment, mi_page_t** ppage) mi_attr_noexcept
+{
+  #if !MI_THEAP_INITASNULL
+  mi_assert_internal(theap != NULL);
+  #endif
+  const bool zero = ((zero_huge_alignment & 1) != 0);
+  const size_t huge_alignment = (zero_huge_alignment & ~1);
+  mi_page_t* page = NULL;
+
+  // fast path objects that fit in a small page
+  if mi_likely(mi_theap_is_initialized(theap) && ++theap->generic_count < 1000 && huge_alignment==0) {
+    const size_t req_size = size - MI_PADDING_SIZE;  // correct for padding_size in case of an overflow on `size`
+    if (req_size < MI_SMALL_MAX_OBJ_SIZE) {
+      mi_page_queue_t* pq = mi_page_queue(theap, size);
+      mi_assert_internal(pq!=NULL && !mi_page_queue_is_huge(pq));
+      page = mi_page_queue_find_free(theap,pq);
+      // mi_assert_internal(mi_page_block_size(page) <= MI_SMALL_MAX_OBJ_SIZE);
+      if (page!=NULL) {        
+        if (ppage!=NULL) { *ppage = page; }
+        mi_assert_internal(mi_page_immediate_available(page));
+        return _mi_page_malloc_zero(theap,page,size,zero);
+      }
+    }
+  }
+  // otherwise fallback
+  return mi_malloc_generic_fallback(theap,size,zero, huge_alignment,ppage);
 }
 /* ---- end inlined: src/page.c ---- */
 /* ---- begin inlined: src/page-map.c ---- */
@@ -20604,46 +20078,68 @@ mi_decl_nodiscard mi_decl_export bool mi_is_in_heap_region(const void* p) mi_att
 
 // A 2-level page map
 #define MI_PAGE_MAP_SUB_SIZE          (MI_PAGE_MAP_SUB_COUNT * sizeof(mi_page_t*))
-#define MI_PAGE_MAP_ENTRIES_PER_CBIT  (MI_PAGE_MAP_COUNT < MI_BFIELD_BITS ? 1 : (MI_PAGE_MAP_COUNT / MI_BFIELD_BITS))
 
-// Use an initial empty page map so `free(NULL)` works even if mimalloc is not yet initialized (issue #1341)
-static mi_page_t*            mi_submap_empty[1]    = { NULL };
-static _Atomic(mi_submap_t)  mi_page_map_empty[1]  = { MI_ATOMIC_VAR_INIT(mi_submap_empty) };
+// Use an initial empty page map so `free(NULL)` works even if mimalloc is not yet initialized (issue #1341).
+// The first submap must be a real (all-NULL) table: `_mi_unchecked_ptr_page` indexes `submaps[0][0]` for
+// `p==NULL` without checking the submap, so a NULL entry here makes `free(NULL)` before initialization
+// fault at address 0 (glibc 2.44's `__newlocale` does exactly that from the loader, before any constructor).
+// imported from oven-sh/mimalloc @ 942b8342 (commit 7ac561ab), MIT -- see #266.
+static mi_page_t*     mi_submap_empty[MI_PAGE_MAP_SUB_COUNT];   // zero-initialized: every lookup yields no page
+static mi_page_map_t  mi_page_map_empty = {
+  MI_ATOMIC_VAR_INIT(1),
+  sizeof(mi_page_map_t),
+  MI_MEMID_STATIC,
+  MI_LOCK_INITIALIZER,
+  { MI_ATOMIC_VAR_INIT(mi_submap_empty) }
+};
 
-mi_decl_hidden mi_decl_cache_align _Atomic(mi_submap_t)* _mi_page_map = mi_page_map_empty;
-mi_decl_hidden _Atomic(void*) _mi_page_map_max_address = NULL;
-static size_t       mi_page_map_count;
-static mi_memid_t   mi_page_map_memid;
-static mi_lock_t    mi_page_map_lock;
+mi_decl_hidden mi_decl_cache_align _Atomic(mi_page_map_t*) __mi_page_map  = MI_ATOMIC_VAR_INIT(&mi_page_map_empty);
 
-// divide the main map in 64 (`MI_BFIELD_BITS`) parts commit those parts on demand
-static _Atomic(mi_bfield_t)  mi_page_map_commit;
-
-mi_decl_nodiscard static inline bool mi_page_map_is_committed(size_t idx, size_t* pbit_idx) {
-  mi_bfield_t commit = mi_atomic_load_relaxed(&mi_page_map_commit);
-  const size_t bit_idx = idx/MI_PAGE_MAP_ENTRIES_PER_CBIT;
-  mi_assert_internal(bit_idx < MI_BFIELD_BITS);
-  if (pbit_idx != NULL) { *pbit_idx = bit_idx; }
-  return ((commit & (MI_ZU(1) << bit_idx)) != 0);
+static size_t mi_page_map_count_of_size(size_t size) {
+  return (size < sizeof(mi_page_map_t) ? 0 : 1 + (size - sizeof(mi_page_map_t))/sizeof(mi_submap_t));
 }
 
-mi_decl_nodiscard static bool mi_page_map_ensure_committed(size_t idx, mi_submap_t* submap) {
-  mi_assert_internal(submap!=NULL && *submap==NULL);
-  size_t bit_idx;
-  if mi_unlikely(!mi_page_map_is_committed(idx, &bit_idx)) {
-    uint8_t* start = (uint8_t*)&_mi_page_map[bit_idx * MI_PAGE_MAP_ENTRIES_PER_CBIT];
-    if (!_mi_os_commit(_mi_subproc_main(), start, MI_PAGE_MAP_ENTRIES_PER_CBIT * sizeof(mi_submap_t), NULL)) {
-      mi_page_map_cannot_commit();
-      return false;
-    }
-    mi_atomic_or_acq_rel(&mi_page_map_commit, MI_ZU(1) << bit_idx);
+// static void* mi_page_map_addr_of_index(size_t idx) {
+//   return (void*)((uintptr_t)idx * MI_PAGE_MAP_SUB_COUNT * MI_ARENA_SLICE_SIZE);
+// }
+
+mi_decl_nodiscard static mi_decl_noinline bool mi_page_map_commit_entries(mi_page_map_t* pmap, size_t required_idx) {
+  const size_t reserved_count = mi_page_map_count_of_size(pmap->reserved_size);  
+  if mi_unlikely(required_idx >= reserved_count) {
+    mi_page_map_cannot_commit(); 
+    return false;
   }
-  *submap = mi_atomic_load_ptr_acquire(mi_page_t*, &_mi_page_map[idx]); // acquire _mi_page_map_at(idx);
+  size_t commit_size = _mi_align_up( sizeof(mi_page_map_t) + (required_idx * sizeof(mi_submap_t)), MI_ARENA_SLICE_SIZE );
+  if (pmap->reserved_size < commit_size) { commit_size = pmap->reserved_size; }
+  const size_t commit_count = mi_page_map_count_of_size(commit_size);
+  mi_assert_internal(commit_count > required_idx);
+  mi_assert_internal(commit_count <= reserved_count);
+  // note: we rely on uncommitted memory to be zero initialized on the first commit (and further concurrent commits leave the memory as is).
+  bool is_zero;
+  if mi_unlikely(!_mi_os_commit(_mi_subproc_main(), pmap, commit_size, &is_zero)) {
+    mi_page_map_cannot_commit();
+    return false;
+  }
+  mi_assert_internal(is_zero || pmap->memid.initially_zero);
+  mi_atomic_store_release(&pmap->committed_count, commit_count); 
+  // mi_atomic_store_release(&pmap->committed_addr, mi_page_map_addr_of_index(commit_count));
   return true;
 }
 
-// initialize the page map
-bool _mi_page_map_init(void) {
+mi_decl_nodiscard static bool mi_page_map_ensure_committed(mi_page_map_t* pmap, size_t idx, mi_submap_t* submap) {
+  mi_assert_internal(submap!=NULL && *submap==NULL);
+  if mi_unlikely(idx >= mi_atomic_load_relaxed(&pmap->committed_count)) {
+    if (idx >= mi_atomic_load_acquire(&pmap->committed_count)) {
+      if (!mi_page_map_commit_entries(pmap,idx)) return false;    
+      mi_assert_internal(idx < mi_atomic_load_relaxed(&pmap->committed_count));
+    }
+  }
+  *submap = mi_atomic_load_ptr_acquire(mi_page_t*, &pmap->submaps[idx]);
+  return true;
+}
+
+// initialize the page map 
+static bool mi_page_map_init_once(void) {
   size_t vbits = (size_t)mi_option_get_clamp(mi_option_max_vabits, 0, MI_MAX_VABITS);
   if (vbits == 0) {
     vbits = _mi_os_virtual_address_bits();
@@ -20663,111 +20159,135 @@ bool _mi_page_map_init(void) {
 
   // Allocate the page map and commit bits
   mi_assert(MI_MAX_VABITS >= vbits);
-  mi_atomic_store_ptr_release(void, &_mi_page_map_max_address, (void*)(vbits >= MI_SIZE_BITS ? (SIZE_MAX - MI_ARENA_SLICE_SIZE + 1) : (MI_PU(1) << vbits)));
-  mi_page_map_count = (MI_ZU(1) << (vbits - MI_PAGE_MAP_SUB_SHIFT - MI_ARENA_SLICE_SHIFT));
-  mi_assert(mi_page_map_count <= MI_PAGE_MAP_COUNT);
-  const size_t os_page_size = _mi_os_page_size();
-  const size_t page_map_size = _mi_align_up( mi_page_map_count * sizeof(mi_page_t**), os_page_size);
-  const size_t submap_size = MI_PAGE_MAP_SUB_SIZE;
-  const size_t reserve_size = page_map_size + submap_size;
-  #if MI_SECURE
+  const size_t reserve_count = (MI_ZU(1) << (vbits - MI_PAGE_MAP_SUB_SHIFT - MI_ARENA_SLICE_SHIFT));
+  const size_t os_page_size  = _mi_os_page_size();
+  const size_t reserve_size  = _mi_align_up( sizeof(mi_page_map_t) + ((reserve_count - 1) * sizeof(mi_submap_t)), os_page_size);
+  const size_t submap_size   = MI_PAGE_MAP_SUB_SIZE;
+  const size_t extra_reserve_size  = reserve_size + submap_size;
+  #if MI_SECURE 
   const bool commit = true;  // the whole page map is valid and we can reliably check any pointer
   #else
-  const bool commit = page_map_size <= 64*MI_KiB ||
-                      mi_option_is_enabled(mi_option_pagemap_commit) || _mi_os_has_overcommit();
+  const bool commit = false; // reserve_size <= 256*MI_KiB ||  // 40 virtual address bits
+                      // mi_option_is_enabled(mi_option_pagemap_commit) || _mi_os_has_overcommit();
   #endif
   mi_subproc_t* const subproc = _mi_subproc_main();
-  _mi_page_map = (_Atomic(mi_page_t**)*)_mi_os_alloc_aligned(subproc, reserve_size, 1, commit, true /* allow large */, &mi_page_map_memid);
-  if (_mi_page_map==NULL) {
-    _mi_error_message(ENOMEM, "unable to reserve virtual memory for the page map (%zu KiB)\n", page_map_size / MI_KiB);
-    _mi_page_map = mi_page_map_empty;
+  mi_memid_t memid;
+  mi_page_map_t* const pmap = (mi_page_map_t*)_mi_os_alloc_aligned(subproc, extra_reserve_size, 1, commit, true /* allow large */, &memid);
+  if mi_unlikely(pmap==NULL) {
+    _mi_error_message(ENOMEM, "unable to reserve virtual memory for the page map (%zu KiB)\n", extra_reserve_size / MI_KiB);
     return false;
   }
-  if (mi_page_map_memid.initially_committed && !mi_page_map_memid.initially_zero) {
-    _mi_warning_message("internal: the page map was committed but not zero initialized!\n");
-    _mi_memzero_aligned(_mi_page_map, page_map_size);
+ 
+  // commit 
+  size_t commit_count;
+  if (memid.initially_committed) {
+    if (!memid.initially_zero) {
+      _mi_warning_message("internal: the page map was committed but not zero initialized!\n");
+      _mi_memzero_aligned(pmap, extra_reserve_size);
+      memid.initially_zero = true;
+    }
+    commit_count = mi_page_map_count_of_size(reserve_size);
   }
-  mi_atomic_store_release(&mi_page_map_commit, (mi_page_map_memid.initially_committed ? ~MI_ZU(0) : MI_ZU(0)));
-
+  else {
+    // commit first page
+    bool is_zero;
+    if (!_mi_os_commit(subproc,pmap,os_page_size,&is_zero)) {
+      mi_page_map_cannot_commit();
+      _mi_os_free(subproc,pmap,extra_reserve_size,memid);
+      return false;
+    };
+    mi_assert_internal(is_zero || memid.initially_zero);
+    commit_count = mi_page_map_count_of_size(os_page_size);
+  }
+  
   // ensure there is a submap for the NULL address
-  mi_page_t** const sub0 = (mi_page_t**)((uint8_t*)_mi_page_map + page_map_size);  // we reserved a submap part at the end already
-  if (!mi_page_map_memid.initially_committed) {
+  mi_page_t** const sub0 = (mi_submap_t)((uint8_t*)pmap + reserve_size);  // we reserved a submap part at the end already
+  if (!memid.initially_committed) {
     if (!_mi_os_commit(subproc, sub0, submap_size, NULL)) {  // commit full submap (issue #1087)
       mi_page_map_cannot_commit();
+      _mi_os_free(subproc,pmap,extra_reserve_size,memid);
       return false;
     }
   }
-  if (!mi_page_map_memid.initially_zero) {     // initialize low addresses with NULL
+  if (!memid.initially_zero) {     // initialize low addresses with NULL
     _mi_memzero_aligned(sub0, submap_size);
   }
-  mi_submap_t nullsub = NULL;
-  if (!mi_page_map_ensure_committed(0,&nullsub)) {
-    mi_page_map_cannot_commit();
-    return false;
-  }
-  mi_atomic_store_ptr_release(mi_page_t*, &_mi_page_map[0], sub0);
-  mi_lock_init(&mi_page_map_lock);             // initialize late in case the lock init causes allocation
-  
+
+  // initialize the fields
+  pmap->memid = memid;
+  pmap->reserved_size  = reserve_size;
+  mi_lock_init(&pmap->lock);
+  mi_atomic_store_release(&pmap->committed_count, commit_count);
+  // mi_atomic_store_release(&pmap->committed_addr, mi_page_map_addr_of_index(commit_count));
+  mi_atomic_store_ptr_release(mi_page_t*, &pmap->submaps[0], sub0);
+  mi_atomic_store_ptr_release(mi_page_map_t, &__mi_page_map, pmap);
   mi_assert_internal(_mi_ptr_page(NULL)==NULL);
   return true;
 }
 
-
-void _mi_page_map_unsafe_destroy(void) {
-  mi_assert_internal(_mi_page_map != NULL);
-  if (_mi_page_map == NULL) return;
-  mi_subproc_t* const subproc = _mi_subproc_main();
-  mi_lock_done(&mi_page_map_lock);  
-  for (size_t idx = 1; idx < mi_page_map_count; idx++) {  // skip entry 0 (as we allocate that submap at the end of the page_map)
-    // free all sub-maps
-    if (mi_page_map_is_committed(idx, NULL)) {
-      mi_submap_t sub = _mi_page_map_at(idx);
-      if (sub != NULL) {
-        mi_memid_t memid = _mi_memid_create_os(sub, MI_PAGE_MAP_SUB_SIZE, true, false, false);
-        _mi_os_free_ex(subproc, memid.mem.os.base, memid.mem.os.size, true, memid);
-        mi_atomic_store_ptr_release(mi_page_t*, &_mi_page_map[idx], NULL);
-      }
-    }
+bool _mi_page_map_init(void) {
+  bool ok = true;
+  mi_atomic_do_once {
+    ok = mi_page_map_init_once();
   }
-  _mi_os_free_ex(subproc, _mi_page_map, mi_page_map_memid.mem.os.size, true, mi_page_map_memid);
-  _mi_page_map = NULL;
-  mi_page_map_count = 0;
-  mi_page_map_memid = _mi_memid_none();
-  mi_atomic_store_ptr_release(void, &_mi_page_map_max_address, NULL);
-  mi_atomic_store_release(&mi_page_map_commit, (mi_bfield_t)0);
+  return ok;
 }
 
-
-mi_decl_nodiscard static bool mi_page_map_ensure_submap_at(size_t idx, mi_submap_t* submap) {
-  mi_assert_internal(submap!=NULL && *submap==NULL);
-  mi_submap_t sub = NULL;
-  if (!mi_page_map_ensure_committed(idx, &sub)) {
-    return false;
+void _mi_page_map_unsafe_destroy(void) {
+  mi_page_map_t* const pmap = _mi_page_map();
+  mi_assert_internal(pmap != NULL);
+  if (pmap == NULL || pmap == &mi_page_map_empty) return;
+  mi_subproc_t* const subproc = _mi_subproc_main();
+  mi_lock_done(&pmap->lock);  
+  for (size_t idx = 1; idx < pmap->committed_count; idx++) {  // skip entry 0 (as we allocate that submap at the end of the page_map)
+    // free all sub-maps   
+    mi_submap_t sub = _mi_page_map_at(pmap,idx);
+    if (sub != NULL) {
+      mi_memid_t memid = _mi_memid_create_os(sub, MI_PAGE_MAP_SUB_SIZE, true, false, false);
+      _mi_os_free_ex(subproc, memid.mem.os.base, memid.mem.os.size, true, memid);
+      mi_atomic_store_ptr_release(mi_page_t*, &pmap->submaps[idx], NULL);
+    }
   }
-  if mi_unlikely(sub == NULL) {
-    // sub map not yet allocated, alloc now
-    mi_lock(&mi_page_map_lock) 
+  _mi_os_free_ex(subproc, pmap, pmap->reserved_size, true, pmap->memid);
+  mi_atomic_store_ptr_release(mi_page_map_t, &__mi_page_map, &mi_page_map_empty);  
+}
+
+mi_decl_nodiscard static mi_decl_noinline mi_submap_t mi_page_map_alloc_submap_at(mi_page_map_t* pmap, size_t idx) {
+  // sub map not yet allocated, alloc now
+  mi_submap_t sub = NULL;
+  mi_lock(&pmap->lock) 
+  {
+    sub = mi_atomic_load_ptr_acquire(mi_page_t*, &pmap->submaps[idx]); // reload
+    if (sub==NULL) // not yet allocated by another thread?      
     {
-      sub = mi_atomic_load_ptr_acquire(mi_page_t*, &_mi_page_map[idx]); // reload
-      if (sub==NULL) // not yet allocated by another thread?      
-      {
-        mi_subproc_t* const subproc = _mi_subproc_main();
-        mi_memid_t memid;
-        const size_t submap_size = MI_PAGE_MAP_SUB_SIZE;        
-        sub = (mi_submap_t)_mi_os_zalloc(subproc, submap_size, &memid);        
-        if (sub==NULL) {
-          _mi_warning_message("internal error: unable to extend the page map\n");          
-        }
-        else {
-          mi_submap_t expect = NULL;
-          if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t*, &_mi_page_map[idx], &expect, sub)) {
-            // another thread already allocated it.. free and continue
-            _mi_os_free(subproc, sub, submap_size, memid);
-            sub = expect;
-          }
+      mi_subproc_t* const subproc = _mi_subproc_main();
+      mi_memid_t memid;
+      const size_t submap_size = MI_PAGE_MAP_SUB_SIZE;        
+      sub = (mi_submap_t)_mi_os_zalloc(subproc, submap_size, &memid);        
+      if (sub==NULL) {
+        _mi_warning_message("internal error: unable to extend the page map\n");          
+      }
+      else {
+        mi_submap_t expect = NULL;
+        if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t*, &pmap->submaps[idx], &expect, sub)) {
+          // another thread already allocated it.. free and continue
+          _mi_os_free(subproc, sub, submap_size, memid);
+          sub = expect;
         }
       }
     }
+  }
+  return sub;
+}
+
+mi_decl_nodiscard static bool mi_page_map_ensure_submap_at(mi_page_map_t* pmap, size_t idx, mi_submap_t* submap) {
+  mi_assert_internal(submap!=NULL && *submap==NULL);
+  mi_submap_t sub = NULL;
+  if (!mi_page_map_ensure_committed(pmap, idx, &sub)) {
+    return false;
+  }
+  if mi_unlikely(sub==NULL) {
+    sub = mi_page_map_alloc_submap_at(pmap, idx);
     if (sub==NULL) return false; // unable to allocate the submap..
   }
   mi_assert_internal(sub!=NULL);
@@ -20775,11 +20295,11 @@ mi_decl_nodiscard static bool mi_page_map_ensure_submap_at(size_t idx, mi_submap
   return true;
 }
 
-static bool mi_page_map_set_range_prim(mi_page_t* page, size_t idx, size_t sub_idx, size_t slice_count) {
+static bool mi_page_map_set_range_prim(mi_page_map_t* pmap, mi_page_t* page, size_t idx, size_t sub_idx, size_t slice_count) {
   // is the page map area that contains the page address committed?
   while (slice_count > 0) {
     mi_submap_t sub = NULL;
-    if (!mi_page_map_ensure_submap_at(idx, &sub)) {
+    if (!mi_page_map_ensure_submap_at(pmap, idx, &sub)) {
       return false;
     };
     mi_assert_internal(sub!=NULL);
@@ -20795,11 +20315,11 @@ static bool mi_page_map_set_range_prim(mi_page_t* page, size_t idx, size_t sub_i
   return true;
 }
 
-static bool mi_page_map_set_range(mi_page_t* page, size_t idx, size_t sub_idx, size_t slice_count) {
-  if mi_unlikely(!mi_page_map_set_range_prim(page,idx,sub_idx,slice_count)) {
+static bool mi_page_map_set_range(mi_page_map_t* pmap, mi_page_t* page, size_t idx, size_t sub_idx, size_t slice_count) {
+  if mi_unlikely(!mi_page_map_set_range_prim(pmap, page,idx,sub_idx,slice_count)) {
     // failed to commit, call again to reset the page pointer if needed
     if (page!=NULL) {
-      mi_page_map_set_range_prim(NULL,idx,sub_idx,slice_count);
+      mi_page_map_set_range_prim(pmap,NULL,idx,sub_idx,slice_count);
     }
     return false;
   }
@@ -20849,49 +20369,46 @@ static size_t mi_page_map_get_idx(mi_page_t* page, size_t* sub_idx, size_t* slic
 bool _mi_page_map_register(mi_page_t* page) {
   mi_assert_internal(page != NULL);
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
-  mi_assert_internal(_mi_page_map != NULL);  // should be initialized before multi-thread access!
-  if mi_unlikely(_mi_page_map == NULL) {
+  mi_page_map_t* pmap = _mi_page_map();
+  mi_assert_internal(pmap != NULL);  // should be initialized before multi-thread access!
+  if mi_unlikely(pmap == NULL) {
     if (!_mi_page_map_init()) return false;
+    pmap = mi_atomic_load_ptr_acquire(mi_page_map_t,&__mi_page_map);
   }
-  mi_assert(_mi_page_map!=NULL);
+  mi_assert(pmap!=NULL);
   size_t   slice_count;
   size_t   sub_idx;
   const size_t idx = mi_page_map_get_idx(page, &sub_idx, &slice_count);
-  return mi_page_map_set_range(page, idx, sub_idx, slice_count);
+  return mi_page_map_set_range(pmap, page, idx, sub_idx, slice_count);
 }
 
 void _mi_page_map_unregister(mi_page_t* page) {
   mi_assert_internal(_mi_page_map != NULL);
   mi_assert_internal(page != NULL);
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+  mi_page_map_t* const pmap = _mi_page_map();
   // note: should proceed even if the page was not registered yet (for failure paths in page allocation in `arena.c`)
-  if mi_unlikely(_mi_page_map == NULL) return;
+  if mi_unlikely(pmap == NULL) return;
   // get index and count
   size_t slice_count;
   size_t sub_idx;
   const size_t idx = mi_page_map_get_idx(page, &sub_idx, &slice_count);
   // unset the offsets
-  mi_page_map_set_range(NULL, idx, sub_idx, slice_count);
+  mi_page_map_set_range(pmap, NULL, idx, sub_idx, slice_count);
 }
 
 void _mi_page_map_unregister_range(void* start, size_t size) {
-  if mi_unlikely(_mi_page_map == NULL) return;
+  mi_page_map_t* const pmap = _mi_page_map();
+  if mi_unlikely(pmap == NULL) return;
   const size_t slice_count = _mi_divide_up(size, MI_ARENA_SLICE_SIZE);
   size_t sub_idx;
   const uintptr_t idx = _mi_page_map_index(start, &sub_idx);
-  mi_page_map_set_range(NULL, idx, sub_idx, slice_count);  // todo: avoid committing if not already committed?
+  mi_page_map_set_range(pmap, NULL, idx, sub_idx, slice_count);  // todo: avoid committing if not already committed?
 }
 
 // Return NULL for invalid pointers
 mi_page_t* _mi_safe_ptr_page(const void* p) {
-  if (p==NULL) return NULL;
-  if mi_unlikely(p >= mi_atomic_load_ptr_relaxed(void, &_mi_page_map_max_address)) return NULL;
-  size_t sub_idx;
-  const size_t idx = _mi_page_map_index(p,&sub_idx);
-  if mi_unlikely(!mi_page_map_is_committed(idx,NULL)) return NULL;
-  mi_page_t** const sub = _mi_page_map[idx];
-  if mi_unlikely(sub==NULL) return NULL;
-  return sub[sub_idx];
+  return _mi_checked_ptr_page(p);
 }
 
 mi_decl_nodiscard mi_decl_export bool mi_is_in_heap_region(const void* p) mi_attr_noexcept {
@@ -23116,6 +22633,10 @@ void mi_subproc_heap_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* 
   if (subproc==NULL) return;
   mi_heap_print_visit_info_t vinfo = { out, arg };
   mi_subproc_visit_heaps(subproc_id, &mi_heap_print_visitor, &vinfo);
+  if (subproc->theap_meta!=NULL) {
+    _mi_stats_print("meta", subproc->subproc_seq, &subproc->theap_meta->stats, out, arg);
+  }
+  // if (subproc->theap_meta!=NULL) { _mi_stats_merge_into(&subproc->stats, &subproc->theap_meta->stats); }
   _mi_stats_print("subproc", subproc->subproc_seq, &subproc->stats, out, arg);
 }
 
@@ -23252,6 +22773,8 @@ bool mi_subproc_stats_get(mi_subproc_id_t subproc_id, mi_stats_t* stats) mi_attr
   if (subproc == NULL) return false;
   if (!mi_stats_copy(stats, &subproc->stats)) return false;
   mi_subproc_visit_heaps(subproc_id, &mi_heap_aggregate_visitor, stats);
+  // hide meta data stats
+  // if (subproc->theap_meta!=NULL) { mi_stats_add_into(stats, &subproc->theap_meta->stats); }
   return true;
 }
 
@@ -23453,6 +22976,332 @@ char* mi_stats_as_json(mi_stats_t* stats, size_t buf_size, char* buf) mi_attr_no
   return mi_stats_get_json_from(stats, buf_size, buf);
 }
 /* ---- end inlined: src/stats.c ---- */
+/* ---- begin inlined: src/subproc.c ---- */
+/* ----------------------------------------------------------------------------
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
+This is free software; you can redistribute it and/or modify it under the
+terms of the MIT license. A copy of the license can be found in the file
+"LICENSE" at the root of this distribution.
+-----------------------------------------------------------------------------*/
+
+
+// pre-allocate the main subprocess structure.
+static mi_decl_cache_align mi_subproc_t mi_process_subproc_main = mi_init_struct_zero;
+static mi_subproc_t* mi_subprocs = NULL;
+static mi_lock_t     mi_subprocs_lock = MI_LOCK_INITIALIZER;
+
+
+/* -----------------------------------------------------------
+  Meta-data allocation
+  We allocate thread local data and theaps through a dedicated
+  theap `subproc.theap_meta` which uses a detached tld with
+  a detached thread id. The initial theap_meta is statically 
+  allocated and can thus be used to allocate on an as yet
+  uninitialized thread or process.
+  We need to take a lock though to allocate safely on the
+  detached `theap_meta`.
+----------------------------------------------------------- */
+
+void* _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid ) {
+  mi_assert_internal(subproc->theap_meta != NULL);
+  void* p = NULL;
+  mi_lock(&subproc->theap_meta_lock) {
+    p = mi_theap_zalloc(subproc->theap_meta, size);
+    if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
+  }
+  return p;
+}
+
+void* _mi_meta_zalloc_aligned( mi_subproc_t* subproc, size_t size, size_t aligned, mi_memid_t* memid ) {
+  mi_assert_internal(subproc->theap_meta != NULL);
+  void* p = NULL;
+  mi_lock(&subproc->theap_meta_lock) {
+    p = mi_theap_zalloc_aligned(subproc->theap_meta, size, aligned);
+    if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
+  }
+  return p;
+}
+
+void* _mi_meta_rezalloc( mi_subproc_t* subproc, void* oldp, size_t newsize, mi_memid_t* memid ) {
+  mi_assert_internal(subproc->theap_meta != NULL);
+  // note: since we take a meta lock we cannot use `mi_theap_rezalloc` as that could call `mi_free` which
+  // can call `mi_stat_free` which would try to take the meta lock again. See issue #1358.
+  void* p = NULL;  
+  mi_lock(&subproc->theap_meta_lock) {
+    p = mi_theap_zalloc(subproc->theap_meta, newsize);
+  }
+  if (p!=NULL) {
+    if (oldp!=NULL) {
+      const size_t oldsize  = mi_usable_size(oldp);
+      const size_t copysize = (newsize < oldsize ? newsize : oldsize);
+      _mi_memcpy(p,oldp,copysize);
+      if (memid!=NULL) { _mi_meta_free(subproc,oldp,*memid); } 
+                  else { mi_free(oldp); }
+    }
+    if (memid!=NULL) { *memid = _mi_memid_create_malloc(p,newsize,true); }
+  }
+  else {
+    if (memid!=NULL) { *memid = _mi_memid_none(); }  
+  }
+  return p;
+}
+
+void _mi_meta_free(mi_subproc_t* subproc, void* p, mi_memid_t memid) {
+  if (p==NULL || mi_memid_needs_no_free(memid)) return;
+  if (memid.memkind == MI_MEM_MALLOC) {
+    mi_free(p);
+  }
+  else {
+    mi_assert_internal(subproc!=NULL);  
+    _mi_arenas_free(subproc, p, _mi_memid_size(memid), memid);
+  }
+}
+
+bool _mi_meta_is_meta_page(const mi_subproc_t* subproc, const mi_page_t* page) {
+  if (page==NULL) return false;
+  mi_theap_t* theap = page->theap;
+  return (theap != NULL && theap == subproc->theap_meta);
+}
+
+
+/* -----------------------------------------------------------
+  Sub process helpers
+----------------------------------------------------------- */
+
+mi_subproc_t* _mi_subproc_main(void) {
+  return &mi_process_subproc_main;
+}
+
+bool _mi_subproc_is_main(mi_subproc_t* subproc) {
+  return (subproc == &mi_process_subproc_main);
+}
+
+mi_subproc_t* _mi_subproc(void) {
+  mi_theap_t* theap = _mi_theap_default();
+  if (theap == NULL || theap->tld == NULL) {  // see issue #1289
+    return _mi_subproc_main();
+  }
+  else {
+    return theap->tld->subproc;
+  }
+}
+
+mi_heap_t* mi_heap_main(void) {
+  return _mi_subproc_heap_main(_mi_subproc()); // don't use mi_theap_main_init_get() so this call works during process_init
+}
+
+
+mi_subproc_t* _mi_subproc_from_id(mi_subproc_id_t subproc_id) {
+  return (mi_subproc_t*)(subproc_id._mi_subproc_id);
+}
+
+mi_subproc_id_t _mi_subproc_to_id(mi_subproc_t* subproc) {
+  mi_subproc_id_t id = { subproc };
+  return id;
+}
+
+mi_subproc_id_t mi_subproc_main(void) {
+  return _mi_subproc_to_id(_mi_subproc_main());
+}
+
+mi_subproc_id_t mi_subproc_current(void) {
+  return _mi_subproc_to_id(_mi_subproc());
+}
+
+
+/* -----------------------------------------------------------
+  Sub process creation
+----------------------------------------------------------- */
+
+
+static mi_subproc_t* mi_subproc_init(mi_subproc_t* subproc, mi_subproc_t* parent) {
+  static _Atomic(size_t) subproc_total_count;
+  subproc->parent = parent;
+  subproc->subproc_seq = mi_atomic_increment_relaxed(&subproc_total_count);
+  mi_stats_header_init(&subproc->stats);
+  mi_lock_init(&subproc->arena_reserve_lock);
+  mi_lock_init(&subproc->heaps_lock);
+  mi_lock_init(&subproc->theap_meta_lock);
+  mi_lock(&mi_subprocs_lock) {
+    // push on subproc list
+    subproc->next = mi_subprocs;
+    if (mi_subprocs!=NULL) { mi_subprocs->prev = subproc; }
+    mi_subprocs = subproc;
+  }
+  return subproc;
+}
+
+mi_subproc_id_t mi_subproc_new(void) {
+  mi_thread_init();
+  mi_subproc_t* const parent = _mi_subproc();
+  mi_memid_t memid;
+  mi_subproc_t* const subproc = (mi_subproc_t*)_mi_meta_zalloc(parent, sizeof(mi_subproc_t), &memid);
+  if (subproc == NULL) { return _mi_subproc_to_id(NULL); }
+  subproc->memid  = memid;  
+  
+  mi_memid_t theap_memid;
+  mi_theap_t* const theap_meta = (mi_theap_t*)_mi_meta_zalloc(parent, sizeof(mi_theap_t), &theap_memid);
+  if (theap_meta==NULL) { 
+    _mi_meta_free(parent, subproc, memid); 
+    return _mi_subproc_to_id(NULL); 
+  }
+  theap_meta->memid = memid;
+  
+  // init subproc
+  mi_subproc_init(subproc,parent);
+  
+  // init main heap
+  mi_heap_t* heap_main = _mi_heap_new_for_subproc(subproc,0,true);
+  if (heap_main==NULL) {
+    _mi_meta_free(parent, theap_meta, theap_meta->memid);
+    mi_subproc_destroy(_mi_subproc_to_id(subproc));
+    return _mi_subproc_to_id(NULL);
+  }
+  mi_assert_internal(subproc->heap_main == heap_main);
+
+  // init meta theap
+  mi_assert_internal(parent->theap_meta!=NULL);
+  mi_assert_internal(parent->theap_meta->tld!=NULL);
+  mi_assert_internal(parent->theap_meta->tld->thread_id == MI_THREADID_DETACHED);
+  _mi_theap_init(theap_meta,heap_main,parent->theap_meta->tld /* detached tld */);
+  subproc->theap_meta = theap_meta;
+
+  return _mi_subproc_to_id(subproc);
+}
+
+
+/* -----------------------------------------------------------
+  Sub process destruction
+----------------------------------------------------------- */
+
+// destroy all subproc resources including arena's, heap's etc.
+static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subprocs_lock)
+{
+  if (subproc==NULL) return;
+
+  // remove from the subproc list
+  mi_lock_maybe(&mi_subprocs_lock, acquire_subprocs_lock) {
+    if (subproc->next!=NULL) { subproc->next->prev = subproc->prev;  }
+    if (subproc->prev!=NULL) { subproc->prev->next = subproc->next;  }
+                        else { mi_assert_internal(mi_subprocs==subproc);  mi_subprocs = subproc->next; }
+  }
+
+  // destroy all subproc heaps
+  mi_lock(&subproc->heaps_lock) {
+    mi_heap_t* heap = subproc->heaps;
+    while (heap != NULL) {
+      mi_heap_t* next = heap->next;
+      if (heap!=subproc->heap_main) { _mi_heap_force_destroy(heap, false /* don't re-acquire the heaps_lock */); }
+      heap = next;
+    }
+    mi_assert_internal(subproc->heap_main==NULL || subproc->heaps == subproc->heap_main);
+    if (subproc->heap_main!=NULL) {
+      _mi_thread_locals_thread_done(); // release thread locals that may have been allocated (safe as the main heap uses the fast key)
+      if (_mi_subproc_is_main(subproc)) {
+        _mi_thread_locals_done();      
+      }
+      _mi_heap_force_destroy(subproc->heap_main, false /* don't re-acquire the heaps_lock */);  // no warning if destroying the main heap
+    }
+  }
+
+  subproc->theap_meta = NULL; // theap meta stats are merged during heap_destroy of the main heap
+
+  if (!_mi_subproc_is_main(subproc)) {
+    // merge stats back into the main subproc  
+    _mi_stats_merge_into(&mi_process_subproc_main.stats, &subproc->stats);
+  }
+
+  // remove associated arenas
+  _mi_arenas_unsafe_destroy_all(subproc);
+
+  // show stats of the main process (at process end) before releasing the heaps lock
+  if (_mi_subproc_is_main(subproc)) {
+    if (mi_option_is_enabled(mi_option_show_stats) || mi_option_is_enabled(mi_option_verbose)) {
+      mi_subproc_stats_print_out(mi_subproc_main(), NULL, NULL);
+    }
+  }
+
+  // todo: should we refcount subprocesses?
+  mi_lock_done(&subproc->arena_reserve_lock);
+  mi_lock_done(&subproc->heaps_lock);
+  mi_lock_done(&subproc->theap_meta_lock);  
+  _mi_meta_free( subproc->parent, subproc, subproc->memid);  
+  if (_mi_subproc_is_main(subproc)) {
+    // for the main subproc, also release the global page map
+    _mi_page_map_unsafe_destroy();
+  }
+}
+
+void mi_subproc_destroy(mi_subproc_id_t subproc_id) {
+  mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
+  if (subproc==NULL || subproc==&mi_process_subproc_main) return;
+  mi_subproc_unsafe_destroy(subproc, true /* take lock */);
+}
+
+void _mi_subprocs_unsafe_destroy_all(void) {
+  mi_lock(&mi_subprocs_lock) {
+    mi_subproc_t* subproc = mi_subprocs;
+    while (subproc!=NULL) {
+      mi_subproc_t* next = subproc->next;
+      if (subproc!=&mi_process_subproc_main) {
+        mi_subproc_unsafe_destroy(subproc, false /* take mi_subprocs lock */);
+      }
+      subproc = next;
+    }
+  }
+  mi_subproc_unsafe_destroy(&mi_process_subproc_main, true /* take mi_subprocs lock */);
+}
+
+
+/* -----------------------------------------------------------
+  Sub process various
+----------------------------------------------------------- */
+
+void mi_subproc_add_current_thread(mi_subproc_id_t subproc_id) {
+  mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
+  mi_assert_internal(subproc!=NULL);
+  if (subproc==NULL) return;
+  mi_assert_internal(subproc->heap_main!=NULL);
+  if (subproc->heap_main==NULL) return;
+  mi_theap_t* theap = _mi_theap_default();
+  if (mi_theap_is_initialized(theap)) {
+    if (theap->tld!=NULL && theap->tld->subproc != subproc) {
+      _mi_warning_message("unable to add thread to the subprocess as it was already in another subprocess (at %p)\n", theap->tld->subproc);
+    }
+    return;
+  }
+
+  // initialize this thread tld & theap
+  _mi_thread_init_with_heap(subproc->heap_main);
+}
+
+
+bool mi_subproc_visit_heaps(mi_subproc_id_t subproc_id, mi_heap_visit_fun* visitor, void* arg) {
+  mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
+  if (subproc==NULL) return false;
+  bool ok = true;
+  mi_lock(&subproc->heaps_lock) {
+    for (mi_heap_t* heap = subproc->heaps; heap!=NULL && ok; heap = heap->next) {
+      ok = (*visitor)(heap, arg);
+    }
+  }
+  return ok;
+}
+
+
+mi_subproc_t* _mi_subproc_main_init(void) {
+  mi_lock_init(&mi_subprocs_lock);
+  mi_memid_t memid = _mi_memid_create_static(&mi_process_subproc_main,sizeof(mi_subproc_t));
+  mi_process_subproc_main.memid = memid;
+  mi_subproc_init(&mi_process_subproc_main,NULL);
+  return &mi_process_subproc_main;
+}
+
+void _mi_subproc_main_done(void) {
+  mi_lock_done(&mi_subprocs_lock);
+}
+
+/* ---- end inlined: src/subproc.c ---- */
 /* ---- begin inlined: src/theap.c ---- */
 /*----------------------------------------------------------------------------
 Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
@@ -23566,7 +23415,7 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
   return true; // don't break
 }
 
-static void mi_theap_merge_stats(mi_theap_t* theap) {
+void _mi_theap_merge_stats(mi_theap_t* theap) {
   mi_assert_internal(mi_theap_is_initialized(theap));
   mi_heap_t* const heap = _mi_theap_heap(theap);
   _mi_stats_merge_into(&heap->stats, &theap->stats);
@@ -23583,8 +23432,8 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   // python/cpython#112532: we may be called from a thread that is not the owner of the theap
   // const bool is_main_thread = (_mi_is_main_thread() && theap->thread_id == _mi_thread_id());
 
-  // collect retired pages
-  _mi_theap_collect_retired(theap, force);
+  // collect retired pages (and full pages if theap->allow_page_abandon is false)
+  _mi_theap_collect_retired(theap, force); 
 
   // collect all pages owned by this thread
   mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
@@ -23594,7 +23443,7 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   _mi_arenas_collect(collect == MI_FORCE /* force purge? */, collect >= MI_FORCE /* visit all? */, theap->tld);
 
   // merge statistics
-  mi_theap_merge_stats(theap);
+  _mi_theap_merge_stats(theap);
 }
 
 void _mi_theap_collect_abandon(mi_theap_t* theap) {
@@ -23637,6 +23486,51 @@ mi_theap_t* mi_theap_set_default(mi_theap_t* theap) {
   return previous;
 }
 
+#if MI_GUARDED
+mi_decl_export void mi_theap_guarded_set_sample_rate(mi_theap_t* theap, size_t sample_rate, size_t seed) {
+  theap->guarded_sample_rate  = sample_rate;
+  theap->guarded_sample_count = sample_rate;  // count down samples
+  if (theap->guarded_sample_rate > 1) {
+    if (seed == 0) {
+      seed = _mi_theap_random_next(theap);
+    }
+    theap->guarded_sample_count = (seed % theap->guarded_sample_rate) + 1;  // start at random count between 1 and `sample_rate`
+  }
+}
+
+mi_decl_export void mi_theap_guarded_set_size_bound(mi_theap_t* theap, size_t min, size_t max) {
+  theap->guarded_size_min = min;
+  theap->guarded_size_max = (min > max ? min : max);
+}
+
+static void mi_theap_guarded_init(mi_theap_t* theap) {
+  mi_theap_guarded_set_sample_rate(theap,
+    (size_t)mi_option_get_clamp(mi_option_guarded_sample_rate, 0, LONG_MAX),
+    (size_t)mi_option_get(mi_option_guarded_sample_seed));
+  mi_theap_guarded_set_size_bound(theap,
+    (size_t)mi_option_get_clamp(mi_option_guarded_min, 0, LONG_MAX),
+    (size_t)mi_option_get_clamp(mi_option_guarded_max, 0, LONG_MAX) );
+}
+#else
+mi_decl_export void mi_theap_guarded_set_sample_rate(mi_theap_t* theap, size_t sample_rate, size_t seed) {
+  MI_UNUSED(theap); MI_UNUSED(sample_rate); MI_UNUSED(seed);
+}
+
+mi_decl_export void mi_theap_guarded_set_size_bound(mi_theap_t* theap, size_t min, size_t max) {
+  MI_UNUSED(theap); MI_UNUSED(min); MI_UNUSED(max);
+}
+static void mi_theap_guarded_init(mi_theap_t* theap) {
+  MI_UNUSED(theap);
+}
+#endif
+
+static void mi_theap_options_init(mi_theap_t* theap) {
+  theap->allow_page_reclaim = (mi_option_get(mi_option_page_reclaim_on_free) >= 0);
+  theap->allow_page_abandon = (mi_option_get(mi_option_page_full_retain) >= 0);
+  theap->page_full_retain = mi_option_get_clamp(mi_option_page_full_retain, -1, 32);
+  theap->is_detached = (theap->tld->thread_id == MI_THREADID_DETACHED);
+}
+
 // todo: make order of parameters consistent (but would that break compat with CPython?)
 void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
 {
@@ -23647,13 +23541,11 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
   _mi_memcpy_aligned(theap, &_mi_theap_empty, sizeof(mi_theap_t));
   theap->memid = memid;
   theap->tld   = tld;  // avoid reading the thread-local tld during initialization
-  mi_atomic_store_release(&theap->refcount,1);
-  mi_atomic_store_release(&theap->freed,0);
+  mi_atomic_store_release(&theap->refcount,1);  
   mi_atomic_store_ptr_release(mi_subproc_t,&theap->subproc,heap->subproc);
   mi_assert_internal(theap->stats.size == sizeof(mi_stats_t));
-  
-  _mi_theap_options_init(theap);
-  
+  mi_theap_options_init(theap);
+
   if (theap->tld->is_in_threadpool) {
     // if we run as part of a thread pool it is better to not arbitrarily reclaim abandoned pages into our theap.
     // this is checked in `free.c:mi_free_try_collect_mt`
@@ -23694,8 +23586,10 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
     _mi_random_split(&head_random, &theap->random); // &theap->random is used as nonce so it is ok if threads capture the same head->random
   }
   theap->cookie = _mi_theap_random_next(theap) | 1;
-  _mi_theap_guarded_init(theap);  // needs theap->random
-  mi_subproc_stat_increase(_mi_theap_subproc(theap),theaps,1);  // on subproc to match theap_free_mem
+  mi_theap_guarded_init(theap); // needs theap->random
+  if (!theap->is_detached) {
+    mi_subproc_stat_increase(_mi_theap_subproc(theap),theaps,1);  // on subproc to match theap_free_mem
+  }
 
   // only now set the heap member as it is used to determine if a theap is initialized
   mi_atomic_store_ptr_release(mi_heap_t,&theap->heap,heap);
@@ -23710,10 +23604,10 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
   }
 }
 
-mi_theap_t* _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld) {
+mi_theap_t* _mi_theap_alloc(mi_heap_t* heap, mi_tld_t* tld) {
   mi_assert_internal(tld!=NULL);
   mi_assert_internal(heap!=NULL);
-  mi_assert_internal(_mi_thread_id() == tld->thread_id);
+  mi_assert_internal(tld->thread_id == MI_THREADID_DETACHED || _mi_thread_id() == tld->thread_id);
   // mi_assert_internal(_mi_heap_theap_peek(heap)==NULL);  // don't access thread locals as this is called on thread init
 
   // allocate and initialize a theap
@@ -23735,7 +23629,13 @@ mi_theap_t* _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld) {
   }
 
   theap->memid = memid;
-  _mi_theap_init(theap, heap, tld);  
+  return theap;
+}
+
+mi_theap_t* _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld) {
+  mi_theap_t* theap = _mi_theap_alloc(heap,tld);
+  if (theap == NULL) return NULL;
+  _mi_theap_init(theap, heap, tld);
   return theap;
 }
 
@@ -23745,18 +23645,11 @@ uintptr_t _mi_theap_random_next(mi_theap_t* theap) {
 
 static void mi_theap_free_mem(mi_theap_t* theap) {
   if (theap!=NULL) {
-    mi_subproc_stat_decrease(_mi_theap_subproc(theap),theaps,1);
-    // free the used memory
-    if (theap->memid.memkind == MI_MEM_HEAP_MAIN) {  // note: for now unused as it would access theap_default stats in mi_free of the current theap
-      mi_assert_internal(_mi_is_heap_main(mi_heap_of(theap)));
-      _mi_free_subproc_safe(theap);
+    mi_subproc_t* const subproc = mi_atomic_load_ptr_relaxed(mi_subproc_t,&theap->subproc);      
+    if (!theap->is_detached) {
+      mi_subproc_stat_decrease(subproc,theaps,1);  
     }
-    else if (theap->memid.memkind == MI_MEM_META) {
-      _mi_meta_free(_mi_theap_subproc(theap), theap, sizeof(*theap), theap->memid);
-    }
-    else {
-      _mi_arenas_free(_mi_theap_subproc(theap), theap, _mi_align_up(sizeof(*theap),MI_ARENA_MIN_OBJ_SIZE), theap->memid ); // issue #1168, avoid assertion failure
-    }
+    _mi_meta_free(subproc, theap, theap->memid);
   }
 }
 
@@ -23775,105 +23668,97 @@ void _mi_theap_decref(mi_theap_t* theap) {
   }
 }
 
+// Thread termination and heap delete/destroy might run concurrently
+// and we need to ensure we free the memory correctly. A heap or tld
+// will first "detach" its theaps so it has a list with theaps that are
+// no longer shared, and only then free's the theaps in that list.
+// To detach we need to hold both the `heap->theaps_lock` and the `tld->theaps_lock`.
+// Due to lock-inversion we need to use `mi_lock_try_acquire` and if that fails
+// we back-off, release the outer lock, and try again until we succeed.
+//
+// NOTE (mimalloc-pprof, issue #128 / #78): this non-blocking try-acquire-and-retry
+// design is exactly the fix that used to live here as a KNOWN-ISSUE comment on the
+// fork's own (now removed) `_mi_theap_free`, which took `heap->theaps_lock` and
+// `tld->theaps_lock` in opposite orders via BLOCKING acquisitions -- an AB-BA
+// deadlock risk. Upstream restructured thread/heap teardown between our previous
+// pin and 6def7be9 into `_mi_heap_detach_theaps` / `_mi_tld_detach_theaps` below,
+// which use `mi_lock_try_acquire` with a back-off retry loop instead, so the
+// deadlock this fork was tracking is now structurally avoided. `_mi_theap_free`
+// itself no longer exists at this pin (no callers, no declaration) -- confirmed
+// via `git grep _mi_theap_free` across src/include at 6def7be9.
 
-// called from `mi_theap_delete` to free the internal theap resources.
-// KNOWN ISSUE (#78): the two `mi_lock_maybe` acquisitions below are BLOCKING, and the
-// two callers take them in opposite orders. That is an AB-BA cycle:
-//
-//   mi_thread_theaps_done (init.c)  holds tld->theaps_lock,
-//                                   calls _mi_theap_free(theap, true, false)
-//                                   -> blocks on heap->theaps_lock
-//   mi_heap_free_theaps   (heap.c)  holds heap->theaps_lock,
-//                                   calls _mi_theap_free(theap, false, true)
-//                                   -> blocks on tld->theaps_lock
-//
-// i.e. a thread exiting while another thread calls mi_heap_delete / mi_heap_destroy on a
-// heap that exiting thread has theaps for.
-//
-// The `theap->freed` exchange just below DOES defeat the two-party version of this, and
-// an earlier revision of this comment got that wrong. Worked through properly:
-//
-//   A thread in mi_thread_theaps_done holds tld_X and waits on heap_Y, for theap(X,Y).
-//   A thread in mi_heap_free_theaps   holds heap_Y and waits on tld_Z, for theap(Z,Y).
-//
-// A 2-cycle needs the second to wait on tld_X, i.e. Z == X -- so both are freeing
-// theap(X,Y), the SAME theap, and one of them gets `freed != 0`, returns false, and
-// releases. There is exactly one theap per (tld, heap) pair, so "two different theaps
-// sharing a tld and a heap" -- what this comment previously claimed -- cannot exist.
-//
-// A 4-cycle is not prevented, and needs four distinct theaps:
-//
-//   T1 holds tld_X,  waits heap_Y   freeing theap(X,Y)
-//   T2 holds heap_Y, waits tld_Z    freeing theap(Z,Y)     Z != X
-//   T3 holds tld_Z,  waits heap_W   freeing theap(Z,W)     W != Y
-//   T4 holds heap_W, waits tld_X    freeing theap(X,W)
-//
-// All four are distinct, so no `freed` early return fires anywhere in the cycle. It
-// requires two threads exiting concurrently with two heaps being deleted, where both
-// threads hold theaps on both heaps -- considerably narrower than the two-party story,
-// and a reason the ordering has survived this long.
-//
-// Both callers already have the retry machinery this wants -- each comments "We do this
-// in a loop where we release the theaps_lock at every potential re-iteration to unblock"
-// and each re-loops when this function returns false. So the fix is to make these two
-// acquisitions non-blocking (`mi_lock_try_acquire`, available at atomic.h:424/451) and,
-// on failure, release whatever was taken, restore `theap->freed` to 0, and return false
-// so the existing outer loop retries. That is what oven-sh/mimalloc does.
-//
-// NOT changed here, deliberately. The cycle is derived by reading the two call sites; it
-// has no reproduction. Rewriting lock acquisition in the thread-exit path on analysis
-// alone is exactly the trade this fork got right on the page-map os_align defect (see
-// src/page-map.c), where the same style of reasoning was sound and the predicted
-// corruption still could not be produced. A deadlock fix that is subtly wrong is worse
-// than a deadlock that may be unreachable.
-//
-// To re-open: build a stress case matching the 4-cycle above -- at least TWO threads
-// exiting concurrently with at least TWO heaps being deleted, where both threads hold
-// theaps on both heaps -- and get it to hang under a timeout. Then apply the try-acquire
-// form above. Note the earlier "more than one theap per (tld, heap) pair" phrasing was a
-// consequence of the same mistake and describes something that cannot happen.
-bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acquire_tld_theaps_lock) {
-  mi_assert(theap != NULL);
-  if (theap==NULL) return true;
-
-  // ensure only one thread actually frees the theap
-  const size_t freed = mi_atomic_exchange_acq_rel( &theap->freed, 1 );
-  if (freed!=0) {
-    // concurrent interaction, retry in an outer loop (as the other thread may be blocked on our lock)
-    return false;
-  }
-  else {
-    // merge stats to the owning heap
-    mi_heap_t* const heap = _mi_theap_heap(theap);
-    _mi_stats_merge_into(&heap->stats, &theap->stats);
-
-    // remove ourselves from the heap theaps list
-    mi_lock_maybe(&heap->theaps_lock, acquire_heap_theaps_lock) {
-      if (theap->hnext != NULL) { theap->hnext->hprev = theap->hprev; }
-      if (theap->hprev != NULL) { theap->hprev->hnext = theap->hnext; }
-                          else { mi_assert_internal(heap->theaps == theap); heap->theaps = theap->hnext; }
-      theap->hnext = theap->hprev = NULL;
+// Remove the theaps in this heap from any thread local tld lists.
+void _mi_heap_detach_theaps( mi_heap_t* heap ) {
+  bool all_detached;
+  do {
+    all_detached = true;
+    mi_lock(&heap->theaps_lock) {
+      mi_theap_t* theap = heap->theaps;
+      while (theap != NULL) {
+        mi_theap_t* next = theap->hnext;
+        mi_tld_t* tld = theap->tld;
+        if (tld != NULL) {
+          if (mi_lock_try_acquire(&tld->theaps_lock)) {
+            // remove the theap from the tld theaps list
+            if (theap->tnext != NULL) { theap->tnext->tprev = theap->tprev;  }
+            if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
+                                else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
+            theap->tnext = theap->tprev = NULL;
+            theap->tld = NULL;
+            mi_lock_release(&tld->theaps_lock);
+          }
+          else {
+            all_detached = false;
+          }
+        }
+        theap = next;
+      }
     }
-
-    // remove ourselves from the thread local theaps list
-    mi_lock_maybe(&theap->tld->theaps_lock, acquire_tld_theaps_lock) {
-      if (theap->tnext != NULL) { theap->tnext->tprev = theap->tprev;  }
-      if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
-                          else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
-      theap->tnext = theap->tprev = NULL;           
+    if (!all_detached) {
+      mi_subproc_stat_counter_increase(heap->subproc,heaps_delete_wait,1);
+      _mi_prim_thread_yield();
     }
-
-    // Set heap to NULL only after we are removed from the thread local theaps list since
-    // we may concurrently traverse it to collect (in `init.c:mi_thread_theaps_done`)
-    // (We need to set it to NULL to avoid an ABA problem where the _mi_theap_cached
-    // has a heap address that is reused for a newly allocated heap.)
-    mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
-    theap->tld = NULL;
-    // leave subproc field as is for free-ing
-    _mi_theap_decref(theap);
-    return true;
-  }
+  } while (!all_detached);
 }
+
+// Remove the theaps in this thread from the heaps that own them.
+void _mi_tld_detach_theaps( mi_tld_t* tld ) {
+  bool all_detached;
+  do {
+    all_detached = true;
+    mi_lock(&tld->theaps_lock) {
+      mi_theap_t* theap = tld->theaps;
+      while (theap != NULL) {
+        mi_theap_t* next = theap->tnext;
+        mi_assert_internal(theap->page_count==0);
+        mi_heap_t* heap = _mi_theap_heap_peek(theap); // now the heap might be NULL from an earlier iteration
+        if (heap != NULL) {
+          if (mi_lock_try_acquire(&heap->theaps_lock)) {
+            // merge stats into the owning heap stats
+            _mi_stats_merge_into(&heap->stats, &theap->stats);
+            // remove the theap from the heap list
+            if (theap->hnext != NULL) { theap->hnext->hprev = theap->hprev; }
+            if (theap->hprev != NULL) { theap->hprev->hnext = theap->hnext; }
+                                else { mi_assert_internal(heap->theaps == theap); heap->theaps = theap->hnext; }
+            theap->hnext = theap->hprev = NULL;
+            // and set `heap` to NULL
+            mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
+            mi_lock_release(&heap->theaps_lock);
+          }
+          else {
+            all_detached = false;
+          }
+        }
+        theap = next;
+      }
+    }
+    if (!all_detached) {
+      mi_subproc_stat_counter_increase(tld->subproc,heaps_delete_wait,1);
+      _mi_prim_thread_yield();
+    }
+  } while (!all_detached);
+}
+
 
 
 /* -----------------------------------------------------------
@@ -23947,7 +23832,7 @@ bool mi_theap_reload(mi_theap_t* theap, mi_arena_id_t arena_id) {
   // reinit direct pages (as we may be in a different process)
   mi_assert_internal(theap->page_count == 0);
   for (size_t i = 0; i < MI_PAGES_DIRECT; i++) {
-    theap->pages_free_direct[i] = (mi_page_t*)&_mi_page_empty;
+    theap->pages_free_direct[i] = _mi_page_empty_get();
   }
 
   // push on the thread local theaps list
@@ -24157,9 +24042,9 @@ terms of the MIT license. A copy of the license can be found in the file
 -----------------------------------------------------------------------------*/
 
 /* ----------------------------------------------------------------------------
-Implement dynamic thread local variables (for heap's).
-Unlike most OS native implementations there is no limit on the number
-that can be allocated.
+  Implement dynamic thread local variables (used by heap's for their theap's).
+  Unlike most OS native implementations there is no limit on the number
+  that can be allocated.
 -----------------------------------------------------------------------------*/
 
 
@@ -24175,10 +24060,11 @@ typedef struct mi_tls_slot_s {
 
 typedef struct mi_thread_locals_s {
   size_t        count;
+  mi_memid_t    memid;
   mi_tls_slot_t slots[1];
 } mi_thread_locals_t;
 
-static mi_thread_locals_t mi_thread_locals_empty = { 0, {{0,NULL}} };
+static mi_thread_locals_t mi_thread_locals_empty = mi_init_struct_zero;
 
 
 /* -----------------------------------------------------------
@@ -24202,7 +24088,7 @@ static mi_thread_locals_t mi_thread_locals_empty = { 0, {{0,NULL}} };
 #define mi_define_thread_local(tp,name,initval) \
   static mi_decl_thread tp __##name = initval; \
   static inline tp   name##_peek(void)    { return __##name; } \
-  static inline tp   name##_get(void)     { return __##name; } \
+  static inline tp   name##_get(void)     { tp result = __##name; return (result!=NULL ? result : initval); } \
   static inline bool name##_set(tp val)   { __##name = val; return true; } \
   static inline void name##_delete(void)  {  }
 #endif
@@ -24269,22 +24155,36 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
 #if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
   if (_mi_test_tls_control_fail_growth(count_old)) { return NULL; }
 #endif
-  // Allocate from the main heap explicitly, never from the calling thread's default.
-  // Plain `mi_rezalloc` uses whatever heap the application last passed to
-  // `mi_theap_set_default`, so a later `mi_heap_destroy` on that heap frees this array
-  // while `mi_thread_locals` still points at it -- a use-after-free that is silent
-  // rather than fatal, since the clobbered `count` is huge enough to pass every bounds
-  // check and lookups then just return NULL. See test/test-tls-slots-heap.c (#128 B3).
-  // The main heap cannot be destroyed through any public API. Freeing stays plain
+  // Allocate as meta (for secure mode); this is recursion safe as meta uses the fast
+  // local key. This also structurally fixes the provenance bug this comment used to
+  // describe (#128 B3): a plain heap-relative `mi_rezalloc` uses whatever heap the
+  // application last passed to `mi_theap_set_default`, so a later `mi_heap_destroy` on
+  // THAT heap would free this array while `mi_thread_locals` still points at it -- a
+  // use-after-free that is silent rather than fatal, since the clobbered `count` is
+  // huge enough to pass every bounds check and lookups then just return NULL. See
+  // test/test-tls-slots-heap.c. Meta allocations always come from the owning subproc's
+  // meta theap (backed by its main heap), independent of the calling thread's default
+  // heap, so that failure mode cannot occur on this path anymore. Freeing stays plain
   // `mi_free` in `_mi_thread_locals_thread_done`, which finds the owning page itself.
+  mi_memid_t memid = (tls_old==NULL ? _mi_memid_none() : tls_old->memid);
+  mi_thread_locals_t* tls;
 #if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
-  mi_heap_t* const storage_heap = (_mi_test_tls_control_mode() == 1
-    ? _mi_theap_heap(mi_theap_get_default()) : mi_heap_main());
-  mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_heap_rezalloc(storage_heap, tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
-#else
-  mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_heap_rezalloc(mi_heap_main(), tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
+  if (_mi_test_tls_control_mode() == 1) {
+    // Re-derived ownership negative control (#128 B3 test infra): `run_owner_control`
+    // sets a freshly created, non-main heap as the calling thread's default and then
+    // expects `_mi_diagnostic_check_tls_owner` below to abort. Since the real path now
+    // always allocates through the subproc meta heap (which is always main-owned),
+    // deliberately route through the calling thread's default heap here instead, so
+    // there is still a real ownership violation for the diagnostic to catch.
+    tls = (mi_thread_locals_t*)mi_heap_rezalloc(_mi_theap_heap(mi_theap_get_default()), tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
+  }
+  else
 #endif
+  {
+    tls = (mi_thread_locals_t*)_mi_meta_rezalloc(_mi_subproc(), tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t), &memid);
+  }
   if mi_unlikely(tls==NULL) return NULL;
+  tls->memid = memid;
 #if MI_DEBUG > 2
   _mi_diagnostic_check_tls_owner(tls);
 #endif
@@ -24405,7 +24305,7 @@ void* _mi_thread_local_get( mi_thread_local_t key ) {
 void _mi_thread_locals_thread_done(void) {
   mi_thread_locals_t* const tls = mi_thread_locals_peek();
   if (tls!=NULL && tls->count > 0) {
-    mi_free(tls);
+    _mi_meta_free(_mi_subproc(), tls, tls->memid);
     mi_thread_locals_set(NULL);
   }
   if (mi_slot_fast_peek() != NULL) {
@@ -24430,9 +24330,7 @@ void _mi_thread_locals_done(void) {
   mi_lock(&mi_thread_locals_lock) {
     mi_bitmap_t* const slots = mi_thread_locals_free;
     if (slots!=NULL) {
-      const size_t slots_count = mi_bitmap_max_bits(slots);
-      const size_t slots_size  = mi_bitmap_size(slots_count,NULL);
-      _mi_meta_free(_mi_subproc_main(), slots,slots_size,mi_thread_locals_memid);
+      _mi_meta_free(_mi_subproc_main(), slots, mi_thread_locals_memid);
     }
   }
   mi_lock_done(&mi_thread_locals_lock);
@@ -24470,14 +24368,14 @@ static bool mi_thread_local_create_expand(void) {
   const size_t newsize = mi_bitmap_size( newcount, NULL );
   // mi_bitmap_t* newslots = (mi_bitmap_t*)mi_zalloc_aligned(newsize, MI_BCHUNK_SIZE);
   mi_memid_t memid;
-  mi_bitmap_t* newslots = (mi_bitmap_t*)_mi_meta_zalloc(_mi_subproc_main(), newsize, &memid); // always allocate thread locals in the main subprocess
+  mi_bitmap_t* newslots = (mi_bitmap_t*)_mi_meta_zalloc_aligned(_mi_subproc_main(), newsize, MI_BCHUNK_SIZE, &memid); // always allocate thread locals in the main subprocess
   mi_assert_internal(_mi_is_aligned(newslots,MI_BCHUNK_SIZE));
   if (newslots==NULL) { return false; }
   if (slots!=NULL) {
     // copy over the previous bitmap
     const size_t oldsize = mi_bitmap_size(oldcount,NULL);
     _mi_memcpy_aligned(newslots, slots, oldsize);
-    _mi_meta_free(_mi_subproc_main(), slots,oldsize,mi_thread_locals_memid);
+    _mi_meta_free(_mi_subproc_main(), slots, mi_thread_locals_memid);
   }
   mi_bitmap_init(newslots, newcount, true /* pretend already zero'd so we do not zero out the copied old entries */);
   mi_bitmap_unsafe_setN(newslots, oldcount, newcount - oldcount);  /* set the new expanded slots as available */
@@ -24517,7 +24415,7 @@ void _mi_thread_local_free(mi_thread_local_t key) {
 /* ---- end inlined: src/threadlocal.c ---- */
 /* ---- begin inlined: src/prim/prim.c ---- */
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2023, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -24615,7 +24513,7 @@ typedef BOOL (__stdcall* PGetVersionExW)(LPOSVERSIONINFOW lpVersionInformation);
 
 
 // Load a library
-static HMODULE mi_win_loadlibrary(const TCHAR* library) {  
+static HMODULE mi_win_loadlibrary(const TCHAR* library) {
   #if MI_WIN_DESKTOP
     return LoadLibrary(library);
   #else
@@ -24627,7 +24525,7 @@ static HMODULE mi_win_loadlibrary(const TCHAR* library) {
 static HMODULE mi_win_getlibrary(const TCHAR* library, bool* should_free) {
   #if MI_WIN_DESKTOP
   // avoid calling LoadLibrary for "kernel32", "ntdll", and "kernelbase" (also to avoid hitting the loader lock)
-  HMODULE mod = GetModuleHandle(library); 
+  HMODULE mod = GetModuleHandle(library);
   if (mod!=NULL) {
     *should_free = false;
     return mod;
@@ -24638,7 +24536,7 @@ static HMODULE mi_win_getlibrary(const TCHAR* library, bool* should_free) {
 }
 
 static void mi_win_freelibrary(HMODULE mod, bool should_free) {
-  if (should_free) { 
+  if (should_free) {
     FreeLibrary(mod);
   }
 }
@@ -25142,7 +25040,7 @@ void _mi_prim_process_info(mi_process_info_t* pinfo)
     }
   }
 
-  // get process info  
+  // get process info
   if (pGetProcessMemoryInfo != NULL) {
     PROCESS_MEMORY_COUNTERS info; _mi_memzero_var(info);
     if (pGetProcessMemoryInfo(GetCurrentProcess(), &info, sizeof(info))) {
@@ -25164,12 +25062,17 @@ void _mi_prim_out_stderr( const char* msg )
   // on windows with redirection, the C runtime cannot handle locale dependent output
   // after the main thread closes so we use direct console output.
   if (!_mi_preloading()) {
-    // _cputs(msg);  // _cputs cannot be used as it aborts when failing to lock the console
     static HANDLE hcon = INVALID_HANDLE_VALUE;
+    #if MI_WIN_DESKTOP
     static bool hconIsConsole = false;
+    #endif
     if (hcon == INVALID_HANDLE_VALUE) {
-      hcon = GetStdHandle(STD_ERROR_HANDLE); // returns NULL on error
+      hcon = GetStdHandle(STD_ERROR_HANDLE);   // returns NULL if no stderr is available
       #if MI_WIN_DESKTOP
+      if (hcon==NULL) {
+        AttachConsole(ATTACH_PARENT_PROCESS);  // if started from a parent console, try to attach to that
+        hcon = GetStdHandle(STD_ERROR_HANDLE);
+      }
       CONSOLE_SCREEN_BUFFER_INFO sbi;
       hconIsConsole = ((hcon != NULL && hcon != INVALID_HANDLE_VALUE) && GetConsoleScreenBufferInfo(hcon, &sbi));
       #endif
@@ -25177,19 +25080,19 @@ void _mi_prim_out_stderr( const char* msg )
     const size_t len = _mi_strlen(msg);
     if (len > 0 && len < UINT32_MAX) {
       DWORD written = 0;
-      if (hconIsConsole) {
+      if (hcon != NULL && hcon != INVALID_HANDLE_VALUE) {
         #if MI_WIN_DESKTOP
-        WriteConsoleA(hcon, msg, (DWORD)len, &written, NULL);
+        if (hconIsConsole) {
+          WriteConsoleA(hcon, msg, (DWORD)len, &written, NULL);
+        }
+        else
         #endif
+        {
+          // use direct write in case stderr was redirected
+          WriteFile(hcon, msg, (DWORD)len, &written, NULL);
+        }
       }
-      else if (hcon != NULL && hcon != INVALID_HANDLE_VALUE) {
-        // use direct write if stderr was redirected
-        WriteFile(hcon, msg, (DWORD)len, &written, NULL);
-      }
-      else {
-        // finally fall back to fputs after all
-        fputs(msg, stderr);
-      }
+      // don't fall back to fputs or _cputs as the crt can have it locked
     }
   }
 }
@@ -25306,14 +25209,17 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
 ------------------------------------------------------------------------- */
 #if !defined(MI_WIN_INIT_USE_CRT_TLS) && !defined(MI_WIN_INIT_USE_RAW_DLLMAIN) && !defined(MI_WIN_INIT_USE_TLS_DLLMAIN) && !defined(MI_WIN_INIT_USE_FLS)
   #if defined(__INTEL_LLVM_COMPILER) || defined(__INTEL_COMPILER)
-    #define MI_WIN_INIT_USE_TLS_DLLMAIN  1     /* needed for Intel ICX, see issue #1268 */    
+    #define MI_WIN_INIT_USE_TLS_DLLMAIN  1     /* needed for Intel ICX, see issue #1268 */
   #else
     #define MI_WIN_INIT_USE_CRT_TLS      1     /* default */
   #endif
 #endif
 
 #if defined(MI_WIN_INIT_USE_CRT_TLS)
-  #define MI_PRIM_HAS_PROCESS_ATTACH  1
+  #if !defined(__MINGW32__) || defined(MI_MINGW_UCRT64)  // on mingw without UCRT use the constructor attribute (in `src/prim/prim.c`)
+  #define MI_PRIM_HAS_PROCESS_ATTACH  1   
+  #endif
+
   // nothing to do since `_mi_thread_done` is handled through the DLL_THREAD_DETACH event.
   void _mi_prim_thread_init_auto_done(void) {}
   void _mi_prim_thread_done_auto_done(void) {}
@@ -25430,7 +25336,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     __attribute__((used)) static const void* const mi_tls_used_ref = &_tls_used; // pull in the CRT tls
     __attribute__((used, section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_pre = &mi_tls_attach;
     __attribute__((used, section(".CRT$XLY"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_post = &mi_tls_detach;
-    __attribute__((used, section(".CRT$XIB"))) mi_crt_callback_t   _mi_crt_callback_init = &mi_crt_init;  
+    __attribute__((used, section(".CRT$XIB"))) mi_crt_callback_t   _mi_crt_callback_init = &mi_crt_init;
   #endif
 
   #if defined(__cplusplus)
@@ -25526,7 +25432,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     extern const IMAGE_TLS_DIRECTORY _tls_used;
     __attribute__((used)) static const void* const mi_tls_used_ref = &_tls_used; // pull in the CRT tls
     __attribute__((used, section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_pre  = &mi_tls_attach;
-    __attribute__((used, section(".CRT$XLY"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_post = &mi_tls_detach;      
+    __attribute__((used, section(".CRT$XLY"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_post = &mi_tls_detach;
   #endif
 
   #if defined(__cplusplus)
@@ -25600,7 +25506,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     extern const IMAGE_TLS_DIRECTORY _tls_used;
     __attribute__((used)) static const void* const mi_tls_used_ref = &_tls_used; // pull in the CRT tls
     __attribute__((used, section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_pre  = &mi_tls_attach;
-    __attribute__((used, section(".CRT$XLY"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_post = &mi_tls_detach;    
+    __attribute__((used, section(".CRT$XLY"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_post = &mi_tls_detach;
   #endif
 
   #if defined(__cplusplus)
@@ -25641,8 +25547,8 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
       #pragma comment(linker, "/INCLUDE:__mi_crt_callback_init")
       #pragma data_seg(".CRT$XIU")
       mi_crt_callback_t _mi_crt_callback_init[] = { &mi_crt_init };
-      #pragma data_seg()    
-    #endif  
+      #pragma data_seg()
+    #endif
     #if defined(__cplusplus)
     }
     #endif
@@ -26032,7 +25938,7 @@ int _mi_prim_free(void* addr, size_t size ) {
 
 // return errno on failure
 static int unix_madvise(void* addr, size_t size, int advice) {
-  #if defined(__sun)
+  #if defined(__sun) || defined(_AIX)
   const int res = madvise((caddr_t)addr, size, advice);  // Solaris needs cast (issue #520)
   return (res==0 ? 0 : errno);
   #elif defined(__QNX__)
@@ -26191,6 +26097,8 @@ static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protec
       }
     }
   } // huge pages
+  #else
+  MI_UNUSED(large_only);
   #endif
   // regular allocation
   if (p == NULL) {
@@ -26412,18 +26320,16 @@ size_t _mi_prim_numa_node(void) {
 
 size_t _mi_prim_numa_node_count(void) {
   char buf[128];
-  unsigned node = 0;
-  size_t skipped = 0;
-  for(node = 0; node < 256; node++) {
+  unsigned last_found = 1;
+  for(unsigned node = 1; node < 256; node++) {
     // enumerate node entries -- todo: it there a more efficient way to do this? (but ensure there is no allocation)
-    _mi_snprintf(buf, 127, "/sys/devices/system/node/node%u", node + 1);
+    _mi_snprintf(buf, 127, "/sys/devices/system/node/node%u", node);
     if (mi_prim_access(buf,R_OK) != 0) {
-      skipped++;
-      if (skipped > 4) break; // allow some sparseness of nodes but not more than 4
+      if (node - last_found > 4) break; // allow some sparseness of nodes but not more than 4
     }
-    else { skipped = 0; }     // reset skipped count
+    else { last_found = node; }         // highest found node
   }
-  return (node+1);
+  return last_found;
 }
 
 #elif defined(__FreeBSD__) && __FreeBSD_version >= 1200000
@@ -26535,7 +26441,7 @@ static mi_msecs_t timeval_secs(const struct timeval* tv) {
 }
 
 void _mi_prim_process_info(mi_process_info_t* pinfo)
-{  
+{
   struct rusage rusage;
   if (getrusage(RUSAGE_SELF, &rusage) == 0) {
     pinfo->utime = timeval_secs(&rusage.ru_utime);
@@ -26549,20 +26455,20 @@ void _mi_prim_process_info(mi_process_info_t* pinfo)
       pinfo->peak_rss = rusage.ru_maxrss * 1024;  // Linux/BSD report in KiB
     #endif
   }
-  
+
   #if defined(__HAIKU__)
     // Haiku does not have (yet?) a way to
     // get these stats per process
     thread_info tid;
     if (get_thread_info(find_thread(0), &tid) == B_OK) {
       area_info mem;
-      ssize_t c;    
+      ssize_t c;
       while (get_next_area_info(tid.team, &c, &mem) == B_OK) {
         pinfo->peak_rss += mem.ram_size;
       }
     }
     pinfo->page_faults = 0;
-  #elif defined(__APPLE__)  
+  #elif defined(__APPLE__)
     #ifdef MACH_TASK_BASIC_INFO
     struct mach_task_basic_info info;
     mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
@@ -26675,7 +26581,7 @@ int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
     const char* s = env[i];
     if (_mi_strnicmp(name, s, len) == 0 && s[len] == '=') { // case insensitive
       // found it
-      if (!_mi_strlcpy(result, s + len + 1, result_size)) return -1; 
+      if (!_mi_strlcpy(result, s + len + 1, result_size)) return -1;
       return 1;   // success
     }
   }
@@ -26699,7 +26605,7 @@ int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
   }
   if (s == NULL || _mi_strnlen(s,result_size) >= result_size) return 0; // not found
   if (!_mi_strlcpy(result, s, result_size)) return -1;
-  return 1;  // success  
+  return 1;  // success
 }
 #endif  // !MI_USE_ENVIRON
 
@@ -26728,7 +26634,7 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   return true;
 }
 
-#elif defined(__APPLE__) || defined(__linux__) || defined(__HAIKU__)   // also for old apple versions < 10.7 (issue #829)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__HAIKU__) || defined(__CYGWIN__)  // also for old apple versions < 10.7 (issue #829)
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -27205,7 +27111,6 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config) {
 extern void emmalloc_free(void*);
 
 int _mi_prim_free(void* addr, size_t size) {
-  if (size==0) return 0;
   emmalloc_free(addr);
   return 0;
 }
@@ -27703,7 +27608,7 @@ int _mi_prim_free(void* addr, size_t size ) {
 
 // return errno on failure
 static int unix_madvise(void* addr, size_t size, int advice) {
-  #if defined(__sun)
+  #if defined(__sun) || defined(_AIX)
   const int res = madvise((caddr_t)addr, size, advice);  // Solaris needs cast (issue #520)
   return (res==0 ? 0 : errno);
   #elif defined(__QNX__)
@@ -27862,6 +27767,8 @@ static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protec
       }
     }
   } // huge pages
+  #else
+  MI_UNUSED(large_only);
   #endif
   // regular allocation
   if (p == NULL) {
@@ -28083,18 +27990,16 @@ size_t _mi_prim_numa_node(void) {
 
 size_t _mi_prim_numa_node_count(void) {
   char buf[128];
-  unsigned node = 0;
-  size_t skipped = 0;
-  for(node = 0; node < 256; node++) {
+  unsigned last_found = 1;
+  for(unsigned node = 1; node < 256; node++) {
     // enumerate node entries -- todo: it there a more efficient way to do this? (but ensure there is no allocation)
-    _mi_snprintf(buf, 127, "/sys/devices/system/node/node%u", node + 1);
+    _mi_snprintf(buf, 127, "/sys/devices/system/node/node%u", node);
     if (mi_prim_access(buf,R_OK) != 0) {
-      skipped++;
-      if (skipped > 4) break; // allow some sparseness of nodes but not more than 4
+      if (node - last_found > 4) break; // allow some sparseness of nodes but not more than 4
     }
-    else { skipped = 0; }     // reset skipped count
+    else { last_found = node; }         // highest found node
   }
-  return (node+1);
+  return last_found;
 }
 
 #elif defined(__FreeBSD__) && __FreeBSD_version >= 1200000
@@ -28206,7 +28111,7 @@ static mi_msecs_t timeval_secs(const struct timeval* tv) {
 }
 
 void _mi_prim_process_info(mi_process_info_t* pinfo)
-{  
+{
   struct rusage rusage;
   if (getrusage(RUSAGE_SELF, &rusage) == 0) {
     pinfo->utime = timeval_secs(&rusage.ru_utime);
@@ -28220,20 +28125,20 @@ void _mi_prim_process_info(mi_process_info_t* pinfo)
       pinfo->peak_rss = rusage.ru_maxrss * 1024;  // Linux/BSD report in KiB
     #endif
   }
-  
+
   #if defined(__HAIKU__)
     // Haiku does not have (yet?) a way to
     // get these stats per process
     thread_info tid;
     if (get_thread_info(find_thread(0), &tid) == B_OK) {
       area_info mem;
-      ssize_t c;    
+      ssize_t c;
       while (get_next_area_info(tid.team, &c, &mem) == B_OK) {
         pinfo->peak_rss += mem.ram_size;
       }
     }
     pinfo->page_faults = 0;
-  #elif defined(__APPLE__)  
+  #elif defined(__APPLE__)
     #ifdef MACH_TASK_BASIC_INFO
     struct mach_task_basic_info info;
     mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
@@ -28346,7 +28251,7 @@ int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
     const char* s = env[i];
     if (_mi_strnicmp(name, s, len) == 0 && s[len] == '=') { // case insensitive
       // found it
-      if (!_mi_strlcpy(result, s + len + 1, result_size)) return -1; 
+      if (!_mi_strlcpy(result, s + len + 1, result_size)) return -1;
       return 1;   // success
     }
   }
@@ -28370,7 +28275,7 @@ int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
   }
   if (s == NULL || _mi_strnlen(s,result_size) >= result_size) return 0; // not found
   if (!_mi_strlcpy(result, s, result_size)) return -1;
-  return 1;  // success  
+  return 1;  // success
 }
 #endif  // !MI_USE_ENVIRON
 
@@ -28399,7 +28304,7 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   return true;
 }
 
-#elif defined(__APPLE__) || defined(__linux__) || defined(__HAIKU__)   // also for old apple versions < 10.7 (issue #829)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__HAIKU__) || defined(__CYGWIN__)  // also for old apple versions < 10.7 (issue #829)
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -28566,6 +28471,256 @@ void _mi_allocator_done(void) {
 }
 #endif
 /* ---- end inlined: src/prim/prim.c ---- */
+/* ---- begin inlined: src/prim/prim-tls.c ---- */
+/* ----------------------------------------------------------------------------
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
+This is free software; you can redistribute it and/or modify it under the
+terms of the MIT license. A copy of the license can be found in the file
+"LICENSE" at the root of this distribution.
+-----------------------------------------------------------------------------*/
+
+
+// --------------------------------------------------------------------------
+// Implement fast access to the thread local storage for `_mi_theap_default()`
+// and `mi_theap_cached()`. See `include/mimalloc/prim-tls.h` for more info
+// on the TLS models.
+// --------------------------------------------------------------------------
+
+void _mi_tls_slots_init(void);
+void _mi_tls_slots_done(void);
+void _mi_theap_default_set(mi_theap_t* theap);
+void _mi_theap_cached_set(mi_theap_t* theap);
+
+
+#if MI_TLS_MODEL_LOCAL
+// the thread-local main theap for allocation
+mi_decl_hidden mi_decl_thread mi_theap_t* __mi_theap_default = (mi_theap_t*)&_mi_theap_empty;
+// the last used non-main theap
+mi_decl_hidden mi_decl_thread mi_theap_t* __mi_theap_cached = (mi_theap_t*)&_mi_theap_empty;
+#endif
+
+mi_decl_hidden mi_decl_thread void* __mi_thread_id_helper = NULL;
+
+mi_threadid_t _mi_thread_id(void) mi_attr_noexcept {
+  const mi_threadid_t tid = _mi_prim_thread_id();
+  mi_assert_internal( (tid & MI_PAGE_FLAG_MASK) == 0 ); // mimalloc reserves the bottom 2 bits
+  return tid;
+}
+
+// ----------------------------------------------------------------------------
+// Setting the default and cached theap
+// ----------------------------------------------------------------------------
+
+#if MI_TLS_MODEL_WIN32
+
+// If we can, we use one of the 64 direct TLS slots (but fall back to expansion slots if needed)
+// See <https://en.wikipedia.org/wiki/Win32_Thread_Information_Block> for the offsets.
+#if MI_SIZE_SIZE==4
+#define MI_TLS_DIRECT_FIRST             (0x0E10 / MI_INTPTR_SIZE)
+#else
+#define MI_TLS_DIRECT_FIRST             (0x1480 / MI_INTPTR_SIZE)
+#endif
+#define MI_TLS_DIRECT_SLOTS             (64)
+#define MI_TLS_EXPANSION_SLOTS          (1024)
+
+#if !MI_WIN_DIRECT_TLS
+// We initially use the last of the expansion slots as the default NULL.
+// note: this will fail if the program allocates exactly 1024+64 slots with TlsAlloc 
+// before we are initialized :-( (but this seems quite unlikely).
+// (todo: another approach could be to use slot 7 (EnvironmentPointer) as the initial slot as that seems to be always NULL)
+#define MI_TLS_INITIAL_SLOT             MI_TLS_EXPANSION_SLOT
+#define MI_TLS_INITIAL_EXPANSION_SLOT   (MI_TLS_EXPANSION_SLOTS-1)
+#else
+// With direct tls we need an initial NULL slot outside the expansion slots
+#define MI_TLS_INITIAL_SLOT             (5)  // Arbitrary user pointer
+#define MI_TLS_INITIAL_EXPANSION_SLOT   (MI_TLS_EXPANSION_SLOTS-1)  // unused
+#endif
+
+// in case of errors assign fixed slots (but since we use EFAULT the program should fail anyways)
+#define MI_TLS_ERROR_SLOT               (5)   // arbitrary user pointer
+#define MI_TLS_ERROR_EXPANSION_SLOT     (7)   // environment pointer (only used for OS/2 emulation)
+
+
+mi_decl_hidden mi_decl_cache_align _Atomic(size_t) _mi_theap_default_slot = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_SLOT);
+mi_decl_hidden _Atomic(size_t) _mi_theap_default_expansion_slot = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_EXPANSION_SLOT);
+mi_decl_hidden _Atomic(size_t) _mi_theap_cached_slot            = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_SLOT);
+mi_decl_hidden _Atomic(size_t) _mi_theap_cached_expansion_slot  = MI_ATOMIC_VAR_INIT(MI_TLS_INITIAL_EXPANSION_SLOT);
+
+static DWORD mi_tls_raw_index_default = TLS_OUT_OF_INDEXES;
+static DWORD mi_tls_raw_index_cached  = TLS_OUT_OF_INDEXES;
+
+static bool mi_win_tls_slot_alloc(_Atomic(size_t)* slot, _Atomic(size_t)* extended, DWORD* raw_index) {
+  // always write slot before extended due to concurrent readers
+  const DWORD index = TlsAlloc();
+  *raw_index = index;
+  if (index==TLS_OUT_OF_INDEXES) {
+    mi_atomic_store_release(slot,MI_TLS_ERROR_SLOT);
+    mi_atomic_store_release(extended,MI_TLS_ERROR_EXPANSION_SLOT);
+    return false;
+  }
+  else if (index<MI_TLS_DIRECT_SLOTS) {
+    mi_atomic_store_release(slot,index + MI_TLS_DIRECT_FIRST);
+    mi_atomic_store_release(extended,0);
+    return true;
+  }
+  #if !MI_WIN_DIRECT_TLS
+  else if (index < MI_TLS_DIRECT_SLOTS + MI_TLS_EXPANSION_SLOTS - 1) { // check maximum number of expansion slots - 1 (as we use the last one as the default)
+    mi_atomic_store_release(slot, MI_TLS_EXPANSION_SLOT);
+    mi_atomic_store_release(extended,index - MI_TLS_DIRECT_SLOTS);
+    return true;
+  }
+  #endif
+  else {
+    // to high an index for us
+    _mi_error_message(EFAULT, "returned TLS index was too high (%u)\n", index);
+    TlsFree(index);
+    *raw_index = TLS_OUT_OF_INDEXES;
+    mi_atomic_store_release(slot, MI_TLS_ERROR_SLOT);
+    mi_atomic_store_release(extended,MI_TLS_ERROR_EXPANSION_SLOT);
+    return false;
+  }
+}
+
+static void mi_win_tls_slot_free(_Atomic(size_t)*slot, _Atomic(size_t)*extended, DWORD* raw_index) {
+  if (*raw_index != TLS_OUT_OF_INDEXES) {
+    mi_atomic_store_release(slot, MI_TLS_ERROR_SLOT);
+    mi_atomic_store_release(extended, MI_TLS_ERROR_EXPANSION_SLOT);
+    TlsFree(*raw_index);
+    *raw_index = TLS_OUT_OF_INDEXES;
+  }
+}
+
+void _mi_tls_slots_init(void) {
+  mi_atomic_do_once {
+    bool ok = mi_win_tls_slot_alloc(&_mi_theap_default_slot, &_mi_theap_default_expansion_slot, &mi_tls_raw_index_default);
+    if (ok) {
+      ok = mi_win_tls_slot_alloc(&_mi_theap_cached_slot, &_mi_theap_cached_expansion_slot, &mi_tls_raw_index_cached);
+    }
+    if (!ok) {
+      _mi_error_message(EFAULT, "unable to allocate a fast TLS user slot.\n");
+    }
+  }
+}
+
+void _mi_tls_slots_done(void) {
+  mi_win_tls_slot_free(&_mi_theap_default_slot, &_mi_theap_default_expansion_slot, &mi_tls_raw_index_default);
+  mi_win_tls_slot_free(&_mi_theap_cached_slot, &_mi_theap_cached_expansion_slot, &mi_tls_raw_index_cached );
+}
+
+static void mi_win_tls_slot_set(size_t slot, size_t extended_slot, void* value) {
+  mi_assert_internal((slot >= MI_TLS_DIRECT_FIRST && slot < MI_TLS_DIRECT_FIRST + MI_TLS_DIRECT_SLOTS) || slot == MI_TLS_EXPANSION_SLOT);
+  if (slot < MI_TLS_DIRECT_FIRST + MI_TLS_DIRECT_SLOTS) {
+    mi_prim_tls_slot_set(slot, value);
+  }
+  else {
+    mi_assert_internal(extended_slot < MI_TLS_EXPANSION_SLOTS);
+    TlsSetValue((DWORD)(extended_slot + MI_TLS_DIRECT_SLOTS), value);  // use TlsSetValue to initialize the TlsExpansion array if needed
+  }
+}
+
+#elif MI_TLS_MODEL_PTHREADS
+
+// only for pthreads for now
+mi_decl_hidden _Atomic(pthread_key_t) _mi_theap_default_key = MI_ATOMIC_VAR_INIT(MI_PTHREAD_KEY_INVALID);
+mi_decl_hidden _Atomic(pthread_key_t) _mi_theap_cached_key  = MI_ATOMIC_VAR_INIT(MI_PTHREAD_KEY_INVALID);
+
+static void mi_theap_cached_key_destroy(void* theapv) {
+  mi_theap_t* theap = (mi_theap_t*)theapv;
+  if (theap!=NULL) {
+    _mi_theap_decref(theap);
+  }
+}
+
+void _mi_tls_slots_init(void) {
+  mi_atomic_do_once {
+    pthread_key_t key;
+    if (_mi_pthread_key_create(&key,NULL,NULL)) { mi_atomic_store_release(&_mi_theap_default_key,key); }
+    if (_mi_pthread_key_create(&key,&mi_theap_cached_key_destroy,NULL)) { mi_atomic_store_release(&_mi_theap_cached_key,key); }
+  }  
+}
+
+void _mi_tls_slots_done(void) {
+  pthread_key_t key = mi_atomic_exchange_relaxed(&_mi_theap_default_key,MI_PTHREAD_KEY_INVALID);
+  if (key!=MI_PTHREAD_KEY_INVALID) { pthread_key_delete(key); }
+  key = mi_atomic_exchange_relaxed(&_mi_theap_cached_key,MI_PTHREAD_KEY_INVALID);
+  if (key!=MI_PTHREAD_KEY_INVALID) { pthread_key_delete(key); }
+}
+
+#elif MI_TLS_MODEL_FIXED 
+
+void _mi_tls_slots_init(void) {
+  mi_atomic_do_once {
+    mi_theap_t* theap = _mi_theap_default();
+    if (theap!=NULL) {
+      _mi_error_message(EINVAL,"fixed TLS slot is already in use (slot %d = %p)", MI_TLS_MODEL_FIXED_DEFAULT, theap);
+    }
+    theap = _mi_theap_cached();
+    if (theap!=NULL) {
+      _mi_error_message(EINVAL,"fixed TLS slot is already in use (slot %d = %p)", MI_TLS_MODEL_FIXED_CACHED, theap);
+    }
+  }
+}
+
+void _mi_tls_slots_done(void) {
+  // nothing
+}
+
+
+#else
+
+void _mi_tls_slots_init(void) {
+  // nothing
+}
+
+void _mi_tls_slots_done(void) {
+  // nothing
+}
+
+#endif
+
+void _mi_theap_cached_set(mi_theap_t* theap) {
+  mi_theap_t* prev = _mi_theap_cached();
+  if (prev==theap) return;
+  // set
+  _mi_tls_slots_init();
+  #if MI_TLS_MODEL_LOCAL
+    __mi_theap_cached = theap;
+  #elif MI_TLS_MODEL_FIXED
+    mi_prim_tls_slot_set(MI_TLS_MODEL_FIXED_CACHED, theap);
+  #elif MI_TLS_MODEL_WIN32
+    mi_win_tls_slot_set(mi_atomic_load_relaxed(&_mi_theap_cached_slot), mi_atomic_load_relaxed(&_mi_theap_cached_expansion_slot), theap);
+  #elif MI_TLS_MODEL_PTHREADS
+    pthread_key_t key = mi_atomic_load_relaxed(&_mi_theap_cached_key);
+    if (key!=MI_PTHREAD_KEY_INVALID) { pthread_setspecific(key, theap); }
+  #endif
+  // update refcounts (so cached theap memory keeps available until no longer cached)
+  _mi_theap_incref(theap);
+  _mi_theap_decref(prev);
+}
+
+void _mi_theap_default_set(mi_theap_t* theap)  {
+  mi_assert_internal(theap != NULL);
+  mi_assert_internal(theap->tld != NULL);
+  mi_assert_internal(mi_theap_matches_thread(theap));
+  _mi_tls_slots_init();
+  #if MI_TLS_MODEL_LOCAL
+    __mi_theap_default = theap;
+  #elif MI_TLS_MODEL_FIXED
+    mi_prim_tls_slot_set(MI_TLS_MODEL_FIXED_DEFAULT, theap);
+  #elif MI_TLS_MODEL_WIN32
+    mi_win_tls_slot_set(mi_atomic_load_relaxed(&_mi_theap_default_slot), mi_atomic_load_relaxed(&_mi_theap_default_expansion_slot), theap);
+  #elif MI_TLS_MODEL_PTHREADS
+    pthread_key_t key = mi_atomic_load_relaxed(&_mi_theap_default_key);
+    if (key!=MI_PTHREAD_KEY_INVALID) { pthread_setspecific(key, theap); }
+  #endif
+
+  // set theap main if needed
+  if (mi_theap_is_initialized(theap)) {
+    // ensure the default theap is passed to `_mi_thread_done` as on some platforms we cannot access TLS at thread termination (as it would allocate again)
+    _mi_prim_thread_associate_default_theap(theap);
+  }
+}
+/* ---- end inlined: src/prim/prim-tls.c ---- */
 #if MI_OSX_ZONE
 /* ---- begin inlined: src/prim/osx/alloc-override-zone.c ---- */
 /* ----------------------------------------------------------------------------
@@ -28638,14 +28793,17 @@ static void* zone_valloc(malloc_zone_t* zone, size_t size) {
 }
 
 static void zone_free(malloc_zone_t* zone, void* p) {
-  if mi_likely(mi_any_heap_contains(p)) {
-    if mi_likely(_mi_thread_is_initialized()) {
-      mi_free(p); // with the page_map and pagemap_commit=1 we can use the regular free
-    }
-    else {
-      // during thread shutdown `_pthread_tsd_cleanup` may call `zone_free` on a pointer that was allocated in another subproc.
-      _mi_free_subproc_safe(p); 
-    }
+  mi_page_t* const page = _mi_checked_ptr_page(p);  
+  if mi_likely(page!=NULL) {
+    mi_assert_internal(_mi_thread_is_initialized());  
+    _mi_free_in_page(p,page);
+    // if mi_likely(_mi_thread_is_initialized()) {
+    //   _mi_free_in_page(p,page);
+    // }
+    // else {
+    //   // during thread shutdown `_pthread_tsd_cleanup` may call `zone_free` on a pointer that was allocated in another subproc.
+    //   _mi_free_subproc_safe_in_page(p,page); 
+    // }
   }
   else if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
     zone->free(zone,p);

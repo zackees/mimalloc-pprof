@@ -22,6 +22,7 @@ ALLOCATORS = (
     "_mi_meta_realloc",
     "_mi_meta_rezalloc",
     "_mi_meta_zalloc",
+    "_mi_meta_zalloc_aligned",
     "_mi_os_alloc",
     "_mi_os_alloc_aligned",
     "_mi_os_alloc_aligned_at_offset",

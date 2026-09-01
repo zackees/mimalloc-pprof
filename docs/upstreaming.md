@@ -187,6 +187,17 @@ should land after the fixes.
 
 **MinGW CI job: still unfiled**, and now correctly sequenced behind #1351.
 
+**Update (2026-09-01, #266 pin bump):** the `__GCC__`/`__GNUC__` detection typo described above is fixed upstream as of our new pin (`6def7be9`). It was still present at `1f06f694` (the tip snapshot measured above) but upstream landed
+`4cca633e`/`b5fdee4a` ("fix mingw detection: __GCC__ -> __GNUC__") and then
+`1cf88691` ("use __MINGW32__ to detect mingw ... instead of __GNUC__") somewhere
+in `1f06f694..6def7be9`. `src/prim/windows/prim.c` at `6def7be9` already reads
+`#elif defined(__MINGW32__)` in all three `MI_WIN_INIT_USE_*` blocks -- a real,
+correct macro (defined by MinGW-w64 GCC and by clang targeting `*-w64-mingw32`),
+not the old typo. We do not carry a patch for this anymore; our overlay took
+upstream's file verbatim at the bump (#266). The historical measurements above
+(against `1f06f694`) remain accurate for their time and are left as-is for the
+record; they no longer describe our current pin.
+
 ## Posture on upstream PR #1266 (competing profiler)
 
 Resolves #128 F2. Re-check the dates below before cutting a `pr/*` branch that touches

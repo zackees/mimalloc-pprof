@@ -899,14 +899,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     #pragma data_seg(".CRT$XIB")
       mi_crt_callback_t _mi_crt_callback_init[] = { &mi_crt_init };
     #pragma data_seg()
-  // FORK PATCH (mimalloc-pprof): upstream's MinGW branch tested a macro that does not
-  // exist -- GCC defines __GNUC__, not the one upstream wrote. The branch therefore never
-  // compiled, no TLS callbacks were registered under MinGW, and the thread-exit leak this
-  // block was added to fix (upstream 60c4f031, crediting our issue #56) silently returned.
-  // Verified: `gcc -dM -E` lists __GNUC__ and no such macro; with the typo in place,
-  // test-degenerate reports 184 live threads after creating and joining 184.
-  // The same typo appears in all three MI_WIN_INIT_USE_* blocks. Report upstream.
-  #elif defined(__GNUC__) && !defined(_MSC_VER)  // mingw
+  #elif defined(__MINGW32__)
     extern const IMAGE_TLS_DIRECTORY _tls_used;
     __attribute__((used)) static const void* const mi_tls_used_ref = &_tls_used; // pull in the CRT tls
     __attribute__((used, section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_pre = &mi_tls_attach;
@@ -1003,7 +996,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     #pragma data_seg(".CRT$XLY")
       PIMAGE_TLS_CALLBACK _mi_tls_callback_post[] = { &mi_tls_detach };
     #pragma data_seg()
-  #elif defined(__GNUC__) && !defined(_MSC_VER)  // mingw  /* FORK PATCH: see note above */
+  #elif defined(__MINGW32__)
     extern const IMAGE_TLS_DIRECTORY _tls_used;
     __attribute__((used)) static const void* const mi_tls_used_ref = &_tls_used; // pull in the CRT tls
     __attribute__((used, section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_pre  = &mi_tls_attach;
@@ -1077,7 +1070,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     #pragma data_seg(".CRT$XLY")
     PIMAGE_TLS_CALLBACK _mi_tls_callback_post[] = { &mi_win_main_detach };
     #pragma data_seg()
-  #elif defined(__GNUC__) && !defined(_MSC_VER)  // mingw  /* FORK PATCH: see note above */
+  #elif defined(__MINGW32__)
     extern const IMAGE_TLS_DIRECTORY _tls_used;
     __attribute__((used)) static const void* const mi_tls_used_ref = &_tls_used; // pull in the CRT tls
     __attribute__((used, section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_pre  = &mi_tls_attach;

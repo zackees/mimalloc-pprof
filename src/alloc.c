@@ -458,8 +458,7 @@ static mi_decl_forceinline void* mi_theap_realloc_zero_ex(mi_theap_t* theap, voi
   if (memevt_is_resize) {
     _mi_memevt_suppress_end();
     if (newp != NULL) {
-      mi_page_t* const memevt_new_page = _mi_ptr_page(newp);
-      _mi_memevt_on_resize(memevt_oldp, _mi_page_ptr_unalign(memevt_new_page, newp), memevt_usable_pre, memevt_usable_post, newsize);
+      _mi_memevt_on_resize(memevt_oldp, _mi_page_ptr_unalign(newpage, newp), memevt_usable_pre, memevt_usable_post, newsize);
     }
   }
   return newp;

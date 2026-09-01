@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8af2f9d7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4aee6bc5 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -7637,8 +7637,7 @@ static mi_decl_forceinline void* mi_theap_realloc_zero_ex(mi_theap_t* theap, voi
   if (memevt_is_resize) {
     _mi_memevt_suppress_end();
     if (newp != NULL) {
-      mi_page_t* const memevt_new_page = _mi_ptr_page(newp);
-      _mi_memevt_on_resize(memevt_oldp, _mi_page_ptr_unalign(memevt_new_page, newp), memevt_usable_pre, memevt_usable_post, newsize);
+      _mi_memevt_on_resize(memevt_oldp, _mi_page_ptr_unalign(newpage, newp), memevt_usable_pre, memevt_usable_post, newsize);
     }
   }
   return newp;
@@ -19187,35 +19186,6 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
 }
 
 
-/* Stays commented out deliberately -- see issue #128 B2 and C1.
-
-   Upstream `bf054991` un-comments this, on the reasoning that with
-   MIMALLOC_PAGE_FULL_RETAIN=-1 (allow_page_abandon false) a page sitting in
-   MI_BIN_FULL whose blocks are all cross-thread freed can neither be abandoned nor
-   collected: `_mi_page_unfull` runs only from a thread-LOCAL free, and a remote free
-   just pushes onto `xthread_free` without waking anyone. The mechanism is really
-   there in our pin -- but the memory growth it predicts is not.
-
-   Measured, Windows/MinGW, Release, MIMALLOC_PAGE_FULL_RETAIN=-1: 60 rounds of
-   "fill pages from thread A, free every block from thread B", at both 256 and 4096
-   live 16 KiB blocks (the latter reaching 64 MiB committed). Committed bytes and RSS
-   were flat to the kilobyte from round 10 through round 60 -- 0.0% growth in each
-   configuration. A page retained per round would have shown linear growth.
-
-   So the predicted leak is not reachable this way, and repo rule #66 C.2 is to import
-   only with a test that fails without the import. There is no such test, so this stays
-   as upstream left it. The negative result does not prove the bug's absence -- it
-   bounds it: whatever reaches this path is not the simple cross-thread-free-a-full-page
-   workload. Anyone re-opening this should produce a growing repro FIRST.
-
-   Same evidence retires C1 (`mi_page_is_full()` ignoring uncollected `xthread_free`).
-   C1 asked to "confirm a reachable call site before changing a predicate that's
-   asserted in three places": every site that could RETAIN memory already collects
-   first -- `mi_free_try_collect_mt` opens with `_mi_page_free_collect{,_partly}`, and
-   `mi_abandoned_page_unown_from_free` re-collects and re-tries free/reabandon on every
-   CAS that observes a non-empty `xthread_free`. The window is closed by construction.
-*/
-/*
 static void mi_theap_collect_full_pages(mi_theap_t* theap) {
   // note: normally full pages get immediately abandoned and the full queue is always empty
   // this path is only used if abandoning is disabled due to a destroy-able theap or options
@@ -19236,7 +19206,6 @@ static void mi_theap_collect_full_pages(mi_theap_t* theap) {
     page = next;
   }
 }
-*/
 
 // free retired pages: we don't need to look at the entire queues
 // since we only retire pages that are at the head position in a queue.
@@ -19265,9 +19234,9 @@ void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
   }
   theap->page_retired_min = min;
   theap->page_retired_max = max;
-  // NOTE: not calling `mi_theap_collect_full_pages` here -- see issue #128 B2/C1
-  // comment above; upstream `bf054991` un-commented it but the fork deliberately
-  // keeps it disabled (measured: no reachable leak at this pin).
+  if (!theap->allow_page_abandon) {
+    mi_theap_collect_full_pages(theap);
+  }
 }
 
 
@@ -24164,8 +24133,9 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
   // huge enough to pass every bounds check and lookups then just return NULL. See
   // test/test-tls-slots-heap.c. Meta allocations always come from the owning subproc's
   // meta theap (backed by its main heap), independent of the calling thread's default
-  // heap, so that failure mode cannot occur on this path anymore. Freeing stays plain
-  // `mi_free` in `_mi_thread_locals_thread_done`, which finds the owning page itself.
+  // heap, so that failure mode cannot occur on this path anymore. Freeing correspondingly
+  // uses `_mi_meta_free(_mi_subproc(), tls, tls->memid)` in `_mi_thread_locals_thread_done`,
+  // matching the meta provenance this allocation now has.
   mi_memid_t memid = (tls_old==NULL ? _mi_memid_none() : tls_old->memid);
   mi_thread_locals_t* tls;
 #if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)
@@ -25324,14 +25294,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     #pragma data_seg(".CRT$XIB")
       mi_crt_callback_t _mi_crt_callback_init[] = { &mi_crt_init };
     #pragma data_seg()
-  // FORK PATCH (mimalloc-pprof): upstream's MinGW branch tested a macro that does not
-  // exist -- GCC defines __GNUC__, not the one upstream wrote. The branch therefore never
-  // compiled, no TLS callbacks were registered under MinGW, and the thread-exit leak this
-  // block was added to fix (upstream 60c4f031, crediting our issue #56) silently returned.
-  // Verified: `gcc -dM -E` lists __GNUC__ and no such macro; with the typo in place,
-  // test-degenerate reports 184 live threads after creating and joining 184.
-  // The same typo appears in all three MI_WIN_INIT_USE_* blocks. Report upstream.
-  #elif defined(__GNUC__) && !defined(_MSC_VER)  // mingw
+  #elif defined(__MINGW32__)
     extern const IMAGE_TLS_DIRECTORY _tls_used;
     __attribute__((used)) static const void* const mi_tls_used_ref = &_tls_used; // pull in the CRT tls
     __attribute__((used, section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_pre = &mi_tls_attach;
@@ -25428,7 +25391,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     #pragma data_seg(".CRT$XLY")
       PIMAGE_TLS_CALLBACK _mi_tls_callback_post[] = { &mi_tls_detach };
     #pragma data_seg()
-  #elif defined(__GNUC__) && !defined(_MSC_VER)  // mingw  /* FORK PATCH: see note above */
+  #elif defined(__MINGW32__)
     extern const IMAGE_TLS_DIRECTORY _tls_used;
     __attribute__((used)) static const void* const mi_tls_used_ref = &_tls_used; // pull in the CRT tls
     __attribute__((used, section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_pre  = &mi_tls_attach;
@@ -25502,7 +25465,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     #pragma data_seg(".CRT$XLY")
     PIMAGE_TLS_CALLBACK _mi_tls_callback_post[] = { &mi_win_main_detach };
     #pragma data_seg()
-  #elif defined(__GNUC__) && !defined(_MSC_VER)  // mingw  /* FORK PATCH: see note above */
+  #elif defined(__MINGW32__)
     extern const IMAGE_TLS_DIRECTORY _tls_used;
     __attribute__((used)) static const void* const mi_tls_used_ref = &_tls_used; // pull in the CRT tls
     __attribute__((used, section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK _mi_tls_callback_pre  = &mi_tls_attach;

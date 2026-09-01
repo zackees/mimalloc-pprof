@@ -1307,7 +1307,12 @@ if (MI_BUILD_TESTS)
   # with MI_FREE_IS_CHECKED=1 (line ~419), which makes mi_free NULL-safe unconditionally
   # via _mi_checked_ptr_page and would never exercise the unchecked page-map path the bug
   # is in.
-  if(NOT MI_DEBUG_TSAN)
+  # MSVC (cl.exe) is excluded: the pre-init hook is `__attribute__((section(...)))` /
+  # `__attribute__((constructor))`, neither of which cl.exe supports, so a pure-MSVC build
+  # would define no hook at all and the test would fail for the wrong reason (the hook
+  # never running) rather than testing anything. MinGW (GCC) is unaffected and still runs
+  # it via the constructor branch. Unverified on MSVC; see #266.
+  if(NOT MI_DEBUG_TSAN AND NOT MSVC)
     add_executable(mimalloc-test-free-before-init test/test-free-before-init.c)
     target_compile_definitions(mimalloc-test-free-before-init PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-free-before-init PRIVATE ${mi_cflags})

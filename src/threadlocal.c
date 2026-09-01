@@ -131,8 +131,9 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
   // huge enough to pass every bounds check and lookups then just return NULL. See
   // test/test-tls-slots-heap.c. Meta allocations always come from the owning subproc's
   // meta theap (backed by its main heap), independent of the calling thread's default
-  // heap, so that failure mode cannot occur on this path anymore. Freeing stays plain
-  // `mi_free` in `_mi_thread_locals_thread_done`, which finds the owning page itself.
+  // heap, so that failure mode cannot occur on this path anymore. Freeing correspondingly
+  // uses `_mi_meta_free(_mi_subproc(), tls, tls->memid)` in `_mi_thread_locals_thread_done`,
+  // matching the meta provenance this allocation now has.
   mi_memid_t memid = (tls_old==NULL ? _mi_memid_none() : tls_old->memid);
   mi_thread_locals_t* tls;
 #if defined(MI_TEST_TLS_CONTROL) && (MI_TEST_TLS_CONTROL != 0)

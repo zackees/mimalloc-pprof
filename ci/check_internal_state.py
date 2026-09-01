@@ -49,7 +49,6 @@ EXCLUDED = {
     "src/alloc-override.c",
     "src/alloc-posix.c",
     "src/alloc.c",
-    "src/arena-meta.c",
     "src/os.c",
 }
 REQUIRED_FIELDS = {

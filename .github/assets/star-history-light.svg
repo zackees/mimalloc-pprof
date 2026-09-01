@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400" width="800" height="400" role="img" aria-label="Star history for zackees/mimalloc-pprof">
+<rect width="800" height="400" fill="#ffffff"/>
+<g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<text x="64" y="28" font-size="16" font-weight="600" fill="#1f2328">Star history</text>
+<text x="776" y="28" font-size="12" text-anchor="end" fill="#59636e">zackees/mimalloc-pprof</text>
+<line x1="64" y1="352.00" x2="776" y2="352.00" stroke="#d8dee4" stroke-width="1"/>
+<text x="54" y="356.00" font-size="11" text-anchor="end" fill="#59636e">0</text>
+<line x1="64" y1="291.20" x2="776" y2="291.20" stroke="#d8dee4" stroke-width="1"/>
+<text x="54" y="295.20" font-size="11" text-anchor="end" fill="#59636e">5</text>
+<line x1="64" y1="230.40" x2="776" y2="230.40" stroke="#d8dee4" stroke-width="1"/>
+<text x="54" y="234.40" font-size="11" text-anchor="end" fill="#59636e">10</text>
+<line x1="64" y1="169.60" x2="776" y2="169.60" stroke="#d8dee4" stroke-width="1"/>
+<text x="54" y="173.60" font-size="11" text-anchor="end" fill="#59636e">15</text>
+<line x1="64" y1="108.80" x2="776" y2="108.80" stroke="#d8dee4" stroke-width="1"/>
+<text x="54" y="112.80" font-size="11" text-anchor="end" fill="#59636e">20</text>
+<line x1="64" y1="48.00" x2="776" y2="48.00" stroke="#d8dee4" stroke-width="1"/>
+<text x="54" y="52.00" font-size="11" text-anchor="end" fill="#59636e">25</text>
+<text x="64.00" y="374.00" font-size="11" text-anchor="start" fill="#59636e">2026-07-25</text>
+<text x="776.00" y="374.00" font-size="11" text-anchor="end" fill="#59636e">2026-09-01</text>
+<path d="M 64.00 339.84 L 64.00 327.68 L 64.00 315.52 L 82.74 303.36 L 101.47 291.20 L 101.47 279.04 L 120.21 266.88 L 120.21 254.72 L 138.95 242.56 L 157.68 230.40 L 157.68 218.24 L 213.89 206.08 L 232.63 193.92 L 251.37 181.76 L 251.37 169.60 L 345.05 157.44 L 363.79 145.28 L 382.53 133.12 L 494.95 120.96 L 776.00 108.80 L 776.00 96.64 L 776.00 84.48 L 776.00 72.32 L 776.00 352.00 L 64.00 352.00 Z" fill="rgba(9,105,218,0.12)" stroke="none"/>
+<path d="M 64.00 339.84 L 64.00 327.68 L 64.00 315.52 L 82.74 303.36 L 101.47 291.20 L 101.47 279.04 L 120.21 266.88 L 120.21 254.72 L 138.95 242.56 L 157.68 230.40 L 157.68 218.24 L 213.89 206.08 L 232.63 193.92 L 251.37 181.76 L 251.37 169.60 L 345.05 157.44 L 363.79 145.28 L 382.53 133.12 L 494.95 120.96 L 776.00 108.80 L 776.00 96.64 L 776.00 84.48 L 776.00 72.32" fill="none" stroke="#0969da" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="776.00" cy="72.32" r="3.5" fill="#0969da"/>
+</g></svg>

@@ -250,15 +250,47 @@ two apart. Full field list and the rest of the caveats:
 
 When sampling isn't enough — you want **every** allocation's size and lifetime —
 run a short, focused session under the exact DHAT observer and open the result
-in Valgrind's `dh_view.html`:
+in Valgrind's [`dh_view.html`](https://valgrind.org/docs/manual/dh-manual.html).
+No code needed at all:
 
 ```sh
 MIMALLOC_DHAT=1 MIMALLOC_DHAT_DUMP_AT_EXIT=heap.dhat.json ./my_app
 ```
 
-Or from code: `mi_dhat_start()` … `mi_dhat_dump("heap.dhat.json")` from
-`<mimalloc/dhat.h>`. It's exact and high-overhead — for tests and
-investigations, not production. Budgeting, caveats, and the API:
+#### Rust
+
+```rust
+use mimalloc_pprof::dhat;
+use std::path::Path;
+
+assert!(dhat::start(), "DHAT already running");
+
+let retained = vec![0_u8; 1024 * 1024];
+std::hint::black_box(&retained);
+
+dhat::stop();  // stop observing; the retained records still dump
+dhat::dump_file(Path::new("heap.dhat.json")).expect("write DHAT report");
+```
+
+#### C
+
+```c
+#include <mimalloc.h>
+#include <mimalloc/dhat.h>
+
+if (!mi_dhat_start()) return 1;
+
+void* p = mi_malloc(4096);
+mi_free(p);
+
+mi_dhat_stop();                             /* stop observing; report still dumps */
+if (!mi_dhat_dump("heap.dhat.json")) return 2;
+```
+
+Unlike the sampled profiler this keeps a record for **every** live allocation, so
+it is exact but high-overhead — use it for tests and focused investigations, not a
+continuously running production workload. Memory budgeting
+(`MIMALLOC_DHAT_MAX_BYTES`), partial-report semantics, and the stats API:
 **[docs/dhat-and-memory-events.md](docs/dhat-and-memory-events.md)**.
 
 ### Going deeper

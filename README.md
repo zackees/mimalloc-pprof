@@ -61,65 +61,15 @@ not sample until you call a start API or set `MIMALLOC_PROF=1`.
 
 **Contents**
 
-- [Why use this fork](#why-use-this-fork) — the most tested mimalloc fork in existence
 - [Quick start](#quick-start)
 - [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, TCMalloc, and jemalloc
+- [Why use this fork](#why-use-this-fork) — the most tested mimalloc fork in existence
 - [Choosing a version: v2 or v3](#choosing-a-version-v2-or-v3)
 - [Profiling and observability](#profiling-and-observability) — sampled pprof, exact stats, DHAT, memory events
 - [Upstream bugs found and fixed](#upstream-bugs-found-and-fixed) — including two unbounded memory leaks
 - [Documentation](#documentation) — the full docs index
 - [Release history](#release-history)
 - [Prior art and credits](#prior-art-and-credits)
-
----
-
-## Why use this fork
-
-Beyond being the one mimalloc with a native-Windows heap profiler, this is — as of
-September 2026 — **the most tested mimalloc fork in existence**, and that testing
-regime has caught real allocator bugs that **Microsoft has since upstreamed fixes
-for** ([`60c4f031`](https://github.com/microsoft/mimalloc/commit/60c4f031c9d878da05ffa6066777accd51458b98),
-crediting [#56](https://github.com/zackees/mimalloc-pprof/issues/56)).
-
-**Every platform, every commit.** Ubuntu, Windows **MSVC**, Windows **MinGW**, and
-macOS are all required CI gates, in Debug and Release, with the profiler compiled
-in and out, plus shared-library builds. Upstream has no MinGW job at all — running
-one here is exactly how two unbounded memory leaks were found
-([docs/upstream-bugs.md](docs/upstream-bugs.md)).
-
-**Cross-compilation is tested, not assumed.** The Rust crate builds wherever
-`cc-rs` reaches a C compiler, and CI exercises cross builds including
-`cargo-xwin` for `aarch64-pc-windows-msvc` — which is how a real upstream
-ARM64-atomics incompatibility was caught and fixed
-([#223](https://github.com/zackees/mimalloc-pprof/issues/223)).
-
-**Tests that must prove they can fail.** Beyond correctness suites there is a
-memory-regression gate, an instruction-set baseline scanner, AddressSanitizer,
-and structured fuzzing — and every gate that can carry a *positive control* has
-one: a deliberately injected bug it must catch, verified on every run. A
-regression test that has never been observed to fail proves nothing
-([docs/ci-gates.md](docs/ci-gates.md)).
-
-**The entire fork constellation was scoured for improvements.** All 1,146 GitHub
-forks of mimalloc were enumerated and the living ones byte-diffed — every fork
-pushed since mid-2024 plus every older starred one — and each real change rated
-for adoption ([`MIMALLOC_FORKS.md`](MIMALLOC_FORKS.md)). The good ideas came in:
-[Bun's](https://github.com/oven-sh/mimalloc) zero-tracking optimization and its
-TLS-slot zeroing fix are on `main` — in the latter case each fork had found half
-the bug, and this one now carries both halves. Just as deliberately, changes that
-failed review stayed out, each with its reasoning recorded
-([docs/fork-divergence.md](docs/fork-divergence.md)).
-
-**Measured against its peers, continuously.** Throughput is benchmarked against
-upstream mimalloc, TCMalloc, and jemalloc on every publication cycle, with sealed
-artifacts and reproduction commands — see [Performance](#performance).
-
-**Committed to for the long term.** [Zach Vorhies](https://github.com/zackees),
-the author, commits to maintaining this fork long-term.
-[Pull requests](https://github.com/zackees/mimalloc-pprof/pulls) are welcome and
-will be reviewed — and held to the same bar as everything else here: every
-contribution passes the full four-platform CI matrix and its gates before it
-lands, so quality is maintained by machinery, not just intent.
 
 ---
 
@@ -358,6 +308,56 @@ allocators replay one identical stream inside each paired block.
 
 Full methodology, per-cell tables, and the pending metric roadmap:
 **[docs/benchmarks.md](docs/benchmarks.md)**.
+
+---
+
+## Why use this fork
+
+Beyond being the one mimalloc with a native-Windows heap profiler, this is — as of
+September 2026 — **the most tested mimalloc fork in existence**, and that testing
+regime has caught real allocator bugs that **Microsoft has since upstreamed fixes
+for** ([`60c4f031`](https://github.com/microsoft/mimalloc/commit/60c4f031c9d878da05ffa6066777accd51458b98),
+crediting [#56](https://github.com/zackees/mimalloc-pprof/issues/56)).
+
+**Every platform, every commit.** Ubuntu, Windows **MSVC**, Windows **MinGW**, and
+macOS are all required CI gates, in Debug and Release, with the profiler compiled
+in and out, plus shared-library builds. Upstream has no MinGW job at all — running
+one here is exactly how two unbounded memory leaks were found
+([docs/upstream-bugs.md](docs/upstream-bugs.md)).
+
+**Cross-compilation is tested, not assumed.** The Rust crate builds wherever
+`cc-rs` reaches a C compiler, and CI exercises cross builds including
+`cargo-xwin` for `aarch64-pc-windows-msvc` — which is how a real upstream
+ARM64-atomics incompatibility was caught and fixed
+([#223](https://github.com/zackees/mimalloc-pprof/issues/223)).
+
+**Tests that must prove they can fail.** Beyond correctness suites there is a
+memory-regression gate, an instruction-set baseline scanner, AddressSanitizer,
+and structured fuzzing — and every gate that can carry a *positive control* has
+one: a deliberately injected bug it must catch, verified on every run. A
+regression test that has never been observed to fail proves nothing
+([docs/ci-gates.md](docs/ci-gates.md)).
+
+**The entire fork constellation was scoured for improvements.** All 1,146 GitHub
+forks of mimalloc were enumerated and the living ones byte-diffed — every fork
+pushed since mid-2024 plus every older starred one — and each real change rated
+for adoption ([`MIMALLOC_FORKS.md`](MIMALLOC_FORKS.md)). The good ideas came in:
+[Bun's](https://github.com/oven-sh/mimalloc) zero-tracking optimization and its
+TLS-slot zeroing fix are on `main` — in the latter case each fork had found half
+the bug, and this one now carries both halves. Just as deliberately, changes that
+failed review stayed out, each with its reasoning recorded
+([docs/fork-divergence.md](docs/fork-divergence.md)).
+
+**Measured against its peers, continuously.** Throughput is benchmarked against
+upstream mimalloc, TCMalloc, and jemalloc on every publication cycle, with sealed
+artifacts and reproduction commands — the charts above.
+
+**Committed to for the long term.** [Zach Vorhies](https://github.com/zackees),
+the author, commits to maintaining this fork long-term.
+[Pull requests](https://github.com/zackees/mimalloc-pprof/pulls) are welcome and
+will be reviewed — and held to the same bar as everything else here: every
+contribution passes the full four-platform CI matrix and its gates before it
+lands, so quality is maintained by machinery, not just intent.
 
 ---
 

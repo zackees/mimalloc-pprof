@@ -466,35 +466,6 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
 }
 
 
-/* Stays commented out deliberately -- see issue #128 B2 and C1.
-
-   Upstream `bf054991` un-comments this, on the reasoning that with
-   MIMALLOC_PAGE_FULL_RETAIN=-1 (allow_page_abandon false) a page sitting in
-   MI_BIN_FULL whose blocks are all cross-thread freed can neither be abandoned nor
-   collected: `_mi_page_unfull` runs only from a thread-LOCAL free, and a remote free
-   just pushes onto `xthread_free` without waking anyone. The mechanism is really
-   there in our pin -- but the memory growth it predicts is not.
-
-   Measured, Windows/MinGW, Release, MIMALLOC_PAGE_FULL_RETAIN=-1: 60 rounds of
-   "fill pages from thread A, free every block from thread B", at both 256 and 4096
-   live 16 KiB blocks (the latter reaching 64 MiB committed). Committed bytes and RSS
-   were flat to the kilobyte from round 10 through round 60 -- 0.0% growth in each
-   configuration. A page retained per round would have shown linear growth.
-
-   So the predicted leak is not reachable this way, and repo rule #66 C.2 is to import
-   only with a test that fails without the import. There is no such test, so this stays
-   as upstream left it. The negative result does not prove the bug's absence -- it
-   bounds it: whatever reaches this path is not the simple cross-thread-free-a-full-page
-   workload. Anyone re-opening this should produce a growing repro FIRST.
-
-   Same evidence retires C1 (`mi_page_is_full()` ignoring uncollected `xthread_free`).
-   C1 asked to "confirm a reachable call site before changing a predicate that's
-   asserted in three places": every site that could RETAIN memory already collects
-   first -- `mi_free_try_collect_mt` opens with `_mi_page_free_collect{,_partly}`, and
-   `mi_abandoned_page_unown_from_free` re-collects and re-tries free/reabandon on every
-   CAS that observes a non-empty `xthread_free`. The window is closed by construction.
-*/
-/*
 static void mi_theap_collect_full_pages(mi_theap_t* theap) {
   // note: normally full pages get immediately abandoned and the full queue is always empty
   // this path is only used if abandoning is disabled due to a destroy-able theap or options
@@ -515,7 +486,6 @@ static void mi_theap_collect_full_pages(mi_theap_t* theap) {
     page = next;
   }
 }
-*/
 
 // free retired pages: we don't need to look at the entire queues
 // since we only retire pages that are at the head position in a queue.
@@ -544,9 +514,9 @@ void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
   }
   theap->page_retired_min = min;
   theap->page_retired_max = max;
-  // NOTE: not calling `mi_theap_collect_full_pages` here -- see issue #128 B2/C1
-  // comment above; upstream `bf054991` un-commented it but the fork deliberately
-  // keeps it disabled (measured: no reachable leak at this pin).
+  if (!theap->allow_page_abandon) {
+    mi_theap_collect_full_pages(theap);
+  }
 }
 
 

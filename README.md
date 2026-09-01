@@ -53,6 +53,14 @@ top reports, and profile diffs.
 Profiling is **opt-in at runtime**: a build with `MI_PPROF=ON` (the default) does
 not sample until you call a start API or set `MIMALLOC_PROF=1`.
 
+<a href="https://star-history.com/#zackees/mimalloc-pprof&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zackees/mimalloc-pprof&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zackees/mimalloc-pprof&type=Date" />
+    <img alt="Star history for zackees/mimalloc-pprof" src="https://api.star-history.com/svg?repos=zackees/mimalloc-pprof&type=Date" width="600" />
+  </picture>
+</a>
+
 **Contents**
 
 - [Why use this fork](#why-use-this-fork) — the most tested mimalloc fork in existence

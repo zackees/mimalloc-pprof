@@ -211,7 +211,9 @@ tables — but keep the matching **PDB** next to the binary.
 ### Exact allocator stats
 
 Alongside the sampled profile, v3 exposes the allocator's own **exact** counters
-— useful for checking how much the sampled numbers under-count:
+— useful for checking how much the sampled numbers under-count.
+
+#### Rust
 
 ```rust
 let s = mimalloc_pprof::prof::stats();
@@ -221,10 +223,27 @@ println!(
 );
 ```
 
-From C it's `mi_prof_stats_t_decl(stats); mi_prof_stats_get(&stats);`, and every text dump
-embeds the same counters as pprof-ignored `#` comment lines. One caveat:
-`malloc_requested` needs a `-DMI_STAT=2` build (default release builds report 0)
-— details and the full field list in
+#### C
+
+```c
+#include <stdio.h>
+#include <mimalloc.h>
+#include <mimalloc/profile.h>
+
+mi_prof_stats_t_decl(stats);   /* zeroed, with size + version filled in */
+if (mi_prof_stats_get(&stats)) {
+  printf("sampled live: %zu bytes; exact committed: %zu, requested: %zu\n",
+         stats.live_bytes, stats.heap_committed, stats.heap_malloc_requested);
+}
+```
+
+Every text dump also embeds the same counters as pprof-ignored `#` comment lines,
+so a saved profile carries them without any code at all.
+
+One caveat: `malloc_requested` is only maintained when the library was built with
+`-DMI_STAT=2` — a default release build reports 0. Since 0 is also a legitimate
+value, check `heap.detailed` (Rust) / `stats.heap_stats_detailed` (C) to tell the
+two apart. Full field list and the rest of the caveats:
 **[docs/profiler.md → allocator statistics](docs/profiler.md#allocator-statistics-in-the-profile-v3-only)**.
 
 ### DHAT: exact heap profiling

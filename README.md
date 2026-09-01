@@ -63,7 +63,6 @@ afterthought is how the leaks in
 - [Quick start](#quick-start)
 - [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, TCMalloc, and jemalloc
 - [Choosing a version: v2 or v3](#choosing-a-version-v2-or-v3)
-- [Adding it to your build](#adding-it-to-your-build) — Rust and C/C++
 - [Profiling and observability](#profiling-and-observability) — sampled pprof, exact stats, DHAT, memory events
 - [Upstream bugs found and fixed](#upstream-bugs-found-and-fixed) — including two unbounded memory leaks
 - [Documentation](#documentation) — the full docs index
@@ -143,7 +142,14 @@ pprof -http=:0 ./my_app heap.prof     # interactive
 pprof -top ./my_app heap.prof         # text summary
 ```
 
-Build with debug info, and on MSVC keep the matching PDB next to the binary.
+Build with debug info, and on MSVC keep the matching PDB next to the binary. On
+Linux/macOS keep frame pointers in **your** code so stacks resolve —
+`-fno-omit-frame-pointer` (C/C++) or `-Cforce-frame-pointers=yes` (Rust).
+
+Everything deeper — CMake install and linking, the zeroing-realloc family,
+stack-flag guidance, cross-compilation — is in
+**[docs/c-integration.md](docs/c-integration.md)** and
+**[docs/rust-integration.md](docs/rust-integration.md)**.
 
 ---
 
@@ -223,48 +229,6 @@ pre-release branch. It has had less field exposure than v2 no matter how green a
 test suite looks. That risk is real and testing cannot retire it — see
 [how v3 was validated](docs/fork-divergence.md#how-v3-was-validated) for exactly
 what was measured.
-
----
-
-## Adding it to your build
-
-### Rust
-
-Add the crate and install the global allocator (see [Quick start](#quick-start)).
-On Linux/macOS, keep frame pointers so stacks resolve:
-
-```toml
-# .cargo/config.toml
-[build]
-rustflags = ["-Cforce-frame-pointers=yes"]
-```
-
-Windows x64 uses unwind tables instead — keep the PDB for symbolization.
-Cross-compilation works wherever `cc-rs` finds a C compiler, including
-`cargo-xwin` for `aarch64-pc-windows-msvc`.
-Details: **[docs/rust-integration.md](docs/rust-integration.md)**.
-
-### C / C++
-
-```sh
-cmake -S . -B build -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build --config RelWithDebInfo
-```
-
-```cmake
-add_subdirectory(path/to/mimalloc-pprof)
-target_link_libraries(my_app PRIVATE mimalloc-static)
-
-# Linux/macOS: the profiler walks frame pointers, so your code must keep them.
-if(NOT WIN32)
-  target_compile_options(my_app PRIVATE -fno-omit-frame-pointer)
-endif()
-```
-
-Use `MI_PPROF=OFF` to omit the profiler hooks entirely (no-op stubs stay
-linkable). **Do not link two mimalloc implementations into one process.**
-Build/install details, the zeroing-realloc family, and stack-flag guidance:
-**[docs/c-integration.md](docs/c-integration.md)**.
 
 ---
 

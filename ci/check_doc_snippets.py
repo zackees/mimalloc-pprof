@@ -94,7 +94,9 @@ FENCE_CLOSE = "```"
 # `<!-- doc-snippet: skip (reason) -->` on the line immediately before a ```c fence.
 # The reason is mandatory -- `skip ()` does not match -- so an opt-out cannot be added
 # without leaving behind a stated justification.
-SKIP_MARKER_RE = re.compile(r"^<!--\s*doc-snippet:\s*skip\s*\((?P<reason>.+?)\)\s*-->\s*$")
+SKIP_MARKER_RE = re.compile(
+    r"^<!--\s*doc-snippet:\s*skip\s*\(\s*(?P<reason>\S(?:[^)]*\S)?)\s*\)\s*-->\s*$"
+)
 
 MAIN_RE = re.compile(r"\bint\s+main\s*\(")
 INCLUDE_RE = re.compile(r"^\s*#\s*include\b")

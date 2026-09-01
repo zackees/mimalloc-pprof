@@ -56,7 +56,7 @@ not sample until you call a start API or set `MIMALLOC_PROF=1`.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/star-history-dark.svg" />
   <source media="(prefers-color-scheme: light)" srcset=".github/assets/star-history-light.svg" />
-  <img alt="Star history for zackees/mimalloc-pprof" src=".github/assets/star-history-light.svg" width="600" />
+  <img alt="Star history for zackees/mimalloc-pprof" src=".github/assets/star-history-light.svg" width="100%" />
 </picture>
 
 **Contents**

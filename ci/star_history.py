@@ -39,8 +39,8 @@ from typing import NamedTuple, Optional, cast
 DEFAULT_REPO = "zackees/mimalloc-pprof"
 
 # Chart geometry, in user units (the SVG scales to whatever width it is given).
-WIDTH = 800
-HEIGHT = 400
+WIDTH = 1000
+HEIGHT = 360
 PAD_LEFT = 64
 PAD_RIGHT = 24
 PAD_TOP = 48
@@ -250,9 +250,9 @@ def render_svg(series: list[Point], repo: str, theme: Theme) -> str:
         f'aria-label="Star history for {escape(repo)}">',
         f'<rect width="{WIDTH}" height="{HEIGHT}" fill="{theme.background}"/>',
         '<g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">',
-        f'<text x="{PAD_LEFT}" y="28" font-size="16" font-weight="600" '
+        f'<text x="{PAD_LEFT}" y="28" font-size="18" font-weight="600" '
         f'fill="{theme.text}">Star history</text>',
-        f'<text x="{WIDTH - PAD_RIGHT}" y="28" font-size="12" text-anchor="end" '
+        f'<text x="{WIDTH - PAD_RIGHT}" y="28" font-size="13" text-anchor="end" '
         f'fill="{theme.muted}">{escape(repo)}</text>',
     ]
 
@@ -263,7 +263,7 @@ def render_svg(series: list[Point], repo: str, theme: Theme) -> str:
             f'stroke="{theme.grid}" stroke-width="1"/>'
         )
         parts.append(
-            f'<text x="{PAD_LEFT - 10}" y="{y + 4:.2f}" font-size="11" text-anchor="end" '
+            f'<text x="{PAD_LEFT - 10}" y="{y + 4:.2f}" font-size="12" text-anchor="end" '
             f'fill="{theme.muted}">{tick}</text>'
         )
 
@@ -271,7 +271,7 @@ def render_svg(series: list[Point], repo: str, theme: Theme) -> str:
         label = date.fromordinal(ordinal).isoformat()
         anchor = "start" if ordinal == first_day else "end"
         parts.append(
-            f'<text x="{x_of(ordinal):.2f}" y="{HEIGHT - PAD_BOTTOM + 22:.2f}" font-size="11" '
+            f'<text x="{x_of(ordinal):.2f}" y="{HEIGHT - PAD_BOTTOM + 22:.2f}" font-size="12" '
             f'text-anchor="{anchor}" fill="{theme.muted}">{label}</text>'
         )
 

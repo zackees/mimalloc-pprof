@@ -13,6 +13,22 @@ A fork of [microsoft/mimalloc](https://github.com/microsoft/mimalloc) that adds
 target alongside Linux and macOS.
 
 ```
+   __  __ ___ __  __    _    _     _     ___   ____
+  |  \/  |_ _|  \/  |  / \  | |   | |   / _ \ / ___|
+  | |\/| || || |\/| | / _ \ | |   | |  | | | | |
+  | |  | || || |  | |/ ___ \| |___| |__| |_| | |___
+  |_|  |_|___|_|  |_/_/   \_\_____|_____\___/ \____|
+
+   ____  ____  ____   ___  _____
+  |  _ \|  _ \|  _ \ / _ \|  ___|
+  | |_) | |_) | |_) | | | | |_
+  |  __/|  __/|  _ <| |_| |  _|
+  |_|   |_|   |_| \_\\___/|_|
+
+      PPROF-COMPATIBLE SAMPLED HEAP PROFILING
+      WINDOWS FIRST-CLASS | LINUX | MACOS
+
+
     malloc / free
           |
           v

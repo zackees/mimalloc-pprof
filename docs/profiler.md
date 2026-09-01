@@ -101,6 +101,9 @@ process-wide.
 do not rely on the variable names — use `MI_PROF_CONFIG_OVERRIDE`:**
 
 ```c
+#include <mimalloc.h>
+#include <mimalloc/profile.h>
+
 mi_prof_config_t_decl(cfg);           /* zeroed, with size + version filled in */
 cfg.mode = MI_PROF_CONFIG_OVERRIDE;   /* struct wins over env, field by field */
 cfg.sample_interval = 2048;

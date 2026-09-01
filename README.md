@@ -202,14 +202,48 @@ Apply it to every library you want to see in a profile, and build with debug
 info so addresses resolve to names. Windows x64 needs no flag — it uses unwind
 tables — but keep the matching **PDB** next to the binary.
 
+### Exact allocator stats
+
+Alongside the sampled profile, v3 exposes the allocator's own **exact** counters
+— useful for checking how much the sampled numbers under-count:
+
+```rust
+let s = mimalloc_pprof::prof::stats();
+println!(
+    "sampled live: {} bytes; exact committed: {}, requested: {}",
+    s.live_bytes, s.heap.committed, s.heap.malloc_requested,
+);
+```
+
+From C it's `mi_prof_stats_t_decl(stats); mi_prof_stats_get(&stats);`, and every text dump
+embeds the same counters as pprof-ignored `#` comment lines. One caveat:
+`malloc_requested` needs a `-DMI_STAT=2` build (default release builds report 0)
+— details and the full field list in
+**[docs/profiler.md → allocator statistics](docs/profiler.md#allocator-statistics-in-the-profile-v3-only)**.
+
+### DHAT: exact heap profiling
+
+When sampling isn't enough — you want **every** allocation's size and lifetime —
+run a short, focused session under the exact DHAT observer and open the result
+in Valgrind's `dh_view.html`:
+
+```sh
+MIMALLOC_DHAT=1 MIMALLOC_DHAT_DUMP_AT_EXIT=heap.dhat.json ./my_app
+```
+
+Or from code: `mi_dhat_start()` … `mi_dhat_dump("heap.dhat.json")` from
+`<mimalloc/dhat.h>`. It's exact and high-overhead — for tests and
+investigations, not production. Budgeting, caveats, and the API:
+**[docs/dhat-and-memory-events.md](docs/dhat-and-memory-events.md)**.
+
+### Going deeper
+
 Everything deeper — CMake install and linking, the zeroing-realloc family,
 stack-flag guidance, cross-compilation — is in
 **[docs/c-integration.md](docs/c-integration.md)** and
-**[docs/rust-integration.md](docs/rust-integration.md)**.
-
-The sampled profiler is one of four instruments here — exact allocator
-counters, DHAT-style exact heap/lifetime profiling, and a memory-events API
-are covered in [Profiling and observability](#profiling-and-observability).
+**[docs/rust-integration.md](docs/rust-integration.md)**. The full instrument
+lineup, including the memory-events API, is in
+[Profiling and observability](#profiling-and-observability).
 
 ---
 

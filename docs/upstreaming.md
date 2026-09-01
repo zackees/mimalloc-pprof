@@ -127,6 +127,7 @@ one is filed; and one new defect was found in the process.
 **v2 thread-exit (FLS) — ADOPTED, with attribution.** `upstream/main` and `upstream/dev`
 both carry it at `src/prim/windows/prim.c:764`:
 
+<!-- doc-snippet: skip (patch excerpt, not a program) -->
 ```c
 #if defined(__GNUC__) && !defined(_MSC_VER)  /* mingw */
   #define MI_WIN_INIT_USE_FLS  1  /* needed for v1/v2, see <https://github.com/zackees/mimalloc-pprof/pull/48> */

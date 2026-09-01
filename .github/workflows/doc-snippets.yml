@@ -1,0 +1,35 @@
+name: doc-snippets
+
+# READMEs and docs/*.md carry fenced ```c examples that nothing else in the repo ever
+# compiles. PR #259 fixed one (docs/profiler.md) that used mi_prof_config_t_decl and
+# mi_prof_start_ex without naming a single #include -- it read fine and nobody caught
+# it in review. ci/check_doc_snippets.py extracts every such block and compiles it with
+# both gcc and clang under -fsyntax-only -Wall -Wextra -Werror -I include, so a header
+# rename or a typo'd identifier in an example fails the PR instead of shipping.
+#
+# --self-test is the positive control: it feeds the checker a snippet calling an
+# undeclared mimalloc function and asserts the checker's own compile step rejects it.
+# Runs alongside the real check on every PR the paths filter below matches -- a gate
+# that has never been observed to fire proves nothing (see docs/ci-gates.md).
+
+on:
+  push:
+    branches: [main, v4]
+  pull_request:
+    paths:
+      - 'README.md'
+      - 'docs/*.md'
+      - 'include/**'
+      - 'ci/check_doc_snippets.py'
+      - '.github/workflows/doc-snippets.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ubuntu-latest ships both gcc and clang already; nothing to install.
+      - name: Positive control (must catch a deliberately broken snippet)
+        run: python3 ci/check_doc_snippets.py --self-test
+      - name: Compile every ```c block in README.md and docs/*.md
+        run: python3 ci/check_doc_snippets.py

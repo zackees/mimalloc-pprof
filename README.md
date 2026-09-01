@@ -108,6 +108,13 @@ failed review stayed out, each with its reasoning recorded
 upstream mimalloc, TCMalloc, and jemalloc on every publication cycle, with sealed
 artifacts and reproduction commands — see [Performance](#performance).
 
+**Committed to for the long term.** [Zach Vorhies](https://github.com/zackees),
+the author, commits to maintaining this fork long-term.
+[Pull requests](https://github.com/zackees/mimalloc-pprof/pulls) are welcome and
+will be reviewed — and held to the same bar as everything else here: every
+contribution passes the full four-platform CI matrix and its gates before it
+lands, so quality is maintained by machinery, not just intent.
+
 ---
 
 ## Quick start

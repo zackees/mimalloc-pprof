@@ -125,7 +125,13 @@ lands, so quality is maintained by machinery, not just intent.
 
 ## Quick start
 
-### Rust
+Three instruments, each shown in Rust and C: **pprof** sampled profiling for
+production, **exact allocator stats** to check a sampled profile against, and
+**DHAT** exact profiling for focused investigations.
+
+### pprof: sampled heap profiling
+
+#### Rust
 
 ```toml
 [dependencies]
@@ -155,7 +161,7 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-### C
+#### C
 
 ```sh
 cmake -S . -B build -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -181,20 +187,20 @@ int main(void) {
 `mi_prof_start` and `mi_prof_dump` are `nodiscard` — check their results or the
 compiler will warn.
 
-### Or without touching the code at all
+#### Or without touching the code at all
 
 ```sh
 MIMALLOC_PROF=1 MIMALLOC_PROF_DUMP_AT_EXIT=heap.prof ./my_app
 ```
 
-### Then read the profile
+#### Then read the profile
 
 ```sh
 pprof -http=:0 ./my_app heap.prof     # interactive
 pprof -top ./my_app heap.prof         # text summary
 ```
 
-### ⚠️ The flags your stacks depend on
+#### ⚠️ The flags your stacks depend on
 
 On Linux/macOS the profiler walks frame pointers, and **your** code must keep
 them — the failure mode is silently truncated stacks, not an error:

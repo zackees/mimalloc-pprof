@@ -188,9 +188,19 @@ pprof -http=:0 ./my_app heap.prof     # interactive
 pprof -top ./my_app heap.prof         # text summary
 ```
 
-Build with debug info, and on MSVC keep the matching PDB next to the binary. On
-Linux/macOS keep frame pointers in **your** code so stacks resolve —
-`-fno-omit-frame-pointer` (C/C++) or `-Cforce-frame-pointers=yes` (Rust).
+### ⚠️ The flags your stacks depend on
+
+On Linux/macOS the profiler walks frame pointers, and **your** code must keep
+them — the failure mode is silently truncated stacks, not an error:
+
+| Toolchain | Required flag |
+|---|---|
+| C / C++ | `-fno-omit-frame-pointer` |
+| Rust | `-Cforce-frame-pointers=yes` (in `.cargo/config.toml` rustflags) |
+
+Apply it to every library you want to see in a profile, and build with debug
+info so addresses resolve to names. Windows x64 needs no flag — it uses unwind
+tables — but keep the matching **PDB** next to the binary.
 
 Everything deeper — CMake install and linking, the zeroing-realloc family,
 stack-flag guidance, cross-compilation — is in
@@ -284,31 +294,25 @@ what was measured.
 
 ## Profiling and observability
 
-Four complementary facilities, all documented in depth in `docs/`:
+Four complementary instruments. Pick by the question you're asking:
 
-**Sampled pprof profiler** — the headline feature. Runtime opt-in
-(`mi_prof_start` / `prof::start` / `MIMALLOC_PROF=1`), ~512 KiB default sample
-interval, dumps `heap_v2` text or `profile.proto`. Environment variables,
-deterministic seeding, config-override API, and the measured cost of shipping
-`MI_PPROF=ON`: **[docs/profiler.md](docs/profiler.md)**.
+| Instrument | Use it when you want… | Overhead | Deep dive |
+|---|---|---|---|
+| **Sampled pprof profiler** | flame graphs of live heap in production | low (sampled, ~512 KiB interval) | **[docs/profiler.md](docs/profiler.md)** |
+| **Exact allocator statistics** (v3) | ground truth to check the profile against | none — counters the allocator already keeps | **[docs/profiler.md → allocator statistics](docs/profiler.md#allocator-statistics-in-the-profile-v3-only)** |
+| **Exact DHAT profiling** | every allocation's lifetime, in a short focused run | high (exact; not for production) | **[docs/dhat-and-memory-events.md](docs/dhat-and-memory-events.md)** |
+| **Memory-events API** | your own counters/callbacks on allocation events | opt-in, works even with `MI_PPROF=OFF` | **[docs/dhat-and-memory-events.md → memory events](docs/dhat-and-memory-events.md#memory-events-api)** |
 
-**Exact allocator statistics (v3)** — alongside the sampled numbers,
-`mi_prof_stats_t` / Rust `ProfStats::heap` carry the allocator's **exact**
-per-heap counters (`committed`, `reserved`, `malloc_requested`, page counts), and
-every text dump embeds them as pprof-ignored `#` comment lines. Comparing exact
-`malloc_requested` against sampled `live_bytes` measures the sampling error
-directly:
-**[docs/profiler.md#allocator-statistics-in-the-profile-v3-only](docs/profiler.md#allocator-statistics-in-the-profile-v3-only)**.
+Two details worth knowing before you go deeper:
 
-**Exact DHAT profiling** — `<mimalloc/dhat.h>` is an exact, high-overhead
-heap/lifetime observer writing DHAT v2 JSON for Valgrind's `dh_view.html`. For
-short tests and focused investigations rather than production:
-**[docs/dhat-and-memory-events.md](docs/dhat-and-memory-events.md)**.
-
-**Memory-events API** — opt-in allocation-change counters, callbacks, and a
-live-allocation visitor, independent of `MI_PPROF` and available even in OFF
-builds:
-**[docs/dhat-and-memory-events.md#memory-events-api](docs/dhat-and-memory-events.md#memory-events-api)**.
+- **The pprof profiler** is runtime opt-in (`mi_prof_start` / `prof::start` /
+  `MIMALLOC_PROF=1`) and dumps `heap_v2` text or `profile.proto`. Env vars,
+  deterministic seeding, the config-override API, and the measured cost of
+  shipping `MI_PPROF=ON` are all in its doc.
+- **The exact stats are what make a sampled profile trustworthy**: comparing the
+  allocator's exact `malloc_requested` against the profiler's sampled
+  `live_bytes` measures the sampling error directly. They ride along inside
+  every dump as pprof-ignored `#` comment lines.
 
 ---
 

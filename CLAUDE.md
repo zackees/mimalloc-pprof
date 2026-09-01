@@ -34,10 +34,12 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
 ## Repo facts
 
 - Branch layout: `main` is the **v3** line (crate 0.9.x, overlay pinned to `upstream/dev3`
-  commit `bcee5a88`; was `579f8c0e` before the #80 bump). The previous v2 line is preserved on the **`v2`** branch and is what
+  commit `6def7be9`; was `bcee5a88` before the #266 bump, and `579f8c0e` before that (#80)).
+  The previous v2 line is preserved on the **`v2`** branch and is what
   crates.io still serves as 0.8.x. Do not move the v3 overlay to a newer `dev3` without
   re-verifying the profiler hook patches — they only apply byte-identically against the
-  pinned base, and the current tip fixes nothing we need.
+  pinned base. Bumped 2026-09-01 to Bun's merge-base for Bun parity (#264/#266); do not
+  move again without re-verifying hooks.
 - Repo root IS mimalloc (currently tracking the v3/`dev3` line; remote `upstream` =
   microsoft/mimalloc). The fork's `main` and `upstream/dev3` have unrelated histories:
   **never merge them directly and never use `--allow-unrelated-histories` or `commit-tree`

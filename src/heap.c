@@ -192,6 +192,18 @@ static void mi_heap_detach_theaps(mi_heap_t* heap) {
   mi_lock(&heap->theaps_lock) { // paranoia
     for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
       mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // detached
+      // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): a
+      // theap whose owning thread did not survive a multi-threaded fork() (P5's src/fork.c
+      // reset `heap->theaps_lock` in the child, so we can still walk this list, but the
+      // theap's own bookkeeping -- page_count, queue links -- may be torn mid-update) must
+      // not be walked here: `_mi_theap_abandon` -> `_mi_page_abandon` asserts page validity
+      // that a torn theap can violate (test-fork-user-heap.c's `case_a`). Its arena pages
+      // get taken instead by `mi_heap_visit_page_claim`'s own forked-child branch
+      // (arena.c), which re-derives ownership from the page/arena bitmaps rather than the
+      // theap's queues.
+      if mi_unlikely(_mi_process_is_forked_child && theap->tld->thread_id != _mi_thread_id()) {
+        continue;
+      }
       _mi_theap_abandon(theap);
       _mi_stats_merge_into(&heap->stats, &theap->stats);
     }

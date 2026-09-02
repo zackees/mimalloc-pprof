@@ -193,6 +193,13 @@ void          _mi_process_fork_prepare(void);
 void          _mi_process_fork_parent(void);
 void          _mi_process_fork_child(void);
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): set once by
+// `_mi_process_fork_child`, never cleared. See src/fork.c's definition for the full
+// rationale; consulted by `mi_heap_visit_page_claim` (arena.c) and `mi_heap_detach_theaps`
+// (heap.c) to avoid waiting on / walking pages of a theap whose owning thread did not
+// survive a multi-threaded fork().
+extern mi_decl_hidden bool _mi_process_is_forked_child;
+
 // #270: runtime lock-order detector. Every internal lock acquire already goes through
 // diagnostic.c's reentrancy checker (MI_DEBUG>2), which records the owning thread in
 // `mi_lock_t::debug_owner`; fork.c uses that to record the nesting edges actually

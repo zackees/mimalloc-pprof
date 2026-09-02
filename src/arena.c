@@ -2402,10 +2402,16 @@ mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;  // impor
 // too. This is the same protocol the abandoned-page map already uses
 // (`mi_arena_try_claim_abandoned`).
 //
-// Dropped from the upstream version: the `_mi_process_is_forked_child` branch, which
-// re-derives a torn page snapshot after a multi-threaded `fork()`. `pthread_atfork`
-// handling does not exist in this tree yet (#270 / PR #289, not merged as of this PR); add
-// that branch back when it lands.
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): the
+// `_mi_process_is_forked_child` branch below was originally dropped here with a note to
+// "add it back once #270/PR #289 lands" -- #289 landed a handler-only fork design
+// (src/fork.c) without the persistent flag this branch needs, so the flag
+// (`_mi_process_is_forked_child`, src/fork.c) was added alongside restoring this branch.
+// Without it, a page belonging to a theap whose thread did not survive a multi-threaded
+// `fork()` hits the `!mi_page_is_abandoned` branch below and gets force-seized without
+// reconciling its (possibly torn, mid-update) `used`/`local_free`/`xthread_free`
+// bookkeeping, which can trip `mi_page_is_valid_init` downstream
+// (test-fork-user-heap.c's `case_a`, found while merging P5's fork.c into this branch).
 static void mi_heap_visit_page_seize(mi_page_t* page) {
   // the page sits in the queue of a theap whose thread is gone or misbehaving; leave that queue be
   page->next = page->prev = NULL;
@@ -2423,6 +2429,20 @@ static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* pag
       while (mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) == 2) { _mi_prim_thread_yield(); }
     }
     #endif
+    if mi_unlikely(_mi_process_is_forked_child) {
+      // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): after a
+      // multi-threaded fork() the (single-threaded) child may inherit a torn snapshot of a
+      // page that another thread was allocating or freeing when the fork happened -- the
+      // arena-pages bit propagated but the page-map entry or the owned bit did not, and that
+      // thread no longer exists in this process to finish the update. Re-derive what we can
+      // and take the page outright; there is nobody left to race.
+      if (mi_page_start(page) == NULL) return false;  // the page struct never made it across: leave it unpublished
+      if (_mi_safe_ptr_page(mi_page_start(page)) != page && !_mi_page_map_register(page)) return false;
+      mi_page_claim_ownership(page);   // ours now, whether or not the dead thread held it
+      mi_bitmap_set(pages, slice_index);
+      if (!mi_page_is_abandoned(page)) { mi_heap_visit_page_seize(page); }
+      break;
+    }
     if mi_unlikely(!mi_page_is_abandoned(page)) {
       // A thread that allocated from this heap before is using it during the delete (it
       // allocated this page, or reclaimed it on a free just now): that is outside the

@@ -313,6 +313,16 @@ static mi_lock_t mi_fork_serialize_lock = MI_LOCK_INITIALIZER;
 static _Atomic(mi_threadid_t) mi_fork_owner;   // 0 = unowned; else the thread id currently mid-fork
 static int mi_fork_depth;                      // nesting depth for `mi_fork_owner`; only touched while owning
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): set once in
+// `_mi_process_fork_child`, never cleared. The child is single-threaded from the moment
+// `fork()` returns, but it can still be holding page-map/arena-pages bits published by a
+// sibling thread that did not survive the fork -- that thread's theap may be torn mid
+// -update (an allocation or free that was between its bitmap-set and its owned-bit-set/
+// bookkeeping-update when the fork happened). `mi_heap_visit_page_claim` (arena.c) and
+// `mi_heap_detach_theaps` (heap.c) consult this flag to avoid waiting on / walking pages
+// belonging to those dead threads, since they will never be relinquished normally.
+mi_decl_hidden bool _mi_process_is_forked_child;
+
 // Mimalloc reserves the low bit of a thread id for exactly this purpose elsewhere
 // (see diagnostic.c's `mi_lock_debug_thread`): some platform's `_mi_thread_id()` can
 // legitimately return 0 for a real thread, which would collide with `mi_fork_owner`'s
@@ -626,6 +636,7 @@ void _mi_process_fork_child(void) {
   // in practice that only matters for the depth count -- resetting the shared locks
   // unconditionally below is always correct in the child regardless).
   if (mi_atomic_load_acquire(&mi_fork_owner) != mi_fork_thread_id()) return;
+  _mi_process_is_forked_child = true;  // set before anything below can touch a heap/theap (issue #271)
   mi_fork_depth = 0;
   mi_atomic_store_relaxed(&mi_fork_owner, (mi_threadid_t)0);
   mi_lock_init(&mi_fork_serialize_lock);  // fresh for this child's own future forks

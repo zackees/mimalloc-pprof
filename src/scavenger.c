@@ -183,9 +183,18 @@ static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = runnin
 
 #if defined(__linux__)
 
-#include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+// DEVIATION from Bun, which includes <linux/futex.h>. That is a KERNEL uapi header: it
+// ships in glibc distros' base development packages but NOT in Alpine's `build-base`
+// (it needs the separate `linux-headers` package), so including it made the musl c-unit
+// job fail to compile. CLAUDE.md rule 5 forbids adding a required build dependency, so
+// define the two constants instead. They are fixed,permanently stable kernel ABI values
+// (uapi/linux/futex.h: FUTEX_WAIT = 0, FUTEX_WAKE = 1, FUTEX_PRIVATE_FLAG = 128) --
+// the same thing every libc's own futex wrapper hardcodes.
+#define MI_FUTEX_WAIT_PRIVATE  (0 | 128)
+#define MI_FUTEX_WAKE_PRIVATE  (1 | 128)
 
 static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;
@@ -193,7 +202,7 @@ static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
   ts.tv_sec  = (time_t)(timeout_ms / 1000);
   ts.tv_nsec = (long)((timeout_ms % 1000) * 1000000L);
   while (mi_atomic_load_acquire(addr) == 0) {
-    const long rc = syscall(SYS_futex, (uint32_t*)addr, FUTEX_WAIT_PRIVATE, (uint32_t)0, &ts, NULL, 0);
+    const long rc = syscall(SYS_futex, (uint32_t*)addr, MI_FUTEX_WAIT_PRIVATE, (uint32_t)0, &ts, NULL, 0);
     if (rc == 0) return;                 // woken by FUTEX_WAKE
     if (errno == ETIMEDOUT) return;
     if (errno == EAGAIN) return;         // *addr != 0 at kernel check; caller re-reads
@@ -202,7 +211,7 @@ static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
 }
 
 static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
-  syscall(SYS_futex, (uint32_t*)addr, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+  syscall(SYS_futex, (uint32_t*)addr, MI_FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
 }
 
 #elif defined(__APPLE__)

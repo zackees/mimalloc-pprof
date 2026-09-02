@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit cbe7625d of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 37fbf587 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -15122,6 +15122,33 @@ mi_heap_t* mi_heap_new(void) {
 // other party that can hold one is a concurrent mi_free collecting it -- the walk can then
 // safely claim and move/free each page without racing a still-live theap.
 static void mi_heap_detach_theaps(mi_heap_t* heap) {
+  // #272: a theap of this heap can be the `park_theap0` that a thread handed to the background
+  // scavenger -- `mi_on_thread_idle_start` captures `_mi_theap_default()`, and after
+  // `mi_heap_set_default(heap)` that is a theap of a DELETABLE heap. Nothing below consults the
+  // park protocol, so a cross-thread `mi_heap_delete` would abandon (and `mi_heap_free_theaps`
+  // later free) a theap the scavenger is walking right now; both assertions that would have
+  // caught it are suppressed (`theap->heap==NULL` here, the MI_PARK_SWEEPING clause of
+  // `mi_theap_page_is_valid` there). So take every parked owner back first.
+  //
+  // Outside `theaps_lock`, one at a time: `_mi_park_leave` waits out an in-progress sweep, and
+  // the sweep can take locks a holder of `theaps_lock` would deadlock against. It terminates
+  // because a parked thread is blocked -- it cannot re-park -- and `_mi_park_leave` leaves it
+  // RUNNING; the owner's own `mi_on_thread_idle_end` then finds RUNNING and no-ops.
+  if (!_mi_process_is_forked_child) {   // a forked child's park_state may name a thread that is gone
+    for (;;) {
+      mi_tld_t* parked = NULL;
+      mi_lock(&heap->theaps_lock) {
+        for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
+          mi_tld_t* const tld = theap->tld;
+          if (tld != NULL && mi_atomic_load_acquire(&tld->park_state) != MI_PARK_RUNNING) {
+            parked = tld; break;
+          }
+        }
+      }
+      if (parked == NULL) break;
+      _mi_park_leave(parked);
+    }
+  }
   _mi_heap_detach_theaps(heap);
   mi_lock(&heap->theaps_lock) { // paranoia
     for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
@@ -24888,6 +24915,11 @@ void _mi_scavenger_start_lazy(void) { _mi_scavenger_start(); }
 #include <errno.h>
 
 static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = running
+// Set by `_mi_scavenger_stop` and never cleared: teardown has begun, so no start may create a
+// thread any more. Without it `_mi_scavenger_start_lazy` -- reachable from a thread that parks
+// while the process is tearing down -- can spawn a scavenger AFTER the stop that was supposed
+// to join it, leaving a thread walking a subproc that is being dismantled.
+static _Atomic(uintptr_t) _mi_scavenger_shutdown;
 
 // -----------------------------------------------------------------------------
 // Wait/wake on subproc->scavenger_wake (a uint32_t futex word).
@@ -25173,6 +25205,7 @@ static DWORD WINAPI mi_scavenger_thread_main(LPVOID arg) {
 
 void _mi_scavenger_start(void) {
   if (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) return;
+  if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) return;   // teardown has begun
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
@@ -25184,6 +25217,7 @@ void _mi_scavenger_start(void) {
 }
 
 void _mi_scavenger_stop(void) {
+  mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)1);   // before the exchange: no restart past here
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
   mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
@@ -25249,6 +25283,7 @@ static void* mi_scavenger_thread_main(void* arg) {
 
 void _mi_scavenger_start(void) {
   if (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) return;
+  if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) return;   // teardown has begun
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
@@ -25284,6 +25319,7 @@ void _mi_scavenger_start(void) {
 }
 
 void _mi_scavenger_stop(void) {
+  mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)1);   // before the exchange: no restart past here
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
   mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
@@ -25297,6 +25333,7 @@ void _mi_scavenger_stop(void) {
 // child would: take the wake path in `_mi_arenas_purge_now` and signal nobody (so never purge at
 // all), and `pthread_join` a `pthread_t` that names no thread at exit.
 void _mi_scavenger_forked_child(void) {
+  mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)0);   // a fresh image, not a teardown
   mi_atomic_store_release(&_mi_scavenger_joinable, (uintptr_t)0);
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
   mi_scav_fork_child_reset();
@@ -28766,8 +28803,20 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     mi_win_main(NULL, DLL_PROCESS_DETACH, 0);
   }
 
+  // #272: stop the background scavenger from `exit()`, while it is still alive and can be
+  // joined. The only teardown hook a statically linked exe otherwise has is the
+  // DLL_PROCESS_DETACH TLS callback below, and that runs from INSIDE `ExitProcess` -- after the
+  // loader has already terminated every other thread, possibly where it stood inside the arena
+  // purge guard or an SRWLOCK, which teardown then waits on forever.
+  static void mi_cdecl mi_scavenger_crt_stop(void) {
+    _mi_scavenger_stop();
+  }
+
   static int mi_cdecl mi_crt_init(void) {
     // mi_debug_out(mi_current_module_is_dll() ? "crt dll init\n" : "crt exe init\n");
+    // registered FIRST, so `atexit` (which runs in reverse order) calls it LAST: every user
+    // handler and static destructor still runs with a scavenger behind it.
+    atexit(&mi_scavenger_crt_stop);
     if (mi_current_module_is_dll()) {
       // in a dll, atexit (crt_done) is called after tls process detach
       atexit(&mi_crt_done);

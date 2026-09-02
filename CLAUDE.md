@@ -29,7 +29,11 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    The dockur guest needs a golden disk built once by hand (`ci/macos_golden_local.sh`,
    published by `macos-golden-upload.yml`), so `run-macos-x64-dockur` is red until that
    exists — deliberately, and documented in docs/ci-gates.md.
-   (macOS gates run from Linux-built bundles on one runner; see #277.)
+   The **win-gnu** gate is `windows-bundles.yml` (#277 phase C): the bundles are cross-built
+   on Linux by soldr's mingw-w64 and run on one Windows runner. Phase C changed *how*
+   win-gnu is built, not whether it is tested — soldr's mingw-w64 is **UCRT**, while the
+   native MSYS2 MINGW64 jobs it replaces were msvcrt, so those stay informational for a
+   ≥10-push window. Keep win-gnu gated; do not drop it to "MSVC covers Windows".
 4. **Profiler memory-safety invariant:** profiler-internal memory (sample records, intern table,
    dump buffers) comes ONLY from the raw-OS-layer arena (`_mi_os_alloc`), never from hooked
    allocation paths (`mi_malloc`/`operator new`/`GlobalAlloc`). Debug builds assert this.

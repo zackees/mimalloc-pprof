@@ -28,9 +28,16 @@ Absolute build-tree paths appear in argv *and* in env values, so both are rewrit
 than a build-tree RPATH); a basename collision is a hard error rather than a silent
 overwrite.
 
+A Windows bundle also has to carry the runtime DLLs its executables import but the build
+tree does not contain: soldr's mingw-w64 links `mimalloc.dll` against `libgcc_s_seh-1.dll`,
+which does not exist on a plain `windows-latest` runner. `--dll-search-dir` turns on an
+import scan (`--objdump`, transitive) that copies exactly those and refuses to write a
+bundle whose executables import something neither carried nor supplied by Windows itself.
+
 Usage:
 
     uv run ci/bundle_tests.py <build-dir> <out-dir> [--config Debug]
+                              [--objdump PROG] [--dll-search-dir DIR ...]
 """
 
 from __future__ import annotations
@@ -323,28 +330,69 @@ def looks_absolute(value: str) -> bool:
     return Path(value).is_absolute() or bool(_WINDOWS_ABSOLUTE.match(value))
 
 
+#: A leading option prefix that an absolute path can hide behind: `-I/abs`, `-L/abs`,
+#: `--out=/abs`, `--sysroot=/abs`. Stripping it is what makes those reachable to
+#: `looks_absolute`, which only ever looks at the start of the string.
+_FLAG_PREFIX = re.compile(r"^--?[A-Za-z][A-Za-z0-9_-]*=?")
+
+
+def split_path_list(value: str) -> list[str]:
+    """Split a list-shaped value on `;`, `,` and `:` -- but never inside `C:\\...`.
+
+    Both separators are always honoured, regardless of the host: a Windows bundle is
+    produced on Linux (`os.pathsep == ":"`) and replayed on Windows (`";"`), so splitting
+    on `os.pathsep` alone leaves one of the two shapes unscanned.
+
+    A `:` is a separator *except* when it is the second character of the current element
+    and the first is a letter -- i.e. a drive qualifier. Splitting `C:\\build\\x` on `:`
+    the way the phase B code did produced `C` and `\\build\\x`, neither of which any
+    absolute-path test recognises, so a Windows build-tree leak inside a `PATH`-shaped
+    value scanned clean (deferred review follow-up on PR #282).
+    """
+    pieces: list[str] = []
+    start = 0
+    for index, char in enumerate(value):
+        # A `:` is a separator except when it is the drive qualifier of the element that
+        # started one character ago.
+        is_drive_letter = char == ":" and index - start == 1 and value[start].isalpha()
+        if char in ";,:" and not is_drive_letter:
+            pieces.append(value[start:index])
+            start = index + 1
+    pieces.append(value[start:])
+    return pieces
+
+
 def leaked_paths(test: BundledTest) -> list[str]:
     """Every absolute path in a lowered test that the bundle does not carry.
 
-    `PathRewriter` only rewrites paths under the *build* directory. An absolute path from
-    anywhere else -- the source tree, the toolchain, the runner's home -- is copied into
-    the manifest verbatim and then silently refers to a directory that does not exist on
-    the machine that replays the bundle. Phase A only checked `argv[0]`, which was enough
+    `PathRewriter` only rewrites paths under the *build* directory, and only when they are
+    the whole value. An absolute path from anywhere else -- the source tree, the
+    toolchain, the runner's home -- or one hiding behind a flag prefix is copied into the
+    manifest verbatim and then silently refers to a directory that does not exist on the
+    machine that replays the bundle. Phase A only checked `argv[0]`, which was enough
     while the bundle never left the build host; phase B ships bundles to another machine,
-    so argv[1:], every env value and the working directory are checked too (review
-    follow-up on PR #279).
-
-    `os.pathsep`-joined values are split first, so a `PATH`-shaped variable is reported by
-    the element that leaked rather than as one unreadable blob.
+    so argv[1:], every env value and the working directory are checked too, and phase C
+    closes the two shapes phase B's review found still slipping through: a flag-prefixed
+    absolute (`--out=/abs`, `-I/abs`) and a `C:\\...` element inside a separated list.
     """
     leaked: list[str] = []
 
     def scan(where: str, value: str) -> None:
-        for piece in value.split(os.pathsep) if os.pathsep in value else [value]:
+        for piece in split_path_list(value):
             if not piece or piece.startswith(BUNDLE_PLACEHOLDER):
                 continue
-            if looks_absolute(piece):
-                leaked.append(f"{where}: {piece}")
+            candidates = [piece]
+            flag = _FLAG_PREFIX.match(piece)
+            if flag is not None:
+                # Report the whole element, not the tail: `--out=/abs` is what a reader
+                # has to go and find in the CMakeLists.
+                candidates.append(piece[flag.end() :])
+            for candidate in candidates:
+                if not candidate or candidate.startswith(BUNDLE_PLACEHOLDER):
+                    continue
+                if looks_absolute(candidate):
+                    leaked.append(f"{where}: {piece}")
+                    break
 
     for index, argument in enumerate(test.argv):
         scan(f"argv[{index}]", argument)
@@ -526,6 +574,138 @@ def convert(payload: object, build_dir: Path) -> tuple[list[BundledTest], dict[s
 
 
 # --------------------------------------------------------------------------------------
+# Windows runtime DLLs
+# --------------------------------------------------------------------------------------
+
+#: `objdump -p`/`llvm-objdump -p` print one of these per PE import descriptor. Both tools
+#: spell the *export* directory's own name `DLL name:` (lower-case `n`), so matching
+#: case-sensitively is what keeps `mimalloc.dll` from being reported as importing itself.
+_PE_IMPORT = re.compile(r"^\s*DLL Name:\s*(\S+)\s*$")
+
+#: DLLs Windows itself supplies. Anything outside this set has to be carried by the bundle
+#: or the executable will not start on a machine that never had a toolchain installed --
+#: and a missing DLL surfaces as a dialog-free 0xC0000135 exit, not as a test failure that
+#: says what happened.
+#:
+#: The prefixes cover the API sets (`api-ms-win-crt-heap-l1-1-0.dll` and friends): UCRT is
+#: reached exclusively through those, which is why an mingw-w64 UCRT build imports no
+#: `ucrtbase.dll` by name.
+SYSTEM_DLL_PREFIXES = ("api-ms-win-", "ext-ms-win-")
+SYSTEM_DLLS = frozenset(
+    name.lower()
+    for name in (
+        "advapi32.dll",
+        "bcrypt.dll",
+        "bcryptprimitives.dll",
+        "comctl32.dll",
+        "comdlg32.dll",
+        "crypt32.dll",
+        "d3d11.dll",
+        "dbghelp.dll",
+        "dxgi.dll",
+        "gdi32.dll",
+        "iphlpapi.dll",
+        "kernel32.dll",
+        "kernelbase.dll",
+        "mscoree.dll",
+        "msvcrt.dll",
+        "ntdll.dll",
+        "ole32.dll",
+        "oleaut32.dll",
+        "powrprof.dll",
+        "psapi.dll",
+        "rpcrt4.dll",
+        "secur32.dll",
+        "shell32.dll",
+        "shlwapi.dll",
+        "synchronization.dll",
+        "ucrtbase.dll",
+        "user32.dll",
+        "userenv.dll",
+        "version.dll",
+        "winmm.dll",
+        "ws2_32.dll",
+    )
+)
+
+#: Files whose imports are worth reading. `.a`/`.lib` import libraries are not loaded at
+#: run time, so they are not scanned even when they sit in the bundle.
+PE_SUFFIXES = (".exe", ".dll")
+
+
+def is_system_dll(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in SYSTEM_DLLS or lowered.startswith(SYSTEM_DLL_PREFIXES)
+
+
+def read_pe_imports(path: Path, objdump: str) -> list[str]:
+    """The DLL names `path` imports, in import-table order. Non-PE input yields nothing."""
+    proc = subprocess.run(
+        [objdump, "-p", str(path)], capture_output=True, text=True, errors="replace", check=False
+    )
+    if proc.returncode != 0:
+        raise BundleError(
+            f"`{objdump} -p {path}` failed ({proc.returncode}): {proc.stderr.strip()}"
+        )
+    names: list[str] = []
+    for line in proc.stdout.splitlines():
+        match = _PE_IMPORT.match(line)
+        if match is not None and match.group(1) not in names:
+            names.append(match.group(1))
+    return names
+
+
+def resolve_runtime_dlls(
+    staged: Sequence[Path], search_dirs: Sequence[Path], objdump: str
+) -> list[Path]:
+    """Every non-system DLL the staged files import, transitively, found in `search_dirs`.
+
+    The closure matters: `mimalloc-test-stress-dynamic.exe` imports `mimalloc.dll`, which
+    imports `libgcc_s_seh-1.dll`, which is the one the runner does not have. Scanning only
+    the executables would miss it.
+
+    An import that is neither a system DLL nor findable is a hard error naming both the
+    importer and the directories that were searched -- shipping the bundle anyway would
+    trade a legible failure here for an unexplained exit code on the Windows runner.
+    """
+    # Case-insensitive, because PE import names are (`KERNEL32.dll` vs `kernel32.dll`) and
+    # the search directories live on a case-sensitive filesystem during a cross build.
+    available: dict[str, Path] = {}
+    for directory in search_dirs:
+        if not directory.is_dir():
+            raise BundleError(f"--dll-search-dir {directory} is not a directory")
+        for candidate in sorted(directory.glob("*.dll")):
+            available.setdefault(candidate.name.lower(), candidate)
+
+    carried = {path.name.lower(): path for path in staged}
+    pending = [path for path in staged if path.suffix.lower() in PE_SUFFIXES]
+    found: list[Path] = []
+    missing: list[str] = []
+    while pending:
+        current = pending.pop(0)
+        for imported in read_pe_imports(current, objdump):
+            key = imported.lower()
+            if key in carried or is_system_dll(imported):
+                continue
+            resolved = available.get(key)
+            if resolved is None:
+                missing.append(f"{current.name} imports {imported}")
+                carried[key] = current  # report each missing DLL once, not once per importer
+                continue
+            carried[key] = resolved
+            found.append(resolved)
+            pending.append(resolved)
+    if missing:
+        searched = ", ".join(str(directory) for directory in search_dirs) or "(none given)"
+        raise BundleError(
+            "the bundle would ship executables that cannot load:\n  - "
+            + "\n  - ".join(sorted(missing))
+            + f"\nnot a known Windows system DLL and not found in: {searched}"
+        )
+    return found
+
+
+# --------------------------------------------------------------------------------------
 # Copying
 # --------------------------------------------------------------------------------------
 
@@ -601,11 +781,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="build configuration for multi-config generators (passed to ctest as -C)",
     )
+    parser.add_argument(
+        "--dll-search-dir",
+        action="append",
+        default=None,
+        metavar="DIR",
+        type=Path,
+        help=(
+            "directory holding toolchain runtime DLLs (repeatable). Passing it turns on the "
+            "PE import scan: every non-system DLL the bundle's executables import, "
+            "transitively, is copied in, and an unresolvable import is an error."
+        ),
+    )
+    parser.add_argument(
+        "--objdump",
+        default="llvm-objdump",
+        metavar="PROG",
+        help="objdump used by --dll-search-dir (llvm-objdump or x86_64-w64-mingw32-objdump)",
+    )
     args = parser.parse_args(argv)
 
     build_dir = Path(cast("Path", args.build_dir)).resolve()
     out_dir = Path(cast("Path", args.out_dir))
     config = cast("str | None", args.config)
+    search_dirs = cast("list[Path] | None", args.dll_search_dir) or []
+    objdump = cast("str", args.objdump)
 
     try:
         payload = run_ctest_show_only(build_dir, config)
@@ -617,6 +817,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             if source.name not in seen:
                 seen[source.name] = source
                 unique.append(source)
+        runtime_dlls: list[Path] = []
+        if search_dirs:
+            runtime_dlls = resolve_runtime_dlls(unique, search_dirs, objdump)
+            for dll in runtime_dlls:
+                if dll.name not in seen:
+                    seen[dll.name] = dll
+                    unique.append(dll)
         copied = copy_into(out_dir, unique)
         manifest_path = write_manifest(out_dir, tests, build_dir, config)
     except BundleError as exc:
@@ -631,6 +838,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     wrapped = sum(1 for test in tests if test.env)
     if wrapped:
         print(f"  {wrapped} test(s) carry environment overrides")
+    if runtime_dlls:
+        print(
+            f"  {len(runtime_dlls)} toolchain runtime DLL(s): "
+            + ", ".join(sorted(dll.name for dll in runtime_dlls))
+        )
     return 0
 
 

@@ -1,0 +1,730 @@
+name: windows-bundles
+
+# Issue #277 phase C: build the windows-gnu (MinGW-w64) test binaries on Linux, execute
+# them on ONE Windows runner.
+#
+# Five jobs per push go away: c-unit.yml's `ctest-win-gnu`, `ctest-debug-full-win-gnu` and
+# `ctest-shared-win-gnu` (each an `msys2/setup-msys2` install of gcc+cmake+ninja on its own
+# VM before it compiles anything), rust-native.yml's `test-win-gnu`, and cross.yml's
+# `build-win-gnu` + `test (x86_64-pc-windows-gnu)`. They are replaced by four Linux build
+# jobs, one Linux Rust build job, and one `windows-latest` job that runs everything
+# serially.
+#
+# The Linux side needs no MSYS2 and no Windows: `soldr prepare --target
+# x86_64-pc-windows-gnu` provisions mingw-w64-gcc 15.3.0, and
+# cmake/toolchains/soldr-x86_64-pc-windows-gnu.cmake feeds CMake nothing but what soldr
+# exported. `ci/bundle_tests.py` turns the build tree into a directory that runs with no
+# CMake and no checkout (see docs/ci-gates.md, "Test bundles").
+#
+# THE CRT CHANGES. MSYS2's MINGW64 environment, which the three native jobs use, is
+# msvcrt. soldr's mingw-w64 is UCRT (`libmsvcrt.a` is an archive of `lib64_libucrt_*.o`,
+# `_mingw.h` defines `_UCRT`, and a hello-world imports `api-ms-win-crt-*` rather than
+# `msvcrt.dll`). That is a deliberate coverage change and it has two consequences this
+# workflow has to handle explicitly, because `MI_MINGW_UCRT64` keys on `$ENV{MSYSTEM}`
+# upstream and cannot fire in a cross build:
+#   * the toolchain file sets `MI_MINGW_UCRT64` ON, which turns on the `.CRT$XLB` TLS
+#     callback path in src/prim/windows/prim.c, and
+#   * mingw put the wrong thing first in TWO import tables -- `mimalloc.dll` last in
+#     `mimalloc-test-stress-dynamic.exe`, and `mimalloc-redirect.dll` after the CRT
+#     api-sets in `mimalloc.dll` itself -- so the redirection module was initialised after
+#     the runtime it patches and refused to do anything. Both are a path-spelling property
+#     of the link line, not a CRT property; see CMakeLists.txt (MI_MINGW_REDIRECT_FIRST).
+# `run-windows-gnu` asserts the import order on the BUNDLE'S OWN binaries
+# (`ci/pe_imports.py`) as a hard failure, and gates the override itself on a BEHAVIOURAL
+# probe (`mimalloc-test-redirect-probe`: a CRT `malloc` pointer must land in a mimalloc
+# region) across all three bundles. Both halves of #277 -- the import order and the
+# emulated-TLS recursion it exposed -- are fixed; the bundle redirects.
+# The msvcrt row MSYS2 builds is printed but is NOT a control: see the step that says so.
+#
+# While this is being compared against the jobs it replaces, those jobs are
+# `continue-on-error: true`. They are the control arm, not decoration -- see the dated
+# TODO on each.
+
+env:
+  SOLDR_GITHUB_TOKEN: ${{ github.token }}
+
+on:
+  push:
+    branches: [main, v4]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'test/**'
+      - 'rust/**'
+      - 'bin/**'
+      - 'CMakeLists.txt'
+      - 'cmake/toolchains/**'
+      - 'ci/**'
+      - '.github/workflows/windows-bundles.yml'
+
+concurrency:
+  group: windows-bundles-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-gnu:
+    name: build-windows-gnu (${{ matrix.bundle }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Exactly today's win-gnu C coverage, config for config. The flags mirror the
+          # c-unit.yml job each bundle replaces; where one differs from the macOS lane it
+          # is because the native job differs, not because this lane chose differently.
+          - bundle: windows-gnu-x64-release
+            # `ctest-win-gnu`: `cmake -B build -G Ninja -DMI_PPROF=ON`. It passes no
+            # CMAKE_BUILD_TYPE and CMakeLists.txt (~137-145) defaults it from the binary
+            # directory's name, which is `build` -> Release. Spelled out here.
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON
+          - bundle: windows-gnu-x64-debug-full
+            # `ctest-debug-full-win-gnu`: `-DMI_PPROF=ON -DMI_DEBUG_FULL=ON
+            # -DCMAKE_BUILD_TYPE=Debug`. NOTE: unlike macOS's `ctest-debug-full`, this job
+            # passes CMAKE_BUILD_TYPE=Debug *explicitly*, so #277's phase B correction 3
+            # ("debug-full is really Release + MI_DEBUG=3") does NOT transfer to win-gnu.
+            # Debug here also turns on MI_GUARDED=1 and MI_FREE_IS_CHECKED=1, and renames
+            # the library to `mimalloc-debug`.
+            cmake: -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
+          - bundle: windows-gnu-x64-shared
+            # `ctest-shared-win-gnu`.
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
+          - bundle: windows-gnu-x64-leak
+            # The memory gate's positive control. It is a separate *build*
+            # (MI_BENCH_INJECT_LEAK), not a separate run, so it cannot be an entry in
+            # another bundle's manifest. A gate whose control never runs is a gate nobody
+            # has seen fire (docs/ci-gates.md). New on win-gnu: no native win-gnu job runs
+            # the memory gate today -- see the coverage table in docs/ci-gates.md.
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - uses: zackees/setup-soldr@v0
+        with:
+          # zccache wraps `soldr cargo`; this job drives CMake directly, so there is
+          # nothing for it to wrap. Only the toolchain provisioning is wanted here.
+          cache: false
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+      - name: Cache the prepared MinGW toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/soldr-x86_64-pc-windows-gnu.tar.zst
+          key: soldr-prepare-x86_64-pc-windows-gnu-${{ hashFiles('rust/rust-toolchain.toml') }}
+      - name: Prepare the soldr MinGW toolchain
+        # `soldr prepare` resolves rustc from a rust-toolchain.toml at or above the working
+        # directory, which is why this runs in rust/ like cross.yml does.
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          archive="$HOME/soldr-x86_64-pc-windows-gnu.tar.zst"
+          args=(--target x86_64-pc-windows-gnu --github-env "$GITHUB_ENV" --save "$archive")
+          # --restore on a nonexistent archive is not a documented no-op, so only pass it
+          # on a cache hit.
+          if [ -f "$archive" ]; then
+            args=(--restore "$archive" "${args[@]}")
+          fi
+          soldr prepare "${args[@]}"
+      - name: Configure for x86_64-pc-windows-gnu
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja ${{ matrix.cmake }} \
+            --toolchain cmake/toolchains/soldr-x86_64-pc-windows-gnu.cmake \
+            --log-level=VERBOSE 2>&1 | tee configure.log
+          # Assert on the *resolved* list, not on the option that was passed in -- the
+          # MI_GUARDED lesson from docs/ci-gates.md. On this lane the find-root confinement
+          # is belt-and-braces rather than load-bearing (unlike Darwin): CMake's
+          # Windows-GNU CMAKE_FIND_LIBRARY_SUFFIXES are `.dll.a;.a;.lib`, so a host
+          # `librt.so` is not a candidate even with the search unconfined. Verified both
+          # ways locally; the assertion is what would notice if that ever changed.
+          if ! grep -qE '^-- Link libraries *: *psapi;shell32;user32;advapi32;bcrypt$' configure.log; then
+            echo "::error::the MinGW link resolved unexpected libraries"
+            grep -E 'Link libraries' configure.log || true
+            exit 1
+          fi
+          # The CRT decision, asserted rather than assumed: the toolchain file sets
+          # MI_MINGW_UCRT64 because $ENV{MSYSTEM} cannot fire in a cross build, and a flag
+          # that never reaches the compiler is this repository's most-repeated CI bug.
+          if ! grep -qE '^-- Compiler defines .*MI_MINGW_UCRT64=1' configure.log; then
+            echo "::error::MI_MINGW_UCRT64=1 did not reach the compiler defines"
+            grep -E 'Compiler defines' configure.log || true
+            exit 1
+          fi
+      - run: cmake --build build --parallel
+      - name: Prove the output is x86-64 PE with the profiler's Windows sections
+        run: |
+          set -euo pipefail
+          # soldr's own binutils, so this does not depend on what the runner image ships.
+          objdump="$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump"
+          lib=$(ls build/mimalloc*.dll | grep -v 'redirect' | head -1)
+          echo "## ${{ matrix.bundle }}" >> "$GITHUB_STEP_SUMMARY"
+          "$objdump" -f "$lib" | tee headers.txt
+          grep -q 'file format pei-x86-64' headers.txt
+          # MI_MINGW_UCRT64=1 makes src/prim/windows/prim.c register process/thread
+          # init through the CRT initialiser tables instead of a constructor attribute.
+          # If a cross build silently dropped them, mimalloc would load on the runner and
+          # never initialise -- which no test failure would obviously explain.
+          obj=$(find build -name 'prim.c.obj' | head -1)
+          test -n "$obj"
+          "$objdump" -h "$obj" > prim-sections.txt
+          for section in '.CRT$XLB' '.CRT$XLY' '.CRT$XIB'; do
+            if ! grep -qF "$section" prim-sections.txt; then
+              echo "::error::$section is missing from $obj"
+              cat prim-sections.txt
+              exit 1
+            fi
+          done
+          # ... and the linked image must actually carry a TLS directory, which is what
+          # makes the .CRT$XLB callback fire. An empty entry 9 means the section was
+          # dropped at link time.
+          "$objdump" -p "$lib" > private.txt
+          if ! grep -qE '^Entry 9 +0*[1-9a-f][0-9a-f]* +0*[1-9a-f]' private.txt; then
+            echo "::error::$lib has no Thread Storage Directory; the .CRT\$XLB callback cannot fire"
+            grep -E '^Entry 9' private.txt || true
+            exit 1
+          fi
+          # The Windows override goes through the redirection DLL, not through symbol
+          # interposition; a mimalloc.dll that lost this import overrides nothing.
+          grep -qi 'DLL Name: mimalloc-redirect.dll' private.txt
+          # #277, both halves of the override, asserted on the artifact rather than on the
+          # flags that produced it:
+          #  * the redirection module must be the FIRST import descriptor, or the loader
+          #    initialises `ucrtbase` first and the module refuses to patch it;
+          #  * `mimalloc.dll` must not import `__emutls_get_address`. This toolchain's
+          #    GCC has no native TLS, so a `__thread` on the allocation path becomes
+          #    emulated TLS, and libgcc allocates it with `malloc` -- which, once the
+          #    override is live, is mi_malloc: unbounded recursion, dead before `main`.
+          first_dll=$(grep -i 'DLL Name:' private.txt | head -1 | sed 's/.*DLL Name: *//' | tr -d '\r')
+          if [ "$first_dll" != "mimalloc-redirect.dll" ]; then
+            echo "::error::$lib imports '$first_dll' first, expected mimalloc-redirect.dll"
+            exit 1
+          fi
+          if grep -q '__emutls_get_address' private.txt; then
+            echo "::error::$lib imports __emutls_get_address: a thread-local on the allocation path will recurse through the redirected malloc (#277)"
+            grep -n '__emutls' private.txt
+            exit 1
+          fi
+          {
+            echo '```'
+            grep -E '^Entry 9' private.txt
+            echo "$lib imports:"
+            grep -i 'DLL Name:' private.txt
+            echo "mimalloc-test-stress-dynamic.exe imports (order matters, see minject):"
+            "$objdump" -p build/mimalloc-test-stress-dynamic.exe | grep -i 'DLL Name:'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Bundle the tests
+        # --dll-search-dir turns on the PE import scan. soldr's mingw-w64 links
+        # mimalloc.dll against libgcc_s_seh-1.dll, which no `windows-latest` runner has,
+        # and a missing DLL is a dialog-free 0xC0000135 exit rather than a test failure
+        # that says what happened. Shipping it (rather than building `-static-libgcc`)
+        # keeps the binary under test byte-for-byte the one an ordinary mingw link
+        # produces: the DLL is a property of the *bundle*, not of the artifact.
+        run: |
+          set -euo pipefail
+          uv run ci/bundle_tests.py build bundle \
+            --objdump "$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump" \
+            --dll-search-dir "$MINGW_W64_CROSS_ROOT/x86_64-w64-mingw32/lib"
+      - name: The manifest must carry no absolute path, and the runtime DLL must be there
+        # bundle_tests.py already refuses both; these are the independent checks, because
+        # the whole portability claim rests on them.
+        run: |
+          set -euo pipefail
+          if grep -nE '"(/|[A-Za-z]:[\\/])' bundle/tests.json; then
+            echo "::error::the bundle manifest contains an absolute path"
+            exit 1
+          fi
+          uv run python -c "import json; d=json.load(open('bundle/tests.json')); print(len(d['tests']), 'tests')"
+          ls bundle | grep -q '^libgcc_s_seh-1\.dll$'
+          ls bundle | grep -q '^mimalloc-redirect\.dll$'
+      - name: Pack the bundle
+        # tar, not a plain artifact upload: upload-artifact@v4 drops the executable bit.
+        # (Nothing in a Windows bundle is a symlink, but keeping the two lanes identical
+        # means one unpack step on the runner rather than two.)
+        run: tar -C bundle -czf "${{ matrix.bundle }}.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.bundle }}
+          path: ${{ matrix.bundle }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build-rust-windows-gnu:
+    name: build-rust (x86_64-pc-windows-gnu)
+    # cross.yml's `build-win-gnu` runs this on `windows-latest` (it predates soldr having
+    # a Linux-hosted mingw lane). Nothing about it needs Windows: soldr's mingw-w64 is a
+    # Linux-hosted cross compiler and cc-rs picks it up from CC_x86_64_pc_windows_gnu.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: zackees/setup-soldr@v0
+        with:
+          # Same reason cross.yml's build-win-gnu gives: the embedded cache expects
+          # MSVC-style .pdb outputs even though this target is GNU, then fails while
+          # materialising files that do not exist.
+          cache: false
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+      - name: Prepare blessed cross toolchain
+        run: soldr prepare --target x86_64-pc-windows-gnu --github-env "$GITHUB_ENV"
+      - name: Build test binaries through Soldr
+        run: |
+          # pipefail is NOT on by default in GitHub's `bash -e` shell, so without it this
+          # pipeline reports jq's exit status and a FAILED cargo build looks green. And
+          # the raw JSON is kept because piping cargo straight into jq discards every
+          # `compiler-message`, which is where the error text lives.
+          set -euo pipefail
+          rc=0
+          # Plain `cargo`, NOT `soldr cargo` -- see the long note in cross.yml's
+          # build-cross: the wrapper drops mi_prof_* symbols at link time. No
+          # frame-pointer flags either: the profiler does not walk frame pointers on
+          # Windows (it uses RtlCaptureStackBackTrace), which is why cross.yml's
+          # frame-pointer steps are gated on `apple-darwin`.
+          cargo test -p mimalloc-pprof --no-run --target x86_64-pc-windows-gnu --release \
+            --message-format=json > cargo.json || rc=$?
+          jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' cargo.json > bins.txt
+          if [ "$rc" -ne 0 ]; then
+            jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' cargo.json >&2
+            exit "$rc"
+          fi
+          test -s bins.txt
+          mkdir -p dist/x86_64-pc-windows-gnu
+          xargs -r -a bins.txt -I{} cp {} dist/x86_64-pc-windows-gnu/
+          # `test (x86_64-pc-windows-gnu)` has `pprof: true`, so run-windows-gnu needs
+          # these two specifically. Assert it here, next to the compiler output, instead
+          # of letting the consumer fail without saying why.
+          for required in t3_stats t12_proto; do
+            if ! ls "dist/x86_64-pc-windows-gnu/$required"-* >/dev/null 2>&1; then
+              echo "::error::$required was not built. Staged binaries:"
+              ls -1 dist/x86_64-pc-windows-gnu || echo "  (none)"
+              exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-test-bins-x86_64-pc-windows-gnu
+          path: rust/dist/x86_64-pc-windows-gnu
+          if-no-files-found: error
+          retention-days: 7
+
+  run-windows-gnu:
+    # The point of the whole workflow: one Windows VM, one queue slot, everything serial.
+    needs: [build-windows-gnu, build-rust-windows-gnu]
+    runs-on: windows-latest
+    # Everything here is serial, so a hung test would otherwise hold the slot for the
+    # workflow's whole timeout.
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      # `windows-latest` ships a Python, but every ci/ script in this repo is run through
+      # uv everywhere else and the two must not drift.
+      - uses: astral-sh/setup-uv@v3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-windows-gnu-*
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-test-bins-x86_64-pc-windows-gnu
+          path: rust-bins
+      - name: Unpack the bundles
+        run: |
+          set -euo pipefail
+          for archive in artifacts/*/*.tar.gz; do
+            name=$(basename "$archive" .tar.gz)
+            mkdir -p "bundle/$name"
+            tar -C "bundle/$name" -xzf "$archive"
+          done
+          # A cross-built binary that will not even load is the failure this whole phase
+          # risks, so say what these files are before running anything.
+          uv --version
+          ls -l bundle/windows-gnu-x64-release | head -40
+
+      - name: The bundle's own binaries must import mimalloc.dll first
+        # The measurable half of the override. `ld`'s PE script emits import descriptors
+        # under `SORT(*)(.idata$2)`, sorted by the input file path as spelled on the link
+        # line, so a build-relative `libmimalloc.dll.a` lands behind every absolute CRT
+        # archive and `mimalloc.dll` ends up LAST -- after which the redirection module it
+        # pulls in is initialised after the CRT it patches. CMakeLists.txt spells the same
+        # file `./…` on this target to fix that; assert the result rather than the flag.
+        run: |
+          set -euo pipefail
+          for bundle in bundle/windows-gnu-x64-release bundle/windows-gnu-x64-debug-full bundle/windows-gnu-x64-shared; do
+            exe="$bundle/mimalloc-test-stress-dynamic.exe"
+            dll=$(basename "$(ls "$bundle"/mimalloc*.dll | grep -v 'redirect' | head -1)")
+            echo "::group::$bundle"
+            # `dumpbin` is MSVC-only and MSYS2 is not installed yet at this point in the
+            # job, so read the import table with the objdump soldr shipped -- the bundle
+            # carries no tool, so this comes from the checkout's Python instead.
+            uv run ci/pe_imports.py "$exe" | tee "$bundle/imports.txt"
+            first=$(head -1 "$bundle/imports.txt")
+            if [ "$first" != "$dll" ]; then
+              echo "::error::$exe imports '$first' first, expected '$dll'"
+              exit 1
+            fi
+            # The DLL's own table is the half that decides whether the override engages
+            # at all, and it is asserted in the Linux build job that produced this bundle
+            # (mimalloc-redirect.dll first, and no __emutls_get_address import). Recorded
+            # again here so a bundle can be diagnosed from its own artifact.
+            uv run ci/pe_imports.py "$bundle/$dll" | tee "$bundle/imports-dll.txt"
+            echo "::endgroup::"
+          done
+
+      - name: Windows override gate -- the bundle's own malloc must reach mimalloc
+        # BEHAVIOURAL, deliberately. `mi_is_redirected()` -- what "mimalloc: malloc is
+        # redirected." reports -- only says the redirection module believed it patched
+        # something, and that flag lies: the MSYS2 msvcrt binary further down prints it
+        # while its `msvcrt.dll!malloc` was never touched (the module v1.3.3 knows only
+        # `ucrtbase`/`ucrtbased`; it had patched a `ucrtbase.dll` some system DLL dragged
+        # into the process). So gate on `mimalloc-test-redirect-probe`, which takes a
+        # pointer from the CRT's own `malloc` and asks `mi_is_in_heap_region`. Only a real
+        # override makes that 1.
+        #
+        # A HARD failure, on all three bundles (#277). What used to make it impossible:
+        #   1. `mimalloc-redirect.dll` refuses to patch a CRT whose DllMain has already
+        #      run -- it reads `ucrtbase.dll`'s LDR_DATA_TABLE_ENTRY.Flags and checks
+        #      LDRP_PROCESS_ATTACH_CALLED (0x00080000), then reports
+        #      "seems to be initialized after ucrtbase.dll" and gives up. The loader
+        #      initialises a module's dependencies in that module's own import order, so
+        #      `mimalloc.dll` must import the redirect module before `api-ms-win-crt-*`
+        #      (CMakeLists.txt, MI_MINGW_REDIRECT_FIRST) -- the exe importing
+        #      `mimalloc.dll` first is necessary but not sufficient.
+        #   2. With that fixed, the process died before `main`: soldr's mingw-w64 GCC has
+        #      no native TLS, so mimalloc's `__thread` variables became GCC *emulated*
+        #      TLS, and `__emutls_get_address` allocates with `malloc` -- which is now
+        #      mi_malloc. Fixed in src/threadlocal.c and src/options.c; asserted in the
+        #      build job (mimalloc.dll must not import `__emutls_get_address`).
+        # The module's own explanation only ever reaches the log through the `const char**`
+        # that `mi_allocator_init` returns (it imports no output API at all), which
+        # src/init.c prints AFTER the option dump -- so on failure print all of it.
+        run: |
+          set -uo pipefail
+          failed=0
+          gate() {
+            local label="$1" bundle="$2" rc=0
+            local probe="$bundle/mimalloc-test-redirect-probe.exe"
+            if [ ! -f "$probe" ]; then
+              echo "::error::$probe is missing from the bundle"
+              failed=1; return
+            fi
+            PATH="$PWD/$bundle:$PATH" "$probe" > "$bundle/redirect-probe.txt" 2>&1 || rc=$?
+            echo "$label:"
+            sed 's/^/  /' "$bundle/redirect-probe.txt"
+            if [ "$rc" -ne 0 ] || ! grep -q '^REDIRECT_BEHAVIOURAL=1$' "$bundle/redirect-probe.txt"; then
+              echo "::error::$probe did not prove the override (rc=$rc)"
+              # test-stress-dynamic under MIMALLOC_VERBOSE is what carries the redirection
+              # module's own explanation; print it whole, options and all.
+              MIMALLOC_VERBOSE=1 PATH="$PWD/$bundle:$PATH" \
+                "$bundle/mimalloc-test-stress-dynamic.exe" 4 10 1 2>&1 | grep -v "^option '" || true
+              failed=1
+            fi
+          }
+          gate "UCRT release bundle   " bundle/windows-gnu-x64-release
+          gate "UCRT shared bundle    " bundle/windows-gnu-x64-shared
+          gate "UCRT debug-full bundle" bundle/windows-gnu-x64-debug-full
+          exit $failed
+
+      - name: ctest-win-gnu equivalent -- windows-gnu-x64-release
+        run: |
+          uv run ci/run_test_bundle.py bundle/windows-gnu-x64-release \
+            --junit "$GITHUB_WORKSPACE/bundle-release.xml"
+      - name: ctest-debug-full-win-gnu equivalent -- windows-gnu-x64-debug-full
+        # Carries the six run-negative.cmake controls. Run serially after the release
+        # bundle, never alongside it.
+        run: |
+          uv run ci/run_test_bundle.py bundle/windows-gnu-x64-debug-full \
+            --junit "$GITHUB_WORKSPACE/bundle-debug-full.xml"
+      - name: ctest-shared-win-gnu equivalent -- windows-gnu-x64-shared
+        run: |
+          uv run ci/run_test_bundle.py bundle/windows-gnu-x64-shared \
+            --junit "$GITHUB_WORKSPACE/bundle-shared.xml"
+
+      - name: Run the cross-built Rust test binaries
+        # Replaces cross.yml's `test (x86_64-pc-windows-gnu)` and rust-native.yml's
+        # `test-win-gnu`. Those binaries link MI_STATIC_LIB, so no DLL, no redirection
+        # module and no minject are involved.
+        run: |
+          set -euo pipefail
+          for test_binary in rust-bins/*.exe; do
+            echo "::group::$(basename "$test_binary")"
+            "$test_binary" --test-threads=4
+            echo "::endgroup::"
+          done
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install pprof
+        run: |
+          set -euo pipefail
+          go install github.com/google/pprof@latest
+          # `go env GOPATH` answers a native path (C:\Users\...); pasting that into a
+          # bash command line produces mixed separators. Resolve it once, here, into a
+          # POSIX path the following steps can use verbatim.
+          #
+          # Deliberately NOT via $GITHUB_PATH: the runner treats every line there as a
+          # *Windows* PATH element, so a POSIX path written to it comes back through
+          # MSYS's conversion as a current-drive-relative path.
+          echo "PPROF=$(cygpath -u "$(go env GOPATH)")/bin/pprof.exe" >> "$GITHUB_ENV"
+          ls -l "$(cygpath -u "$(go env GOPATH)")/bin/pprof.exe"
+      - name: Prove pprof parses a native dump
+        # cross.yml's win-gnu row has `pprof: true`; these two steps are that row's
+        # dump checks, unchanged in substance.
+        run: |
+          set -euo pipefail
+          generator=$(ls rust-bins/t3_stats-*.exe | head -1)
+          MIMALLOC_PPROF_CI_DUMP="$GITHUB_WORKSPACE/heap.prof" "$generator"
+          "$PPROF" -raw "$GITHUB_WORKSPACE/heap.prof" > raw.txt
+          grep -Eq 'PeriodType: space|heap_v2|inuse_space' raw.txt
+      - name: Prove pprof parses a proto dump
+        run: |
+          set -euo pipefail
+          generator=$(ls rust-bins/t12_proto-*.exe | head -1)
+          MIMALLOC_PROF_PROTO_PATH="$GITHUB_WORKSPACE/heap.pb" "$generator"
+          "$PPROF" -raw "$GITHUB_WORKSPACE/heap.pb" > raw-pb.txt
+          grep -Eq 'inuse_space|alloc_space' raw-pb.txt
+
+      - name: Memory gate -- 8 runs from the release bundle
+        # NEW coverage on win-gnu: no native MinGW job runs the memory gate today (only
+        # the MSVC `memory-gate (windows-latest)` row does, against
+        # ci/memory-baselines/windows-pprof1.json, which this lane must not borrow).
+        run: |
+          set -euo pipefail
+          exe="bundle/windows-gnu-x64-release/mimalloc-test-memory-gate.exe"
+          for i in 1 2 3 4 5 6 7 8; do
+            MI_BENCH_JSON="result-$i.json" "$exe" > /dev/null
+          done
+          # A gate binary that crashed writes no JSON, the glob stays unexpanded, and
+          # every downstream error would then be indistinguishable from "this lane has no
+          # baseline yet" -- i.e. a green step. Count first, with a glob rather than
+          # `ls | wc -l` (which fails under `pipefail` when it finds nothing).
+          count=0
+          for produced in result-*.json; do
+            if [ -e "$produced" ]; then count=$((count + 1)); fi
+          done
+          if [ "$count" -ne 8 ]; then
+            echo "::error::only $count of 8 memory-gate runs produced JSON"
+            exit 1
+          fi
+          cat result-1.json
+          # --arch/--compiler give this lane its own baseline file. Without them it would
+          # be compared against ci/memory-baselines/windows-pprof1.json, which MSVC
+          # recorded -- a cross-toolchain comparison dressed as a regression check.
+          #
+          # "Is this lane new?" is decided by `where`, which answers 3 for "no baseline"
+          # and 2 for "cannot read this run". `check` collapses both into 2, so gating the
+          # yellow bootstrap path on check's own status would report an unreadable result
+          # as a bootstrap and exit green.
+          rc=0
+          uv run ci/memory_gate.py where --arch x64 --compiler soldr-mingw-gcc-15 result-1.json || rc=$?
+          case "$rc" in
+            0)
+              uv run ci/memory_gate.py check --arch x64 --compiler soldr-mingw-gcc-15 result-*.json
+              ;;
+            3)
+              echo "::warning::No committed baseline for the soldr win-gnu lane yet -- bootstrap it from this run's memory-gate artifact."
+              # `check` exits 2 here by construction: the probe just proved the baseline
+              # is absent, so its status carries no information -- but its report does.
+              uv run ci/memory_gate.py check --arch x64 --compiler soldr-mingw-gcc-15 result-*.json || true
+              ;;
+            *)
+              echo "::error::memory_gate could not read this run's JSON (rc=$rc)"
+              exit 1
+              ;;
+          esac
+      - name: Positive control -- the gate must catch an injected leak
+        run: |
+          set -euo pipefail
+          exe="bundle/windows-gnu-x64-leak/mimalloc-test-memory-gate.exe"
+          for i in 1 2 3 4 5 6 7 8; do
+            MI_BENCH_JSON="leak-$i.json" "$exe" > /dev/null || true
+          done
+          # The leak build is *expected* to exit non-zero (hence `|| true` above), which
+          # makes the file count the only evidence that it ran at all.
+          count=0
+          for produced in leak-*.json; do
+            if [ -e "$produced" ]; then count=$((count + 1)); fi
+          done
+          if [ "$count" -ne 8 ]; then
+            echo "::error::only $count of 8 leak-control runs produced JSON"
+            exit 1
+          fi
+          # `control` requires `check` to FAIL. A missing baseline is not a failure, it is
+          # a bootstrap, so before this lane's baseline is committed the control would go
+          # red for the wrong reason.
+          rc=0
+          uv run ci/memory_gate.py where --arch x64 --compiler soldr-mingw-gcc-15 leak-1.json || rc=$?
+          case "$rc" in
+            0)
+              uv run ci/memory_gate.py control --arch x64 --compiler soldr-mingw-gcc-15 leak-*.json
+              ;;
+            3)
+              echo "::warning::the soldr win-gnu lane has no committed baseline yet, so its positive control cannot run. Commit the baseline, then this becomes a hard gate."
+              ;;
+            *)
+              echo "::error::memory_gate could not read the leak control's JSON (rc=$rc)"
+              exit 1
+              ;;
+          esac
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-gate-windows-gnu-x64-soldr
+          # The leak runs too: they are what a reader needs to see why the control did or
+          # did not fire, and the gate runs are what the baseline is bootstrapped from.
+          path: |
+            result-*.json
+            leak-*.json
+          if-no-files-found: error
+
+      - uses: msys2/setup-msys2@v2
+        if: ${{ !cancelled() }}
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+      - name: Native compile-compat check and native ctest enumeration (MSYS2 MinGW64)
+        # The bundles are built by soldr's UCRT mingw-w64 on Linux. This is the only thing
+        # on this runner that still uses MSYS2's *msvcrt* MINGW64 gcc, and it catches
+        # compile-only breakage that a cross build would not. It builds the Release tree
+        # (no tests -- the bundles do that) and only *configures* the other two, because
+        # `--show-only` needs a configured tree, not a built one.
+        #
+        # Each configure must stay in step with the c-unit.yml job it mirrors, or the
+        # coverage comparison below silently stops describing the job being replaced.
+        if: ${{ !cancelled() }}
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          gcc --version | head -1
+          # `ctest-win-gnu`
+          cmake -B native-release -G Ninja -DMI_PPROF=ON
+          cmake --build native-release
+          # `ctest-debug-full-win-gnu` (CMAKE_BUILD_TYPE=Debug is explicit there)
+          cmake -B native-debug-full -G Ninja -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DCMAKE_BUILD_TYPE=Debug
+          # `ctest-shared-win-gnu`
+          cmake -B native-shared -G Ninja -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
+          ctest --test-dir native-release --show-only=json-v1 > native-release.json
+          ctest --test-dir native-debug-full --show-only=json-v1 > native-debug-full.json
+          ctest --test-dir native-shared --show-only=json-v1 > native-shared.json
+          # Recorded, not gated: the native lane's own import order, so the claim that
+          # this is a link-order property and not a CRT property is measured on both
+          # sides rather than asserted on one. The gate is on the bundle, above.
+          objdump -p native-release/mimalloc-test-stress-dynamic.exe | grep -i 'DLL Name' \
+            | sed 's/^[[:space:]]*//' > native-imports.txt
+          cat native-imports.txt
+          set +e
+          MIMALLOC_VERBOSE=1 ./native-release/mimalloc-test-stress-dynamic.exe 4 10 1 > msvcrt.raw 2>&1
+          rc=$?
+          set -e
+          # The msvcrt row is NOT a like-for-like control, and #277 records why: this
+          # binary's malloc comes from `msvcrt.dll`, and `mimalloc-redirect.dll` v1.3.3
+          # contains no reference to `msvcrt` at all -- its only CRT module names are
+          # `ucrtbase` and `ucrtbased`. It reports "redirected" because `ucrtbase.dll` is
+          # in the process (pulled in by system DLLs) and gets patched, not because this
+          # exe's allocations moved. Printed, not trusted.
+          echo "::group::msvcrt native, full output"
+          grep -v "^option '" msvcrt.raw || true
+          echo "::endgroup::"
+          echo "::group::msvcrt native: the DLL's own import table"
+          objdump -p native-release/mimalloc.dll | grep -i 'DLL Name' || true
+          echo "::endgroup::"
+          if [ "$rc" -ne 0 ]; then
+            echo "FAILED(rc=$rc)" > msvcrt.txt
+          elif grep -q 'malloc is redirected' msvcrt.raw; then
+            echo "REDIRECTED" > msvcrt.txt
+          else
+            echo "NOT-REDIRECTED" > msvcrt.txt
+          fi
+          echo "msvcrt (MSYS2 MINGW64): flag says $(cat msvcrt.txt)"
+          # ...and what the same binary does, which is the point. This row is expected to
+          # show the flag and the behaviour disagreeing: the probe's `malloc` comes from
+          # `msvcrt.dll`, which the redirection module cannot patch.
+          ./native-release/mimalloc-test-redirect-probe.exe > msvcrt-probe.txt 2>&1 || true
+          sed 's/^/  /' msvcrt-probe.txt
+      - name: Coverage -- the bundles must run every test the native runner would
+        if: ${{ !cancelled() }}
+        run: |
+          uv run ci/bundle_coverage.py \
+            --compare "ctest-win-gnu" native-release.json bundle/windows-gnu-x64-release/tests.json \
+            --compare "ctest-debug-full-win-gnu" native-debug-full.json bundle/windows-gnu-x64-debug-full/tests.json \
+            --compare "ctest-shared-win-gnu" native-shared.json bundle/windows-gnu-x64-shared/tests.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Summary -- the flag, the behaviour, and why they differ
+        # `ctest-win-gnu` (what this lane replaces) only ever looked at
+        # `mi_is_redirected()`. That flag is kept here as a regression detector on the
+        # native row, but it is NOT the gate and it is not a control: on the msvcrt binary
+        # it reports success while the binary's own allocations never reach mimalloc.
+        # `mimalloc-redirect.dll` v1.3.3 names only `ucrtbase`/`ucrtbased` as CRT targets
+        # and contains no reference to `msvcrt` at all; what it patched in that process is
+        # a `ucrtbase.dll` a system DLL had loaded. The behavioural rows below show it.
+        # The cross-built bundle is gated hard, behaviourally, earlier in this job.
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          read_result() { cat "$1" 2>/dev/null || echo "UNKNOWN"; }
+          behavioural() { grep -h '^REDIRECT_BEHAVIOURAL=' "$1" 2>/dev/null | tail -1 | cut -d= -f2 || echo "?"; }
+          flag()        { grep -h '^REDIRECT_FLAG=' "$1" 2>/dev/null | tail -1 | cut -d= -f2 || echo "?"; }
+          msvcrt=$(read_result msvcrt.txt)
+          {
+            echo "### Does mimalloc actually override the CRT?"
+            echo
+            echo "\`REDIRECT_BEHAVIOURAL\` is a CRT \`malloc\` pointer landing in a mimalloc region."
+            echo "\`mi_is_redirected()\` is only what the redirection module believed it did."
+            echo
+            echo "| lane | behavioural | \`mi_is_redirected()\` |"
+            echo "|---|---|---|"
+            for b in release shared debug-full; do
+              f="bundle/windows-gnu-x64-$b/redirect-probe.txt"
+              echo "| soldr mingw-w64 (**UCRT**) $b bundle | $(behavioural "$f") | $(flag "$f") |"
+            done
+            echo "| MSYS2 MINGW64 (**msvcrt**), built by this job | $(behavioural msvcrt-probe.txt) | $(flag msvcrt-probe.txt) |"
+            echo
+            echo "First import of each \`test-stress-dynamic\`:"
+            echo
+            echo '```'
+            echo "bundle (cross): $(head -1 bundle/windows-gnu-x64-release/imports.txt)"
+            echo "native (MSYS2): $(head -1 native-imports.txt)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # Native row, flag only: while this MSYS2 build exists, losing even the flag
+          # there is a regression worth knowing about.
+          if [ "$msvcrt" != "REDIRECTED" ]; then
+            echo "::error::the msvcrt win-gnu lane no longer sets mi_is_redirected() (got: $msvcrt)"
+            cat msvcrt.raw || true
+            exit 1
+          fi
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-gnu-bundle-results
+          path: |
+            bundle-release.xml
+            bundle-debug-full.xml
+            bundle-shared.xml
+            native-release.json
+            native-debug-full.json
+            native-shared.json
+            bundle/windows-gnu-x64-release/redirect-probe.txt
+            bundle/windows-gnu-x64-shared/redirect-probe.txt
+            bundle/windows-gnu-x64-debug-full/redirect-probe.txt
+            msvcrt.txt
+            msvcrt.raw
+            msvcrt-probe.txt
+            native-imports.txt
+            bundle/windows-gnu-x64-release/imports.txt
+            bundle/windows-gnu-x64-release/imports-dll.txt
+            bundle/windows-gnu-x64-debug-full/imports.txt
+            bundle/windows-gnu-x64-debug-full/imports-dll.txt
+            bundle/windows-gnu-x64-shared/imports.txt
+            bundle/windows-gnu-x64-shared/imports-dll.txt
+          if-no-files-found: warn
+          retention-days: 7

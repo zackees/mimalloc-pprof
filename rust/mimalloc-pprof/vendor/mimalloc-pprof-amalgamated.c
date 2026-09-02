@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit cc6cc2a3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 892e15cb of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4094,6 +4094,25 @@ _mcgen_PASTE2(McTemplateU0xx_, MCGEN_EVENTWRITETRANSFER)(
 
 #define mi_decl_cache_align     mi_decl_align(64)
 
+// Should thread-locals that sit on an allocation path use dynamic Win32 TLS keys
+// (`_mi_prim_tls_key_*`) instead of `mi_decl_thread`?
+//
+// Yes for every Windows compiler that is not MSVC. Many mingw-w64 GCCs -- notably the
+// conda-forge cross compilers, and any toolchain configured `--disable-tls` -- have no
+// native TLS, so `__thread` becomes GCC's *emulated* TLS and `__declspec(thread)` is
+// silently ignored (it only warns). `__emutls_get_address` allocates its per-thread table
+// with `malloc`, so with `mimalloc-redirect.dll` active a thread-local read from the
+// allocator re-enters the allocator, forever. Win32 TLS keys never allocate.
+// llvm-mingw is included deliberately: the hazard is the toolchain's TLS lowering, not
+// the compiler brand, and one rule beats two that can disagree. See mimalloc-pprof #277.
+#if !defined(MI_WIN_TLS_SLOTS)
+#if defined(_WIN32) && !defined(_MSC_VER)
+#define MI_WIN_TLS_SLOTS  1
+#else
+#define MI_WIN_TLS_SLOTS  0
+#endif
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable:4127)   // suppress constant conditional warning (due to MI_SECURE paths)
 #pragma warning(disable:26812)  // unscoped enum warning
@@ -4208,6 +4227,7 @@ void          _mi_verbose_message(const char* fmt, ...);
 void          _mi_trace_message(const char* fmt, ...);
 void          _mi_options_init(void);
 void          _mi_options_post_init(void);
+void          _mi_options_done(void);
 long          _mi_option_get_fast(mi_option_t option);
 void          _mi_error_message(int err, const char* fmt, ...);
 
@@ -12084,6 +12104,34 @@ bool _mi_prim_thread_is_in_threadpool(void);
 // Is called only in rare situations and does not have to be lightning fast.
 void _mi_prim_thread_yield(void);
 
+
+#if MI_WIN_TLS_SLOTS
+/* ----------------------------------------------------------------------------------
+  Dynamic Win32 TLS keys (mimalloc-pprof #277).
+
+  A `mi_prim_tls_key_t` holds a `TlsAlloc` index biased by one, so that a zeroed
+  (statically initialised) key means "not allocated yet" without needing a constructor.
+  `_mi_prim_tls_key_alloc` allocates on first use under a CAS and is safe to call
+  concurrently; it returns 0 -- and the caller must then *fail closed* -- only when the
+  process has exhausted its TLS indices.
+
+  None of these allocate, which is the whole point: they replace `mi_decl_thread` on
+  paths reachable from `mi_malloc`, where a toolchain that lowers `__thread` to GCC's
+  emulated TLS would otherwise call `malloc` to materialise the variable.
+---------------------------------------------------------------------------------- */
+typedef _Atomic(size_t) mi_prim_tls_key_t;   // 0 == unallocated, otherwise a TLS index + 1
+
+// Return the (biased) key, allocating it on first use. Returns 0 if none is available.
+size_t _mi_prim_tls_key_alloc(mi_prim_tls_key_t* key);
+
+// Read/write this thread's value for a biased key. The caller's last error is preserved.
+void*  _mi_prim_tls_key_get(size_t key);
+bool   _mi_prim_tls_key_set(size_t key, void* value);
+
+// Release a key (process teardown). Safe on an unallocated key.
+void   _mi_prim_tls_key_free(mi_prim_tls_key_t* key);
+#endif
+
 #endif  // MI_PRIM_H
 /* ---- end inlined: include/mimalloc/prim.h ---- */
 
@@ -15253,6 +15301,7 @@ static void mi_process_done_once(void) {
   }
 
   _mi_tls_slots_done();
+  _mi_options_done();       // releases the Win32 TLS key behind the output recursion guard
   _mi_subproc_main_done();
   _mi_allocator_done();
   _mi_verbose_message("process done\n"); // : 0x%zx\n", mi_process_tld_main.thread_id);
@@ -17536,6 +17585,37 @@ static _Atomic(size_t) warning_count; // = 0;  // when >= max_warning_count stop
 // variables on demand. This is why we use a _mi_preloading test on such
 // platforms. However, C code generator may move the initial thread local address
 // load before the `if` and we therefore split it out in a separate function.
+//
+// mimalloc-pprof #277: on Windows with a non-MSVC compiler this guard must not be a
+// `mi_decl_thread` either, and for a sharper version of the same reason. `__thread` may
+// be GCC's emulated TLS there, and `__emutls_get_address` allocates with `malloc` --
+// which, with `mimalloc-redirect.dll` active, is `mi_malloc`. This guard sits directly on
+// `mi_malloc`'s own verbose-output path (`_mi_verbose_message` -> `_mi_fputs` -> here),
+// so touching it there recurses until the stack is gone. Win32 TLS keys never allocate.
+#if MI_WIN_TLS_SLOTS
+static mi_prim_tls_key_t mi_recurse_key;   // 0 == not allocated yet
+
+// Note this FAILS CLOSED: if the process has exhausted its TLS indices,
+// `_mi_prim_tls_key_alloc` returns 0 and we report "already inside", so the message is
+// dropped rather than risking unbounded recursion. Silence is the safe answer here.
+static mi_decl_noinline bool mi_recurse_enter_prim(void) {
+  const size_t key = _mi_prim_tls_key_alloc(&mi_recurse_key);
+  if (key == 0) return false;
+  if (_mi_prim_tls_key_get(key) != NULL) return false;   // already inside on this thread
+  _mi_prim_tls_key_set(key, (void*)1);
+  return true;
+}
+
+static mi_decl_noinline void mi_recurse_exit_prim(void) {
+  _mi_prim_tls_key_set(mi_atomic_load_relaxed(&mi_recurse_key), NULL);
+}
+
+// Called once from `mi_process_done_once` (init.c).
+void _mi_options_done(void) {
+  _mi_prim_tls_key_free(&mi_recurse_key);
+}
+
+#else
 static mi_decl_thread bool recurse = false;
 
 static mi_decl_noinline bool mi_recurse_enter_prim(void) {
@@ -17547,6 +17627,11 @@ static mi_decl_noinline bool mi_recurse_enter_prim(void) {
 static mi_decl_noinline void mi_recurse_exit_prim(void) {
   recurse = false;
 }
+
+void _mi_options_done(void) {
+  // nothing to release
+}
+#endif
 
 static bool mi_recurse_enter(void) {
   #if defined(__APPLE__) || defined(__ANDROID__) || defined(MI_TLS_RECURSE_GUARD)
@@ -24774,6 +24859,20 @@ static mi_thread_locals_t mi_thread_locals_empty = mi_init_struct_zero;
   static inline bool name##_set(tp val)   { return mi_pthread_key_set(&__##name##_key,val); } \
   static inline void name##_delete(void)  { mi_pthread_key_delete(&__##name##_key); }
 
+#elif MI_WIN_TLS_SLOTS
+// Windows, non-MSVC: dynamic Win32 TLS keys instead of `__thread`. This toolchain may
+// lower `__thread` to GCC's *emulated* TLS, whose `__emutls_get_address` allocates with
+// `malloc` -- which is `mi_malloc` once `mimalloc-redirect.dll` is live, so a
+// thread-local read from the allocator would re-enter the allocator forever
+// (mimalloc-pprof #277). See `MI_WIN_TLS_SLOTS` in `mimalloc/internal.h` and
+// `_mi_prim_tls_key_*` in `mimalloc/prim.h`; none of them allocate.
+#define mi_define_thread_local(tp,name,initval) \
+  static mi_prim_tls_key_t __##name##_key;  /* 0 == not allocated yet */ \
+  static inline tp   name##_peek(void)    { return (tp)_mi_prim_tls_key_get(mi_atomic_load_relaxed(&__##name##_key)); } \
+  static inline tp   name##_get(void)     { tp result = name##_peek(); return (result!=NULL ? result : initval); } \
+  static inline bool name##_set(tp val)   { return _mi_prim_tls_key_set(_mi_prim_tls_key_alloc(&__##name##_key), (void*)val); } \
+  static inline void name##_delete(void)  { _mi_prim_tls_key_free(&__##name##_key); }
+
 #else
 // Direct thread locals
 #define mi_define_thread_local(tp,name,initval) \
@@ -25852,6 +25951,56 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
 //----------------------------------------------------------------
 // Thread pool?
 //----------------------------------------------------------------
+
+/* ----------------------------------------------------------------------------------
+  Dynamic Win32 TLS keys -- see `include/mimalloc/prim.h` (mimalloc-pprof #277).
+  `TlsAlloc` takes an index from a bitmap in the PEB; none of this touches the C heap,
+  which is exactly why these exist. `TlsGetValue`/`TlsSetValue` reset the calling
+  thread's last error on success, and an allocator must not do that to its caller, so it
+  is saved and restored around them.
+---------------------------------------------------------------------------------- */
+#if MI_WIN_TLS_SLOTS
+size_t _mi_prim_tls_key_alloc(mi_prim_tls_key_t* key) {
+  size_t biased = mi_atomic_load_acquire(key);
+  if mi_unlikely(biased == 0) {
+    const DWORD index = TlsAlloc();
+    if (index == TLS_OUT_OF_INDEXES) {
+      return mi_atomic_load_acquire(key);   // another thread may have installed one meanwhile
+    }
+    size_t expected = 0;
+    if (mi_atomic_cas_strong_acq_rel(key, &expected, (size_t)index + 1)) {
+      biased = (size_t)index + 1;
+    }
+    else {
+      TlsFree(index);                       // lost the race; keep the winner's key
+      biased = expected;
+    }
+  }
+  return biased;
+}
+
+void* _mi_prim_tls_key_get(size_t key) {
+  if (key == 0) return NULL;
+  const DWORD err = GetLastError();
+  void* const value = TlsGetValue((DWORD)(key - 1));
+  SetLastError(err);
+  return value;
+}
+
+bool _mi_prim_tls_key_set(size_t key, void* value) {
+  if (key == 0) return false;
+  const DWORD err = GetLastError();
+  const BOOL ok = TlsSetValue((DWORD)(key - 1), value);
+  SetLastError(err);
+  return (ok != 0);
+}
+
+void _mi_prim_tls_key_free(mi_prim_tls_key_t* key) {
+  const size_t biased = mi_atomic_exchange_acq_rel(key, (size_t)0);
+  if (biased != 0) { TlsFree((DWORD)(biased - 1)); }
+}
+#endif
+
 
 bool _mi_prim_thread_is_in_threadpool(void) {
 #if (MI_ARCH_X64 || MI_ARCH_X86 || MI_ARCH_ARM64)

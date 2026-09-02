@@ -477,6 +477,37 @@ static _Atomic(size_t) warning_count; // = 0;  // when >= max_warning_count stop
 // variables on demand. This is why we use a _mi_preloading test on such
 // platforms. However, C code generator may move the initial thread local address
 // load before the `if` and we therefore split it out in a separate function.
+//
+// mimalloc-pprof #277: on Windows with a non-MSVC compiler this guard must not be a
+// `mi_decl_thread` either, and for a sharper version of the same reason. `__thread` may
+// be GCC's emulated TLS there, and `__emutls_get_address` allocates with `malloc` --
+// which, with `mimalloc-redirect.dll` active, is `mi_malloc`. This guard sits directly on
+// `mi_malloc`'s own verbose-output path (`_mi_verbose_message` -> `_mi_fputs` -> here),
+// so touching it there recurses until the stack is gone. Win32 TLS keys never allocate.
+#if MI_WIN_TLS_SLOTS
+static mi_prim_tls_key_t mi_recurse_key;   // 0 == not allocated yet
+
+// Note this FAILS CLOSED: if the process has exhausted its TLS indices,
+// `_mi_prim_tls_key_alloc` returns 0 and we report "already inside", so the message is
+// dropped rather than risking unbounded recursion. Silence is the safe answer here.
+static mi_decl_noinline bool mi_recurse_enter_prim(void) {
+  const size_t key = _mi_prim_tls_key_alloc(&mi_recurse_key);
+  if (key == 0) return false;
+  if (_mi_prim_tls_key_get(key) != NULL) return false;   // already inside on this thread
+  _mi_prim_tls_key_set(key, (void*)1);
+  return true;
+}
+
+static mi_decl_noinline void mi_recurse_exit_prim(void) {
+  _mi_prim_tls_key_set(mi_atomic_load_relaxed(&mi_recurse_key), NULL);
+}
+
+// Called once from `mi_process_done_once` (init.c).
+void _mi_options_done(void) {
+  _mi_prim_tls_key_free(&mi_recurse_key);
+}
+
+#else
 static mi_decl_thread bool recurse = false;
 
 static mi_decl_noinline bool mi_recurse_enter_prim(void) {
@@ -488,6 +519,11 @@ static mi_decl_noinline bool mi_recurse_enter_prim(void) {
 static mi_decl_noinline void mi_recurse_exit_prim(void) {
   recurse = false;
 }
+
+void _mi_options_done(void) {
+  // nothing to release
+}
+#endif
 
 static bool mi_recurse_enter(void) {
   #if defined(__APPLE__) || defined(__ANDROID__) || defined(MI_TLS_RECURSE_GUARD)

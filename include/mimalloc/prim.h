@@ -133,4 +133,32 @@ bool _mi_prim_thread_is_in_threadpool(void);
 // Is called only in rare situations and does not have to be lightning fast.
 void _mi_prim_thread_yield(void);
 
+
+#if MI_WIN_TLS_SLOTS
+/* ----------------------------------------------------------------------------------
+  Dynamic Win32 TLS keys (mimalloc-pprof #277).
+
+  A `mi_prim_tls_key_t` holds a `TlsAlloc` index biased by one, so that a zeroed
+  (statically initialised) key means "not allocated yet" without needing a constructor.
+  `_mi_prim_tls_key_alloc` allocates on first use under a CAS and is safe to call
+  concurrently; it returns 0 -- and the caller must then *fail closed* -- only when the
+  process has exhausted its TLS indices.
+
+  None of these allocate, which is the whole point: they replace `mi_decl_thread` on
+  paths reachable from `mi_malloc`, where a toolchain that lowers `__thread` to GCC's
+  emulated TLS would otherwise call `malloc` to materialise the variable.
+---------------------------------------------------------------------------------- */
+typedef _Atomic(size_t) mi_prim_tls_key_t;   // 0 == unallocated, otherwise a TLS index + 1
+
+// Return the (biased) key, allocating it on first use. Returns 0 if none is available.
+size_t _mi_prim_tls_key_alloc(mi_prim_tls_key_t* key);
+
+// Read/write this thread's value for a biased key. The caller's last error is preserved.
+void*  _mi_prim_tls_key_get(size_t key);
+bool   _mi_prim_tls_key_set(size_t key, void* value);
+
+// Release a key (process teardown). Safe on an unallocated key.
+void   _mi_prim_tls_key_free(mi_prim_tls_key_t* key);
+#endif
+
 #endif  // MI_PRIM_H

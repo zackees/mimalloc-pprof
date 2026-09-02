@@ -27,13 +27,14 @@ name: windows-bundles
 #   * mingw put the wrong thing first in TWO import tables -- `mimalloc.dll` last in
 #     `mimalloc-test-stress-dynamic.exe`, and `mimalloc-redirect.dll` after the CRT
 #     api-sets in `mimalloc.dll` itself -- so the redirection module was initialised after
-#     the runtime it patches and the override silently did nothing. Both are a
-#     path-spelling property of the link line, not a CRT property; see CMakeLists.txt.
+#     the runtime it patches and refused to do anything. Both are a path-spelling property
+#     of the link line, not a CRT property; see CMakeLists.txt (MI_MINGW_REDIRECT_FIRST).
 # `run-windows-gnu` asserts the import order on the BUNDLE'S OWN binaries
-# (`ci/pe_imports.py`) as a hard failure. Whether the bundle actually redirects is
-# measured and reported but NOT yet gated: no cross-built configuration has been found
-# that does, and the one that came closest segfaults -- see the TODO on that step and
-# #277. The msvcrt binary MSYS2 builds in this job does redirect and is gated.
+# (`ci/pe_imports.py`) as a hard failure, and gates the override itself on a BEHAVIOURAL
+# probe (`mimalloc-test-redirect-probe`: a CRT `malloc` pointer must land in a mimalloc
+# region) across all three bundles. Both halves of #277 -- the import order and the
+# emulated-TLS recursion it exposed -- are fixed; the bundle redirects.
+# The msvcrt row MSYS2 builds is printed but is NOT a control: see the step that says so.
 #
 # While this is being compared against the jobs it replaces, those jobs are
 # `continue-on-error: true`. They are the control arm, not decoration -- see the dated
@@ -187,6 +188,24 @@ jobs:
           # The Windows override goes through the redirection DLL, not through symbol
           # interposition; a mimalloc.dll that lost this import overrides nothing.
           grep -qi 'DLL Name: mimalloc-redirect.dll' private.txt
+          # #277, both halves of the override, asserted on the artifact rather than on the
+          # flags that produced it:
+          #  * the redirection module must be the FIRST import descriptor, or the loader
+          #    initialises `ucrtbase` first and the module refuses to patch it;
+          #  * `mimalloc.dll` must not import `__emutls_get_address`. This toolchain's
+          #    GCC has no native TLS, so a `__thread` on the allocation path becomes
+          #    emulated TLS, and libgcc allocates it with `malloc` -- which, once the
+          #    override is live, is mi_malloc: unbounded recursion, dead before `main`.
+          first_dll=$(grep -i 'DLL Name:' private.txt | head -1 | sed 's/.*DLL Name: *//' | tr -d '\r')
+          if [ "$first_dll" != "mimalloc-redirect.dll" ]; then
+            echo "::error::$lib imports '$first_dll' first, expected mimalloc-redirect.dll"
+            exit 1
+          fi
+          if grep -q '__emutls_get_address' private.txt; then
+            echo "::error::$lib imports __emutls_get_address: a thread-local on the allocation path will recurse through the redirected malloc (#277)"
+            grep -n '__emutls' private.txt
+            exit 1
+          fi
           {
             echo '```'
             grep -E '^Entry 9' private.txt
@@ -353,61 +372,67 @@ jobs:
               echo "::error::$exe imports '$first' first, expected '$dll'"
               exit 1
             fi
-            # The DLL's own table is RECORDED, not asserted. Forcing
-            # `mimalloc-redirect.dll` ahead of the CRT api-sets here was tried and
-            # segfaults the process before it prints anything (run 33614876511) -- the
-            # redirection module then patches `ucrtbase` before `ucrtbase` has
-            # initialised. Upstream's supported MSVC layout has the api-sets first too.
+            # The DLL's own table is the half that decides whether the override engages
+            # at all, and it is asserted in the Linux build job that produced this bundle
+            # (mimalloc-redirect.dll first, and no __emutls_get_address import). Recorded
+            # again here so a bundle can be diagnosed from its own artifact.
             uv run ci/pe_imports.py "$bundle/$dll" | tee "$bundle/imports-dll.txt"
             echo "::endgroup::"
           done
 
-      - name: Windows override probe -- does the bundle redirect malloc?
-        # `test-stress-dynamic` asserts nothing about redirection: it links `mi_version()`
-        # so the DLL loads and then allocates through the CRT. `MIMALLOC_VERBOSE=1` makes
-        # src/init.c:530 print "malloc is redirected." exactly when `_mi_is_redirected()`
-        # is true, which is the only direct evidence that the redirection module patched
-        # the runtime -- so without this step the bundle could pass while overriding
-        # nothing.
+      - name: Windows override gate -- the bundle's own malloc must reach mimalloc
+        # BEHAVIOURAL, deliberately. `mi_is_redirected()` -- what "mimalloc: malloc is
+        # redirected." reports -- only says the redirection module believed it patched
+        # something, and that flag lies: the MSYS2 msvcrt binary further down prints it
+        # while its `msvcrt.dll!malloc` was never touched (the module v1.3.3 knows only
+        # `ucrtbase`/`ucrtbased`; it had patched a `ucrtbase.dll` some system DLL dragged
+        # into the process). So gate on `mimalloc-test-redirect-probe`, which takes a
+        # pointer from the CRT's own `malloc` and asks `mi_is_in_heap_region`. Only a real
+        # override makes that 1.
         #
-        # TODO(#277 phase C, added 2026-09-02): make this a HARD failure. It is not one
-        # today because no cross-built configuration has been found that redirects, and a
-        # permanently-red gate is worse than an absent one (docs/ci-gates.md). What was
-        # measured, in order:
-        #   * mimalloc.dll last in the exe's import table -> NOT-REDIRECTED (run …889444)
-        #   * `minject` (both postfixes, with and without --inplace) -> image will not
-        #     start, rc 127 (run …497360)
-        #   * MI_MINGW_UCRT64=OFF, same toolchain -> NOT-REDIRECTED (run …909837)
-        #   * mimalloc.dll FIRST in the exe (the CMakeLists fix) -> still NOT-REDIRECTED,
-        #     everything else green (run …889444)
-        #   * mimalloc-redirect.dll also first inside mimalloc.dll -> SEGFAULT before any
-        #     output (run …876511); reverted
-        # The msvcrt binary MSYS2 builds in this same job redirects, and IS gated below.
-        # Escalated on #277: this needs a Windows debugger, not another CI round.
+        # A HARD failure, on all three bundles (#277). What used to make it impossible:
+        #   1. `mimalloc-redirect.dll` refuses to patch a CRT whose DllMain has already
+        #      run -- it reads `ucrtbase.dll`'s LDR_DATA_TABLE_ENTRY.Flags and checks
+        #      LDRP_PROCESS_ATTACH_CALLED (0x00080000), then reports
+        #      "seems to be initialized after ucrtbase.dll" and gives up. The loader
+        #      initialises a module's dependencies in that module's own import order, so
+        #      `mimalloc.dll` must import the redirect module before `api-ms-win-crt-*`
+        #      (CMakeLists.txt, MI_MINGW_REDIRECT_FIRST) -- the exe importing
+        #      `mimalloc.dll` first is necessary but not sufficient.
+        #   2. With that fixed, the process died before `main`: soldr's mingw-w64 GCC has
+        #      no native TLS, so mimalloc's `__thread` variables became GCC *emulated*
+        #      TLS, and `__emutls_get_address` allocates with `malloc` -- which is now
+        #      mi_malloc. Fixed in src/threadlocal.c and src/options.c; asserted in the
+        #      build job (mimalloc.dll must not import `__emutls_get_address`).
+        # The module's own explanation only ever reaches the log through the `const char**`
+        # that `mi_allocator_init` returns (it imports no output API at all), which
+        # src/init.c prints AFTER the option dump -- so on failure print all of it.
         run: |
           set -uo pipefail
-          probe() {
-            local label="$1" bundle="$2" out="$3" rc=0
-            local exe="$bundle/mimalloc-test-stress-dynamic.exe"
-            # 4 threads / scale 10 / 1 iteration: a redirection probe, not the stress test
-            # (the bundle runs that in full below).
-            MIMALLOC_VERBOSE=1 PATH="$PWD/$bundle:$PATH" "$exe" 4 10 1 > "$out.raw" 2>&1 || rc=$?
-            if [ "$rc" -ne 0 ]; then
-              # 127 from this shell means the image did not start at all.
-              echo "FAILED(rc=$rc)" > "$out"
-            elif grep -q 'malloc is redirected' "$out.raw"; then
-              echo "REDIRECTED" > "$out"
-            else
-              echo "NOT-REDIRECTED" > "$out"
+          failed=0
+          gate() {
+            local label="$1" bundle="$2" rc=0
+            local probe="$bundle/mimalloc-test-redirect-probe.exe"
+            if [ ! -f "$probe" ]; then
+              echo "::error::$probe is missing from the bundle"
+              failed=1; return
             fi
-            echo "$label: $(cat "$out")"
-            if [ "$(cat "$out")" != "REDIRECTED" ]; then
-              echo "::warning::$exe did not redirect malloc ($(cat "$out")) -- known, tracked on #277 phase C"
-              head -30 "$out.raw" || true
+            PATH="$PWD/$bundle:$PATH" "$probe" > "$bundle/redirect-probe.txt" 2>&1 || rc=$?
+            echo "$label:"
+            sed 's/^/  /' "$bundle/redirect-probe.txt"
+            if [ "$rc" -ne 0 ] || ! grep -q '^REDIRECT_BEHAVIOURAL=1$' "$bundle/redirect-probe.txt"; then
+              echo "::error::$probe did not prove the override (rc=$rc)"
+              # test-stress-dynamic under MIMALLOC_VERBOSE is what carries the redirection
+              # module's own explanation; print it whole, options and all.
+              MIMALLOC_VERBOSE=1 PATH="$PWD/$bundle:$PATH" \
+                "$bundle/mimalloc-test-stress-dynamic.exe" 4 10 1 2>&1 | grep -v "^option '" || true
+              failed=1
             fi
           }
-          probe "UCRT release bundle" bundle/windows-gnu-x64-release ucrt-release.txt
-          probe "UCRT shared bundle " bundle/windows-gnu-x64-shared ucrt-shared.txt
+          gate "UCRT release bundle   " bundle/windows-gnu-x64-release
+          gate "UCRT shared bundle    " bundle/windows-gnu-x64-shared
+          gate "UCRT debug-full bundle" bundle/windows-gnu-x64-debug-full
+          exit $failed
 
       - name: ctest-win-gnu equivalent -- windows-gnu-x64-release
         run: |
@@ -600,6 +625,18 @@ jobs:
           MIMALLOC_VERBOSE=1 ./native-release/mimalloc-test-stress-dynamic.exe 4 10 1 > msvcrt.raw 2>&1
           rc=$?
           set -e
+          # The msvcrt row is NOT a like-for-like control, and #277 records why: this
+          # binary's malloc comes from `msvcrt.dll`, and `mimalloc-redirect.dll` v1.3.3
+          # contains no reference to `msvcrt` at all -- its only CRT module names are
+          # `ucrtbase` and `ucrtbased`. It reports "redirected" because `ucrtbase.dll` is
+          # in the process (pulled in by system DLLs) and gets patched, not because this
+          # exe's allocations moved. Printed, not trusted.
+          echo "::group::msvcrt native, full output"
+          grep -v "^option '" msvcrt.raw || true
+          echo "::endgroup::"
+          echo "::group::msvcrt native: the DLL's own import table"
+          objdump -p native-release/mimalloc.dll | grep -i 'DLL Name' || true
+          echo "::endgroup::"
           if [ "$rc" -ne 0 ]; then
             echo "FAILED(rc=$rc)" > msvcrt.txt
           elif grep -q 'malloc is redirected' msvcrt.raw; then
@@ -607,7 +644,12 @@ jobs:
           else
             echo "NOT-REDIRECTED" > msvcrt.txt
           fi
-          echo "msvcrt (MSYS2 MINGW64, no minject): $(cat msvcrt.txt)"
+          echo "msvcrt (MSYS2 MINGW64): flag says $(cat msvcrt.txt)"
+          # ...and what the same binary does, which is the point. This row is expected to
+          # show the flag and the behaviour disagreeing: the probe's `malloc` comes from
+          # `msvcrt.dll`, which the redirection module cannot patch.
+          ./native-release/mimalloc-test-redirect-probe.exe > msvcrt-probe.txt 2>&1 || true
+          sed 's/^/  /' msvcrt-probe.txt
       - name: Coverage -- the bundles must run every test the native runner would
         if: ${{ !cancelled() }}
         run: |
@@ -616,27 +658,35 @@ jobs:
             --compare "ctest-debug-full-win-gnu" native-debug-full.json bundle/windows-gnu-x64-debug-full/tests.json \
             --compare "ctest-shared-win-gnu" native-shared.json bundle/windows-gnu-x64-shared/tests.json \
             --summary "$GITHUB_STEP_SUMMARY"
-      - name: The Windows override must not regress against the msvcrt lane
-        # The gate is comparative on purpose. `ctest-win-gnu` is what this lane replaces,
-        # and it runs test-stress-dynamic with no minject on a msvcrt runtime; requiring
-        # the UCRT bundle to do something the job it replaces never did would be a new
-        # gate smuggled in under the word "parity". So: if msvcrt redirects, UCRT must
-        # too (with or without minject). Anything else is recorded, loudly, and passes.
+      - name: Summary -- the flag, the behaviour, and why they differ
+        # `ctest-win-gnu` (what this lane replaces) only ever looked at
+        # `mi_is_redirected()`. That flag is kept here as a regression detector on the
+        # native row, but it is NOT the gate and it is not a control: on the msvcrt binary
+        # it reports success while the binary's own allocations never reach mimalloc.
+        # `mimalloc-redirect.dll` v1.3.3 names only `ucrtbase`/`ucrtbased` as CRT targets
+        # and contains no reference to `msvcrt` at all; what it patched in that process is
+        # a `ucrtbase.dll` a system DLL had loaded. The behavioural rows below show it.
+        # The cross-built bundle is gated hard, behaviourally, earlier in this job.
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           read_result() { cat "$1" 2>/dev/null || echo "UNKNOWN"; }
+          behavioural() { grep -h '^REDIRECT_BEHAVIOURAL=' "$1" 2>/dev/null | tail -1 | cut -d= -f2 || echo "?"; }
+          flag()        { grep -h '^REDIRECT_FLAG=' "$1" 2>/dev/null | tail -1 | cut -d= -f2 || echo "?"; }
           msvcrt=$(read_result msvcrt.txt)
-          release=$(read_result ucrt-release.txt)
-          shared=$(read_result ucrt-shared.txt)
           {
-            echo "### test-stress-dynamic: does mimalloc override the CRT?"
+            echo "### Does mimalloc actually override the CRT?"
             echo
-            echo "| lane | result |"
-            echo "|---|---|"
-            echo "| MSYS2 MINGW64 (**msvcrt**), built by this job | $msvcrt |"
-            echo "| soldr mingw-w64 (**UCRT**) release bundle | $release |"
-            echo "| soldr mingw-w64 (**UCRT**) shared bundle | $shared |"
+            echo "\`REDIRECT_BEHAVIOURAL\` is a CRT \`malloc\` pointer landing in a mimalloc region."
+            echo "\`mi_is_redirected()\` is only what the redirection module believed it did."
+            echo
+            echo "| lane | behavioural | \`mi_is_redirected()\` |"
+            echo "|---|---|---|"
+            for b in release shared debug-full; do
+              f="bundle/windows-gnu-x64-$b/redirect-probe.txt"
+              echo "| soldr mingw-w64 (**UCRT**) $b bundle | $(behavioural "$f") | $(flag "$f") |"
+            done
+            echo "| MSYS2 MINGW64 (**msvcrt**), built by this job | $(behavioural msvcrt-probe.txt) | $(flag msvcrt-probe.txt) |"
             echo
             echo "First import of each \`test-stress-dynamic\`:"
             echo
@@ -645,12 +695,10 @@ jobs:
             echo "native (MSYS2): $(head -1 native-imports.txt)"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          # The cross-built bundle is already gated hard, earlier in the job. This is the
-          # native row: it is recorded for the comparison window and gated too, because
-          # while it exists a regression there is still a regression -- but the bundle,
-          # not this, is what the product ships.
+          # Native row, flag only: while this MSYS2 build exists, losing even the flag
+          # there is a regression worth knowing about.
           if [ "$msvcrt" != "REDIRECTED" ]; then
-            echo "::error::the msvcrt win-gnu lane no longer redirects malloc in test-stress-dynamic (got: $msvcrt)"
+            echo "::error::the msvcrt win-gnu lane no longer sets mi_is_redirected() (got: $msvcrt)"
             cat msvcrt.raw || true
             exit 1
           fi
@@ -665,12 +713,12 @@ jobs:
             native-release.json
             native-debug-full.json
             native-shared.json
-            ucrt-release.txt
-            ucrt-release.txt.raw
-            ucrt-shared.txt
-            ucrt-shared.txt.raw
+            bundle/windows-gnu-x64-release/redirect-probe.txt
+            bundle/windows-gnu-x64-shared/redirect-probe.txt
+            bundle/windows-gnu-x64-debug-full/redirect-probe.txt
             msvcrt.txt
             msvcrt.raw
+            msvcrt-probe.txt
             native-imports.txt
             bundle/windows-gnu-x64-release/imports.txt
             bundle/windows-gnu-x64-release/imports-dll.txt

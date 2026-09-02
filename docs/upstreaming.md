@@ -321,30 +321,47 @@ It is what upstream's own "try to link with the mimalloc library earlier on the 
 line" hint asks for, it applies to the native MSYS2 lane too, and it needs no `minject`.
 Upstreamable as-is; it touches one guarded block and no C.
 
-**It is necessary but not sufficient, and the remaining half is unsolved.** With the exe
-importing `mimalloc.dll` first, a cross-built UCRT binary still reports
-`_mi_is_redirected() == false`. Going one level further -- forcing `mimalloc-redirect.dll`
-ahead of the `api-ms-win-crt-*` imports inside `mimalloc.dll`, by the same path-spelling
-trick -- makes the process **segfault before it prints anything**, which is also exactly
-what `minject` produces (minject builds the same layout). So the redirection module cannot
-be initialised before `ucrtbase` here, and upstream's supported MSVC layout does not do
-that either: the MSVC linker sorts descriptors alphabetically, so `api-ms-win-crt-*`
-precedes `mimalloc-redirect.dll` there as well. Whatever makes redirection work on
-MSVC/UCRT and on mingw/msvcrt, but not on mingw/UCRT, is still unidentified; it needs a
-Windows debugger.
+**It is necessary but not sufficient — the other half is inside `mimalloc.dll`.** The
+loader initialises a module's dependencies in *that module's* import-descriptor order, so
+`mimalloc.dll` must import `mimalloc-redirect.dll` before its own `api-ms-win-crt-*`, or
+`ucrtbase.dll`'s DllMain has already run by the time the redirection module gets control.
+It then refuses outright: `LdrGetDllHandle("ucrtbase.dll")` followed by a test of
+`LDR_DATA_TABLE_ENTRY.Flags & 0x00080000` (`LDRP_PROCESS_ATTACH_CALLED`), disassembled at
+`0x180003720` in `bin/mimalloc-redirect.dll` v1.3.3, and it reports
+`mimalloc-redirect.dll seems to be initialized after ucrtbase.dll` through the
+`const char**` that `mi_allocator_init` hands back — the module imports no output API, so
+that message is the only channel it has. MSVC produces the accepted layout by
+construction, because link.exe emits descriptors for explicitly named libraries before the
+`/DEFAULTLIB` ones. **Fix we carry:** `MI_MINGW_REDIRECT_FIRST` (default ON), the same
+`./…` spelling applied to `bin/mimalloc-redirect.lib`.
 
-**Related, and probably the same defect: `minject` produces a non-starting image on a
-mingw-linked exe.** Facts from CI run 33609497360: `minject --verbose --postfix=<p>` reads
-the exe, reports `inject 'mimalloc-redirect.dll'`, prints a correct reordering
+**Second fix, and the one that is genuinely ours: GCC emulated TLS on the allocation
+path.** With the layout above, the process died at load. soldr's conda-forge
+`x86_64-w64-mingw32-gcc 15.3.0` has no native TLS — `__thread int x;` compiles to
+`__emutls_v.x` plus a call to `__emutls_get_address`, and `__declspec(thread)` draws
+"warning: 'thread' attribute directive ignored" and emits an ordinary global.
+`__emutls_get_address` allocates its per-thread table with `malloc`, which with the
+override live is `mi_malloc`, which reads the thread-local again: unbounded recursion, and
+cdb on a Windows runner shows exactly that cycle with one
+`libgcc_s_seh_1!__emutls_get_address` frame per turn. We move the two thread-locals
+reachable from the allocator onto dynamic Win32 TLS keys, which never allocate:
+`src/threadlocal.c` (`mi_thread_locals`, `mi_slot_fast`) and `src/options.c` (the
+output-recursion guard, reached via `mi_malloc` -> arena reservation ->
+`_mi_verbose_message` -> `_mi_fputs`), behind `MI_WIN_TLS_SLOTS` and
+`_mi_prim_tls_key_*` in the prim layer. MSVC is untouched. Upstreamable: it is a real
+defect on any `--disable-tls` mingw-w64, independent of this fork.
+
+**`minject` produces a non-starting image on a mingw-linked exe — same defect, now
+explained.** Facts from CI run 33609497360: `minject --verbose --postfix=<p>` reads the
+exe, reports `inject 'mimalloc-redirect.dll'`, prints a correct reordering
 (`mimalloc-redirect.dll` #0, `mimalloc*.dll` #1, then `KERNEL32.dll` and the
-`api-ms-win-crt-*` set), and writes the file. `minject --list` on the result shows the
-intended 13-entry table. The resulting executable then fails to start: exit **127** from
-the runner's bash, i.e. the loader refused the image (`ERROR_MOD_NOT_FOUND`-shaped), with
-`mimalloc-redirect.dll` present next to it and every other import satisfied. Reproduced
-for both an empty `--postfix=` and `--postfix=debug`, and with and without `--inplace`
-(the in-place form died the same way). Not investigated further — the link-order fix above
-removes the need for minject on this lane. Worth reporting upstream with these facts if
-anyone picks it up.
+`api-ms-win-crt-*` set), writes the file, and `minject --list` on the result shows the
+intended 13-entry table. The image then exits **127**. That is **not** a PE defect:
+minject had built the correct layout, the override engaged, and the process then
+stack-overflowed in the emulated-TLS recursion above, before `main`. Superseded by
+`MI_MINGW_REDIRECT_FIRST`, which achieves the same import order at link time and works on
+a cross build, where minject (a Windows PE utility) cannot run at all. Nothing to report
+upstream about minject.
 
 ## Local reproduction
 

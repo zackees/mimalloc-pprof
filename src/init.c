@@ -663,6 +663,7 @@ static void mi_process_done_once(void) {
   }
 
   _mi_tls_slots_done();
+  _mi_options_done();       // releases the Win32 TLS key behind the output recursion guard
   _mi_subproc_main_done();
   _mi_allocator_done();
   _mi_verbose_message("process done\n"); // : 0x%zx\n", mi_process_tld_main.thread_id);

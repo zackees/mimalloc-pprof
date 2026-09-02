@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit da0658d7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 9f321fff of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -5273,9 +5273,15 @@ static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
 // walk: `test-park-handoff` trips `mi_theap_visit_pages`'s `count == total` (and
 // `mi_page_is_valid_init`'s block-conservation check) that way, ~2/120 runs pinned to 4 CPUs.
 //
-// So take the park back in the allocator's own slow paths as well, which makes the guarantee
-// hold for ANY owner-side allocation or free however it got there. Costs one relaxed load of an
-// already-hot cache line, and only on the generic/slow paths -- never on the fast path.
+// So take the park back in the allocator's own generic/slow paths as well (`mi_page_malloc`'s
+// slow path and `mi_free_generic_local`), which closes the gap for those paths. Costs one
+// relaxed load of an already-hot cache line, and only there -- never on the fast path.
+//
+// Residual: `mi_free_ex`'s thread-local fast path (`src/free.c`, `xtid==0`) calls
+// `mi_free_block_local` directly, and `mi_page_malloc`'s free-list pop, without going through
+// this function -- a parked thread's fast-path free that ends up retiring a page (via
+// `_mi_page_retire`) still races the scavenger's walk on that path. `mi_free_block_local` carries
+// a permanent debug-only assert as a detector for that residual instead (see its definition).
 static inline void _mi_park_leave_if_parked(mi_theap_t* theap) {
   if (theap == NULL) return;
   mi_tld_t* const tld = theap->tld;
@@ -7202,6 +7208,11 @@ static void   mi_stat_free(const mi_page_t* page, const mi_block_t* block);
 static inline void mi_free_block_local(mi_page_t* page, mi_block_t* block, bool was_guarded, bool track_stats, bool check_full)
 {
   MI_UNUSED(was_guarded);
+  // #272 permanent detector: this fast path is reached directly from `mi_free_ex`'s xtid==0
+  // branch, bypassing `_mi_park_leave_if_parked` (see the comment above that function). If the
+  // owner is here while its own theap is mid-sweep (MI_PARK_SWEEPING), this free races the
+  // scavenger's walk. Zero cost in release builds; keep even if it stays quiet for a long time.
+  mi_assert_internal(mi_atomic_load_relaxed(&mi_page_theap(page)->tld->park_state) != MI_PARK_SWEEPING);
   // checks
   if mi_unlikely(mi_check_is_double_free(page, block)) return;
   #if MI_PPROF

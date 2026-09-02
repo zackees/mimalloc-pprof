@@ -18,6 +18,11 @@ on:
       - rust/**
       - .github/workflows/cross.yml
 
+concurrency:
+  # Measured ~4 h / ~5.5 h queue waits on the Apple rows (#277).
+  group: cross-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-linux:
     name: build (${{ matrix.target }})

@@ -23,6 +23,11 @@ on:
     branches: [main, v4]
   pull_request:
 
+concurrency:
+  # Pure verification: a superseded push's answer is worthless.
+  group: amalgamation-drift-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: vendored C amalgamation matches src/

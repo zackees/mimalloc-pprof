@@ -18,6 +18,11 @@ on:
       - 'CMakeLists.txt'
       - '.github/workflows/asan.yml'
 
+concurrency:
+  # Pure verification: a superseded push's answer is worthless.
+  group: asan-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   asan:
     name: address sanitizer

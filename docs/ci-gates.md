@@ -33,6 +33,49 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 | **python-lint** | the gate scripts themselves — `ruff` + `pyright --strict` | — |
 | **zero-tracking** | correctness and footprint of `mi_option_purge_zeroes`, reported as paired interleaved A/B medians with the within-arm spread alongside | — |
 
+## Concurrency: superseded runs are cancelled
+
+Every workflow now carries a `concurrency:` group. A second push to the same ref cancels
+the first push's still-queued jobs instead of letting both compete for a runner. This is
+issue #277 phase 0, and the reason it is worth a paragraph is that the cost it removes is
+not build time:
+
+| workflow | runner | jobs | queue p50 | queue p90 | queue max | exec p50 |
+|---|---|---|---|---|---|---|
+| `c-unit.yml` | `ubuntu-latest` | 160 | 4s | 19s | 1m10s | 45s |
+| `c-unit.yml` | `macos-latest` | 60 | 21s | 2m03s | 3m05s | 48s |
+| `cross.yml` | `macos-latest` | 20 | 9m25s | 1h29m | **5h26m** | 8s |
+| `cross.yml` | `macos-15-intel` | 20 | 9m23s | 2h32m | **6h13m** | 9s |
+
+Those Apple rows *execute* in under fifteen seconds and *wait* for hours. Cancelling a
+superseded push does not make any job faster; it stops a dead push from holding a macOS
+slot that a live one needs.
+
+Not every workflow may be cancelled. Anything that publishes keeps `cancel-in-progress:
+false`, because a half-finished publish is worse than a redundant one:
+
+- `auto-release.yml`, `release.yaml` — upload release assets / `cargo publish`
+- `benchmark-stats.yml`, `benchmark-latency.yml`, `benchmark-memory.yml`,
+  `benchmark-scaling.yml` — push the sealed `benchmark-stats` branch and deploy Pages;
+  these deliberately **share** one group (`benchmark-stats-production`) to serialise
+  against each other, so their group is not per-workflow
+- `star-history.yml` — commits a regenerated chart
+- `stale.yaml` — closes and labels issues; a half-run leaves the repo partly swept
+
+`fuzz.yml` is the one subtle case: it has a `schedule:` trigger, and a scheduled run
+carries `github.ref == refs/heads/main`. Its group therefore includes `github.event_name`,
+so the nightly long run and a `main` push cannot cancel each other.
+
+**Measuring it.** `uv run ci/ci_queue_wait.py --limit 20 c-unit.yml cross.yml
+rust-native.yml` reads the Actions API through `gh` and prints, per `runs-on` label,
+p50/p90/max of `started_at - created_at` (queue wait) and `completed_at - started_at`
+(execution), with the job count. One caveat is baked into the tool's output and repeated
+here: a job with `needs:` is *created* when the run is created, so a `cross.yml`
+`test (*)` row measures "pool wait + upstream build", while `c-unit.yml` and
+`rust-native.yml` have no `needs:` edges and measure pool wait alone. `--jobs-json` replays
+a saved payload, which is how `ci/tests/test_ci_queue_wait.py` checks the arithmetic
+without touching the network.
+
 Three details worth stating, because each was an assumption that measurement overturned:
 
 - **Peak memory is not a low-variance signal.** Repeated runs of the same unchanged

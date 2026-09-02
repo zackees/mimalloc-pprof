@@ -1233,6 +1233,53 @@ if (MI_BUILD_TESTS)
     add_test(NAME test-park-handoff-no-scavenger COMMAND mimalloc-test-park-handoff)
     set_tests_properties(test-park-handoff-no-scavenger PROPERTIES TIMEOUT 600
                          ENVIRONMENT "MIMALLOC_SCAVENGER=0")
+    # ... and with the P7b sweep rate limit removed, so every park is due the moment it is
+    # claimed: `test_park_inside_window_gets_swept` takes its "no window" branch and
+    # `test_parks_get_swept` stops spacing its parks (the file calls this the `-eager` variant).
+    add_test(NAME test-park-handoff-eager COMMAND mimalloc-test-park-handoff)
+    set_tests_properties(test-park-handoff-eager PROPERTIES TIMEOUT 600
+                         ENVIRONMENT "MIMALLOC_PURGE_HOLES_MIN_INTERVAL=0")
+
+    # test-purge-holes: imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 /
+    # Bun parity P7b). The hole engine's own test: survivors stay byte-for-byte intact
+    # across a discard, churn/aligned/lifecycle/abandoned/large-page cases, the unformed
+    # tail, the OS-page arithmetic, the read-only hole report, and the `swept_state` skip
+    # (including its `purge_holes_full_every` bound). It reaches internal headers, so it
+    # links the static library and is built with the library's own defines.
+    add_executable(mimalloc-test-purge-holes test/test-purge-holes.c)
+    target_compile_definitions(mimalloc-test-purge-holes PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-purge-holes PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-purge-holes PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-purge-holes PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-purge-holes PRIVATE mimalloc ${mi_libraries})
+    endif()
+    target_link_libraries(mimalloc-test-purge-holes PRIVATE Threads::Threads)
+    add_test(NAME test-purge-holes COMMAND mimalloc-test-purge-holes)
+    set_tests_properties(test-purge-holes PROPERTIES TIMEOUT 600)
+    # ... and with the feature off: every data-integrity check still runs, and the test
+    # additionally asserts that nothing is ever discarded (the option's off-path).
+    add_test(NAME test-purge-holes-off COMMAND mimalloc-test-purge-holes)
+    set_tests_properties(test-purge-holes-off PROPERTIES TIMEOUT 600
+                         ENVIRONMENT "MIMALLOC_PURGE_HOLES=0")
+
+    # test-purge-zero: imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 /
+    # Bun parity P7b). The purge path may hand a recycled slice back as "reads zero";
+    # this poisons everything, churns until slices are purged and recycled, and verifies
+    # every byte of every recycled mi_zalloc/mi_calloc allocation is zero. (Distinct from
+    # test-zero-tracking, which covers the -- since #80 dead -- `purge_zeroes` option.)
+    add_executable(mimalloc-test-purge-zero test/test-purge-zero.c)
+    target_compile_definitions(mimalloc-test-purge-zero PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-purge-zero PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-purge-zero PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-purge-zero PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-purge-zero PRIVATE mimalloc ${mi_libraries})
+    endif()
+    add_test(NAME test-purge-zero COMMAND mimalloc-test-purge-zero)
+    set_tests_properties(test-purge-zero PROPERTIES TIMEOUT 600)
   endif()
 
   # MI_NO_PROCESS_DETACH (issue #268, Bun parity P3): imported from

@@ -7,15 +7,17 @@ terms of the MIT license. A copy of the license can be found in the file
 
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
 //
-// TWO DELIBERATE ADAPTATIONS for this tree, both marked `Phase 7b` inline:
-//  1. Bun's "did a sweep run?" observable is `mi_purge_holes_stats_get().discard_calls`, which
-//     belongs to hole purging (Phase 7b of #272). Here it is `_mi_test_idle_work_count()`
-//     (src/scavenger.c): the number of completed idle-work passes, which is the same signal for
-//     everything 7a can do and is in fact stricter (it counts passes, not syscalls). 7b adds the
-//     discard-count assertions on top.
-//  2. The two cases about `mi_option_purge_holes_min_interval` sweep pacing
-//     (`test_park_inside_window_gets_swept`, and the spacing inside `test_parks_get_swept`) need
-//     that option and are `#if 0 // Phase 7b` until it exists.
+// ONE DELIBERATE ADAPTATION for this tree (marked inline where it is used):
+//   Bun's "did a sweep run?" observable is `mi_purge_holes_stats_get().discard_calls`. Here it is
+//   `_mi_test_idle_work_count()` (src/scavenger.c): the number of completed idle-work passes.
+//   That is the same signal and a strictly stronger one -- it counts passes rather than
+//   madvise syscalls, so a pass that legitimately finds nothing discardable (a page whose free
+//   runs happen not to cover a whole OS page) still registers, and the pacing cases below stay
+//   deterministic. `min_interval` skips the tld in `_mi_theap_sweep_parked` before any work
+//   runs, so the counter is silent inside the window exactly as `discard_calls` would be.
+//   Phase 7b landed the hole engine, so this file now ALSO asserts, at the end, that the
+//   handoff really did discard hole memory (`mi_purge_holes_stats_get().discard_calls`) --
+//   the part of the contract only 7b can deliver.
 
 // `mi_on_thread_idle_start`/`mi_on_thread_idle_end`: a thread that is about to block hands its
 // theaps to the scavenger, which sweeps them while it is in the kernel.
@@ -99,10 +101,19 @@ static long first_corrupt_survivor(void** p) {
   return -1;
 }
 
-// Phase 7b adaptation (see the file header): Bun reads `mi_purge_holes_stats_get().discard_calls`.
+// see the file header: Bun reads `mi_purge_holes_stats_get().discard_calls` here.
 extern size_t _mi_test_idle_work_count(void);
 static size_t discards(void) {
   return _mi_test_idle_work_count();
+}
+
+// ... and the 7b half of the contract, which `_mi_test_idle_work_count` deliberately does not
+// cover: how much hole memory the idle work actually gave back.
+static size_t hole_discard_calls(void) {
+  mi_purge_holes_stats_t h; mi_purge_holes_stats_get(&h); return h.discard_calls;
+}
+static size_t hole_discarded_bytes(void) {
+  mi_purge_holes_stats_t h; mi_purge_holes_stats_get(&h); return h.purged_bytes_total;
 }
 
 // wait (bounded) for the handoff to have actually done a discard, standing in for a syscall
@@ -394,7 +405,7 @@ static void test_third_thread_frees_during_sweep(void) {
 // ---------------------------------------------------------------------------
 static void test_parks_get_swept(void) {
   enum { ROUNDS = 20 };
-  const long interval_ms = 0;   // Phase 7b: `mi_option_get(mi_option_purge_holes_min_interval)`
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
   void** p = (void**)calloc(LIVE, sizeof(void*));
   if (p == NULL) return;
   int missed = 0;
@@ -424,7 +435,6 @@ static void test_parks_get_swept(void) {
 // this time for long. That second park is passed over when it starts, and must be swept once the
 // window ends rather than at the scavenger's next unrelated wake (up to its 30s safety timeout).
 // ---------------------------------------------------------------------------
-#if 0 // Phase 7b (#272): needs `mi_option_purge_holes_min_interval`
 static void test_park_inside_window_gets_swept(void) {
   const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
   if (interval_ms <= 0) return;   // no window (the `-eager` variant)
@@ -464,10 +474,6 @@ static void test_park_inside_window_gets_swept(void) {
   check("park inside the rate window is swept when the window ends", parked && waited_ms >= 0);
 }
 
-#endif // Phase 7b
-static void test_park_inside_window_gets_swept(void) {
-  fprintf(stderr, "test: park inside the rate window is swept when the window ends...  skipped (Phase 7b)\n");
-}
 
 // ---------------------------------------------------------------------------
 // fork() by a thread that is between _start and _end -- fork does not allocate, so the contract
@@ -598,6 +604,22 @@ int main(void) {
   test_exit_while_swept_with_dyn_tls();
   test_park_stress();
   test_scavenger_stop();
+  // #272 Phase 7b: the second clause of `mi_on_thread_idle`'s contract. Every case above churned
+  // pages with scattered survivors and then parked or idled, which is exactly the shape hole
+  // punching exists for -- so by now the idle path must have discarded real memory, not just
+  // completed passes. With the scavenger off (`MIMALLOC_SCAVENGER=0`) `mi_on_thread_idle`
+  // sweeps inline instead, so this holds in that variant too.
+  {
+    const size_t calls = hole_discard_calls();
+    const size_t bytes = hole_discarded_bytes();
+    fprintf(stderr, "  hole purging over the whole run: %zu discards, %zu bytes\n", calls, bytes);
+    if (mi_option_is_enabled(mi_option_purge_holes)) {
+      check("the idle handoff discarded hole memory (mi_purge_holes_stats_get)", calls > 0 && bytes > 0);
+    }
+    else {
+      check("purge_holes off: the idle handoff discarded nothing", calls == 0 && bytes == 0);
+    }
+  }
   fprintf(stderr, "\n%s\n", failures == 0 ? "all tests passed." : "SOME TESTS FAILED.");
   return failures == 0 ? 0 : 1;
 }

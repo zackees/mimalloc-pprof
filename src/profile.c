@@ -1042,7 +1042,12 @@ void _mi_prof_debug_assert_no_records_in(const mi_page_t* page, const void* addr
   // inside it (mi_prof_visit's callback), where the list is ours to read anyway.
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
   const bool own = (hooks != NULL && hooks->prof_lock_owner);
-  if (!own) { mi_lock_acquire(&prof_lock); }
+  // TRY-acquire, never block: the sweep calls this while holding `tld->theaps_lock`
+  // (`_mi_purge_holes_of`), and `mi_prof_visit` holds `prof_lock` across the user callback --
+  // a callback that deletes a heap then waits on `theaps_lock`. Blocking here would close that
+  // ABBA cycle in debug builds. An assertion that occasionally does not run beats a deadlock;
+  // the sweep visits the same pages again at the next idle point.
+  if (!own && !mi_lock_try_acquire(&prof_lock)) return;
   for (mi_prof_record_t* rec = (mi_prof_record_t*)page->metadata; rec != NULL; rec = rec->next) {
     mi_assert_internal((const uint8_t*)rec->ptr < lo || (const uint8_t*)rec->ptr >= hi);
     mi_assert_internal((const uint8_t*)rec < lo || (const uint8_t*)rec >= hi);

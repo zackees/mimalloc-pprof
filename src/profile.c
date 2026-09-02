@@ -300,7 +300,7 @@ bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept {
   // oven-sh/mimalloc @ 942b8342; this specific window is a consequence of our own
   // implementation choice to walk outside prof_lock, not a claim about Bun's own
   // start-time behavior, which was not inspected in this detail.
-  if (started) { _mi_subproc_prof_set_force_slow(true); }
+  if (started) { _mi_subproc_prof_set_force_slow(); }
   return started;
 }
 bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { return mi_prof_start_seeded(sample_rate, (uint64_t)mi_option_get(mi_option_prof_seed)); }
@@ -459,7 +459,7 @@ void mi_prof_stop(void) mi_attr_noexcept {
   // a page that gets freed moments later -- a use-after-free on that theap's next fast-path
   // malloc. Each theap re-syncs its own `pages_free_direct` itself, same-thread, the next
   // time it takes the generic path (see `mi_find_page`/`_mi_malloc_generic` in page.c).
-  _mi_subproc_prof_set_force_slow(false);
+  _mi_subproc_prof_set_force_slow();
 }
 bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
   if (write == NULL) return false;
@@ -874,6 +874,18 @@ bool mi_prof_dump_proto(const char* path) mi_attr_noexcept {
 static void prof_auto_start(void) {
   /* Some statically linked MinGW programs do not retain the CRT/TLS startup
      callback. Fall back to the first allocation so MIMALLOC_PROF still works. */
+  // #267 follow-up (latent, not fixed here): mi_prof_start (via this function) now
+  // reaches _mi_subproc_prof_set_force_slow (subproc.c), which takes
+  // subproc->heaps_lock and each heap's theaps_lock. This function is reachable from
+  // the alloc path (any mi_malloc can be the first-ever allocation with
+  // MIMALLOC_PROF=1), so a caller's own mi_heap_visit_fun/visitor passed to
+  // mi_subproc_visit_heaps -- which already holds subproc->heaps_lock across the
+  // callback -- would self-deadlock (non-reentrant lock, same thread) if that visitor
+  // allocates for the first time there. Meta allocations are already excluded (see
+  // _mi_prof_on_alloc's meta-page check, which runs before this), so this is narrower
+  // than it once was, but a user visitor's OWN allocation is not excluded. Not fixed
+  // here: doing so needs something like Bun's lazy per-theap enable rather than an
+  // eager cross-process walk; track as a follow-up if a real visitor callback trips it.
   mi_atomic_do_once {
     if (mi_option_is_enabled(mi_option_prof)) { const bool started = mi_prof_start(0); MI_UNUSED(started); }
     (void)_mi_getenv("MIMALLOC_PROF_DUMP_AT_EXIT", prof_dump_at_exit, sizeof(prof_dump_at_exit));

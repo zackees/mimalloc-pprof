@@ -210,20 +210,29 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
   mi_assert_internal(mi_theap_contains_queue(theap,pq));
   const size_t size = pq->block_size;
   if (size > MI_SMALL_SIZE_MAX) return;
-  #if MI_PPROF
-  // #267: while the profiler is forcing this theap onto the slow path, leave
-  // `pages_free_direct` poisoned (pointing at the empty page) instead of re-publishing a
-  // real free page here -- that is what makes every malloc miss the fast list-pop and land
-  // in `_mi_malloc_generic`, where the sampling countdown lives. Cleared by
-  // `_mi_subproc_prof_set_force_slow(false)` (subproc.c) on `mi_prof_stop`; this theap
-  // re-syncs itself the next time it goes through the generic path (see `mi_find_page`/
-  // `_mi_malloc_generic` in page.c) -- never eagerly from another thread, which would race
-  // this theap's own concurrent queue mutations.
-  if (theap->prof_force_slow) return;
-  #endif
 
   mi_page_t* page = pq->first;
   if (pq->first == NULL) page = _mi_page_empty_get();
+  #if MI_PPROF
+  // #267: while the profiler is forcing this theap onto the slow path, substitute the
+  // empty page for the real one here -- same effect as poisoning (every malloc misses the
+  // fast list-pop and lands in `_mi_malloc_generic`, where the sampling countdown lives),
+  // but derived fresh from the CURRENT queue state on every call instead of freezing
+  // `pages_free_direct` at whatever `_mi_theap_pages_free_direct_poison` last wrote.
+  //
+  // This is a correctness fix, not just a cost one: an earlier version of this code
+  // early-returned here instead, skipping the write entirely while `prof_force_slow` was
+  // set. That is unsafe -- when a page is later retired (`_mi_page_free` ->
+  // `mi_page_queue_remove` -> this same function, one of its other callers below) while
+  // poisoned, an early return would leave that page's now-stale pointer sitting in
+  // `pages_free_direct` even after the arena reclaims its memory, a use-after-free on the
+  // next fast-path allocation of that size class. Substituting the empty sentinel instead
+  // keeps every write self-consistent with "currently valid queue page, or empty",
+  // regardless of any race with `_mi_subproc_prof_set_force_slow`'s cross-thread flag/
+  // poison writes (subproc.c) -- this thread always derives the value from its own,
+  // definitely-current `pq->first`, never from a value written by another thread.
+  if mi_unlikely(theap->prof_force_slow) { page = _mi_page_empty_get(); }
+  #endif
 
   // find index in the right direct page array
   const size_t idx = _mi_wsize_from_size(size);

@@ -966,22 +966,50 @@ static void test_meta_pages_never_sampled(void) {
    Exercises the zero-cost-when-off fast path's cross-thread poison/unpoison machinery
    (mi_theap_t::prof_force_slow, `_mi_subproc_prof_set_force_slow` in subproc.c) under
    the exact conditions it is built for: worker threads hammering the small-object fast
-   path (allocate + touch + free, repeatedly) while this thread starts, stops, and
-   restarts the profiler with a different rate underneath them, plus a reset while a
-   page still carries a live sampled block. None of this should crash, deadlock, or
-   leave the fast path (or the profiler) unable to run normally afterward. */
+   path while this thread starts, stops, and restarts the profiler with a different rate
+   underneath them, plus a reset while a page still carries a live sampled block. None of
+   this should crash, deadlock, or leave the fast path (or the profiler) unable to run
+   normally afterward.
+
+   Workers allocate/free in BATCHES across a few size classes, not one block at a time --
+   this is what lets pages actually fill up and then fully retire (`_mi_page_free`)
+   *while* the profiler is starting/stopping around them. A single-block-at-a-time
+   worker keeps at most one live block per page and never drives a page back to empty, so
+   it can never exercise `mi_page_queue_remove` -> `mi_theap_queue_first_update` racing
+   `prof_force_slow` -- which is exactly the path an earlier (reverted) version of
+   `mi_theap_queue_first_update` got wrong: it early-returned while `prof_force_slow` was
+   set instead of substituting the empty page, so a page retired during that window could
+   leave a stale, soon-freed pointer sitting in `pages_free_direct` -- a use-after-free on
+   the next fast-path allocation of that size class. See that function's comment
+   (page-queue.c) for the fix. */
 static volatile bool p267_stop_workers;
+enum { P267_BATCH = 256 };
 static void p267_worker_body(void) {
-  size_t i = 0;
+  static const size_t p267_sizes[3] = { 32, 96, 224 };  /* a few distinct size classes/pages */
+  void* blocks[P267_BATCH];
+  size_t round = 0;
   while (!p267_stop_workers) {
-    void* p = mi_malloc(48 + (i % 5) * 16);
-    assert(p != NULL);
-    *(volatile char*)p = (char)i;
-    mi_free(p);
-    i++;
+    const size_t size = p267_sizes[round % 3];
+    for (size_t i = 0; i < P267_BATCH; i++) {
+      blocks[i] = mi_malloc(size);
+      assert(blocks[i] != NULL);
+      *(volatile char*)blocks[i] = (char)i;
+    }
+    /* Free the whole batch back-to-front so pages actually empty out and retire, rather
+       than shedding one block at a time interleaved with allocation. */
+    for (size_t i = P267_BATCH; i > 0; i--) { mi_free(blocks[i-1]); }
+    round++;
   }
 }
 enum { P267_WORKERS = 6 };
+/* Burn wall-clock time without allocating, so a "workers only, main thread idle" window
+   can be observed -- any sample growth during it is unambiguously worker-driven, not the
+   main thread's own canary allocations. */
+static void p267_spin(void) {
+  volatile size_t sink = 0;
+  for (size_t i = 0; i < 20000000; i++) { sink += i; }
+  (void)sink;
+}
 #ifdef _WIN32
 static DWORD WINAPI p267_worker(LPVOID arg) { (void)arg; p267_worker_body(); return 0; }
 static void p267_spawn(HANDLE* threads) {
@@ -1007,14 +1035,34 @@ static void test_start_while_allocating_stop_mid_sample_restart_reset(void) {
 #else
   pthread_t threads[P267_WORKERS];
 #endif
+  /* accum mode lets sample counts monotonically grow across the racing windows below so
+     "did worker allocations get sampled while running" can be asserted directly; restore
+     whatever the option was on entry since it is a sticky, process-wide mi_option_t, not
+     per-profiler-session state. */
+  const bool accum_was_enabled = mi_option_is_enabled(mi_option_prof_accum);
+  mi_prof_config_t_decl(cfg1);
+  cfg1.accum = true;
+  cfg1.sample_interval = 128;
 
   /* 1) start while several threads are already mid-allocation loop -- races the
         cross-theap poison walk (_mi_subproc_prof_set_force_slow) against each worker's
-        own theap-creation/queue-update activity. */
+        own theap-creation/queue-update activity, AND races the page-retirement path
+        against `prof_force_slow` (see the worker-body comment above). */
   p267_stop_workers = false;
   p267_spawn(threads);
   for (int i = 0; i < 200; i++) { void* p = mi_malloc(64); assert(p != NULL); mi_free(p); }   /* let them get going */
-  assert(mi_prof_start_seeded(128, 267001));
+  assert(mi_prof_start_ex(&cfg1));                                                            /* races the poison start */
+
+  mi_prof_stats_t_decl(before_workers_only);
+  assert(mi_prof_stats_get(&before_workers_only));
+  p267_spin();   /* worker-only window: main thread allocates nothing here */
+  mi_prof_stats_t_decl(after_workers_only);
+  assert(mi_prof_stats_get(&after_workers_only));
+  /* The real assertion: worker-thread allocations are sampled while the profiler runs,
+     not just this function's own canary allocations (which happen only outside this
+     window). */
+  assert(after_workers_only.accum_samples > before_workers_only.accum_samples + 5);
+
   for (int i = 0; i < 4000; i++) { void* p = mi_malloc(64); assert(p != NULL); mi_free(p); }   /* race the poison from both sides */
 
   /* 2) stop mid-sample: workers are still allocating/freeing right now. */
@@ -1031,14 +1079,26 @@ static void test_start_while_allocating_stop_mid_sample_restart_reset(void) {
 
   /* 3) restart with a DIFFERENT rate while workers race the second start too --
         exercises prof_generation invalidating each theap's stale sampling counters,
-        not just prof_force_slow re-poisoning pages_free_direct. */
+        not just prof_force_slow re-poisoning pages_free_direct. Also re-checks the
+        worker-only sample-growth property at a different rate. */
   p267_stop_workers = false;
   p267_spawn(threads);
   for (int i = 0; i < 200; i++) { void* p = mi_malloc(64); assert(p != NULL); mi_free(p); }
-  assert(mi_prof_start_seeded(8192, 267002));   /* much coarser than step 1's 128 */
+  mi_prof_config_t_decl(cfg2);
+  cfg2.accum = true;
+  cfg2.sample_interval = 8192;   /* much coarser than step 1's 128 */
+  assert(mi_prof_start_ex(&cfg2));
   mi_prof_stats_t_decl(started2);
   assert(mi_prof_stats_get(&started2));
   assert(started2.sample_rate == 8192);
+
+  mi_prof_stats_t_decl(before_workers_only2);
+  assert(mi_prof_stats_get(&before_workers_only2));
+  p267_spin();
+  mi_prof_stats_t_decl(after_workers_only2);
+  assert(mi_prof_stats_get(&after_workers_only2));
+  assert(after_workers_only2.accum_samples > before_workers_only2.accum_samples);
+
   for (int i = 0; i < 4000; i++) { void* p = mi_malloc(64); assert(p != NULL); mi_free(p); }
   p267_stop_workers = true;
   p267_join(threads);
@@ -1066,6 +1126,8 @@ static void test_start_while_allocating_stop_mid_sample_restart_reset(void) {
   void* p = mi_malloc(64); assert(p != NULL); mi_free(p);
   mi_prof_stop();
   for (int i = 0; i < 4000; i++) { void* q = mi_malloc(64); assert(q != NULL); mi_free(q); }
+
+  mi_option_set_enabled(mi_option_prof_accum, accum_was_enabled);
 }
 
 int main(void) {

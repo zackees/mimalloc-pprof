@@ -923,7 +923,12 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   // reach prof_auto_start() here. Meta pages are never sampled anyway, so skipping
   // auto-start for them too costs nothing: it still fires on the first genuine user
   // allocation, which happens strictly after thread/process init releases those locks.
-  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
+  // adapted for issue #271 (Bun parity P6): was _mi_meta_is_meta_page(mi_page_subproc(page),
+  // page). _mi_prof_on_alloc always runs on the allocating thread itself (never cross-thread,
+  // unlike _mi_memevt_on_free -- see that function's provenance comment in
+  // memory-events.c), so page->heap is not actually at risk here, but the arena-derived
+  // helper is equally correct and keeps both meta-page checks on the same, provably-safe path.
+  if (_mi_meta_is_meta_page_safe(page)) return;
 
   prof_auto_start();
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;

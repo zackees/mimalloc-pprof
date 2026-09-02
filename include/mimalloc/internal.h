@@ -180,6 +180,24 @@ void*         _mi_meta_zalloc_aligned( mi_subproc_t* subproc, size_t size, size_
 void          _mi_meta_free(mi_subproc_t* subproc, void* p, mi_memid_t memid);
 bool          _mi_meta_is_meta_page(const mi_subproc_t* subproc, const mi_page_t* p);
 
+// issue #271 (Bun parity P6, "keep our profiler hooks consistent -- a page unpublished
+// from its heap must not be visited with a dangling heap pointer"): a hook that runs for a
+// cross-thread free (free.c:mi_free_block_mt) can race a concurrent mi_heap_delete /
+// mi_heap_destroy of the page's heap on another thread. The block being freed keeps the
+// *page* struct alive (see free.c's _mi_page_ptr_unalign comment), but NOT the heap or
+// theap it points to -- `mi_heap_free`/`_mi_theap_decref` can free and (in MI_DEBUG builds)
+// poison that memory out from under a concurrent reader with no synchronization of its own
+// (reproduced: `mi_page_subproc(page)` / `page->heap->subproc` reading freed, poisoned
+// mi_heap_t memory from `_mi_memevt_on_free`, SIGSEGV inside `_mi_meta_is_meta_page`).
+// `page->memid` is immutable after page creation and safe to read; for an arena-backed page
+// (the only kind a meta-allocator page ever is -- mi_heap_t/mi_theap_t are always small,
+// arena-sized allocations, never OS/oversized) its arena's `subproc` field is set once at
+// arena creation and outlives every heap in it, so this never touches page->heap/page->theap.
+static inline bool _mi_meta_is_meta_page_safe(const mi_page_t* page) {
+  mi_arena_t* const arena = mi_memid_arena(page->memid);
+  return (arena != NULL && _mi_meta_is_meta_page(arena->subproc, page));
+}
+
 
 // init.c
 mi_page_t*    _mi_page_empty_get(void);
@@ -280,6 +298,7 @@ void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 
 mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t page_alignment);
 void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
+void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271)
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);

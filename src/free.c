@@ -292,9 +292,11 @@ void _mi_free_subproc_safe(void* p) mi_attr_noexcept {
 static bool mi_abandoned_page_try_free(mi_page_t* page)
 {
   if (!mi_page_all_free(page)) return false;
-  // first remove it from the abandoned pages in the arena (if mapped, this might wait for any readers to finish)
-  _mi_arenas_page_unabandon(page,NULL);
-  _mi_arenas_page_free(page,NULL); // we can now free the page directly
+  // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+  // ff96441a): _mi_arenas_abandoned_page_free captures what it needs from the heap before
+  // unabandoning (which, for an OS page, is where it is unpublished from the heap) instead
+  // of after -- see mi_arenas_page_free_ex's provenance comment in arena.c.
+  _mi_arenas_abandoned_page_free(page,NULL);
   return true;
 }
 
@@ -728,10 +730,20 @@ static void mi_check_padding(const mi_page_t* page, const mi_block_t* block) {
 // only maintain stats for smaller objects if requested
 #if (MI_STAT>0)
 static void mi_stat_free(const mi_page_t* page, const mi_block_t* block) {
-  MI_UNUSED(block);  
+  MI_UNUSED(block);
   mi_theap_t* theap = _mi_theap_default();
   mi_lock_t* lock = NULL;
-  mi_subproc_t* const subproc = mi_page_subproc(page);
+  // adapted for issue #271 (Bun parity P6): was mi_page_subproc(page), i.e. page->heap->subproc.
+  // This can run for a cross-thread free (mi_free_block_mt) racing a concurrent
+  // mi_heap_delete/mi_heap_destroy of page's heap on another thread -- reproduced as a
+  // SIGSEGV reading page->heap->subproc here (see memory-events.c's _mi_memevt_on_free
+  // provenance comment for the first instance of this class of bug and its fix). _mi_subproc()
+  // is this (the freeing) thread's own subproc -- always safe, no dereference of anything
+  // reachable only through `page`. Matches the pre-existing (commented out, "never collect
+  // across subprocesses") assumption a few lines below that the two agree in the normal case;
+  // the rare cross-subprocess free this could get wrong (attributing the stat decrease to the
+  // wrong subproc's theap_meta) was already an unverified edge case, not a memory-safety one.
+  mi_subproc_t* const subproc = _mi_subproc();
   mi_theap_t* const theap_meta = subproc->theap_meta;
   if mi_unlikely(!mi_theap_is_initialized(theap) || // can happen if free'd after thread_done was called (usually a thread cleanup call by the OS)
                   // page->theap == subproc->theap_meta  .. but we cannot read `theap` if we don't own the page

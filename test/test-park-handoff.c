@@ -721,41 +721,47 @@ static void test_exit_while_swept_stress(void) {
 // under a running sweep, and the sweep never touches a theap of a thread that has left.
 // ---------------------------------------------------------------------------
 
-// Bounded under MI_GUARDED for the same reason `LIVE` is: every sampled allocation gets its own
-// guard-page mapping, and this case's destructor allocates DTOR_BLOCKS blocks a SECOND time on
-// each of THREADS threads. At the guarded lane's sizes that is enough VMAs to hit the runner's
-// `vm.max_map_count`; the race it is looking for does not need the volume.
-#if defined(MI_GUARDED)
-#define HOLE_EXIT_THREADS  (4)
-#define HOLE_EXIT_ROUNDS   (10)
-#define HOLE_EXIT_DTOR_N   (64)
-#else
-#define HOLE_EXIT_THREADS  (12)
-#define HOLE_EXIT_ROUNDS   (60)
-#define HOLE_EXIT_DTOR_N   DTOR_BLOCKS
-#endif
+// Bounded on the same signal as the three stress cases above -- `guard_every_alloc()`, not the
+// MI_GUARDED compile flag, for the reason spelled out with the FULL/BOUND counts near the top of
+// this file: MI_GUARDED is compiled into every MI_DEBUG build, but only `ctest-guarded`'s forced
+// `MIMALLOC_GUARDED_SAMPLE_RATE=1` pass actually guards every allocation. This case is the most
+// VMA-hungry of the four when it does -- its destructor allocates HOLE_EXIT_DTOR_N blocks a
+// SECOND time on each of THREADS threads, each its own guard-page mapping -- so it scales down
+// hardest there, while `ctest-debug-full` keeps the FULL counts and their discriminating power.
+#define HOLE_EXIT_THREADS_FULL   (12)
+#define HOLE_EXIT_ROUNDS_FULL    (60)
+#define HOLE_EXIT_DTOR_N_FULL    DTOR_BLOCKS
+
+#define HOLE_EXIT_THREADS_BOUND  (4)
+#define HOLE_EXIT_ROUNDS_BOUND   (10)
+#define HOLE_EXIT_DTOR_N_BOUND   (64)
+
+// The destructor and the thread body both need the block count, and the `calloc` length must
+// agree with the loop bound that walks it. Latched once in `test_exit_while_hole_swept_stress`
+// before the first `pthread_create` and never written again, so the threads only ever read it.
+static int hole_exit_dtor_n = HOLE_EXIT_DTOR_N_FULL;
 
 static atomic_int hole_exit_handoffs;
 
 static void dtor_frees_and_allocs(void* blocks_v) {
   void** blocks = (void**)blocks_v;
   if (blocks == NULL) return;
-  for (int i = 0; i < HOLE_EXIT_DTOR_N; i++) { if (blocks[i] != NULL) { mi_free(blocks[i]); blocks[i] = NULL; } }
+  for (int i = 0; i < hole_exit_dtor_n; i++) { if (blocks[i] != NULL) { mi_free(blocks[i]); blocks[i] = NULL; } }
   // ... and allocate again, on a thread that is parked and may be mid-sweep: this is the
   // `_mi_malloc_generic` half of the park-leave, and it needs fresh pages (the frees above
   // just emptied this thread's), so it really does take the slow path.
-  for (int i = 0; i < HOLE_EXIT_DTOR_N; i++) {
+  for (int i = 0; i < hole_exit_dtor_n; i++) {
     blocks[i] = mi_malloc(24 + (size_t)(i % RACE_CLASSES) * 56);
   }
-  for (int i = 0; i < HOLE_EXIT_DTOR_N; i++) { if (blocks[i] != NULL) mi_free(blocks[i]); }
+  for (int i = 0; i < hole_exit_dtor_n; i++) { if (blocks[i] != NULL) mi_free(blocks[i]); }
   free(blocks);
 }
 
 static void* park_then_exit_racing_alloc_dtor(void* arg) {
   const unsigned id = (unsigned)(uintptr_t)arg;
-  void** dblocks = (void**)calloc(HOLE_EXIT_DTOR_N, sizeof(void*));
+  void** dblocks = (void**)calloc((size_t)hole_exit_dtor_n, sizeof(void*));
   if (dblocks != NULL) {
-    for (int i = 0; i < HOLE_EXIT_DTOR_N; i++) {
+    for (int i = 0; i < hole_exit_dtor_n; i++) {
       dblocks[i] = mi_malloc(16 + (size_t)(i % RACE_CLASSES) * 40);
       if (dblocks[i] == NULL) break;
     }
@@ -785,7 +791,11 @@ static void* park_then_exit_racing_alloc_dtor(void* arg) {
 }
 
 static void test_exit_while_hole_swept_stress(void) {
-  enum { THREADS = HOLE_EXIT_THREADS, ROUNDS = HOLE_EXIT_ROUNDS };
+  enum { THREADS_MAX = HOLE_EXIT_THREADS_FULL };
+  const bool bound = guard_every_alloc();
+  const int THREADS = bound ? HOLE_EXIT_THREADS_BOUND : HOLE_EXIT_THREADS_FULL;
+  const int ROUNDS  = bound ? HOLE_EXIT_ROUNDS_BOUND  : HOLE_EXIT_ROUNDS_FULL;
+  hole_exit_dtor_n  = bound ? HOLE_EXIT_DTOR_N_BOUND  : HOLE_EXIT_DTOR_N_FULL;
   const long saved = mi_option_get(mi_option_purge_holes_min_interval);
   mi_option_set(mi_option_purge_holes_min_interval, 0);   // sweep on EVERY park: widest window
   mi_purge_holes_stats_t before;
@@ -796,7 +806,7 @@ static void test_exit_while_hole_swept_stress(void) {
     return;
   }
   for (int r = 0; r < ROUNDS; r++) {
-    pthread_t t[THREADS];
+    pthread_t t[THREADS_MAX];
     int made = 0;
     for (int i = 0; i < THREADS; i++) {
       if (pthread_create(&t[i], NULL, &park_then_exit_racing_alloc_dtor,

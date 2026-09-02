@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4678a02c of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 5ae7cbba of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4567,7 +4567,7 @@ mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);
 // `-fvisibility=hidden` would otherwise hide it -- same reason as the `mi_debug_*` hooks
 // above, except this one is NOT `MI_DEBUG`-only: the test is meaningful in a Release
 // build too, and one relaxed increment per park is not worth a config split.
-mi_decl_export size_t _mi_test_idle_work_count(void);
+mi_decl_externc mi_decl_export size_t _mi_test_idle_work_count(void);
 #if MI_DEBUG > 0
 // #272 fork test hook (test/test-fork-user-heap.c case_b); see src/init.c
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
@@ -24743,14 +24743,14 @@ terms of the MIT license. A copy of the license can be found in the file
 // in the test; the counter stays as the "a pass ran at all" signal.
 static _Atomic(size_t) mi_idle_work_count;
 
-mi_decl_export size_t _mi_test_idle_work_count(void) {
+mi_decl_externc mi_decl_export size_t _mi_test_idle_work_count(void) {
   return mi_atomic_load_relaxed(&mi_idle_work_count);
 }
 
 // Fold in pending frees and drain the arena purge queue. Runs on the owner
 // (`mi_on_thread_idle`) or on the scavenger for a parked thread; both require that the owner
 // of `tld` is not allocating while we rewrite its free lists.
-void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept {
+void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) {
   if (tld == NULL) return;
   // each phase is a full walk: an owner waiting in `_mi_park_leave` cannot allocate until we stop
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;

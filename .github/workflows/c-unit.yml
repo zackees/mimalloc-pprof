@@ -22,13 +22,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # TODO(#277 phase B, added 2026-09-02): DELETE the macos-latest row after ten pushes
-    # have compared it against `run-macos` in macos-bundles.yml. Until then it is the
-    # control arm and is informational only -- a permanently-yellow job is worse than an
-    # absent one, so this comment carries its own expiry.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     steps:
       - uses: actions/checkout@v4
       - run: cmake -B build -DMI_PPROF=ON
@@ -116,13 +111,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # TODO(#277 phase B, added 2026-09-02): DELETE the macos-latest row after ten pushes
-    # have compared it against `run-macos` in macos-bundles.yml. Until then it is the
-    # control arm and is informational only -- a permanently-yellow job is worse than an
-    # absent one, so this comment carries its own expiry.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     steps:
       - uses: actions/checkout@v4
       - run: cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON && cmake --build build --config Debug && ctest --test-dir build -C Debug --output-on-failure
@@ -265,17 +255,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # TODO(#277 phase B, added 2026-09-02): DELETE the macos-latest row after ten pushes
-    # have compared it against `run-macos` in macos-bundles.yml. Until then it is the
-    # control arm and is informational only -- a permanently-yellow job is worse than an
-    # absent one, so this comment carries its own expiry.
-    # The macOS row keeps matching ci/memory-baselines/macos-pprof1.json, which is now
-    # annotated `compiler: apple-clang`: it declares no --arch/--compiler, so its baseline
-    # filename is unchanged. The soldr lane asks for its own file instead of borrowing
-    # this number (#277 phase B).
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     steps:
       - uses: actions/checkout@v4
       - run: cmake -B build -DMI_PPROF=ON

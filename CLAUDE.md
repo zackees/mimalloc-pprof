@@ -16,10 +16,16 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    the sub-issue. One PR per phase. Conventional commits (`feat:`, `fix:`, `ci:`, `docs:`, `test:`).
 2. **Never mix C-core paths (`src/`, `include/`, `test/`, `CMakeLists.txt`) and `rust/` paths
    in one commit.** This keeps upstream cherry-picks clean.
-3. **Merge gates for every PR:** `c-unit` green on ubuntu/windows-MSVC/windows-MinGW/macos with
+3. **Merge gates for every PR:** `c-unit` green on ubuntu/windows-MSVC/windows-MinGW with
    `MI_PPROF=ON`, the `OFF` job green (profiler hooks disabled; upstream allocator behavior
    with independent memory-events tracking left runtime-disabled), `rust-native` green.
    MSVC **and** win-gnu are priority platforms — both, always.
+   The **macOS** gate is `macos-bundles.yml` and uses no Apple hardware (#277 phase B2):
+   both Apple arches are cross-built on Linux through soldr, `x86_64` is *executed* inside a
+   `dockurr/macos` guest on a Linux runner (`run-macos-x64-dockur`), and `aarch64` is
+   **compile-only** — a build plus Mach-O header assertions, with its test-name set checked
+   against the executed x86_64 bundle. Never add a `macos-*` runner label to a workflow;
+   `ci/lint_no_macos_runners.py` fails `python-lint` if you do.
    (macOS gates run from Linux-built bundles on one runner; see #277.)
 4. **Profiler memory-safety invariant:** profiler-internal memory (sample records, intern table,
    dump buffers) comes ONLY from the raw-OS-layer arena (`_mi_os_alloc`), never from hooked

@@ -645,6 +645,15 @@ def run_lint(ctx: RunCtx) -> bool:
         )
         ok = ok and rc == 0
 
+    # Issue #277 phase B2: no workflow may schedule onto a native macOS runner. Also
+    # yaml-dependent, so it gets the same ephemeral environment as the four above.
+    rc, _ = run_logged(
+        ["uv", "run", "--with", "pyyaml==6.0.2", "ci/lint_no_macos_runners.py"],
+        cwd=ROOT,
+        log=ctx.log,
+    )
+    ok = ok and rc == 0
+
     rc, _ = run_logged(
         [
             "uv",

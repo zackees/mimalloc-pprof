@@ -13,8 +13,7 @@ on:
     paths:
       - 'ci/**'
       - 'pyproject.toml'
-      - '.github/workflows/python-lint.yml'
-      - '.github/workflows/benchmark-*.yml'
+      - '.github/workflows/**'
 
 concurrency:
   # Pure verification: a superseded push's answer is worthless.
@@ -56,5 +55,12 @@ jobs:
           python3 ci/check_benchmark_memory_workflow.py --selftest
           python3 ci/check_benchmark_latency_workflow.py --selftest
           python3 ci/check_benchmark_scaling_workflow.py --selftest
+      # Issue #277 phase B2. Both Apple architectures are cross-built on Linux and the
+      # x86_64 bundle runs under dockurr/macos, so a macOS runner label anywhere in
+      # .github/workflows is a regression. This is the check that says so out loud --
+      # see the module docstring for why it parses the YAML instead of grepping it.
+      - name: No workflow may schedule onto a native macOS runner
+        run: python3 ci/lint_no_macos_runners.py
+
       - name: Benchmark report and policy unit tests
         run: python3 -m pytest ci/tests -q

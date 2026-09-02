@@ -319,6 +319,7 @@ bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t*
 void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 
 void          _mi_heap_detach_theaps( mi_heap_t* heap );
+void          _mi_theap_abandon(mi_theap_t* theap);  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271)
 void          _mi_tld_detach_theaps( mi_tld_t* tld );
 void          _mi_theap_incref(mi_theap_t* theap);
 void          _mi_theap_decref(mi_theap_t* theap);
@@ -756,6 +757,21 @@ static inline bool mi_theap_is_detached(mi_theap_t* theap) {
 static inline bool mi_theap_matches_thread(mi_theap_t* theap) {
   const mi_threadid_t tid = _mi_thread_id();
   return (theap==NULL || theap->tld->thread_id == tid || mi_theap_is_detached(theap));
+}
+
+// adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// 8286bfb6): like mi_theap_matches_thread, but additionally allows a theap that
+// mi_heap_delete/mi_heap_destroy detached from its heap (`_mi_heap_detach_theaps` clears
+// `theap->heap`, see theap.c) -- `_mi_theap_abandon` (theap.c) calls
+// `_mi_arenas_page_abandon` on behalf of such a theap from the *deleting* thread, which
+// is not the theap's own owning thread. Bun's version also allows the park state the
+// background scavenger sets while sweeping a parked thread's theaps; that state does not
+// exist in this tree (#272), so that clause is omitted here.
+static inline bool _mi_theap_can_touch(const mi_theap_t* theap) {
+  if (theap == NULL || theap->tld == NULL) return true;
+  if (mi_atomic_load_ptr_relaxed(mi_heap_t, &((mi_theap_t*)theap)->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`
+  if (theap->tld->thread_id == _mi_thread_id()) return true;
+  return mi_theap_is_detached((mi_theap_t*)theap);   // upstream's permanently-detached theaps (meta-data) belong to no thread
 }
 
 /* -----------------------------------------------------------

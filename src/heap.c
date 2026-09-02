@@ -181,11 +181,18 @@ mi_heap_t* mi_heap_new(void) {
 // the heap, so no thread finds a theap for this heap anymore, but the theap structs (and
 // their `tld`) stay valid until `mi_heap_free_theaps` runs -- after the pages have moved
 // or been destroyed -- for a free that obtained the theap just before the detach.
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// 8286bfb6): also abandon every page of each now-detached theap (_mi_theap_abandon,
+// theap.c), so by the time the page walk (_mi_heap_move_pages / _mi_heap_destroy_pages,
+// with claim_pages=true) starts, every page of the heap is an abandoned page and the only
+// other party that can hold one is a concurrent mi_free collecting it -- the walk can then
+// safely claim and move/free each page without racing a still-live theap.
 static void mi_heap_detach_theaps(mi_heap_t* heap) {
   _mi_heap_detach_theaps(heap);
   mi_lock(&heap->theaps_lock) { // paranoia
     for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
       mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // detached
+      _mi_theap_abandon(theap);
       _mi_stats_merge_into(&heap->stats, &theap->stats);
     }
   }

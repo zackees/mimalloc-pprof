@@ -156,6 +156,33 @@ void _mi_theap_collect_abandon(mi_theap_t* theap) {
   mi_theap_collect_ex(theap, MI_ABANDON);
 }
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// 8286bfb6): abandon every page of a theap that mi_heap_delete/mi_heap_destroy detached
+// from its heap (heap.c:mi_heap_detach_theaps -> _mi_heap_detach_theaps), as if its thread
+// had terminated. That thread no longer reaches the theap (_mi_heap_theap_peek /
+// _mi_page_associated_theap_peek return NULL for a detached theap, see prim-tls.h), and by
+// the contract of mi_heap_delete it is not allocating from or freeing into these pages
+// itself -- so after this call every page of the heap is an abandoned page, and the only
+// other party that can touch one is a concurrent mi_free collecting it. Called from the
+// deleting thread, on behalf of the (possibly different) thread that owned the theap --
+// _mi_arenas_page_abandon's assertions use _mi_theap_can_touch, not
+// mi_theap_matches_thread, to allow that.
+static bool mi_theap_page_abandon(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2) {
+  MI_UNUSED(theap); MI_UNUSED(arg1); MI_UNUSED(arg2);
+  _mi_page_abandon(page, pq);  // frees it instead if all blocks turn out to be free
+  return true;
+}
+
+void _mi_theap_abandon(mi_theap_t* theap) {
+  mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // must already be detached
+  mi_assert_internal(theap->tnext==NULL && theap->tprev==NULL);
+  mi_theap_visit_pages(theap, &mi_theap_page_abandon, true /* include full pages */, NULL, NULL);
+  mi_assert_internal(theap->page_count==0);
+  #if MI_DEBUG>1
+  for (size_t i = 0; i <= MI_BIN_FULL; i++) { mi_assert_internal(theap->pages[i].first == NULL); }
+  #endif
+}
+
 void mi_theap_collect(mi_theap_t* theap, bool force) mi_attr_noexcept {
   mi_theap_collect_ex(theap, (force ? MI_FORCE : MI_NORMAL));
 }

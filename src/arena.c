@@ -22,6 +22,7 @@ The arena allocation needs to be thread safe and we use an atomic bitmap to allo
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/prim-tls.h"
+#include "mimalloc/prim.h"      // _mi_prim_thread_yield (issue #271: mi_heap_visit_page_claim / mi_heap_visit_os_pages)
 #include "bitmap.h"
 
 #if (MI_ARENA_MAX_SIZE > MI_MAX_ALIGN_SIZE*UINT32_MAX)
@@ -611,7 +612,7 @@ void* _mi_arenas_alloc(mi_heap_t* heap, size_t size, bool commit, bool allow_lar
 static bool mi_abandoned_page_unown(mi_page_t* page, mi_theap_t* current_theap) {
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(mi_theap_matches_thread(current_theap));
+  mi_assert_internal(_mi_theap_can_touch(current_theap));  // adapted from 942b8342 (issue #271): was mi_theap_matches_thread
   mi_thread_free_t tf_new;
   mi_thread_free_t tf_old = mi_atomic_load_relaxed(&page->xthread_free);
   do {
@@ -670,7 +671,11 @@ static mi_arena_t* mi_page_arena_pages(mi_page_t* page, size_t* slice_index, siz
     mi_heap_t* heap = mi_page_heap(page);
     mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
     mi_assert_internal(arena_pages != NULL);
-    mi_assert_internal(slice_index==NULL || mi_bitmap_is_set(arena_pages->pages, *slice_index));
+    // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+    // 8286bfb6): dropped. No longer holds under the heap delete/destroy claim protocol --
+    // mi_heap_visit_page_claim (above) legitimately holds this bit clear for a moment
+    // while it pins an owned, abandoned page it has not claimed yet, and this function can
+    // run on that page in the meantime (e.g. from mi_arenas_page_free_prim's own call).
     *parena_pages = arena_pages;
   }
   return arena;
@@ -1102,7 +1107,10 @@ static void mi_arenas_page_free_prim(mi_page_t* page) {
     mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
     mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
     mi_assert_internal(bin >= MI_ARENA_BIN_COUNT || mi_bitmap_is_clearN(arena_pages->pages_abandoned[bin], slice_index, 1));
-    mi_assert_internal(mi_bitmap_is_setN(arena_pages->pages, slice_index, 1));
+    // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+    // 8286bfb6): dropped `mi_assert_internal(mi_bitmap_is_setN(arena_pages->pages, slice_index, 1))`.
+    // No longer holds under the heap delete/destroy claim protocol: a concurrent
+    // mi_heap_visit_page_claim may legitimately hold this bit clear (pinned) right now.
     // note: we cannot check for `!mi_page_is_abandoned_and_mapped` since that may
     // be (temporarily) not true if the free happens while trying to reclaim
     // see `mi_arena_try_claim_abandoned`
@@ -1128,7 +1136,15 @@ static void mi_arenas_page_free_prim(mi_page_t* page) {
     mi_arena_t* const arena = mi_page_arena_pages(page, &slice_index, &slice_count, &arena_pages);
     mi_assert_internal(arena_pages!=NULL);
     mi_assert_internal(arena->subproc == mi_page_subproc(page));
-    mi_bitmap_clear(arena_pages->pages, slice_index);
+    // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+    // 8286bfb6): a heap walker (mi_heap_visit_page_claim, below) may hold this bit clear
+    // for a moment to pin the page while it tries to claim it; mi_bitmap_clear (which does
+    // not wait) could unpublish the page here while it is pinned, racing the walker's own
+    // clear/set pair. mi_bitmap_clear_once_set waits for the bit to be set (i.e. not
+    // currently pinned) before clearing it. This is also the last access to `arena_pages`
+    // (and, through it, the heap): a concurrent mi_heap_delete frees the heap once it sees
+    // the bit clear.
+    mi_bitmap_clear_once_set(arena->subproc, arena_pages->pages, slice_index);
     const size_t slice_committed = mi_page_slice_committed(page);
     if (slice_committed > 0) {
       // if committed on-demand, set the commit bits to account commit properly
@@ -1161,7 +1177,7 @@ void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
   mi_assert_internal(mi_page_all_free(page));
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(page->next==NULL && page->prev==NULL);
-  mi_assert_internal(mi_theap_matches_thread(current_theapx));
+  mi_assert_internal(_mi_theap_can_touch(current_theapx));  // adapted from 942b8342 (issue #271): was mi_theap_matches_thread
 
   if (current_theapx != NULL) {
     mi_theap_stat_decrease(current_theapx, page_bins[_mi_page_stats_bin(page)], 1);
@@ -1186,12 +1202,11 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(!mi_page_all_free(page));
   mi_assert_internal(page->next==NULL && page->prev == NULL);
-  mi_assert_internal(mi_theap_matches_thread(current_theap));
+  mi_assert_internal(_mi_theap_can_touch(current_theap));  // adapted from 942b8342 (issue #271): was mi_theap_matches_thread + an assert requiring current_theap's own heap to match, which does not hold for a detached theap that _mi_theap_abandon (theap.c) is abandoning on behalf of its (foreign) owning thread
   // mi_assert_internal(current_theap == _mi_page_associated_theap(page));
 
   // add to abandoned?
   mi_heap_t* heap = mi_page_heap(page); 
-  mi_assert_internal(heap==_mi_theap_heap(current_theap));
   if (page->memid.memkind==MI_MEM_ARENA && !mi_page_is_full(page)) {
     // make available for allocations
     size_t bin = _mi_bin(mi_page_block_size(page));
@@ -1268,7 +1283,7 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(mi_theap_matches_thread(current_theapx));
+  mi_assert_internal(_mi_theap_can_touch(current_theapx));  // adapted from 942b8342 (issue #271): was mi_theap_matches_thread
 
   mi_heap_t* const heap = mi_page_heap(page);
   if (mi_page_is_abandoned_mapped(page)) {
@@ -2308,6 +2323,8 @@ typedef struct mi_heap_visit_info_s {
   mi_block_visit_fun* visitor;
   void* arg;
   bool visit_blocks;
+  bool claim_pages;      // adapted from 942b8342 (issue #271): claim ownership before visiting (for delete/destroy)
+  mi_arena_pages_t* arena_pages;
 } mi_heap_visit_info_t;
 
 static bool mi_heap_visit_page(mi_page_t* page, mi_heap_visit_info_t* vinfo) {
@@ -2325,33 +2342,132 @@ static bool mi_heap_visit_page(mi_page_t* page, mi_heap_visit_info_t* vinfo) {
   }
 }
 
-// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): test hook
-// for test-heap-teardown.c's `pin` case. Not yet wired into the claim loop -- that lands
-// with the heap delete/destroy teardown protocol port; until then this only exists so the
-// imported test corpus links (it stalls forever, bounded by its ctest TIMEOUT).
 #if MI_DEBUG > 0
-mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271): test-heap-teardown.c's `pin` case
 #endif
+
+// adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// 8286bfb6 "heap delete/destroy: one teardown protocol instead of per-reader fixes"):
+// claim a page of `vinfo->heap` for `mi_heap_delete`/`mi_heap_destroy` (`claim_pages`). By
+// the time this runs, `heap.c:mi_heap_detach_theaps` has detached and abandoned every theap
+// of the heap (`_mi_theap_abandon`), so every page still published in `arena_pages->pages`
+// is an abandoned page of this heap, and the only other party that can own one is a
+// concurrent `mi_free` that collects it (`free.c:mi_free_try_collect_mt`) -- which may free
+// the page, after which the slice can be reused for anything at once. So we must not write
+// to the page (claiming is a write) unless it is pinned: we pin it by clearing its `pages`
+// bit while it is set. The owner of a page unpublishes it with `mi_bitmap_clear_once_set`
+// (`mi_arenas_page_free_prim`, above), which waits while we hold the bit, so a pinned page
+// stays a page of this heap. If the page turns out to be owned by a concurrent free, we
+// give the bit back and retry; once we own it nobody else can free it and the bit goes back
+// too. This is the same protocol the abandoned-page map already uses
+// (`mi_arena_try_claim_abandoned`).
+//
+// Dropped from the upstream version: the `_mi_process_is_forked_child` branch, which
+// re-derives a torn page snapshot after a multi-threaded `fork()`. `pthread_atfork`
+// handling does not exist in this tree yet (#270 / PR #289, not merged as of this PR); add
+// that branch back when it lands.
+static void mi_heap_visit_page_seize(mi_page_t* page) {
+  // the page sits in the queue of a theap whose thread is gone or misbehaving; leave that queue be
+  page->next = page->prev = NULL;
+  mi_page_set_theap(page, NULL);
+}
+
+static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* page, size_t slice_index) {
+  mi_bitmap_t* const pages = vinfo->arena_pages->pages;
+  for (;;) {
+    if (!mi_bitmap_clear(pages, slice_index)) return false;   // freed by a concurrent `mi_free`
+    // pinned
+    #if MI_DEBUG > 0
+    if (mi_atomic_load_relaxed(&mi_debug_stall_in_heap_delete_claim) == 1) {
+      mi_atomic_store_release(&mi_debug_stall_in_heap_delete_claim, (uintptr_t)2);  // signal: pinned, not yet claimed
+      while (mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) == 2) { _mi_prim_thread_yield(); }
+    }
+    #endif
+    if mi_unlikely(!mi_page_is_abandoned(page)) {
+      // A thread that allocated from this heap before is using it during the delete (it
+      // allocated this page, or reclaimed it on a free just now): that is outside the
+      // contract of `mi_heap_delete`.
+      _mi_error_message(EINVAL, "heap 0x%zx is deleted while thread 0x%zx still uses it\n", (uintptr_t)vinfo->heap, (uintptr_t)mi_page_thread_id(page));
+      mi_bitmap_set(pages, slice_index);
+      mi_heap_visit_page_seize(page);
+      break;
+    }
+    if (mi_page_claim_ownership(page)) {
+      mi_bitmap_set(pages, slice_index);
+      break;
+    }
+    // owned by a concurrent `mi_free`: let it finish (it may free the page, re-abandon it, or just release it)
+    mi_bitmap_set(pages, slice_index);
+    mi_subproc_stat_counter_increase(vinfo->heap->subproc, heaps_delete_wait, 1);
+    _mi_prim_thread_yield();
+  }
+  mi_assert_internal(mi_page_is_owned(page) && mi_page_is_abandoned(page));
+  mi_assert_internal(mi_bitmap_is_set(pages, slice_index));
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page)) == page && mi_page_heap(page) == vinfo->heap);
+  return true;
+}
 
 static bool mi_heap_visit_page_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   MI_UNUSED(slice_count);
   mi_heap_visit_info_t* vinfo = (mi_heap_visit_info_t*)arg;
   mi_page_t* page = mi_arena_page_at_slice(arena, slice_index);
+  if (vinfo->claim_pages) {
+    if (!mi_heap_visit_page_claim(vinfo, page, slice_index)) return true;  // gone: skip
+  }
   return mi_heap_visit_page(page, vinfo);
 }
 
-bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
+// adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// 8286bfb6): visit the abandoned OS-allocated pages of a heap. When `claim_pages` is set
+// (delete/destroy), a page on the list is pinned by holding the list lock: a concurrent
+// `mi_free` that owns it has to take the lock to unlink it before it can free it
+// (`_mi_arenas_page_unabandon`). So we claim under the lock, and if the page is owned we
+// drop the lock to let that free finish and start over, until the list is empty.
+static bool mi_heap_visit_os_pages(mi_heap_t* heap, mi_heap_visit_info_t* vinfo) {
+  if (!vinfo->claim_pages) {
+    // (we assume we are the only thread running in this heap)
+    mi_page_t* page = NULL;
+    mi_lock(&heap->os_abandoned_pages_lock) { page = heap->os_abandoned_pages; }
+    while (page != NULL) {
+      mi_page_t* const next = page->next;  // read upfront in case the visitor frees the page
+      if (!mi_heap_visit_page(page, vinfo)) return false;
+      page = next;
+    }
+    return true;
+  }
+  for (;;) {
+    mi_page_t* page = NULL;
+    bool owned = false;
+    mi_lock(&heap->os_abandoned_pages_lock) {
+      page = heap->os_abandoned_pages;
+      if (page != NULL) { owned = mi_page_claim_ownership(page); }
+    }
+    if (page == NULL) return true;
+    if (owned) {
+      mi_assert_internal(mi_page_is_abandoned(page) && mi_page_heap(page) == heap);
+      if (!mi_heap_visit_page(page, vinfo)) return false;  // the visitor unlinks it from the list
+    }
+    else {
+      mi_subproc_stat_counter_increase(heap->subproc, heaps_delete_wait, 1);
+      _mi_prim_thread_yield();
+    }
+  }
+}
+
+bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_blocks, bool claim_pages, mi_block_visit_fun* visitor, void* arg) {
   mi_assert(visitor!=NULL);
   if (visitor==NULL) return false;
   if (heap==NULL) { heap = mi_heap_main(); }
-  // visit all pages in a heap
-  // we don't have to claim because we assume we are the only thread running (with this heap).
-  // (but we could atomically claim as well by first doing abandoned_reclaim and afterwards reabandoning).
-  mi_heap_visit_info_t visit_info = { heap, visitor, arg, visit_blocks };
+  // when `claim_pages` is not set we don't have to claim: we assume we are the only thread
+  // running (with this heap). When it is set (delete/destroy), mi_heap_visit_page_at /
+  // mi_heap_visit_os_pages claim each page first so concurrent `mi_free` calls (which may
+  // briefly own abandoned pages) cannot race with the visitor.
+  mi_heap_visit_info_t visit_info = { heap, visitor, arg, visit_blocks, claim_pages, NULL };
   bool ok = true;
   mi_forall_arenas(heap, NULL, 0, arena) {
     mi_arena_pages_t* arena_pages = mi_heap_arena_pages(heap, arena);
     if (ok && arena_pages != NULL) {
+      visit_info.arena_pages = arena_pages;
       if (abandoned_only) {
         for (size_t bin = 0; ok && bin < MI_ARENA_BIN_COUNT; bin++) {
           // todo: if we had a single abandoned page map as well, this can be faster.
@@ -2369,26 +2485,15 @@ bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_bloc
   if (!ok) return false;
 
   // visit abandoned pages in OS allocated memory
-  // (technically we don't need the initial lock as we assume we are the only thread running in this subproc)
-  mi_page_t* page = NULL;
-  mi_lock(&heap->os_abandoned_pages_lock) {
-    page = heap->os_abandoned_pages;
-  }
-  while (ok && page != NULL) {
-    mi_page_t* next = page->next;  // read upfront in case the visitor frees the page
-    ok = mi_heap_visit_page(page, &visit_info);
-    page = next;
-  }
-
-  return ok;
+  return mi_heap_visit_os_pages(heap, &visit_info);
 }
 
 bool mi_heap_visit_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
-  return _mi_heap_visit_blocks(heap, false, visit_blocks, visitor, arg);
+  return _mi_heap_visit_blocks(heap, false, visit_blocks, false, visitor, arg);
 }
 
 bool mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
-  return _mi_heap_visit_blocks(heap, true, visit_blocks, visitor, arg);
+  return _mi_heap_visit_blocks(heap, true, visit_blocks, false, visitor, arg);
 }
 
 
@@ -2405,16 +2510,15 @@ static bool mi_heap_delete_page(const mi_heap_t* heap, const mi_heap_area_t* are
   mi_theap_t* const theap           = NULL; // info->theap;       mi_assert_internal(_mi_theap_heap(theap) == heap);
   mi_page_t*  const page            = (mi_page_t*)area->reserved1;
 
-  mi_page_claim_ownership(page);       // claim ownership
-  if (mi_page_is_abandoned(page)) {
-    _mi_arenas_page_unabandon(page,theap);
-  }
-  else {
-    page->next = page->prev = NULL;    // yikes.. better not to try to access this from a thread later on..
-    mi_page_set_theap(page,NULL);      // set threadid to abandoned
-  }
-  mi_assert_internal(mi_page_is_abandoned(page));
+  // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+  // 8286bfb6): claimed by mi_heap_visit_page_claim (or mi_heap_visit_os_pages) before this
+  // visitor runs -- every page reachable here is guaranteed abandoned (heap.c's
+  // mi_heap_detach_theaps abandons every theap of the heap, via _mi_theap_abandon, before
+  // the walk starts), so there is no longer an else-branch that force-abandons a
+  // theap-owned page inline.
   mi_assert_internal(mi_page_is_owned(page));
+  mi_assert_internal(mi_page_is_abandoned(page));
+  _mi_arenas_page_unabandon(page,theap);
 
   if (page->used==0) {
     // free the page
@@ -2482,7 +2586,7 @@ static void mi_heap_delete_pages(mi_heap_t* heap, mi_heap_t* heap_target) {
   mi_theap_t* const theap_target = (heap_target != NULL ? _mi_heap_theap(heap_target) : NULL);
   // mi_theap_t* const theap = _mi_heap_theap(heap);
   mi_heap_delete_visit_info_t info = { heap_target, theap_target, NULL };
-  _mi_heap_visit_blocks(heap, false, false, &mi_heap_delete_page, &info);
+  _mi_heap_visit_blocks(heap, false, false, true /* claim_pages: issue #271 */, &mi_heap_delete_page, &info);
   #if MI_DEBUG>1
   // no more arena pages?
   for (size_t i = 0; i < MI_MAX_ARENAS; i++) {

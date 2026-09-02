@@ -34,6 +34,7 @@ option(MI_BUILD_TESTS       "Build test executables" ON)
 option(MI_OSX_INTERPOSE     "Use interpose to override standard malloc on macOS" ON)
 option(MI_OSX_ZONE          "Use malloc zone to override standard malloc on macOS" ON)
 option(MI_WIN_REDIRECT      "Use redirection module ('mimalloc-redirect') on Windows if compiling mimalloc as a DLL" ON)
+option(MI_MINGW_REDIRECT_FIRST "Emit 'mimalloc-redirect.dll' as the first import descriptor of mimalloc.dll (MinGW; see #277)" OFF)
 option(MI_WIN_DIRECT_TLS    "Use only direct TLS slots on Windows to avoid extra tests in the malloc fast path (only works if the program uses less than 64 TlsAlloc'd slots in total)" OFF)
 option(MI_LOCAL_DYNAMIC_TLS "Use local-dynamic-tls, a slightly slower but dlopen-compatible thread local storage mechanism (Unix)" OFF)
 option(MI_LIBC_MUSL         "Enable this when linking with musl libc" OFF)
@@ -811,7 +812,31 @@ if(MI_BUILD_SHARED)
       set(MINJECT_SUFFIX "-${MI_ARCH}")
     endif()
 
-    target_link_libraries(mimalloc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib)  # the DLL import library
+    if(MINGW AND MI_MINGW_REDIRECT_FIRST)
+      # `mimalloc-redirect.dll` only redirects if its DllMain runs BEFORE the C runtime's:
+      # it reads `ucrtbase.dll`'s LDR_DATA_TABLE_ENTRY.Flags and bails out with
+      #   "mimalloc-redirect.dll seems to be initialized after ucrtbase.dll"
+      # as soon as LDRP_PROCESS_ATTACH_CALLED (0x00080000) is set there. The loader
+      # initialises a module's dependencies in THAT module's import-descriptor order, so
+      # the redirect module has to precede `api-ms-win-crt-*` in *this DLL's* import
+      # table -- the executable importing `mimalloc.dll` first is necessary but not
+      # sufficient. MSVC gets this for free (explicit libs are emitted before
+      # /DEFAULTLIB ones); `ld` sorts `.idata$2` by the input file path as spelled on the
+      # link line, and CMake spells this one as an absolute source path, which wins or
+      # loses against the absolute sysroot path purely by where the checkout lives.
+      # A copy spelled `./…` (0x2e) sorts ahead of every absolute path (0x2f).
+      #
+      # #277: OFF by default while the crash this exposes is unresolved -- see
+      # .github/workflows/windows-bundles.yml.
+      configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib"
+        "${CMAKE_CURRENT_BINARY_DIR}/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib"
+        COPYONLY)
+      target_link_libraries(mimalloc PRIVATE
+        "-L." "-l:mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib")  # the DLL import library
+    else()
+      target_link_libraries(mimalloc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib)  # the DLL import library
+    endif()
     add_custom_command(TARGET mimalloc POST_BUILD
       COMMAND "${CMAKE_COMMAND}" -E copy "${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.dll" $<TARGET_FILE_DIR:mimalloc>
       COMMENT "Copy mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.dll to output directory")

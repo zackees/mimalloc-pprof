@@ -153,6 +153,89 @@ class NegativeControlTest(unittest.TestCase):
         self.assertIn("EXTRA", str(caught.exception))
 
 
+class TextCheckTest(unittest.TestCase):
+    """test/run-text-check.cmake semantics (issue #268), the zero-exit mirror of
+    run-negative.cmake: REQUIRE lowers to expect_text, FORBID lowers to forbid_text, and
+    both leave expect_nonzero False (the opposite exit-code contract)."""
+
+    def test_lowers_require_mode(self) -> None:
+        lowered = bundle_tests.lower_command(
+            [
+                "/usr/bin/cmake",
+                "-DTEST_EXE=/build/exe",
+                "-DEXPECTED_TEXT=process done",
+                "-DMODE=REQUIRE",
+                "-P",
+                "/src/test/run-text-check.cmake",
+            ],
+            "t",
+        )
+        self.assertEqual(lowered.argv, ["/build/exe"])
+        self.assertFalse(lowered.expect_nonzero)
+        self.assertEqual(lowered.expect_text, "process done")
+        self.assertIsNone(lowered.forbid_text)
+        self.assertEqual(lowered.timeout, bundle_tests.NEGATIVE_TIMEOUT_SECONDS)
+
+    def test_lowers_forbid_mode(self) -> None:
+        lowered = bundle_tests.lower_command(
+            [
+                "/usr/bin/cmake",
+                "-DTEST_EXE=/build/exe",
+                "-DEXPECTED_TEXT=process done",
+                "-DMODE=FORBID",
+                "-P",
+                "/src/test/run-text-check.cmake",
+            ],
+            "t",
+        )
+        self.assertFalse(lowered.expect_nonzero)
+        self.assertIsNone(lowered.expect_text)
+        self.assertEqual(lowered.forbid_text, "process done")
+
+    def test_missing_mode_is_an_error(self) -> None:
+        with self.assertRaises(bundle_tests.BundleError):
+            bundle_tests.lower_command(
+                [
+                    "/usr/bin/cmake",
+                    "-DTEST_EXE=/build/exe",
+                    "-DEXPECTED_TEXT=boom",
+                    "-P",
+                    "/src/test/run-text-check.cmake",
+                ],
+                "t",
+            )
+
+    def test_invalid_mode_is_an_error(self) -> None:
+        with self.assertRaises(bundle_tests.BundleError):
+            bundle_tests.lower_command(
+                [
+                    "/usr/bin/cmake",
+                    "-DTEST_EXE=/build/exe",
+                    "-DEXPECTED_TEXT=boom",
+                    "-DMODE=SIDEWAYS",
+                    "-P",
+                    "/src/test/run-text-check.cmake",
+                ],
+                "t",
+            )
+
+    def test_unknown_define_is_refused(self) -> None:
+        with self.assertRaises(bundle_tests.BundleError) as caught:
+            bundle_tests.lower_command(
+                [
+                    "/usr/bin/cmake",
+                    "-DTEST_EXE=/build/exe",
+                    "-DEXPECTED_TEXT=boom",
+                    "-DMODE=REQUIRE",
+                    "-DEXTRA=surprise",
+                    "-P",
+                    "/src/test/run-text-check.cmake",
+                ],
+                "t",
+            )
+        self.assertIn("EXTRA", str(caught.exception))
+
+
 class PathRewritingTest(unittest.TestCase):
     def test_build_tree_paths_become_placeholders_and_register_assets(self) -> None:
         _, assets = bundle_tests.convert(_payload(), BUILD)
@@ -407,6 +490,22 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("100% tests passed", proc.stdout)
 
+    def test_forbid_text_absent_passes(self) -> None:
+        """issue #268's MODE=FORBID: a zero-exit test where the forbidden text does not
+        appear in the output passes."""
+        self.write_manifest([self.spec("t-forbid-ok", "ok", forbid_text="expected_marker_here")])
+        proc = self.run_bundle()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("100% tests passed", proc.stdout)
+
+    def test_forbid_text_present_is_red(self) -> None:
+        """The mirror image: the forbidden text DOES appear, so the test must fail even
+        though the process exited zero."""
+        self.write_manifest([self.spec("t-forbid-bad", "ok", forbid_text="all good")])
+        proc = self.run_bundle()
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("forbidden text", proc.stdout)
+
     def test_negative_control_that_fails_for_the_wrong_reason_is_red(self) -> None:
         self.write_manifest(
             [
@@ -479,6 +578,7 @@ class RunnerTest(unittest.TestCase):
             timeout=1.0,
             expect_nonzero=False,
             expect_text=None,
+            forbid_text=None,
             labels=(),
         )
         env = run_test_bundle.build_environment(

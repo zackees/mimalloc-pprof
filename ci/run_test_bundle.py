@@ -10,12 +10,14 @@ a glance.
                                           [--timeout-scale F] [--junit out.xml]
                                           [--compare-junit ctest.xml]
 
-The three semantics that are not just "run it and check the exit code":
+The semantics that are not just "run it and check the exit code":
 
   * `expect_nonzero` -- the negative controls lowered from test/run-negative.cmake must
     fail. A zero exit is a test failure.
   * `expect_text` -- with it, the expected substring must appear in the combined
     stdout+stderr, so a control that fails for the *wrong* reason is still red.
+  * `forbid_text` -- with it, the substring must NOT appear (issue #268's
+    test/run-text-check.cmake MODE=FORBID), the mirror image of `expect_text`.
   * a timeout is always a failure, `expect_nonzero` included. run-negative.cmake says so
     in as many words ("timed out instead of failing fast"), and a hung negative control
     proves nothing.
@@ -61,6 +63,7 @@ class TestSpec:
     timeout: float
     expect_nonzero: bool
     expect_text: str | None
+    forbid_text: str | None
     labels: tuple[str, ...]
 
 
@@ -112,6 +115,7 @@ def load_manifest(bundle: Path) -> list[TestSpec]:
         )
         cwd = entry.get("cwd")
         expect_text = entry.get("expect_text")
+        forbid_text = entry.get("forbid_text")
         specs.append(
             TestSpec(
                 name=name,
@@ -121,6 +125,7 @@ def load_manifest(bundle: Path) -> list[TestSpec]:
                 timeout=timeout,
                 expect_nonzero=entry.get("expect_nonzero") is True,
                 expect_text=expect_text if isinstance(expect_text, str) else None,
+                forbid_text=forbid_text if isinstance(forbid_text, str) else None,
                 labels=tuple(_str_list(entry.get("labels"))),
             )
         )
@@ -198,6 +203,14 @@ def run_one(
             False,
             elapsed,
             f"expected text {spec.expect_text!r} not found in output",
+            combined,
+        )
+    if spec.forbid_text is not None and spec.forbid_text in combined:
+        return TestResult(
+            spec.name,
+            False,
+            elapsed,
+            f"forbidden text {spec.forbid_text!r} found in output",
             combined,
         )
     return TestResult(spec.name, True, elapsed, "", combined)

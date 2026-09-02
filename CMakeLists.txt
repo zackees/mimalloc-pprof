@@ -43,6 +43,8 @@ option(MI_OPT_FREE_SMALL    "Use optimized `mi_free_small` without pagemap looku
 option(MI_PADDING           "Enable padding to detect heap block overflow (always on in DEBUG or SECURE mode, or with Valgrind/ASAN)" OFF)
 option(MI_NO_PADDING        "Force no use of padding even in DEBUG mode etc." OFF)
 option(MI_SKIP_COLLECT_ON_EXIT "Skip collecting memory on program exit" OFF)
+# imported from oven-sh/mimalloc @ 942b8342, MIT -- see #268.
+option(MI_NO_PROCESS_DETACH "Skip automatic mi_process_done at process exit (embedder calls it manually or not at all)" OFF)
 option(MI_NO_THP            "Disable transparent huge pages support on Linux/Android for the mimalloc process only" OFF)
 option(MI_EXTRA_CPPDEFS     "Extra pre-processor definitions (use as `-DMI_EXTRA_CPPDEFS=\"opt1=val1;opt2=val2\"`)" "")
 option(MI_SEE_ASM           "Generate assembly files" OFF)
@@ -356,6 +358,12 @@ endif()
 if (MI_SKIP_COLLECT_ON_EXIT)
   message(STATUS "Skip collecting memory on program exit (MI_SKIP_COLLECT_ON_EXIT=ON)")
   list(APPEND mi_defines MI_SKIP_COLLECT_ON_EXIT=1)
+endif()
+
+# imported from oven-sh/mimalloc @ 942b8342, MIT -- see #268.
+if (MI_NO_PROCESS_DETACH)
+  message(STATUS "Skip automatic mi_process_done at process exit (MI_NO_PROCESS_DETACH=ON)")
+  list(APPEND mi_defines MI_NO_PROCESS_DETACH=1)
 endif()
 
 if(MI_NO_DEBUG)
@@ -992,6 +1000,62 @@ if (MI_BUILD_TESTS)
   endif()
   add_test(NAME test-subproc-lifecycle COMMAND mimalloc-test-subproc-lifecycle)
   set_tests_properties(test-subproc-lifecycle PROPERTIES TIMEOUT 600)
+
+  # MI_NO_PROCESS_DETACH (issue #268, Bun parity P3): imported from
+  # oven-sh/mimalloc @ 942b8342, MIT. The same test source is built and run twice --
+  # once against the normal library (the automatic exit path runs and "process done"
+  # must appear under MIMALLOC_VERBOSE=1), once against a dedicated static library
+  # compiled with MI_NO_PROCESS_DETACH=1 (the automatic exit path is skipped and
+  # "process done" must NOT appear). The define has to be baked into the library build
+  # itself -- it guards src/init.c's _mi_auto_process_done and src/prim/prim.c's
+  # destructor registration, not anything in the test source -- so this needs its own
+  # static-lib target rather than just a per-test compile definition. Requires
+  # MI_BUILD_STATIC (skipped, e.g., under the MI_BUILD_STATIC=OFF shared-lib CI job;
+  # every other c-unit job builds static by default and covers this).
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-no-process-detach test/test-no-process-detach.c)
+    target_compile_definitions(mimalloc-test-no-process-detach PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-no-process-detach PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-no-process-detach PRIVATE include)
+    target_link_libraries(mimalloc-test-no-process-detach PRIVATE mimalloc-static ${mi_libraries})
+    # ctest's PASS_REGULAR_EXPRESSION/FAIL_REGULAR_EXPRESSION have no bundle equivalent
+    # (ci/bundle_tests.py's SUPPORTED_PROPERTIES refuses them outright, issue #277) --
+    # use the run-negative.cmake-style `cmake -P` harness instead, which the bundler
+    # already knows how to lower. ENVIRONMENT is set via the ctest property, not a
+    # script variable: ctest sets it on the `cmake -P` process, execute_process()
+    # inherits it, and the bundler already lowers ENVIRONMENT for any command shape.
+    add_test(
+      NAME test-no-process-detach-runs
+      COMMAND ${CMAKE_COMMAND}
+        -DTEST_EXE=$<TARGET_FILE:mimalloc-test-no-process-detach>
+        "-DEXPECTED_TEXT=process done"
+        -DMODE=REQUIRE
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run-text-check.cmake)
+    set_tests_properties(test-no-process-detach-runs PROPERTIES ENVIRONMENT "MIMALLOC_VERBOSE=1")
+
+    add_library(mimalloc-static-no-detach STATIC EXCLUDE_FROM_ALL ${mi_sources})
+    set_property(TARGET mimalloc-static-no-detach PROPERTY POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(mimalloc-static-no-detach PRIVATE ${mi_defines} MI_STATIC_LIB MI_NO_PROCESS_DETACH=1)
+    target_compile_options(mimalloc-static-no-detach PRIVATE ${mi_cflags} ${mi_cflags_static})
+    target_link_libraries(mimalloc-static-no-detach PRIVATE ${mi_libraries})
+    target_include_directories(mimalloc-static-no-detach PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    )
+
+    add_executable(mimalloc-test-no-process-detach-skip test/test-no-process-detach.c)
+    target_compile_definitions(mimalloc-test-no-process-detach-skip PRIVATE ${mi_defines} MI_NO_PROCESS_DETACH=1)
+    target_compile_options(mimalloc-test-no-process-detach-skip PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-no-process-detach-skip PRIVATE include)
+    target_link_libraries(mimalloc-test-no-process-detach-skip PRIVATE mimalloc-static-no-detach ${mi_libraries})
+    add_test(
+      NAME test-no-process-detach-skipped
+      COMMAND ${CMAKE_COMMAND}
+        -DTEST_EXE=$<TARGET_FILE:mimalloc-test-no-process-detach-skip>
+        "-DEXPECTED_TEXT=process done"
+        -DMODE=FORBID
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run-text-check.cmake)
+    set_tests_properties(test-no-process-detach-skipped PROPERTIES ENVIRONMENT "MIMALLOC_VERBOSE=1")
+  endif()
 
   # libFuzzer harnesses (issue #87). Off by default and clang-only: -fsanitize=fuzzer
   # is a clang feature, and these are driven by the fuzz CI job rather than ctest --

@@ -119,6 +119,7 @@ class BundledTest:
     timeout: float = DEFAULT_TIMEOUT_SECONDS
     expect_nonzero: bool = False
     expect_text: str | None = None
+    forbid_text: str | None = None
     labels: list[str] = field(default_factory=list[str])
 
     def to_json(self) -> dict[str, object]:
@@ -130,6 +131,7 @@ class BundledTest:
             "timeout": self.timeout,
             "expect_nonzero": self.expect_nonzero,
             "expect_text": self.expect_text,
+            "forbid_text": self.forbid_text,
             "labels": list(self.labels),
         }
 
@@ -143,6 +145,7 @@ class _Lowered:
     timeout: float | None = None
     expect_nonzero: bool = False
     expect_text: str | None = None
+    forbid_text: str | None = None
 
 
 # --------------------------------------------------------------------------------------
@@ -178,14 +181,9 @@ def _split_env_assignments(tokens: Sequence[str], test_name: str) -> tuple[dict[
     raise BundleError(f"{test_name}: `cmake -E env` has no command after its assignments")
 
 
-def _lower_run_negative(tokens: Sequence[str], test_name: str) -> _Lowered:
-    """Lower `cmake -D... -P .../run-negative.cmake` into manifest fields.
-
-    Mirrors test/run-negative.cmake exactly: run TEST_EXE (with optional TEST_ARG) under a
-    10 s timeout, require a non-zero exit, and require EXPECTED_TEXT somewhere in the
-    combined stdout+stderr. A timeout is a *failure*, not a pass -- the script's own words
-    are "negative control timed out instead of failing fast".
-    """
+def _parse_dash_d_p(tokens: Sequence[str], test_name: str) -> tuple[dict[str, str], str | None]:
+    """Parse a `-Dkey=value ... -P script` token stream shared by every `cmake -P` harness
+    this bundler understands. Any other token shape is refused outright."""
     defines: dict[str, str] = {}
     script: str | None = None
     index = 0
@@ -204,11 +202,17 @@ def _lower_run_negative(tokens: Sequence[str], test_name: str) -> _Lowered:
             raise BundleError(
                 f"{test_name}: unsupported token {token!r} in a `cmake -P` command line"
             )
-    if script is None or PurePosixPath(script.replace("\\", "/")).name != "run-negative.cmake":
-        raise BundleError(
-            f"{test_name}: only test/run-negative.cmake is understood as a `cmake -P` "
-            f"harness, got {script!r}"
-        )
+    return defines, script
+
+
+def _lower_run_negative(defines: dict[str, str], test_name: str) -> _Lowered:
+    """Lower `cmake -D... -P .../run-negative.cmake` into manifest fields.
+
+    Mirrors test/run-negative.cmake exactly: run TEST_EXE (with optional TEST_ARG) under a
+    10 s timeout, require a non-zero exit, and require EXPECTED_TEXT somewhere in the
+    combined stdout+stderr. A timeout is a *failure*, not a pass -- the script's own words
+    are "negative control timed out instead of failing fast".
+    """
     exe = defines.get("TEST_EXE")
     expected = defines.get("EXPECTED_TEXT")
     if not exe or not expected:
@@ -228,6 +232,50 @@ def _lower_run_negative(tokens: Sequence[str], test_name: str) -> _Lowered:
         timeout=NEGATIVE_TIMEOUT_SECONDS,
         expect_nonzero=True,
         expect_text=expected,
+    )
+
+
+def _lower_run_text_check(defines: dict[str, str], test_name: str) -> _Lowered:
+    """Lower `cmake -D... -P .../run-text-check.cmake` into manifest fields (issue #268).
+
+    Mirrors test/run-text-check.cmake: run TEST_EXE under a 10 s timeout, require a *zero*
+    exit (the opposite contract from run-negative.cmake), and either require or forbid
+    EXPECTED_TEXT in the combined stdout+stderr depending on MODE. ENVIRONMENT is not a
+    script variable here -- it is lowered separately from the ctest ENVIRONMENT property,
+    which the `cmake -P` process inherits down to execute_process() same as any other
+    command shape.
+    """
+    exe = defines.get("TEST_EXE")
+    expected = defines.get("EXPECTED_TEXT")
+    mode = defines.get("MODE")
+    if not exe or not expected or mode not in ("REQUIRE", "FORBID"):
+        raise BundleError(
+            f"{test_name}: run-text-check.cmake needs TEST_EXE, EXPECTED_TEXT and "
+            f"MODE=REQUIRE|FORBID, got {sorted(defines)}"
+        )
+    unknown = sorted(set(defines) - {"TEST_EXE", "EXPECTED_TEXT", "MODE"})
+    if unknown:
+        raise BundleError(f"{test_name}: unrecognised run-text-check.cmake variables {unknown}")
+    return _Lowered(
+        argv=[exe],
+        timeout=NEGATIVE_TIMEOUT_SECONDS,
+        expect_nonzero=False,
+        expect_text=expected if mode == "REQUIRE" else None,
+        forbid_text=expected if mode == "FORBID" else None,
+    )
+
+
+def _lower_cmake_script(tokens: Sequence[str], test_name: str) -> _Lowered:
+    """Lower a `cmake -D... -P <script>` command, dispatching on the script's basename."""
+    defines, script = _parse_dash_d_p(tokens, test_name)
+    script_name = PurePosixPath(script.replace("\\", "/")).name if script else None
+    if script_name == "run-negative.cmake":
+        return _lower_run_negative(defines, test_name)
+    if script_name == "run-text-check.cmake":
+        return _lower_run_text_check(defines, test_name)
+    raise BundleError(
+        f"{test_name}: only test/run-negative.cmake and test/run-text-check.cmake are "
+        f"understood as a `cmake -P` harness, got {script!r}"
     )
 
 
@@ -253,7 +301,7 @@ def lower_command(command: Sequence[str], test_name: str) -> _Lowered:
             f"{test_name}: `cmake -E {mode}` is not a shape this bundler lowers (only "
             f"`cmake -E env`)"
         )
-    return _lower_run_negative(rest, test_name)
+    return _lower_cmake_script(rest, test_name)
 
 
 # --------------------------------------------------------------------------------------
@@ -440,6 +488,7 @@ def convert(payload: object, build_dir: Path) -> tuple[list[BundledTest], dict[s
                 timeout=timeout,
                 expect_nonzero=expect_nonzero,
                 expect_text=lowered.expect_text,
+                forbid_text=lowered.forbid_text,
                 labels=_str_list(properties.get("LABELS")),
             )
         except BundleError as exc:

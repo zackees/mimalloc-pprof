@@ -679,6 +679,10 @@ void mi_cdecl mi_process_done(void) mi_attr_noexcept {
 
 // Called automatically when the process is done (cdecl as it is used with `at_exit` on some platforms)
 void mi_cdecl _mi_auto_process_done(void) mi_attr_noexcept {
+  // imported from oven-sh/mimalloc @ 942b8342, MIT -- see #268.
+  #ifdef MI_NO_PROCESS_DETACH
+  return;   // fork: the embedder tears down explicitly or not at all; touching allocator state this late is unsafe under other static destructors
+  #endif
   if (_mi_option_get_fast(mi_option_destroy_on_exit)>=2) return;  // allow disabling auto process done
   mi_process_done();
 }

@@ -17,7 +17,14 @@
    Same policy as Go/tcmalloc. Every drop cause (record-alloc failure, stack-intern failure,
    including the MI_PROF_STACK_CAP cap) is counted in mi_prof_stats_t.dropped_samples (v2);
    cap overflows are additionally broken out in stack_table_overflows, so
-   dropped_samples >= stack_table_overflows always. */
+   dropped_samples >= stack_table_overflows always.
+
+   ## MI_NO_PROCESS_DETACH interaction
+
+   MIMALLOC_PROF_DUMP_AT_EXIT (and MIMALLOC_DHAT_DUMP_AT_EXIT, see dhat.h) fire from the
+   automatic process-exit path (_mi_auto_process_done), which a build configured with
+   MI_NO_PROCESS_DETACH skips entirely. An embedder using MI_NO_PROCESS_DETACH must call
+   mi_prof_dump / mi_dhat_dump themselves before exit, or no dump is written. */
 #pragma once
 #ifndef MIMALLOC_PROFILE_H
 #define MIMALLOC_PROFILE_H

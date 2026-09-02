@@ -739,6 +739,11 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   if (buf_len > ULONG_MAX) return false;
   mi_atomic_do_once {
     bool hDllFree;
+    // mi_win_getlibrary's GetModuleHandleW path (mirrors Bun) returns the module handle
+    // without incrementing its refcount, unlike LoadLibrary. We never FreeLibrary it either
+    // way (see below), so that is fine here -- but it does mean the handle stays valid only
+    // because *we* never release it; if some other, unrelated FreeLibrary call in the host
+    // process were to unload bcryptprimitives.dll from under us, pProcessPrng would dangle.
     HINSTANCE hDll = mi_win_getlibrary(L"bcryptprimitives.dll", &hDllFree);
     if (hDll != NULL) {
       pProcessPrng = (PProcessPrng)(void (*)(void))GetProcAddress(hDll, "ProcessPrng");

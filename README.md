@@ -64,7 +64,7 @@ not sample until you call a start API or set `MIMALLOC_PROF=1`.
 - [Quick start](#quick-start)
 - [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, TCMalloc, and jemalloc
 - [Why use this fork](#why-use-this-fork) — the most tested mimalloc fork in existence
-- [Returning memory faster: scavenger and hole purging](#returning-memory-faster-scavenger-and-hole-purging) — a measured chart of peak RSS, off vs on
+- [Returning memory faster: scavenger and hole purging](#returning-memory-faster-scavenger-and-hole-purging) — measured resident memory after idle, off vs on
 - [Choosing a version: v2 or v3](#choosing-a-version-v2-or-v3)
 - [Profiling and observability](#profiling-and-observability) — sampled pprof, exact stats, DHAT, memory events
 - [Upstream bugs found and fixed](#upstream-bugs-found-and-fixed) — including two unbounded memory leaks
@@ -445,8 +445,9 @@ still-used page instead, one OS page at a time, via `MADV_DONTNEED` /
 list is rebuilt before anything is discarded. It costs the malloc/free fast path
 nothing (default on, `MIMALLOC_PURGE_HOLES`; pacing via
 `MIMALLOC_PURGE_HOLES_MIN_INTERVAL`, default 100 ms; `MIMALLOC_PURGE_HOLES_EAGER_ZERO`
-is a debug-only test knob). Query it live with `mi_purge_holes_stats_get` /
-`mi_purge_holes_report`.
+is a test knob, always on when `MI_DEBUG>1`, that zeroes a range before discarding it
+so a mis-scoped discard corrupts visibly rather than silently). Query it live with
+`mi_purge_holes_stats_get` / `mi_purge_holes_report`.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-rss-dark.svg" />
@@ -460,26 +461,29 @@ is a debug-only test knob). Query it live with `mi_purge_holes_stats_get` /
   <img alt="Hole purging characteristics of the churn workload" src=".github/assets/hole-purging-table-light.svg" width="100%" />
 </picture>
 
-Both were measured with [`ci/bench_hole_purging.py`](ci/bench_hole_purging.py): 150k
-512 B + 100k 1 KiB + 50k 2 KiB blocks, a scattered 1-in-20 kept alive, then idled for
-10 s calling `mi_on_thread_idle()` every 100 ms — median of 3 runs, pinned to 4 CPUs.
-
-| | hole purging off | hole purging on |
-|---|---:|---:|
-| resident memory before idle (peak) | 280.3 MB | 280.3 MB |
-| resident memory after idle (median of 3) | 230.7 MB | 73.2 MB |
+Both were measured at commit `be13eadf` with
+[`ci/bench_hole_purging.py`](ci/bench_hole_purging.py): 150k 512 B + 100k 1 KiB +
+50k 2 KiB blocks, a scattered 1-in-20 kept alive, then idled for 10 s calling
+`mi_on_thread_idle()` every 100 ms — median of 3 runs, pinned to 4 CPUs. The table's
+size-class breakdown, `discardable-vs-OS-page-size` curve and per-run text report are
+in [`.github/assets/hole-purging-report.json`](.github/assets/hole-purging-report.json);
+some counters `mi_purge_holes_stats_t` does not expose (a sweep count split by
+owner vs. scavenger thread, why-ineligible buckets, `min_interval` pacing skips) are
+not in the table because there is nothing to read them from.
 
 For comparison, the PR #302 description measured Bun's own workload shape
 (400k blocks, min of 5 runs): peak RSS went **210.0 MB → 105.0 MB**, and
 single-threaded alloc/free latency was unchanged within noise across three
 independent rounds (the free path gains no new code in a release build — the only
-addition sits inside the debug-only `MI_CHECK_DOUBLE_FREE` path). The one real cost
-is `sizeof(mi_page_t)` growing 144 → 192 bytes, all of it appended at the tail.
+addition sits inside the `MI_CHECK_DOUBLE_FREE` path, debug/secure builds only). The
+one real cost is `sizeof(mi_page_t)` growing 144 → 192 bytes, all of it appended at
+the tail.
 
 Ported from [oven-sh/mimalloc @ `942b8342`](https://github.com/oven-sh/mimalloc),
-MIT; the engine lives in `src/page-holes.c`, with the sweep drivers in
-`src/scavenger.c` / `src/theap.c`. More detail, including the options reference,
-is in [docs/c-integration.md](docs/c-integration.md#scavenger-and-hole-purging).
+MIT; the engine, including the sweep drivers, is `src/page-holes.c`, invoked from
+the idle sweep in `src/scavenger.c` (`src/page.c` and `src/theap.c` carry only a
+handful of hook calls). More detail, including the options reference, is in
+[docs/c-integration.md](docs/c-integration.md#scavenger-and-hole-purging).
 
 ---
 

@@ -124,6 +124,18 @@ static void churn(intptr_t tid) {
 #ifdef __cplusplus
 #include <atomic>
 extern "C" std::atomic<uintptr_t> mi_debug_stall_in_heap_delete_claim;
+#elif defined(_MSC_VER) && !(defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__))
+// MSVC C compilation without `/std:c11 /experimental:c11atomics` (not set here): <stdatomic.h>
+// exists but its vcruntime_c11_stdatomic.h #errors "C atomic support is not enabled" (same
+// condition as include/mimalloc/atomic.h's own MI_HAS_C11_ATOMICS detection, inlined here).
+// The real definition (src/arena.c) goes through that same header's `_Atomic(tp)` macro,
+// which on this exact branch resolves to plain `tp` (mimalloc's internal MSVC-C wrapper
+// always accesses it via explicit mi_atomic_* calls, never a bare operator) -- a `volatile`
+// qualification here is a stricter, compiler-visible-reordering-safe declaration than that
+// plain type, and only affects how *this* file's own bare `=`/comparison accesses below are
+// codegen'd (same treatment as this file's own `pin_heap`/`pin_block`), not the ABI/layout
+// two TUs must agree on for `extern`.
+extern volatile uintptr_t mi_debug_stall_in_heap_delete_claim;
 #else
 #include <stdatomic.h>
 extern _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;

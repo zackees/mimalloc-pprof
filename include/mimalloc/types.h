@@ -802,6 +802,12 @@ struct mi_tld_s {
   // on a thread allocates -- re-entering the collect that is reading it, without bound
   // (oven-sh/bun#38051). Plain (non-atomic) fields: only the one thread doing the sweep -- the
   // owner, or the scavenger holding this tld in MI_PARK_SWEEPING -- ever touches them.
+  // If one of these ever DOES need to be atomic, declare it `_Atomic(size_t)`, never
+  // `_Atomic(uint32_t)`: MSVC's plain-C atomic wrapper (`mimalloc/atomic.h`) only implements
+  // uintptr_t/int64_t-width primitives, so `mi_atomic_load_*` on a 32-bit field issues an
+  // 8-byte `__iso_volatile_load64` and reads the next field into the high half (C4133). The
+  // process-wide hole counters in `src/page-holes.c` are `int64_t` for the same reason -- they
+  // go through `mi_atomic_addi64_relaxed`, the 64-bit primitive, exactly as `mi_stat_counter_t`.
   size_t                holes_sweep_seq;      // idle sweeps of this thread's heaps so far (`purge_holes_full_every`)
   mi_msecs_t            holes_sweep_last;     // when the last one ran (`purge_holes_min_interval` pacing)
   bool                  holes_sweeping;       // a sweep of this thread's heaps is in progress right now

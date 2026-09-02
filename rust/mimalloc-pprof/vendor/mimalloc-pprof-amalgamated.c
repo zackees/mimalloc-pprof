@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 9f953225 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 73f22a43 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4217,6 +4217,10 @@ void          _mi_options_init(void);
 void          _mi_options_post_init(void);
 long          _mi_option_get_fast(mi_option_t option);
 void          _mi_error_message(int err, const char* fmt, ...);
+// #270: fork-safety -- quiesce/reset `out_buf_lock` around fork(). See subproc.c's lock-order block.
+void          _mi_options_fork_prepare(void);
+void          _mi_options_fork_parent(void);
+void          _mi_options_fork_child(void);
 
 // random.c
 void          _mi_random_init(mi_random_ctx_t* ctx);
@@ -4244,6 +4248,15 @@ mi_subproc_t* _mi_subproc(void);          // current subproc of this thread
 mi_heap_t*    _mi_subproc_heap_main(mi_subproc_t* subproc);
 mi_subproc_t* _mi_subproc_from_id(mi_subproc_id_t subproc_id);
 void          _mi_subprocs_unsafe_destroy_all(void);
+
+// #270: pthread_atfork fork-safety handlers (POSIX only; registered once in init.c's
+// mi_process_init_once). See the lock-order block at the top of subproc.c for the full
+// contract; the three functions below are the pthread_atfork prepare/parent/child
+// callbacks, also invoked (nested-call-safe via an internal depth counter) from the
+// macOS malloc-zone force_lock/force_unlock/reinit_lock callbacks (alloc-override-zone.c).
+void          _mi_process_fork_prepare(void);
+void          _mi_process_fork_parent(void);
+void          _mi_process_fork_child(void);
 
 void*         _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid );
 void*         _mi_meta_rezalloc( mi_subproc_t* subproc, void* p, size_t newsize, mi_memid_t* memid );
@@ -4316,6 +4329,12 @@ bool          _mi_thread_local_set(  mi_thread_local_t key, void* val );
 void*         _mi_thread_local_get(  mi_thread_local_t key );
 void          _mi_thread_locals_init(void);
 void          _mi_thread_locals_done(void);
+// #270: fork-safety -- quiesce/reset `mi_thread_locals_lock` around fork(). Imported
+// (design, not code) from oven-sh/mimalloc @ 942b8342, MIT (threadlocal.c's
+// `_mi_thread_locals_fork_prepare/parent/child`).
+void          _mi_thread_locals_fork_prepare(void);
+void          _mi_thread_locals_fork_parent(void);
+void          _mi_thread_locals_fork_child(void);
 void          _mi_thread_locals_thread_done(void);
 
 // arena.c
@@ -4447,6 +4466,12 @@ bool        _mi_prof_maps_append(_mi_prof_dump_append_fun* append, void* arg);
 bool        _mi_prof_maps_visit(mi_prof_module_visit_fun* visitor, void* arg);
 void        _mi_prof_process_init(void);
 void        _mi_prof_process_done(void);
+// #270: fork-safety -- quiesce/reset `prof_lock` around fork(). Child-side policy:
+// continue (profiler records are ordinary process memory, safe copy-on-write across
+// fork; only the lock itself needs resetting). See subproc.c's lock-order block.
+void        _mi_prof_fork_prepare(void);
+void        _mi_prof_fork_parent(void);
+void        _mi_prof_fork_child(void);
 
 // "memory-events.c": opt-in allocation-change accounting/callbacks (issue #20). Independent of
 // MI_PPROF: always compiled in and hooked; the runtime activation flag gates all real work.
@@ -4462,6 +4487,13 @@ void        _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size
 // from inside a memory-change callback itself.
 void        _mi_memevt_suppress_begin(void);
 void        _mi_memevt_suppress_end(void);
+// #270: fork-safety -- quiesce/reset `memevt_cb_lock` around fork(). Child-side policy:
+// continue (the callback table is ordinary process memory; handlers themselves are the
+// embedder's responsibility across fork, same as any other pthread_atfork-registered
+// library). See subproc.c's lock-order block.
+void        _mi_memevt_fork_prepare(void);
+void        _mi_memevt_fork_parent(void);
+void        _mi_memevt_fork_child(void);
 
 // "dhat.c": exact heap/lifetime observer, independent of MI_PPROF. The event
 // bracketing deliberately captures before the public callback and commits after it.
@@ -4474,6 +4506,13 @@ void        _mi_dhat_finish_event(void);
 void        _mi_dhat_process_init(void);
 void        _mi_dhat_process_done(void);
 size_t      _mi_dhat_stack_capture(void** pcs, size_t capacity);
+// #270: fork-safety -- quiesce/reset `dhat_lock` around fork(). Child-side policy:
+// continue (the live/pp tables are ordinary process memory, safe copy-on-write across
+// fork; only the lock itself needs resetting; `mi_dhat_dump` must keep working in the
+// child -- see test-fork-locks.c). See subproc.c's lock-order block.
+void        _mi_dhat_fork_prepare(void);
+void        _mi_dhat_fork_parent(void);
+void        _mi_dhat_fork_child(void);
 
 
 // ------------------------------------------------------
@@ -14608,6 +14647,9 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <string.h>  // memcpy, memset
 #include <stdlib.h>  // atexit
+#if !defined(_WIN32) && !defined(__wasi__)
+#include <pthread.h> // pthread_atfork (fork handlers, subproc.c) -- #270
+#endif
 
 // Empty page used to initialize the small free pages array
 static const mi_page_t mi_page_empty = {
@@ -15168,6 +15210,14 @@ static void mi_process_init_once(void) {
   _mi_tls_slots_init();      // pthread key create
   _mi_thread_locals_init();  // pthread key create
   _mi_process_is_initialized = true;
+
+  // #270 (Bun parity P5): register once per process, in process init -- never per heap
+  // or per thread. Bun's own history is the cautionary tale here: an earlier version
+  // registered from `mi_heap_new` and exhausted glibc's fixed-size atfork table,
+  // aborting inside BoringSSL. See the lock-order block at the top of subproc.c.
+  #if !defined(_WIN32) && !defined(__wasi__)
+  pthread_atfork(&_mi_process_fork_prepare, &_mi_process_fork_parent, &_mi_process_fork_child);
+  #endif
 
   #if defined(_WIN32) && defined(MI_WIN_INIT_USE_FLS)
   // On windows, when building as a static lib the FLS cleanup happens to early for the main thread.
@@ -16015,6 +16065,19 @@ static void*                 memevt_args[MI_MEMORY_CHANGE_COUNT];
 // in that window; see its comment in init.c). No-op on NULL rather than crash either way.
 void _mi_memevt_suppress_begin(void) { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth++; }
 void _mi_memevt_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth--; }
+
+// #270: fork-safety. Child-side policy: CONTINUE. `memevt_cb_lock` only ever guards a
+// snapshot-copy of the callback table (see the comment above its declaration) and, per
+// that same comment, is never held while a user handler runs -- so it is one of the
+// "never held across an allocation" locks and does not need to sit before
+// `arena_reserve_lock` in the documented order (subproc.c), though quiescing it early
+// alongside the other global hook locks costs nothing and keeps the order simple. The
+// registered handlers themselves are the embedder's own responsibility across fork
+// (same as any other pthread_atfork-registered library) -- mimalloc does not know how to
+// make an arbitrary user callback fork-safe. Only the lock is reset.
+void _mi_memevt_fork_prepare(void) { mi_lock_acquire(&memevt_cb_lock); }
+void _mi_memevt_fork_parent(void)  { mi_lock_release(&memevt_cb_lock); }
+void _mi_memevt_fork_child(void)   { mi_lock_init(&memevt_cb_lock); }
 
 // ---------------------------------------------------------------------------------------
 // Lazy activation.
@@ -17033,6 +17096,15 @@ bool mi_dhat_dump(const char* path) mi_attr_noexcept {
 }
 void _mi_dhat_process_init(void) { dhat_resolve_env(); }
 void _mi_dhat_process_done(void) { if (dhat_dump_at_exit[0] != 0) { const bool dumped = mi_dhat_dump(dhat_dump_at_exit); MI_UNUSED(dumped); } }
+
+// #270: fork-safety. Child-side policy (decided here; DHAT predates the fork handlers
+// too): CONTINUE, for the same reason as the profiler (see profile.c's matching
+// comment) -- the live/pp tables are process memory that survives fork() by ordinary
+// copy-on-write, and `mi_dhat_dump` must keep working in the child (test-fork-locks.c
+// checks this). Only `dhat_lock` needs resetting.
+void _mi_dhat_fork_prepare(void) { mi_lock_acquire(&dhat_lock); }
+void _mi_dhat_fork_parent(void)  { mi_lock_release(&dhat_lock); }
+void _mi_dhat_fork_child(void)   { mi_lock_init(&dhat_lock); }
 /* ---- end inlined: src/dhat.c ---- */
 /* ---- begin inlined: src/dhat-stack.c ---- */
 /* Allocation-free stack capture for the exact DHAT observer. Kept separate from
@@ -17471,6 +17543,14 @@ static void mi_cdecl mi_out_buf(const char* msg, void* arg) {
     }
   }
 }
+
+// #270: fork-safety. `out_buf_lock`'s critical section is a plain memcpy into a fixed
+// buffer -- it never calls back into the allocator -- so in the documented lock order
+// (subproc.c) it is always the innermost lock: acquired last in prepare, released first
+// in parent.
+void _mi_options_fork_prepare(void) { mi_lock_acquire(&out_buf_lock); }
+void _mi_options_fork_parent(void)  { mi_lock_release(&out_buf_lock); }
+void _mi_options_fork_child(void)   { mi_lock_init(&out_buf_lock); }
 
 static void mi_out_buf_flush(mi_output_fun* out, bool no_more_buf, void* arg) {
   if (out==NULL) return;
@@ -21986,6 +22066,23 @@ void _mi_prof_process_done(void) {
     MI_UNUSED(dumped);
   }
 }
+
+// #270: fork-safety. Child-side policy (decided here, not ported from Bun -- their fork
+// handlers predate the profiler): CONTINUE. Every profiler record, chunk, and stack is
+// allocated from the raw-OS-layer arena (`_mi_prof_arena_alloc`, rule 4), never from a
+// hooked path, so it is ordinary process memory that survives fork() by plain
+// copy-on-write -- nothing about it is thread-affine. Only `prof_lock` itself can be
+// left in a locked state by a thread that did not survive the fork, so only the lock is
+// reset. `mi_prof_dump`/`mi_prof_start`/`mi_prof_stop` all keep working in the child
+// (see test-fork-locks.c's `mi_prof_dump` check) since they only ever touch this lock
+// plus the (intact) records. `prof_lock` can be held across a user-supplied
+// `mi_prof_visit`/`mi_prof_snapshot_visit` callback that may itself allocate (see the
+// `prof_lock_owner` reentrancy comment above), so per the documented lock order
+// (subproc.c) it is one of the "held across an allocation" locks and is quiesced before
+// any per-subprocess allocation lock (heaps_lock, arena_reserve_lock, ...).
+void _mi_prof_fork_prepare(void) { mi_lock_acquire(&prof_lock); }
+void _mi_prof_fork_parent(void)  { mi_lock_release(&prof_lock); }
+void _mi_prof_fork_child(void)   { mi_lock_init(&prof_lock); }
 void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size) {
   // #266: never sample allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
   // _mi_meta_zalloc onto subproc->theap_meta). These are large (sizeof(mi_theap_t) is
@@ -22133,6 +22230,10 @@ bool mi_prof_snapshot_visit(const mi_prof_snapshot_t* snap, mi_prof_visit_fun* v
 void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { MI_UNUSED(snap); }
 void _mi_prof_process_init(void) { }
 void _mi_prof_process_done(void) { }
+// #270: no `prof_lock` exists when MI_PPROF is off -- nothing to quiesce.
+void _mi_prof_fork_prepare(void) { }
+void _mi_prof_fork_parent(void)  { }
+void _mi_prof_fork_child(void)   { }
 #endif
 /* ---- end inlined: src/profile.c ---- */
 #if MI_PPROF
@@ -23619,6 +23720,96 @@ terms of the MIT license. A copy of the license can be found in the file
 -----------------------------------------------------------------------------*/
 
 
+/* -----------------------------------------------------------
+  #270 (Bun parity P5): pthread_atfork fork-safety handlers.
+
+  fork() from a multithreaded process only clones the calling thread; every other
+  thread simply vanishes in the child, taking whatever locks it happened to hold with
+  it. If any mimalloc-internal lock was locked by a thread other than the one calling
+  fork() at the moment of the fork, the child inherits it permanently locked and its
+  first allocation that touches that lock hangs forever. `pthread_atfork` (registered
+  once in `src/init.c`'s `mi_process_init_once`, POSIX only -- see the platform guard
+  there) gives us three callbacks around every fork(): `prepare` runs in the parent
+  just before the actual fork and must acquire every lock that could otherwise be held
+  by some other thread; `parent` runs in the parent immediately after and must release
+  them in the reverse order (so the parent process never observes anything different
+  from a world where fork() were a no-op); `child` runs instead in the (now
+  single-threaded) child and must put every one of those locks back into a fresh,
+  unlocked state. The child uses `mi_lock_init`, never `mi_lock_release`: the lock
+  state copied from the parent does not correspond to *this* thread being the logical
+  owner, and `mi_lock_init` also resets the `MI_DEBUG>2` reentrancy checker's
+  `debug_owner` field (diagnostic.c's `_mi_lock_debug_init`), so the child's first real
+  acquire is never flagged as "owner not cleared" against a parent-side thread id that
+  no longer exists here -- thread ids can (and on some platforms do) get reused, so a
+  `mi_lock_release`-only reset would be a false-negative waiting to happen, not just an
+  asymmetry.
+
+  Nested-call safety: on macOS the malloc-zone `force_lock`/`force_unlock`/
+  `reinit_lock` callbacks (src/prim/osx/alloc-override-zone.c) call the very same three
+  functions below, and the system can invoke both the zone callbacks and
+  `pthread_atfork` for one actual fork(). `mi_fork_depth` (a PER-THREAD, `mi_decl_thread`
+  reentrancy count -- not a shared atomic, see its declaration below for why) makes
+  `_mi_process_fork_prepare/parent/child` idempotent under that double call: only the
+  outermost `prepare`/`parent` pair on a given thread does real work, and `child` does
+  its reset exactly once no matter how many registered mechanisms invoke it for the
+  same fork. `mi_fork_serialize_lock` is the separate piece that gives TRUE
+  cross-thread exclusion: glibc does not serialize fork() calls made concurrently by
+  different threads of the same process, so this lock (acquired once per thread's
+  outermost `prepare`, released once per thread's outermost `parent`/`child`) is what
+  guarantees only one thread's prepare/parent/child sequence -- and therefore only one
+  attempt to acquire the locks below -- is ever in flight process-wide at a time.
+
+  Ported design (not code, except where an individual block says otherwise) from
+  oven-sh/mimalloc @ 942b8342, MIT (`src/subproc.c`'s
+  `_mi_process_fork_prepare/parent/child`; Bun's own `mi_fork_depth` is a shared atomic,
+  since Bun's callers do not appear to fork() concurrently from multiple threads --
+  this tree's version is a per-thread reentrancy count plus a real mutex instead, see
+  its declaration below, after a concurrent-fork stress test reproduced a real bug in
+  the shared-atomic form). Bun's version is entangled
+  with a per-subprocess `tld` registry (`sp->tlds`/`tlds_lock`) and scavenger/park
+  state that do not exist in this tree yet -- only the lock skeleton and the
+  `threadlocal.c` handler are ported here; the resulting gap and every
+  scavenger-specific hook point are marked `// Phase 7: scavenger` below (tracked by
+  #264 item 7 / #272).
+
+  ---- Lock order (KEEP IN SYNC with `mi_subproc_fork_prepare`/`_mi_process_fork_prepare`
+  below -- `mi_fork_lock_order_assert` self-checks it in MI_DEBUG builds) ----
+  Acquired in `_mi_process_fork_prepare`, in this order; released in
+  `_mi_process_fork_parent` in the exact reverse order; reset with `mi_lock_init`
+  (order irrelevant -- nothing is acquired) in `_mi_process_fork_child`. Bun's rule,
+  kept verbatim because it is the right one: a lock that can still be held while a call
+  comes back into mimalloc (e.g. a user callback invoked under the lock allocates) must
+  be taken before `arena_reserve_lock`, and therefore before every lock that only the
+  plain allocation slow path itself takes.
+
+    1.  mi_subprocs_lock                    (subproc.c)            subprocess registry
+    2.  mi_thread_locals_lock               (threadlocal.c)        TLS slot bitmap
+    3.  prof_lock                           (profile.c, MI_PPROF)  held across mi_prof_visit/snapshot callbacks
+    4.  dhat_lock                           (dhat.c)               held across DHAT bookkeeping
+    5.  memevt_cb_lock                      (memory-events.c)      never held across a callback; quiesced here anyway
+    6.  _mi_page_map()->lock                (page-map.c)           page-map submap growth
+        for each subproc `sp` in `mi_subprocs` (newest first):
+    7.    sp->heap_main->arena_pages_lock
+    8.    sp->heaps_lock
+    9.    for each other heap `h` in `sp->heaps` (h != heap_main):
+            h->arena_pages_lock, then h->theaps_lock, then h->os_abandoned_pages_lock
+    10.   sp->heap_main->theaps_lock, then sp->heap_main->os_abandoned_pages_lock
+            // Phase 7: scavenger -- Bun also quiesces a per-subprocess `tlds` registry
+            // and its own `tlds_lock` here (walking every thread's `tld->theaps_lock`
+            // and park state). That registry does not exist yet in this tree; it lands
+            // with the scavenger (#264 item 7 / #272). `mi_tld_t::theaps_lock`
+            // (types.h, "sometimes accessed from another thread on mi_heap_free") is
+            // therefore a KNOWN GAP not covered by this phase -- see the P5 PR
+            // description and MIMALLOC_FORKS.md. It is deliberately not approximated
+            // by an ad hoc walk here: a heap's theaps list can reach the same `tld`
+            // through more than one theap (one thread, several heaps), and locking a
+            // non-recursive mutex twice would turn a currently-rare hang into a
+            // guaranteed one inside this very handler.
+    11.   sp->arena_reserve_lock
+    12.   sp->theap_meta_lock
+    13. out_buf_lock                        (options.c)            innermost: its critical section never calls back into the allocator
+----------------------------------------------------------- */
+
 // pre-allocate the main subprocess structure.
 static mi_decl_cache_align mi_subproc_t mi_process_subproc_main = mi_init_struct_zero;
 static mi_subproc_t* mi_subprocs = NULL;
@@ -23994,6 +24185,221 @@ mi_subproc_t* _mi_subproc_main_init(void) {
 
 void _mi_subproc_main_done(void) {
   mi_lock_done(&mi_subprocs_lock);
+}
+
+
+/* -----------------------------------------------------------
+  #270: pthread_atfork fork-safety handlers.
+  See the lock-order block at the top of this file.
+----------------------------------------------------------- */
+
+// Cross-thread serialization + nested-call guard.
+//
+// `pthread_atfork` and the macOS malloc-zone callbacks (alloc-override-zone.c) can
+// both fire for the SAME fork() (on the SAME thread, back to back); only the
+// outermost prepare/parent pair of that pair does real work, and child resets exactly
+// once. That part is a plain same-thread reentrancy count.
+//
+// Separately: glibc does NOT serialize fork() calls made concurrently from different
+// threads of the same process -- verified empirically (a minimal pthread_atfork
+// probe saw prepare/parent handlers for distinct, overlapping fork() calls on
+// different threads interleave essentially every time under load; see the #270 PR
+// description). If `mi_fork_depth` were a single process-wide atomic (as first
+// ported from Bun, whose design assumes only the same-thread nesting case above), two
+// threads' fork() calls landing close together can race it through 0 in a way that is
+// indistinguishable from ordinary same-thread nesting: a `_mi_process_fork_parent`
+// call left over from a fork() that returned early (because another thread's fork()
+// was already "outermost" when it ran) can then match up against a completely
+// different, currently-in-flight fork() on another thread once the counter cycles
+// back through 0 in between -- an ABA race across fork "generations", not the nested
+// same-fork case the counter was designed for. This was reproduced empirically: it
+// manifests as `internal_lock_release_by_non_owner` (diagnostic.c's MI_DEBUG>2 lock
+// owner checker correctly catching the wrong thread releasing a lock it never
+// acquired) under a multi-threaded fork-storm stress test -- see the PR description.
+//
+// The fix: `mi_fork_serialize_lock` gives TRUE cross-thread mutual exclusion around
+// one fork "generation" (only one thread's prepare/parent/child sequence is ever in
+// flight process-wide at a time; a second thread's concurrent fork() call blocks in
+// `mi_lock_acquire` below until the first finishes), while `mi_fork_depth` becomes a
+// per-thread (mi_decl_thread) reentrancy count instead of a shared atomic -- it can
+// now only ever be read/written by the one thread it belongs to, so the ABA scenario
+// above is structurally impossible: a thread only skips the real body (and skips
+// (re)acquiring `mi_fork_serialize_lock`) when ITS OWN earlier call already holds it.
+static mi_lock_t mi_fork_serialize_lock = MI_LOCK_INITIALIZER;
+static mi_decl_thread int mi_fork_depth;
+
+#if (MI_DEBUG>1)
+// #270: self-checks the documented lock order at the top of this file. Reset to 0 at
+// the start of `_mi_process_fork_prepare`; each acquire below must pass a `lvl` no
+// lower than the last one seen, or a future edit that reorders two steps (e.g. moves
+// `arena_reserve_lock` ahead of `heaps_lock`) fails loudly here instead of only under
+// a real, timing-dependent concurrent fork. `>=`, not `>`: `mi_subproc_fork_prepare`
+// legitimately calls `mi_fork_acquire(9, ...)` once per non-main heap in the walked
+// subproc (heap count is runtime-variable -- see the churn thread in
+// test-fork-locks.c, which can leave more than one live heap at fork time), and that
+// repetition is the SAME numbered step (a sub-order within one heap), not a new one --
+// see the lock-order comment block at the top of this file. A strict `>` here
+// (rejecting a lvl equal to the last one seen) is a false positive on exactly that
+// repetition, not a real ordering violation; this was caught empirically by a
+// multi-heap, multi-thread stress run (see the #270 PR description) that a
+// single-heap/single-thread run does not exercise.
+//
+// THREAD-LOCAL, defensively: `mi_fork_depth` only serializes entry into the real
+// prepare/parent/child body across NESTED calls for one fork() (the macOS zone
+// callbacks and `pthread_atfork` firing together, always the calling thread) -- it is
+// not a claim about, and this phase does not attempt to prove, full correctness under
+// genuinely CONCURRENT fork() calls from multiple application threads (glibc does not
+// serialize those either; see the PR description's "known limitation" note). Keeping
+// this tracking thread-local costs nothing and removes one possible source of
+// cross-thread interference on it regardless.
+static mi_decl_thread int mi_fork_lock_level;
+static void mi_fork_lock_order_assert(int lvl) {
+  mi_assert_internal(lvl >= mi_fork_lock_level);
+  mi_fork_lock_level = lvl;
+}
+#define mi_fork_acquire(lvl,lock)   do { mi_fork_lock_order_assert(lvl); mi_lock_acquire(lock); } while(0)
+#else
+#define mi_fork_acquire(lvl,lock)   mi_lock_acquire(lock)
+#endif
+
+// See lock-order steps 7-10 at the top of this file.
+static void mi_subproc_fork_prepare(mi_subproc_t* sp) {
+  mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
+  if (heap_main != NULL) { mi_fork_acquire(7, &heap_main->arena_pages_lock); }
+  mi_fork_acquire(8, &sp->heaps_lock);
+  for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
+    if (h == heap_main) continue;
+    mi_fork_acquire(9, &h->arena_pages_lock);
+    mi_lock_acquire(&h->theaps_lock);           // same step (9): sub-order within one heap, not a new level
+    mi_lock_acquire(&h->os_abandoned_pages_lock);
+  }
+  if (heap_main != NULL) {
+    mi_fork_acquire(10, &heap_main->theaps_lock);
+    mi_lock_acquire(&heap_main->os_abandoned_pages_lock);
+  }
+  // Phase 7: scavenger -- sp->tlds / sp->tlds_lock (per-thread tld->theaps_lock, park
+  // state) would be quiesced here once the tld registry lands. See the file comment.
+  mi_fork_acquire(11, &sp->arena_reserve_lock);
+  mi_fork_acquire(12, &sp->theap_meta_lock);
+}
+
+// Exact reverse of mi_subproc_fork_prepare.
+static void mi_subproc_fork_parent(mi_subproc_t* sp) {
+  mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
+  mi_lock_release(&sp->theap_meta_lock);
+  mi_lock_release(&sp->arena_reserve_lock);
+  // Phase 7: scavenger -- release sp->tlds_lock / per-tld locks here (see prepare).
+  if (heap_main != NULL) {
+    mi_lock_release(&heap_main->os_abandoned_pages_lock);
+    mi_lock_release(&heap_main->theaps_lock);
+  }
+  for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
+    if (h == heap_main) continue;
+    mi_lock_release(&h->os_abandoned_pages_lock);
+    mi_lock_release(&h->theaps_lock);
+    mi_lock_release(&h->arena_pages_lock);
+  }
+  mi_lock_release(&sp->heaps_lock);
+  if (heap_main != NULL) { mi_lock_release(&heap_main->arena_pages_lock); }
+}
+
+// Reset every lock this subproc could have contributed to the walk above, plus the
+// debug reentrancy-checker owner each carries (MI_DEBUG>2, see mi_lock_init). Order is
+// irrelevant here: nothing is acquired, only re-initialized.
+static void mi_subproc_fork_child(mi_subproc_t* sp) {
+  mi_lock_init(&sp->arena_reserve_lock);
+  mi_lock_init(&sp->heaps_lock);
+  mi_lock_init(&sp->theap_meta_lock);
+  // Phase 7: scavenger -- re-init sp->tlds_lock and every live tld->theaps_lock here
+  // once the tld registry exists (see the file comment's KNOWN GAP note).
+  for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
+    mi_lock_init(&h->theaps_lock);
+    mi_lock_init(&h->arena_pages_lock);
+    mi_lock_init(&h->os_abandoned_pages_lock);
+  }
+}
+
+void _mi_process_fork_prepare(void) {
+  if (!_mi_process_is_initialized) return;
+  if (mi_fork_depth == 0) {
+    // First entry for THIS thread's fork(): block until no other thread's fork
+    // generation is in flight, then become that generation ourselves.
+    mi_lock_acquire(&mi_fork_serialize_lock);
+  }
+  mi_fork_depth++;
+  if (mi_fork_depth != 1) return;  // nested call (same thread, same fork()): outermost already in progress
+  #if (MI_DEBUG>1)
+  mi_fork_lock_level = 0;
+  #endif
+  mi_fork_acquire(1, &mi_subprocs_lock);
+  _mi_thread_locals_fork_prepare();               // step 2
+  #if (MI_DEBUG>1)
+  mi_fork_lock_order_assert(2);
+  #endif
+  _mi_prof_fork_prepare();                        // step 3 (no-op when MI_PPROF is off)
+  #if (MI_DEBUG>1)
+  mi_fork_lock_order_assert(3);
+  #endif
+  _mi_dhat_fork_prepare();                        // step 4
+  #if (MI_DEBUG>1)
+  mi_fork_lock_order_assert(4);
+  #endif
+  _mi_memevt_fork_prepare();                      // step 5
+  #if (MI_DEBUG>1)
+  mi_fork_lock_order_assert(5);
+  #endif
+  mi_fork_acquire(6, &_mi_page_map()->lock);
+  for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) {
+    mi_subproc_fork_prepare(sp);
+  }
+  _mi_options_fork_prepare();                     // step 13: innermost
+  #if (MI_DEBUG>1)
+  mi_fork_lock_order_assert(13);
+  #endif
+}
+
+void _mi_process_fork_parent(void) {
+  if (!_mi_process_is_initialized) return;
+  mi_fork_depth--;
+  if (mi_fork_depth != 0) return;  // still nested (same thread): outermost call handles the release
+  _mi_options_fork_parent();
+  // release in reverse: last sub-process first (the registry is a stack: newest
+  // pushed first, so walk it in reverse by counting then re-walking, same as Bun).
+  size_t n = 0;
+  for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) { n++; }
+  while (n > 0) {
+    mi_subproc_t* sp = mi_subprocs;
+    for (size_t k = 1; k < n; k++) { sp = sp->next; }
+    mi_subproc_fork_parent(sp);
+    n--;
+  }
+  mi_lock_release(&_mi_page_map()->lock);
+  _mi_memevt_fork_parent();
+  _mi_dhat_fork_parent();
+  _mi_prof_fork_parent();
+  _mi_thread_locals_fork_parent();
+  mi_lock_release(&mi_subprocs_lock);
+  mi_lock_release(&mi_fork_serialize_lock);  // let the next thread's fork() (if any) proceed
+}
+
+void _mi_process_fork_child(void) {
+  if (!_mi_process_is_initialized) return;
+  // The child is single-threaded from here on -- only THIS thread's own (possibly
+  // nested) prepare calls are relevant; no other thread's `mi_fork_depth` or
+  // `mi_fork_serialize_lock` state exists in this process to race against.
+  if (mi_fork_depth == 0) return;  // no matching prepare (shouldn't happen)
+  mi_fork_depth = 0;
+  mi_lock_init(&mi_fork_serialize_lock);  // fresh for this child's own future forks
+  mi_lock_init(&mi_subprocs_lock);
+  _mi_thread_locals_fork_child();
+  _mi_prof_fork_child();
+  _mi_dhat_fork_child();
+  _mi_memevt_fork_child();
+  mi_lock_init(&_mi_page_map()->lock);
+  for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) {
+    mi_subproc_fork_child(sp);
+  }
+  _mi_options_fork_child();
 }
 
 /* ---- end inlined: src/subproc.c ---- */
@@ -25033,6 +25439,15 @@ static size_t       mi_thread_locals_version; // version to be able to reuse slo
 void _mi_thread_locals_init(void) {
   mi_lock_init(&mi_thread_locals_lock);
 }
+
+// #270: fork-safety. Ported (design, not code) from oven-sh/mimalloc @ 942b8342, MIT,
+// whose `threadlocal.c` defines the identically-named
+// `_mi_thread_locals_fork_prepare/parent/child` around this same lock. See the lock
+// order documented at the top of subproc.c: thread locals are quiesced right after the
+// subprocess registry (`mi_subprocs_lock`) and before any per-subprocess lock.
+void _mi_thread_locals_fork_prepare(void) { mi_lock_acquire(&mi_thread_locals_lock); }
+void _mi_thread_locals_fork_parent(void)  { mi_lock_release(&mi_thread_locals_lock); }
+void _mi_thread_locals_fork_child(void)   { mi_lock_init(&mi_thread_locals_lock); }
 
 void _mi_thread_locals_done(void) {
   mi_lock(&mi_thread_locals_lock) {
@@ -29606,14 +30021,21 @@ static void intro_log(malloc_zone_t* zone, void* p) {
   // todo?
 }
 
+// #270: macOS calls `force_lock` on every registered zone before a fork() actually
+// forks (from `_malloc_fork_prepare`), the same moment `pthread_atfork`'s prepare
+// callback fires. Wire it to the same handler `pthread_atfork` uses (src/init.c);
+// `mi_fork_depth` (subproc.c) makes the two calls for one fork() idempotent -- only
+// whichever fires first does the real work.
 static void intro_force_lock(malloc_zone_t* zone) {
   MI_UNUSED(zone);
-  // todo?
+  _mi_process_fork_prepare();
 }
 
+// #270: mirrors intro_force_lock above -- called from `_malloc_fork_parent`, the same
+// moment `pthread_atfork`'s parent callback fires.
 static void intro_force_unlock(malloc_zone_t* zone) {
   MI_UNUSED(zone);
-  // todo?
+  _mi_process_fork_parent();
 }
 
 static void intro_statistics(malloc_zone_t* zone, malloc_statistics_t* stats) {
@@ -29631,11 +30053,16 @@ static boolean_t intro_zone_locked(malloc_zone_t* zone) {
 }
 
 // Required whenever the zone advertises version >= 9: macOS calls this from the
-// atfork_child handler (_malloc_fork_child) without a NULL check. mimalloc keeps
-// no zone-level locks that need reinitializing after fork, so a no-op is safe.
-// Leaving it NULL makes the forked child jump to address 0 and crash in fork().
+// atfork_child handler (_malloc_fork_child) without a NULL check. Leaving it NULL
+// makes the forked child jump to address 0 and crash in fork().
+// #270: mimalloc itself is not zone-lock-free anymore -- wire this to the same
+// child handler `pthread_atfork` uses (src/init.c) so the locks documented at the
+// top of subproc.c actually get reset in the child, whichever of `pthread_atfork`
+// or this zone callback macOS invokes first for a given fork() (mi_fork_depth
+// makes the pair idempotent).
 static void intro_reinit_lock(malloc_zone_t* zone) {
   MI_UNUSED(zone);
+  _mi_process_fork_child();
 }
 
 
@@ -29774,14 +30201,21 @@ static int mi_malloc_jumpstart(uintptr_t cookie) {
   return 1; // or 0 for no error?
 }
 
+// #270: DYLD interposition (below) redirects every process-wide call to libSystem's own
+// `_malloc_fork_prepare/parent/child` -- the functions its own fork() implementation
+// calls internally, and what the default zone's atfork machinery targets -- to these.
+// This is a third path into the same handlers as `pthread_atfork` (src/init.c) and the
+// zone introspection callbacks `intro_force_lock`/`intro_force_unlock`/
+// `intro_reinit_lock` above; `mi_fork_depth` (subproc.c) is exactly what makes calling
+// the real handler from all three safe and idempotent for one fork().
 static void mi__malloc_fork_prepare(void) {
-  // nothing
+  _mi_process_fork_prepare();
 }
 static void mi__malloc_fork_parent(void) {
-  // nothing
+  _mi_process_fork_parent();
 }
 static void mi__malloc_fork_child(void) {
-  // nothing
+  _mi_process_fork_child();
 }
 
 static void mi_malloc_printf(const char* fmt, ...) {

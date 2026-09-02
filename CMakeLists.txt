@@ -1285,7 +1285,33 @@ if (MI_BUILD_TESTS)
     target_include_directories(mimalloc-test-stress-dynamic PRIVATE include)
     if(WIN32)
       target_compile_definitions(mimalloc-test-stress-dynamic PRIVATE "MI_LINK_VERSION=1")  # link mi_version
-      target_link_libraries(mimalloc-test-stress-dynamic PRIVATE mimalloc ${mi_libraries})  # link mi_version
+      if(MINGW)
+        # `mimalloc.dll` must come first in this exe's import table, or the redirection
+        # module (which `mimalloc.dll` pulls in, and which imports only `ntdll.dll`) is
+        # initialised after the CRT it is meant to patch and `mi_is_redirected()` stays
+        # false. That is what upstream's "mingw always links mimalloc after system
+        # libraries" note below is about.
+        #
+        # The mechanism is `ld`'s PE script, which emits the import descriptors under
+        # `SORT(*)(.idata$2)` -- sorted by the *input file path as spelled on the command
+        # line*, archive path first and member name only as a tie-break within one
+        # archive. CMake names this import library relative to the build directory
+        # (`libmimalloc.dll.a`), while every CRT archive arrives as an absolute path from
+        # the sysroot, and `/` (0x2f) sorts before `l`. Spelling the same file `./…`
+        # (0x2e) puts it ahead of every absolute path instead. Verified with
+        # `objdump -p`: byte-identical archives give `mimalloc.dll` last when named
+        # `libmimalloc.dll.a` and first when named `./libmimalloc.dll.a`.
+        #
+        # It has to sit in the *libraries* position, after the objects -- an archive named
+        # before anything needs it contributes nothing -- hence a raw `-l:` here rather
+        # than target_link_options(), with an explicit dependency since this is no longer
+        # a target reference.
+        add_dependencies(mimalloc-test-stress-dynamic mimalloc)
+        target_link_libraries(mimalloc-test-stress-dynamic PRIVATE
+          "-L." "-l:$<TARGET_LINKER_FILE_NAME:mimalloc>" ${mi_libraries})
+      else()
+        target_link_libraries(mimalloc-test-stress-dynamic PRIVATE mimalloc ${mi_libraries})  # link mi_version
+      endif()
       if(MI_MINGW_UCRT64 AND CMAKE_HOST_WIN32)
         # mingw always links mimalloc after system libraries.
         # post-process with `minject` to make sure mimalloc is the first dll in the load order.

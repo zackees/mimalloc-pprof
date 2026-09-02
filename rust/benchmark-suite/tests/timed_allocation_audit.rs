@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 
 use benchmark_suite::execution::{
     execute_cell, execute_latency_cell, set_measured_region_hook, AllocatorAdapter,
@@ -12,17 +12,11 @@ use benchmark_suite::scenarios::{cards, CardId, ScenarioCell, Topology};
 
 static MEASURED: AtomicBool = AtomicBool::new(false);
 static HARNESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-// Serializes the two audits: they share `MEASURED`, `HARNESS_ALLOCATIONS`, and the
-// process-wide measured-region hook, so they cannot overlap.
-//
-// Acquired with `unwrap_or_else(PoisonError::into_inner)`, never `unwrap()`. These
-// tests assert, and an assertion panic while holding the guard poisons the mutex --
-// so a plain `unwrap()` made the *other* test panic on `PoisonError` at its lock
-// line. One real failure was reported as two, the second pointing at a lock
-// acquisition that has nothing to do with allocations. Recovering is correct rather
-// than a workaround: the guard provides mutual exclusion only, and a `()` payload
-// cannot be left in an inconsistent state. See #236.
-static TEST_GATE: Mutex<()> = Mutex::new(());
+// Size in bytes of the first allocation that tripped `HARNESS_ALLOCATIONS` in
+// the current measured interval, `u64::MAX` when none has. Recorded so a
+// failure names *something* about the culprit without the audit hook itself
+// allocating (a `Backtrace` capture here would recurse into this allocator).
+static FIRST_OFFENDING_SIZE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 thread_local! {
     static INSIDE_ADAPTER: Cell<bool> = const { Cell::new(false) };
@@ -30,25 +24,30 @@ thread_local! {
 
 struct AuditedSystem;
 
+impl AuditedSystem {
+    fn record(&self, layout: Layout) {
+        if MEASURED.load(Ordering::SeqCst) && !INSIDE_ADAPTER.with(Cell::get) {
+            let previous = HARNESS_ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+            if previous == 0 {
+                FIRST_OFFENDING_SIZE.store(layout.size() as u64, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
 unsafe impl GlobalAlloc for AuditedSystem {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if MEASURED.load(Ordering::SeqCst) && !INSIDE_ADAPTER.with(Cell::get) {
-            HARNESS_ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
-        }
+        self.record(layout);
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if MEASURED.load(Ordering::SeqCst) && !INSIDE_ADAPTER.with(Cell::get) {
-            HARNESS_ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
-        }
+        self.record(layout);
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if MEASURED.load(Ordering::SeqCst) && !INSIDE_ADAPTER.with(Cell::get) {
-            HARNESS_ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
-        }
+        self.record(layout);
         unsafe { System.realloc(pointer, layout, size) }
     }
 
@@ -143,13 +142,13 @@ impl AllocatorAdapter for InstrumentedAdapter {
     }
 }
 
-#[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "macOS realloc may route through the global allocator"
-)]
 fn ordinary_measured_region_performs_zero_harness_allocations() {
-    let _test_guard = TEST_GATE.lock().unwrap_or_else(PoisonError::into_inner);
+    if cfg!(target_os = "macos") {
+        println!(
+            "test ordinary_measured_region_performs_zero_harness_allocations ... skipped (macOS realloc may route through the global allocator)"
+        );
+        return;
+    }
     let adapter = InstrumentedAdapter {
         layouts: Mutex::new(HashMap::new()),
     };
@@ -184,10 +183,12 @@ fn ordinary_measured_region_performs_zero_harness_allocations() {
         1,
         "native thread creation is the sole explicit timed-allocation exemption"
     );
+    println!("test ordinary_measured_region_performs_zero_harness_allocations ... ok");
 }
 
 fn audit_cell(adapter: &InstrumentedAdapter, cell: &ScenarioCell) {
     HARNESS_ALLOCATIONS.store(0, Ordering::SeqCst);
+    FIRST_OFFENDING_SIZE.store(u64::MAX, Ordering::SeqCst);
     set_measured_region_hook(Some(timing_hook));
     let result = execute_cell(adapter, cell);
     set_measured_region_hook(None);
@@ -195,18 +196,19 @@ fn audit_cell(adapter: &InstrumentedAdapter, cell: &ScenarioCell) {
     assert_eq!(
         HARNESS_ALLOCATIONS.load(Ordering::SeqCst),
         0,
-        "Rust control-plane allocation entered the measured interval for {:?}",
-        cell.card
+        "Rust control-plane allocation entered the measured interval for {:?} (first offending allocation size = {} bytes)",
+        cell.card,
+        FIRST_OFFENDING_SIZE.load(Ordering::SeqCst)
     );
 }
 
-#[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "macOS realloc may route through the global allocator"
-)]
 fn latency_sampling_buffers_do_not_allocate_after_warmup() {
-    let _test_guard = TEST_GATE.lock().unwrap_or_else(PoisonError::into_inner);
+    if cfg!(target_os = "macos") {
+        println!(
+            "test latency_sampling_buffers_do_not_allocate_after_warmup ... skipped (macOS realloc may route through the global allocator)"
+        );
+        return;
+    }
     let adapter = InstrumentedAdapter {
         layouts: Mutex::new(HashMap::new()),
     };
@@ -235,6 +237,7 @@ fn latency_sampling_buffers_do_not_allocate_after_warmup() {
         let cell = ScenarioCell::new(card, point, topology, 8, 0x5eed).unwrap();
         for control in [false, true] {
             HARNESS_ALLOCATIONS.store(0, Ordering::SeqCst);
+            FIRST_OFFENDING_SIZE.store(u64::MAX, Ordering::SeqCst);
             set_measured_region_hook(Some(timing_hook));
             let result = execute_latency_cell(&adapter, &cell, 2, control);
             set_measured_region_hook(None);
@@ -242,8 +245,27 @@ fn latency_sampling_buffers_do_not_allocate_after_warmup() {
             assert_eq!(
                 HARNESS_ALLOCATIONS.load(Ordering::SeqCst),
                 0,
-                "latency sampling allocated in the measured region for {card:?}, control={control}"
+                "latency sampling allocated in the measured region for {card:?}, control={control} (first offending allocation size = {} bytes)",
+                FIRST_OFFENDING_SIZE.load(Ordering::SeqCst)
             );
         }
     }
+    println!("test latency_sampling_buffers_do_not_allocate_after_warmup ... ok");
+}
+
+fn main() {
+    // No libtest harness: both audits run sequentially, on this thread only.
+    // libtest's default harness spawns each `#[test]` fn on its own OS thread
+    // and initializes per-thread output capture the moment that thread
+    // starts -- an allocation with no ordering relative to `MEASURED`. That
+    // stray allocation from the *sibling* test's thread could land inside
+    // this test's measured interval and be misattributed to the code under
+    // audit (reproduced locally: ~10% failure rate under `--test-threads=4`
+    // with two logical CPUs pinned via `taskset`, 0/60 with
+    // `--test-threads=1`). Running everything on one thread with no sibling
+    // test threads in the process removes the interference at the source.
+    // See #236 / #206.
+    println!("running 2 tests");
+    ordinary_measured_region_performs_zero_harness_allocations();
+    latency_sampling_buffers_do_not_allocate_after_warmup();
 }

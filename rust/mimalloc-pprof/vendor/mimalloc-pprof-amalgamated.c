@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit cf15bb2b of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit c0f622c3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -15425,6 +15425,184 @@ bool _mi_test_heaps_lock_poison_observed(void) {
 #endif // !defined(_WIN32) && !defined(__wasi__)
 /* ---- end inlined: src/fork.c ---- */
 #endif
+/* ---- begin inlined: src/heap-dump.c ---- */
+/* Live heap dump: mi_heap_dump_json / mi_heap_get_seq (issue #269, Bun parity P4).
+
+   Backs Bun's shipped `bun:jsc` `heapStats({ dump: true | "blocks" }).mimallocDump`
+   (declared in `include/mimalloc-stats.h`, called from `BunJSCModule.h`). Independent of
+   MI_PPROF: Bun builds this unconditionally (see src/static.c), so it is a plain
+   diagnostics API, not part of the sampling profiler.
+
+   Per rule 6 this is a new file so upstream files stay untouched beyond the two
+   declarations in include/mimalloc-stats.h. The JSON-buffer helpers below intentionally
+   duplicate (rather than share) stats.c's private `mi_json_buf_t` machinery, to keep this
+   feature self-contained in its own file instead of exporting stats.c internals.
+
+   Ported from oven-sh/mimalloc @ 942b8342 (src/stats.c:840-949), MIT license -- see the
+   "imported from" comment below for the exact scope. Adapted: renamed the buffer type to
+   avoid colliding with stats.c's private `mi_json_buf_t`, and reads the heap sequence
+   number from our own `mi_heap_t::heap_seq` field (already present at our pin; Bun added
+   the equivalent field to their `mi_heap_t` in the same commit).
+
+   THREAD SAFETY (#78): this walks heaps with `mi_subproc_visit_heaps` and pages/blocks
+   with `mi_heap_visit_blocks`, both of which are documented in include/mimalloc.h as NOT
+   safe against a concurrent free into the heap being visited -- the dump is best-effort
+   under concurrent mutation, matching Bun's own implementation. Separately (see the
+   walk-order comment above mi_memory_visit_live_allocations in src/memory-events.c),
+   mi_heap_visit_blocks only sees pages registered in the heap's arena-page bitmap or its
+   os_abandoned_pages list; a page a live theap owns that was allocated directly from the
+   OS (memid.memkind == MI_MEM_OS, e.g. before this process's first arena reservation) is
+   visible to neither, so it can be silently absent from a dump. This mirrors Bun's own
+   mi_heap_dump_json, which has the identical gap for the identical reason.
+
+   SELF-MUTATION: the dump's own JSON buffer growth (mi_hdump_buf_expand -> mi_rezalloc)
+   allocates from the calling thread's default heap, and mi_heap_dump_json walks that same
+   heap if it is one of the subprocess's heaps -- so the walk can observe its own buffer's
+   allocations, and because pages and blocks are two separate mi_heap_visit_blocks passes,
+   a block size seen in the blocks[] pass is not guaranteed to already appear in the
+   pages[] pass taken moments earlier. Same class of best-effort as Bun's implementation,
+   not something either side corrects for.
+*/
+
+// -----------------------------------------------------------
+// small growable buffer for building the JSON string.
+// mirrors (does not share) stats.c's private mi_json_buf_t.
+// -----------------------------------------------------------
+
+typedef struct mi_hdump_buf_s {
+  char*   buf;
+  size_t  size;
+  size_t  used;
+} mi_hdump_buf_t;
+
+static bool mi_hdump_buf_expand(mi_hdump_buf_t* hbuf) {
+  if (hbuf == NULL) return false;
+  if (hbuf->buf != NULL && hbuf->size > 0) {
+    hbuf->buf[hbuf->size - 1] = 0;
+  }
+  if (hbuf->size > SIZE_MAX / 2) return false;
+  const size_t newsize = (hbuf->size == 0 ? mi_good_size(12 * MI_KiB) : 2 * hbuf->size);
+  char* const  newbuf  = (char*)mi_rezalloc(hbuf->buf, newsize);
+  if (newbuf == NULL) return false;
+  hbuf->buf = newbuf;
+  hbuf->size = newsize;
+  return true;
+}
+
+static void mi_hdump_buf_print(mi_hdump_buf_t* hbuf, const char* msg) {
+  if (msg == NULL || hbuf == NULL) return;
+  for (const char* src = msg; *src != 0; src++) {
+    if (hbuf->used + 1 >= hbuf->size) {
+      if (!mi_hdump_buf_expand(hbuf)) return;
+    }
+    mi_assert_internal(hbuf->used < hbuf->size);
+    hbuf->buf[hbuf->used++] = *src;
+  }
+  mi_assert_internal(hbuf->used < hbuf->size);
+  hbuf->buf[hbuf->used] = 0;
+}
+
+/* -----------------------------------------------------------
+  imported from oven-sh/mimalloc @ 942b8342, MIT
+  (src/stats.c:857-949: mi_dump_ctx_t, mi_dump_id, mi_dump_block_visit,
+  mi_dump_heap_visit, mi_heap_dump_json, mi_heap_get_seq)
+
+  Live heap dump: per-heap -> per-page -> (optional) per-block JSON.
+  Addresses are mixed through a per-process key when `hash_addresses`
+  so snapshots can be diffed without exposing ASLR.
+----------------------------------------------------------- */
+
+typedef struct mi_dump_ctx_s {
+  mi_hdump_buf_t hbuf;
+  bool           include_blocks;
+  bool           hash_addresses;
+  bool           in_block_pass;
+  uintptr_t      key;
+  bool           first_heap;
+  bool           first_page;
+  bool           first_block;
+} mi_dump_ctx_t;
+
+static uintptr_t mi_dump_id(mi_dump_ctx_t* ctx, const void* p) {
+  uintptr_t x = (uintptr_t)p;
+  if (!ctx->hash_addresses) return x;
+  x ^= ctx->key;
+  x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+  x ^= x >> 33;
+  return x;
+}
+
+static bool mi_cdecl mi_dump_block_visit(const mi_heap_t* heap, const mi_heap_area_t* area, void* block, size_t block_size, void* arg) {
+  MI_UNUSED(heap);
+  mi_dump_ctx_t* ctx = (mi_dump_ctx_t*)arg;
+  // 192, not Bun's 128: the page-line format below has 5 %zu fields plus ~71 fixed
+  // characters, and a 64-bit size_t can print up to 20 digits, so the worst realistic
+  // line is 71 + 5*20 = 171 bytes (+ NUL). _mi_snprintf truncates rather than overflows,
+  // but a truncated line here is a *silently* malformed JSON document -- Bun's
+  // JSONParse(json) on the caller side turns that into a hard `mimallocDump: null`
+  // rather than a visible error. Deliberate deviation from Bun's own buffer size.
+  char tmp[192];
+  if (block == NULL) {
+    if (ctx->in_block_pass) return true;
+    if (!ctx->first_page) { mi_hdump_buf_print(&ctx->hbuf, ",\n"); }
+    ctx->first_page = false;
+    const mi_page_t* page = (const mi_page_t*)area->reserved1;
+    const uintptr_t tid = (page != NULL ? mi_page_thread_id(page) : 0);
+    _mi_snprintf(tmp, sizeof(tmp),
+      "      { \"id\": %zu, \"block_size\": %zu, \"used\": %zu, \"reserved\": %zu, \"thread_id\": %zu }",
+      mi_dump_id(ctx, area->blocks), area->block_size, area->used,
+      area->reserved / (area->block_size > 0 ? area->block_size : 1), tid);
+    mi_hdump_buf_print(&ctx->hbuf, tmp);
+  }
+  else if (ctx->in_block_pass) {
+    if (!ctx->first_block) { mi_hdump_buf_print(&ctx->hbuf, ","); }
+    ctx->first_block = false;
+    _mi_snprintf(tmp, sizeof(tmp), "[%zu,%zu]", mi_dump_id(ctx, block), block_size);
+    mi_hdump_buf_print(&ctx->hbuf, tmp);
+  }
+  return true;
+}
+
+static bool mi_cdecl mi_dump_heap_visit(mi_heap_t* heap, void* arg) {
+  mi_dump_ctx_t* ctx = (mi_dump_ctx_t*)arg;
+  char tmp[64];
+  if (!ctx->first_heap) { mi_hdump_buf_print(&ctx->hbuf, ",\n"); }
+  ctx->first_heap = false;
+  _mi_snprintf(tmp, sizeof(tmp), "  { \"seq\": %zu,\n    \"pages\": [\n", heap->heap_seq);
+  mi_hdump_buf_print(&ctx->hbuf, tmp);
+  ctx->first_page = true; ctx->in_block_pass = false;
+  mi_heap_visit_blocks(heap, false, &mi_dump_block_visit, ctx);
+  mi_hdump_buf_print(&ctx->hbuf, "\n    ]");
+  if (ctx->include_blocks) {
+    mi_hdump_buf_print(&ctx->hbuf, ",\n    \"blocks\": [");
+    ctx->first_block = true; ctx->in_block_pass = true;
+    mi_heap_visit_blocks(heap, true, &mi_dump_block_visit, ctx);
+    mi_hdump_buf_print(&ctx->hbuf, "]");
+  }
+  mi_hdump_buf_print(&ctx->hbuf, " }");
+  return true;
+}
+
+char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept {
+  mi_dump_ctx_t ctx;
+  _mi_memzero(&ctx, sizeof(ctx));
+  ctx.include_blocks = include_blocks;
+  ctx.hash_addresses = hash_addresses;
+  ctx.key             = _mi_os_random_weak((uintptr_t)&ctx) | 1;
+  if (!mi_hdump_buf_expand(&ctx.hbuf)) return NULL;
+  mi_hdump_buf_print(&ctx.hbuf, "{ \"heaps\": [\n");
+  ctx.first_heap = true;
+  mi_subproc_visit_heaps(mi_subproc_current(), &mi_dump_heap_visit, &ctx);
+  mi_hdump_buf_print(&ctx.hbuf, "\n] }\n");
+  if (ctx.hbuf.used >= ctx.hbuf.size) { mi_free(ctx.hbuf.buf); return NULL; }
+  return ctx.hbuf.buf;
+}
+
+size_t mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept {
+  return (heap != NULL ? heap->heap_seq : 0);
+}
+/* ---- end inlined: src/heap-dump.c ---- */
 /* ---- begin inlined: src/init.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
@@ -21967,6 +22145,13 @@ mi_decl_export bool    mi_subproc_stats_get_exclusive(mi_subproc_id_t subproc_id
 mi_decl_export char*   mi_stats_as_json(mi_stats_t* stats, size_t buf_size, char* buf) mi_attr_noexcept;      // use mi_free to free the result if the input buf == NULL
 mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 
+// per-heap -> per-page -> (optional) per-block live snapshot (issue #269, Bun parity).
+// Backs bun:jsc heapStats({ dump: true | "blocks" }).mimallocDump. Best-effort under
+// concurrent frees, same caveat as mi_heap_visit_blocks (#78) -- see src/heap-dump.c.
+// use mi_free to free the result.
+mi_decl_export char*   mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept;
+mi_decl_export size_t  mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept;
+
 #ifdef __cplusplus
 }
 #endif
@@ -24038,7 +24223,20 @@ mi_decl_export void mi_process_info_print_out(mi_output_fun* out, void* arg) mi_
   _mi_fprintf(out, arg, "\n");
 }
 
-void _mi_stats_print(const char* name, size_t id, const mi_stats_t* stats, mi_output_fun* out0, void* arg0) mi_attr_noexcept {
+// imported from oven-sh/mimalloc @ 942b8342, MIT (src/stats.c:352-360; issue #269 step 4a)
+// print a snapshot: heap and subproc stats are live and updated concurrently by other
+// threads via mi_stats_add's atomic adds (see mi_stats_add above), so printing straight
+// from `stats` risked a torn read across the many mi_stat_print_ex/mi_stat_print calls
+// below. mi_stats_t_decl + mi_stats_add gives a coherent, non-live copy first.
+static void mi_stats_print_copy(const char* name, size_t id, const mi_stats_t* stats, mi_output_fun* out0, void* arg0) mi_attr_noexcept;
+
+void _mi_stats_print(const char* name, size_t id, const mi_stats_t* stats0, mi_output_fun* out0, void* arg0) mi_attr_noexcept {
+  mi_stats_t_decl(stats);
+  mi_stats_add(&stats, stats0);
+  mi_stats_print_copy(name, id, &stats, out0, arg0);
+}
+
+static void mi_stats_print_copy(const char* name, size_t id, const mi_stats_t* stats, mi_output_fun* out0, void* arg0) mi_attr_noexcept {
   // wrap the output function to be line buffered
   char buf[256]; _mi_memzero_var(buf);
   buffered_t buffer = { out0, arg0, NULL, 0, 255 };
@@ -24293,7 +24491,12 @@ size_t mi_stats_get_bin_size(size_t bin) mi_attr_noexcept {
 static bool mi_stats_copy(mi_stats_t* stats_to, const mi_stats_t* stats_from) mi_attr_noexcept {
   if (stats_to == NULL || stats_to->size != sizeof(mi_stats_t) || stats_to->version != MI_STAT_VERSION) return false;
   if (stats_from == NULL || stats_from->size != stats_to->size) return false;
-  _mi_memcpy(stats_to, stats_from, stats_to->size);
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (src/stats.c:625-627; issue #269 step 4b)
+  // stats_from is live (other threads update it with atomic operations): a plain
+  // _mi_memcpy can tear a multi-word counter mid-update, so copy it a counter at a time
+  // through the same atomic-add path mi_stats_add uses elsewhere in this file.
+  mi_stats_init(stats_to);
+  mi_stats_add(stats_to, stats_from);
   return true;
 }
 

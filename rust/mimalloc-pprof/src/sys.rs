@@ -130,6 +130,11 @@ pub struct mi_prof_module_info_t {
 pub type mi_prof_module_visit_fun =
     unsafe extern "C" fn(info: *const mi_prof_module_info_t, arg: *mut c_void) -> bool;
 
+/// Opaque handle for `mi_heap_t` (issue #269, Bun parity P4): only ever seen behind a
+/// pointer here (mi_heap_get_seq), so this type is never constructed on the Rust side.
+#[allow(non_camel_case_types)]
+pub enum mi_heap_t {}
+
 unsafe extern "C" {
     pub fn mi_malloc(size: usize) -> *mut c_void;
     pub fn mi_zalloc(size: usize) -> *mut c_void;
@@ -202,4 +207,13 @@ unsafe extern "C" {
     pub fn mi_unwrapped_free(p: *mut c_void);
     /// Mirrors `mi_unwrapped_realloc` (include/mimalloc/memory-events.h).
     pub fn mi_unwrapped_realloc(p: *mut c_void, new_size: usize, alignment: usize) -> *mut c_void;
+
+    /// Live per-heap -> per-page -> (optional) per-block JSON snapshot (issue #269, Bun
+    /// parity P4). Backs Bun's shipped `bun:jsc` `heapStats({dump:true|"blocks"})`. Returns
+    /// NULL on allocation failure; a non-NULL result is `mi_malloc`-family memory the
+    /// caller must free with `mi_free` (see `prof::heap_dump_json` for the safe wrapper).
+    pub fn mi_heap_dump_json(include_blocks: bool, hash_addresses: bool) -> *mut c_char;
+    /// Mirrors `mi_heap_get_seq` (include/mimalloc-stats.h): the monotonic sequence
+    /// number assigned to `heap` at creation, or 0 for a NULL heap.
+    pub fn mi_heap_get_seq(heap: *mut mi_heap_t) -> usize;
 }

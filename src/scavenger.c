@@ -52,14 +52,14 @@ terms of the MIT license. A copy of the license can be found in the file
 // in the test; the counter stays as the "a pass ran at all" signal.
 static _Atomic(size_t) mi_idle_work_count;
 
-mi_decl_export size_t _mi_test_idle_work_count(void) {
+mi_decl_externc mi_decl_export size_t _mi_test_idle_work_count(void) {
   return mi_atomic_load_relaxed(&mi_idle_work_count);
 }
 
 // Fold in pending frees and drain the arena purge queue. Runs on the owner
 // (`mi_on_thread_idle`) or on the scavenger for a parked thread; both require that the owner
 // of `tld` is not allocating while we rewrite its free lists.
-void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept {
+void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) {
   if (tld == NULL) return;
   // each phase is a full walk: an owner waiting in `_mi_park_leave` cannot allocate until we stop
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;

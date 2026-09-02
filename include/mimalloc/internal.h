@@ -397,7 +397,7 @@ mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);
 // `-fvisibility=hidden` would otherwise hide it -- same reason as the `mi_debug_*` hooks
 // above, except this one is NOT `MI_DEBUG`-only: the test is meaningful in a Release
 // build too, and one relaxed increment per park is not worth a config split.
-mi_decl_export size_t _mi_test_idle_work_count(void);
+mi_decl_externc mi_decl_export size_t _mi_test_idle_work_count(void);
 #if MI_DEBUG > 0
 // #272 fork test hook (test/test-fork-user-heap.c case_b); see src/init.c
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;

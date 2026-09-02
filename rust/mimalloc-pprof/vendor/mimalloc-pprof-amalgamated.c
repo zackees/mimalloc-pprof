@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 37fbf587 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 76b2768d of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -224,6 +224,47 @@ mi_decl_export bool mi_on_thread_idle_start(void) mi_attr_noexcept;
 mi_decl_export void mi_on_thread_idle_end(void) mi_attr_noexcept;
 // Stop the background scavenger thread (it restarts on demand; see `mi_option_scavenger`).
 mi_decl_export void mi_scavenger_stop(void)     mi_attr_noexcept;
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+// How much hole punching actually reclaims (process wide, monotonic except for the
+// gauges marked below). These are not part of `mi_stats_t`: hole purging also covers
+// pages that no heap owns, and `mi_stats_t` cannot grow (it is embedded in a theap,
+// which is at the meta-allocator's 8KB block limit).
+typedef struct mi_purge_holes_stats_s {
+  size_t purged_bytes;        // bytes of free blocks that are discarded right now
+  size_t purged_blocks;       // free blocks held off the free lists right now
+  size_t purged_bytes_total;  // bytes ever discarded
+  size_t discard_calls;       // discard syscalls (madvise/MEM_RESET)
+  size_t reuse_calls;         // reuse syscalls made when handing a hole back
+  size_t pages_freed;         // pages the sweep found completely free and gave back to the arena
+  // What hole punching cannot reach: the pages the sweep found ineligible (a huge page, a
+  // large page whose OS pages do not fit the bitmap, pinned memory, a custom-commit arena).
+  // Gauges over the last idle sweep (`mi_on_thread_idle`), which resets them.
+  size_t ineligible_pages;
+  size_t ineligible_bytes;      // total size of those pages
+  size_t ineligible_free_bytes; // the free (but not discardable) blocks inside them
+  // The unformed tail: the blocks of a page that were never handed out (`capacity < reserved`).
+  // Carved from a recycled arena slice, that memory is already resident, so the sweep discards
+  // it as well; `mi_page_extend_free` hands it back before it formats a block in it.
+  size_t unformed_bytes;        // bytes of unformed tail discarded right now
+  size_t unformed_bytes_total;  // bytes of unformed tail ever discarded
+  size_t unformed_discard_calls;
+  size_t unformed_reuse_calls;  // reuse syscalls made when a page extends back into its tail
+  // What the sweep costs. A page in which nothing was allocated or freed since the last sweep is
+  // skipped without its free list being walked at all (see `_mi_page_purge_holes`).
+  size_t pages_skipped;         // pages skipped that way (monotonic)
+  size_t blocks_visited;        // free-list blocks the sweep did walk (monotonic): what the skip avoids
+  size_t full_sweeps;           // sweeps that walked every page anyway (`purge_holes_full_every`)
+} mi_purge_holes_stats_t;
+
+mi_decl_export void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept;
+
+// Print, per size class, what hole punching leaves behind: the free bytes that share an OS
+// page with a live block and therefore cannot be discarded, and how few live blocks pin each
+// such OS page. Read-only (it purges nothing, and mutates no free list). Like the idle sweep
+// it only covers what the calling thread may safely read: its own theaps, plus the abandoned
+// pages of the heaps behind them. Call it right after a sweep.
+mi_decl_export void mi_purge_holes_report(void) mi_attr_noexcept;
 
 mi_decl_export int  mi_version(void);
 mi_decl_export void mi_options_print(void)      mi_attr_noexcept;
@@ -584,8 +625,17 @@ typedef enum mi_option_e {
   mi_option_prof_seed,                  // profiler sampling PRNG seed; 0 = nondeterministic (=0)
   mi_option_prof_max_bytes,             // budget (in bytes) for profiler-internal arena memory; 0 = unbudgeted (=0)
   mi_option_memory_events,              // enable opt-in allocation-change accounting/callbacks (MIMALLOC_MEMORY_EVENTS) (=0)
-  mi_option_purge_zeroes,               // treat decommit-purged slices as zeroed, letting mi_zalloc skip its memset (=0, experimental)
+  mi_option_purge_zeroes,               // DEAD since #80: the implementation added by #79 went away with the v3 pin bump and was never
+                                        // restored (see issue #67). The option slot is kept -- never renumber -- and setting
+                                        // MIMALLOC_PURGE_ZEROES still parses, it just has no effect. NOT related to
+                                        // `purge_holes_eager_zero` below, which is the opposite knob (it zeroes MORE, for testing).
   mi_option_scavenger,                  // run a background thread that purges scheduled arena memory (=1). imported from oven-sh/mimalloc @ 942b8342, MIT (#272)
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b). Appended
+  // after `scavenger`, NOT at Bun's slot numbers 50-53: slots 47+ diverged long ago (#264).
+  mi_option_purge_holes,                // discard the memory of free blocks inside still-used pages, on `mi_on_thread_idle` (=1)
+  mi_option_purge_holes_eager_zero,     // zero a range before discarding it, so a mis-scoped discard corrupts visibly (=0; forced on in debug builds). NOT zero-tracking -- see mi_option_purge_zeroes
+  mi_option_purge_holes_min_interval,   // do not sweep one thread's heaps more often than every N milli-seconds (=100)
+  mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=64); 0 disables
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -2497,6 +2547,18 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 // Minimal commit for a page on-demand commit 
 #define MI_PAGE_MIN_COMMIT_SIZE  (16*MI_KiB) /* MI_ARENA_SLICE_SIZE */
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+// Hole purging: a bitmap of the OS pages inside a mimalloc page whose memory has been
+// discarded. It is indexed by OS page (not by block), so its size does not depend on the
+// size class: a page needs `page_size/os_page_size` bits (plus one for the partial OS page
+// that holds the page header). 256 bits covers every small (64 KiB) and medium (512 KiB)
+// page on every OS page size, and a large (4 MiB) page when the OS page is 16 KiB. A large
+// page on a 4 KiB OS page needs 1025 bits and stays ineligible -- the capacity check is at
+// runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in
+// `src/page-holes.c`).
+#define MI_PAGE_PURGE_BITS                (256)
+#define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from
@@ -2700,7 +2762,35 @@ typedef struct mi_page_s {
 
   struct mi_prof_record_s*  metadata;          // sampled live allocation records, or NULL (MI_PPROF)
   bool                      has_metadata;      // `true` if profiler records are attached to this page
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+  // The OS pages inside this page whose memory was discarded to the OS. A block is
+  // "purged" exactly when it overlaps one of them (we discard an OS page only when every
+  // block overlapping it is free), and a purged block is held OFF every free list: mimalloc
+  // threads its free list through the free blocks themselves, so a discarded block cannot
+  // hold a `next` pointer. COLD: touched only by the idle hole-purge sweep, so it stays at
+  // the very tail of the struct, after this fork's own `metadata`/`has_metadata` (which the
+  // free path reads) and after every upstream field.
+  uint64_t                  purged[MI_PAGE_PURGE_WORDS];
+
+  // The discarded part of the *unformed tail*: the blocks in `[capacity,reserved)` are not
+  // formatted yet, but when the page is carved from a recycled arena slice their memory is
+  // already resident. Byte offsets from `page_start`, OS-page aligned, `lo == hi` when
+  // nothing is discarded. Deliberately NOT part of `purged` above: a bit there means "this
+  // block is free and off every free list" (`_mi_page_is_valid`), and these blocks do not
+  // exist yet. The region only ever shrinks from the left, as `capacity` grows.
+  uint32_t                  unformed_purged_lo;
+  uint32_t                  unformed_purged_hi;
+
+  // The `(capacity,used)` the last hole sweep left this page in, packed as `(capacity<<32)|used`.
+  // A sweep that finds it unchanged skips the page without walking its free list at all: nothing
+  // was allocated or freed in it since, so the sweep has nothing new to discard (see
+  // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". Cold, like `purged` above.
+  uint64_t                  swept_state;
 } mi_page_t;
+
+// An impossible `(capacity,used)` (`used > capacity` never holds): "this page has no sweep state".
+#define MI_PAGE_SWEPT_NONE                (~(uint64_t)0)   // capacity is 16-bit, so a state with all upper bits set cannot occur
 
 
 // ------------------------------------------------------
@@ -3024,6 +3114,21 @@ struct mi_tld_s {
   mi_theap_t*           park_theap0;          // default theap, captured at the park (the scavenger has no TLS to find it)
   _Atomic(uint32_t)     park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
   mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+  // State of a running hole sweep of THIS thread's heaps. It lives on the tld being swept and
+  // never in a thread-local of the sweeping thread: besides the scavenger sweeping many tlds
+  // from one thread, `_mi_page_purge_holes_in_progress` is read from inside the allocator
+  // (`mi_page_free_collect_ex`), and on targets where `__thread` is emulated the first access
+  // on a thread allocates -- re-entering the collect that is reading it, without bound
+  // (oven-sh/bun#38051). Plain (non-atomic) fields: only the one thread doing the sweep -- the
+  // owner, or the scavenger holding this tld in MI_PARK_SWEEPING -- ever touches them.
+  size_t                holes_sweep_seq;      // idle sweeps of this thread's heaps so far (`purge_holes_full_every`)
+  mi_msecs_t            holes_sweep_last;     // when the last one ran (`purge_holes_min_interval` pacing)
+  bool                  holes_sweeping;       // a sweep of this thread's heaps is in progress right now
+  bool                  holes_sweep_full;     // ... and it ignores `page->swept_state` (every N'th sweep)
+  size_t                holes_sweep_skipped;  // per-pass counters, folded into the process-wide ones by
+  size_t                holes_sweep_visited;  // `_mi_page_purge_holes_end` (a per-page atomic would cost real time)
 };
 
 
@@ -4476,6 +4581,9 @@ size_t        _mi_os_minimal_purge_size(void);
 bool          _mi_os_reset(mi_subproc_t* subproc, void* addr, size_t size);
 bool          _mi_os_decommit(mi_subproc_t* subproc, void* addr, size_t size);
 void          _mi_os_reuse(mi_subproc_t* subproc, void* p, size_t size);
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b): release the
+// physical pages of a range NOW without touching its commit state (see src/page-holes.c).
+bool          _mi_os_discard(mi_subproc_t* subproc, void* addr, size_t size);
 mi_decl_nodiscard bool _mi_os_commit(mi_subproc_t* subproc, void* p, size_t size, bool* is_zero);
 mi_decl_nodiscard bool _mi_os_commit_ex(mi_subproc_t* subproc, void* addr, size_t size, bool* is_zero, size_t stat_size);
 
@@ -4598,6 +4706,10 @@ void          _mi_page_free(mi_page_t* page, mi_page_queue_t* pq);     // free t
 void          _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq);  // abandon the page, to be picked up by another thread...
 void          _mi_deferred_free(mi_theap_t* theap, bool force);
 void          _mi_page_free_collect(mi_page_t* page, bool force);
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b): the same, but
+// never brings a discarded hole back (heap inspection must not mutate the heap, and a sweep is
+// about to discard anyway). See `mi_page_free_collect_ex` in `src/page.c`.
+void          _mi_page_free_collect_no_unpurge(mi_page_t* page, bool force);
 void          _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head);
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page);
 bool          _mi_page_queue_is_valid(mi_theap_t* theap, const mi_page_queue_t* pq);
@@ -4613,6 +4725,10 @@ mi_theap_t*   _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld);
 void          _mi_theap_collect_retired(mi_theap_t* theap, bool force);
 void          _mi_theap_collect_abandon(mi_theap_t* theap);
 bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi_block_visit_fun* visitor, void* arg);
+// #272 (Bun parity P7b): visit every page of a theap (see `src/theap.c`). Exported for the hole
+// engine in `src/page-holes.c`, which sweeps and reports over exactly this walk.
+typedef bool (theap_page_visitor_fun)(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2);
+bool          _mi_theap_visit_pages(mi_theap_t* theap, theap_page_visitor_fun* fn, bool include_full, void* arg1, void* arg2);
 void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 
 void          _mi_heap_detach_theaps( mi_heap_t* heap );
@@ -4700,6 +4816,15 @@ void        _mi_prof_process_done(void);
 void        _mi_prof_fork_prepare(void);
 void        _mi_prof_fork_parent(void);
 void        _mi_prof_fork_child(void);
+#if MI_DEBUG
+// #272 profiler-interaction invariant (1): hole purging discards the memory of FREE blocks only.
+// A sampled record is attached to a LIVE block, so no record's block may lie in a range the hole
+// sweep is about to discard -- and the record structs themselves live in the profiler's own
+// raw-OS arena (CLAUDE.md rule 4), never inside a page, which this also asserts. Called from
+// `src/page-holes.c` just before every `_mi_os_discard` on a page that carries records; takes
+// `prof_lock` (unless this thread already holds it), so it is MI_DEBUG-only.
+void        _mi_prof_debug_assert_no_records_in(const mi_page_t* page, const void* addr, size_t size);
+#endif
 
 // "memory-events.c": opt-in allocation-change accounting/callbacks (issue #20). Independent of
 // MI_PPROF: always compiled in and hooked; the runtime activation flag gates all real work.
@@ -5294,6 +5419,213 @@ static inline size_t mi_page_committed(const mi_page_t* page) {
 static inline bool mi_page_all_free(const mi_page_t* page) {
   mi_assert_internal(page != NULL);
   return (page->used == 0);
+}
+
+/* ------------------------------------------------------
+   Page hole purging (issue #272 / Bun parity P7b)
+   imported from oven-sh/mimalloc @ 942b8342, MIT.
+   The engine lives in `src/page-holes.c`; `src/page.c` carries only the hook calls
+   (CLAUDE.md rule 6). Bun keeps these helpers as `page.c` statics; here they are shared
+   between the engine and those hooks, so they live with the other page inlines.
+   ------------------------------------------------------ */
+
+void          _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld);   // `tld`: the thread whose sweep this is
+void          _mi_page_purged_reset(mi_page_t* page);
+bool          _mi_page_unpurge_run(mi_page_t* page);
+void          _mi_page_unpurge_all(mi_page_t* page);
+size_t        _mi_page_purged_count(const mi_page_t* page);
+void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   // hand the discarded unformed tail back below `end` (an absolute address)
+size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            // the bytes of this page's unformed tail that are discarded right now
+bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
+                                            size_t capacity, size_t k, size_t* first, size_t* last);
+bool          _mi_page_purge_holes_in_progress(void);            // is the calling thread inside a sweep of its own heaps?
+void          _mi_page_holes_count_page_freed(void);
+void          _mi_page_holes_count_ineligible(const mi_page_t* page);
+void          _mi_page_holes_reset_ineligible(void);
+void          _mi_page_purge_holes_begin(mi_tld_t* tld);         // around each pass of a sweep; `tld` is the thread being swept
+void          _mi_page_purge_holes_end(mi_tld_t* tld);
+void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
+void          _mi_purge_holes_of(mi_tld_t* tld);                 // the sweep itself (src/page-holes.c)
+void          _mi_page_holes_assert_valid(const mi_page_t* page);   // MI_DEBUG hole invariants, called from `_mi_page_is_valid`
+
+/* ------------------------------------------------------
+   Hole report  (`mi_purge_holes_report`, see the "Hole report" section in `src/page-holes.c`)
+   imported from oven-sh/mimalloc @ 942b8342, MIT.
+
+   What is left behind after a sweep, per size class: the free bytes that share an OS page
+   with a live block cannot be discarded, and this says how much of that there is and how
+   few live blocks are holding it down.
+   ------------------------------------------------------ */
+
+#define MI_HOLES_HIST_BUCKETS  (5)    // live blocks per pinned OS page: 1, 2, 3-4, 5-8, 9+
+#define MI_HOLES_GRAN_COUNT    (5)    // the hypothetical OS page sizes of the granularity curve
+
+typedef struct mi_holes_bin_s {
+  size_t block_size;           // the largest block size seen in this bin
+  size_t pages;
+  size_t ineligible_pages;     // pages `mi_page_can_purge_holes` rejects (nothing in them is discardable)
+  size_t live_bytes;           // bytes of allocated blocks
+  size_t free_bytes;           // bytes of free blocks (free-listed *and* already discarded)
+  size_t undiscardable_bytes;  // free bytes in an OS page that a live block pins (or that is not entirely inside the block area)
+  size_t discarded_bytes;      // bytes of the OS pages that are discarded right now
+  size_t edge_bytes;           // of `undiscardable_bytes`: those in a partial OS page (holds the page header, or memory past `capacity`)
+  size_t pending_bytes;        // free bytes in a fully free OS page that is not discarded (no sweep yet, or the discard failed)
+  size_t pinned_ospages;       // OS pages holding >= 1 live block
+  size_t pinned_live_blocks;   // live blocks over those (a block straddling two pinned OS pages counts in both)
+  size_t pinned_free_bytes;    // free bytes trapped inside those pinned OS pages
+  size_t pinned_live_bytes;    // live bytes inside those pinned OS pages
+  size_t hist[MI_HOLES_HIST_BUCKETS];
+} mi_holes_bin_t;
+
+typedef struct mi_holes_report_s {
+  mi_holes_bin_t bin[MI_BIN_COUNT];
+  size_t total_pages;
+  size_t ineligible_pages;
+  size_t unformed_bytes;       // memory of blocks not formed yet (`capacity < reserved`)
+  size_t unformed_discarded_bytes;  // of those: the OS pages the sweep discarded (`page->unformed_purged_*`)
+  // The granularity curve: how many bytes WOULD be discardable if the OS page size were
+  // `mi_holes_granularity(g)` -- the total size of the G-aligned, G-sized spans that lie wholly
+  // inside a page's block area and hold not one live block. Nothing is discarded to measure it;
+  // it is pure counting over the same free/live classification the sweep uses.
+  size_t discardable_at[MI_HOLES_GRAN_COUNT];
+  size_t unmadvisable_pages;   // excluded from the curve: their memory cannot be discarded at ANY granularity
+
+  // Where the memory actually IS. If the curve turns out flat, the free memory is not
+  // contaminating the pages -- and then this says where it went instead.
+  //
+  // CAVEAT, and it is why these fields are named the way they are: `slices_committed` is set for
+  // the WHOLE arena at reserve time whenever the OS memory is `initially_committed` (which every
+  // POSIX mmap is), and a reset-style purge (MADV_FREE_REUSABLE on darwin) does NOT clear it. So
+  // there that bitmap is address space, not residency, and `arena_committed_bytes` must not be
+  // read as "memory we are paying for". `slices_dirty` (ever touched) and `slices_purge`
+  // (scheduled but not yet purged) are the bitmaps that carry residency information.
+  size_t page_committed_bytes;       // committed bytes of the pages this walk reached
+  size_t arena_reserved_bytes;       // total arena address space
+  size_t arena_committed_bytes;      // popcount(slices_committed) -- see the caveat: on POSIX this is ~= reserved
+  size_t arena_free_dirty_bytes;     // slices in NO page that were touched at least once: the UPPER bound on arena slack still resident
+  size_t arena_purge_pending_bytes;  // slices in NO page, scheduled for purge but not purged yet: definitely still resident (the purge delay)
+  size_t arena_meta_bytes;           // the arenas' own bitmaps (`info_slices`) -- ROUGH: excludes the `mi_meta` heaps
+} mi_holes_report_t;
+
+size_t        mi_holes_granularity(size_t g);
+void          _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep);
+void          _mi_page_holes_report_print(const mi_holes_report_t* rep);
+void          _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep);
+void          _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep);
+void          _mi_purge_holes_report_collect(mi_holes_report_t* rep);
+void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld);   // src/arena.c
+
+// The base of the OS-page bitmap: the start of the first OS page that the block area of
+// this page overlaps. It is OS-page aligned by construction, so bit `k` always names the
+// OS-page-aligned range `[base + k*os_page_size, base + (k+1)*os_page_size)`.
+static inline uintptr_t mi_page_purge_base(const mi_page_t* page) {
+  return _mi_align_down((uintptr_t)mi_page_start(page), _mi_os_page_size());
+}
+
+// the number of OS pages the block area spans = the number of bits this page needs
+static inline size_t mi_page_purge_bits(const mi_page_t* page) {
+  const uintptr_t base = mi_page_purge_base(page);
+  const uintptr_t end = (uintptr_t)mi_page_start(page) + mi_page_size(page);
+  return _mi_divide_up((size_t)(end - base), _mi_os_page_size());
+}
+
+// Eligible when the page's OS pages fit the bitmap. This does not depend on the block size
+// at all: a discard covers a whole OS page, so any number of small free blocks can together
+// cover one (and a page whose free runs never cover a whole OS page simply discards nothing).
+// Small and medium pages always fit; a large (4 MiB) page only fits when the OS page is
+// 16 KiB, and a huge page is a singleton (one block) so there is nothing to purge in it.
+// Pinned memory (large/huge OS pages) cannot be madvise'd away, and an arena with a custom
+// commit function owns its own commit/decommit -- like every other purge site
+// (`mi_arena_schedule_purge`, `_mi_os_purge_ex`), we stay away from both.
+static inline bool mi_page_can_purge_holes(const mi_page_t* page) {
+  if (page->reserved <= 1) return false;             // a singleton page has no free block while it is in use
+  if (page->memid.is_pinned) return false;
+  const mi_arena_t* const arena = mi_memid_arena(page->memid);
+  if (arena != NULL && arena->commit_fun != NULL) return false;
+  return (mi_page_purge_bits(page) <= MI_PAGE_PURGE_BITS);
+}
+
+static inline bool mi_page_has_purged(const mi_page_t* page) {
+  for (size_t i = 0; i < MI_PAGE_PURGE_WORDS; i++) {
+    if (page->purged[i] != 0) return true;
+  }
+  return false;
+}
+
+// is the memory of OS page `k` (counted from `mi_page_purge_base`) discarded?
+static inline bool mi_page_os_page_purged(const mi_page_t* page, size_t k) {
+  if (k >= MI_PAGE_PURGE_BITS) return false;
+  return ((page->purged[k / 64] >> (k % 64)) & 1) != 0;
+}
+
+// Is the block at index `idx` free-but-discarded (and thus not on any free list)?
+// This is the derived purge predicate: an OS page is discarded only when *every* block
+// overlapping it is free, so a block lost memory exactly when it overlaps a discarded OS page.
+static inline bool mi_page_block_index_is_purged(const mi_page_t* page, size_t idx) {
+  if (!mi_page_has_purged(page)) return false;
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t base = mi_page_purge_base(page);
+  const uintptr_t lo = (uintptr_t)mi_page_start(page) + (idx * page->block_size);
+  const size_t kfirst = (size_t)(lo - base) / os_size;
+  const size_t klast = (size_t)((lo + page->block_size - 1) - base) / os_size;
+  for (size_t k = kfirst; k <= klast && k < MI_PAGE_PURGE_BITS; k++) {
+    if (mi_page_os_page_purged(page, k)) return true;
+  }
+  return false;
+}
+
+// is `block` free-but-discarded? A purged block is on no free list, so a free-list walk
+// (as `free.c`'s double-free check does) cannot see that it is already free.
+static inline bool mi_page_block_is_purged(const mi_page_t* page, const void* block) {
+  if (!mi_page_has_purged(page)) return false;
+  mi_assert_internal((const uint8_t*)block >= mi_page_start(page));
+  const size_t idx = ((size_t)((const uint8_t*)block - mi_page_start(page))) / page->block_size;
+  if (idx >= page->capacity) return false;
+  return mi_page_block_index_is_purged(page, idx);
+}
+
+// The block state of the page, as the sweep sees it: `(capacity << 32) | used`.
+static inline uint64_t mi_page_sweep_state(const mi_page_t* page) {
+  mi_assert_internal(page->used <= page->capacity);
+  return (((uint64_t)page->capacity) << 32) | (uint64_t)page->used;
+}
+
+// Anything that changes which blocks are free *without* changing `(capacity,used)` must say so,
+// or the next sweep would wrongly skip the page. That is exactly `mi_page_unpurge_range`: it puts
+// discarded blocks back on the free list, and a purged block was already free.
+static inline void mi_page_sweep_state_invalidate(mi_page_t* page) {
+  page->swept_state = MI_PAGE_SWEPT_NONE;
+}
+
+static inline size_t mi_page_block_index(const mi_page_t* page, const mi_block_t* block) {
+  mi_assert_internal((uint8_t*)block >= mi_page_start(page));
+  return ((size_t)((uint8_t*)block - mi_page_start(page))) / page->block_size;
+}
+
+static inline mi_block_t* mi_page_block_index_at(const mi_page_t* page, size_t idx) {
+  mi_assert_internal(idx < page->capacity);
+  return (mi_block_t*)(mi_page_start(page) + (idx * page->block_size));
+}
+
+static inline void mi_page_purged_clear(mi_page_t* page, size_t k) {
+  mi_assert_internal(k < MI_PAGE_PURGE_BITS);
+  page->purged[k / 64] &= ~((uint64_t)1 << (k % 64));
+}
+
+// the OS pages that the block at index `idx` overlaps (relative to `mi_page_purge_base`)
+static inline void mi_page_block_os_pages(const mi_page_t* page, size_t idx, size_t* kfirst, size_t* klast) {
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t base = mi_page_purge_base(page);
+  const uintptr_t lo = (uintptr_t)mi_page_start(page) + (idx * page->block_size);
+  *kfirst = (size_t)(lo - base) / os_size;
+  *klast = (size_t)((lo + page->block_size - 1) - base) / os_size;
+}
+
+// the blocks that overlap OS page `k`, or `false` if that OS page is not entirely inside
+// the block area (see `_mi_page_purge_os_page_blocks`)
+static inline bool mi_page_os_page_blocks(const mi_page_t* page, size_t k, size_t* first, size_t* last) {
+  return _mi_page_purge_os_page_blocks(_mi_os_page_size(), page->block_size, (uintptr_t)mi_page_start(page),
+                                       page->capacity, k, first, last);
 }
 
 // are there immediately available blocks, i.e. blocks available on the free list.
@@ -7374,6 +7706,15 @@ static inline bool mi_block_could_be_double_free(const mi_page_t* page, const mi
 
 // check if `block` was free'd before
 static inline bool mi_check_is_double_free(const mi_page_t* page, const mi_block_t* block) {
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b). A purged block
+  // is free but held off every free list and its memory is discarded, so neither the decoded-
+  // `next` heuristic nor the free-list walk below can recognize it. This is inside
+  // MI_CHECK_DOUBLE_FREE (debug/secure builds only): the real free fast path gains nothing --
+  // a block being freed was live, hence never inside a discarded OS page.
+  if mi_unlikely(mi_page_block_is_purged(page, block)) {
+    _mi_error_message(EAGAIN, "double free detected of block %p with size %zu\n", block, mi_page_block_size(page));
+    return true;
+  }
   if mi_unlikely(mi_block_could_be_double_free(page,block))  // quick check: next field is aligned in the same page or NULL?
   {
     // Suspicious: decoded value a in block is in the same page (or NULL) -- maybe a double free?
@@ -9392,6 +9733,20 @@ int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit);
 // Returns error code or 0 on success.
 int _mi_prim_reset(void* addr, size_t size);
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+// Discard memory: like `_mi_prim_reset`, but release the physical pages *now*
+// (so `rss` drops immediately) while keeping the range committed and accessible.
+// Never changes the commit state of the range (in particular, never MEM_DECOMMIT).
+// Returns error code or 0 on success.
+// `MI_PRIM_HAS_DISCARD` is 0 where the primitive cannot release anything (and is a
+// no-op that must not be counted as a purge).
+#if defined(__wasi__) || defined(__EMSCRIPTEN__)
+#define MI_PRIM_HAS_DISCARD  (0)
+#else
+#define MI_PRIM_HAS_DISCARD  (1)
+#endif
+int _mi_prim_discard(void* addr, size_t size);
+
 // Reuse memory. This is called for memory that is already committed but
 // may have been reset (`_mi_prim_reset`) or decommitted (`_mi_prim_decommit`) where `needs_recommit` was false.
 // Returns error code or 0 on success. On most platforms this is a no-op.
@@ -11022,6 +11377,13 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   mi_assert_internal(!page->has_metadata && page->metadata == NULL);
   #endif
 
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+  // Undo any hole in the page: the arena can hand this memory out again as committed without
+  // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
+  // until it is MADV_FREE_REUSE'd. This function is the single choke point for a page going
+  // back to the arena (`_mi_page_free` and the abandoned-page free in `free.c` both land here).
+  _mi_page_unpurge_all(page);
+
   // all we need from the heap, before the page is unpublished from it (see
   // mi_arenas_page_free_prim's provenance comment, above)
   mi_heap_t* const heap = mi_page_heap(page);
@@ -11187,6 +11549,150 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   else {
     mi_heap_stat_decrease(heap, pages_abandoned, 1);
   }
+}
+
+
+
+/* -----------------------------------------------------------
+  Purge the holes in abandoned pages   (issue #272 / Bun parity P7b)
+  imported from oven-sh/mimalloc @ 942b8342, MIT.
+
+  Abandoned pages have no owning thread, so the idle sweep of a theap never sees them --
+  yet with the default `allow_page_abandon` every page that ever became full ends up here.
+  We claim each page with the arena's ownership protocol before touching its free list.
+  (The engine itself is in `src/page-holes.c`; only the arena walk lives here, because it
+  needs the arena bitmaps and the claim protocol.)
+----------------------------------------------------------- */
+
+typedef struct mi_purge_holes_arg_s {
+  mi_bitmap_t* bitmap;
+  mi_tld_t*    tld;      // the thread whose sweep this is (its own, or the parked one the scavenger is sweeping for)
+} mi_purge_holes_arg_t;
+
+static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  MI_UNUSED(slice_count);
+  mi_purge_holes_arg_t* const parg = (mi_purge_holes_arg_t*)arg;
+  // this pass holds every page that ever became full, so it is most of a cold sweep: an owner
+  // waiting in `_mi_park_leave` cannot allocate until we stop
+  if (mi_atomic_load_relaxed(&parg->tld->park_reclaim) != 0) return false;
+  mi_bitmap_t* const bitmap = parg->bitmap;
+
+  // Take the page out of the abandoned map first: this is the reader side of the protocol in
+  // `mi_arena_try_claim_abandoned`. A concurrent `_mi_arenas_page_unabandon` busy-waits for the
+  // bit to reappear (`mi_bitmap_clear_once_set`), so while we hold it cleared the page cannot be
+  // freed under us. If the bit is already clear, someone else has the page: skip it.
+  if (!mi_bitmap_clear(bitmap, slice_index)) return true;
+
+  mi_page_t* const page = mi_arena_page_at_slice(arena, slice_index);
+  if (!mi_page_claim_ownership(page)) {
+    mi_bitmap_set(bitmap, slice_index);   // a concurrent free owns it: keep it abandoned (as `mi_arena_try_claim_abandoned` does)
+    return true;
+  }
+
+  // We own the page: no other thread can reclaim, unabandon, or free it now, and only the
+  // atomic `xthread_free` can still change under us. (No un-purging: we are about to purge.)
+  _mi_page_free_collect_no_unpurge(page, true);
+  if (mi_page_all_free(page)) {
+    mi_bitmap_set(bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
+    _mi_arenas_abandoned_page_free(page, NULL);
+    _mi_page_holes_count_page_freed();
+    return true;
+  }
+  _mi_page_purge_holes(page, parg->tld);
+  mi_bitmap_set(bitmap, slice_index);     // back in the map *before* unowning: unown may free the page
+  mi_abandoned_page_unown(page, NULL);
+  return true;
+}
+
+// note: this only reaches the *mapped* abandoned pages (the ones in `pages_abandoned`).
+// A page abandoned while full is not mapped; it has no free blocks at that point, and once
+// enough blocks are freed in it, `_mi_arenas_page_try_reabandon_to_mapped` puts it in the map.
+void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
+  if (heap == NULL || tld == NULL) return;
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  _mi_page_purge_holes_begin(tld);
+  mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
+    mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
+    if (arena_pages != NULL) {
+      // pages_abandoned[] is MI_ARENA_BIN_COUNT wide, not MI_BIN_COUNT: bins above the
+      // singleton bins have no abandoned bitmap (upstream ad1bcdbf, to shrink arena meta).
+      for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
+        if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
+        mi_bitmap_t* const bitmap = arena_pages->pages_abandoned[bin];
+        mi_purge_holes_arg_t parg = { bitmap, tld };
+        (void)_mi_bitmap_forall_set(bitmap, &mi_arena_page_purge_holes_at, arena, &parg);
+      }
+    }
+  }
+  mi_forall_arenas_end();
+  _mi_page_purge_holes_end(tld);
+}
+
+// The read-only counterpart of the sweep above: account for the holes in the abandoned pages
+// instead of purging them. Same claim protocol -- the page must not be reclaimed or freed
+// while we read its free lists -- but nothing inside the page is modified.
+typedef struct mi_arena_holes_report_arg_s {
+  mi_bitmap_t*       bitmap;
+  mi_holes_report_t* rep;
+} mi_arena_holes_report_arg_t;
+
+static bool mi_arena_page_holes_report_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  MI_UNUSED(slice_count);
+  mi_arena_holes_report_arg_t* const ra = (mi_arena_holes_report_arg_t*)arg;
+  if (!mi_bitmap_clear(ra->bitmap, slice_index)) return true;   // someone else has the page
+
+  mi_page_t* const page = mi_arena_page_at_slice(arena, slice_index);
+  if (!mi_page_claim_ownership(page)) {
+    mi_bitmap_set(ra->bitmap, slice_index);   // a concurrent free owns it: keep it abandoned
+    return true;
+  }
+  _mi_page_holes_report_page(page, ra->rep);
+  mi_bitmap_set(ra->bitmap, slice_index);     // back in the map *before* unowning: unown may free the page
+  // Unown collects a pending `xthread_free`, but that collect always lands a block on `page->free`,
+  // so it can never take the `free == NULL` branch that would un-purge a run of holes.
+  mi_abandoned_page_unown(page, NULL);
+  return true;
+}
+
+void _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep) {
+  if (heap == NULL || rep == NULL) return;
+  mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
+    mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
+    if (arena_pages != NULL) {
+      for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {   // see above: not MI_BIN_COUNT
+        if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
+        mi_arena_holes_report_arg_t ra = { arena_pages->pages_abandoned[bin], rep };
+        (void)_mi_bitmap_forall_set(ra.bitmap, &mi_arena_page_holes_report_at, arena, &ra);
+      }
+    }
+  }
+  mi_forall_arenas_end();
+}
+
+// Where the memory IS: the arena slack, i.e. the memory mimalloc holds OUTSIDE any page. If what
+// we are chasing lands here instead of inside the pages, the problem is the arena / purge delay
+// and not free blocks contaminating pages -- a completely different fix.
+//
+// A slice in `slices_free` belongs to no page. Of those, a slice that was never touched costs
+// nothing, so residency is carried by `slices_dirty` (ever handed out, hence written) and
+// `slices_purge` (queued for purge, so still resident right now). `slices_committed` is NOT a
+// residency signal: it is set for the whole arena at reserve time for any `initially_committed`
+// memory (every POSIX mmap) and a reset-style purge does not clear it -- we report it only so the
+// caveat is visible in the output rather than silently misleading.
+void _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep) {
+  if (heap == NULL || rep == NULL) return;
+  mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
+    rep->arena_meta_bytes += mi_size_of_slices(mi_arena_info_slices(arena));
+    rep->arena_reserved_bytes += mi_size_of_slices(arena->slice_count);
+    const size_t slice_count = arena->slice_count;
+    for (size_t i = 0; i < slice_count; i++) {
+      if (mi_bitmap_is_set(arena->slices_committed, i)) { rep->arena_committed_bytes += MI_ARENA_SLICE_SIZE; }
+      if (!mi_bbitmap_is_setN(arena->slices_free, i, 1)) continue;   // in a page (or reserved meta): not slack
+      if (mi_bitmap_is_set(arena->slices_dirty, i)) { rep->arena_free_dirty_bytes += MI_ARENA_SLICE_SIZE; }
+      if (mi_bitmap_is_set(arena->slices_purge, i)) { rep->arena_purge_pending_bytes += MI_ARENA_SLICE_SIZE; }
+    }
+  }
+  mi_forall_arenas_end();
 }
 
 
@@ -16350,7 +16856,11 @@ static const mi_page_t mi_page_empty = {
   { 0, 0 },                // keys
   #endif
   NULL,                   // metadata (MI_PPROF)
-  false                   // has_metadata
+  false,                  // has_metadata
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
+  { 0 },                  // purged: no discarded OS pages
+  0, 0,                   // unformed_purged_lo / _hi: nothing of the unformed tail is discarded
+  MI_PAGE_SWEPT_NONE      // swept_state: never swept
 };
 
 #define MI_PAGE_EMPTY() ((mi_page_t*)&mi_page_empty)
@@ -16422,7 +16932,10 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // park_reclaim
   NULL,                   // park_theap0
   MI_ATOMIC_VAR_INIT(0),  // park_swept
-  NULL                    // subproc_next (unregistered)
+  NULL,                   // subproc_next (unregistered)
+  0, 0,                   // holes_sweep_seq / holes_sweep_last (#272 P7b)
+  false, false,           // holes_sweeping / holes_sweep_full
+  0, 0                    // holes_sweep_skipped / holes_sweep_visited
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -19129,6 +19642,11 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_zeroes) }           // experimental (#67): treat decommit-purged slices as zeroed so mi_zalloc can skip its memset
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(scavenger) }              // background thread that purges scheduled arena memory (MIMALLOC_SCAVENGER)
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
+  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(purge_holes) }            // discard free blocks inside still-used pages on `mi_on_thread_idle`
+  ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_holes_eager_zero) } // zero a range before discarding it so a mis-scoped discard corrupts visibly (debug builds force it on)
+  ,{ 100,    MI_OPTION_UNINIT, MI_OPTION(purge_holes_min_interval) } // min milli-seconds between two sweeps of the same thread's heaps
+  ,{ 64,     MI_OPTION_UNINIT, MI_OPTION(purge_holes_full_every) }   // every N'th sweep walks every page regardless of the skip check; 0 disables (Bun's default)
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
@@ -20381,6 +20899,46 @@ void _mi_os_reuse( mi_subproc_t* subproc, void* addr, size_t size ) {
   }
 }
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+// Release the physical pages of `[addr,addr+size)` right now, WITHOUT changing its commit
+// state -- see the "Page hole purging" block in `src/page-holes.c` for why the commit state
+// must stay untouched (the arena tracks commit per 64 KiB slice and cannot represent a
+// sub-slice hole). Returns whether anything was actually discarded.
+bool _mi_os_discard(mi_subproc_t* subproc, void* addr, size_t size) {
+  #if !MI_PRIM_HAS_DISCARD
+  MI_UNUSED(subproc); MI_UNUSED(addr); MI_UNUSED(size);
+  return false;   // `_mi_prim_discard` is a no-op here: nothing is released, so nothing is counted
+  #else
+  // page align conservatively *within* the range: never touch a partially covered OS page
+  size_t csize = 0;
+  void* const start = mi_os_page_align_area_conservative(addr, size, &csize);
+  if (csize == 0) return false;
+
+  #if !MI_TRACK_ENABLED
+  // Pretend the discard is eager (as `_mi_os_reset` does): on macOS MADV_FREE_REUSABLE
+  // keeps the data until the pages are actually reclaimed, so without this a range that
+  // wrongly overlaps a *live* block goes unnoticed. Always on in a debug build; the tests
+  // force it on with `purge_holes_eager_zero` so they are not vacuous in a release build.
+  #if (MI_DEBUG>1) && !MI_SECURE
+  const bool eager_zero = true;
+  #else
+  const bool eager_zero = mi_option_is_enabled(mi_option_purge_holes_eager_zero);
+  #endif
+  if (eager_zero) { _mi_memzero(start, csize); }
+  #endif
+
+  const int err = _mi_prim_discard(start, csize);
+  if (err != 0) {
+    _mi_warning_message("cannot discard OS memory (error: %d (0x%x), address: %p, size: 0x%zx bytes)\n", err, err, start, csize);
+    return false;
+  }
+  // count only what was actually discarded
+  mi_subproc_stat_counter_increase(subproc, purge_calls, 1);
+  mi_subproc_stat_counter_increase(subproc, purged, csize);
+  return true;
+  #endif
+}
+
 // either resets or decommits memory, returns true if the memory needs
 // to be recommitted if it is to be re-used later on.
 bool _mi_os_purge_ex(mi_subproc_t* subproc, void* p, size_t size, bool allow_reset, size_t stat_size, mi_commit_fun_t* commit_fun, void* commit_fun_arg)
@@ -21260,8 +21818,11 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   //mi_assert_internal(tfree_count <= page->thread_freed + 1);
   #endif
 
+  // #272 (P7b): blocks are conserved: used (incl. not-yet-collected thread frees) + free-listed
+  // + purged == capacity. Purged blocks are free but held OFF every free list (their memory is
+  // discarded); `_mi_page_purged_count` is 0 unless this page carries holes.
   size_t free_count = mi_page_list_count(page, page->free) + mi_page_list_count(page, page->local_free);
-  mi_assert_internal(page->used + free_count == page->capacity);
+  mi_assert_internal(page->used + free_count + _mi_page_purged_count(page) == page->capacity);
 
   return true;
 }
@@ -21273,6 +21834,9 @@ bool _mi_page_is_valid(mi_page_t* page) {
   #if MI_SECURE
   mi_assert_internal(page->keys[0] != 0);
   #endif
+  // #272 (P7b): the hole invariants (see `src/page-holes.c`). These are what make every existing
+  // test in the suite a test of the purge machinery. Debug-only, and a no-op without holes.
+  _mi_page_holes_assert_valid(page);
   if (!mi_page_is_abandoned(page)) {
     //mi_assert_internal(!_mi_process_is_initialized);
     mi_assert_internal(page->heap!=NULL);
@@ -21368,7 +21932,7 @@ static inline bool mi_page_free_quick_collect(mi_page_t* page) {
   return true;
 }
 
-void _mi_page_free_collect(mi_page_t* page, bool force) {
+static void mi_page_free_collect_ex(mi_page_t* page, bool force, bool allow_unpurge) {
   mi_assert_internal(page!=NULL);
 
   // collect the thread free list
@@ -21397,6 +21961,27 @@ void _mi_page_free_collect(mi_page_t* page, bool force) {
   }
 
   mi_assert_internal(!force || page->local_free == NULL);
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 1/5.
+  // Free list empty but this page has discarded holes: bring a whole run of them back. Every
+  // caller re-checks `mi_page_immediate_available` after collect, so the page becomes usable
+  // again without touching the other holes. (`_mi_page_unpurge_run` etc. live in
+  // `src/page-holes.c`; `mi_page_has_purged` is a bitmap scan of cold, tail-of-struct words.)
+  if (allow_unpurge && page->free == NULL && mi_page_has_purged(page) && !_mi_page_purge_holes_in_progress()) {
+    _mi_page_unpurge_run(page);
+  }
+}
+
+void _mi_page_free_collect(mi_page_t* page, bool force) {
+  mi_page_free_collect_ex(page, force, true);
+}
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 2/5.
+// Heap inspection must not mutate the heap: leave the holes discarded (they are still reported
+// as free, see `_mi_theap_area_visit_blocks`). Also used by the sweep itself, which is about to
+// discard and would only un-purge what it re-discards a moment later.
+void _mi_page_free_collect_no_unpurge(mi_page_t* page, bool force) {
+  mi_page_free_collect_ex(page, force, false);
 }
 
 // Collect elements in the thread-free list starting at `head`. This is an optimized
@@ -21446,7 +22031,10 @@ void _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page)
 }
 
 void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
-  _mi_page_free_collect(page, false); // ensure used count is up to date
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 3/5.
+  // no allocation to serve here either (see `mi_theap_page_collect`): un-purging would fault a run
+  // of this page's holes back in on the way out, for a page nobody is about to allocate from.
+  _mi_page_free_collect_no_unpurge(page, false); // ensure used count is up to date
   if (mi_page_all_free(page)) {
     _mi_page_free(page, pq);
   }
@@ -21840,6 +22428,12 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
     }
   }
 
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 4/5.
+  // The blocks we are about to format may sit in the discarded unformed tail: hand that memory
+  // back to the OS *before* the first free-list pointer is written into it (on macOS a discarded
+  // page stays reclaimable by the kernel, and stays charged to the process, until it is REUSE'd).
+  _mi_page_unpurge_unformed_upto(page, (uintptr_t)mi_page_start(page) + ((size_t)page->capacity + extend) * bsize);
+
   // and append the extend the free list
   if (extend < MI_MIN_SLICES || MI_SECURE<2) { //!mi_option_is_enabled(mi_option_secure)) {
     mi_page_free_list_extend(page, bsize, extend );
@@ -21862,6 +22456,9 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_assert(theap!=NULL);
   // page->heap = (_mi_is_heap_main(_mi_theap_heap(theap)) ? NULL : _mi_theap_heap(theap)); // faster for `mi_page_associated_theap`
   // mi_page_set_theap(page, theap);
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 5/5.
+  _mi_page_purged_reset(page);   // fresh (or recycled) page: no holes, never swept
 
   size_t page_size;
   uint8_t* page_start = mi_page_area(page, &page_size); MI_UNUSED(page_start);
@@ -22843,6 +23440,1146 @@ mi_decl_nodiscard mi_decl_export bool mi_is_in_heap_region(const void* p) mi_att
 
 #endif
 /* ---- end inlined: src/page-map.c ---- */
+/* ---- begin inlined: src/page-holes.c ---- */
+/* ----------------------------------------------------------------------------
+Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
+This is free software; you can redistribute it and/or modify it under the
+terms of the MIT license. A copy of the license can be found in the file
+"LICENSE" at the root of this distribution.
+-----------------------------------------------------------------------------*/
+
+/* -----------------------------------------------------------
+  Page hole purging  (issue #272 / Bun parity P7b)
+  imported from oven-sh/mimalloc @ 942b8342, MIT.
+
+  Upstream mimalloc returns a page's memory to the OS only when EVERY block in
+  it is free. One long-lived object therefore keeps a whole 64KB/512KB page
+  resident, and a server that churns allocations ends up paying for pages that
+  are 95% free (oven-sh/bun#39844: heap peaks 1.4-2.6x Node's). Hole punching
+  fixes exactly that: at an idle point (`mi_on_thread_idle`) it discards the
+  memory of the free blocks inside a still-used page.
+
+  The unit is an OS page, because that is the unit `madvise`/`MEM_RESET` works
+  in. `page->purged` is a bitmap over the OS pages of the block area
+  (`mi_page_purge_base` is its origin, so bit `k` always names an OS-page
+  aligned range in absolute terms). An OS page may be discarded only when
+  *every* block overlapping it is free, which is what
+  `mi_page_block_index_is_purged` computes. A purged block lost bytes, so it is
+  taken OFF every free list: mimalloc threads its free list through the free
+  blocks themselves and a discarded block cannot carry a `next` pointer.
+  `_mi_page_unpurge_run` hands a whole run of discarded OS pages back at once:
+  it calls `_mi_os_reuse` on exactly that byte range before any byte of it is
+  written again (on macOS a discarded page stays MADV_FREE_REUSABLE --
+  reclaimable by the kernel -- until it is REUSE'd), and pushes every block that
+  is whole again back onto the free list.
+
+  An OS page that is not entirely inside the block area is never discarded: it
+  holds bytes we do not own (the page header, which lives *before* `page_start`,
+  or blocks beyond `capacity` that are not formed yet). See
+  `_mi_page_purge_os_page_blocks`, which is the only place this arithmetic lives.
+
+  The discard goes through `_mi_os_discard`, which NEVER changes commit state
+  (MADV_FREE_REUSABLE on macOS, MADV_DONTNEED on Linux -- both keep the mapping
+  and demand-fault zeroes -- MEM_RESET on Windows). The arena tracks commit per
+  64KB slice and cannot represent a sub-slice hole, so commit state MUST stay
+  untouched: otherwise a page returned to the arena would be re-handed-out as
+  "committed" and the first write into a hole would fault (on Windows only --
+  silently fine on macOS/Linux). Note that `_mi_os_purge` is NOT usable here:
+  with the default `MIMALLOC_PURGE_DECOMMITS=1` it decommits (and in debug
+  builds it also mprotects the range PROT_NONE).
+
+  DEVIATION from Bun (CLAUDE.md rule 6): Bun keeps all of this inside
+  `src/page.c` (+1038 lines) and the sweep drivers inside `src/theap.c`. Here
+  the whole engine lives in this file; `src/page.c` carries only the five hook
+  calls, and `src/theap.c` only exports its page walker. The shared inline
+  helpers (`mi_page_can_purge_holes`, `mi_page_block_index_is_purged`, ...) are
+  in `mimalloc/internal.h` next to the other page inlines, because both this
+  file and those hooks need them.
+
+  PROFILER INTERACTION (this fork, #272). Our profiler attaches sampled
+  allocation records to a page (`page->metadata`), which Bun's does not. Three
+  things make that safe here:
+   1. a record is attached to a LIVE block and the sweep only discards OS pages
+      in which every block is free, so no record's block can be inside a
+      discarded range; the record structs themselves come from the profiler's
+      raw-OS arena (CLAUDE.md rule 4) and are never inside a page at all. Both
+      are asserted, per discard, by `_mi_prof_debug_assert_no_records_in`.
+   2. heap inspection (`mi_prof_visit`, `mi_heap_visit_blocks`, the DHAT and
+      memory-events walkers) goes through `_mi_theap_area_visit_blocks`, which
+      counts a purged block as free -- so a discarded block is never handed to a
+      visitor -- and through `_mi_page_free_collect_no_unpurge`, so inspecting a
+      heap never faults a hole back in.
+   3. the sweep of a parked thread never touches `mi_tld_t::profiler`: nothing
+      in this file reads or writes it (asserted in `_mi_theap_sweep_parked`).
+----------------------------------------------------------- */
+
+
+#include <stddef.h>              // offsetof
+
+
+/* -----------------------------------------------------------
+  Page-geometry helpers shared with the hooks in `page.c`
+----------------------------------------------------------- */
+
+// The blocks that overlap OS page `k` of a page whose block area starts at `page_start` and
+// holds `capacity` blocks of `block_size` bytes. OS pages are counted from
+// `align_down(page_start, os_page_size)`, so OS page `k` is an OS-page aligned range in
+// absolute terms -- exactly what `_mi_os_discard` and `_mi_os_reuse` need.
+// Returns `false` when OS page `k` is not *entirely* inside the block area: such an OS page
+// holds bytes of the page header or of blocks that are not formed yet, and may never be
+// discarded. Exposed for `test-purge-holes.c`.
+bool _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
+                                   size_t capacity, size_t k, size_t* first, size_t* last)
+{
+  *first = 0;
+  *last = 0;
+  const uintptr_t base = _mi_align_down(page_start, os_page_size);
+  const uintptr_t lo = base + (k * os_page_size);
+  const uintptr_t hi = lo + os_page_size;
+  const uintptr_t pend = page_start + (capacity * block_size);
+  if (lo < page_start || hi > pend) return false;   // not entirely inside the block area
+  *first = (size_t)(lo - page_start) / block_size;
+  *last = (size_t)((hi - 1) - page_start) / block_size;
+  mi_assert_internal(*first <= *last && *last < capacity);
+  return true;
+}
+
+#if !MI_PADDING && !MI_ENCODE_FREELIST
+// imported from oven-sh/mimalloc @ 942b8342, MIT. The fields up to and including `theap` are read
+// by `mi_free` and `mi_page_alloc`; they must all sit in the first cache line. This is the static
+// proof that `purged`/`swept_state` (and this fork's `metadata`/`has_metadata`) stay COLD, i.e.
+// that hole purging costs the alloc/free fast path nothing in layout terms.
+typedef char mi_page_hot_fields_first_cacheline[(offsetof(mi_page_t,theap) + sizeof(mi_theap_t*) <= 64) ? 1 : -1];
+#endif
+
+void _mi_page_purged_reset(mi_page_t* page) {
+  for (size_t i = 0; i < MI_PAGE_PURGE_WORDS; i++) { page->purged[i] = 0; }
+  page->unformed_purged_lo = 0;
+  page->unformed_purged_hi = 0;
+  page->swept_state = MI_PAGE_SWEPT_NONE;   // a fresh (or recycled) page was never swept
+}
+
+// `mi_page_sweep_state` is lossless while `capacity` fits 16 bits and `used` 32, and then
+// `MI_PAGE_SWEPT_NONE` (all ones) is an impossible state:
+typedef char mi_page_sweep_state_fits[(sizeof(((mi_page_t*)0)->capacity) <= 2 &&
+                                       sizeof(((mi_page_t*)0)->used) <= 4) ? 1 : -1];
+
+// The number of blocks that are purged: the blocks overlapping a discarded OS page.
+// (the blocks of a maximal run of discarded OS pages are contiguous)
+size_t _mi_page_purged_count(const mi_page_t* page) {
+  if (!mi_page_has_purged(page)) return 0;
+  size_t total = 0;
+  size_t k = 0;
+  while (k < MI_PAGE_PURGE_BITS) {
+    if (!mi_page_os_page_purged(page, k)) { k++; continue; }
+    const size_t k0 = k;
+    while (k < MI_PAGE_PURGE_BITS && mi_page_os_page_purged(page, k)) { k++; }
+    size_t first, last, first1, last1;
+    if (!mi_page_os_page_blocks(page, k0, &first, &last)) { mi_assert_internal(false); continue; }
+    if (!mi_page_os_page_blocks(page, k - 1, &first1, &last1)) { mi_assert_internal(false); continue; }
+    total += (last1 - first) + 1;
+  }
+  return total;
+}
+
+// The hole invariants, called from `_mi_page_is_valid` (`src/page.c`). Kept here rather than
+// inlined there so `page.c` keeps its five hook calls (CLAUDE.md rule 6). These are what make
+// every existing test in the suite a test of the purge machinery.
+void _mi_page_holes_assert_valid(const mi_page_t* page) {
+  #if MI_DEBUG > 1
+  if (!mi_page_has_purged(page)) return;
+  mi_assert_internal(mi_page_can_purge_holes(page));   // only eligible pages may carry holes
+  // A purged block is OFF every free list: if it were on one, its `next` pointer would live in
+  // discarded memory. (checked from the lists, which is O(list) instead of the O(capacity * list)
+  // of the other direction -- pages can hold thousands of blocks)
+  mi_page_t* const p = (mi_page_t*)page;
+  for (mi_block_t* b = p->free; b != NULL; b = mi_block_next(p, b)) {
+    mi_assert_internal(!mi_page_block_is_purged(p, b));
+  }
+  for (mi_block_t* b = p->local_free; b != NULL; b = mi_block_next(p, b)) {
+    mi_assert_internal(!mi_page_block_is_purged(p, b));
+  }
+  #if !MI_TRACK_ENABLED && !MI_TSAN
+  for (mi_block_t* b = mi_page_thread_free(p); b != NULL; b = mi_block_next(p, b)) {
+    mi_assert_internal(!mi_page_block_is_purged(p, b));
+  }
+  #endif
+  #else
+  MI_UNUSED(page);
+  #endif
+}
+
+
+/* -----------------------------------------------------------
+  Process-wide counters
+
+  This is the only way to see how much hole punching actually reclaims
+  (`mi_stats_t` cannot grow, see `mi_purge_holes_stats_t` in `mimalloc.h`).
+  Plain `int64_t` updated through the atomic i64 helpers, exactly as
+  `mi_stat_counter_t` is.
+----------------------------------------------------------- */
+
+static int64_t mi_holes_bytes;          // currently discarded
+static int64_t mi_holes_blocks;         // currently held off the free lists
+static int64_t mi_holes_bytes_total;
+static int64_t mi_holes_discard_calls;
+static int64_t mi_holes_reuse_calls;
+static int64_t mi_holes_pages_freed;
+static int64_t mi_holes_inelig_pages;   // pages the sweep cannot purge at all (see `mi_page_can_purge_holes`)
+static int64_t mi_holes_inelig_bytes;
+static int64_t mi_holes_inelig_free_bytes;
+static int64_t mi_holes_unformed_bytes;         // unformed tail discarded right now
+static int64_t mi_holes_unformed_bytes_total;
+static int64_t mi_holes_unformed_discard_calls;
+static int64_t mi_holes_unformed_reuse_calls;
+static int64_t mi_holes_pages_skipped;          // pages the sweep skipped: unchanged since it last swept them
+static int64_t mi_holes_blocks_visited;         // free-list blocks the sweep walked (the cost the skip avoids)
+static int64_t mi_holes_full_sweeps;            // sweeps that walked every page regardless (`purge_holes_full_every`)
+
+static inline size_t mi_holes_load(int64_t* c) {
+  const int64_t v = mi_atomic_addi64_relaxed(c, 0);
+  return (v < 0 ? 0 : (size_t)v);
+}
+
+void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept {
+  if (stats == NULL) return;
+  stats->purged_bytes       = mi_holes_load(&mi_holes_bytes);
+  stats->purged_blocks      = mi_holes_load(&mi_holes_blocks);
+  stats->purged_bytes_total = mi_holes_load(&mi_holes_bytes_total);
+  stats->discard_calls      = mi_holes_load(&mi_holes_discard_calls);
+  stats->reuse_calls        = mi_holes_load(&mi_holes_reuse_calls);
+  stats->pages_freed        = mi_holes_load(&mi_holes_pages_freed);
+  stats->ineligible_pages      = mi_holes_load(&mi_holes_inelig_pages);
+  stats->ineligible_bytes      = mi_holes_load(&mi_holes_inelig_bytes);
+  stats->ineligible_free_bytes = mi_holes_load(&mi_holes_inelig_free_bytes);
+  stats->unformed_bytes         = mi_holes_load(&mi_holes_unformed_bytes);
+  stats->unformed_bytes_total   = mi_holes_load(&mi_holes_unformed_bytes_total);
+  stats->unformed_discard_calls = mi_holes_load(&mi_holes_unformed_discard_calls);
+  stats->unformed_reuse_calls   = mi_holes_load(&mi_holes_unformed_reuse_calls);
+  stats->pages_skipped          = mi_holes_load(&mi_holes_pages_skipped);
+  stats->blocks_visited         = mi_holes_load(&mi_holes_blocks_visited);
+  stats->full_sweeps            = mi_holes_load(&mi_holes_full_sweeps);
+}
+
+void _mi_page_holes_count_page_freed(void) {
+  mi_atomic_addi64_relaxed(&mi_holes_pages_freed, 1);
+}
+
+// The pages the sweep could not touch at all, so it is visible what hole punching does
+// *not* reach. A gauge over the last sweep: `_mi_purge_holes_of` zeroes it before it starts.
+void _mi_page_holes_reset_ineligible(void) {
+  mi_atomic_addi64_relaxed(&mi_holes_inelig_pages, -(int64_t)mi_holes_load(&mi_holes_inelig_pages));
+  mi_atomic_addi64_relaxed(&mi_holes_inelig_bytes, -(int64_t)mi_holes_load(&mi_holes_inelig_bytes));
+  mi_atomic_addi64_relaxed(&mi_holes_inelig_free_bytes, -(int64_t)mi_holes_load(&mi_holes_inelig_free_bytes));
+}
+
+void _mi_page_holes_count_ineligible(const mi_page_t* page) {
+  // Blocks are conserved (see `mi_page_is_valid_init`): free-listed == capacity - used - purged.
+  // Eligibility is fixed for a page's lifetime (page size, block size, memid), so an ineligible
+  // page never carries a purged block and the last term is 0 -- O(1), on every page of every sweep.
+  mi_assert_internal(!mi_page_has_purged(page));
+  const size_t nfree = (size_t)(page->capacity - page->used);
+  mi_atomic_addi64_relaxed(&mi_holes_inelig_pages, 1);
+  mi_atomic_addi64_relaxed(&mi_holes_inelig_bytes, (int64_t)mi_page_size(page));
+  mi_atomic_addi64_relaxed(&mi_holes_inelig_free_bytes, (int64_t)(nfree * page->block_size));
+}
+
+static void mi_holes_count_discard(size_t bytes) {
+  mi_atomic_addi64_relaxed(&mi_holes_discard_calls, 1);
+  mi_atomic_addi64_relaxed(&mi_holes_bytes_total, (int64_t)bytes);
+  mi_atomic_addi64_relaxed(&mi_holes_bytes, (int64_t)bytes);
+}
+
+static void mi_holes_count_blocks_off(size_t blocks) {
+  mi_atomic_addi64_relaxed(&mi_holes_blocks, (int64_t)blocks);
+}
+
+static void mi_holes_count_reuse(size_t bytes, size_t blocks, bool reused) {
+  if (reused) {
+    mi_atomic_addi64_relaxed(&mi_holes_reuse_calls, 1);
+    mi_atomic_addi64_relaxed(&mi_holes_bytes, -(int64_t)bytes);
+  }
+  mi_atomic_addi64_relaxed(&mi_holes_blocks, -(int64_t)blocks);
+}
+
+
+/* -----------------------------------------------------------
+  Sweep state
+
+  The state of a running sweep lives on the tld being swept (`tld->holes_sweep*`, see
+  `types.h`), never in thread-locals of the sweeping thread. Besides the scavenger sweeping
+  many tlds from one thread, this must not touch a `__thread` variable at all:
+  `_mi_page_purge_holes_in_progress` is read from `mi_page_free_collect_ex`, inside the
+  allocator, and on targets where `__thread` is emulated (Android before API 29) the first
+  access on a thread allocates -- re-entering the collect that is reading it, without bound
+  (oven-sh/bun#38051). The tld of the calling thread is reached through the default theap,
+  which every TLS model can read without allocating.
+----------------------------------------------------------- */
+
+// Re-entrancy guard: while a sweep is rewriting a page's free list and bitmap, a nested `mi_malloc`
+// on the sweeping thread (only reachable through a user output function from a warning message)
+// must not un-purge a hole from under it. That nested allocation comes out of the calling thread's
+// own theaps, so it is its own tld that matters here: on the owner that is the tld being swept;
+// the scavenger has no theaps of its own being swept (it sweeps a parked thread's theaps, and the
+// abandoned pages it touches are claimed), so un-purging there is harmless.
+bool _mi_page_purge_holes_in_progress(void) {
+  mi_theap_t* const theap = _mi_theap_default();
+  if (theap == NULL || theap->tld == NULL) return false;
+  return theap->tld->holes_sweeping;
+}
+
+void _mi_page_purge_holes_begin(mi_tld_t* tld) {
+  mi_assert_internal(tld != NULL && !tld->holes_sweeping);
+  tld->holes_sweeping = true;
+}
+
+// Also folds the per-sweep counters into the process-wide ones. The sweep runs over every page of
+// the thread, so a process-wide atomic per page would be a real cost on the very path we are making
+// cheap: they accumulate on the tld and are folded in once per pass.
+void _mi_page_purge_holes_end(mi_tld_t* tld) {
+  mi_assert_internal(tld != NULL && tld->holes_sweeping);
+  tld->holes_sweeping = false;
+  if (tld->holes_sweep_skipped > 0) {
+    mi_atomic_addi64_relaxed(&mi_holes_pages_skipped, (int64_t)tld->holes_sweep_skipped);
+    tld->holes_sweep_skipped = 0;
+  }
+  if (tld->holes_sweep_visited > 0) {
+    mi_atomic_addi64_relaxed(&mi_holes_blocks_visited, (int64_t)tld->holes_sweep_visited);
+    tld->holes_sweep_visited = 0;
+  }
+}
+
+// Called once per idle sweep of `tld`'s heaps, before its passes (`_mi_purge_holes_of`): decides
+// whether this sweep ignores `page->swept_state` (see `_mi_page_purge_holes`).
+void _mi_page_purge_holes_sweep_begin(mi_tld_t* tld) {
+  const long every = mi_option_get(mi_option_purge_holes_full_every);
+  const size_t seq = ++tld->holes_sweep_seq;
+  tld->holes_sweep_full = (every > 0 && (seq % (size_t)every) == 0);
+  if (tld->holes_sweep_full) { mi_atomic_addi64_relaxed(&mi_holes_full_sweeps, 1); }
+}
+
+
+/* -----------------------------------------------------------
+  Discarding and un-discarding
+----------------------------------------------------------- */
+
+static inline bool mi_page_bits_at(const uint64_t* bits, size_t k) {
+  mi_assert_internal(k < MI_PAGE_PURGE_BITS);
+  return ((bits[k / 64] >> (k % 64)) & 1) != 0;
+}
+
+// does the block at index `idx` overlap any OS page in `bits`?
+static bool mi_page_block_overlaps(const mi_page_t* page, size_t idx, const uint64_t* bits) {
+  size_t kfirst, klast;
+  mi_page_block_os_pages(page, idx, &kfirst, &klast);
+  for (size_t k = kfirst; k <= klast && k < MI_PAGE_PURGE_BITS; k++) {
+    if (mi_page_bits_at(bits, k)) return true;
+  }
+  return false;
+}
+
+// Discard `[dstart,dstart+dsize)` of `page`, checking the profiler invariant first (#272).
+static bool mi_page_holes_discard(mi_page_t* page, uintptr_t dstart, size_t dsize) {
+  #if MI_PPROF && MI_DEBUG
+  // #272 profiler-interaction invariant (1): before the discard, so the debug eager-zero in
+  // `_mi_os_discard` cannot destroy the evidence of a mis-scoped range.
+  _mi_prof_debug_assert_no_records_in(page, (void*)dstart, dsize);
+  #endif
+  return _mi_os_discard(mi_page_subproc(page), (void*)dstart, dsize);
+}
+
+// Bring the discarded OS pages [k0,k1] back. `discarded` is false when the discard itself
+// failed, in which case the memory was never released and needs no `reuse`.
+// Tells the OS we are using the memory again *before* any block in it is written to, then
+// pushes every block that is whole again back onto the free list. A block at either end of
+// the range can still overlap a hole we are not touching: those stay purged.
+static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool discarded) {
+  mi_assert_internal(k0 <= k1 && k1 < MI_PAGE_PURGE_BITS);
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t dstart = mi_page_purge_base(page) + (k0 * os_size);
+  const size_t dsize = ((k1 - k0) + 1) * os_size;
+  if (discarded) { _mi_os_reuse(mi_page_subproc(page), (void*)dstart, dsize); }
+
+  // clear the bits first: `mi_page_block_index_is_purged` then tells us exactly which
+  // blocks are whole again
+  for (size_t k = k0; k <= k1; k++) { mi_page_purged_clear(page, k); }
+  mi_page_sweep_state_invalidate(page);   // the free list is about to grow, but `used`/`capacity` will not
+                                          // (before any early return below: the bits are already cleared)
+
+  size_t first, last, first1, last1;
+  if (!mi_page_os_page_blocks(page, k0, &first, &last) ||
+      !mi_page_os_page_blocks(page, k1, &first1, &last1)) {
+    mi_assert_internal(false);   // a discarded OS page is always entirely inside the block area
+    return;
+  }
+  // every block in [first,last1] was free when we discarded, and a purged block cannot be
+  // allocated or freed, so they are all still free
+  size_t nblocks = 0;
+  for (size_t i = last1 + 1; i > first; i--) {   // descending: the free list stays in address order
+    const size_t idx = i - 1;
+    if (mi_page_block_index_is_purged(page, idx)) continue;   // still overlaps another hole
+    mi_block_t* const block = mi_page_block_index_at(page, idx);
+    mi_block_set_next(page, block, page->free);
+    page->free = block;
+    nblocks++;
+  }
+  page->free_is_zero = false;
+  mi_page_sweep_state_invalidate(page);   // the free list grew, but `used`/`capacity` did not
+  mi_holes_count_reuse(dsize, nblocks, discarded);
+}
+
+
+/* -----------------------------------------------------------
+  The unformed tail.
+
+  The blocks in `[capacity, reserved)` were never handed out: `mi_page_extend_free`
+  formats them lazily, a few OS pages worth at a time. They still cost memory though --
+  a page is carved from an arena slice that had a previous life, so its tail is already
+  resident, dirtying memory for blocks that may never exist.
+
+  So we discard it too, but NOT through the `purged` bitmap: a bit there means "this block
+  is free and off every free list" (`_mi_page_holes_assert_valid`), and an unformed block is
+  on no list and has no identity yet. The region is contiguous and only shrinks from the left
+  as `capacity` grows, so two offsets say everything there is to say.
+
+  `mi_page_extend_free` calls `_mi_page_unpurge_unformed_upto` on exactly the range it is
+  about to format, *before* it writes the first free-list pointer into it.
+----------------------------------------------------------- */
+
+// Can this page's memory be discarded at ALL? Pinned (large/huge OS pages) memory cannot be
+// madvise'd away, and an arena with a custom commit function owns its own decommit. Note this
+// is deliberately weaker than `mi_page_can_purge_holes`, which also rejects pages whose OS
+// pages do not fit the `purged` bitmap -- the unformed tail needs no bitmap.
+static bool mi_page_holes_madvisable(const mi_page_t* page) {
+  if (page->memid.is_pinned) return false;
+  const mi_arena_t* const arena = mi_memid_arena(page->memid);
+  return (arena == NULL || arena->commit_fun == NULL);
+}
+
+// The OS pages that lie wholly inside the unformed tail *and* inside the committed part of
+// the page: `[align_up(page_start + capacity*bs), align_down(min(page_start + reserved*bs, committed_end)))`.
+// Empty (lo == hi) when there is no tail, when it is smaller than an OS page, or when the
+// page has no committed memory there (`slice_committed`).
+static void mi_page_unformed_tail_range(const mi_page_t* page, uintptr_t* lo, uintptr_t* hi) {
+  *lo = 0; *hi = 0;
+  if (page->capacity >= page->reserved) return;    // no tail
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
+  const uintptr_t tlo = pstart + ((size_t)page->capacity * page->block_size);
+  uintptr_t thi = pstart + ((size_t)page->reserved * page->block_size);
+  const uintptr_t climit = pstart + mi_page_committed(page);   // never discard memory that is not committed
+  if (thi > climit) { thi = climit; }
+  const uintptr_t alo = _mi_align_up(tlo, os_size);
+  const uintptr_t ahi = _mi_align_down(thi, os_size);
+  if (alo >= ahi) return;
+  *lo = alo;
+  *hi = ahi;
+}
+
+size_t _mi_page_unformed_purged_bytes(const mi_page_t* page) {
+  return (page->unformed_purged_hi > page->unformed_purged_lo
+            ? (size_t)(page->unformed_purged_hi - page->unformed_purged_lo) : 0);
+}
+
+// Discard the OS pages of the unformed tail that are not discarded already.
+static void mi_page_purge_unformed_tail(mi_page_t* page) {
+  if (!mi_page_holes_madvisable(page)) return;
+  uintptr_t lo, hi;
+  mi_page_unformed_tail_range(page, &lo, &hi);
+  if (lo >= hi) return;
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
+  mi_assert_internal(hi - pstart <= UINT32_MAX);   // only a huge page can be that big, and it has no tail
+  if (hi - pstart > UINT32_MAX) return;
+
+  // the part of the tail that is not discarded yet (the tail can only grow to the right,
+  // when `mi_page_extend_free` commits more of the page)
+  uintptr_t dlo = lo;
+  const size_t already = _mi_page_unformed_purged_bytes(page);
+  if (already > 0) {
+    mi_assert_internal(pstart + page->unformed_purged_lo >= lo);   // extend un-discards what it formats
+    const uintptr_t uhi = pstart + page->unformed_purged_hi;
+    if (uhi > dlo) { dlo = uhi; }
+    lo = pstart + page->unformed_purged_lo;
+  }
+  if (dlo >= hi) return;   // nothing new
+
+  if (!mi_page_holes_discard(page, dlo, (size_t)(hi - dlo))) return;   // the discard failed: leave the page as it was
+  page->unformed_purged_lo = (uint32_t)(lo - pstart);
+  page->unformed_purged_hi = (uint32_t)(hi - pstart);
+  mi_atomic_addi64_relaxed(&mi_holes_unformed_discard_calls, 1);
+  mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes_total, (int64_t)(hi - dlo));
+  mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
+}
+
+// Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
+// in it is written to. `end` is an absolute address (`UINTPTR_MAX` for the whole tail); it is
+// rounded up to an OS page, as the discard covers whole OS pages.
+void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
+  if (_mi_page_unformed_purged_bytes(page) == 0) return;
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
+  const uintptr_t rlo = pstart + page->unformed_purged_lo;
+  const uintptr_t rhi = pstart + page->unformed_purged_hi;
+  uintptr_t rend;
+  if (end >= rhi) { rend = rhi; }   // (also the `UINTPTR_MAX` case: `_mi_align_up` would overflow)
+  else {
+    rend = _mi_align_up(end, os_size);
+    if (rend > rhi) { rend = rhi; }
+  }
+  if (rend <= rlo) return;   // nothing of the discarded tail is needed yet
+
+  _mi_os_reuse(mi_page_subproc(page), (void*)rlo, (size_t)(rend - rlo));
+  if (rend >= rhi) { page->unformed_purged_lo = 0; page->unformed_purged_hi = 0; }
+  else { page->unformed_purged_lo = (uint32_t)(rend - pstart); }
+  mi_atomic_addi64_relaxed(&mi_holes_unformed_reuse_calls, 1);
+  mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, -(int64_t)(rend - rlo));
+}
+
+
+/* -----------------------------------------------------------
+  The sweep of a single page
+----------------------------------------------------------- */
+
+// Walk the free list of a page and discard every OS page in it that holds no live block.
+// Returns false if any discard failed: those blocks went straight back on the free list and the
+// page must be swept again, so the caller must not record it as swept.
+static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
+  if (page->free == NULL) return true;                    // nothing to take off the free list
+
+  const size_t os_size = _mi_os_page_size();
+  const size_t nbits = mi_page_purge_bits(page);
+  mi_assert_internal(nbits <= MI_PAGE_PURGE_BITS);
+  if (nbits > MI_PAGE_PURGE_BITS) return true;
+  bool complete = true;
+
+  // 1. count, per OS page, the blocks on the free list that overlap it
+  uint16_t nfree[MI_PAGE_PURGE_BITS];
+  _mi_memzero(nfree, nbits * sizeof(uint16_t));
+  size_t nvisited = 0;
+  for (mi_block_t* b = page->free; b != NULL; b = mi_block_next(page, b)) {
+    const size_t idx = mi_page_block_index(page, b);
+    mi_assert_internal(idx < page->capacity);
+    mi_assert_internal(!mi_page_block_index_is_purged(page, idx));   // it is on the free list, so not purged
+    nvisited++;
+    size_t kfirst, klast;
+    mi_page_block_os_pages(page, idx, &kfirst, &klast);
+    for (size_t k = kfirst; k <= klast && k < nbits; k++) {
+      mi_assert_internal(nfree[k] < UINT16_MAX);
+      nfree[k]++;
+    }
+  }
+  tld->holes_sweep_visited += nvisited;   // folded into the process-wide counter at the end of the pass
+
+  // 2. an OS page can be discarded when *every* block overlapping it is free -- either on the
+  //    free list, or purged already. Of the blocks overlapping an OS page, only the first and
+  //    the last can stick out into another OS page, so only those two can be purged already
+  //    (any other block lies entirely inside this OS page, whose bit is clear here).
+  uint64_t todo[MI_PAGE_PURGE_WORDS];
+  for (size_t i = 0; i < MI_PAGE_PURGE_WORDS; i++) { todo[i] = 0; }
+  size_t ntodo = 0;
+  for (size_t k = 0; k < nbits; k++) {
+    if (mi_page_os_page_purged(page, k)) continue;                 // discarded already
+    size_t first, last;
+    if (!mi_page_os_page_blocks(page, k, &first, &last)) continue; // not entirely inside the block area
+    size_t nfreek = nfree[k];
+    if (mi_page_block_index_is_purged(page, first)) { nfreek++; }
+    if (last != first && mi_page_block_index_is_purged(page, last)) { nfreek++; }
+    mi_assert_internal(nfreek <= (last - first) + 1);
+    if (nfreek != (last - first) + 1) continue;                    // some block overlapping it is still live
+    todo[k / 64] |= ((uint64_t)1 << (k % 64));
+    ntodo++;
+  }
+  if (ntodo == 0) return true;   // nothing discardable: the page IS fully swept
+
+  // 3. rebuild the free list without the blocks that are about to lose memory. This must
+  //    happen *before* the discard: it walks `next` pointers that live in the very memory
+  //    we are about to discard.
+  mi_block_t* keep = NULL;
+  size_t ndropped = 0;
+  mi_block_t* b = page->free;
+  while (b != NULL) {
+    mi_block_t* const next = mi_block_next(page, b);
+    if (mi_page_block_overlaps(page, mi_page_block_index(page, b), todo)) {
+      ndropped++;   // it becomes purged in step 4
+    }
+    else {
+      mi_block_set_next(page, b, keep);
+      keep = b;
+    }
+    b = next;
+  }
+  page->free = keep;
+  page->free_is_zero = false;   // discarded memory reads back zero or stale; never assume
+
+  // 4. mark the OS pages as discarded (this is what makes the blocks we just dropped
+  //    "purged"), then discard them a maximal run at a time.
+  for (size_t i = 0; i < MI_PAGE_PURGE_WORDS; i++) { page->purged[i] |= todo[i]; }
+  mi_holes_count_blocks_off(ndropped);
+  size_t k = 0;
+  while (k < nbits) {
+    if (!mi_page_bits_at(todo, k)) { k++; continue; }
+    const size_t k0 = k;
+    while (k < nbits && mi_page_bits_at(todo, k)) { k++; }
+    const size_t dsize = (k - k0) * os_size;
+    if (mi_page_holes_discard(page, mi_page_purge_base(page) + (k0 * os_size), dsize)) {
+      mi_holes_count_discard(dsize);
+    }
+    else {
+      // the discard failed: the memory is intact, so hand these blocks straight back
+      mi_page_unpurge_range(page, k0, k - 1, false /* nothing was discarded, so no reuse */);
+      complete = false;
+    }
+  }
+  return complete;
+}
+
+// Discard the memory of the free blocks in a still-used page.
+//
+// The free blocks a sweep leaves behind are the ones it could NOT discard (their OS page still
+// holds a live block), and they stay on `page->free`. Walking them again finds exactly the same
+// thing, so a sweep that follows one with nothing in between must not walk them: on a thread that
+// parks often that re-walk is the dominant cost, and it grows with uptime. `page->swept_state` --
+// the `(capacity,used)` we left the page in -- is the O(1) guard, and it is sound in one
+// direction:
+//
+//   an OS page that is discardable now but was not at the end of the last sweep must have gained
+//   a free block since (that sweep discarded EVERY OS page all of whose blocks were free), and a
+//   block can only become free by being freed (`used` down) or by being formed (`capacity` up).
+//
+// So an unchanged `(capacity,used)` means at most that the page CHURNED: as many frees as allocs,
+// leaving `used` where it was but a different set of blocks free -- which can hide a discardable
+// OS page from the check. That is a missed discard, never a correctness bug (the block bookkeeping
+// is exact either way), but a steady-state server can sit at the same `used` at every park, so it
+// would not heal on its own. `purge_holes_full_every` bounds it: every N'th sweep walks every page
+// regardless, which caps the delay of a missed discard at N parks for 1/N of the old cost.
+// (An exact "was anything freed in this page" bit is the alternative, and it costs a store in
+// `mi_free` itself -- the hot path this whole feature stays off.)
+void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
+  mi_assert_internal(page != NULL && tld != NULL);
+  mi_assert_internal(tld->holes_sweeping);
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  if (mi_page_all_free(page)) return;                     // the page itself is about to be freed
+  if (mi_option_get(mi_option_purge_delay) < 0) return;   // purging disabled
+  mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
+  if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }
+
+  if (!tld->holes_sweep_full && page->swept_state == mi_page_sweep_state(page)) {
+    tld->holes_sweep_skipped++;   // nothing was allocated or freed in this page since we swept it
+    return;
+  }
+  // Record the state we LEAVE the page in, read back from the page: a nested `mi_malloc` (see
+  // `_mi_page_purge_holes_in_progress`) may have taken a block out of it while we walked.
+  //
+  // Only if the walk got everything. A failed `_mi_os_discard` (ENOMEM under pressure) puts its
+  // blocks straight back, and changes neither `capacity` nor `used` -- so recording here would
+  // say "already swept" for a page that still has holes, and the skip check would then park them
+  // until the next full sweep, or forever with `purge_holes_full_every=0`.
+  if (mi_page_purge_holes_walk(page, tld)) {
+    page->swept_state = mi_page_sweep_state(page);
+  }
+}
+
+// Bring the first run of discarded OS pages back onto the free list. Only that run is
+// touched, so the other holes in the page stay discarded. A whole run at a time (and not
+// one OS page at a time) so that the `_mi_os_reuse` is one call and the following
+// allocations from this page hit the fast path instead of a syscall per block.
+bool _mi_page_unpurge_run(mi_page_t* page) {
+  if (!mi_page_has_purged(page)) return false;
+  size_t k0 = 0;
+  while (k0 < MI_PAGE_PURGE_BITS && !mi_page_os_page_purged(page, k0)) { k0++; }
+  mi_assert_internal(k0 < MI_PAGE_PURGE_BITS);
+  if (k0 >= MI_PAGE_PURGE_BITS) return false;
+  size_t k1 = k0;
+  while (k1 + 1 < MI_PAGE_PURGE_BITS && mi_page_os_page_purged(page, k1 + 1)) { k1++; }
+  mi_page_unpurge_range(page, k0, k1, true);
+  return true;
+}
+
+// Undo every hole in the page (the page is going back to the arena, which may hand the
+// memory out as committed without any further `reuse` call). The page is dead here (every
+// block is free), so we do NOT rebuild its free list: writing `next` pointers into the
+// holes would fault every discarded OS page right back in.
+void _mi_page_unpurge_all(mi_page_t* page) {
+  _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);   // the unformed tail goes back as well
+  if (!mi_page_has_purged(page)) return;
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t base = mi_page_purge_base(page);
+  size_t k = 0;
+  while (k < MI_PAGE_PURGE_BITS) {
+    if (!mi_page_os_page_purged(page, k)) { k++; continue; }
+    const size_t k0 = k;
+    while (k < MI_PAGE_PURGE_BITS && mi_page_os_page_purged(page, k)) { k++; }
+    const size_t dsize = (k - k0) * os_size;
+    _mi_os_reuse(mi_page_subproc(page), (void*)(base + (k0 * os_size)), dsize);
+    size_t first, last, first1, last1;
+    if (mi_page_os_page_blocks(page, k0, &first, &last) &&
+        mi_page_os_page_blocks(page, k - 1, &first1, &last1)) {
+      mi_holes_count_reuse(dsize, (last1 - first) + 1, true);
+    }
+    else {
+      mi_assert_internal(false);   // a discarded OS page is always entirely inside the block area
+    }
+  }
+  _mi_page_purged_reset(page);
+}
+
+
+/* -----------------------------------------------------------
+  The idle sweep
+
+  Visit every page (INCLUDING the full queue, which a normal collect skips -- see
+  `mi_theap_collect_ex`) and discard the memory of free blocks inside pages that are still
+  partially used. Meant to be called when the application knows it is idle (e.g. from an
+  event loop about to park): it costs a few madvise calls and nothing on the alloc/free
+  hot path.
+
+  DEVIATION from Bun (CLAUDE.md rule 6): these drivers are `src/theap.c` statics there.
+----------------------------------------------------------- */
+
+static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg_tld, void* arg2) {
+  MI_UNUSED(arg2);
+  mi_tld_t* const tld = (mi_tld_t*)arg_tld;   // the tld being swept (== theap->tld)
+  // When the scavenger is doing this for a parked thread, the owner may wake at any moment and
+  // has to wait for us. Stopping between pages bounds that wait to one page's walk; the pages we
+  // skip are simply swept at the next park (`swept_state` makes the re-walk cheap).
+  if (theap->tld != NULL && mi_atomic_load_relaxed(&theap->tld->park_reclaim) != 0) return false;
+  // force: fold local_free (and thread_free) into `free` first. Never un-purge here: we are about
+  // to purge, and a run brought back now would be discarded again right away (see `mi_theap_page_collect`).
+  _mi_page_free_collect_no_unpurge(page, true);
+  if (mi_page_all_free(page)) {
+    // the forced collect emptied the page: hand it back instead of leaving it resident
+    _mi_page_holes_count_page_freed();
+    _mi_page_free(page, pq);
+    return true;
+  }
+  _mi_page_purge_holes(page, tld);
+  mi_assert_expensive(_mi_page_is_valid(page));
+  return true; // continue
+}
+
+static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
+  if (theap == NULL || !mi_theap_is_initialized(theap)) return;
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  // This rewrites the thread-local free list of every page, so it may only run when the owner is
+  // not allocating. Two ways to know that: we ARE the owner, or the owner published MI_PARK_PARKED
+  // and the scavenger claimed it (MI_PARK_SWEEPING) -- the same "owner is quiesced" precondition
+  // `mi_theap_collect` already relies on for its non-owner callers (see python/cpython#112532).
+  if (theap->tld == NULL) return;
+  if (theap->tld->thread_id != _mi_thread_id() &&
+      mi_atomic_load_acquire(&theap->tld->park_state) != MI_PARK_SWEEPING) return;
+  mi_tld_t* const tld = theap->tld;
+  _mi_page_purge_holes_begin(tld);
+  _mi_theap_visit_pages(theap, &mi_theap_page_purge_holes, true /* include full pages */, tld, NULL);
+  _mi_page_purge_holes_end(tld);
+}
+
+// Purge the holes in every page this thread may safely touch:
+//  - the pages of every theap of this thread (`page->free`/`used` are plain fields that only the
+//    owning thread may write, so we can never do this for a theap of another thread), and
+//  - the abandoned pages of the heaps behind those theaps: those have no owning thread and are
+//    claimed through the arena ownership protocol (see `_mi_arenas_purge_abandoned_holes`).
+// The abandoned pages matter: with the default `allow_page_abandon`, every page that ever became
+// full ends up there. Non-default heaps matter too (JSC allocates its structure heap with
+// `mi_heap_new_in_arena`), which is why we sweep every theap and not just the default one.
+#define MI_PURGE_HOLES_MAX_HEAPS  (8)
+
+void _mi_purge_holes_of(mi_tld_t* tld) {
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  if (tld == NULL) return;
+  _mi_page_purge_holes_sweep_begin(tld);  // decides whether this sweep skips unchanged pages
+  _mi_page_holes_reset_ineligible();      // the ineligible counters are a gauge over this sweep
+
+  mi_heap_t* heaps[MI_PURGE_HOLES_MAX_HEAPS];
+  size_t heap_count = 0;
+
+  // Hold `tld->theaps_lock` for the whole sweep, including the abandoned-page pass below:
+  //  - another thread can unlink a theap from this list in `_mi_heap_detach_theaps`, and
+  //  - it keeps every `heaps[i]` alive: a heap is only freed by `mi_heap_delete`/`mi_heap_destroy`
+  //    *after* `_mi_heap_detach_theaps` detached every theap of it, and detaching our theap needs this
+  //    lock (it try-acquires it and retries), so it cannot complete while we hold it. Reading a
+  //    `heaps[i]` outside the lock is a use-after-free (`heap->subproc`).
+  mi_lock(&tld->theaps_lock) {
+    for (mi_theap_t* theap = tld->theaps; theap != NULL; theap = theap->tnext) {
+      mi_theap_purge_holes(theap);
+      mi_heap_t* const heap = _mi_theap_heap(theap);
+      if (heap != NULL && heap_count < MI_PURGE_HOLES_MAX_HEAPS) {
+        bool seen = false;
+        for (size_t i = 0; i < heap_count; i++) { if (heaps[i] == heap) { seen = true; break; } }
+        if (!seen) { heaps[heap_count++] = heap; }
+      }
+    }
+    for (size_t i = 0; i < heap_count; i++) {
+      if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) break;
+      _mi_arenas_purge_abandoned_holes(heaps[i], tld);
+    }
+  }
+}
+
+
+/* -----------------------------------------------------------
+  Hole report
+
+  After a sweep, the memory that hole punching did *not* get back is the free blocks that
+  share an OS page with a live block: an OS page is discarded only when every block
+  overlapping it is free, so a single live block pins the whole OS page. This accounts for
+  that, per size class, and says how many live blocks each pinned OS page is holding.
+
+  Read-only: it does not purge, un-purge, collect, or touch a free list. It walks the three
+  free lists in place instead of collecting them.
+
+  A block is exactly one of:
+   - free-listed: on `free`, `local_free`, or `xthread_free`;
+   - purged: free but held off every list because its memory is discarded. This is derived
+     from the OS-page bitmap (`mi_page_block_index_is_purged`: a block is purged iff it
+     overlaps a discarded OS page), which is how the rest of the code derives it too;
+   - live: everything else. Note `page->used` counts the not-yet-collected `xthread_free`
+     blocks as used, so live is *not* `page->used` -- we take it as the complement of the
+     other two (the conservation invariant is asserted in `mi_page_is_valid_init`).
+
+  Bytes are attributed per OS page, by overlap: every byte of every block lies in exactly
+  one OS page, so nothing is double counted even for a block straddling a boundary.
+----------------------------------------------------------- */
+
+#define MI_HOLES_MAX_CAP  (1 << 16)   // `page->capacity` is a uint16_t
+
+static void mi_holes_mark_free_list(const mi_page_t* page, mi_block_t* b, uint64_t* set) {
+  const size_t cap = page->capacity;
+  for (size_t n = 0; b != NULL && n <= cap; n++) {   // `n` bounds a corrupt or cyclic list
+    const size_t idx = mi_page_block_index(page, b);
+    if (idx >= cap) break;
+    set[idx / 64] |= ((uint64_t)1 << (idx % 64));
+    b = mi_block_next((mi_page_t*)page, b);
+  }
+}
+
+static size_t mi_holes_hist_bucket(size_t nlive) {
+  if (nlive <= 1) return 0;
+  if (nlive == 2) return 1;
+  if (nlive <= 4) return 2;
+  if (nlive <= 8) return 3;
+  return 4;
+}
+
+// the hypothetical OS page sizes of the granularity curve
+size_t mi_holes_granularity(size_t g) {
+  static const size_t grans[MI_HOLES_GRAN_COUNT] = { 4*MI_KiB, 8*MI_KiB, 16*MI_KiB, 32*MI_KiB, 64*MI_KiB };
+  return (g < MI_HOLES_GRAN_COUNT ? grans[g] : 0);
+}
+
+// is the block at `idx` free? Either on a free list, or purged (free, but held off every list
+// because its memory is already discarded). Anything else is live.
+static bool mi_holes_block_is_free(const mi_page_t* page, const uint64_t* freelisted, size_t idx) {
+  if (((freelisted[idx / 64] >> (idx % 64)) & 1) != 0) return true;
+  return mi_page_block_index_is_purged(page, idx);
+}
+
+// How many bytes of this page would be discardable if the OS page size were `G`? A G-aligned,
+// G-sized span can be discarded exactly when it lies wholly inside the block area and every
+// block overlapping it is free -- the same rule the real sweep applies at `_mi_os_page_size()`.
+static void mi_page_holes_granularity_curve(const mi_page_t* page, const uint64_t* freelisted, mi_holes_report_t* rep) {
+  const size_t bs = page->block_size;
+  const size_t cap = page->capacity;
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
+  const uintptr_t pend = pstart + (cap * bs);
+  for (size_t g = 0; g < MI_HOLES_GRAN_COUNT; g++) {
+    const size_t gran = mi_holes_granularity(g);
+    for (uintptr_t lo = _mi_align_down(pstart, gran); lo + gran <= pend; lo += gran) {
+      if (lo < pstart) continue;   // not entirely inside the block area
+      const size_t first = (size_t)(lo - pstart) / bs;
+      const size_t last = (size_t)((lo + gran - 1) - pstart) / bs;
+      bool all_free = true;
+      for (size_t idx = first; idx <= last && idx < cap; idx++) {
+        if (!mi_holes_block_is_free(page, freelisted, idx)) { all_free = false; break; }
+      }
+      if (all_free) { rep->discardable_at[g] += gran; }
+    }
+  }
+}
+
+void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
+  if (page == NULL || rep == NULL) return;
+  const size_t bs = page->block_size;
+  const size_t cap = page->capacity;
+  if (bs == 0 || cap > MI_HOLES_MAX_CAP) return;
+  mi_holes_bin_t* const r = &rep->bin[_mi_bin(bs)];
+  r->pages++;
+  if (bs > r->block_size) { r->block_size = bs; }
+  rep->total_pages++;
+  rep->page_committed_bytes += mi_page_committed(page);
+  if (page->reserved > cap) { rep->unformed_bytes += ((size_t)page->reserved - cap) * bs; }
+  rep->unformed_discarded_bytes += _mi_page_unformed_purged_bytes(page);
+  if (cap == 0) return;
+
+  uint64_t freelisted[MI_HOLES_MAX_CAP / 64];
+  const size_t nwords = _mi_divide_up(cap, 64);
+  _mi_memzero(freelisted, nwords * sizeof(uint64_t));
+  mi_holes_mark_free_list(page, page->free, freelisted);
+  mi_holes_mark_free_list(page, page->local_free, freelisted);
+  mi_holes_mark_free_list(page, mi_page_thread_free((mi_page_t*)page), freelisted);   // a concurrent free can push after this read: that block reads as live (a diagnostic, so this is fine)
+
+  if (mi_page_holes_madvisable(page)) { mi_page_holes_granularity_curve(page, freelisted, rep); }
+  else { rep->unmadvisable_pages++; }
+
+  // An ineligible page has no discardable OS page at all (and carries no holes, see
+  // `_mi_page_holes_assert_valid`), so every free block in it is undiscardable by definition.
+  if (!mi_page_can_purge_holes(page)) {
+    size_t nlive = 0;
+    for (size_t idx = 0; idx < cap; idx++) {
+      if (!mi_holes_block_is_free(page, freelisted, idx)) { nlive++; }
+    }
+    r->live_bytes += nlive * bs;
+    r->free_bytes += (cap - nlive) * bs;
+    r->undiscardable_bytes += (cap - nlive) * bs;
+    r->ineligible_pages++;
+    rep->ineligible_pages++;
+    return;
+  }
+
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
+  const uintptr_t pend = pstart + (cap * bs);
+  const uintptr_t base = mi_page_purge_base(page);
+  const size_t nbits = mi_page_purge_bits(page);
+  mi_assert_internal(nbits <= MI_PAGE_PURGE_BITS);
+
+  for (size_t k = 0; k < nbits; k++) {
+    const uintptr_t lo = base + (k * os_size);
+    const uintptr_t hi = lo + os_size;
+    const uintptr_t clo = (lo < pstart ? pstart : lo);
+    const uintptr_t chi = (hi > pend ? pend : hi);
+    if (clo >= chi) continue;                            // holds no block byte at all (the page header, or memory past `capacity`)
+    const bool whole = (lo >= pstart && hi <= pend);     // entirely inside the block area -- only such an OS page can ever be discarded
+    const size_t first = (size_t)(clo - pstart) / bs;
+    const size_t last = (size_t)((chi - 1) - pstart) / bs;
+    size_t live_ov = 0, free_ov = 0, nlive = 0;
+    for (size_t idx = first; idx <= last && idx < cap; idx++) {
+      const uintptr_t blo = pstart + (idx * bs);
+      const uintptr_t bhi = blo + bs;
+      const uintptr_t olo = (blo < lo ? lo : blo);
+      const uintptr_t ohi = (bhi > hi ? hi : bhi);
+      const size_t ov = (size_t)(ohi - olo);
+      if (mi_holes_block_is_free(page, freelisted, idx)) { free_ov += ov; }
+      else { live_ov += ov; nlive++; }
+    }
+    r->live_bytes += live_ov;
+    r->free_bytes += free_ov;
+    if (mi_page_os_page_purged(page, k)) {
+      mi_assert_internal(whole && live_ov == 0 && free_ov == os_size);
+      r->discarded_bytes += os_size;
+    }
+    else if (!whole) {
+      // Not entirely inside the block area (it holds the page header, or memory past `capacity`),
+      // so it is never discardable whatever lives in it. Checked BEFORE liveness on purpose:
+      // counting it as pinned would blame a live block for an OS page that freeing that block
+      // cannot release anyway, and `pinned_ospages` / the histogram are the whole point here.
+      r->undiscardable_bytes += free_ov;
+      r->edge_bytes += free_ov;
+    }
+    else if (nlive > 0) {
+      r->undiscardable_bytes += free_ov;                 // pinned: a live block in this OS page keeps it resident
+      r->pinned_ospages++;
+      r->pinned_live_blocks += nlive;
+      r->pinned_free_bytes += free_ov;
+      r->pinned_live_bytes += live_ov;
+      r->hist[mi_holes_hist_bucket(nlive)]++;
+    }
+    else {
+      r->pending_bytes += free_ov;                       // fully free and discardable, but not discarded (no sweep yet, or the discard failed)
+    }
+  }
+}
+
+// bytes as "MB.hh", since the mimalloc printf has no %f
+static void mi_holes_mb(size_t bytes, char* buf, size_t bufsize) {
+  const size_t mb = bytes / MI_MiB;
+  const size_t hundredths = ((bytes % MI_MiB) * 100) / MI_MiB;
+  _mi_snprintf(buf, bufsize, "%zu.%02zu", mb, hundredths);
+}
+
+static void mi_holes_print_row(const char* name, const mi_holes_bin_t* r) {
+  char slive[32], sfree[32], sundisc[32], sdisc[32];
+  mi_holes_mb(r->live_bytes, slive, sizeof(slive));
+  mi_holes_mb(r->free_bytes, sfree, sizeof(sfree));
+  mi_holes_mb(r->undiscardable_bytes, sundisc, sizeof(sundisc));
+  mi_holes_mb(r->discarded_bytes, sdisc, sizeof(sdisc));
+  // live blocks per pinned OS page, to two decimals
+  const size_t avg100 = (r->pinned_ospages == 0 ? 0 : (r->pinned_live_blocks * 100) / r->pinned_ospages);
+  _mi_fprintf(NULL, NULL, "%10s %8zu %10s %10s %18s %13s %10zu.%02zu\n",
+              name, r->pages, slive, sfree, sundisc, sdisc, avg100 / 100, avg100 % 100);
+}
+
+void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
+  if (rep == NULL) return;
+  static const char* hist_name[MI_HOLES_HIST_BUCKETS] = { "1", "2", "3-4", "5-8", "9+" };
+
+  _mi_fprintf(NULL, NULL, "\nholes report: os page = %zu bytes, %zu pages (%zu ineligible, %zu never madvise-able)\n",
+              _mi_os_page_size(), rep->total_pages, rep->ineligible_pages, rep->unmadvisable_pages);
+
+  mi_holes_bin_t total;
+  _mi_memzero(&total, sizeof(total));
+  for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+    const mi_holes_bin_t* const r = &rep->bin[bin];
+    total.live_bytes += r->live_bytes;
+    total.free_bytes += r->free_bytes;
+    total.pinned_ospages += r->pinned_ospages;
+    total.pinned_free_bytes += r->pinned_free_bytes;
+    total.pinned_live_bytes += r->pinned_live_bytes;
+  }
+
+  // THE measurement: what a smaller OS page would buy us. `discardable@4K - discardable@16K` is
+  // the memory the 16KB darwin page costs us, measured directly here -- no cross-platform
+  // subtraction, no RSS arithmetic. Nothing is discarded to produce these numbers.
+  char sgran[32];
+  _mi_fprintf(NULL, NULL, "  discardable bytes vs hypothetical OS page size (nothing is discarded to measure this):\n");
+  for (size_t g = 0; g < MI_HOLES_GRAN_COUNT; g++) {
+    const size_t gran = mi_holes_granularity(g);
+    mi_holes_mb(rep->discardable_at[g], sgran, sizeof(sgran));
+    _mi_fprintf(NULL, NULL, "    @%6zu : %10s MB%s\n", gran, sgran,
+                (gran == _mi_os_page_size() ? "   <-- this machine's OS page size" : ""));
+  }
+  char slive[32], sfree[32], spfree[32], splive[32];
+  mi_holes_mb(total.live_bytes, slive, sizeof(slive));
+  mi_holes_mb(total.free_bytes, sfree, sizeof(sfree));
+  mi_holes_mb(total.pinned_free_bytes, spfree, sizeof(spfree));
+  mi_holes_mb(total.pinned_live_bytes, splive, sizeof(splive));
+  _mi_fprintf(NULL, NULL, "  live %s MB, free %s MB\n", slive, sfree);
+  _mi_fprintf(NULL, NULL, "  %zu pinned OS pages (>= 1 live block): %s MB live + %s MB free trapped in them\n",
+              total.pinned_ospages, splive, spfree);
+
+  // Where the memory IS. If the curve is flat, the free memory is not sitting inside the pages --
+  // and then it is sitting here. "in-page free" is memory the PAGES are holding (contamination);
+  // "arena slack" is memory held in NO page at all (a purge/arena problem). Those want completely
+  // different fixes, so the split has to be explicit -- and so does what each number can't tell us.
+  {
+    char spage[32], soverhead[32], sslack[32], spend[32], smeta[32], scommit[32], sresv[32], sother[32];
+    const size_t page_overhead = (rep->page_committed_bytes > total.live_bytes + total.free_bytes
+                                   ? rep->page_committed_bytes - total.live_bytes - total.free_bytes : 0);
+    const size_t touched = rep->page_committed_bytes + rep->arena_free_dirty_bytes + rep->arena_meta_bytes;
+    mi_holes_mb(rep->page_committed_bytes, spage, sizeof(spage));
+    mi_holes_mb(page_overhead, soverhead, sizeof(soverhead));
+    mi_holes_mb(rep->arena_free_dirty_bytes, sslack, sizeof(sslack));
+    mi_holes_mb(rep->arena_purge_pending_bytes, spend, sizeof(spend));
+    mi_holes_mb(rep->arena_meta_bytes, smeta, sizeof(smeta));
+    mi_holes_mb(touched, sother, sizeof(sother));
+    mi_holes_mb(rep->arena_committed_bytes, scommit, sizeof(scommit));
+    mi_holes_mb(rep->arena_reserved_bytes, sresv, sizeof(sresv));
+    _mi_fprintf(NULL, NULL, "  memory partition (walking the arena bitmaps):\n");
+    _mi_fprintf(NULL, NULL, "    in pages           : %10s MB  = live %s + in-page free %s + page overhead %s (header/unformed)\n",
+                spage, slive, sfree, soverhead);
+    _mi_fprintf(NULL, NULL, "    arena slack        : %10s MB  (in NO page, touched at least once; %s MB of it is queued for purge and so certainly still resident)\n",
+                sslack, spend);
+    _mi_fprintf(NULL, NULL, "    arena meta (ROUGH) : %10s MB  (arena bitmaps only; excludes the mi_meta heaps)\n", smeta);
+    _mi_fprintf(NULL, NULL, "    ---- ever-touched  : %10s MB  (in-pages + slack + meta; the ceiling on what we can be paying for)\n", sother);
+    _mi_fprintf(NULL, NULL, "    reserved %s MB, slices_committed %s MB -- NOTE: on POSIX every slice is marked committed at reserve\n", sresv, scommit);
+    _mi_fprintf(NULL, NULL, "      time and a reset-purge never clears it, so slices_committed is address space, NOT residency.\n");
+    _mi_fprintf(NULL, NULL, "      'arena slack' is an UPPER bound: a slice purged earlier still reads as dirty here.\n");
+    _mi_fprintf(NULL, NULL, "      'in pages' misses pages owned by OTHER threads' theaps -- this walk cannot read them.\n");
+  }
+
+  _mi_fprintf(NULL, NULL, "%10s %8s %10s %10s %18s %13s %13s\n",
+              "size_class", "pages", "live_MB", "free_MB", "undiscardable_MB", "discarded_MB", "avg_live_blocks_per_pinned_ospage");
+  _mi_memzero(&total, sizeof(total));
+  char name[32];
+  for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+    const mi_holes_bin_t* const r = &rep->bin[bin];
+    if (r->pages == 0) continue;
+    _mi_snprintf(name, sizeof(name), "%zu", r->block_size);
+    mi_holes_print_row(name, r);
+    total.pages += r->pages;
+    total.live_bytes += r->live_bytes;
+    total.free_bytes += r->free_bytes;
+    total.undiscardable_bytes += r->undiscardable_bytes;
+    total.discarded_bytes += r->discarded_bytes;
+    total.edge_bytes += r->edge_bytes;
+    total.pending_bytes += r->pending_bytes;
+    total.pinned_ospages += r->pinned_ospages;
+    total.pinned_live_blocks += r->pinned_live_blocks;
+  }
+  mi_holes_print_row("TOTAL", &total);
+
+  char edge[32], pending[32], unformed[32], unformed_disc[32];
+  mi_holes_mb(total.edge_bytes, edge, sizeof(edge));
+  mi_holes_mb(total.pending_bytes, pending, sizeof(pending));
+  mi_holes_mb(rep->unformed_bytes, unformed, sizeof(unformed));
+  mi_holes_mb(rep->unformed_discarded_bytes, unformed_disc, sizeof(unformed_disc));
+  _mi_fprintf(NULL, NULL, "  of undiscardable: %s MB lies in a partial OS page (page header / past capacity)\n", edge);
+  _mi_fprintf(NULL, NULL, "  free and discardable but not discarded: %s MB;  blocks not formed yet: %s MB (of which discarded: %s MB)\n", pending, unformed, unformed_disc);
+
+  // the 3 worst size classes by undiscardable bytes: how many live blocks pin each pinned OS page?
+  size_t taken[3] = { MI_BIN_COUNT, MI_BIN_COUNT, MI_BIN_COUNT };
+  for (size_t n = 0; n < 3; n++) {
+    size_t worst = MI_BIN_COUNT;
+    for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+      const mi_holes_bin_t* const r = &rep->bin[bin];
+      if (r->pinned_ospages == 0 || r->undiscardable_bytes == 0) continue;
+      bool already = false;
+      for (size_t i = 0; i < n; i++) { if (taken[i] == bin) { already = true; break; } }
+      if (already) continue;
+      if (worst == MI_BIN_COUNT || r->undiscardable_bytes > rep->bin[worst].undiscardable_bytes) { worst = bin; }
+    }
+    if (worst == MI_BIN_COUNT) break;
+    taken[n] = worst;
+    const mi_holes_bin_t* const r = &rep->bin[worst];
+    char worst_undisc[32];
+    mi_holes_mb(r->undiscardable_bytes, worst_undisc, sizeof(worst_undisc));
+    _mi_fprintf(NULL, NULL, "  block_size %zu: %s MB undiscardable over %zu pinned OS pages; live blocks per pinned OS page:",
+                r->block_size, worst_undisc, r->pinned_ospages);
+    for (size_t h = 0; h < MI_HOLES_HIST_BUCKETS; h++) {
+      _mi_fprintf(NULL, NULL, "  %s: %zu", hist_name[h], r->hist[h]);
+    }
+    _mi_fprintf(NULL, NULL, "\n");
+  }
+  _mi_fprintf(NULL, NULL, "  (a live block straddling two pinned OS pages counts in both; abandoned pages are only reached when they are in the arena's abandoned map)\n");
+}
+
+// Report what hole punching leaves behind. Same traversal and same ownership rules as
+// `_mi_purge_holes_of` -- every theap of this thread, plus the abandoned pages of the heaps
+// behind them -- but read-only: it collects nothing, purges nothing, un-purges nothing, and
+// never touches a free list.
+static bool mi_theap_page_holes_report(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2) {
+  MI_UNUSED(theap); MI_UNUSED(pq); MI_UNUSED(arg2);
+  _mi_page_holes_report_page(page, (mi_holes_report_t*)arg1);
+  return true; // continue
+}
+
+void _mi_purge_holes_report_collect(mi_holes_report_t* rep) {
+  if (rep == NULL) return;
+  _mi_memzero(rep, sizeof(*rep));
+  mi_theap_t* const theap0 = _mi_theap_default();
+  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
+  mi_tld_t* const tld = theap0->tld;
+  if (tld->thread_id != _mi_thread_id()) return;   // owner thread only, exactly as for the sweep
+
+  mi_heap_t* heaps[MI_PURGE_HOLES_MAX_HEAPS];
+  size_t heap_count = 0;
+
+  // hold the lock for the whole walk -- it also keeps the heaps alive, see `_mi_purge_holes_of`
+  mi_lock(&tld->theaps_lock) {
+    for (mi_theap_t* theap = tld->theaps; theap != NULL; theap = theap->tnext) {
+      if (!mi_theap_is_initialized(theap)) continue;
+      _mi_theap_visit_pages(theap, &mi_theap_page_holes_report, true /* include full pages */, rep, NULL);
+      mi_heap_t* const heap = _mi_theap_heap(theap);
+      if (heap != NULL && heap_count < MI_PURGE_HOLES_MAX_HEAPS) {
+        bool seen = false;
+        for (size_t i = 0; i < heap_count; i++) { if (heaps[i] == heap) { seen = true; break; } }
+        if (!seen) { heaps[heap_count++] = heap; }
+      }
+    }
+    for (size_t i = 0; i < heap_count; i++) {
+      _mi_arenas_holes_report(heaps[i], rep);
+    }
+    // The committed partition is a property of the subprocess's arenas, not of a heap, so count it
+    // once: every heap of this thread reaches the same arenas.
+    if (heap_count > 0) { _mi_arenas_holes_committed(heaps[0], rep); }
+  }
+}
+
+void mi_purge_holes_report(void) mi_attr_noexcept {
+  mi_holes_report_t rep;
+  _mi_purge_holes_report_collect(&rep);
+  _mi_page_holes_report_print(&rep);
+}
+/* ---- end inlined: src/page-holes.c ---- */
 /* ---- begin inlined: src/profile.c ---- */
 /* Allocation sampling profiler.  Its records never use mimalloc: the arena
    below is backed directly by _mi_os_alloc so profiler bookkeeping cannot
@@ -24040,6 +25777,41 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
 void _mi_prof_suppress_begin(void) { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->prof_callback_depth++; }
 void _mi_prof_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->prof_callback_depth--; }
 
+#if MI_DEBUG
+// #272 profiler-interaction invariant (1), see `mimalloc/internal.h`. Called from the hole
+// sweep (`src/page-holes.c`) just BEFORE `_mi_os_discard` on a range of `page`, so a wrong
+// range is caught before the debug eager-zero destroys the evidence.
+//
+// Two things are asserted:
+//  - no sampled record's block (`rec->ptr`) lies in the range. A record is attached to a LIVE
+//    block, and hole purging only ever discards OS pages in which every block is free, so this
+//    is a direct check of the sweep's central invariant against an independent bookkeeping.
+//  - the record STRUCT itself does not lie in the range: records come from the profiler's own
+//    raw-OS arena (`_mi_prof_arena_alloc`, CLAUDE.md rule 4), never from a mimalloc page, so a
+//    hit here means that invariant was broken somewhere else entirely.
+void _mi_prof_debug_assert_no_records_in(const mi_page_t* page, const void* addr, size_t size) {
+  if (page == NULL || !page->has_metadata || size == 0) return;
+  const uint8_t* const lo = (const uint8_t*)addr;
+  const uint8_t* const hi = lo + size;
+  // `page->metadata` is only mutated under `prof_lock`; a sweep runs on an arbitrary thread
+  // (the owner, or the scavenger for a parked one), so take it -- unless this thread is already
+  // inside it (mi_prof_visit's callback), where the list is ours to read anyway.
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  const bool own = (hooks != NULL && hooks->prof_lock_owner);
+  // TRY-acquire, never block: the sweep calls this while holding `tld->theaps_lock`
+  // (`_mi_purge_holes_of`), and `mi_prof_visit` holds `prof_lock` across the user callback --
+  // a callback that deletes a heap then waits on `theaps_lock`. Blocking here would close that
+  // ABBA cycle in debug builds. An assertion that occasionally does not run beats a deadlock;
+  // the sweep visits the same pages again at the next idle point.
+  if (!own && !mi_lock_try_acquire(&prof_lock)) return;
+  for (mi_prof_record_t* rec = (mi_prof_record_t*)page->metadata; rec != NULL; rec = rec->next) {
+    mi_assert_internal((const uint8_t*)rec->ptr < lo || (const uint8_t*)rec->ptr >= hi);
+    mi_assert_internal((const uint8_t*)rec < lo || (const uint8_t*)rec >= hi);
+  }
+  if (!own) { mi_lock_release(&prof_lock); }
+}
+#endif
+
 static void prof_free_collect(mi_page_t* page, mi_block_t* head) { for (mi_block_t* b=head; b != NULL && page->has_metadata; b=mi_block_next(page,b)) prof_free_record(page,b); }
 static void prof_realloc_in_place(mi_page_t* page, void* p, size_t size) {
   // #266: callers pass the caller-visible pointer, which for a guarded (interior)
@@ -24767,10 +26539,9 @@ terms of the MIT license. A copy of the license can be found in the file
 // (CLAUDE.md rule 6), and none of them need theap file statics.
 //
 // DEVIATION from Bun: the second phase of `_mi_thread_idle_work` -- discarding the free
-// blocks inside still-used pages (`mi_option_purge_holes`) -- is Phase 7b (#272) and is
-// not in this file yet. Everything here works without it; `mi_on_thread_idle` currently
-// delivers clauses 1 and 3 of its documented contract (collect pending frees, hand the
-// arena purge to the scavenger) and gains clause 2 with 7b.
+// blocks inside still-used pages (`mi_option_purge_holes`) -- lives in `src/page-holes.c`
+// (CLAUDE.md rule 6), and is called from here as `_mi_purge_holes_of`. With Phase 7b landed,
+// `mi_on_thread_idle` delivers all three clauses of its documented contract.
 
 
 /* -----------------------------------------------------------
@@ -24813,8 +26584,8 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) {
     mi_theap_collect(theap0, false /* not forced */);
   }
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
-  // Phase 7b (#272): `mi_purge_holes_of(tld)` -- discard the free blocks inside still-used
-  // pages -- goes here, between the collect and the arena purge.
+  _mi_purge_holes_of(tld);   // #272 (P7b): every theap of this thread + its heaps' abandoned pages
+  if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
   _mi_arenas_purge_now(tld->subproc);
   mi_atomic_increment_relaxed(&mi_idle_work_count);   // #272 test observable, see above
 }
@@ -24847,19 +26618,30 @@ void _mi_park_leave(mi_tld_t* tld) {
 
 // Sweep the theaps of every parked thread of `subproc`; scavenger only.
 //
-// Returns in how many msecs a park that was passed over becomes due (0: none was), so the
-// scavenger can wake for it instead of leaving it to its safety timeout. Always 0 until
-// Phase 7b adds `purge_holes_min_interval` pacing.
+// Returns in how many msecs a park that was passed over for `purge_holes_min_interval` becomes
+// due (0: none was), so the scavenger can wake for it instead of leaving it to its safety timeout.
 mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
   if (subproc == NULL) return 0;
   if (mi_atomic_load_relaxed(&subproc->parked_count) == 0) return 0;
   for (;;) {
     mi_tld_t* claimed = NULL;
     mi_theap_t* theap0 = NULL;
-    const mi_msecs_t due_in = 0;   // Phase 7b: `purge_holes_min_interval` pacing
+    mi_msecs_t due_in = 0;
     mi_lock(&subproc->tlds_lock) {
+      // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b):
+      // `purge_holes_min_interval` pacing -- a thread that parks in a tight loop must not have
+      // its heaps swept on every park (the sweep is a full walk of its pages).
+      const mi_msecs_t now = _mi_clock_now();
+      const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
         if (mi_atomic_load_acquire(&tld->park_swept) != 0) continue;   // already done for this park
+        if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
+          if (mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_PARKED) {
+            const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
+            if (due_in == 0 || due < due_in) { due_in = due; }
+          }
+          continue;
+        }
         uint32_t expected = MI_PARK_PARKED;
         if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_SWEEPING)) {
           claimed = tld; theap0 = tld->park_theap0; break;
@@ -24874,6 +26656,7 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     // parked thread's next sample depend on how often the scavenger happened to visit it.
     const mi_profiler_tld_t prof_before = claimed->profiler;
     #endif
+    claimed->holes_sweep_last = _mi_clock_now();
     _mi_thread_idle_work(claimed, theap0);
     #if MI_DEBUG
     mi_assert_internal(claimed->profiler.bytes_since_sample == prof_before.bytes_since_sample &&
@@ -25936,6 +27719,20 @@ void mi_subproc_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, 
   if (mi_subproc_stats_get(subproc_id, &stats)) {
     _mi_stats_print("subproc", subproc->subproc_seq, &stats, out, arg);
   }
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b): hole purging is
+  // process wide (it also covers pages no theap owns), so it has its own counters.
+  mi_purge_holes_stats_t hs;
+  mi_purge_holes_stats_get(&hs);
+  if (hs.discard_calls > 0 || hs.purged_bytes_total > 0 || hs.ineligible_pages > 0) {
+    _mi_fprintf(out, arg, "holes: %zu bytes / %zu blocks discarded now, %zu bytes total, %zu discards, %zu reuses, %zu pages freed by the sweep\n",
+                hs.purged_bytes, hs.purged_blocks, hs.purged_bytes_total, hs.discard_calls, hs.reuse_calls, hs.pages_freed);
+    _mi_fprintf(out, arg, "holes: %zu ineligible pages in the last sweep (%zu bytes, of which %zu bytes are free)\n",
+                hs.ineligible_pages, hs.ineligible_bytes, hs.ineligible_free_bytes);
+    _mi_fprintf(out, arg, "holes: the sweeps walked %zu free blocks and skipped %zu unchanged pages (%zu full sweeps)\n",
+                hs.blocks_visited, hs.pages_skipped, hs.full_sweeps);
+    _mi_fprintf(out, arg, "holes: unformed tail %zu bytes discarded now, %zu bytes total, %zu discards, %zu reuses\n",
+                hs.unformed_bytes, hs.unformed_bytes_total, hs.unformed_discard_calls, hs.unformed_reuse_calls);
+  }
 }
 
 void mi_stats_print_out(mi_output_fun* out, void* arg) mi_attr_noexcept {
@@ -26694,10 +28491,12 @@ terms of the MIT license. A copy of the license can be found in the file
 ----------------------------------------------------------- */
 
 // return `true` if ok, `false` to break
-typedef bool (theap_page_visitor_fun)(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2);
+// #272: `theap_page_visitor_fun` moved to `mimalloc/internal.h` with `_mi_theap_visit_pages`.
 
 // Visit all pages in a theap; returns `false` if break was called.
-static bool mi_theap_visit_pages(mi_theap_t* theap, theap_page_visitor_fun* fn, bool include_full, void* arg1, void* arg2)
+// #272 (Bun parity P7b): exported so the hole engine in `src/page-holes.c` can drive the same
+// walk without a second copy of it (CLAUDE.md rule 6 keeps that engine out of this file).
+bool _mi_theap_visit_pages(mi_theap_t* theap, theap_page_visitor_fun* fn, bool include_full, void* arg1, void* arg2)
 {
   if (theap==NULL || theap->page_count==0) return true;
 
@@ -26758,7 +28557,7 @@ static bool mi_theap_is_valid(mi_theap_t* theap) {
   // ... plus the scavenger-sweeps-a-parked-thread case, see mi_theap_page_is_valid (#272)
   mi_assert_internal(heap_theap==NULL || heap_theap == theap || mi_theap_is_detached(theap)
                      || theap->tld == NULL || theap->tld->thread_id != _mi_thread_id());
-  mi_theap_visit_pages(theap, &mi_theap_page_is_valid, true, NULL, NULL);
+  _mi_theap_visit_pages(theap, &mi_theap_page_is_valid, true, NULL, NULL);
   for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
     mi_assert_internal(_mi_page_queue_is_valid(theap, &theap->pages[bin]));
   }
@@ -26792,7 +28591,10 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
   // scavenger is doing this for a parked thread, the owner may wake at any moment and has to
   // wait for us in `_mi_park_leave`. Stopping between pages bounds that wait to one page.
   if (theap->tld != NULL && mi_atomic_load_relaxed(&theap->tld->park_reclaim) != 0) return false;
-  _mi_page_free_collect(page, collect >= MI_FORCE);
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b): never un-purge here. A collect
+  // serves no allocation, so a run brought back would only be re-discarded by the next sweep --
+  // and on macOS bringing it back costs an `_mi_os_reuse` syscall.
+  _mi_page_free_collect_no_unpurge(page, collect >= MI_FORCE);
   if (mi_page_all_free(page)) {
     // no more used blocks, possibly free the page.
     if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced/abandon, or not already retired
@@ -26828,7 +28630,7 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   _mi_theap_collect_retired(theap, force); 
 
   // collect all pages owned by this thread
-  mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
+  _mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
 
   // collect arenas (this is program wide so don't force purges on abandonment of threads).
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): not from a
@@ -26869,7 +28671,7 @@ static bool mi_theap_page_abandon(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
 void _mi_theap_abandon(mi_theap_t* theap) {
   mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // must already be detached
   mi_assert_internal(theap->tnext==NULL && theap->tprev==NULL);
-  mi_theap_visit_pages(theap, &mi_theap_page_abandon, true /* include full pages */, NULL, NULL);
+  _mi_theap_visit_pages(theap, &mi_theap_page_abandon, true /* include full pages */, NULL, NULL);
   mi_assert_internal(theap->page_count==0);
   #if MI_DEBUG>1
   for (size_t i = 0; i <= MI_BIN_FULL; i++) { mi_assert_internal(theap->pages[i].first == NULL); }
@@ -27328,7 +29130,10 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
   mi_assert(page != NULL);
   if (page == NULL) return true;
 
-  _mi_page_free_collect(page,true);              // collect both thread_delayed and local_free
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b):
+  // visiting must not un-purge a hole -- inspection may not mutate the heap, and a discarded
+  // block is reported as free here either way (see the `purged` marking below).
+  _mi_page_free_collect_no_unpurge(page,true);   // collect both thread_delayed and local_free
   mi_assert_internal(page->local_free == NULL);
   if (page->used == 0) return true;
 
@@ -27390,7 +29195,23 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
     size_t bit = blockidx - (bitidx * MI_INTPTR_BITS);
     free_map[bitidx] |= ((uintptr_t)1 << bit);
   }
-  mi_assert_internal(page->capacity == (free_count + page->used));
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b):
+  // purged blocks are free too, but held off the free list (see `src/page-holes.c`): a block is
+  // purged exactly when it overlaps a discarded OS page. Marking them free here is what keeps a
+  // visitor (mi_heap_visit_blocks, the DHAT/memory-events walkers, mi_prof_snapshot) from ever
+  // being handed a pointer into discarded memory (#272 profiler-interaction point 2).
+  size_t purged_count = 0;
+  if (mi_page_has_purged(page)) {
+    for (size_t blockidx = 0; blockidx < page->capacity; blockidx++) {
+      if (!mi_page_block_index_is_purged(page, blockidx)) continue;
+      purged_count++;
+      size_t bitidx = (blockidx / MI_INTPTR_BITS);
+      size_t bit = blockidx - (bitidx * MI_INTPTR_BITS);
+      free_map[bitidx] |= ((uintptr_t)1 << bit);
+    }
+  }
+  mi_assert_internal(page->capacity == (free_count + purged_count + page->used));
+  MI_UNUSED(purged_count);
 
   // walk through all blocks skipping the free ones
   #if MI_DEBUG>1
@@ -27454,7 +29275,7 @@ static bool mi_theap_visit_areas_page(mi_theap_t* theap, mi_page_queue_t* pq, mi
 // Visit all theap pages as areas
 static bool mi_theap_visit_areas(const mi_theap_t* theap, mi_theap_area_visit_fun* visitor, void* arg) {
   if (visitor == NULL) return false;
-  return mi_theap_visit_pages((mi_theap_t*)theap, &mi_theap_visit_areas_page, true, (void*)(visitor), arg); // note: function pointer to void* :-{
+  return _mi_theap_visit_pages((mi_theap_t*)theap, &mi_theap_visit_areas_page, true, (void*)(visitor), arg); // note: function pointer to void* :-{
 }
 
 // Just to pass arguments
@@ -28338,6 +30159,19 @@ int _mi_prim_reset(void* addr, size_t size) {
   }
   #endif
   return (p != NULL ? 0 : (int)GetLastError());
+}
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
+int _mi_prim_discard(void* addr, size_t size) {
+  // MEM_RESET keeps the range committed and accessible (contents become undefined).
+  // It must NOT be VirtualFree(MEM_DECOMMIT): the arena tracks commit per slice and
+  // cannot represent a sub-slice hole (see the hole purging section in `src/page-holes.c`).
+  const int err = _mi_prim_reset(addr, size);
+  if (err != 0) return err;
+  // VirtualUnlock on a reset range removes it from the working set right away, so
+  // the rss drop is immediate (it fails with ERROR_NOT_LOCKED, which we ignore).
+  VirtualUnlock(addr, size);
+  return 0;
 }
 
 int _mi_prim_reuse(void* addr, size_t size) {
@@ -29804,6 +31638,23 @@ int _mi_prim_reset(void* start, size_t size) {
   return err;
 }
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
+int _mi_prim_discard(void* start, size_t size) {
+  // Release the physical pages immediately but keep the mapping (and thus the
+  // commit state) intact and accessible -- this is `_mi_prim_decommit` without
+  // its `needs_recommit`/mprotect(PROT_NONE) part.
+  int err = 0;
+  #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
+    // as in `_mi_prim_decommit`: MADV_FREE_REUSABLE does immediate rss accounting (issue #1097)
+    err = unix_madvise(start, size, MADV_FREE_REUSABLE);
+    if (err) { err = unix_madvise(start, size, MADV_DONTNEED); }
+  #else
+    // MADV_DONTNEED decreases rss immediately (unlike MADV_FREE) and keeps the mapping
+    err = unix_madvise(start, size, MADV_DONTNEED);
+  #endif
+  return err;
+}
+
 int _mi_prim_protect(void* start, size_t size, bool protect) {
   int err = mprotect(start, size, protect ? PROT_NONE : (PROT_READ | PROT_WRITE));
   if (err != 0) { err = errno; }
@@ -30484,6 +32335,13 @@ int _mi_prim_reuse(void* addr, size_t size) {
   return 0;
 }
 
+// #272: nothing to release here; MI_PRIM_HAS_DISCARD is 0 on this platform, so
+// `_mi_os_discard` never calls this and never counts a purge.
+int _mi_prim_discard(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
 int _mi_prim_protect(void* addr, size_t size, bool protect) {
   MI_UNUSED(addr); MI_UNUSED(size); MI_UNUSED(protect);
   return 0;
@@ -30745,6 +32603,13 @@ int _mi_prim_reset(void* addr, size_t size) {
 }
 
 int _mi_prim_reuse(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
+// #272: nothing to release here; MI_PRIM_HAS_DISCARD is 0 on this platform, so
+// `_mi_os_discard` never calls this and never counts a purge.
+int _mi_prim_discard(void* addr, size_t size) {
   MI_UNUSED(addr); MI_UNUSED(size);
   return 0;
 }
@@ -31486,6 +33351,23 @@ int _mi_prim_reset(void* start, size_t size) {
   }
   #else
   err = unix_madvise(start, size, MADV_DONTNEED);
+  #endif
+  return err;
+}
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
+int _mi_prim_discard(void* start, size_t size) {
+  // Release the physical pages immediately but keep the mapping (and thus the
+  // commit state) intact and accessible -- this is `_mi_prim_decommit` without
+  // its `needs_recommit`/mprotect(PROT_NONE) part.
+  int err = 0;
+  #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
+    // as in `_mi_prim_decommit`: MADV_FREE_REUSABLE does immediate rss accounting (issue #1097)
+    err = unix_madvise(start, size, MADV_FREE_REUSABLE);
+    if (err) { err = unix_madvise(start, size, MADV_DONTNEED); }
+  #else
+    // MADV_DONTNEED decreases rss immediately (unlike MADV_FREE) and keeps the mapping
+    err = unix_madvise(start, size, MADV_DONTNEED);
   #endif
   return err;
 }

@@ -135,6 +135,29 @@ pub type mi_prof_module_visit_fun =
 #[allow(non_camel_case_types)]
 pub enum mi_heap_t {}
 
+/// Mirrors `mi_purge_holes_stats_t` (issue #272, Bun parity P7b): what page hole purging
+/// actually reclaimed, process wide. Field order and types must match `mimalloc.h` exactly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MiPurgeHolesStats {
+    pub purged_bytes: usize,
+    pub purged_blocks: usize,
+    pub purged_bytes_total: usize,
+    pub discard_calls: usize,
+    pub reuse_calls: usize,
+    pub pages_freed: usize,
+    pub ineligible_pages: usize,
+    pub ineligible_bytes: usize,
+    pub ineligible_free_bytes: usize,
+    pub unformed_bytes: usize,
+    pub unformed_bytes_total: usize,
+    pub unformed_discard_calls: usize,
+    pub unformed_reuse_calls: usize,
+    pub pages_skipped: usize,
+    pub blocks_visited: usize,
+    pub full_sweeps: usize,
+}
+
 unsafe extern "C" {
     pub fn mi_malloc(size: usize) -> *mut c_void;
     pub fn mi_zalloc(size: usize) -> *mut c_void;
@@ -226,4 +249,6 @@ unsafe extern "C" {
     pub fn mi_on_thread_idle_end();
     /// Mirrors `mi_scavenger_stop` (issue #272).
     pub fn mi_scavenger_stop();
+    /// Mirrors `mi_purge_holes_stats_get` (issue #272, Bun parity P7b).
+    pub fn mi_purge_holes_stats_get(stats: *mut MiPurgeHolesStats);
 }

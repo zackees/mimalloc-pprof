@@ -4,11 +4,7 @@ from __future__ import annotations
 # ruff: noqa: I001
 
 import copy
-import sys
 import unittest
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import check_benchmark_latency_workflow as policy
 

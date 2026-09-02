@@ -14,13 +14,13 @@ flags/env are copied from the workflow files rather than re-derived, so drift is
 caught by `ci/tests/test_verify_local.py` rather than trusted to stay in sync by hand.
 
 Usage:
-    python ci/verify_local.py                        # everything fast (slow tests excluded)
-    python ci/verify_local.py --only release,lint     # just these configs
-    python ci/verify_local.py --slow                  # also run the long-tail ctest suite
-    python ci/verify_local.py --list                  # print the config table and exit
-    python ci/verify_local.py --jobs 8                # override the worker/build budget
-    python ci/verify_local.py --keep-going             # don't skip queued configs on a failure
-    python ci/verify_local.py --selftest               # trivially fast dry-run, no real builds
+    uv run ci/verify_local.py                        # everything fast (slow tests excluded)
+    uv run ci/verify_local.py --only release,lint     # just these configs
+    uv run ci/verify_local.py --slow                  # also run the long-tail ctest suite
+    uv run ci/verify_local.py --list                  # print the config table and exit
+    uv run ci/verify_local.py --jobs 8                # override the worker/build budget
+    uv run ci/verify_local.py --keep-going             # don't skip queued configs on a failure
+    uv run ci/verify_local.py --selftest               # trivially fast dry-run, no real builds
 
 Exit code is non-zero if any selected config failed (a config SKIPPED because a tool
 it needs -- e.g. clang for `asan` -- is unavailable does not count as a failure).
@@ -166,7 +166,7 @@ def run_logged(
 
 def run_captured(log: Path, func: Callable[[], int], *, label: str) -> tuple[int, str]:
     """Call a Python function (e.g. a ci/*.py module entry point) capturing its stdout
-    into the log instead of shelling out to `python3 ci/<script>.py`.
+    into the log instead of shelling out to `uv run ci/<script>.py`.
     """
     log_write(log, f"\n$ <python> {label}\n")
     buf = io.StringIO()
@@ -428,15 +428,17 @@ def run_diag(ctx: RunCtx) -> bool:
     `isa-baseline` -- both are cheap, ubuntu-only diagnostic checks over the same
     kind of throwaway `mimalloc-static`-only build, so they share one config.
 
-    Shells out to `python3 ci/<script>.py` for each check (rather than importing the
+    Shells out to `uv run ci/<script>.py` for each check (rather than importing the
     module and calling its argparse-driven `main()` in-process) so there is no need to
     juggle a process-global `sys.argv` from a worker thread that runs concurrently with
-    every other config.
+    every other config. `uv run` (rather than a bare `python3`) guarantees the
+    interpreter running each script is the one `uv` resolves, not whatever `python3`
+    happens to be first on PATH.
     """
     ok = True
 
     def py(*args: str) -> bool:
-        rc, _ = run_logged(["python3", f"ci/{args[0]}", *args[1:]], cwd=ROOT, log=ctx.log)
+        rc, _ = run_logged(["uv", "run", f"ci/{args[0]}", *args[1:]], cwd=ROOT, log=ctx.log)
         return rc == 0
 
     ok = py("check_internal_state.py") and ok
@@ -522,30 +524,44 @@ def run_rust(ctx: RunCtx) -> bool:
 
 
 def run_lint(ctx: RunCtx) -> bool:
-    """python-lint.yml job `lint` (its only job, already ubuntu-latest)."""
+    """python-lint.yml job `lint` (its only job, already ubuntu-latest).
+
+    Every tool/script below runs through `uv run --with <pkg>==<version> ...` --
+    pinned to the same versions `.github/workflows/python-lint.yml`'s `pip install`
+    line uses -- rather than a bare `ruff`/`pyright`/`python3`, so this config never
+    depends on (or silently drifts from) whatever happens to be on the ambient PATH.
+    """
     ok = True
-    rc, _ = run_logged(["ruff", "check", "ci/"], cwd=ROOT, log=ctx.log)
+    rc, _ = run_logged(
+        ["uv", "run", "--with", "ruff==0.12.10", "ruff", "check", "ci/"], cwd=ROOT, log=ctx.log
+    )
     ok = ok and rc == 0
-    rc, _ = run_logged(["ruff", "format", "--check", "ci/"], cwd=ROOT, log=ctx.log)
+    rc, _ = run_logged(
+        ["uv", "run", "--with", "ruff==0.12.10", "ruff", "format", "--check", "ci/"],
+        cwd=ROOT,
+        log=ctx.log,
+    )
     ok = ok and rc == 0
-    rc, _ = run_logged(["pyright"], cwd=ROOT, log=ctx.log)
+    rc, _ = run_logged(
+        ["uv", "run", "--with", "pyright==1.1.411", "pyright"], cwd=ROOT, log=ctx.log
+    )
     ok = ok and rc == 0
 
     for cmd in (
-        ["python3", "ci/check_isa_baseline.py", "--selftest"],
-        ["python3", "ci/check_internal_state.py", "--selftest"],
-        ["python3", "ci/check_isa_baseline.py", "--help"],
-        ["python3", "ci/check_release_equivalence.py", "--help"],
+        ["uv", "run", "ci/check_isa_baseline.py", "--selftest"],
+        ["uv", "run", "ci/check_internal_state.py", "--selftest"],
+        ["uv", "run", "ci/check_isa_baseline.py", "--help"],
+        ["uv", "run", "ci/check_release_equivalence.py", "--help"],
     ):
         rc, _ = run_logged(cmd, cwd=ROOT, log=ctx.log)
         ok = ok and rc == 0
-    rc, out = run_logged(["python3", "ci/memory_gate.py"], cwd=ROOT, log=ctx.log)
+    rc, out = run_logged(["uv", "run", "ci/memory_gate.py"], cwd=ROOT, log=ctx.log)
     ok = ok and "Exit codes" in out
 
     # These four import `yaml`, which python-lint.yml's job-level `pip install`
     # provides for every subsequent bare `python3` call in that job. Nothing here
-    # guarantees the ambient `python3` has PyYAML, so run them the same way
-    # ci/tests gets it below: an ephemeral uvx environment with it installed.
+    # guarantees the ambient interpreter has PyYAML, so run them the same way
+    # ci/tests gets it below: an ephemeral `uv run --with pyyaml==...` environment.
     for script in (
         "ci/check_benchmark_workflow.py",
         "ci/check_benchmark_memory_workflow.py",
@@ -553,7 +569,7 @@ def run_lint(ctx: RunCtx) -> bool:
         "ci/check_benchmark_scaling_workflow.py",
     ):
         rc, _ = run_logged(
-            ["uvx", "--with", "pyyaml==6.0.2", "python3", script, "--selftest"],
+            ["uv", "run", "--with", "pyyaml==6.0.2", script, "--selftest"],
             cwd=ROOT,
             log=ctx.log,
         )
@@ -561,13 +577,12 @@ def run_lint(ctx: RunCtx) -> bool:
 
     rc, _ = run_logged(
         [
-            "uvx",
+            "uv",
+            "run",
             "--with",
             "pyyaml==6.0.2",
             "--with",
             "pytest==8.3.4",
-            "python",
-            "-m",
             "pytest",
             "ci/tests",
             "-q",
@@ -652,6 +667,12 @@ def _need_clang() -> str | None:
     return None
 
 
+def _need_uv() -> str | None:
+    if shutil.which("uv") is None:
+        return "uv not found on PATH; install it (https://docs.astral.sh/uv/) -- this config pins every tool/script version through `uv run --with ...`"
+    return None
+
+
 CONFIGS: list[ConfigSpec] = [
     ConfigSpec("release", "c-unit.yml: ctest", "Release, MI_PPROF=ON, full ctest", run_release),
     ConfigSpec("off", "c-unit.yml: ctest-pprof-off", "MI_PPROF=OFF, full ctest", run_off),
@@ -675,10 +696,15 @@ CONFIGS: list[ConfigSpec] = [
         "c-unit.yml: diagnostic-gates + isa-baseline(x64)",
         "internal-state/release/ISA gates",
         run_diag,
+        _need_uv,
     ),
     ConfigSpec("rust", "rust-native.yml: test", "xtask check + cargo test --workspace", run_rust),
     ConfigSpec(
-        "lint", "python-lint.yml: lint", "ruff + pyright + gate selftests + pytest", run_lint
+        "lint",
+        "python-lint.yml: lint",
+        "ruff + pyright + gate selftests + pytest",
+        run_lint,
+        _need_uv,
     ),
     ConfigSpec(
         "asan",

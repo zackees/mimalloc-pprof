@@ -4,11 +4,7 @@ from __future__ import annotations
 # ruff: noqa: I001
 
 import copy
-import sys
 import unittest
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import benchmark_report as report
 import check_benchmark_scaling_workflow as policy

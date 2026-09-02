@@ -5,6 +5,13 @@
 # (ci/check_isa_baseline.py). A bug in one of those silently disables a gate, which
 # has already happened twice -- so they get checked like the gating code they are.
 
+[tool.pytest.ini_options]
+# ci/tests/*.py import their subjects as flat top-level modules (e.g.
+# `import benchmark_report`), not as `ci.benchmark_report` -- add ci/ to
+# sys.path via pytest config instead of each test hand-rolling
+# sys.path.insert(0, ...).
+pythonpath = ["ci"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py39"          # oldest Python the CI runners are guaranteed to have

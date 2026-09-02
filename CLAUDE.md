@@ -58,9 +58,9 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
 - `src/static.c` is the single-TU amalgamation the Rust sys crate compiles — every new C file
   must be included there (guarded by `MI_PPROF` where appropriate) or Rust builds silently
   miss it.
-- Fast local iteration: `python ci/dev_linux.py c-test | rust-test | bench` (issue #10) once
+- Fast local iteration: `uv run ci/dev_linux.py c-test | rust-test | bench` (issue #10) once
   landed. `bench` is the speed acceptance test; paste its output on #10 when touched.
-  `python ci/verify_local.py` mirrors the Linux-runnable subset of CI (c-unit/rust-native/
+  `uv run ci/verify_local.py` mirrors the Linux-runnable subset of CI (c-unit/rust-native/
   python-lint/asan) as ten concurrent configs; see `docs/dev-loop.md`.
 - Upstreaming to microsoft/mimalloc: v3-targeted `pr/*` branches are cut from
   `upstream/dev3` (or its eventual renamed/default v3 branch), and receive only the

@@ -30,6 +30,25 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #define mi_decl_cache_align     mi_decl_align(64)
 
+// Should thread-locals that sit on an allocation path use dynamic Win32 TLS keys
+// (`_mi_prim_tls_key_*`) instead of `mi_decl_thread`?
+//
+// Yes for every Windows compiler that is not MSVC. Many mingw-w64 GCCs -- notably the
+// conda-forge cross compilers, and any toolchain configured `--disable-tls` -- have no
+// native TLS, so `__thread` becomes GCC's *emulated* TLS and `__declspec(thread)` is
+// silently ignored (it only warns). `__emutls_get_address` allocates its per-thread table
+// with `malloc`, so with `mimalloc-redirect.dll` active a thread-local read from the
+// allocator re-enters the allocator, forever. Win32 TLS keys never allocate.
+// llvm-mingw is included deliberately: the hazard is the toolchain's TLS lowering, not
+// the compiler brand, and one rule beats two that can disagree. See mimalloc-pprof #277.
+#if !defined(MI_WIN_TLS_SLOTS)
+#if defined(_WIN32) && !defined(_MSC_VER)
+#define MI_WIN_TLS_SLOTS  1
+#else
+#define MI_WIN_TLS_SLOTS  0
+#endif
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable:4127)   // suppress constant conditional warning (due to MI_SECURE paths)
 #pragma warning(disable:26812)  // unscoped enum warning
@@ -144,6 +163,7 @@ void          _mi_verbose_message(const char* fmt, ...);
 void          _mi_trace_message(const char* fmt, ...);
 void          _mi_options_init(void);
 void          _mi_options_post_init(void);
+void          _mi_options_done(void);
 long          _mi_option_get_fast(mi_option_t option);
 void          _mi_error_message(int err, const char* fmt, ...);
 // #270: fork-safety -- quiesce/reset `out_buf_lock` around fork(). See fork.c's lock-order block.

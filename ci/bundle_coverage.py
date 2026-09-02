@@ -95,7 +95,7 @@ class Comparison:
 
 def render(
     comparisons: Sequence[Comparison],
-    heading: str = "macOS coverage: native ctest vs cross-built bundle",
+    heading: str = "Coverage: native ctest vs cross-built bundle",
     reference: str = "native",
     candidate: str = "bundle",
 ) -> str:
@@ -139,7 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--heading",
-        default="macOS coverage: native ctest vs cross-built bundle",
+        default="Coverage: native ctest vs cross-built bundle",
         help="markdown heading for the report",
     )
     parser.add_argument(

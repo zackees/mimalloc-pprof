@@ -50,6 +50,20 @@ static mi_thread_locals_t mi_thread_locals_empty = mi_init_struct_zero;
   static inline bool name##_set(tp val)   { return mi_pthread_key_set(&__##name##_key,val); } \
   static inline void name##_delete(void)  { mi_pthread_key_delete(&__##name##_key); }
 
+#elif MI_WIN_TLS_SLOTS
+// Windows, non-MSVC: dynamic Win32 TLS keys instead of `__thread`. This toolchain may
+// lower `__thread` to GCC's *emulated* TLS, whose `__emutls_get_address` allocates with
+// `malloc` -- which is `mi_malloc` once `mimalloc-redirect.dll` is live, so a
+// thread-local read from the allocator would re-enter the allocator forever
+// (mimalloc-pprof #277). See `MI_WIN_TLS_SLOTS` in `mimalloc/internal.h` and
+// `_mi_prim_tls_key_*` in `mimalloc/prim.h`; none of them allocate.
+#define mi_define_thread_local(tp,name,initval) \
+  static mi_prim_tls_key_t __##name##_key;  /* 0 == not allocated yet */ \
+  static inline tp   name##_peek(void)    { return (tp)_mi_prim_tls_key_get(mi_atomic_load_relaxed(&__##name##_key)); } \
+  static inline tp   name##_get(void)     { tp result = name##_peek(); return (result!=NULL ? result : initval); } \
+  static inline bool name##_set(tp val)   { return _mi_prim_tls_key_set(_mi_prim_tls_key_alloc(&__##name##_key), (void*)val); } \
+  static inline void name##_delete(void)  { _mi_prim_tls_key_free(&__##name##_key); }
+
 #else
 // Direct thread locals
 #define mi_define_thread_local(tp,name,initval) \

@@ -736,6 +736,56 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
 // Thread pool?
 //----------------------------------------------------------------
 
+/* ----------------------------------------------------------------------------------
+  Dynamic Win32 TLS keys -- see `include/mimalloc/prim.h` (mimalloc-pprof #277).
+  `TlsAlloc` takes an index from a bitmap in the PEB; none of this touches the C heap,
+  which is exactly why these exist. `TlsGetValue`/`TlsSetValue` reset the calling
+  thread's last error on success, and an allocator must not do that to its caller, so it
+  is saved and restored around them.
+---------------------------------------------------------------------------------- */
+#if MI_WIN_TLS_SLOTS
+size_t _mi_prim_tls_key_alloc(mi_prim_tls_key_t* key) {
+  size_t biased = mi_atomic_load_acquire(key);
+  if mi_unlikely(biased == 0) {
+    const DWORD index = TlsAlloc();
+    if (index == TLS_OUT_OF_INDEXES) {
+      return mi_atomic_load_acquire(key);   // another thread may have installed one meanwhile
+    }
+    size_t expected = 0;
+    if (mi_atomic_cas_strong_acq_rel(key, &expected, (size_t)index + 1)) {
+      biased = (size_t)index + 1;
+    }
+    else {
+      TlsFree(index);                       // lost the race; keep the winner's key
+      biased = expected;
+    }
+  }
+  return biased;
+}
+
+void* _mi_prim_tls_key_get(size_t key) {
+  if (key == 0) return NULL;
+  const DWORD err = GetLastError();
+  void* const value = TlsGetValue((DWORD)(key - 1));
+  SetLastError(err);
+  return value;
+}
+
+bool _mi_prim_tls_key_set(size_t key, void* value) {
+  if (key == 0) return false;
+  const DWORD err = GetLastError();
+  const BOOL ok = TlsSetValue((DWORD)(key - 1), value);
+  SetLastError(err);
+  return (ok != 0);
+}
+
+void _mi_prim_tls_key_free(mi_prim_tls_key_t* key) {
+  const size_t biased = mi_atomic_exchange_acq_rel(key, (size_t)0);
+  if (biased != 0) { TlsFree((DWORD)(biased - 1)); }
+}
+#endif
+
+
 bool _mi_prim_thread_is_in_threadpool(void) {
 #if (MI_ARCH_X64 || MI_ARCH_X86 || MI_ARCH_ARM64)
   if (win_major_version >= 6) {

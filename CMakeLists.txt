@@ -34,6 +34,7 @@ option(MI_BUILD_TESTS       "Build test executables" ON)
 option(MI_OSX_INTERPOSE     "Use interpose to override standard malloc on macOS" ON)
 option(MI_OSX_ZONE          "Use malloc zone to override standard malloc on macOS" ON)
 option(MI_WIN_REDIRECT      "Use redirection module ('mimalloc-redirect') on Windows if compiling mimalloc as a DLL" ON)
+option(MI_MINGW_REDIRECT_FIRST "Emit 'mimalloc-redirect.dll' as the first import descriptor of mimalloc.dll (MinGW; see #277)" ON)
 option(MI_WIN_DIRECT_TLS    "Use only direct TLS slots on Windows to avoid extra tests in the malloc fast path (only works if the program uses less than 64 TlsAlloc'd slots in total)" OFF)
 option(MI_LOCAL_DYNAMIC_TLS "Use local-dynamic-tls, a slightly slower but dlopen-compatible thread local storage mechanism (Unix)" OFF)
 option(MI_LIBC_MUSL         "Enable this when linking with musl libc" OFF)
@@ -531,8 +532,16 @@ if(MI_TLS_RECURSE_GUARD)
   list(APPEND mi_defines MI_TLS_RECURSE_GUARD=1)
 endif()
 
-if("$ENV{MSYSTEM}" STREQUAL "UCRT64")
-  message(STATUS "Detected MSYS2 UCRT64 environment")
+# MI_MINGW_UCRT64 may also be set by the caller (a cache entry or a toolchain file):
+# $ENV{MSYSTEM} is set only by an MSYS2 shell, so it cannot detect a mingw-w64 UCRT
+# toolchain used from anywhere else -- notably a cross build on Linux, where mingw-w64 13
+# configured `--with-default-msvcrt=ucrt` is UCRT while MSYSTEM is unset (#277 phase C).
+if(MI_MINGW_UCRT64 OR "$ENV{MSYSTEM}" STREQUAL "UCRT64")
+  if(MI_MINGW_UCRT64)
+    message(STATUS "Using the mingw-w64 UCRT runtime (MI_MINGW_UCRT64=ON)")
+  else()
+    message(STATUS "Detected MSYS2 UCRT64 environment")
+  endif()
   set(MI_MINGW_UCRT64 "ON")
   list(APPEND mi_defines MI_MINGW_UCRT64=1)
 elseif("$ENV{MSYSTEM}" STREQUAL "MSYS")
@@ -819,7 +828,38 @@ if(MI_BUILD_SHARED)
       set(MINJECT_SUFFIX "-${MI_ARCH}")
     endif()
 
-    target_link_libraries(mimalloc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib)  # the DLL import library
+    if(MINGW AND MI_MINGW_REDIRECT_FIRST)
+      # `mimalloc-redirect.dll` only redirects if its DllMain runs BEFORE the C runtime's:
+      # it reads `ucrtbase.dll`'s LDR_DATA_TABLE_ENTRY.Flags and bails out with
+      #   "mimalloc-redirect.dll seems to be initialized after ucrtbase.dll"
+      # as soon as LDRP_PROCESS_ATTACH_CALLED (0x00080000) is set there. The loader
+      # initialises a module's dependencies in THAT module's import-descriptor order, so
+      # the redirect module has to precede `api-ms-win-crt-*` in *this DLL's* import
+      # table -- the executable importing `mimalloc.dll` first is necessary but not
+      # sufficient. MSVC gets this for free (explicit libs are emitted before
+      # /DEFAULTLIB ones); `ld` sorts `.idata$2` by the input file path as spelled on the
+      # link line, and CMake spells this one as an absolute source path, which wins or
+      # loses against the absolute sysroot path purely by where the checkout lives.
+      # A copy spelled `./…` (0x2e) sorts ahead of every absolute path (0x2f).
+      #
+      # ON by default: this is the only layout in which the override works at all, and
+      # the load-time crash it used to expose (GCC emulated TLS re-entering the redirected
+      # `malloc`) is fixed in `src/threadlocal.c` and `src/options.c`. #277.
+      configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib"
+        "${CMAKE_CURRENT_BINARY_DIR}/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib"
+        COPYONLY)
+      # The link runs from CMAKE_BINARY_DIR, not from this project's binary dir, so under
+      # add_subdirectory()/FetchContent a bare `./` would name the wrong directory. Spell
+      # the relative path from the top of the build tree (empty for a standalone build,
+      # which gives plain `-L.`).
+      file(RELATIVE_PATH _mi_redirect_ldir "${CMAKE_BINARY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+      set(_mi_redirect_ldir "-L./${_mi_redirect_ldir}")
+      target_link_libraries(mimalloc PRIVATE
+        "${_mi_redirect_ldir}" "-l:mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib")  # the DLL import library
+    else()
+      target_link_libraries(mimalloc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib)  # the DLL import library
+    endif()
     add_custom_command(TARGET mimalloc POST_BUILD
       COMMAND "${CMAKE_COMMAND}" -E copy "${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.dll" $<TARGET_FILE_DIR:mimalloc>
       COMMENT "Copy mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.dll to output directory")
@@ -1537,12 +1577,44 @@ if (MI_BUILD_TESTS)
     target_include_directories(mimalloc-test-stress-dynamic PRIVATE include)
     if(WIN32)
       target_compile_definitions(mimalloc-test-stress-dynamic PRIVATE "MI_LINK_VERSION=1")  # link mi_version
-      target_link_libraries(mimalloc-test-stress-dynamic PRIVATE mimalloc ${mi_libraries})  # link mi_version
-      if(MI_MINGW_UCRT64)
-        # mingw always links mimalloc after system libraries.
-        # post-process with `minject` to make sure mimalloc is the first dll in the load order.
-        add_custom_command(TARGET mimalloc-test-stress-dynamic POST_BUILD COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/minject${MINJECT_SUFFIX} --postfix=${mi_libsuffix} -f -i $<TARGET_FILE:mimalloc-test-stress-dynamic>)
+      if(MINGW)
+        # `mimalloc.dll` must come first in this exe's import table, or the redirection
+        # module (which `mimalloc.dll` pulls in, and which imports only `ntdll.dll`) is
+        # initialised after the CRT it is meant to patch and `mi_is_redirected()` stays
+        # false. That is what upstream's "mingw always links mimalloc after system
+        # libraries" note below is about.
+        #
+        # The mechanism is `ld`'s PE script, which emits the import descriptors under
+        # `SORT(*)(.idata$2)` -- sorted by the *input file path as spelled on the command
+        # line*, archive path first and member name only as a tie-break within one
+        # archive. CMake names this import library relative to the build directory
+        # (`libmimalloc.dll.a`), while every CRT archive arrives as an absolute path from
+        # the sysroot, and `/` (0x2f) sorts before `l`. Spelling the same file `./…`
+        # (0x2e) puts it ahead of every absolute path instead. Verified with
+        # `objdump -p`: byte-identical archives give `mimalloc.dll` last when named
+        # `libmimalloc.dll.a` and first when named `./libmimalloc.dll.a`.
+        #
+        # It has to sit in the *libraries* position, after the objects -- an archive named
+        # before anything needs it contributes nothing -- hence a raw `-l:` here rather
+        # than target_link_options(), with an explicit dependency since this is no longer
+        # a target reference.
+        #
+        # Same relative-path caveat as the DLL's own redirect import above: the link runs
+        # from CMAKE_BINARY_DIR, so name this project's binary dir relative to that.
+        file(RELATIVE_PATH _mi_mimalloc_ldir "${CMAKE_BINARY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+        set(_mi_mimalloc_ldir "-L./${_mi_mimalloc_ldir}")
+        add_dependencies(mimalloc-test-stress-dynamic mimalloc)
+        target_link_libraries(mimalloc-test-stress-dynamic PRIVATE
+          "${_mi_mimalloc_ldir}" "-l:$<TARGET_LINKER_FILE_NAME:mimalloc>" ${mi_libraries})
+      else()
+        target_link_libraries(mimalloc-test-stress-dynamic PRIVATE mimalloc ${mi_libraries})  # link mi_version
       endif()
+      # No `minject` step. Upstream runs one here because "mingw always links mimalloc
+      # after system libraries", but that is fixed at the link now -- above for the
+      # executable, and in MI_MINGW_REDIRECT_FIRST for `mimalloc.dll`'s own table, which
+      # is the half that actually decides whether the override engages. Running minject
+      # on top would only rewrite an import table that is already correct, and it is a
+      # Windows PE utility, so it cannot run on a cross build's host at all (#277).
       add_test(NAME test-stress-dynamic COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_VERBOSE=1 $<TARGET_FILE:mimalloc-test-stress-dynamic>)
     else()
       target_link_libraries(mimalloc-test-stress-dynamic PRIVATE ${mi_libraries}) # pthreads, issue 1158
@@ -1553,6 +1625,30 @@ if (MI_BUILD_TESTS)
       endif()
       add_test(NAME test-stress-dynamic COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_VERBOSE=1 ${LD_PRELOAD}=$<TARGET_FILE:mimalloc> $<TARGET_FILE:mimalloc-test-stress-dynamic>)
     endif()
+  endif()
+
+  # Behavioural override probe (mimalloc-pprof #277). `mi_is_redirected()` reports what
+  # the redirection module believed it did; this asks whether a CRT `malloc` pointer
+  # actually lands in a mimalloc region, which is the claim that matters and the one the
+  # msvcrt lane fails while reporting success. Windows + shared library only: everywhere
+  # else there is no redirection module to probe.
+  if(WIN32 AND MI_BUILD_SHARED AND MI_WIN_REDIRECT AND NOT (MI_CYGWIN OR MI_TRACK_ASAN OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN))
+    add_executable(mimalloc-test-redirect-probe test/test-redirect-probe.c)
+    target_compile_definitions(mimalloc-test-redirect-probe PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-redirect-probe PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-redirect-probe PRIVATE include)
+    if(MINGW)
+      # `mimalloc.dll` must be this exe's first import descriptor, for the same reason and
+      # by the same means as `mimalloc-test-stress-dynamic` above.
+      file(RELATIVE_PATH _mi_probe_ldir "${CMAKE_BINARY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+      set(_mi_probe_ldir "-L./${_mi_probe_ldir}")
+      add_dependencies(mimalloc-test-redirect-probe mimalloc)
+      target_link_libraries(mimalloc-test-redirect-probe PRIVATE
+        "${_mi_probe_ldir}" "-l:$<TARGET_LINKER_FILE_NAME:mimalloc>" ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-redirect-probe PRIVATE mimalloc ${mi_libraries})
+    endif()
+    add_test(NAME test-redirect-probe COMMAND mimalloc-test-redirect-probe)
   endif()
 
   # imported from oven-sh/mimalloc @ 942b8342 (commit 7ac561ab), MIT -- see #266.

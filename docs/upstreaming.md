@@ -282,6 +282,87 @@ We are already visible in the thread: zackees posted the fork on #1070 on 2026-0
 The convergence itself is the signal worth remembering — Datadog, Bun, and this fork
 independently reached `page->metadata` plus a flag.
 
+## Candidate: mingw links `mimalloc.dll` last in the import table (#277 phase C)
+
+Not yet submitted; recorded here with the measurement so it does not have to be
+rediscovered.
+
+**Symptom.** On MinGW, `mimalloc-test-stress-dynamic.exe` imports `mimalloc.dll` *last*.
+The Windows loader initialises statically imported modules in import-table order, so
+`mimalloc-redirect.dll` — which `mimalloc.dll` pulls in, and which imports only
+`ntdll.dll` — runs after the CRT it is meant to patch, and `mi_is_redirected()` stays
+false. `MIMALLOC_VERBOSE=1` prints no `malloc is redirected.` line. Upstream knows the
+symptom: the `MI_MINGW_UCRT64` branch of `CMakeLists.txt` says "mingw always links
+mimalloc after system libraries" and post-processes the exe with `bin/minject.exe`.
+
+**Cause.** `ld`'s PE linker script emits the import descriptors under
+`SORT(*)(.idata$2)`, sorted by the **input file path as spelled on the link line** —
+archive path first, member name only as a tie-break within one archive. CMake names the
+import library relative to the build directory (`libmimalloc.dll.a`) while every CRT
+archive arrives as an absolute sysroot path, and `/` (0x2f) sorts before `l`. Linking the
+same object against **byte-identical** archives, changing only the spelling:
+
+```
+libmimalloc.dll.a     ->  KERNEL32.dll, api-ms-win-crt-*.dll, ..., mimalloc.dll
+./libmimalloc.dll.a   ->  mimalloc.dll, KERNEL32.dll, api-ms-win-crt-*.dll, ...
+```
+
+This is also the real explanation for the msvcrt/UCRT split: under msvcrt the CRT is
+`libmsvcrt.a` and `mimalloc.dll` happens to sort ahead of `msvcrt.dll`; under UCRT it is
+`api-ms-win-crt-*`, which sorts earlier. The CRT only changes what mimalloc is sorted
+against.
+
+**Fix we carry** (`CMakeLists.txt`, one `if(MINGW)` block on the
+`mimalloc-test-stress-dynamic` target): spell the same file `./…`, in the libraries
+position, via `$<TARGET_LINKER_FILE_NAME:mimalloc>`. Verified cross-built (soldr
+mingw-w64-gcc 15.3.0) for Release, Debug + `MI_DEBUG_FULL` and the shared-only config:
+`mimalloc.dll` / `mimalloc-debug.dll` is import #0 in all three, exactly one descriptor.
+It is what upstream's own "try to link with the mimalloc library earlier on the command
+line" hint asks for, it applies to the native MSYS2 lane too, and it needs no `minject`.
+Upstreamable as-is; it touches one guarded block and no C.
+
+**It is necessary but not sufficient — the other half is inside `mimalloc.dll`.** The
+loader initialises a module's dependencies in *that module's* import-descriptor order, so
+`mimalloc.dll` must import `mimalloc-redirect.dll` before its own `api-ms-win-crt-*`, or
+`ucrtbase.dll`'s DllMain has already run by the time the redirection module gets control.
+It then refuses outright: `LdrGetDllHandle("ucrtbase.dll")` followed by a test of
+`LDR_DATA_TABLE_ENTRY.Flags & 0x00080000` (`LDRP_PROCESS_ATTACH_CALLED`), disassembled at
+`0x180003720` in `bin/mimalloc-redirect.dll` v1.3.3, and it reports
+`mimalloc-redirect.dll seems to be initialized after ucrtbase.dll` through the
+`const char**` that `mi_allocator_init` hands back — the module imports no output API, so
+that message is the only channel it has. MSVC produces the accepted layout by
+construction, because link.exe emits descriptors for explicitly named libraries before the
+`/DEFAULTLIB` ones. **Fix we carry:** `MI_MINGW_REDIRECT_FIRST` (default ON), the same
+`./…` spelling applied to `bin/mimalloc-redirect.lib`.
+
+**Second fix, and the one that is genuinely ours: GCC emulated TLS on the allocation
+path.** With the layout above, the process died at load. soldr's conda-forge
+`x86_64-w64-mingw32-gcc 15.3.0` has no native TLS — `__thread int x;` compiles to
+`__emutls_v.x` plus a call to `__emutls_get_address`, and `__declspec(thread)` draws
+"warning: 'thread' attribute directive ignored" and emits an ordinary global.
+`__emutls_get_address` allocates its per-thread table with `malloc`, which with the
+override live is `mi_malloc`, which reads the thread-local again: unbounded recursion, and
+cdb on a Windows runner shows exactly that cycle with one
+`libgcc_s_seh_1!__emutls_get_address` frame per turn. We move the two thread-locals
+reachable from the allocator onto dynamic Win32 TLS keys, which never allocate:
+`src/threadlocal.c` (`mi_thread_locals`, `mi_slot_fast`) and `src/options.c` (the
+output-recursion guard, reached via `mi_malloc` -> arena reservation ->
+`_mi_verbose_message` -> `_mi_fputs`), behind `MI_WIN_TLS_SLOTS` and
+`_mi_prim_tls_key_*` in the prim layer. MSVC is untouched. Upstreamable: it is a real
+defect on any `--disable-tls` mingw-w64, independent of this fork.
+
+**`minject` produces a non-starting image on a mingw-linked exe — same defect, now
+explained.** Facts from CI run 33609497360: `minject --verbose --postfix=<p>` reads the
+exe, reports `inject 'mimalloc-redirect.dll'`, prints a correct reordering
+(`mimalloc-redirect.dll` #0, `mimalloc*.dll` #1, then `KERNEL32.dll` and the
+`api-ms-win-crt-*` set), writes the file, and `minject --list` on the result shows the
+intended 13-entry table. The image then exits **127**. That is **not** a PE defect:
+minject had built the correct layout, the override engaged, and the process then
+stack-overflowed in the emulated-TLS recursion above, before `main`. Superseded by
+`MI_MINGW_REDIRECT_FIRST`, which achieves the same import order at link time and works on
+a cross build, where minject (a Windows PE utility) cannot run at all. Nothing to report
+upstream about minject.
+
 ## Local reproduction
 
 ```sh

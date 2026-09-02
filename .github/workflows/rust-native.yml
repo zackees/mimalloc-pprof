@@ -19,14 +19,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # TODO(#277 phase B, added 2026-09-02): DELETE the macos-latest row after ten pushes
-    # have compared it against macos-bundles.yml's `run-macos`. Its cross-built Rust test
-    # binaries cover this row's `cargo test`, with one stated exception: the 8 doctests in
-    # rust/mimalloc-pprof/src/lib.rs cannot run from a `--tests` binary and are Linux-only
-    # after this (#277 §4). Informational until then; do not leave it yellow forever.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     defaults:
       run:
         working-directory: rust

@@ -29,6 +29,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "diagnostic.c"
 #endif
 #include "heap.c"
+#include "heap-dump.c"
 #include "init.c"
 #include "libc.c"
 #include "memory-events.c"

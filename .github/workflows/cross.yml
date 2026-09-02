@@ -284,15 +284,19 @@ jobs:
     name: test (${{ matrix.target }})
     needs: [build-linux, build-cross, build-win-gnu]
     runs-on: ${{ matrix.runner }}
-    # TODO(#277 phase B, added 2026-09-02): DELETE the two apple-darwin rows -- and the
-    # matching targets from build-cross -- after ten pushes have compared them against
-    # macos-bundles.yml's `run-macos`, which runs the same binaries on one runner instead
-    # of two. These are the rows that measured 8-14 s of execution behind up to 5h26m /
-    # 6h13m of queue wait. Informational until then.
-    # TODO(#277 phase C, added 2026-09-02): likewise DELETE the x86_64-pc-windows-gnu row
-    # together with build-win-gnu above, after ten pushes against windows-bundles.yml's
-    # `run-windows-gnu`.
-    continue-on-error: ${{ contains(matrix.target, 'apple-darwin') || matrix.target == 'x86_64-pc-windows-gnu' }}
+    # The two apple-darwin rows are GONE (#277 phase B2). Nothing Apple is executed on a
+    # native macOS runner anywhere in this repository any more: the x86_64 test binaries
+    # `build-cross` still stages are executed by macos-bundles.yml's `run-macos-x64-dockur`
+    # inside a dockurr/macos guest on a Linux runner, and aarch64 is compile-only. The
+    # rows that used to be here measured 8-14 s of execution behind up to 5h26m / 6h13m of
+    # queue wait.
+    #
+    # TODO(#277 phase C, added 2026-09-02): DELETE the x86_64-pc-windows-gnu row -- and
+    # `build-win-gnu` above -- after ten pushes have compared them against
+    # windows-bundles.yml's `build-rust (x86_64-pc-windows-gnu)` + `run-windows-gnu`,
+    # which build the same binaries on ubuntu-latest through soldr's Linux-hosted
+    # mingw-w64 and run them on the shared Windows VM. Informational until then.
+    continue-on-error: ${{ matrix.target == 'x86_64-pc-windows-gnu' }}
     strategy:
       fail-fast: false
       matrix:
@@ -309,12 +313,6 @@ jobs:
           - target: x86_64-pc-windows-gnu
             runner: windows-latest
             pprof: true
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-            pprof: false
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            pprof: false
     steps:
       - uses: actions/download-artifact@v4
         with:

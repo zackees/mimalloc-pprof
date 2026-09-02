@@ -161,6 +161,13 @@ mi_decl_export bool    mi_subproc_stats_get_exclusive(mi_subproc_id_t subproc_id
 mi_decl_export char*   mi_stats_as_json(mi_stats_t* stats, size_t buf_size, char* buf) mi_attr_noexcept;      // use mi_free to free the result if the input buf == NULL
 mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 
+// per-heap -> per-page -> (optional) per-block live snapshot (issue #269, Bun parity).
+// Backs bun:jsc heapStats({ dump: true | "blocks" }).mimallocDump. Best-effort under
+// concurrent frees, same caveat as mi_heap_visit_blocks (#78) -- see src/heap-dump.c.
+// use mi_free to free the result.
+mi_decl_export char*   mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept;
+mi_decl_export size_t  mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept;
+
 #ifdef __cplusplus
 }
 #endif

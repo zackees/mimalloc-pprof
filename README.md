@@ -150,6 +150,10 @@ compiler will warn.
 MIMALLOC_PROF=1 MIMALLOC_PROF_DUMP_AT_EXIT=heap.prof ./my_app
 ```
 
+Built with `MI_NO_PROCESS_DETACH` (issue #268)? The automatic exit path that
+`*_DUMP_AT_EXIT` relies on is skipped by design — call `mi_prof_dump` / `mi_dhat_dump`
+yourself before the process exits.
+
 #### Then read the profile
 
 ```sh
@@ -219,6 +223,10 @@ No code needed at all:
 ```sh
 MIMALLOC_DHAT=1 MIMALLOC_DHAT_DUMP_AT_EXIT=heap.dhat.json ./my_app
 ```
+
+Built with `MI_NO_PROCESS_DETACH` (issue #268)? The automatic exit path that
+`*_DUMP_AT_EXIT` relies on is skipped by design — call `mi_prof_dump` / `mi_dhat_dump`
+yourself before the process exits.
 
 #### Rust
 

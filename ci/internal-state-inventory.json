@@ -329,6 +329,25 @@
       ]
     },
     {
+      "id": "heap-dump-json-buffer",
+      "path": "src/heap-dump.c",
+      "callee": "mi_rezalloc",
+      "args": "hbuf->buf,newsize",
+      "occurrence": 1,
+      "owner": "mi_heap_dump_json caller",
+      "initial_owner": "calling thread's default heap",
+      "owner_transitions": "returned to the dump caller; moving growth preserves old buffer on failure, matching stats.c's mi_json_buf_expand this mirrors",
+      "destroyable_by": "caller via mi_free (Bun's BunJSCModule.h frees the same way after JSONParse)",
+      "lifetime": "until caller invokes mi_free",
+      "logical_size": "initial good size near 12 KiB, then doubled",
+      "usable_size": "allocator size class; hbuf->size retains requested logical capacity",
+      "cleanup": "caller owns returned buffer and frees with mi_free; a growth failure mid-print leaves the buffer at its last successfully-written prefix (same discipline as src/stats.c's mi_json_buf_expand)",
+      "publication": "hbuf pointer and size update only after successful rezalloc",
+      "locks": [
+        "none; buffer is operation-local"
+      ]
+    },
+    {
       "id": "thread-heap-object",
       "path": "src/theap.c",
       "callee": "_mi_meta_zalloc",

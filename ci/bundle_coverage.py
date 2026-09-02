@@ -8,6 +8,12 @@ away from -- so `run-macos` configures the same CMake trees natively (configure 
 tree needs no build for `ctest --show-only=json-v1` to list its suite), and this script
 compares those name lists against the bundles it just executed.
 
+Since #277 phase B2 there is no macOS runner left to enumerate a native ctest suite on, so
+the macOS caller compares the *executed* x86_64 bundle against the *compile-only* arm64
+bundle instead: the reference side is whichever manifest is authoritative for the suite,
+and `read_test_names` never cared which shape it was handed. `--heading` and
+`--names` exist so the report says what was actually compared.
+
 A name the native tree has and the bundle does not is a hard failure: it is precisely the
 "gate that reports green on less" failure mode docs/ci-gates.md exists to prevent, and it
 can arise silently -- a test that CMake registers only for AppleClang, or one whose
@@ -87,11 +93,16 @@ class Comparison:
         return sorted(self.bundle - self.native)
 
 
-def render(comparisons: Sequence[Comparison]) -> str:
+def render(
+    comparisons: Sequence[Comparison],
+    heading: str = "Coverage: native ctest vs cross-built bundle",
+    reference: str = "native",
+    candidate: str = "bundle",
+) -> str:
     lines = [
-        "### Coverage: native ctest vs cross-built bundle",
+        f"### {heading}",
         "",
-        "| config | native | bundle | missing from bundle | extra in bundle |",
+        f"| config | {reference} | {candidate} | missing from {candidate} | extra in {candidate} |",
         "|---|---:|---:|---|---|",
     ]
     for comparison in comparisons:
@@ -105,11 +116,11 @@ def render(comparisons: Sequence[Comparison]) -> str:
     total_missing = sum(len(comparison.missing) for comparison in comparisons)
     if total_missing:
         lines.append(
-            f"**{total_missing} test(s) the native runner executes are absent from the "
-            f"bundles.** Coverage would go down; see issue #277 §4."
+            f"**{total_missing} test(s) present in the {reference} side are absent from "
+            f"the {candidate} side.** Coverage would go down; see issue #277 §4."
         )
     else:
-        lines.append("Every test the native runner executes is present in a bundle.")
+        lines.append(f"Every test in the {reference} side is present in the {candidate} side.")
     return "\n".join(lines) + "\n"
 
 
@@ -123,7 +134,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="append",
         metavar=("LABEL", "NATIVE_JSON", "BUNDLE_MANIFEST"),
         required=True,
-        help="a ctest --show-only=json-v1 file and the bundle tests.json that replaces it",
+        help="a reference manifest (ctest --show-only=json-v1 or a bundle tests.json) "
+        "and the bundle tests.json that replaces it",
+    )
+    parser.add_argument(
+        "--heading",
+        default="Coverage: native ctest vs cross-built bundle",
+        help="markdown heading for the report",
+    )
+    parser.add_argument(
+        "--names",
+        nargs=2,
+        default=["native", "bundle"],
+        metavar=("REFERENCE", "CANDIDATE"),
+        help="what to call the two sides in the report",
     )
     parser.add_argument(
         "--summary",
@@ -148,7 +172,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"bundle_coverage: {exc}", file=sys.stderr)
         return 2
 
-    table = render(comparisons)
+    reference, candidate = cast("list[str]", args.names)
+    table = render(comparisons, cast("str", args.heading), reference, candidate)
     print(table, end="")
     summary = cast("Path | None", args.summary)
     if summary is not None:

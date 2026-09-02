@@ -16,15 +16,24 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    the sub-issue. One PR per phase. Conventional commits (`feat:`, `fix:`, `ci:`, `docs:`, `test:`).
 2. **Never mix C-core paths (`src/`, `include/`, `test/`, `CMakeLists.txt`) and `rust/` paths
    in one commit.** This keeps upstream cherry-picks clean.
-3. **Merge gates for every PR:** `c-unit` green on ubuntu/windows-MSVC/windows-MinGW/macos with
+3. **Merge gates for every PR:** `c-unit` green on ubuntu/windows-MSVC/windows-MinGW with
    `MI_PPROF=ON`, the `OFF` job green (profiler hooks disabled; upstream allocator behavior
    with independent memory-events tracking left runtime-disabled), `rust-native` green.
    MSVC **and** win-gnu are priority platforms — both, always.
-   (macOS and win-gnu gates run from Linux-built bundles on one runner each; see #277.
-   Phase C changed *how* win-gnu is built, not whether it is tested: the bundles are
-   built by soldr's mingw-w64, which is **UCRT**, while the native MSYS2 MINGW64 jobs it
-   replaces were msvcrt — those stay informational for a ≥10-push window. Keep win-gnu
-   gated; do not drop it to "MSVC covers Windows".)
+   The **macOS** gate is `macos-bundles.yml` and uses no Apple hardware (#277 phase B2):
+   both Apple arches are cross-built on Linux through soldr, `x86_64` is *executed* inside a
+   `dockurr/macos` guest on a Linux runner (`run-macos-x64-dockur`), and `aarch64` is
+   **compile-only** — a build plus Mach-O header assertions, with its test-name set checked
+   against the executed x86_64 bundle. Never add a `macos-*` runner label to a workflow or
+   to `azure-pipelines.yml`; `ci/lint_no_macos_runners.py` fails `python-lint` if you do.
+   The dockur guest needs a golden disk built once by hand (`ci/macos_golden_local.sh`,
+   published by `macos-golden-upload.yml`), so `run-macos-x64-dockur` is red until that
+   exists — deliberately, and documented in docs/ci-gates.md.
+   The **win-gnu** gate is `windows-bundles.yml` (#277 phase C): the bundles are cross-built
+   on Linux by soldr's mingw-w64 and run on one Windows runner. Phase C changed *how*
+   win-gnu is built, not whether it is tested — soldr's mingw-w64 is **UCRT**, while the
+   native MSYS2 MINGW64 jobs it replaces were msvcrt, so those stay informational for a
+   ≥10-push window. Keep win-gnu gated; do not drop it to "MSVC covers Windows".
 4. **Profiler memory-safety invariant:** profiler-internal memory (sample records, intern table,
    dump buffers) comes ONLY from the raw-OS-layer arena (`_mi_os_alloc`), never from hooked
    allocation paths (`mi_malloc`/`operator new`/`GlobalAlloc`). Debug builds assert this.

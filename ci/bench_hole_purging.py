@@ -36,13 +36,53 @@ import statistics
 import subprocess
 import sys
 import tempfile
-import textwrap
-import time
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import NamedTuple, TypedDict, cast
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+class StatsDict(TypedDict, total=False):
+    """The counters mi_purge_holes_stats_t exposes, as printed by the C driver."""
+
+    purged_bytes: int
+    purged_blocks: int
+    purged_bytes_total: int
+    discard_calls: int
+    reuse_calls: int
+    pages_freed: int
+    ineligible_pages: int
+    ineligible_bytes: int
+    ineligible_free_bytes: int
+    unformed_bytes: int
+    unformed_bytes_total: int
+    unformed_discard_calls: int
+    unformed_reuse_calls: int
+    pages_skipped: int
+    blocks_visited: int
+    full_sweeps: int
+
+
+class RunSummary(TypedDict):
+    """One config's ("off" or "on") half of hole-purging-report.json."""
+
+    stats: StatsDict
+    peak_rss_mb: float
+    tail_mean_rss_mb: float
+    report_text: str
+
+
+class ReportJson(TypedDict):
+    """The full shape of hole-purging-report.json."""
+
+    commit: str
+    cpu: str
+    kernel: str
+    off: RunSummary
+    on: RunSummary
+
 
 # ---------------------------------------------------------------------------
 # The workload. Embedded rather than living under test/ (CLAUDE.md rule 2/6:
@@ -197,7 +237,7 @@ class Sample(NamedTuple):
 @dataclass
 class RunResult:
     samples: list[Sample]
-    stats: dict
+    stats: StatsDict
     report_text: str
 
     @property
@@ -215,8 +255,18 @@ def compile_workload(include_dir: Path, lib_path: Path, work_dir: Path) -> Path:
     src.write_text(CHURN_C_SOURCE, encoding="utf-8")
     exe = work_dir / "hole_purging_churn"
     cmd = [
-        "cc", "-O2", "-g", "-I", str(include_dir), str(src), str(lib_path),
-        "-lpthread", "-lrt", "-latomic", "-o", str(exe),
+        "cc",
+        "-O2",
+        "-g",
+        "-I",
+        str(include_dir),
+        str(src),
+        str(lib_path),
+        "-lpthread",
+        "-lrt",
+        "-latomic",
+        "-o",
+        str(exe),
     ]
     subprocess.run(cmd, check=True)
     return exe
@@ -228,11 +278,12 @@ def run_once(exe: Path, holes_on: bool, seconds: int) -> RunResult:
         "PATH": "/usr/bin:/bin",
     }
     import os
+
     env["PATH"] = os.environ.get("PATH", env["PATH"])
     cmd = ["taskset", "-c", "0-3", str(exe), str(seconds)]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True, env=env)
     samples: list[Sample] = []
-    stats: dict = {}
+    stats: StatsDict = {}
     report_lines: list[str] = []
     in_report = False
     for line in proc.stdout.splitlines():
@@ -240,7 +291,7 @@ def run_once(exe: Path, holes_on: bool, seconds: int) -> RunResult:
             _, t_ms, rss_kb = line.split(",")
             samples.append(Sample(int(t_ms), int(rss_kb)))
         elif line.startswith("STATS_JSON:"):
-            stats = json.loads(line[len("STATS_JSON:"):])
+            stats = json.loads(line[len("STATS_JSON:") :])
         elif line == "REPORT_BEGIN":
             in_report = True
         elif line == "REPORT_END":
@@ -285,14 +336,14 @@ WIDTH = 1000
 HEIGHT = 420
 PAD_LEFT = 64
 PAD_RIGHT = 140
-PAD_TOP = 56
+PAD_TOP = 76
 PAD_BOTTOM = 48
 
 # Palette skill's validated categorical slots 1 (blue) and 2 (orange). `node` was not
 # available in this environment to re-run validate_palette.js, so these are used
 # verbatim from references/palette.md rather than re-derived.
 COLOR_OFF_LIGHT = "#eb6834"  # slot 2, orange -- "hole purging off"
-COLOR_ON_LIGHT = "#2a78d6"   # slot 1, blue   -- "hole purging on"
+COLOR_ON_LIGHT = "#2a78d6"  # slot 1, blue   -- "hole purging on"
 COLOR_OFF_DARK = "#d95926"
 COLOR_ON_DARK = "#3987e5"
 
@@ -329,7 +380,9 @@ def nice_ticks(maximum: float) -> list[float]:
 
 
 def render_line_chart(
-    off_samples: list[Sample], on_samples: list[Sample], theme: Theme,
+    off_samples: list[Sample],
+    on_samples: list[Sample],
+    theme: Theme,
     source_line: str,
 ) -> str:
     max_t = max(off_samples[-1].t_ms, on_samples[-1].t_ms)
@@ -364,16 +417,34 @@ def render_line_chart(
         else:
             off_end_y, on_end_y = mid + 7, mid - 7
 
+    # The title states the takeaway, not just the axes: how much of the pre-idle
+    # peak each configuration gave back. off vs on isolates hole purging's own
+    # contribution -- the scavenger alone (holes off) is the "off" line's return.
+    off_pct_returned = (
+        (off_samples[0].rss_kb - off_samples[-1].rss_kb) / off_samples[0].rss_kb * 100
+        if off_samples[0].rss_kb
+        else 0.0
+    )
+    on_pct_returned = (
+        (on_samples[0].rss_kb - on_samples[-1].rss_kb) / on_samples[0].rss_kb * 100
+        if on_samples[0].rss_kb
+        else 0.0
+    )
+    title = (
+        f"Hole purging returns {on_pct_returned:.0f}% of peak RSS after idle; "
+        f"the scavenger alone returns {off_pct_returned:.0f}%"
+    )
+
     parts: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {WIDTH} {HEIGHT}" '
         f'width="{WIDTH}" height="{HEIGHT}" role="img" '
-        f'aria-label="Resident memory: churn workload, hole purging off vs on">',
+        f'aria-label="{escape(title)}">',
         f'<rect width="{WIDTH}" height="{HEIGHT}" fill="{theme.background}"/>',
         '<g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">',
         f'<text x="{PAD_LEFT}" y="26" font-size="17" font-weight="600" fill="{theme.text}">'
-        'Churn workload: resident memory after idle, hole purging off vs on</text>',
+        f"{escape(title)}</text>",
         f'<text x="{PAD_LEFT}" y="44" font-size="12" fill="{theme.muted}">'
-        f'{escape(source_line)}</text>',
+        f"{escape(source_line)}</text>",
     ]
 
     for tick in ticks:
@@ -399,10 +470,40 @@ def render_line_chart(
             f'text-anchor="{anchor}" fill="{theme.muted}">{label}</text>'
         )
 
-    parts.append(f'<path d="{off_path}" fill="none" stroke="{theme.off_line}" stroke-width="2" '
-                  'stroke-linejoin="round" stroke-linecap="round"/>')
-    parts.append(f'<path d="{on_path}" fill="none" stroke="{theme.on_line}" stroke-width="2" '
-                  'stroke-linejoin="round" stroke-linecap="round"/>')
+    parts.append(
+        f'<path d="{off_path}" fill="none" stroke="{theme.off_line}" stroke-width="2" '
+        'stroke-linejoin="round" stroke-linecap="round"/>'
+    )
+    parts.append(
+        f'<path d="{on_path}" fill="none" stroke="{theme.on_line}" stroke-width="2" '
+        'stroke-linejoin="round" stroke-linecap="round"/>'
+    )
+
+    # Mark the two samples that bracket the drop (t=0, t=100ms) on each series, so
+    # the near-vertical step reads as one measured idle tick rather than a gap in
+    # the data. Annotated once, near the steeper (on) elbow.
+    if len(off_samples) > 1 and len(on_samples) > 1:
+        for s in (off_samples[0], off_samples[1]):
+            parts.append(
+                f'<circle cx="{x_of(s.t_ms):.2f}" cy="{y_of(s.rss_kb / 1024.0):.2f}" '
+                f'r="2.5" fill="{theme.off_line}"/>'
+            )
+        for s in (on_samples[0], on_samples[1]):
+            parts.append(
+                f'<circle cx="{x_of(s.t_ms):.2f}" cy="{y_of(s.rss_kb / 1024.0):.2f}" '
+                f'r="2.5" fill="{theme.on_line}"/>'
+            )
+        elbow_x = x_of(on_samples[1].t_ms)
+        elbow_y = y_of(on_samples[1].rss_kb / 1024.0)
+        note_x, note_y = elbow_x + 14, elbow_y - 10
+        parts.append(
+            f'<line x1="{elbow_x:.2f}" y1="{elbow_y:.2f}" x2="{note_x - 2:.2f}" '
+            f'y2="{note_y + 3:.2f}" stroke="{theme.muted}" stroke-width="1"/>'
+        )
+        parts.append(
+            f'<text x="{note_x:.2f}" y="{note_y:.2f}" font-size="11" fill="{theme.muted}">'
+            "measured: single 100ms idle tick, not a gap</text>"
+        )
 
     # Direct end-of-line labels.
     parts.append(
@@ -416,13 +517,21 @@ def render_line_chart(
 
     # Legend (top-right), in addition to the direct labels.
     leg_x = WIDTH - PAD_RIGHT - 150
-    leg_y = 20
-    parts.append(f'<line x1="{leg_x}" y1="{leg_y}" x2="{leg_x + 20}" y2="{leg_y}" '
-                 f'stroke="{theme.off_line}" stroke-width="2"/>')
-    parts.append(f'<text x="{leg_x + 26}" y="{leg_y + 4}" font-size="12" fill="{theme.muted}">off</text>')
-    parts.append(f'<line x1="{leg_x + 70}" y1="{leg_y}" x2="{leg_x + 90}" y2="{leg_y}" '
-                 f'stroke="{theme.on_line}" stroke-width="2"/>')
-    parts.append(f'<text x="{leg_x + 96}" y="{leg_y + 4}" font-size="12" fill="{theme.muted}">on</text>')
+    leg_y = 64  # own row, below the title (26) and source line (44) -- never collides
+    parts.append(
+        f'<line x1="{leg_x}" y1="{leg_y}" x2="{leg_x + 20}" y2="{leg_y}" '
+        f'stroke="{theme.off_line}" stroke-width="2"/>'
+    )
+    parts.append(
+        f'<text x="{leg_x + 26}" y="{leg_y + 4}" font-size="12" fill="{theme.muted}">off</text>'
+    )
+    parts.append(
+        f'<line x1="{leg_x + 70}" y1="{leg_y}" x2="{leg_x + 90}" y2="{leg_y}" '
+        f'stroke="{theme.on_line}" stroke-width="2"/>'
+    )
+    parts.append(
+        f'<text x="{leg_x + 96}" y="{leg_y + 4}" font-size="12" fill="{theme.muted}">on</text>'
+    )
 
     parts.append("</g></svg>")
     return "\n".join(parts) + "\n"
@@ -463,7 +572,9 @@ def fmt_int(v: int) -> str:
 
 # (label, off value string, on value string) -- rendered above the counter rows,
 # same two value columns, no delta (a delta of two percentages reads as noise).
-def memory_summary_rows(off_summary: dict, on_summary: dict) -> list[tuple[str, str, str]]:
+def memory_summary_rows(
+    off_summary: RunSummary, on_summary: RunSummary
+) -> list[tuple[str, str, str]]:
     off_peak, on_peak = off_summary["peak_rss_mb"], on_summary["peak_rss_mb"]
     off_after, on_after = off_summary["tail_mean_rss_mb"], on_summary["tail_mean_rss_mb"]
     off_pct = (off_peak - off_after) / off_peak * 100 if off_peak else 0.0
@@ -476,10 +587,16 @@ def memory_summary_rows(off_summary: dict, on_summary: dict) -> list[tuple[str, 
 
 
 def render_table_svg(
-    off_stats: dict, on_stats: dict, off_summary: dict, on_summary: dict,
-    theme: Theme, source_line: str,
+    off_stats: Mapping[str, int],
+    on_stats: Mapping[str, int],
+    off_summary: RunSummary,
+    on_summary: RunSummary,
+    theme: Theme,
+    source_line: str,
 ) -> str:
-    counter_rows = [(field, label) for field, label in TABLE_ROWS if field in off_stats and field in on_stats]
+    counter_rows = [
+        (field, label) for field, label in TABLE_ROWS if field in off_stats and field in on_stats
+    ]
     mem_rows = memory_summary_rows(off_summary, on_summary)
     n_rows = len(mem_rows) + len(counter_rows)
     sep_gap = ROW_H // 2
@@ -492,23 +609,33 @@ def render_table_svg(
         f'<rect width="{TABLE_WIDTH}" height="{height}" fill="{theme.background}"/>',
         '<g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">',
         f'<text x="{COL_LABEL_X}" y="26" font-size="17" font-weight="600" fill="{theme.text}">'
-        'Hole purging characteristics: churn workload</text>',
+        "Hole purging characteristics: churn workload</text>",
         f'<text x="{COL_LABEL_X}" y="44" font-size="12" fill="{theme.muted}">'
-        f'{escape(source_line)}</text>',
+        f"{escape(source_line)}</text>",
     ]
 
     header_y = TITLE_H + 14
-    parts.append(f'<text x="{COL_LABEL_X}" y="{header_y}" font-size="12" font-weight="600" '
-                 f'fill="{theme.muted}">measurement</text>')
-    parts.append(f'<text x="{COL_OFF_X}" y="{header_y}" font-size="12" font-weight="600" '
-                 f'text-anchor="end" fill="{theme.muted}">off</text>')
-    parts.append(f'<text x="{COL_ON_X}" y="{header_y}" font-size="12" font-weight="600" '
-                 f'text-anchor="end" fill="{theme.muted}">on</text>')
-    parts.append(f'<text x="{COL_DELTA_X}" y="{header_y}" font-size="12" font-weight="600" '
-                 f'text-anchor="end" fill="{theme.muted}">delta</text>')
+    parts.append(
+        f'<text x="{COL_LABEL_X}" y="{header_y}" font-size="12" font-weight="600" '
+        f'fill="{theme.muted}">measurement</text>'
+    )
+    parts.append(
+        f'<text x="{COL_OFF_X}" y="{header_y}" font-size="12" font-weight="600" '
+        f'text-anchor="end" fill="{theme.muted}">off</text>'
+    )
+    parts.append(
+        f'<text x="{COL_ON_X}" y="{header_y}" font-size="12" font-weight="600" '
+        f'text-anchor="end" fill="{theme.muted}">on</text>'
+    )
+    parts.append(
+        f'<text x="{COL_DELTA_X}" y="{header_y}" font-size="12" font-weight="600" '
+        f'text-anchor="end" fill="{theme.muted}">delta</text>'
+    )
     rule_y = TITLE_H + HEADER_H
-    parts.append(f'<line x1="{COL_LABEL_X}" y1="{rule_y}" x2="{TABLE_WIDTH - COL_LABEL_X}" y2="{rule_y}" '
-                 f'stroke="{theme.grid}" stroke-width="1"/>')
+    parts.append(
+        f'<line x1="{COL_LABEL_X}" y1="{rule_y}" x2="{TABLE_WIDTH - COL_LABEL_X}" y2="{rule_y}" '
+        f'stroke="{theme.grid}" stroke-width="1"/>'
+    )
 
     # `top`: the y-coordinate of this row's top edge, growing downward. A single
     # cursor threaded through both blocks so the separator's gap is the only place
@@ -521,17 +648,27 @@ def render_table_svg(
         bottom = top + ROW_H
         text_y = bottom - 8
         if zebra_index % 2 == 1:
-            parts.append(f'<rect x="{COL_LABEL_X - 8}" y="{top}" '
-                         f'width="{TABLE_WIDTH - 2 * (COL_LABEL_X - 8)}" height="{ROW_H}" '
-                         f'fill="{theme.grid}" opacity="0.25"/>')
-        parts.append(f'<text x="{COL_LABEL_X}" y="{text_y}" font-size="12" fill="{theme.text}">'
-                     f'{escape(label)}</text>')
-        parts.append(f'<text x="{COL_OFF_X}" y="{text_y}" font-size="12" text-anchor="end" '
-                     f'fill="{theme.text}">{off_str}</text>')
-        parts.append(f'<text x="{COL_ON_X}" y="{text_y}" font-size="12" text-anchor="end" '
-                     f'fill="{theme.text}">{on_str}</text>')
-        parts.append(f'<text x="{COL_DELTA_X}" y="{text_y}" font-size="12" text-anchor="end" '
-                     f'fill="{theme.muted}">{delta_str}</text>')
+            parts.append(
+                f'<rect x="{COL_LABEL_X - 8}" y="{top}" '
+                f'width="{TABLE_WIDTH - 2 * (COL_LABEL_X - 8)}" height="{ROW_H}" '
+                f'fill="{theme.grid}" opacity="0.25"/>'
+            )
+        parts.append(
+            f'<text x="{COL_LABEL_X}" y="{text_y}" font-size="12" fill="{theme.text}">'
+            f"{escape(label)}</text>"
+        )
+        parts.append(
+            f'<text x="{COL_OFF_X}" y="{text_y}" font-size="12" text-anchor="end" '
+            f'fill="{theme.text}">{off_str}</text>'
+        )
+        parts.append(
+            f'<text x="{COL_ON_X}" y="{text_y}" font-size="12" text-anchor="end" '
+            f'fill="{theme.text}">{on_str}</text>'
+        )
+        parts.append(
+            f'<text x="{COL_DELTA_X}" y="{text_y}" font-size="12" text-anchor="end" '
+            f'fill="{theme.muted}">{delta_str}</text>'
+        )
         top = bottom
         zebra_index += 1
 
@@ -540,8 +677,10 @@ def render_table_svg(
 
     top += sep_gap
     sep_y = top - sep_gap // 2
-    parts.append(f'<line x1="{COL_LABEL_X}" y1="{sep_y}" x2="{TABLE_WIDTH - COL_LABEL_X}" y2="{sep_y}" '
-                 f'stroke="{theme.grid}" stroke-width="1" stroke-dasharray="2,3"/>')
+    parts.append(
+        f'<line x1="{COL_LABEL_X}" y1="{sep_y}" x2="{TABLE_WIDTH - COL_LABEL_X}" y2="{sep_y}" '
+        f'stroke="{theme.grid}" stroke-width="1" stroke-dasharray="2,3"/>'
+    )
     zebra_index = 0
 
     for field, label in counter_rows:
@@ -557,12 +696,14 @@ def render_table_svg(
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def probe_machine() -> tuple[str, str]:
     """Return (cpu model, kernel release) of the machine actually running the benchmark."""
     import platform
+
     cpu = ""
     try:
-        with open("/proc/cpuinfo") as f:
+        with Path("/proc/cpuinfo").open() as f:
             for line in f:
                 if line.startswith("model name"):
                     cpu = line.split(":", 1)[1].strip()
@@ -600,12 +741,14 @@ def load_csv(path: Path) -> dict[str, list[Sample]]:
     lines = path.read_text(encoding="utf-8").splitlines()[1:]
     for line in lines:
         label, t_s, rss_mb = line.split(",")
-        out[label].append(Sample(int(round(float(t_s) * 1000)), int(round(float(rss_mb) * 1024))))
+        out[label].append(Sample(round(float(t_s) * 1000), round(float(rss_mb) * 1024)))
     return out
 
 
-def write_report_json(path: Path, off: RunResult, on: RunResult, commit: str, cpu: str, kernel: str) -> None:
-    payload = {
+def write_report_json(
+    path: Path, off: RunResult, on: RunResult, commit: str, cpu: str, kernel: str
+) -> None:
+    payload: ReportJson = {
         "commit": commit,
         "cpu": cpu,
         "kernel": kernel,
@@ -625,31 +768,50 @@ def write_report_json(path: Path, off: RunResult, on: RunResult, commit: str, cp
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def load_report_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+def load_report_json(path: Path) -> ReportJson:
+    result: ReportJson = json.loads(path.read_text(encoding="utf-8"))
+    return result
 
 
 def git_commit(repo_root: Path) -> str:
     try:
         out = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "--short=8", "HEAD"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         )
         return out.stdout.strip()
     except Exception:
         return "unknown"
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--build-dir", type=Path, help="dir containing libmimalloc.a (Release, MI_PPROF=ON)")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--build-dir", type=Path, help="dir containing libmimalloc.a (Release, MI_PPROF=ON)"
+    )
     parser.add_argument("--include-dir", type=Path, default=REPO_ROOT / "include")
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / ".github" / "assets")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--seconds", type=int, default=10)
-    parser.add_argument("--table", action="store_true", help="render the characteristics table instead of the line chart")
-    parser.add_argument("--check", action="store_true", help="re-render from committed data; fail if stale; do not re-run the workload")
-    parser.add_argument("--from-data", action="store_true", help="render from the already-committed CSV/JSON instead of re-measuring")
+    parser.add_argument(
+        "--table",
+        action="store_true",
+        help="render the characteristics table instead of the line chart",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="re-render from committed data; fail if stale; do not re-run the workload",
+    )
+    parser.add_argument(
+        "--from-data",
+        action="store_true",
+        help="render from the already-committed CSV/JSON instead of re-measuring",
+    )
     args = parser.parse_args(argv)
 
     out_dir: Path = args.out_dir
@@ -659,7 +821,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.check or args.from_data:
         if not csv_path.exists() or not json_path.exists():
-            print(f"error: {csv_path} / {json_path} missing; run without --check first", file=sys.stderr)
+            print(
+                f"error: {csv_path} / {json_path} missing; run without --check first",
+                file=sys.stderr,
+            )
             return 1
         series = load_csv(csv_path)
         report = load_report_json(json_path)
@@ -689,27 +854,35 @@ def main(argv: Optional[list[str]] = None) -> int:
         write_report_json(json_path, off, on, commit, cpu, kernel)
         off_samples, on_samples = off.samples, on.samples
         off_stats, on_stats = off.stats, on.stats
-        off_summary = {
+        off_summary: RunSummary = {
+            "stats": off.stats,
             "peak_rss_mb": max(s.rss_kb for s in off_samples) / 1024.0,
             "tail_mean_rss_mb": off.mean_rss_kb_tail / 1024.0,
+            "report_text": off.report_text,
         }
-        on_summary = {
+        on_summary: RunSummary = {
+            "stats": on.stats,
             "peak_rss_mb": max(s.rss_kb for s in on_samples) / 1024.0,
             "tail_mean_rss_mb": on.mean_rss_kb_tail / 1024.0,
+            "report_text": on.report_text,
         }
         print(
             f"off: peak {off_summary['peak_rss_mb']:.1f} MB, "
             f"tail-mean {off_summary['tail_mean_rss_mb']:.1f} MB; "
             f"on: peak {on_summary['peak_rss_mb']:.1f} MB, "
             f"tail-mean {on_summary['tail_mean_rss_mb']:.1f} MB "
-            f"(purged {on_stats.get('purged_bytes_total', 0)/1e6:.1f} MB)"
+            f"(purged {on_stats.get('purged_bytes_total', 0) / 1e6:.1f} MB)"
         )
 
     if args.table:
         light_path = out_dir / "hole-purging-table-light.svg"
         dark_path = out_dir / "hole-purging-table-dark.svg"
-        light_svg = render_table_svg(off_stats, on_stats, off_summary, on_summary, LIGHT, source_line)
-        dark_svg = render_table_svg(off_stats, on_stats, off_summary, on_summary, DARK, source_line)
+        stats_off = cast(Mapping[str, int], off_stats)
+        stats_on = cast(Mapping[str, int], on_stats)
+        light_svg = render_table_svg(
+            stats_off, stats_on, off_summary, on_summary, LIGHT, source_line
+        )
+        dark_svg = render_table_svg(stats_off, stats_on, off_summary, on_summary, DARK, source_line)
     else:
         light_path = out_dir / "hole-purging-rss-light.svg"
         dark_path = out_dir / "hole-purging-rss-dark.svg"
@@ -717,7 +890,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         dark_svg = render_line_chart(off_samples, on_samples, DARK, source_line)
 
     if args.check:
-        stale = []
+        stale: list[Path] = []
         for p, body in ((light_path, light_svg), (dark_path, dark_svg)):
             if not p.exists() or p.read_text(encoding="utf-8") != body:
                 stale.append(p)
@@ -729,7 +902,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     light_path.write_text(light_svg, encoding="utf-8")
     dark_path.write_text(dark_svg, encoding="utf-8")
-    print(f"wrote {light_path} ({light_path.stat().st_size} B), {dark_path} ({dark_path.stat().st_size} B)")
+    print(
+        f"wrote {light_path} ({light_path.stat().st_size} B), {dark_path} ({dark_path.stat().st_size} B)"
+    )
     return 0
 
 

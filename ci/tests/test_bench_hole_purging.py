@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import unittest
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 import bench_hole_purging as bench
 
@@ -13,7 +15,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "hole_purging"
 
 
 class BenchHolePurgingTests(unittest.TestCase):
-    def load(self) -> tuple[dict, dict[str, list[bench.Sample]]]:
+    def load(self) -> tuple[bench.ReportJson, dict[str, list[bench.Sample]]]:
         report = bench.load_report_json(FIXTURE / "hole-purging-report.json")
         series = bench.load_csv(FIXTURE / "hole-purging-rss.csv")
         return report, series
@@ -44,8 +46,12 @@ class BenchHolePurgingTests(unittest.TestCase):
         source_line = bench.format_source_line(report["commit"], report["cpu"], report["kernel"])
         off_stats, on_stats = report["off"]["stats"], report["on"]["stats"]
         off_summary, on_summary = report["off"], report["on"]
+        stats_off = cast(Mapping[str, int], off_stats)
+        stats_on = cast(Mapping[str, int], on_stats)
         for theme in (bench.LIGHT, bench.DARK):
-            svg = bench.render_table_svg(off_stats, on_stats, off_summary, on_summary, theme, source_line)
+            svg = bench.render_table_svg(
+                stats_off, stats_on, off_summary, on_summary, theme, source_line
+            )
             root = ET.fromstring(svg)
             self.assertTrue(root.tag.endswith("svg"))
             self.assertIn("viewBox", root.attrib)
@@ -59,11 +65,13 @@ class BenchHolePurgingTests(unittest.TestCase):
 
     def test_table_omits_rows_missing_from_stats(self) -> None:
         report, _ = self.load()
-        off_stats = dict(report["off"]["stats"])
-        on_stats = dict(report["on"]["stats"])
+        off_stats = cast("dict[str, int]", dict(report["off"]["stats"]))
+        on_stats = cast("dict[str, int]", dict(report["on"]["stats"]))
         del off_stats["full_sweeps"]
         del on_stats["full_sweeps"]
-        svg = bench.render_table_svg(off_stats, on_stats, report["off"], report["on"], bench.LIGHT, "src")
+        svg = bench.render_table_svg(
+            off_stats, on_stats, report["off"], report["on"], bench.LIGHT, "src"
+        )
         self.assertNotIn("sweeps that walked every page", svg)
 
     def test_from_data_matches_committed_svgs(self) -> None:
@@ -83,9 +91,21 @@ class BenchHolePurgingTests(unittest.TestCase):
         self.assertEqual(committed, rendered)
 
     def test_median_run_picks_middle_by_tail_rss(self) -> None:
-        low = bench.RunResult(samples=[bench.Sample(9000, 700 * 1024), bench.Sample(10000, 700 * 1024)], stats={}, report_text="")
-        mid = bench.RunResult(samples=[bench.Sample(9000, 800 * 1024), bench.Sample(10000, 800 * 1024)], stats={}, report_text="")
-        high = bench.RunResult(samples=[bench.Sample(9000, 900 * 1024), bench.Sample(10000, 900 * 1024)], stats={}, report_text="")
+        low = bench.RunResult(
+            samples=[bench.Sample(9000, 700 * 1024), bench.Sample(10000, 700 * 1024)],
+            stats={},
+            report_text="",
+        )
+        mid = bench.RunResult(
+            samples=[bench.Sample(9000, 800 * 1024), bench.Sample(10000, 800 * 1024)],
+            stats={},
+            report_text="",
+        )
+        high = bench.RunResult(
+            samples=[bench.Sample(9000, 900 * 1024), bench.Sample(10000, 900 * 1024)],
+            stats={},
+            report_text="",
+        )
         picked = bench.median_run([high, low, mid])
         self.assertIs(picked, mid)
 

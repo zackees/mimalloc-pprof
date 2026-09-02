@@ -126,6 +126,41 @@ extern void* _mi_page_malloc_zero(mi_theap_t* theap, mi_page_t* page, size_t siz
 
 // main allocation primitives for small and generic allocation
 
+#if MI_GUARDED
+// The guarded allocator internally over-allocates (block + trailing guard page) and its
+// own inner allocation hooks would otherwise report that inflated size, and the wrong
+// (interior, block+offset) pointer identity, to observers instead of the caller's actual
+// request. Both call sites below (small and generic dispatch) need the identical
+// suppress-then-refire correction, so it lives once here (rule 6: each upstream call site
+// stays a single guarded line).
+//
+// Pointer identity matters as much as size: the free-side hooks (free.c) and DHAT
+// (dhat.c) key a live record by the BLOCK START, not the caller-visible pointer --
+// _mi_page_ptr_unalign(gpage, gp) recovers that. Get this wrong and every guarded
+// allocation leaks its DHAT/profiler record forever (never found on free, since free
+// looks it up by a different pointer than the one it was recorded under).
+static mi_decl_noinline void* mi_theap_malloc_guarded_hooked(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept {
+  _mi_memevt_suppress_begin();
+  #if MI_PPROF
+  _mi_prof_suppress_begin();
+  #endif
+  void* const gp = _mi_theap_malloc_guarded(theap, size, zero, ppage);
+  #if MI_PPROF
+  _mi_prof_suppress_end();
+  #endif
+  _mi_memevt_suppress_end();
+  if (gp != NULL) {
+    mi_page_t* const gpage = _mi_ptr_page(gp);
+    mi_block_t* const gblock = _mi_page_ptr_unalign(gpage, gp);
+    #if MI_PPROF
+    _mi_prof_on_alloc(theap, gpage, gblock, size);
+    #endif
+    _mi_memevt_on_alloc(gpage, gblock, size);
+  }
+  return gp;
+}
+#endif
+
 // internal small size allocation
 static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_nonnull(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
@@ -139,35 +174,7 @@ static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_non
   #endif
   #if MI_GUARDED
   if mi_unlikely(mi_theap_malloc_use_guarded(theap,size)) {
-    // The guarded allocator internally over-allocates (block + trailing guard page) and
-    // its own inner allocation hooks would otherwise report that inflated size to
-    // observers (memevt) and account it against the sampling budget (the profiler)
-    // instead of the caller's actual request. Suppress both and publish one corrected
-    // event/sample keyed by the real page/block, matching
-    // alloc-aligned.c:mi_theap_malloc_guarded_aligned's existing memevt pattern for the
-    // same underlying call.
-    _mi_memevt_suppress_begin();
-    #if MI_PPROF
-    _mi_prof_suppress_begin();
-    #endif
-    void* const gp = _mi_theap_malloc_guarded(theap, size, zero, ppage);
-    #if MI_PPROF
-    _mi_prof_suppress_end();
-    #endif
-    _mi_memevt_suppress_end();
-    if (gp != NULL) {
-      mi_page_t* const gpage = _mi_ptr_page(gp);
-      #if MI_PPROF
-      // The profiler's own free path (free.c) looks a sample up by the block start it
-      // computes via _mi_page_ptr_unalign, not by the caller-visible (possibly interior,
-      // for a guarded allocation) pointer -- see profile.c:prof_free_record's `ptr != p`
-      // match. Record under that same identity or the free-side lookup never finds it
-      // and the sample leaks until the page itself is reclaimed.
-      _mi_prof_on_alloc(theap, gpage, _mi_page_ptr_unalign(gpage, gp), size);
-      #endif
-      _mi_memevt_on_alloc(gpage, gp, size);
-    }
-    return gp;
+    return mi_theap_malloc_guarded_hooked(theap, size, zero, ppage);
   }
   #endif
 
@@ -192,29 +199,7 @@ static mi_decl_forceinline void* mi_theap_malloc_generic(mi_theap_t* theap, size
   if (theap!=NULL)
   #endif
   if (huge_alignment==0 && mi_theap_malloc_use_guarded(theap, size)) {
-    // See the matching comment in mi_theap_malloc_small_zero_nonnull above.
-    _mi_memevt_suppress_begin();
-    #if MI_PPROF
-    _mi_prof_suppress_begin();
-    #endif
-    void* const gp = _mi_theap_malloc_guarded(theap, size, zero, ppage);
-    #if MI_PPROF
-    _mi_prof_suppress_end();
-    #endif
-    _mi_memevt_suppress_end();
-    if (gp != NULL) {
-      mi_page_t* const gpage = _mi_ptr_page(gp);
-      #if MI_PPROF
-      // The profiler's own free path (free.c) looks a sample up by the block start it
-      // computes via _mi_page_ptr_unalign, not by the caller-visible (possibly interior,
-      // for a guarded allocation) pointer -- see profile.c:prof_free_record's `ptr != p`
-      // match. Record under that same identity or the free-side lookup never finds it
-      // and the sample leaks until the page itself is reclaimed.
-      _mi_prof_on_alloc(theap, gpage, _mi_page_ptr_unalign(gpage, gp), size);
-      #endif
-      _mi_memevt_on_alloc(gpage, gp, size);
-    }
-    return gp;
+    return mi_theap_malloc_guarded_hooked(theap, size, zero, ppage);
   }
   #endif
   #if !MI_THEAP_INITASNULL

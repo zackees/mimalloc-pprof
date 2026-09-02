@@ -40,17 +40,34 @@ static mi_decl_noinline mi_decl_restrict void* mi_theap_malloc_guarded_aligned(m
   }
   const size_t oversize = size + alignment - 1;
   /* The allocator needs oversize bytes internally, but observers describe the
-     caller's requested aligned block. Suppress the base allocation event and
-     publish one normalized event below keyed by the actual page block. */
+     caller's requested aligned block. Suppress the base allocation event/sample and
+     publish one normalized event/sample below keyed by the actual page block. */
   _mi_memevt_suppress_begin();
+  #if MI_PPROF
+  _mi_prof_suppress_begin();
+  #endif
   void* const base = _mi_theap_malloc_guarded(theap, oversize, zero, ppage);
+  #if MI_PPROF
+  _mi_prof_suppress_end();
+  #endif
   _mi_memevt_suppress_end();
   if (base==NULL) return NULL;
   void* const p = _mi_align_up_ptr(base, alignment);
   mi_track_align(base, p, (uint8_t*)p - (uint8_t*)base, size);
   mi_assert_internal(mi_usable_size(p) >= size);
   mi_assert_internal(_mi_is_aligned(p, alignment));
-  _mi_memevt_on_alloc(_mi_ptr_page(base), base, size);
+  {
+    // #266: key the event/sample by the block start, not `base` (still an interior,
+    // guard-offset pointer here) -- see alloc.c:mi_theap_malloc_guarded_hooked's
+    // matching comment. Getting this wrong leaks a DHAT/profiler record forever, since
+    // free-side lookups (free.c, dhat.c) key by block start and would never find it.
+    mi_page_t* const bpage = _mi_ptr_page(base);
+    mi_block_t* const bblock = _mi_page_ptr_unalign(bpage, base);
+    #if MI_PPROF
+    _mi_prof_on_alloc(theap, bpage, bblock, size);
+    #endif
+    _mi_memevt_on_alloc(bpage, bblock, size);
+  }
   return p;
 }
 

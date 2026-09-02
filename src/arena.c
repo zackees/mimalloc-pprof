@@ -2325,6 +2325,14 @@ static bool mi_heap_visit_page(mi_page_t* page, mi_heap_visit_info_t* vinfo) {
   }
 }
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): test hook
+// for test-heap-teardown.c's `pin` case. Not yet wired into the claim loop -- that lands
+// with the heap delete/destroy teardown protocol port; until then this only exists so the
+// imported test corpus links (it stalls forever, bounded by its ctest TIMEOUT).
+#if MI_DEBUG > 0
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+#endif
+
 static bool mi_heap_visit_page_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   MI_UNUSED(slice_count);
   mi_heap_visit_info_t* vinfo = (mi_heap_visit_info_t*)arg;

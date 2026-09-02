@@ -214,6 +214,26 @@ bool          _mi_os_decommit(mi_subproc_t* subproc, void* addr, size_t size);
 void          _mi_os_reuse(mi_subproc_t* subproc, void* p, size_t size);
 mi_decl_nodiscard bool _mi_os_commit(mi_subproc_t* subproc, void* p, size_t size, bool* is_zero);
 mi_decl_nodiscard bool _mi_os_commit_ex(mi_subproc_t* subproc, void* addr, size_t size, bool* is_zero, size_t stat_size);
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT: MI_DEBUG-only test hooks (issue #271 /
+// Bun parity P6). Declared with C linkage so a C test links against a library that may be
+// compiled as C++ (mirrors the other `mi_debug_*` test hooks).
+#if MI_DEBUG > 0
+#ifdef __cplusplus
+extern "C" {
+#endif
+// After `fail_after` successful commits, the next `_mi_os_commit_ex` call fails instead of
+// calling into the OS (test-commit-fail.c).
+extern mi_decl_export volatile long mi_debug_fail_os_commit_after;
+// test-heap-teardown.c's `pin` case: set to 1 before a `mi_heap_delete`; the claim loop in
+// `arena.c` (`mi_heap_visit_page_claim`) sets it to 2 once it has a page pinned but not yet
+// claimed, and stalls there until the test sets it back to 0.
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+#ifdef __cplusplus
+}
+#endif
+#endif
+
 mi_decl_nodiscard bool _mi_os_protect(void* addr, size_t size);
 bool          _mi_os_unprotect(void* addr, size_t size);
 bool          _mi_os_purge(mi_subproc_t* subproc, void* p, size_t size);

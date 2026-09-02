@@ -194,7 +194,8 @@ static void mi_heap_main_init_once(void) {
   // application buffer-overrun to catch here) and corrupts memevt/profiler hook
   // accounting, since the guarded allocator's own inner request reports a different
   // (guard-page-inflated) size than the logical allocation. Never guard theap_meta,
-  // regardless of the global MIMALLOC_GUARDED_SAMPLE_RATE setting.
+  // regardless of the global MIMALLOC_GUARDED_SAMPLE_RATE setting. Diverges from
+  // upstream, which has no such exemption (see docs/fork-divergence.md).
   mi_process_theap_meta.guarded_sample_rate = 0;
   #endif
   subproc_main->theap_meta = &mi_process_theap_meta;
@@ -497,31 +498,49 @@ mi_decl_nodiscard bool mi_is_redirected(void) mi_attr_noexcept {
   return _mi_is_redirected();
 }
 
-// Called once by the process loader from `src/prim/prim.c` before `main` is called.
+// Called once by the process loader from `src/prim/prim.c` before `main` is called --
+// per this comment, always has been. But that "called once" guarantee is only as good
+// as whatever constructor mechanism actually calls it, and on win-gnu it is not: MinGW
+// registers `mi_tls_attach` in the `.CRT$XLB` TLS-callback table AND still emits a GCC
+// `__attribute__((constructor))` for the same entry point (src/prim/prim.c), because
+// `MI_PRIM_HAS_PROCESS_ATTACH` (src/prim/windows/prim.c) is only defined for the
+// `MI_WIN_INIT_USE_TLS_DLLMAIN`/`MI_SHARED_LIB` paths, not for the plain `__MINGW32__`
+// TLS-callback path upstream `1cf88691` switched MinGW onto (see docs/upstreaming.md;
+// at our previous pin, MinGW used MI_WIN_INIT_USE_FLS instead, which set that macro and
+// suppressed the constructor). So on win-gnu specifically this function really does run
+// twice: once via the TLS callback's DLL_PROCESS_ATTACH, once via the constructor.
+// `mi_process_init()` below already tolerates that (it has its own do-once guard), but
+// nothing else in this function did until now -- guard the whole body so a second call
+// is a true no-op rather than re-running side effects meant to happen exactly once
+// (_mi_options_post_init's mi_add_stderr_output is ALSO defensively idempotent now, as
+// belt-and-suspenders, but this is the actual fix for the "called once" contract this
+// function's own comment claims).
 void _mi_auto_process_init(void) {
-  os_preloading = false;
+  mi_atomic_do_once {
+    os_preloading = false;
 
-  mi_process_init();
-  mi_process_setup_auto_thread_done();
+    mi_process_init();
+    mi_process_setup_auto_thread_done();
 
-  _mi_options_post_init();  // now we can print to stderr
-  if (_mi_is_redirected()) _mi_verbose_message("malloc is redirected.\n");
+    _mi_options_post_init();  // now we can print to stderr
+    if (_mi_is_redirected()) _mi_verbose_message("malloc is redirected.\n");
 
-  // show message from the redirector (if present)
-  const char* msg = NULL;
-  _mi_allocator_init(&msg);
-  if (msg != NULL && (mi_option_is_enabled(mi_option_verbose) || mi_option_is_enabled(mi_option_show_errors))) {
-    _mi_fputs(NULL,NULL,NULL,msg);
-  }
+    // show message from the redirector (if present)
+    const char* msg = NULL;
+    _mi_allocator_init(&msg);
+    if (msg != NULL && (mi_option_is_enabled(mi_option_verbose) || mi_option_is_enabled(mi_option_show_errors))) {
+      _mi_fputs(NULL,NULL,NULL,msg);
+    }
 
-  // reseed random
-  mi_theap_t* theap = _mi_theap_default();
-  if (theap != NULL) {
-    _mi_random_reinit_if_weak(&theap->random);
-    mi_subproc_t* subproc = _mi_theap_subproc(theap);
-    if (subproc->theap_meta != NULL) {
-      mi_lock(&subproc->theap_meta_lock) {
-        _mi_random_reinit_if_weak(&subproc->theap_meta->random);
+    // reseed random
+    mi_theap_t* theap = _mi_theap_default();
+    if (theap != NULL) {
+      _mi_random_reinit_if_weak(&theap->random);
+      mi_subproc_t* subproc = _mi_theap_subproc(theap);
+      if (subproc->theap_meta != NULL) {
+        mi_lock(&subproc->theap_meta_lock) {
+          _mi_random_reinit_if_weak(&subproc->theap_meta->random);
+        }
       }
     }
   }

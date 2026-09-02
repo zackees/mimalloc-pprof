@@ -312,13 +312,27 @@ This is also the real explanation for the msvcrt/UCRT split: under msvcrt the CR
 `api-ms-win-crt-*`, which sorts earlier. The CRT only changes what mimalloc is sorted
 against.
 
-**Fix we carry** (`CMakeLists.txt`, `if(MINGW)` on the `mimalloc-test-stress-dynamic`
-target): spell the same file `./…`, in the libraries position, via
-`$<TARGET_LINKER_FILE_NAME:mimalloc>`. Verified cross-built (soldr mingw-w64-gcc 15.3.0)
-for Release, Debug + `MI_DEBUG_FULL` and the shared-only config: `mimalloc.dll` /
-`mimalloc-debug.dll` is import #0 in all three, exactly one descriptor. It removes the
+**It bites at two levels.** The loader initialises a module's dependencies in *its* own
+import-table order, so it is not enough for the exe to import `mimalloc.dll` first —
+`mimalloc.dll` must also import `mimalloc-redirect.dll` before its own
+`api-ms-win-crt-*` imports, or the redirect module is initialised after the runtime it
+patches. That second one is linked from an absolute *source directory* path, so whether it
+beats the sysroot depends on where the checkout lives: it passed in a local tree
+(`/home/u/.clud/...` < `/home/u/.soldr/...`) and failed on CI
+(`/home/runner/work/...` > `/home/runner/.soldr/...`) at the same commit. Proven
+load-bearing by relinking the same objects twice: against a deliberately late-sorting
+absolute path the first import is `libgcc_s_seh-1.dll`; against `./mimalloc-redirect.lib`
+it is `mimalloc-redirect.dll`.
+
+**Fix we carry** (`CMakeLists.txt`, two `if(MINGW)` blocks): spell both files `./…`, in
+the libraries position — the DLL's import library via `$<TARGET_LINKER_FILE_NAME:mimalloc>`
+on the `mimalloc-test-stress-dynamic` target, and a build-directory copy of
+`bin/mimalloc-redirect*.lib` on the `mimalloc` target. Verified cross-built (soldr
+mingw-w64-gcc 15.3.0) for Release, Debug + `MI_DEBUG_FULL` and the shared-only config:
+`mimalloc.dll` / `mimalloc-debug.dll` is import #0 of the exe and `mimalloc-redirect.dll`
+is import #0 of the DLL, in all three, exactly one descriptor each. It removes the
 dependency on `minject` and applies to the native MSYS2 lane too. Upstreamable as-is; it
-touches one guarded block and no C.
+touches two guarded blocks and no C.
 
 **Separate bug, not root-caused: `minject` produces an unloadable image on a
 mingw-linked exe.** Facts from CI run 33609497360: `minject --verbose --postfix=<p>` reads

@@ -265,19 +265,37 @@ the CRT arrives as `libmsvcrt.a` and `mimalloc.dll` happens to sort ahead of `ms
 under UCRT it arrives as `api-ms-win-crt-*`, which sorts earlier, and mimalloc loses. The
 CRT only changes what mimalloc is being sorted against.
 
-`CMakeLists.txt` therefore spells the same file `./…` for `mimalloc-test-stress-dynamic`
-on MinGW — in the *libraries* position, since an archive named before anything needs it
-contributes nothing — using `$<TARGET_LINKER_FILE_NAME:mimalloc>` so the Debug build's
-`mimalloc-debug.dll` is handled too. Verified cross-built for all three configs.
+It bites at **two levels**, and only fixing both makes the override work:
+
+1. `mimalloc-test-stress-dynamic.exe` must import `mimalloc.dll` before the CRT.
+2. `mimalloc.dll` must import `mimalloc-redirect.dll` before the CRT — the loader
+   initialises a module's dependencies in *its* import-table order, so a redirect module
+   listed after the `api-ms-win-crt-*` set is initialised after the runtime it patches.
+
+Level 2 is the one that looks like luck: CMake links the redirect import library by its
+absolute source-directory path, so whether it beats the absolute sysroot path the CRT
+arrives on depends on **where the checkout lives**. `/home/user/src/…` wins against
+`/home/user/.mingw/…` and loses against `/opt/…` — measured going both ways on the same
+commit, working in a local tree and failing on CI.
+
+`CMakeLists.txt` therefore spells both files `./…` on MinGW, in the *libraries* position
+(an archive named before anything needs it contributes nothing): the DLL's import library
+via `$<TARGET_LINKER_FILE_NAME:mimalloc>` so the Debug build's `mimalloc-debug.dll` is
+handled too, and a build-directory copy of `bin/mimalloc-redirect*.lib`. Verified
+cross-built for all three configs, and verified load-bearing by relinking the same objects
+against a deliberately late-sorting absolute path (redirect module not first) and the
+`./` copy (first).
 
 ### The override is gated on the bundle's own binaries
 
 `run-windows-gnu` asserts both halves, as hard failures, on the artifacts it ships:
 
-- **`mimalloc*.dll` is import #0** of `mimalloc-test-stress-dynamic.exe` in the release,
-  debug-full and shared bundles. Read with `ci/pe_imports.py`, a 150-line PE import-table
-  reader — `dumpbin` is MSVC-only and MSYS2 is not installed at that point in the job (and
-  depending on it would be wrong anyway: the bundle is meant to run with no toolchain).
+- **`mimalloc*.dll` is import #0** of `mimalloc-test-stress-dynamic.exe`, and
+  **`mimalloc-redirect.dll` is import #0** of `mimalloc*.dll`, in the release, debug-full
+  and shared bundles. Read with `ci/pe_imports.py`, a PE import-table reader — `dumpbin`
+  is MSVC-only and MSYS2 is not installed at that point in the job (and depending on it
+  would be wrong anyway: the bundle is meant to run with no toolchain). The build job
+  asserts the DLL half a second time, on Linux, before the bundle ships.
 - **`malloc is redirected.`** appears under `MIMALLOC_VERBOSE=1` (`src/init.c:530`,
   printed only when `_mi_is_redirected()`). `test-stress-dynamic` asserts nothing about
   redirection itself, so without this the bundle could pass while overriding nothing.

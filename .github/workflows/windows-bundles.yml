@@ -24,10 +24,11 @@ name: windows-bundles
 # upstream and cannot fire in a cross build:
 #   * the toolchain file sets `MI_MINGW_UCRT64` ON, which turns on the `.CRT$XLB` TLS
 #     callback path in src/prim/windows/prim.c, and
-#   * mingw linked `mimalloc.dll` LAST in `mimalloc-test-stress-dynamic.exe`'s import
-#     table, so the redirection module was initialised after the CRT it patches and the
-#     override silently did nothing. That is a link-order property, not a CRT property --
-#     see the comment on the target in CMakeLists.txt -- and it is fixed there.
+#   * mingw put the wrong thing first in TWO import tables -- `mimalloc.dll` last in
+#     `mimalloc-test-stress-dynamic.exe`, and `mimalloc-redirect.dll` after the CRT
+#     api-sets in `mimalloc.dll` itself -- so the redirection module was initialised after
+#     the runtime it patches and the override silently did nothing. Both are a
+#     path-spelling property of the link line, not a CRT property; see CMakeLists.txt.
 # `run-windows-gnu` asserts both halves on the BUNDLE'S OWN binaries: `mimalloc*.dll` is
 # import #0 (`ci/pe_imports.py`), and the exe prints "malloc is redirected." under
 # MIMALLOC_VERBOSE=1. Both are hard failures. Cross-compilation is the product
@@ -184,8 +185,16 @@ jobs:
             exit 1
           fi
           # The Windows override goes through the redirection DLL, not through symbol
-          # interposition; a mimalloc.dll that lost this import overrides nothing.
-          grep -qi 'DLL Name: mimalloc-redirect.dll' private.txt
+          # interposition; a mimalloc.dll that lost this import overrides nothing. And it
+          # has to come FIRST: the loader initialises a module's dependencies in its
+          # import-table order, so a redirect module listed after the CRT api-sets is
+          # initialised after the runtime it is meant to patch (see CMakeLists.txt).
+          first_import=$(uv run ci/pe_imports.py "$lib" | head -1)
+          if [ "$first_import" != "mimalloc-redirect.dll" ]; then
+            echo "::error::$lib imports '$first_import' first, expected mimalloc-redirect.dll"
+            uv run ci/pe_imports.py "$lib"
+            exit 1
+          fi
           {
             echo '```'
             grep -E '^Entry 9' private.txt
@@ -350,6 +359,17 @@ jobs:
             first=$(head -1 "$bundle/imports.txt")
             if [ "$first" != "$dll" ]; then
               echo "::error::$exe imports '$first' first, expected '$dll'"
+              exit 1
+            fi
+            # ...and the DLL must in turn import the redirection module first, or the
+            # loader initialises the CRT before the module that patches it. Two levels,
+            # both load-bearing, both a path-spelling property of the link line
+            # (CMakeLists.txt). The second one is what actually failed on CI while passing
+            # in a local tree: the winner depends on where the checkout lives.
+            uv run ci/pe_imports.py "$bundle/$dll" | tee "$bundle/imports-dll.txt"
+            first_dll=$(head -1 "$bundle/imports-dll.txt")
+            if [ "$first_dll" != "mimalloc-redirect.dll" ]; then
+              echo "::error::$bundle/$dll imports '$first_dll' first, expected mimalloc-redirect.dll"
               exit 1
             fi
             echo "::endgroup::"
@@ -656,7 +676,10 @@ jobs:
             msvcrt.raw
             native-imports.txt
             bundle/windows-gnu-x64-release/imports.txt
+            bundle/windows-gnu-x64-release/imports-dll.txt
             bundle/windows-gnu-x64-debug-full/imports.txt
+            bundle/windows-gnu-x64-debug-full/imports-dll.txt
             bundle/windows-gnu-x64-shared/imports.txt
+            bundle/windows-gnu-x64-shared/imports-dll.txt
           if-no-files-found: warn
           retention-days: 7

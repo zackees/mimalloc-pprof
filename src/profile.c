@@ -293,10 +293,13 @@ bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept {
   // subproc/heap/theap locks that nothing else nests under prof_lock, and coupling them
   // here would just add a new lock-ordering constraint for no benefit (prof_enabled is
   // already visible process-wide by the time the walk starts). See
-  // `_mi_subproc_prof_set_force_slow`'s comment (subproc.c) for the poisoning strategy and
-  // the accepted start-time coverage gap (a theap whose queue update races the walk and
-  // reads `prof_force_slow` as not-yet-set keeps its fast path live for one more
-  // allocation -- matches oven-sh/mimalloc @ 942b8342's own window).
+  // `_mi_subproc_prof_set_force_slow`'s comment (subproc.c) for the poisoning strategy
+  // and the accepted start-time coverage gap this creates: a theap whose queue update
+  // races the walk and reads `prof_force_slow` as not-yet-set keeps its fast path live
+  // for one more allocation. The strategy (poison-on-start) is ported from
+  // oven-sh/mimalloc @ 942b8342; this specific window is a consequence of our own
+  // implementation choice to walk outside prof_lock, not a claim about Bun's own
+  // start-time behavior, which was not inspected in this detail.
   if (started) { _mi_subproc_prof_set_force_slow(true); }
   return started;
 }

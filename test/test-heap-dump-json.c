@@ -3,7 +3,12 @@
    Spec is Bun's test/js/bun/jsc/heapStats-mimalloc.test.ts (oven-sh/bun): every JSON
    shape assertion it makes on `heapStats({ dump: true | "blocks" }).mimallocDump` is
    checked here at the C level -- `heaps[].seq`, `pages[].{id,block_size,used,reserved,
-   thread_id}`, `blocks` present only when requested, `blocks[[id,size]]`.
+   thread_id}`, `blocks` present only when requested, `blocks[[id,size]]` -- with one
+   exception: Bun's JS test also asserts every `blocks[]` size matches some `pages[]`
+   entry's `block_size`. That is best-effort here rather than a hard assertion, because
+   src/heap-dump.c's own JSON-buffer growth can mutate the heap being walked between the
+   pages pass and the blocks pass (see the SELF-MUTATION note there) -- the same
+   best-effort Bun's own implementation has.
 
    Independent of MI_PPROF (src/heap-dump.c is unconditional), so this test is built and
    registered unconditionally too, like test-memory-events.c / test-dhat.c. */
@@ -184,19 +189,27 @@ int main(void) {
   snprintf(numbuf, sizeof(numbuf), "\"seq\": %zu,", seq2);
   assert(strstr(json_pages, numbuf) != NULL);
 
+  /* the main/default heap is always heap_seq 0 (the first _mi_heap_init call in the
+     process, and mi_atomic_increment_relaxed returns the pre-increment value) -- pin it,
+     since Bun's own test relies on exactly this: `heaps.find(h => h.seq === 0)`. */
+  assert(strstr(json_pages, "\"seq\": 0,") != NULL);
+
   /* heap1's known allocation: exactly N_ALLOC_HEAP1 blocks of >= KNOWN_SIZE_1 bytes each.
      Summed rather than expected on one page: a normal build packs them into one page, but
      a guarded build (MIMALLOC_GUARDED_SAMPLE_RATE=1, see run_guarded in ci/verify_local.py)
-     gives every allocation its own single-block page. */
+     gives every allocation its own single-block page. Every page's "reserved" must also
+     be > 0 (Bun's test: `expect(page.reserved).toBeGreaterThan(0)`). */
   const char* seg1; size_t seg1_len;
   assert(find_heap_segment(json_pages, seq1, &seg1, &seg1_len));
   assert(sum_field(seg1, seg1_len, "\"used\": ") == (size_t)N_ALLOC_HEAP1);
   assert(check_field_min(seg1, seg1_len, "\"block_size\": ", KNOWN_SIZE_1) >= 1);
+  assert(check_field_min(seg1, seg1_len, "\"reserved\": ", 1) >= 1);
 
   const char* seg2; size_t seg2_len;
   assert(find_heap_segment(json_pages, seq2, &seg2, &seg2_len));
   assert(sum_field(seg2, seg2_len, "\"used\": ") == 1);
   assert(check_field_min(seg2, seg2_len, "\"block_size\": ", KNOWN_SIZE_2) >= 1);
+  assert(check_field_min(seg2, seg2_len, "\"reserved\": ", 1) >= 1);
 
   /* seq is stable across a second, independent dump */
   char* json_pages2 = mi_heap_dump_json(false, false);

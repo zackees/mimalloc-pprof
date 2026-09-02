@@ -26,6 +26,14 @@
    OS (memid.memkind == MI_MEM_OS, e.g. before this process's first arena reservation) is
    visible to neither, so it can be silently absent from a dump. This mirrors Bun's own
    mi_heap_dump_json, which has the identical gap for the identical reason.
+
+   SELF-MUTATION: the dump's own JSON buffer growth (mi_hdump_buf_expand -> mi_rezalloc)
+   allocates from the calling thread's default heap, and mi_heap_dump_json walks that same
+   heap if it is one of the subprocess's heaps -- so the walk can observe its own buffer's
+   allocations, and because pages and blocks are two separate mi_heap_visit_blocks passes,
+   a block size seen in the blocks[] pass is not guaranteed to already appear in the
+   pages[] pass taken moments earlier. Same class of best-effort as Bun's implementation,
+   not something either side corrects for.
 */
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
@@ -102,7 +110,13 @@ static uintptr_t mi_dump_id(mi_dump_ctx_t* ctx, const void* p) {
 static bool mi_cdecl mi_dump_block_visit(const mi_heap_t* heap, const mi_heap_area_t* area, void* block, size_t block_size, void* arg) {
   MI_UNUSED(heap);
   mi_dump_ctx_t* ctx = (mi_dump_ctx_t*)arg;
-  char tmp[128];
+  // 192, not Bun's 128: the page-line format below has 5 %zu fields plus ~71 fixed
+  // characters, and a 64-bit size_t can print up to 20 digits, so the worst realistic
+  // line is 71 + 5*20 = 171 bytes (+ NUL). _mi_snprintf truncates rather than overflows,
+  // but a truncated line here is a *silently* malformed JSON document -- Bun's
+  // JSONParse(json) on the caller side turns that into a hard `mimallocDump: null`
+  // rather than a visible error. Deliberate deviation from Bun's own buffer size.
+  char tmp[192];
   if (block == NULL) {
     if (ctx->in_block_pass) return true;
     if (!ctx->first_page) { mi_hdump_buf_print(&ctx->hbuf, ",\n"); }

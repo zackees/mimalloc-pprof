@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2468ad9f of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit cc6cc2a3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -2764,7 +2764,7 @@ struct mi_theap_s {
   bool                  prof_force_slow;                     // #267: poison `pages_free_direct` so every malloc misses
                                                                // the fast path and lands in `_mi_malloc_generic` (where the
                                                                // sampling countdown lives) while the profiler is running.
-                                                               // Set/cleared cross-thread by `_mi_subproc_prof_set_force_slow`
+                                                               // Set/cleared cross-thread by `_mi_subproc_prof_sync_force_slow`
                                                                // (subproc.c) under `heap->theaps_lock`; a new theap reads the
                                                                // current profiler state under that same lock in
                                                                // `_mi_theap_init` (theap.c) so it is never missed by a
@@ -4421,7 +4421,7 @@ mi_prof_stack_t* _mi_prof_stack_intern(void);
 // #267: zero-cost-when-off fast path. "page-queue.c": poisons/refreshes one theap's
 // `pages_free_direct`. "subproc.c": walks every live theap process-wide.
 void        _mi_theap_pages_free_direct_poison(mi_theap_t* theap);
-void        _mi_subproc_prof_set_force_slow(void);
+void        _mi_subproc_prof_sync_force_slow(void);
 void        _mi_prof_stack_release(mi_prof_stack_t* stack);
 void        _mi_prof_stack_alloc(mi_prof_stack_t* stack, size_t size);
 void        _mi_prof_stack_free(mi_prof_stack_t* stack, size_t size);
@@ -18961,6 +18961,7 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
   mi_page_t* page = pq->first;
   if (pq->first == NULL) page = _mi_page_empty_get();
   #if MI_PPROF
+  bool prof_poisoning = false;
   // #267: while the profiler is forcing this theap onto the slow path, substitute the
   // empty page for the real one here -- same effect as poisoning (every malloc misses the
   // fast list-pop and lands in `_mi_malloc_generic`, where the sampling countdown lives),
@@ -18975,16 +18976,34 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
   // `pages_free_direct` even after the arena reclaims its memory, a use-after-free on the
   // next fast-path allocation of that size class. Substituting the empty sentinel instead
   // keeps every write self-consistent with "currently valid queue page, or empty",
-  // regardless of any race with `_mi_subproc_prof_set_force_slow`'s cross-thread flag/
+  // regardless of any race with `_mi_subproc_prof_sync_force_slow`'s cross-thread flag/
   // poison writes (subproc.c) -- this thread always derives the value from its own,
   // definitely-current `pq->first`, never from a value written by another thread.
-  if mi_unlikely(theap->prof_force_slow) { page = _mi_page_empty_get(); }
+  if mi_unlikely(theap->prof_force_slow) { page = _mi_page_empty_get(); prof_poisoning = true; }
   #endif
 
   // find index in the right direct page array
   const size_t idx = _mi_wsize_from_size(size);
   mi_page_t** const pages_free = theap->pages_free_direct;
+  #if MI_PPROF
+  // #267: the "already set" short-circuit below assumes the whole [start..idx] range was
+  // last written as one unit by THIS function -- true when only the owning thread ever
+  // writes `pages_free_direct` (Bun's design: its poison/unpoison runs same-thread, at
+  // theap init). Not true here: `_mi_theap_pages_free_direct_poison` (below) writes the
+  // FULL [0..MI_PAGES_DIRECT) range cross-thread, one entry at a time, with no ordering
+  // guarantee against this function's own concurrent [start..idx] write. A page can start
+  // that race sampled at both ends (`pages_free[idx] == empty`, matching `page` here) while
+  // an interior slot j in [start,idx) still holds a stale real page from this function's
+  // own not-yet-fully-applied write -- the short-circuit would then return without ever
+  // repairing slot j, and it stays wrong for the rest of this profiling run (see the
+  // multi-entry range built below: a size class can span several `pages_free_direct`
+  // slots). Disabling the short-circuit while poisoned costs at most a few extra stores
+  // per update (already on the slow, profiling-only path) and lets every call re-cover the
+  // whole range, self-healing slot j the next time this queue is touched.
+  if (pages_free[idx] == page && !prof_poisoning) return;  // already set
+  #else
   if (pages_free[idx] == page) return;  // already set
+  #endif
 
   // find start slot
   size_t start;
@@ -19014,7 +19033,7 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
 // #267: force every entry to the empty page so the small-object fast path
 // (`alloc.c:mi_page_malloc_zero`, reached via `internal.h:_mi_theap_get_free_small_page`)
 // always misses and falls through to `_mi_malloc_generic`. Called only from
-// `_mi_subproc_prof_set_force_slow(true)` (subproc.c), which already holds
+// `_mi_subproc_prof_sync_force_slow()` (subproc.c), which already holds
 // `heap->theaps_lock` for this theap -- a cross-thread plain-pointer write into memory the
 // owning thread may concurrently read lock-free; see that function's comment for why this
 // is safe (every possible value is either a valid live page or the static empty page,
@@ -20155,12 +20174,15 @@ static mi_page_t* mi_find_page(mi_theap_t* theap, size_t size, size_t huge_align
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   #if MI_PPROF
-  // #267: same-thread, lock-free opportunistic re-sync of `pages_free_direct` for this
-  // queue. A no-op while `theap->prof_force_slow` is still set (see
-  // `mi_theap_queue_first_update`'s early-return in page-queue.c) and a no-op for `pq`
-  // outside the small-object range; once the profiler has stopped, this is what actually
-  // restores the fast path for a theap that is not otherwise mutating its page queues --
-  // `mi_prof_stop` (profile.c) deliberately does not touch `pages_free_direct` cross-thread.
+  // #267: same-thread, lock-free re-sync of `pages_free_direct` for this queue. A no-op
+  // for `pq` outside the small-object range. While `theap->prof_force_slow` is still set
+  // it is NOT a no-op -- it re-poisons the whole range to the empty page (see
+  // `mi_theap_queue_first_update`'s "already set" short-circuit comment in page-queue.c
+  // for why that short-circuit is disabled while poisoned: a cross-thread poison write can
+  // otherwise leave an interior slot of a multi-slot range stuck on a real, soon-to-be-
+  // freed page). Once the profiler has stopped, this is what actually restores the fast
+  // path for a theap that is not otherwise mutating its page queues -- `mi_prof_stop`
+  // (profile.c) deliberately does not touch `pages_free_direct` cross-thread.
   mi_theap_queue_first_update(theap, pq);
   #endif
   return page;
@@ -20306,9 +20328,9 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
         if (ppage!=NULL) { *ppage = page; }
         mi_assert_internal(mi_page_immediate_available(page));
         #if MI_PPROF
-        // #267: opportunistic re-sync (see `mi_find_page`'s matching comment above; a
-        // no-op unless the profiler has stopped and this theap's fast path for `pq` is
-        // still poisoned from a run that ended without this queue being touched again).
+        // #267: re-sync (see `mi_find_page`'s matching comment above) -- restores the
+        // fast path once stopped, or re-poisons a multi-slot range's interior slots while
+        // still running (see `mi_theap_queue_first_update`'s comment, page-queue.c).
         mi_theap_queue_first_update(theap, pq);
         #endif
         void* const p = _mi_page_malloc_zero(theap,page,size,zero);
@@ -21338,14 +21360,14 @@ bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept {
   // subproc/heap/theap locks that nothing else nests under prof_lock, and coupling them
   // here would just add a new lock-ordering constraint for no benefit (prof_enabled is
   // already visible process-wide by the time the walk starts). See
-  // `_mi_subproc_prof_set_force_slow`'s comment (subproc.c) for the poisoning strategy
+  // `_mi_subproc_prof_sync_force_slow`'s comment (subproc.c) for the poisoning strategy
   // and the accepted start-time coverage gap this creates: a theap whose queue update
   // races the walk and reads `prof_force_slow` as not-yet-set keeps its fast path live
   // for one more allocation. The strategy (poison-on-start) is ported from
   // oven-sh/mimalloc @ 942b8342; this specific window is a consequence of our own
   // implementation choice to walk outside prof_lock, not a claim about Bun's own
   // start-time behavior, which was not inspected in this detail.
-  if (started) { _mi_subproc_prof_set_force_slow(); }
+  if (started) { _mi_subproc_prof_sync_force_slow(); }
   return started;
 }
 bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { return mi_prof_start_seeded(sample_rate, (uint64_t)mi_option_get(mi_option_prof_seed)); }
@@ -21504,7 +21526,7 @@ void mi_prof_stop(void) mi_attr_noexcept {
   // a page that gets freed moments later -- a use-after-free on that theap's next fast-path
   // malloc. Each theap re-syncs its own `pages_free_direct` itself, same-thread, the next
   // time it takes the generic path (see `mi_find_page`/`_mi_malloc_generic` in page.c).
-  _mi_subproc_prof_set_force_slow();
+  _mi_subproc_prof_sync_force_slow();
 }
 bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
   if (write == NULL) return false;
@@ -21920,7 +21942,7 @@ static void prof_auto_start(void) {
   /* Some statically linked MinGW programs do not retain the CRT/TLS startup
      callback. Fall back to the first allocation so MIMALLOC_PROF still works. */
   // #267 follow-up (latent, not fixed here): mi_prof_start (via this function) now
-  // reaches _mi_subproc_prof_set_force_slow (subproc.c), which takes
+  // reaches _mi_subproc_prof_sync_force_slow (subproc.c), which takes
   // subproc->heaps_lock and each heap's theaps_lock. This function is reachable from
   // the alloc path (any mi_malloc can be the first-ever allocation with
   // MIMALLOC_PROF=1), so a caller's own mi_heap_visit_fun/visitor passed to
@@ -21963,7 +21985,7 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   // theap_meta) can be in flight while this same thread holds `subproc->theap_meta_lock`
   // or, during subproc/heap creation, `subproc->heaps_lock`. prof_auto_start()'s
   // first-ever call can reach mi_prof_start(), whose cross-theap poison walker
-  // (_mi_subproc_prof_set_force_slow, subproc.c) takes `subproc->heaps_lock` and each
+  // (_mi_subproc_prof_sync_force_slow, subproc.c) takes `subproc->heaps_lock` and each
   // heap's `theaps_lock` -- a non-reentrant self-deadlock if a meta allocation could still
   // reach prof_auto_start() here. Meta pages are never sampled anyway, so skipping
   // auto-start for them too costs nothing: it still fires on the first genuine user
@@ -23926,7 +23948,7 @@ bool mi_subproc_visit_heaps(mi_subproc_id_t subproc_id, mi_heap_visit_fun* visit
 // safe to leave stale for a while rather than a use-after-free waiting to happen. Clearing
 // the flag (fresh read says disabled) never touches `pages_free_direct` itself -- see
 // `mi_prof_stop`'s comment (profile.c) for why.
-void _mi_subproc_prof_set_force_slow(void) {
+void _mi_subproc_prof_sync_force_slow(void) {
   mi_lock(&mi_subprocs_lock) {
     for (mi_subproc_t* subproc = mi_subprocs; subproc != NULL; subproc = subproc->next) {
       mi_lock(&subproc->heaps_lock) {
@@ -24260,7 +24282,7 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
     heap->theaps = theap;
     #if MI_PPROF
     // #267: read the profiler's current run state and push under the SAME lock that
-    // `_mi_subproc_prof_set_force_slow` (subproc.c) holds while poisoning every theap in
+    // `_mi_subproc_prof_sync_force_slow` (subproc.c) holds while poisoning every theap in
     // this heap's list -- this serializes "am I in the list yet" against "is profiling
     // enabled yet" so a theap created concurrently with `mi_prof_start`/`mi_prof_stop` is
     // never missed: either this push is ordered before that walk (which then sees and

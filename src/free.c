@@ -159,6 +159,7 @@ static inline bool mi_block_check_unguard(mi_page_t* page, mi_block_t* block, vo
 
 // free a local pointer  (page parameter comes first for better codegen)
 static void mi_decl_noinline mi_free_generic_local(mi_page_t* page, void* p) mi_attr_noexcept {
+  _mi_park_leave_if_parked(mi_page_theap(page));   // #272: an owner-side free while parked (e.g. from a TLS destructor)
   mi_assert_internal(p!=NULL && page != NULL);
   mi_block_t* const block = (mi_page_has_interior_pointers(page) ? _mi_page_ptr_unalign(page, p) : mi_validate_block_from_ptr(page,p));
   const bool was_guarded = mi_block_check_unguard(page, block, p);

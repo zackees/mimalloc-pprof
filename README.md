@@ -292,6 +292,10 @@ if (mi_on_thread_idle_start()) {   /* ... or hand it to the scavenger instead */
 then `mi_on_thread_idle_end` is not required. Between the two calls the thread must
 not allocate or free — that is the whole precondition the sweep relies on.
 
+The scavenger is stopped and joined at process exit. On Windows that happens from an
+`atexit` handler, so it holds even in an `MI_NO_PROCESS_DETACH` build; on POSIX such a
+build leaves it running through `exit()` unless you call `mi_scavenger_stop()` yourself.
+
 That idle sweep also punches **holes**: upstream mimalloc gives a page back only once
 *every* block in it is free, so a single long-lived object keeps a whole 64 KiB/512 KiB
 page resident. Hole purging discards the memory of the free blocks inside such a page,

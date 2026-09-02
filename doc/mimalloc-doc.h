@@ -948,6 +948,33 @@ int  mi_version(void);
 /// resource usage by calling this every once in a while.
 void mi_collect(bool force);
 
+/// Do the idle work of the calling thread now, on the calling thread: collect its pending
+/// frees and bring its arena purges forward so freed memory goes back to the OS instead of
+/// waiting for the next allocation. Safe on any thread; a no-op on a thread that never
+/// allocated. Issue #272 (Bun parity P7a).
+void mi_on_thread_idle(void);
+
+/// Declare that this thread will not allocate or free until mi_on_thread_idle_end(), so the
+/// background scavenger can do the idle work above while this thread blocks in the kernel.
+/// Returns `false` when there was nothing to hand off, and then mi_on_thread_idle_end() is
+/// not required. Between a `true` return and the matching `_end` the thread must not
+/// allocate or free -- that is the precondition the sweep relies on.
+bool mi_on_thread_idle_start(void);
+
+/// Take this thread's heaps back from the background scavenger; pairs with a
+/// mi_on_thread_idle_start() that returned `true`.
+void mi_on_thread_idle_end(void);
+
+/// Stop the background scavenger thread (see \a mi_option_scavenger). Permanent: it is not
+/// restarted afterwards, and purging falls back to running inline on allocating threads, as
+/// upstream does. Called automatically at process exit.
+///
+/// On Windows the scavenger is stopped from an `atexit` handler, so it is joined even in a
+/// build with `MI_NO_PROCESS_DETACH` (where the rest of `mi_process_done` is skipped). On
+/// POSIX there is no such hook: with `MI_NO_PROCESS_DETACH` the scavenger keeps running
+/// through `exit()` unless the embedder calls this itself.
+void mi_scavenger_stop(void);
+
 /// __v3__: Communicate that a thread is in a threadpool. 
 /// This is done automatically for threads in the Windows threadpool,
 /// but if using a custom threadpool it is good to call this on worker threads.

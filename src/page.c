@@ -1039,6 +1039,13 @@ static _Atomic(void*) deferred_free; // is `mi_deferred_free_fun*` (but some pla
 static _Atomic(void*) deferred_arg;   
 
 void _mi_deferred_free(mi_theap_t* theap, bool force) {
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): OWNER ONLY.
+  // `mi_theap_collect_ex` reaches here, and since this phase that has a non-owner caller: the
+  // background scavenger sweeping a parked thread's theaps. The embedder's deferred-free handler
+  // is documented to run on the thread that is allocating -- a JS runtime's is not thread-safe --
+  // and `theap->heartbeat` / `tld->recurse` are plain (non-atomic) owner-private fields that a
+  // sweep must not write. The owner runs its own deferred free on its next allocation.
+  if (theap->tld == NULL || theap->tld->thread_id != _mi_thread_id()) return;
   theap->heartbeat++;
   mi_deferred_free_fun* const fun = (mi_deferred_free_fun*)mi_atomic_load_ptr_acquire(void,&deferred_free);
   if (fun != NULL && !theap->tld->recurse) {
@@ -1149,6 +1156,7 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   #if !MI_THEAP_INITASNULL
   mi_assert_internal(theap != NULL);
   #endif
+  _mi_park_leave_if_parked(theap);   // #272: an owner-side alloc while parked (e.g. from a TLS destructor)
   const bool zero = ((zero_huge_alignment & 1) != 0);
   const size_t huge_alignment = (zero_huge_alignment & ~1);
   mi_page_t* page = NULL;

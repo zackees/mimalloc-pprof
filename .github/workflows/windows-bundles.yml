@@ -24,13 +24,15 @@ name: windows-bundles
 # upstream and cannot fire in a cross build:
 #   * the toolchain file sets `MI_MINGW_UCRT64` ON, which turns on the `.CRT$XLB` TLS
 #     callback path in src/prim/windows/prim.c, and
-#   * `mimalloc-test-stress-dynamic.exe` imports `mimalloc.dll` *after* the UCRT api-sets,
-#     so `bin/minject.exe` has to reorder its import table -- on the Windows runner, since
-#     minject is itself a PE binary and cannot run on the Linux builder.
-# `run-windows-gnu` measures the override three ways (UCRT as linked, UCRT after minject,
-# and the msvcrt binary MSYS2 builds) and gates on the comparison, not on an absolute:
-# requiring the bundle to redirect where the job it replaces never did would be a new gate
-# smuggled in under the word "parity".
+#   * mingw linked `mimalloc.dll` LAST in `mimalloc-test-stress-dynamic.exe`'s import
+#     table, so the redirection module was initialised after the CRT it patches and the
+#     override silently did nothing. That is a link-order property, not a CRT property --
+#     see the comment on the target in CMakeLists.txt -- and it is fixed there.
+# `run-windows-gnu` asserts both halves on the BUNDLE'S OWN binaries: `mimalloc*.dll` is
+# import #0 (`ci/pe_imports.py`), and the exe prints "malloc is redirected." under
+# MIMALLOC_VERBOSE=1. Both are hard failures. Cross-compilation is the product
+# requirement, so a natively built control passing is not evidence about the artifact this
+# workflow ships; the native row is recorded alongside, not substituted for it.
 #
 # While this is being compared against the jobs it replaces, those jobs are
 # `continue-on-error: true`. They are the control arm, not decoration -- see the dated
@@ -95,6 +97,7 @@ jobs:
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
       - uses: zackees/setup-soldr@v0
         with:
           # zccache wraps `soldr cargo`; this job drives CMake directly, so there is
@@ -201,7 +204,7 @@ jobs:
         # produces: the DLL is a property of the *bundle*, not of the artifact.
         run: |
           set -euo pipefail
-          python3 ci/bundle_tests.py build bundle \
+          uv run ci/bundle_tests.py build bundle \
             --objdump "$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump" \
             --dll-search-dir "$MINGW_W64_CROSS_ROOT/x86_64-w64-mingw32/lib"
       - name: The manifest must carry no absolute path, and the runtime DLL must be there
@@ -213,7 +216,7 @@ jobs:
             echo "::error::the bundle manifest contains an absolute path"
             exit 1
           fi
-          python3 -c "import json; d=json.load(open('bundle/tests.json')); print(len(d['tests']), 'tests')"
+          uv run python -c "import json; d=json.load(open('bundle/tests.json')); print(len(d['tests']), 'tests')"
           ls bundle | grep -q '^libgcc_s_seh-1\.dll$'
           ls bundle | grep -q '^mimalloc-redirect\.dll$'
       - name: Pack the bundle
@@ -303,6 +306,9 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      # `windows-latest` ships a Python, but every ci/ script in this repo is run through
+      # uv everywhere else and the two must not drift.
+      - uses: astral-sh/setup-uv@v3
       - uses: actions/download-artifact@v4
         with:
           pattern: bundle-windows-gnu-*
@@ -321,67 +327,55 @@ jobs:
           done
           # A cross-built binary that will not even load is the failure this whole phase
           # risks, so say what these files are before running anything.
-          python3 --version
+          uv --version
           ls -l bundle/windows-gnu-x64-release | head -40
 
-      - name: Inject mimalloc into the import table with minject
-        # CMakeLists.txt runs this as a POST_BUILD command when MI_MINGW_UCRT64 is on, but
-        # minject is a PE binary and the bundles are built on Linux -- so the guard there
-        # is `AND CMAKE_HOST_WIN32` and this step is the cross-build's other half.
-        #
-        # Deliberately NOT `--inplace`: minject then writes a sibling `*-mi.exe` and the
-        # bundle's own executable is left exactly as linked. That keeps the bundle run
-        # below a like-for-like replacement for `ctest-win-gnu`, which does not minject
-        # anything either (MSYS2 MINGW64 is msvcrt, so MI_MINGW_UCRT64 is off there). The
-        # `-mi.exe` is not in tests.json, so it is an extra artifact for the override
-        # probe rather than a change to what the suite runs.
-        #
-        # The postfix is derived from the bundle's own library name rather than hardcoded
-        # per bundle: the Debug config renames it `mimalloc-debug.dll`, and a `--postfix`
-        # that does not match injects an import of a file that is not there.
+      - name: The bundle's own binaries must import mimalloc.dll first
+        # The measurable half of the override. `ld`'s PE script emits import descriptors
+        # under `SORT(*)(.idata$2)`, sorted by the input file path as spelled on the link
+        # line, so a build-relative `libmimalloc.dll.a` lands behind every absolute CRT
+        # archive and `mimalloc.dll` ends up LAST -- after which the redirection module it
+        # pulls in is initialised after the CRT it patches. CMakeLists.txt spells the same
+        # file `./…` on this target to fix that; assert the result rather than the flag.
         run: |
           set -euo pipefail
-          for bundle in bundle/windows-gnu-x64-*; do
+          for bundle in bundle/windows-gnu-x64-release bundle/windows-gnu-x64-debug-full bundle/windows-gnu-x64-shared; do
             exe="$bundle/mimalloc-test-stress-dynamic.exe"
-            if [ ! -f "$exe" ]; then
-              echo "$bundle has no test-stress-dynamic (nothing to inject)"
-              continue
+            dll=$(basename "$(ls "$bundle"/mimalloc*.dll | grep -v 'redirect' | head -1)")
+            echo "::group::$bundle"
+            # `dumpbin` is MSVC-only and MSYS2 is not installed yet at this point in the
+            # job, so read the import table with the objdump soldr shipped -- the bundle
+            # carries no tool, so this comes from the checkout's Python instead.
+            uv run ci/pe_imports.py "$exe" | tee "$bundle/imports.txt"
+            first=$(head -1 "$bundle/imports.txt")
+            if [ "$first" != "$dll" ]; then
+              echo "::error::$exe imports '$first' first, expected '$dll'"
+              exit 1
             fi
-            dll=$(ls "$bundle"/mimalloc*.dll | grep -v 'redirect' | head -1)
-            base=$(basename "$dll" .dll)
-            postfix=${base#mimalloc}
-            postfix=${postfix#-}
-            echo "::group::minject $bundle (--postfix=$postfix, dll=$(basename "$dll"))"
-            ./bin/minject.exe --verbose --postfix="$postfix" --force "$exe"
             echo "::endgroup::"
           done
 
-      - name: Windows override probe -- with and without minject (UCRT)
-        # The measurement #277 phase C asks for, made rather than argued. The test itself
-        # asserts nothing about redirection: it links `mi_version()` so the DLL loads and
-        # then allocates through the CRT. `MIMALLOC_VERBOSE=1` makes src/init.c:530 print
-        # "malloc is redirected." exactly when `_mi_is_redirected()` is true, which is the
-        # only direct evidence that the redirection module patched the runtime.
+      - name: Windows override probe -- the bundle must redirect malloc
+        # `test-stress-dynamic` asserts nothing about redirection: it links `mi_version()`
+        # so the DLL loads and then allocates through the CRT. `MIMALLOC_VERBOSE=1` makes
+        # src/init.c:530 print "malloc is redirected." exactly when `_mi_is_redirected()`
+        # is true, which is the only direct evidence that the redirection module patched
+        # the runtime -- so without this step the bundle could pass while overriding
+        # nothing.
         #
-        # Nothing here is fatal: the verdict step at the end of the job compares these
-        # against the msvcrt control built by MSYS2, because a UCRT result is only a
-        # regression if the msvcrt lane being replaced did better.
+        # HARD failure, on the bundle's OWN binary. Cross-compilation is the product
+        # requirement here; a natively-built control passing is not evidence about the
+        # artifact this workflow ships.
         run: |
-          set -uo pipefail
-          bundle=bundle/windows-gnu-x64-release
+          set -euo pipefail
           probe() {
-            local label="$1" exe="$2" out="$3" rc=0
-            if [ ! -f "$exe" ]; then
-              echo "MISSING" > "$out"
-              echo "$label: $exe does not exist"
-              return 0
-            fi
-            # 4 threads / scale 10 / 1 iteration: a redirection probe, not the stress
-            # test (the bundle runs that in full below).
+            local label="$1" bundle="$2" out="$3" rc=0
+            local exe="$bundle/mimalloc-test-stress-dynamic.exe"
+            # 4 threads / scale 10 / 1 iteration: a redirection probe, not the stress test
+            # (the bundle runs that in full below).
             MIMALLOC_VERBOSE=1 PATH="$PWD/$bundle:$PATH" "$exe" 4 10 1 > "$out.raw" 2>&1 || rc=$?
             if [ "$rc" -ne 0 ]; then
-              # 127 from this shell means the image failed to start at all -- typically
-              # STATUS_DLL_NOT_FOUND or an image Windows rejects.
+              # 127 from this shell means the image did not start at all.
               echo "FAILED(rc=$rc)" > "$out"
             elif grep -q 'malloc is redirected' "$out.raw"; then
               echo "REDIRECTED" > "$out"
@@ -389,24 +383,28 @@ jobs:
               echo "NOT-REDIRECTED" > "$out"
             fi
             echo "$label: $(cat "$out")"
-            head -5 "$out.raw" || true
+            if [ "$(cat "$out")" != "REDIRECTED" ]; then
+              echo "::error::$exe did not redirect malloc ($(cat "$out"))"
+              head -30 "$out.raw" || true
+              return 1
+            fi
           }
-          probe "UCRT, as linked   " "$bundle/mimalloc-test-stress-dynamic.exe" ucrt-plain.txt
-          probe "UCRT, minjected   " "$bundle/mimalloc-test-stress-dynamic-mi.exe" ucrt-minject.txt
+          probe "UCRT release bundle" bundle/windows-gnu-x64-release ucrt-release.txt
+          probe "UCRT shared bundle " bundle/windows-gnu-x64-shared ucrt-shared.txt
 
       - name: ctest-win-gnu equivalent -- windows-gnu-x64-release
         run: |
-          python3 ci/run_test_bundle.py bundle/windows-gnu-x64-release \
+          uv run ci/run_test_bundle.py bundle/windows-gnu-x64-release \
             --junit "$GITHUB_WORKSPACE/bundle-release.xml"
       - name: ctest-debug-full-win-gnu equivalent -- windows-gnu-x64-debug-full
         # Carries the six run-negative.cmake controls. Run serially after the release
         # bundle, never alongside it.
         run: |
-          python3 ci/run_test_bundle.py bundle/windows-gnu-x64-debug-full \
+          uv run ci/run_test_bundle.py bundle/windows-gnu-x64-debug-full \
             --junit "$GITHUB_WORKSPACE/bundle-debug-full.xml"
       - name: ctest-shared-win-gnu equivalent -- windows-gnu-x64-shared
         run: |
-          python3 ci/run_test_bundle.py bundle/windows-gnu-x64-shared \
+          uv run ci/run_test_bundle.py bundle/windows-gnu-x64-shared \
             --junit "$GITHUB_WORKSPACE/bundle-shared.xml"
 
       - name: Run the cross-built Rust test binaries
@@ -485,16 +483,16 @@ jobs:
           # yellow bootstrap path on check's own status would report an unreadable result
           # as a bootstrap and exit green.
           rc=0
-          python3 ci/memory_gate.py where --arch x64 --compiler soldr-mingw-gcc-15 result-1.json || rc=$?
+          uv run ci/memory_gate.py where --arch x64 --compiler soldr-mingw-gcc-15 result-1.json || rc=$?
           case "$rc" in
             0)
-              python3 ci/memory_gate.py check --arch x64 --compiler soldr-mingw-gcc-15 result-*.json
+              uv run ci/memory_gate.py check --arch x64 --compiler soldr-mingw-gcc-15 result-*.json
               ;;
             3)
               echo "::warning::No committed baseline for the soldr win-gnu lane yet -- bootstrap it from this run's memory-gate artifact."
               # `check` exits 2 here by construction: the probe just proved the baseline
               # is absent, so its status carries no information -- but its report does.
-              python3 ci/memory_gate.py check --arch x64 --compiler soldr-mingw-gcc-15 result-*.json || true
+              uv run ci/memory_gate.py check --arch x64 --compiler soldr-mingw-gcc-15 result-*.json || true
               ;;
             *)
               echo "::error::memory_gate could not read this run's JSON (rc=$rc)"
@@ -522,10 +520,10 @@ jobs:
           # a bootstrap, so before this lane's baseline is committed the control would go
           # red for the wrong reason.
           rc=0
-          python3 ci/memory_gate.py where --arch x64 --compiler soldr-mingw-gcc-15 leak-1.json || rc=$?
+          uv run ci/memory_gate.py where --arch x64 --compiler soldr-mingw-gcc-15 leak-1.json || rc=$?
           case "$rc" in
             0)
-              python3 ci/memory_gate.py control --arch x64 --compiler soldr-mingw-gcc-15 leak-*.json
+              uv run ci/memory_gate.py control --arch x64 --compiler soldr-mingw-gcc-15 leak-*.json
               ;;
             3)
               echo "::warning::the soldr win-gnu lane has no committed baseline yet, so its positive control cannot run. Commit the baseline, then this becomes a hard gate."
@@ -575,10 +573,12 @@ jobs:
           ctest --test-dir native-release --show-only=json-v1 > native-release.json
           ctest --test-dir native-debug-full --show-only=json-v1 > native-debug-full.json
           ctest --test-dir native-shared --show-only=json-v1 > native-shared.json
-          # The msvcrt control for the override probe. This is the binary `ctest-win-gnu`
-          # actually runs today, built by the compiler it actually uses, so it -- not an
-          # argument about what "should" happen -- is what says whether the UCRT lane
-          # regressed anything.
+          # Recorded, not gated: the native lane's own import order, so the claim that
+          # this is a link-order property and not a CRT property is measured on both
+          # sides rather than asserted on one. The gate is on the bundle, above.
+          objdump -p native-release/mimalloc-test-stress-dynamic.exe | grep -i 'DLL Name' \
+            | sed 's/^[[:space:]]*//' > native-imports.txt
+          cat native-imports.txt
           set +e
           MIMALLOC_VERBOSE=1 ./native-release/mimalloc-test-stress-dynamic.exe 4 10 1 > msvcrt.raw 2>&1
           rc=$?
@@ -594,7 +594,7 @@ jobs:
       - name: Coverage -- the bundles must run every test the native runner would
         if: ${{ !cancelled() }}
         run: |
-          python3 ci/bundle_coverage.py \
+          uv run ci/bundle_coverage.py \
             --compare "ctest-win-gnu" native-release.json bundle/windows-gnu-x64-release/tests.json \
             --compare "ctest-debug-full-win-gnu" native-debug-full.json bundle/windows-gnu-x64-debug-full/tests.json \
             --compare "ctest-shared-win-gnu" native-shared.json bundle/windows-gnu-x64-shared/tests.json \
@@ -610,33 +610,32 @@ jobs:
           set -euo pipefail
           read_result() { cat "$1" 2>/dev/null || echo "UNKNOWN"; }
           msvcrt=$(read_result msvcrt.txt)
-          plain=$(read_result ucrt-plain.txt)
-          minjected=$(read_result ucrt-minject.txt)
+          release=$(read_result ucrt-release.txt)
+          shared=$(read_result ucrt-shared.txt)
           {
             echo "### test-stress-dynamic: does mimalloc override the CRT?"
             echo
             echo "| lane | result |"
             echo "|---|---|"
             echo "| MSYS2 MINGW64 (**msvcrt**), built by this job | $msvcrt |"
-            echo "| soldr mingw-w64 (**UCRT**) bundle, as linked | $plain |"
-            echo "| soldr mingw-w64 (**UCRT**) bundle, after \`minject\` | $minjected |"
+            echo "| soldr mingw-w64 (**UCRT**) release bundle | $release |"
+            echo "| soldr mingw-w64 (**UCRT**) shared bundle | $shared |"
+            echo
+            echo "First import of each \`test-stress-dynamic\`:"
+            echo
+            echo '```'
+            echo "bundle (cross): $(head -1 bundle/windows-gnu-x64-release/imports.txt)"
+            echo "native (MSYS2): $(head -1 native-imports.txt)"
+            echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          # The gate is on the msvcrt binary, because that is the lane where the dynamic
-          # override demonstrably works and therefore the only one where a regression is
-          # attributable. Measured on run 33606909837: msvcrt REDIRECTED; UCRT as linked
-          # NOT-REDIRECTED; UCRT after minject FAILED(rc=127) for both an empty and a
-          # non-empty --postfix; and a UCRT build with MI_MINGW_UCRT64=OFF also
-          # NOT-REDIRECTED -- i.e. it is the CRT, not the define. This step is what keeps
-          # that property gated once c-unit.yml's `ctest-win-gnu` is deleted: every test
-          # name it runs is covered by the bundle, but nothing else asserts that mimalloc
-          # actually intercepts the CRT on win-gnu.
+          # The cross-built bundle is already gated hard, earlier in the job. This is the
+          # native row: it is recorded for the comparison window and gated too, because
+          # while it exists a regression there is still a regression -- but the bundle,
+          # not this, is what the product ships.
           if [ "$msvcrt" != "REDIRECTED" ]; then
             echo "::error::the msvcrt win-gnu lane no longer redirects malloc in test-stress-dynamic (got: $msvcrt)"
             cat msvcrt.raw || true
             exit 1
-          fi
-          if [ "$plain" != "REDIRECTED" ] && [ "$minjected" != "REDIRECTED" ]; then
-            echo "::warning::the UCRT bundle does not redirect malloc (as linked: $plain, minjected: $minjected). Known and measured; tracked on #277 phase C. The msvcrt control above is what gates the property."
           fi
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
@@ -649,11 +648,15 @@ jobs:
             native-release.json
             native-debug-full.json
             native-shared.json
-            ucrt-plain.txt
-            ucrt-plain.txt.raw
-            ucrt-minject.txt
-            ucrt-minject.txt.raw
+            ucrt-release.txt
+            ucrt-release.txt.raw
+            ucrt-shared.txt
+            ucrt-shared.txt.raw
             msvcrt.txt
             msvcrt.raw
+            native-imports.txt
+            bundle/windows-gnu-x64-release/imports.txt
+            bundle/windows-gnu-x64-debug-full/imports.txt
+            bundle/windows-gnu-x64-shared/imports.txt
           if-no-files-found: warn
           retention-days: 7

@@ -282,6 +282,57 @@ We are already visible in the thread: zackees posted the fork on #1070 on 2026-0
 The convergence itself is the signal worth remembering — Datadog, Bun, and this fork
 independently reached `page->metadata` plus a flag.
 
+## Candidate: mingw links `mimalloc.dll` last in the import table (#277 phase C)
+
+Not yet submitted; recorded here with the measurement so it does not have to be
+rediscovered.
+
+**Symptom.** On MinGW, `mimalloc-test-stress-dynamic.exe` imports `mimalloc.dll` *last*.
+The Windows loader initialises statically imported modules in import-table order, so
+`mimalloc-redirect.dll` — which `mimalloc.dll` pulls in, and which imports only
+`ntdll.dll` — runs after the CRT it is meant to patch, and `mi_is_redirected()` stays
+false. `MIMALLOC_VERBOSE=1` prints no `malloc is redirected.` line. Upstream knows the
+symptom: the `MI_MINGW_UCRT64` branch of `CMakeLists.txt` says "mingw always links
+mimalloc after system libraries" and post-processes the exe with `bin/minject.exe`.
+
+**Cause.** `ld`'s PE linker script emits the import descriptors under
+`SORT(*)(.idata$2)`, sorted by the **input file path as spelled on the link line** —
+archive path first, member name only as a tie-break within one archive. CMake names the
+import library relative to the build directory (`libmimalloc.dll.a`) while every CRT
+archive arrives as an absolute sysroot path, and `/` (0x2f) sorts before `l`. Linking the
+same object against **byte-identical** archives, changing only the spelling:
+
+```
+libmimalloc.dll.a     ->  KERNEL32.dll, api-ms-win-crt-*.dll, ..., mimalloc.dll
+./libmimalloc.dll.a   ->  mimalloc.dll, KERNEL32.dll, api-ms-win-crt-*.dll, ...
+```
+
+This is also the real explanation for the msvcrt/UCRT split: under msvcrt the CRT is
+`libmsvcrt.a` and `mimalloc.dll` happens to sort ahead of `msvcrt.dll`; under UCRT it is
+`api-ms-win-crt-*`, which sorts earlier. The CRT only changes what mimalloc is sorted
+against.
+
+**Fix we carry** (`CMakeLists.txt`, `if(MINGW)` on the `mimalloc-test-stress-dynamic`
+target): spell the same file `./…`, in the libraries position, via
+`$<TARGET_LINKER_FILE_NAME:mimalloc>`. Verified cross-built (soldr mingw-w64-gcc 15.3.0)
+for Release, Debug + `MI_DEBUG_FULL` and the shared-only config: `mimalloc.dll` /
+`mimalloc-debug.dll` is import #0 in all three, exactly one descriptor. It removes the
+dependency on `minject` and applies to the native MSYS2 lane too. Upstreamable as-is; it
+touches one guarded block and no C.
+
+**Separate bug, not root-caused: `minject` produces an unloadable image on a
+mingw-linked exe.** Facts from CI run 33609497360: `minject --verbose --postfix=<p>` reads
+the exe, reports `inject 'mimalloc-redirect.dll'`, prints a correct reordering
+(`mimalloc-redirect.dll` #0, `mimalloc*.dll` #1, then `KERNEL32.dll` and the
+`api-ms-win-crt-*` set), and writes the file. `minject --list` on the result shows the
+intended 13-entry table. The resulting executable then fails to start: exit **127** from
+the runner's bash, i.e. the loader refused the image (`ERROR_MOD_NOT_FOUND`-shaped), with
+`mimalloc-redirect.dll` present next to it and every other import satisfied. Reproduced
+for both an empty `--postfix=` and `--postfix=debug`, and with and without `--inplace`
+(the in-place form died the same way). Not investigated further — the link-order fix above
+removes the need for minject on this lane. Worth reporting upstream with these facts if
+anyone picks it up.
+
 ## Local reproduction
 
 ```sh

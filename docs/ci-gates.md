@@ -232,56 +232,67 @@ that can only ever be set by an MSYS2 shell:
    attribute instead of the `.CRT$XLB` TLS-callback table. `build-windows-gnu` greps the
    configure log for `MI_MINGW_UCRT64=1` in the resolved compiler defines — a flag that
    never reaches the compiler is this repository's most-repeated CI bug.
-2. `mimalloc-test-stress-dynamic.exe` imports `mimalloc.dll` **after** the UCRT api-sets,
-   which is exactly the case `bin/minject.exe` exists for. Upstream runs it as a CMake
-   `POST_BUILD` command; minject is a PE binary, so that command is now guarded with
-   `AND CMAKE_HOST_WIN32` and `run-windows-gnu` runs minject itself, deriving
-   `--postfix` from the bundle's own library name (the Debug config renames it
-   `mimalloc-debug.dll`).
+2. `mimalloc-test-stress-dynamic.exe` linked `mimalloc.dll` **last** in its import table,
+   so the redirection module was initialised after the CRT it patches and
+   `mi_is_redirected()` stayed false. Upstream's workaround for that is
+   `bin/minject.exe`, run as a CMake `POST_BUILD` when `MI_MINGW_UCRT64` is set; minject
+   is a PE binary, so that command is now guarded with `AND CMAKE_HOST_WIN32`.
 
-   minject runs **without `--inplace`**, so it writes a sibling `*-mi.exe` and the
-   bundle's own executable is left exactly as linked. `ctest-win-gnu` does not minject
-   anything either (MSYS2 MINGW64 is msvcrt, so `MI_MINGW_UCRT64` is off there), so the
-   bundle run stays like-for-like and the injected binary is an extra artifact for the
-   probe below rather than a change to what the suite runs.
+   The cross lane does not use it. See below.
 
-### Is the override actually exercised? (measured, and gated comparatively)
+### Import order is a link-order property, not a CRT property
 
-`test-stress-dynamic` asserts nothing about redirection — it links `mi_version()` so the
-DLL loads, then allocates through the CRT. `MIMALLOC_VERBOSE=1` makes `src/init.c:530`
-print `malloc is redirected.` exactly when `_mi_is_redirected()` is true, which is the only
-direct evidence that the redirection module patched the runtime. `run-windows-gnu` collects
-that for three binaries and puts them in the job summary:
+This was the phase's one surprise and it is worth writing down, because #277 and this
+document both said "it's the CRT" before it was measured.
 
-| lane | binary |
-|---|---|
-| MSYS2 MINGW64 (**msvcrt**) — what `ctest-win-gnu` runs today | built by the native compile-compat step |
-| soldr mingw-w64 (**UCRT**) bundle, as linked | `mimalloc-test-stress-dynamic.exe` |
-| soldr mingw-w64 (**UCRT**) bundle, after `minject` | `mimalloc-test-stress-dynamic-mi.exe` |
+`ld`'s PE linker script emits the import descriptors under `SORT(*)(.idata$2)`, sorted by
+the **input file path as spelled on the link line** — archive path first, member name only
+as a tie-break *within* one archive. CMake names the DLL's import library relative to the
+build directory (`libmimalloc.dll.a`) while every CRT archive arrives as an absolute
+sysroot path, and `/` (0x2f) sorts before `l`:
 
-**Measured on run 33606909837**, and this is the one real cost of the CRT decision:
+```
+libmimalloc.dll.a     -> KERNEL32.dll, api-ms-win-crt-*.dll, ..., mimalloc.dll   (last)
+./libmimalloc.dll.a   -> mimalloc.dll, KERNEL32.dll, api-ms-win-crt-*.dll        (first)
+```
 
-| lane | redirects? |
-|---|---|
-| MSYS2 MINGW64 (msvcrt), no minject | **yes** |
-| soldr mingw-w64 (UCRT), as linked | no |
-| soldr mingw-w64 (UCRT), after `minject` (`--postfix=` *and* `--postfix=debug`) | the injected image does not start (rc 127) |
-| soldr mingw-w64 (UCRT), `MI_MINGW_UCRT64=OFF` | no |
+Those two lines were produced by linking the *same object file* against **byte-identical**
+archives; only the spelling of the path differs. Renaming the archive's members changes
+nothing, because member names only break ties inside one archive.
 
-The last row is what makes this attributable: holding the toolchain fixed and turning the
-define off does not restore redirection, so **it is the CRT, not the init mechanism**. And
-`minject` — upstream's designated fix for exactly this case — produces an image Windows
-refuses to load when applied to a mingw-linked executable, for both an empty and a
-non-empty postfix. Escalated on #277 rather than worked around.
+That also explains the msvcrt/UCRT difference that looked like a CRT effect: under msvcrt
+the CRT arrives as `libmsvcrt.a` and `mimalloc.dll` happens to sort ahead of `msvcrt.dll`;
+under UCRT it arrives as `api-ms-win-crt-*`, which sorts earlier, and mimalloc loses. The
+CRT only changes what mimalloc is being sorted against.
 
-So the gate is on the **msvcrt** binary: `run-windows-gnu` fails if the MSYS2 build it
-compiles for the compile-compat check stops redirecting, and warns (with the numbers) that
-the UCRT bundle does not. That is deliberate. All 27/34/25 ctest names pass in both lanes,
-so nothing is *failing*; what the UCRT lane exercises less of is the redirection path
-inside `test-stress-dynamic`, and this probe is the only thing anywhere in CI that asserts
-that path at all — the test itself does not. Keeping the assertion on the lane where the
-property holds is what lets `ctest-win-gnu` be deleted after the comparison window without
-losing it.
+`CMakeLists.txt` therefore spells the same file `./…` for `mimalloc-test-stress-dynamic`
+on MinGW — in the *libraries* position, since an archive named before anything needs it
+contributes nothing — using `$<TARGET_LINKER_FILE_NAME:mimalloc>` so the Debug build's
+`mimalloc-debug.dll` is handled too. Verified cross-built for all three configs.
+
+### The override is gated on the bundle's own binaries
+
+`run-windows-gnu` asserts both halves, as hard failures, on the artifacts it ships:
+
+- **`mimalloc*.dll` is import #0** of `mimalloc-test-stress-dynamic.exe` in the release,
+  debug-full and shared bundles. Read with `ci/pe_imports.py`, a 150-line PE import-table
+  reader — `dumpbin` is MSVC-only and MSYS2 is not installed at that point in the job (and
+  depending on it would be wrong anyway: the bundle is meant to run with no toolchain).
+- **`malloc is redirected.`** appears under `MIMALLOC_VERBOSE=1` (`src/init.c:530`,
+  printed only when `_mi_is_redirected()`). `test-stress-dynamic` asserts nothing about
+  redirection itself, so without this the bundle could pass while overriding nothing.
+
+Cross-compilation is the product requirement, so a natively built control passing is not
+evidence about the artifact this workflow ships. The MSYS2 lane's own result and import
+order are recorded next to it — measured on both sides rather than asserted on one — and
+that row is gated too while it exists.
+
+`minject` is **not** used on the cross lane. It is a Windows PE utility, so it cannot run
+on the Linux builder at all; and when it was run on the Windows runner instead it produced
+an image that will not start (exit 127 — the loader refused it), for both an empty and a
+non-empty `--postfix`, with and without `--inplace`. That is a separate upstream bug,
+recorded with the facts in `docs/upstreaming.md` and deliberately not root-caused here,
+because the link-order fix removes the need for it.
 
 ### The runtime DLL
 

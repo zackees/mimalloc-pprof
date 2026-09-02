@@ -140,24 +140,13 @@ static_assert(mi_option_page_cross_thread_max_reclaim == 42, "mi_option_t slot 4
 //   src/jsc/modules/BunJSCModule.h -- `bun:jsc` heapStats(), #include "mimalloc.h"
 //
 // `mi_on_thread_idle` is declared `pub safe fn mi_on_thread_idle();` at
-// mimalloc_sys.rs:30 but does not exist in this tree yet (Bun parity P7a, #299 -- open
-// as of this writing). It is declared and referenced unconditionally below, same as
-// every other symbol -- this TU is EXPECTED to fail to link (undefined reference to
-// `mi_on_thread_idle`) until #299 merges. That is not a bug in this test: it is the
-// signal `ci/check_bun_surface.py` exists to surface clearly and gate with
-// `continue-on-error: true` until then. Do not silence it with an #ifdef; a guard that
-// only checks the symbol when it happens to be present would stop catching a
-// regression the day after #299 lands.
-extern "C" {
-// Not in include/mimalloc.h on this branch yet. Prototype matches what it declares on
-// `bun-parity/p7-scavenger` (issue #299) exactly, INCLUDING the noexcept specifier --
-// `mi_attr_noexcept` expands to `noexcept` in C++, and two extern "C" declarations of
-// the same symbol with different exception specifications are a hard C++17 compile
-// error. Get this wrong and the day #299 merges, this TU stops compiling instead of
-// linking clean, and continue-on-error hides that from CI. Verified by building this
-// exact file against the p7-scavenger branch: PASS, zero missing symbols.
-mi_decl_export void mi_on_thread_idle(void) mi_attr_noexcept;
-}
+// mimalloc_sys.rs:30. It merged to `main` with Bun parity P7a (issue #299, `1dbbb8df`)
+// and is now declared in `include/mimalloc.h` (`void mi_on_thread_idle(void)
+// mi_attr_noexcept;`), so it is referenced below the same way as every other symbol,
+// via the header include at the top of this file rather than a local redeclaration.
+// `ci/check_bun_surface.py` reports zero missing symbols on both glibc and musl as of
+// 2026-09-02; this check is now a hard gate (`.github/workflows/c-unit.yml`, job
+// `bun-surface`, no `continue-on-error`).
 
 // The address-of array. `reinterpret_cast<void*>` on a function pointer is
 // implementation-defined but universally supported on every platform this project
@@ -191,7 +180,7 @@ static void* const g_bun_linked_symbols[] = {
     reinterpret_cast<void*>(&mi_heap_collect),
     reinterpret_cast<void*>(&mi_is_in_heap_region),
     reinterpret_cast<void*>(&mi_collect),
-    reinterpret_cast<void*>(&mi_on_thread_idle),  // EXPECTED unresolved until #299 merges
+    reinterpret_cast<void*>(&mi_on_thread_idle),  // landed with #299 (1dbbb8df)
     reinterpret_cast<void*>(&mi_stats_print_out),
     reinterpret_cast<void*>(&mi_process_info),
     reinterpret_cast<void*>(&mi_option_set),

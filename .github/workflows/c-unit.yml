@@ -164,13 +164,9 @@ jobs:
   # result. See `ci/check_bun_surface.py` and `test/test-bun-surface.cpp` for what's
   # checked.
   #
-  # `continue-on-error: true` is deliberate and TEMPORARY, not a way to avoid ever
-  # having to fix this: `mi_on_thread_idle` (Bun parity P7a, issue #299) has not merged
-  # to `main` as of 2026-09-02, so this job is currently RED by design -- the whole
-  # point of `ci/check_bun_surface.py` is to name that gap clearly rather than let a
-  # generic link failure obscure it. TODO(2026-09-02): once #299 merges, re-run this
-  # job, confirm it reports zero missing symbols, and remove `continue-on-error` on
-  # both rows below -- from that point on a regression here must block merge.
+  # Hard gate as of 2026-09-02: `mi_on_thread_idle` (Bun parity P7a, issue #299) merged
+  # in `1dbbb8df`, and both glibc and musl (alpine:3.20) now report zero missing
+  # symbols -- a regression here blocks merge.
   bun-surface:
     strategy:
       fail-fast: false
@@ -187,7 +183,6 @@ jobs:
     name: bun-surface (${{ matrix.name }})
     runs-on: ${{ matrix.runs-on }}
     container: ${{ matrix.container }}
-    continue-on-error: true
     steps:
       - name: Install build dependencies (alpine only)
         if: matrix.name == 'musl'

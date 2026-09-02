@@ -13,13 +13,11 @@ against the result. This script reproduces exactly that build outside CMake:
   3. link the two, run the result, and report cleanly which `mi_*` symbol(s) Bun would
      fail to link against today.
 
-As of this writing `mi_on_thread_idle` (Bun parity P7a, issue #299) has not merged, so
-step 3 is EXPECTED to fail -- that is why the CI job calling this script is
-`continue-on-error: true` (see `.github/workflows/c-unit.yml`, job `bun-surface`; dated
-TODO there to flip it to a hard gate once #299 merges). This script's own exit code
-still reflects reality: it exits 1 whenever any symbol is missing, ABI static_asserts
-fail, or the resulting binary doesn't run clean. `continue-on-error` is what keeps that
-from blocking merges before P7a lands, not a change to what this script reports.
+`mi_on_thread_idle` (Bun parity P7a, issue #299) merged to `main` in `1dbbb8df`, so as of
+2026-09-02 step 3 reports zero missing symbols on both glibc and musl (alpine:3.20). The
+CI job calling this script (`.github/workflows/c-unit.yml`, job `bun-surface`) is a hard
+gate: this script exits 1 whenever any symbol is missing, an ABI static_assert fails, or
+the resulting binary doesn't run clean, and that now blocks merge.
 
 Usage:
     uv run ci/check_bun_surface.py             # glibc build (Bun's default Linux config)

@@ -2,9 +2,16 @@
 
 Re-runs the four checks that produced `docs/bun-gap-analysis-2026-09-01.md` against
 Bun's **current** pin, and re-derives the consumer-surface status against everything
-that has merged since (#276, #281, #284, #286, #289, #291, #297; #299 and #302 open).
+that has merged since (#276, #281, #284, #286, #289, #291, #297, #299; #302 open).
 Every claim below marked **[V]** was re-verified in this session against the raw
 sources named; **[I]** is inference from verified facts.
+
+**Update (same date, later pass, issue #274 P9a/9b finalization):** PR #299 (7a) has
+since merged as `1dbbb8df`. `ci/check_bun_surface.py` now reports zero missing symbols
+on both glibc and musl (alpine:3.20), and the `bun-surface` CI job is a hard gate. Hole
+purging (7b) remains PENDING in PR #302. The status tables below (§2) are updated in
+place to reflect this; text elsewhere in this document that still describes #299 as
+open predates that merge and is superseded by these notes.
 
 ---
 
@@ -67,12 +74,12 @@ inspection (e.g. what a "snapshot-safe stats printing" fix actually touches).
 | 4 | `mi_heap_dump_json` + `mi_heap_get_seq`, + B12 stats.c fixes | OPEN | **DONE — #286** | `include/mimalloc-stats.h:168` declares `mi_heap_dump_json`; PR body confirms both `_mi_stats_print` snapshot fix and `mi_stats_copy` counter-at-a-time fix landed in the same PR |
 | 5 | `pthread_atfork` handlers | OPEN | **DONE — #289** | PR #289: "pthread_atfork fork-safety handlers with lock-order contract" |
 | 6 | Heap teardown/delete race protocol + Bun's heap test corpus | OPEN (L) | **DONE — #291** | `test-commit-fail.c`, `test-heap-teardown.c`, `test-heap-mt.c`, `test-heap-churn.c`, `test-heap-aba.c`, `test-heap-delete-race.c` all present in `test/` [V]; PR #291 reports 20/20 clean in Debug+FULL |
-| 7 | Scavenger thread + hole purging + `mi_on_thread_idle` | OPEN (L) | **OPEN — PR #299 (7a, scavenger) + PR #302 (7b, holes), both open** | `grep mi_on_thread_idle include/ src/` returns nothing on `main` [V]; `src/scavenger.c` and `src/page-holes.c` do not exist on `main` yet — they exist only on the `bun-parity/p7-scavenger` / stacked `bun-parity/p7b-holes` branches |
+| 7 | Scavenger thread + hole purging + `mi_on_thread_idle` | OPEN (L) | **PARTIAL — scavenger + `mi_on_thread_idle` DONE (PR #299, `1dbbb8df`), hole purging PENDING (PR #302, open)** | `mi_on_thread_idle`/`mi_on_thread_idle_start`/`mi_on_thread_idle_end` now declared in `include/mimalloc.h` and implemented in `src/scavenger.c` on `main` [V]; hole purging (`src/page-holes.c` or equivalent) still does not exist on `main` — it is on PR #302, not yet merged |
 | 8 | musl/Alpine CI job | OPEN (S-M) | **DONE — #297** | `.github/workflows/c-unit.yml` job `ctest-musl`, container `alpine:3.20` [V] |
-| 9 | `purge_delay` default 1000 → 100 | OPEN (S) | **OPEN — tied to #299** | `src/options.c:140`: `{ 1000, ... purge_delay ... }` — still 1000 on `main` [V]; PR #299's description says it flips to 100 when that PR lands |
+| 9 | `purge_delay` default 1000 → 100 | OPEN (S) | **DONE — #299** | `src/options.c:143`: `{ 100, ... purge_delay ... }` on `main` [V] — flipped as part of #299 |
 
-**7/9 done.** The remaining two (#7, #9) are the same blocker: both live in the P7a/P7b
-stack, not yet merged.
+**8/9 done.** The remaining item (hole purging, part of #7) lives in PR #302, not yet
+merged.
 
 ### Optional-but-strengthens-the-pitch items (2026-09-01 §5, items 10-15)
 
@@ -90,9 +97,9 @@ stack, not yet merged.
 | ID | 09-01 | 09-02 | PR / evidence |
 |---|---|---|---|
 | B1 (205-commit stale base) | BLOCKER | **DONE** | #276 |
-| B2 (`mi_on_thread_idle` missing) | BLOCKER | **OPEN** | #299 |
-| B3 (no scavenger thread) | BLOCKER | **OPEN** | #299 |
-| B4 (no hole purging) | BLOCKER | **OPEN** | #302 |
+| B2 (`mi_on_thread_idle` missing) | BLOCKER | **DONE** | #299 (`1dbbb8df`) |
+| B3 (no scavenger thread) | BLOCKER | **DONE** | #299 (`1dbbb8df`) |
+| B4 (no hole purging) | BLOCKER | **PENDING** | #302 (open) |
 | B5 (heap teardown race protocol) | BLOCKER | **DONE** | #291 |
 | B6 (no `pthread_atfork`) | BLOCKER | **DONE** | #289 |
 | B7 (`MI_NO_PROCESS_DETACH` absent) | BLOCKER | **DONE** | #284 |
@@ -103,36 +110,39 @@ stack, not yet merged.
 | B12 (`stats.c` correctness fixes) | IMPORTANT | **DONE** | folded into #286 |
 | B13 (musl/Alpine CI) | IMPORTANT | **DONE** | #297 |
 | B14 (Windows PRNG/RAM/NUMA fixes) | IMPORTANT | **DONE** | #297 |
-| B15 (`purge_delay` 1000→100) | IMPORTANT | **OPEN** | tied to #299 |
+| B15 (`purge_delay` 1000→100) | IMPORTANT | **DONE** | #299 |
 | B16 (heap snapshot + mi-heapview) | NICE-TO-HAVE | **OPEN, not planned** | Bun doesn't call it |
-| B17 (Bun's ~7,300-line test corpus) | IMPORTANT | **PARTIAL** | 6 of the named heap/commit-fail tests imported (#291); `test-park-handoff.c`, `test-theap-sentinel.c`, `test-purge-holes.c`, `test-prof-adversarial.c`, `test-emulated-tls.c`, `test-thp-optout.c` still absent — most are tied to #299/#302 |
+| B17 (Bun's ~7,300-line test corpus) | IMPORTANT | **PARTIAL** | 6 of the named heap/commit-fail tests imported (#291); `test-park-handoff.c` now present (landed with #299) [V]; `test-theap-sentinel.c`, `test-purge-holes.c`, `test-prof-adversarial.c`, `test-emulated-tls.c`, `test-thp-optout.c` still absent — most are tied to #302 |
 | B18 (glibc 2.44 startup segfault fix) | NOT A GAP TODAY → becomes one at B1 | **DONE** | carried in #276 alongside the pin bump, as flagged |
 | B19 (2-level pagemap, `subproc.c`) | folded into B1 | **DONE** | #276 |
 | B20 (`mi_page_map_get_idx` over-count) | NICE-TO-HAVE | **OPEN, not planned** | low value, unchanged |
 
-**Summary counts (B1-B20, 20 items):** **11 DONE**, **8 OPEN**, **1 PARTIAL**, **0 NEW**.
+**Summary counts (B1-B20, 20 items):** **14 DONE**, **1 PENDING**, **4 OPEN**, **1 PARTIAL**, **0 NEW**.
 
 ---
 
 ## 3. What's still blocking 9c (filing the Bun issue)
 
-Per issue #274's own acceptance criteria, 9c requires 9a green on every platform (not
-yet — `mi_on_thread_idle` doesn't exist on `main`) and 9b showing zero new gaps (true,
-per §1 above, but that is a *necessary*, not *sufficient*, condition — the remaining
-OPEN items above are pre-existing gaps, not new ones, but they are still gaps). The
-draft issue text in `docs/bun-gap-analysis-2026-09-01.md` §7 asserts "we've ported the
-behavior you depend on that we lacked: `mi_on_thread_idle`, ... the scavenger, hole
-purging" — **that sentence is not yet true** and must not be posted until #299 and #302
-merge. This session does not touch 9c (explicitly out of scope) and files no new
+Per issue #274's own acceptance criteria, 9c requires 9a green on every platform and 9b
+showing zero new gaps. As of this update, #299 (scavenger + `mi_on_thread_idle`, 7a)
+merged (`1dbbb8df`), and `ci/check_bun_surface.py` reports zero missing symbols on both
+glibc and musl (alpine:3.20) — the `bun-surface` CI job is now a hard gate (no
+`continue-on-error`). 9b still shows zero new gaps (§1 above), but that remains
+*necessary*, not *sufficient* — hole purging (#302) is still open, so the draft issue
+text in `docs/bun-gap-analysis-2026-09-01.md` §7 asserting "we've ported ... the
+scavenger, hole purging" **is still not fully true** and must not be posted until #302
+also merges. This session does not touch 9c (explicitly out of scope) and files no new
 sub-issues (no new gaps found).
 
 **Remaining before 9c can proceed**, in order:
-1. #299 (scavenger + `mi_on_thread_idle`, 7a) merges.
+1. ~~#299 (scavenger + `mi_on_thread_idle`, 7a) merges.~~ **DONE** (`1dbbb8df`).
 2. #302 (hole purging, 7b, stacked on #299) merges.
-3. `purge_delay` flips 1000 → 100 (bundled with #299 per its PR description).
-4. `ci/check_bun_surface.py` (this phase's 9a deliverable) goes from "1 missing symbol,
-   `continue-on-error: true`" to a clean, hard-gated pass on ubuntu + alpine — the
-   `bun-surface` CI job's dated TODO comment marks exactly this transition.
+3. ~~`purge_delay` flips 1000 → 100 (bundled with #299 per its PR description).~~ **DONE**
+   — `src/options.c:143` now reads `100` on `main`.
+4. ~~`ci/check_bun_surface.py` (this phase's 9a deliverable) goes from "1 missing symbol,
+   `continue-on-error: true`" to a clean, hard-gated pass on ubuntu + alpine.~~ **DONE** —
+   both matrix rows report zero missing symbols; the `bun-surface` job no longer has
+   `continue-on-error`.
 5. Item 13 above (slot-48 `prof_sample_rate` collision) gets a documentation call or a
    rename before the draft issue text can claim it as "we'll rename ours if that's
    confusing" without being aspirational.

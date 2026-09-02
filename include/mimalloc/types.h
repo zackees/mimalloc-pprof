@@ -649,10 +649,8 @@ typedef struct mi_heap_s {
 // must therefore be exactly pointer-width; `src/scavenger.c` static-asserts it.
 #if defined(_WIN32)
 typedef size_t   mi_scav_word_t;
-#define MI_SCAV_WORD_ALIGN  MI_SIZE_SIZE
 #else
 typedef uint32_t mi_scav_word_t;
-#define MI_SCAV_WORD_ALIGN  8
 #endif
 
 struct mi_subproc_s {
@@ -695,7 +693,8 @@ struct mi_subproc_s {
   mi_tld_t*             tlds;                           // list of tlds of this sub-process (walked by the scavenger for parked threads)
   mi_lock_t             tlds_lock;                      // guards the `tlds` list structure only -- never held across a sweep
   _Atomic(size_t)       parked_count;                   // threads currently parked; lets the scavenger skip the walk entirely
-  mi_decl_align(MI_SCAV_WORD_ALIGN)
+  mi_decl_align(8)   // a LITERAL: MSVC's __declspec(align()) rejects `MI_SIZE_SIZE` (a parenthesized
+                     // expression) with C2059, and 8 over-aligns the 4-byte word harmlessly
   _Atomic(mi_scav_word_t) scavenger_wake;               // wait word signalled when a purge is scheduled (the scavenger thread waits on this)
 };
 

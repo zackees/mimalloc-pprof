@@ -1012,7 +1012,9 @@ if (MI_BUILD_TESTS)
       # `mi_page_block_is_purged`, which a shared build hides. With the static library
       # they are available; without it the scenario still runs (it is a concurrency test
       # first) minus those two assertions -- see the test source.
-      target_compile_definitions(mimalloc-test-profile-race PRIVATE MI_TEST_LINKS_STATIC=1)
+      # MI_TEST_LINKS_STATIC turns scenario 5's purged-block assertions on; MI_STATIC_LIB is
+      # what makes the internal declarations they use link on MSVC (see test-purge-holes above).
+      target_compile_definitions(mimalloc-test-profile-race PRIVATE MI_TEST_LINKS_STATIC=1 MI_STATIC_LIB)
     else()
       target_link_libraries(mimalloc-test-profile-race PRIVATE mimalloc ${mi_libraries})
     endif()
@@ -1260,6 +1262,11 @@ if (MI_BUILD_TESTS)
       target_compile_definitions(mimalloc-test-purge-holes PRIVATE ${mi_defines})
       target_compile_options(mimalloc-test-purge-holes PRIVATE ${mi_cflags})
       target_include_directories(mimalloc-test-purge-holes PRIVATE include)
+      # MI_STATIC_LIB: `mimalloc-static` is compiled with it (see the target above), and
+      # without it here MSVC resolves the internal declarations this test uses through
+      # `__declspec(dllimport)` and the link fails with LNK2019 on `_mi_os_page_size` /
+      # `__mi_page_map`. Same pattern as `mimalloc-test-tls-controls`.
+      target_compile_definitions(mimalloc-test-purge-holes PRIVATE MI_STATIC_LIB)
       target_link_libraries(mimalloc-test-purge-holes PRIVATE mimalloc-static ${mi_libraries})
       target_link_libraries(mimalloc-test-purge-holes PRIVATE Threads::Threads)
       add_test(NAME test-purge-holes COMMAND mimalloc-test-purge-holes)

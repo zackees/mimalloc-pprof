@@ -1630,6 +1630,22 @@ static void run_one_thread(void (*fun)(void)) {
 
 // ---------------------------------------------------------------------------
 
+// ADAPTATION for this fork (Bun has no MI_GUARDED lane): `ctest-guarded`'s second pass runs
+// with `MIMALLOC_GUARDED_SAMPLE_RATE=1`, which turns EVERY allocation into an oversized,
+// guard-page-backed one that hands back an INTERIOR pointer. A test can then neither compute a
+// block's index in its page from the pointer it got, nor keep a page to itself (the test's own
+// `calloc`s and mimalloc's internals land in the same bins). Six cases below need both; the
+// other nineteen do not and still run, as does the whole file in the lane's FIRST pass at the
+// default sample rate. This is about what a test can observe, not about what the engine does:
+// guarded blocks are ordinary free-listed blocks to the sweep.
+static bool layout_is_predictable(void) {
+  #if defined(MI_GUARDED)
+  return (mi_option_get(mi_option_guarded_sample_rate) != 1);
+  #else
+  return true;
+  #endif
+}
+
 int main(void) {
   mi_version();
   purging_enabled = mi_option_is_enabled(mi_option_purge_holes);
@@ -1674,14 +1690,21 @@ int main(void) {
   CHECK("page-lifecycle", test_page_lifecycle());
   CHECK("abandoned-pages", test_abandoned());
   CHECK("large-pages", test_large_pages());
-  CHECK("report-pinned-ospages", test_holes_report(0));
-  CHECK("report-discardable-ospages", test_holes_report(1));
+  if (layout_is_predictable()) {   // see `layout_is_predictable` above
+    CHECK("report-pinned-ospages", test_holes_report(0));
+    CHECK("report-discardable-ospages", test_holes_report(1));
+    CHECK("report-is-read-only-on-abandoned", test_report_read_only_abandoned());
+    CHECK("unformed-tail", test_unformed_tail());
+    CHECK("unformed-tail-freed", test_unformed_tail_freed());
+    CHECK("sweep-skips-unchanged-pages", test_sweep_skip());
+  }
+  else {
+    fprintf(stderr, "skipped (every allocation is guarded, so block layout is unobservable): "
+                    "report-pinned-ospages, report-discardable-ospages, report-is-read-only-on-abandoned, "
+                    "unformed-tail, unformed-tail-freed, sweep-skips-unchanged-pages\n");
+  }
   CHECK("report-is-read-only", test_report_is_read_only());
-  CHECK("report-is-read-only-on-abandoned", test_report_read_only_abandoned());
   CHECK("option-off-is-noop", test_option_off());
-  CHECK("unformed-tail", test_unformed_tail());
-  CHECK("unformed-tail-freed", test_unformed_tail_freed());
-  CHECK("sweep-skips-unchanged-pages", test_sweep_skip());
   CHECK("sweep-does-not-unpurge-on-collect", test_sweep_no_unpurge_on_collect());
   CHECK("sweep-full-every-bounds-a-missed-hole", test_sweep_full_every());
 

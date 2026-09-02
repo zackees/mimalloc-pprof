@@ -372,6 +372,33 @@ jobs:
       # ~87 GB free, and `/mnt` on that same filesystem rather than a separate temp disk.
       # 87 GB is ample for a 64 GB sparse guest disk, but print it -- a full disk during a
       # macOS boot surfaces as an unexplained QEMU exit.
+      - name: Unpack both arches' bundles on the runner
+        # Done here, before anything touches the guest, because the coverage comparison
+        # below is a property of the two bundles and not of the guest: if macOS never
+        # boots, "do these two bundles cover the same tests" is still a question with an
+        # answer, and still worth failing on. Staging into the guest copies from here.
+        run: |
+          set -euo pipefail
+          for archive in artifacts/*/*.tar.gz arm64-artifacts/*/*.tar.gz; do
+            name=$(basename "$archive" .tar.gz)
+            mkdir -p "bundles/$name"
+            tar -C "bundles/$name" -xzf "$archive"
+          done
+          ls -1 bundles
+
+      - name: Coverage -- the executed x86_64 bundles must run the whole arm64 suite
+        # There is no native macOS runner left to enumerate a ctest suite on, so the
+        # reference side is the arm64 bundle: arm64 is compile-only, and this is what
+        # stops a test that exists only there from quietly never running anywhere.
+        run: |
+          set -euo pipefail
+          python3 ci/bundle_coverage.py \
+            --heading "macOS coverage: arm64 (compile-only) vs x86_64 (executed under dockurr/macos)" \
+            --names arm64 x86_64 \
+            --compare "release" bundles/macos-arm64-release/tests.json bundles/macos-x64-release/tests.json \
+            --compare "debug-full" bundles/macos-arm64-debug-full/tests.json bundles/macos-x64-debug-full/tests.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+
       - name: Make room for the guest disk
         run: |
           set -euo pipefail
@@ -475,11 +502,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p payload
-          for archive in artifacts/*/*.tar.gz; do
-            name=$(basename "$archive" .tar.gz)
-            mkdir -p "payload/$name"
-            tar -C "payload/$name" -xzf "$archive"
-          done
+          # Only the x86_64 bundles go into the guest; the arm64 ones exist on the runner
+          # for the coverage comparison and are never executed anywhere.
+          cp -r bundles/macos-x64-* payload/
           chmod +x rust-bins/* || true
           cp -r rust-bins payload/rust-bins
           cp ci/run_test_bundle.py ci/memory_gate.py payload/
@@ -592,25 +617,6 @@ jobs:
           ./ci/dockur_guest.sh pull '~/w/payload/result-\*.json' . || true
           ./ci/dockur_guest.sh pull '~/w/payload/leak-\*.json' . || true
           ls -l bundle-*.xml result-*.json leak-*.json 2>/dev/null || true
-
-      - name: Coverage -- the executed x86_64 bundles must run the whole arm64 suite
-        # There is no native macOS runner left to enumerate a ctest suite on, so the
-        # reference side is the arm64 bundle: arm64 is compile-only, and this is what
-        # stops a test that exists only there from quietly never running anywhere.
-        if: ${{ !cancelled() }}
-        run: |
-          set -euo pipefail
-          for archive in arm64-artifacts/*/*.tar.gz; do
-            name=$(basename "$archive" .tar.gz)
-            mkdir -p "arm64/$name"
-            tar -C "arm64/$name" -xzf "$archive"
-          done
-          python3 ci/bundle_coverage.py \
-            --heading "macOS coverage: arm64 (compile-only) vs x86_64 (executed under dockurr/macos)" \
-            --names arm64 x86_64 \
-            --compare "release" arm64/macos-arm64-release/tests.json payload/macos-x64-release/tests.json \
-            --compare "debug-full" arm64/macos-arm64-debug-full/tests.json payload/macos-x64-debug-full/tests.json \
-            --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Guest and QEMU logs
         if: ${{ !cancelled() }}

@@ -149,8 +149,14 @@ static_assert(mi_option_page_cross_thread_max_reclaim == 42, "mi_option_t slot 4
 // only checks the symbol when it happens to be present would stop catching a
 // regression the day after #299 lands.
 extern "C" {
-void mi_on_thread_idle();  // not in include/mimalloc.h yet -- own prototype, matches
-                           // mimalloc_sys.rs:30 (`pub safe fn mi_on_thread_idle()`)
+// Not in include/mimalloc.h on this branch yet. Prototype matches what it declares on
+// `bun-parity/p7-scavenger` (issue #299) exactly, INCLUDING the noexcept specifier --
+// `mi_attr_noexcept` expands to `noexcept` in C++, and two extern "C" declarations of
+// the same symbol with different exception specifications are a hard C++17 compile
+// error. Get this wrong and the day #299 merges, this TU stops compiling instead of
+// linking clean, and continue-on-error hides that from CI. Verified by building this
+// exact file against the p7-scavenger branch: PASS, zero missing symbols.
+mi_decl_export void mi_on_thread_idle(void) mi_attr_noexcept;
 }
 
 // The address-of array. `reinterpret_cast<void*>` on a function pointer is

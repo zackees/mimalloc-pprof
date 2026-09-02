@@ -12,7 +12,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <string.h>  // memcpy, memset
 #include <stdlib.h>  // atexit
 #if !defined(_WIN32) && !defined(__wasi__)
-#include <pthread.h> // pthread_atfork (fork handlers, subproc.c) -- #270
+#include <pthread.h> // pthread_atfork (fork handlers, src/fork.c) -- #270
 #endif
 
 // Empty page used to initialize the small free pages array
@@ -578,7 +578,7 @@ static void mi_process_init_once(void) {
   // #270 (Bun parity P5): register once per process, in process init -- never per heap
   // or per thread. Bun's own history is the cautionary tale here: an earlier version
   // registered from `mi_heap_new` and exhausted glibc's fixed-size atfork table,
-  // aborting inside BoringSSL. See the lock-order block at the top of subproc.c.
+  // aborting inside BoringSSL. See the lock-order block at the top of src/fork.c.
   #if !defined(_WIN32) && !defined(__wasi__)
   pthread_atfork(&_mi_process_fork_prepare, &_mi_process_fork_parent, &_mi_process_fork_child);
   #endif

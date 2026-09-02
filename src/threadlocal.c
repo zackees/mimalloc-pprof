@@ -298,8 +298,9 @@ void _mi_thread_locals_init(void) {
 // #270: fork-safety. Ported (design, not code) from oven-sh/mimalloc @ 942b8342, MIT,
 // whose `threadlocal.c` defines the identically-named
 // `_mi_thread_locals_fork_prepare/parent/child` around this same lock. See the lock
-// order documented at the top of subproc.c: thread locals are quiesced right after the
-// subprocess registry (`mi_subprocs_lock`) and before any per-subprocess lock.
+// order documented at the top of src/fork.c: thread locals are quiesced after the
+// subprocess registry and per-heap locks, and before `theap_meta_lock` (which
+// `_mi_thread_local_create` can reach through `_mi_meta_zalloc_aligned`).
 void _mi_thread_locals_fork_prepare(void) { mi_lock_acquire(&mi_thread_locals_lock); }
 void _mi_thread_locals_fork_parent(void)  { mi_lock_release(&mi_thread_locals_lock); }
 void _mi_thread_locals_fork_child(void)   { mi_lock_init(&mi_thread_locals_lock); }

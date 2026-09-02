@@ -88,7 +88,7 @@ void _mi_memevt_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_p
 // snapshot-copy of the callback table (see the comment above its declaration) and, per
 // that same comment, is never held while a user handler runs -- so unlike
 // `prof_lock`/`dhat_lock` it is not itself an alloc/free-hook lock that can nest under
-// a heap/arena lock (see subproc.c's lock-order block). It is still grouped with them
+// a heap/arena lock (see fork.c's lock-order block). It is still grouped with them
 // (innermost, alongside `out_buf_lock`) for simplicity rather than given its own
 // earlier slot, since there is no actual ordering requirement pulling it elsewhere.
 // The registered handlers themselves are the embedder's own responsibility across

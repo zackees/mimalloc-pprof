@@ -399,7 +399,7 @@ static void mi_cdecl mi_out_buf(const char* msg, void* arg) {
 
 // #270: fork-safety. `out_buf_lock`'s critical section is a plain memcpy into a fixed
 // buffer -- it never calls back into the allocator -- so in the documented lock order
-// (subproc.c) it is always the innermost lock: acquired last in prepare, released first
+// (src/fork.c) it is always the innermost lock: acquired last in prepare, released first
 // in parent.
 void _mi_options_fork_prepare(void) { mi_lock_acquire(&out_buf_lock); }
 void _mi_options_fork_parent(void)  { mi_lock_release(&out_buf_lock); }

@@ -914,7 +914,7 @@ void _mi_prof_process_done(void) {
 // (see test-fork-locks.c's `mi_prof_dump` check) since they only ever touch this lock
 // plus the (intact) records.
 //
-// Where this sits in the documented lock order (subproc.c): `prof_lock` is also taken
+// Where this sits in the documented lock order (src/fork.c): `prof_lock` is also taken
 // by `_mi_prof_on_alloc` (below), an alloc/free HOOK that runs with a heap's
 // `arena_pages_lock` sometimes still held a few frames up the same call stack -- so
 // per that file's corrected rule, `prof_lock` is quiesced LAST, innermost, alongside
@@ -922,7 +922,7 @@ void _mi_prof_process_done(void) {
 // earlier version of this file had that backwards, ported unmodified from Bun's
 // stated rule, and it produced a real, reproducible AB-BA deadlock -- see the #270 PR
 // discussion). `mi_prof_visit` (above) holding `prof_lock` across a user callback is
-// a SEPARATE, pre-existing hazard this phase does not close -- see subproc.c's file
+// a SEPARATE, pre-existing hazard this phase does not close -- see src/fork.c's file
 // comment and `mi_prof_visit`'s own declaration (profile.h) for why.
 void _mi_prof_fork_prepare(void) { mi_lock_acquire(&prof_lock); }
 void _mi_prof_fork_parent(void)  { mi_lock_release(&prof_lock); }

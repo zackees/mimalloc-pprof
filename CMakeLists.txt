@@ -394,6 +394,13 @@ if(MI_DEBUG_FULL)
   list(APPEND mi_sources src/diagnostic.c)
 endif()
 
+# pthread_atfork fork-safety handlers (#270, Bun parity P5). POSIX-only: the file body
+# is wrapped in `#if !defined(_WIN32) && !defined(__wasi__)` and src/static.c includes it
+# under the same guard, so keep it out of the Windows source list entirely.
+if(NOT WIN32)
+  list(APPEND mi_sources src/fork.c)
+endif()
+
 # NOTE: `!` is NOT negation in CMake -- `!MI_GUARDED` parses as a variable name, and an
 # undefined variable is false, so the original `if(MI_DEBUG AND !MI_GUARDED)` was ALWAYS
 # false. And `set(MI_GUARDED=ON)` created a variable literally named `MI_GUARDED=ON`.
@@ -1040,6 +1047,17 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-fork-locks-dhat-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_DHAT=1")
     add_test(NAME test-fork-locks-memevt-env COMMAND mimalloc-test-fork-locks)
     set_tests_properties(test-fork-locks-memevt-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
+
+    # #270 review follow-up (F1): the lock-ORDER stress variant. `MI_TEST_FORK_SPAWN=1`
+    # makes the test start short-lived threads continuously while it forks; each thread
+    # start allocates its own tld/theap through `_mi_meta_zalloc`, which holds
+    # `theap_meta_lock` across a full allocation on `heap_main` and therefore nests it
+    # OUTSIDE `heap_main->arena_pages_lock` / `arena_reserve_lock` / the page-map lock.
+    # A prepare() that took any of those first deadlocks the parent inside fork() here.
+    # Paired with MIMALLOC_PROF=1 so the alloc/free hook locks are live at the same time.
+    add_test(NAME test-fork-locks-spawn-prof-env COMMAND mimalloc-test-fork-locks)
+    set_tests_properties(test-fork-locks-spawn-prof-env PROPERTIES TIMEOUT 300
+                         ENVIRONMENT "MIMALLOC_PROF=1;MI_TEST_FORK_SPAWN=1")
 
     # test-fork-user-heap: imported from oven-sh/mimalloc @ 942b8342, MIT (see the
     # file's header comment for provenance and for which cases are disabled here as

@@ -214,7 +214,7 @@ static boolean_t intro_zone_locked(malloc_zone_t* zone) {
 // makes the forked child jump to address 0 and crash in fork().
 // #270: mimalloc itself is not zone-lock-free anymore -- wire this to the same
 // child handler `pthread_atfork` uses (src/init.c) so the locks documented at the
-// top of subproc.c actually get reset in the child, whichever of `pthread_atfork`
+// top of src/fork.c actually get reset in the child, whichever of `pthread_atfork`
 // or this zone callback macOS invokes first for a given fork() (mi_fork_depth
 // makes the pair idempotent).
 static void intro_reinit_lock(malloc_zone_t* zone) {

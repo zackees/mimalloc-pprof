@@ -176,6 +176,12 @@ void _mi_lock_debug_after_acquire(const void* lock, _Atomic(uintptr_t)* owner,
     mi_lock_debug_fail("internal_lock_owner_not_cleared", lock, mi_lock_debug_thread(), owned_by, file, line, func);
   }
   mi_atomic_store_relaxed(owner, mi_lock_debug_thread());
+  #if MI_FORK_LOCK_ORDER_CHECK
+  // #270: with `debug_owner` now set for `lock`, the set of locks this thread holds is
+  // readable from the owner fields alone -- fork.c uses that to record the nesting edges
+  // this process actually exhibits and check them against its documented lock order.
+  _mi_fork_lock_order_observe((const mi_lock_t*)lock);
+  #endif
 }
 
 void _mi_lock_debug_before_release(const void* lock, _Atomic(uintptr_t)* owner,

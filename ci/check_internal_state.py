@@ -249,7 +249,7 @@ def selftest(entries: list[dict[str, object]], observed: list[Site]) -> None:
         for i, site in enumerate(observed)
         if site.path == "src/threadlocal.c"
         and site.callee == "mi_heap_rezalloc"
-        and site.args.startswith("mi_heap_main()")
+        and site.args.startswith("_mi_theap_heap(mi_theap_get_default())")
     )
     changed = list(observed)
     old = changed[tls_index]

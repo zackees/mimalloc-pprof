@@ -1,0 +1,161 @@
+#!/usr/bin/env -S uv run --script
+"""Prove a test bundle runs every test the native runner's own ctest would have run.
+
+Issue #277 phase B. The whole argument for building the macOS test binaries on Linux and
+executing them from a bundle is that coverage does not go down. That claim is only worth
+anything if something checks it on every run, against the machine the jobs are being taken
+away from -- so `run-macos` configures the same CMake trees natively (configure only; a
+tree needs no build for `ctest --show-only=json-v1` to list its suite), and this script
+compares those name lists against the bundles it just executed.
+
+A name the native tree has and the bundle does not is a hard failure: it is precisely the
+"gate that reports green on less" failure mode docs/ci-gates.md exists to prevent, and it
+can arise silently -- a test that CMake registers only for AppleClang, or one whose
+`add_test` sits behind a check that a cross configure resolves differently.
+
+A name the bundle has and the native tree does not is reported but not fatal: the bundle
+covering more than the runner used to is the direction this issue wants.
+
+    uv run ci/bundle_coverage.py \
+        --compare "ctest (Release)" native-release.json bundle-release/tests.json \
+        --compare "ctest-debug-full" native-debug.json bundle-debug/tests.json \
+        --summary "$GITHUB_STEP_SUMMARY"
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import cast
+
+
+class CoverageError(Exception):
+    """An input this script cannot read. Always names the file."""
+
+
+def _as_object(value: object) -> dict[str, object] | None:
+    return cast("dict[str, object]", value) if isinstance(value, dict) else None
+
+
+def _as_array(value: object) -> list[object]:
+    return cast("list[object]", value) if isinstance(value, list) else []
+
+
+def read_test_names(path: Path) -> set[str]:
+    """Test names from either shape: `ctest --show-only=json-v1` or a bundle manifest.
+
+    Both put a `tests` array of objects with a `name` at the top level, which is not a
+    coincidence -- `bundle_tests.py` derives one from the other -- so one reader covers
+    both and the comparison cannot drift by reading them differently.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CoverageError(f"{path}: {exc}") from exc
+    root = _as_object(payload)
+    if root is None:
+        raise CoverageError(f"{path}: not a JSON object")
+    names: set[str] = set()
+    for raw in _as_array(root.get("tests")):
+        entry = _as_object(raw)
+        name = entry.get("name") if entry else None
+        if isinstance(name, str):
+            names.add(name)
+    if not names:
+        # An empty side would make every comparison trivially pass, which is the same
+        # "verifies nothing" shape this script exists to catch.
+        raise CoverageError(f"{path}: contains no test names")
+    return names
+
+
+@dataclass(frozen=True)
+class Comparison:
+    label: str
+    native: set[str]
+    bundle: set[str]
+
+    @property
+    def missing(self) -> list[str]:
+        return sorted(self.native - self.bundle)
+
+    @property
+    def extra(self) -> list[str]:
+        return sorted(self.bundle - self.native)
+
+
+def render(comparisons: Sequence[Comparison]) -> str:
+    lines = [
+        "### macOS coverage: native ctest vs cross-built bundle",
+        "",
+        "| config | native | bundle | missing from bundle | extra in bundle |",
+        "|---|---:|---:|---|---|",
+    ]
+    for comparison in comparisons:
+        missing = ", ".join(f"`{name}`" for name in comparison.missing) or "—"
+        extra = ", ".join(f"`{name}`" for name in comparison.extra) or "—"
+        lines.append(
+            f"| {comparison.label} | {len(comparison.native)} | {len(comparison.bundle)} "
+            f"| {missing} | {extra} |"
+        )
+    lines.append("")
+    total_missing = sum(len(comparison.missing) for comparison in comparisons)
+    if total_missing:
+        lines.append(
+            f"**{total_missing} test(s) the native runner executes are absent from the "
+            f"bundles.** Coverage would go down; see issue #277 §4."
+        )
+    else:
+        lines.append("Every test the native runner executes is present in a bundle.")
+    return "\n".join(lines) + "\n"
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--compare",
+        nargs=3,
+        action="append",
+        metavar=("LABEL", "NATIVE_JSON", "BUNDLE_MANIFEST"),
+        required=True,
+        help="a ctest --show-only=json-v1 file and the bundle tests.json that replaces it",
+    )
+    parser.add_argument(
+        "--summary",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="append the markdown table here (point at $GITHUB_STEP_SUMMARY)",
+    )
+    args = parser.parse_args(argv)
+
+    comparisons: list[Comparison] = []
+    try:
+        for label, native, bundle in cast("list[list[str]]", args.compare):
+            comparisons.append(
+                Comparison(
+                    label=label,
+                    native=read_test_names(Path(native)),
+                    bundle=read_test_names(Path(bundle)),
+                )
+            )
+    except CoverageError as exc:
+        print(f"bundle_coverage: {exc}", file=sys.stderr)
+        return 2
+
+    table = render(comparisons)
+    print(table, end="")
+    summary = cast("Path | None", args.summary)
+    if summary is not None:
+        with summary.open("a", encoding="utf-8") as handle:
+            handle.write(table)
+    return 1 if any(comparison.missing for comparison in comparisons) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

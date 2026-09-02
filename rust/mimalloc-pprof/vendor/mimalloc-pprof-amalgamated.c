@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 9d8ca042 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 1c56c22f of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -2855,6 +2855,35 @@ typedef struct mi_profiler_tld_s {
   uint64_t generation;
 } mi_profiler_tld_t;
 
+// Reentrancy-guard / in-flight-event scratch for the fork's hook implementations
+// (src/memory-events.c, src/dhat.c, src/profile.c). These used to be file-local
+// `mi_decl_thread` (`__thread`) variables, but on a macOS dylib the loader can lazily
+// instantiate a thread's `__thread` block via a dyld-interposed `calloc` the very first
+// time it is touched on that thread -- including from inside `_mi_thread_init_with_heap`
+// -> `_mi_meta_zalloc`, which already holds `subproc->theap_meta_lock` for that same
+// thread's own tld/theap allocation. Touching a `__thread` var from our hook there
+// reenters mimalloc and re-acquires that lock on the same thread (see issue #266).
+// Living inline in `mi_tld_t` avoids that: obtaining a thread's `mi_tld_t*` (see
+// `_mi_hooks_tld_peek` in mimalloc/hooks-tld.h) never touches a `mi_decl_thread`
+// variable and never allocates.
+typedef struct mi_hooks_tld_s {
+  int      memevt_suppress_depth;     // memory-events.c: reentrancy / internal-op suppression
+  int      dhat_observer_depth;       // dhat.c: reentrancy guard for the in-flight event below
+  struct {                            // dhat.c: in-flight event scratch; fields are opaque here
+    int        kind;                  // dhat_event_kind_t
+    void*      oldp;
+    void*      newp;
+    size_t     size;
+    uint64_t   at;
+    uint64_t   generation;
+    mi_page_t* page;
+    void*      pp;                    // dhat_pp_t*
+    bool       armed;
+  }        dhat_event;
+  int      prof_callback_depth;       // profile.c (MI_PPROF): reentrancy / suppression depth
+  bool     prof_lock_owner;           // profile.c (MI_PPROF): this thread already holds prof_lock
+} mi_hooks_tld_t;
+
 // Thread local data
 struct mi_tld_s {
   mi_threadid_t         thread_id;            // thread id of this thread
@@ -2867,6 +2896,7 @@ struct mi_tld_s {
   bool                  is_in_threadpool;     // true if this thread is part of a threadpool (and can run arbitrary tasks)
   mi_memid_t            memid;                // provenance of the tld memory itself (meta or OS)
   mi_profiler_tld_t     profiler;             // allocation sampling profiler state
+  mi_hooks_tld_t        hooks;                // memory-events/dhat/profiler hook reentrancy state (#266)
 };
 
 
@@ -14624,7 +14654,8 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   false,                  // recurse
   false,                  // is_in_threadpool
   MI_MEMID_STATIC,        // memid
-  { 0, 0, 0, 0 }          // profiler (MI_PPROF)
+  { 0, 0, 0, 0 },         // profiler (MI_PPROF)
+  { 0 }                   // hooks (#266)
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -15790,6 +15821,84 @@ mi_decl_noinline size_t _mi_popcount_generic(size_t x) {
    mi_unwrapped_* family (backed directly by _mi_os_alloc/_mi_os_free) is provided as a
    stable API for *callers* (e.g. a memory-change callback) that need non-recursive
    scratch storage; this module does not need to consume its own API for that purpose. */
+/* ---- begin inlined: include/mimalloc/hooks-tld.h ---- */
+/* Fork-internal accessors for `mi_tld_t::hooks` (mi_hooks_tld_t, see types.h).
+
+   src/memory-events.c, src/dhat.c and src/profile.c all keep a small amount of
+   per-thread reentrancy-guard / in-flight-event state. It used to live in file-local
+   `mi_decl_thread` (`__thread`) variables, but on a macOS dylib the loader can lazily
+   instantiate a thread's `__thread` block on first touch via a dyld-interposed `calloc` --
+   including from inside `_mi_thread_init_with_heap` -> `_mi_meta_zalloc`, which already
+   holds `subproc->theap_meta_lock` for that same thread's own tld/theap allocation.
+   Touching a `mi_decl_thread` variable from a hook reached that way reenters mimalloc and
+   re-acquires that non-recursive lock on the same thread (see issue #266 for the observed
+   backtrace). Moving the state into `mi_tld_t` avoids the problem: obtaining a thread's
+   `mi_tld_t*` below only ever reads the platform's non-allocating fast-path theap
+   accessor (`_mi_theap_default()` -- pthread_getspecific on macOS, an eagerly-allocated
+   initial-exec `__thread` on Linux, a TLS/TEB slot read on Windows; see prim-tls.h's
+   header comment) and never allocates.
+
+   IMPORTANT: there is deliberately no "force initialization if needed" accessor here.
+   The obvious `&mi_theap_get_default()->tld->hooks` is unsafe not only mid-init (the
+   #266 crash) but also mid *teardown*: `mi_thread_theaps_done` (init.c) resets the
+   default theap to the empty sentinel BEFORE freeing this thread's theaps, specifically
+   so nothing re-initializes it during that window (see its own comment), and a free that
+   runs after a thread's mimalloc cleanup already ran is an explicitly supported case
+   (src/free.c's "can happen if free'd after thread_done was called" comment) -- exactly
+   the window forcing here would violate. Every accessor below only ever peeks.
+
+   - `_mi_hooks_tld_peek()`: for hooks whose caller is prepared to no-op entirely when
+     this thread has no tld (the per-allocation ALLOC-side hooks: _mi_memevt_on_alloc,
+     _mi_prof_on_alloc, _mi_dhat_begin_alloc/_mi_dhat_finish_event -- these ARE reachable
+     from inside `_mi_meta_zalloc`'s call chain, allocating this thread's own tld/theap,
+     where a NULL result always means "this is a meta allocation, nothing to report" --
+     see memory-events.c's `_mi_meta_is_meta_page` check) and for the suppress_begin/end
+     pairs (never actually reachable with a NULL peek in practice, since they only run
+     from already-initialized-thread call sites, but must still never force).
+
+   - `_mi_hooks_tld_peek_or_local()`: for call sites that need real, possibly-mutated
+     scratch state for the duration of ONE call (e.g. memevt_dispatch/dhat_prepare's
+     "already inside the handler" suppression-depth bump around invoking a user
+     callback), but where a NULL peek must NOT mean "drop the event" -- the free/resize
+     hooks (_mi_memevt_on_free/_on_realloc_in_place/_on_resize, _mi_dhat_begin_free/
+     _begin_resize) and any top-level control API that itself brackets a callback
+     (mi_prof_visit, mi_dhat_dump). These are never reachable from inside
+     `_mi_meta_zalloc`'s call chain (meta allocations only ever allocate), so nothing is
+     lost by not forcing; a thread whose very first (or only remaining) mimalloc
+     interaction is exactly such a call -- e.g. a foreign thread's first-ever call being
+     a cross-thread mi_free, or a free arriving after this thread's own mimalloc
+     teardown -- still gets correctly, if not persistently, tracked: see
+     `test_free_from_foreign_thread` in test-memory-events.c. The returned pointer is
+     valid only for the duration of the call that obtained it (it may point at the
+     caller's own stack-local `mi_hooks_tld_t`); never stash it anywhere longer-lived. */
+#pragma once
+#ifndef MIMALLOC_HOOKS_TLD_H
+#define MIMALLOC_HOOKS_TLD_H
+
+
+// Returns this thread's `mi_hooks_tld_t*`, or NULL if this thread currently has no tld
+// (not yet initialized, or already torn down). Never allocates; never calls
+// `mi_theap_get_default()` or any other initializing accessor. Must be the very first
+// thing every per-allocation hook touches -- see the file comment above.
+static inline mi_hooks_tld_t* _mi_hooks_tld_peek(void) {
+  mi_theap_t* const theap = _mi_theap_default();
+  if (!mi_theap_is_initialized(theap)) return NULL;
+  return &theap->tld->hooks;
+}
+
+// Like `_mi_hooks_tld_peek()`, but falls back to `local` (caller-owned stack storage,
+// zeroed here) instead of NULL. `local` must live at least as long as every use of the
+// returned pointer. See the file comment above for when this is (and is not) the right
+// choice over a plain peek.
+static inline mi_hooks_tld_t* _mi_hooks_tld_peek_or_local(mi_hooks_tld_t* local) {
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks != NULL) return hooks;
+  _mi_memzero(local, sizeof(*local));
+  return local;
+}
+
+#endif
+/* ---- end inlined: include/mimalloc/hooks-tld.h ---- */
 #include <string.h>
 #include <stdint.h>
 
@@ -15845,10 +15954,17 @@ static void*                 memevt_args[MI_MEMORY_CHANGE_COUNT];
 //       mi_heap_umalloc+mi_free pair, so those two calls don't leak an ALLOCATE/FREE
 //       pair to consumers; the caller then explicitly calls _mi_memevt_on_resize once,
 //       after suppression is lifted, to emit the single synthesized RESIZE.
-static mi_decl_thread int memevt_suppress_depth;
-
-void _mi_memevt_suppress_begin(void) { memevt_suppress_depth++; }
-void _mi_memevt_suppress_end(void)   { memevt_suppress_depth--; }
+// #266: this used to be `static mi_decl_thread int memevt_suppress_depth`; it now lives
+// on `mi_tld_t::hooks` (see hooks-tld.h's file comment for why). Both callers are always
+// on an already-initialized thread (paired around inner mi_realloc/mi_malloc_aligned/
+// mi_theap_malloc_guarded calls, never inside `_mi_meta_zalloc`'s own call chain), so a
+// NULL peek is not expected here in practice -- but this must still only ever PEEK, never
+// force: forcing (mi_theap_get_default() -> mi_thread_init()) is unsafe not only mid-init
+// but also mid *teardown* (mi_thread_theaps_done resets the default theap to the empty
+// sentinel before freeing this thread's theaps specifically so nothing re-initializes it
+// in that window; see its comment in init.c). No-op on NULL rather than crash either way.
+void _mi_memevt_suppress_begin(void) { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth++; }
+void _mi_memevt_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth--; }
 
 // ---------------------------------------------------------------------------------------
 // Lazy activation.
@@ -15921,8 +16037,10 @@ bool mi_memory_snapshot(mi_memory_snapshot_t* out) mi_attr_noexcept {
 // work / list push is already complete).
 // ---------------------------------------------------------------------------------------
 
-static void memevt_dispatch(mi_memory_change_kind_t kind, int64_t delta_bytes, uint64_t request_size) {
-  if (memevt_suppress_depth > 0) return;
+// `hooks` is the caller's already-peeked, known-non-NULL `mi_hooks_tld_t*` (every call
+// site below obtained it before calling here; see the hook entry points).
+static void memevt_dispatch(mi_hooks_tld_t* hooks, mi_memory_change_kind_t kind, int64_t delta_bytes, uint64_t request_size) {
+  if (hooks->memevt_suppress_depth > 0) return;
 
   size_t live_bytes_after;
   if (delta_bytes >= 0) {
@@ -15961,9 +16079,9 @@ static void memevt_dispatch(mi_memory_change_kind_t kind, int64_t delta_bytes, u
   change.delta_bytes = delta_bytes;
   change.request_size = request_size;
 
-  memevt_suppress_depth++;
+  hooks->memevt_suppress_depth++;
   handler(&change, handler_arg);
-  memevt_suppress_depth--;
+  hooks->memevt_suppress_depth--;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -15980,7 +16098,17 @@ static void memevt_dispatch(mi_memory_change_kind_t kind, int64_t delta_bytes, u
    The shared suppression depth excludes callback-internal and moving-realloc internals
    from both observers. */
 void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
-  if (memevt_suppress_depth > 0) return;
+  // #266: must be the very first thing touched -- see hooks-tld.h's file comment. A
+  // thread mid-init (inside `_mi_thread_init_with_heap` -> `_mi_meta_zalloc`, allocating
+  // its OWN tld/theap) reaches this hook too; peeking (rather than touching any TLS
+  // state directly) lets us bail out before doing anything else. Such a call is always
+  // for a meta allocation anyway -- the `_mi_meta_is_meta_page` check below would have
+  // excluded it regardless, but that check itself must not run first (it does not touch
+  // TLS, but ordering it before the peek would defeat the point: bail before ANY other
+  // per-thread work).
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks == NULL) return;
+  if (hooks->memevt_suppress_depth > 0) return;
   // #266: never report allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
   // _mi_meta_zalloc onto subproc->theap_meta) as a user allocation. This is the sole
   // entry point DHAT's begin_alloc is reached through, so this one check excludes both
@@ -15994,43 +16122,64 @@ void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
-    memevt_dispatch(MI_MEMORY_ALLOCATE, (int64_t)usable, (uint64_t)request_size);
+    memevt_dispatch(hooks, MI_MEMORY_ALLOCATE, (int64_t)usable, (uint64_t)request_size);
   }
   _mi_dhat_finish_event();
 }
 
+// #266: unlike _mi_memevt_on_alloc above, the free/resize hooks are never reachable
+// from inside `_mi_meta_zalloc`'s own call chain (meta allocations only ever allocate,
+// never free or resize), so a NULL peek here does NOT mean "meta allocation, drop it" --
+// it means a thread with no tld of its own is legitimately freeing (or resizing)
+// something, e.g. `test_free_from_foreign_thread` (test-memory-events.c): a thread whose
+// very first ever mimalloc call is a cross-thread mi_free must still be accounted for.
+// But forcing thread init here would be just as unsafe as in the alloc path -- unsafe
+// not for the mid-init reason (frees can't happen there) but because it is equally
+// reachable while THIS thread is mid *teardown* (mi_thread_theaps_done resets the
+// default theap to the empty sentinel before freeing this thread's own theaps precisely
+// so nothing re-initializes it in that window) or after teardown already completed (see
+// free.c's "free'd after thread_done" comment). So: peek, and fall back to a local,
+// per-call scratch `mi_hooks_tld_t` instead of forcing -- see hooks-tld.h.
 void _mi_memevt_on_free(mi_page_t* page, void* p) {
-  if (memevt_suppress_depth > 0) return;
+  mi_hooks_tld_t local_hooks;
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
+  if (hooks->memevt_suppress_depth > 0) return;
   // #266: symmetric with the _mi_memevt_on_alloc check above -- see its comment.
   if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
   _mi_dhat_begin_free(p);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
-    memevt_dispatch(MI_MEMORY_FREE, -(int64_t)usable, 0);
+    memevt_dispatch(hooks, MI_MEMORY_FREE, -(int64_t)usable, 0);
   }
   _mi_dhat_finish_event();
 }
 
 void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size) {
-  if (memevt_suppress_depth > 0) return;
+  // #266: see _mi_memevt_on_free above.
+  mi_hooks_tld_t local_hooks;
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
+  if (hooks->memevt_suppress_depth > 0) return;
   _mi_dhat_begin_resize(p, p, request_size);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     // Same page => same block-size class => usable size is identical before and after.
     MI_UNUSED(page);
-    memevt_dispatch(MI_MEMORY_RESIZE, 0, (uint64_t)request_size);
+    memevt_dispatch(hooks, MI_MEMORY_RESIZE, 0, (uint64_t)request_size);
   }
   _mi_dhat_finish_event();
 }
 
 void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
-  if (memevt_suppress_depth > 0) return;
+  // #266: see _mi_memevt_on_free above.
+  mi_hooks_tld_t local_hooks;
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
+  if (hooks->memevt_suppress_depth > 0) return;
   _mi_dhat_begin_resize(oldp, newp, request_size);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const int64_t delta = (int64_t)usable_post - (int64_t)usable_pre;
-    memevt_dispatch(MI_MEMORY_RESIZE, delta, (uint64_t)request_size);
+    memevt_dispatch(hooks, MI_MEMORY_RESIZE, delta, (uint64_t)request_size);
   }
   _mi_dhat_finish_event();
 }
@@ -16087,9 +16236,9 @@ static bool mi_cdecl memevt_visit_adapter(const mi_heap_t* heap, const mi_heap_a
 
 bool mi_memory_visit_live_allocations(mi_memory_allocation_visit_fun* visitor, void* arg) mi_attr_noexcept {
   if (visitor == NULL) return false;
-  if (memevt_suppress_depth > 0) return false; // do not reenter while a callback/internal-op is in flight on this thread.
-  mi_theap_t* theap = _mi_theap_default();
-  if (theap == NULL || !mi_theap_is_initialized(theap)) return true; // nothing to visit yet on this thread.
+  mi_theap_t* const theap = _mi_theap_default();
+  if (!mi_theap_is_initialized(theap)) return true; // nothing to visit yet on this thread.
+  if (theap->tld->hooks.memevt_suppress_depth > 0) return false; // do not reenter while a callback/internal-op is in flight on this thread.
   memevt_visit_ctx_t ctx = { visitor, arg };
   // Walk every theap on this thread (tld->theaps, via tnext), and for each, walk its own
   // page queues directly -- see the comment block above for why mi_heap_visit_blocks is
@@ -16336,8 +16485,26 @@ static uint64_t dhat_generation;
 static uint64_t dhat_total_bytes, dhat_total_blocks;
 static uint64_t dhat_live_bytes, dhat_live_blocks, dhat_peak_bytes, dhat_peak_blocks, dhat_peak_at;
 static char dhat_dump_at_exit[1024];
-static mi_decl_thread int dhat_observer_depth;
-static mi_decl_thread dhat_event_t dhat_event;
+
+// #266: `dhat_observer_depth` and `dhat_event` used to be file-local `mi_decl_thread`
+// (`__thread`) variables; they now live on `mi_tld_t::hooks` (see hooks-tld.h's file
+// comment for why: touching a `__thread` var from inside `_mi_meta_zalloc`'s call chain
+// can deadlock on macOS). `hooks->dhat_event` stores the same fields as `dhat_event_t`
+// above but with `kind` as a plain `int` and `pp` as `void*` (mi_tld_t/types.h cannot see
+// this file's private `dhat_event_kind_t`/`dhat_pp_t` types); this converts back.
+static dhat_event_t dhat_event_load(const mi_hooks_tld_t* hooks) {
+  dhat_event_t ev;
+  ev.kind = (dhat_event_kind_t)hooks->dhat_event.kind;
+  ev.oldp = hooks->dhat_event.oldp;
+  ev.newp = hooks->dhat_event.newp;
+  ev.size = hooks->dhat_event.size;
+  ev.at = hooks->dhat_event.at;
+  ev.generation = hooks->dhat_event.generation;
+  ev.page = hooks->dhat_event.page;
+  ev.pp = (dhat_pp_t*)hooks->dhat_event.pp;
+  ev.armed = hooks->dhat_event.armed;
+  return ev;
+}
 
 size_t _mi_dhat_stack_capture(void** pcs, size_t capacity);
 
@@ -16570,41 +16737,77 @@ static void dhat_resolve_env(void) {
 }
 
 bool _mi_dhat_is_active(void) { return mi_atomic_load_relaxed(&dhat_state) == DHAT_ENABLED; }
-static void dhat_prepare(dhat_event_kind_t kind, mi_page_t* page, void* oldp, void* newp, size_t size) {
-  dhat_event.armed = false;
-  if (dhat_observer_depth != 0) return;
+// `hooks` is the caller's already-obtained, known-non-NULL `mi_hooks_tld_t*` -- see the
+// three wrappers below for why each uses a different (peek vs. force) strategy to get it.
+static void dhat_prepare(mi_hooks_tld_t* hooks, dhat_event_kind_t kind, mi_page_t* page, void* oldp, void* newp, size_t size) {
+  hooks->dhat_event.armed = false;
+  if (hooks->dhat_observer_depth != 0) return;
   /* Register before reading activation so stop can wait for any thread that
      might have observed the old enabled state. */
   mi_atomic_increment_acq_rel(&dhat_inflight);
   size_t state = mi_atomic_load_relaxed(&dhat_state);
   if (state == DHAT_UNINIT) { dhat_resolve_env(); state = mi_atomic_load_relaxed(&dhat_state); }
   if (state != DHAT_ENABLED) { mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
-  dhat_observer_depth++;
-  dhat_event.kind = kind; dhat_event.page = page; dhat_event.oldp = oldp; dhat_event.newp = newp;
-  dhat_event.size = size; dhat_event.at = _mi_clock_now();
-  dhat_event.generation = 0; dhat_event.pp = NULL;
+  hooks->dhat_observer_depth++;
+  hooks->dhat_event.kind = (int)kind; hooks->dhat_event.page = page; hooks->dhat_event.oldp = oldp; hooks->dhat_event.newp = newp;
+  hooks->dhat_event.size = size; hooks->dhat_event.at = _mi_clock_now();
+  hooks->dhat_event.generation = 0; hooks->dhat_event.pp = NULL;
   if (kind == DHAT_EVENT_ALLOC) {
     void* pcs[DHAT_STACK_MAX]; const size_t depth = _mi_dhat_stack_capture(pcs, DHAT_STACK_MAX);
-    if (depth == 0) { dhat_mark_dropped(); dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
+    if (depth == 0) { dhat_mark_dropped(); hooks->dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
     mi_lock_acquire(&dhat_lock);
-    dhat_event.pp = dhat_pp_intern_locked(pcs, depth);
-    dhat_event.generation = dhat_generation;
+    dhat_pp_t* const pp = dhat_pp_intern_locked(pcs, depth);
+    hooks->dhat_event.pp = pp;
+    hooks->dhat_event.generation = dhat_generation;
     mi_lock_release(&dhat_lock);
-    if (dhat_event.pp == NULL) { dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
+    if (pp == NULL) { hooks->dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
   }
   else {
     mi_lock_acquire(&dhat_lock);
-    dhat_event.generation = dhat_generation;
+    hooks->dhat_event.generation = dhat_generation;
     mi_lock_release(&dhat_lock);
   }
-  dhat_event.armed = true;
+  hooks->dhat_event.armed = true;
 }
-void _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size) { dhat_prepare(DHAT_EVENT_ALLOC, page, NULL, p, request_size); }
-void _mi_dhat_begin_free(void* p) { dhat_prepare(DHAT_EVENT_FREE, NULL, p, NULL, 0); }
-void _mi_dhat_begin_resize(void* oldp, void* newp, size_t request_size) { dhat_prepare(DHAT_EVENT_RESIZE, NULL, oldp, newp, request_size); }
+// #266: this is reached from _mi_memevt_on_alloc, which is itself reachable from inside
+// `_mi_meta_zalloc`'s own call chain (a thread's own tld/theap allocation) -- so, like
+// that caller, this must peek (never force) and bail out immediately on NULL, before
+// touching anything else. Such a call is always for a meta allocation anyway (the
+// calling _mi_memevt_on_alloc's own `_mi_meta_is_meta_page` check already excludes it).
+void _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size) {
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks == NULL) return;
+  dhat_prepare(hooks, DHAT_EVENT_ALLOC, page, NULL, p, request_size);
+}
+// #266: these could in principle use a peek-or-local fallback (like
+// _mi_memevt_on_free's own family) to still track a thread with no tld of its own --
+// EXCEPT that dhat_prepare's armed event has to survive from here until the *separate*
+// _mi_dhat_finish_event() call below, which a stack-local fallback cannot do (its
+// storage would already be gone the moment this function returns). So: like begin_alloc
+// above, peek and bail -- a thread with no tld of its own simply isn't tracked by DHAT
+// (no #266 test exercises DHAT across a foreign/torn-down thread; memevt's own
+// always-on counters, which do not have this begin/finish split, remain accurate
+// either way -- see _mi_memevt_on_free).
+void _mi_dhat_begin_free(void* p) {
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks == NULL) return;
+  dhat_prepare(hooks, DHAT_EVENT_FREE, NULL, p, NULL, 0);
+}
+void _mi_dhat_begin_resize(void* oldp, void* newp, size_t request_size) {
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks == NULL) return;
+  dhat_prepare(hooks, DHAT_EVENT_RESIZE, NULL, oldp, newp, request_size);
+}
 void _mi_dhat_finish_event(void) {
-  if (!dhat_event.armed) return;
-  dhat_event_t ev = dhat_event; dhat_event.armed = false; dhat_observer_depth--;
+  // #266: always safe to peek here regardless of which begin_* (if any) armed the
+  // event -- every begin_* above peeked too, so a non-NULL result here reaches the
+  // exact same real `hooks` (no allocation or thread-state change happens between
+  // begin and finish on the same thread), and a NULL result here means begin_*
+  // (whichever ran) found NULL too and left nothing armed.
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks == NULL) return;
+  if (!hooks->dhat_event.armed) return;
+  dhat_event_t ev = dhat_event_load(hooks); hooks->dhat_event.armed = false; hooks->dhat_observer_depth--;
   /* The observer guard is deliberately popped before mutating the ledger: a user memory
      callback runs between begin and finish, and any allocations it makes are excluded. */
   mi_lock_acquire(&dhat_lock);
@@ -16618,7 +16821,13 @@ void _mi_dhat_finish_event(void) {
 }
 
 bool mi_dhat_start(void) mi_attr_noexcept {
-  if (dhat_observer_depth != 0) return false;
+  // #266: a plain entry check, not a persisted write -- peek (never force: see
+  // hooks-tld.h's file comment) and treat NULL the same as a never-touched thread's
+  // depth reading 0 under the old `mi_decl_thread` counter.
+  {
+    mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+    if (hooks != NULL && hooks->dhat_observer_depth != 0) return false;
+  }
   if (_mi_atomic_once_enter(&dhat_once)) {
     /* Explicit start wins over MIMALLOC_DHAT, but it must still honor the
        independently useful exit-dump configuration before sealing the once. */
@@ -16636,7 +16845,11 @@ bool mi_dhat_start(void) mi_attr_noexcept {
   mi_lock_release(&dhat_lock); return true;
 }
 void mi_dhat_stop(void) mi_attr_noexcept {
-  if (dhat_observer_depth != 0) return;
+  // #266: see mi_dhat_start above.
+  {
+    mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+    if (hooks != NULL && hooks->dhat_observer_depth != 0) return;
+  }
   mi_lock_acquire(&dhat_lock);
   if (!_mi_dhat_is_active()) { mi_lock_release(&dhat_lock); return; }
   /* Block a new start while we drain events that already observed this session. */
@@ -16731,19 +16944,28 @@ static void dhat_write_json_locked(FILE* f) {
   fprintf(f, "\n  ]\n}\n");
 }
 bool mi_dhat_dump(const char* path) mi_attr_noexcept {
-  if (path == NULL || dhat_observer_depth != 0) return false;
+  if (path == NULL) return false;
+  // #266: the depth bump below has to persist across this whole call (fopen/fprintf/
+  // fclose can recursively reach _mi_dhat_begin_alloc etc. via an overridden stdio
+  // allocation), but never forces thread init -- see hooks-tld.h's file comment. A
+  // local fallback is safe here specifically because everything that reads/writes it
+  // stays within this one function call (unlike dhat_prepare/_mi_dhat_finish_event's
+  // begin/finish split, which cannot use this pattern -- see _mi_dhat_begin_free above).
+  mi_hooks_tld_t local_hooks;
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
+  if (hooks->dhat_observer_depth != 0) return false;
   /* stdio can allocate (and applications can override those calls with mimalloc).
      Suppress this thread's dump-time traffic before fopen/fprintf while leaving the
      report's actual live records untouched; otherwise a reentrant hook could attempt
      to take dhat_lock while serialization already owns it. */
-  dhat_observer_depth++;
+  hooks->dhat_observer_depth++;
   /* Suppress the public dispatcher too: a callback invoked by a lazy stdio
      allocation could otherwise call a DHAT API while dhat_lock is held. */
   _mi_memevt_suppress_begin();
   FILE* f = fopen(path, "wb");
   if (f == NULL) {
     _mi_memevt_suppress_end();
-    dhat_observer_depth--;
+    hooks->dhat_observer_depth--;
     return false;
   }
   mi_lock_acquire(&dhat_lock);
@@ -16751,7 +16973,7 @@ bool mi_dhat_dump(const char* path) mi_attr_noexcept {
   mi_lock_release(&dhat_lock);
   const bool ok = (fclose(f) == 0);
   _mi_memevt_suppress_end();
-  dhat_observer_depth--;
+  hooks->dhat_observer_depth--;
   return ok;
 }
 void _mi_dhat_process_init(void) { dhat_resolve_env(); }
@@ -20785,8 +21007,22 @@ static size_t prof_max_bytes;
    dump_format field or, for pure-env users, prof_auto_start reading
    MIMALLOC_PROF_DUMP_FORMAT; consumed by _mi_prof_process_done. */
 static int prof_dump_at_exit_format;
-static mi_decl_thread int prof_callback_depth;
-static mi_decl_thread bool prof_lock_owner;
+// #266: `prof_callback_depth`/`prof_lock_owner` used to be file-local `mi_decl_thread`
+// (`__thread`) variables; they now live on `mi_tld_t::hooks` (mi_hooks_tld_t, types.h) --
+// see hooks-tld.h's file comment for why.
+//
+// This is a plain, read-only entry check (never a persisted write across a callback) --
+// peek only, NEVER force: forcing (mi_theap_get_default() -> mi_thread_init()) is unsafe
+// not only mid-init (the #266 crash: reachable via prof_auto_start() -> mi_prof_start()
+// from deep inside _mi_meta_zalloc's locked region) but equally mid *teardown*
+// (mi_thread_theaps_done resets the default theap to the empty sentinel before freeing
+// this thread's theaps precisely so nothing re-initializes it in that window). A NULL
+// peek is treated the same as a never-touched thread's depth reading 0 under the old
+// `mi_decl_thread` counter -- i.e. "not currently inside a profiler callback".
+static bool prof_callback_depth_active(void) {
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  return (hooks != NULL && hooks->prof_callback_depth > 0);
+}
 static inline size_t prof_min(size_t x, size_t y) { return (x < y ? x : y); }
 static inline size_t prof_max(size_t x, size_t y) { return (x > y ? x : y); }
 
@@ -20966,8 +21202,18 @@ static void prof_free_record(mi_page_t* page, void* p) {
   rec->next = prof_free; prof_free = rec;
 }
 
+// #266: unlike the rest of the top-level profiler API below, this (and mi_prof_start_ex)
+// can be reached from `_mi_prof_on_alloc`'s own `prof_auto_start()` -- i.e. from deep
+// inside `_mi_meta_zalloc`'s locked region, on a thread that is still mid-init allocating
+// its own tld/theap (MIMALLOC_PROF=1's first-ever sample decision triggers it). Forcing
+// thread init here (like the other control functions do) would recursively re-enter
+// `_mi_thread_init_with_heap` and re-acquire `subproc->theap_meta_lock` on that same
+// thread. So this peeks instead: a NULL result means "definitely not already inside a
+// profiler callback on this thread" (no callback can run without a theap), which is
+// exactly the same outcome the old `mi_decl_thread` counter's initial 0 gave on any
+// never-touched thread. See hooks-tld.h's file comment.
 bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return false;
+  if (prof_callback_depth_active()) return false;
   if (sample_rate == 0) {
     /* MIMALLOC_PROF_SAMPLE_INTERVAL is the honest name for this env var (it is an average
        byte interval, not a rate); MIMALLOC_PROF_SAMPLE_RATE (-> mi_option_prof_sample_rate)
@@ -21002,7 +21248,8 @@ bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { return mi_prof_start_s
 bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept {
   if (config == NULL) return mi_prof_start(0);
   if (config->size != sizeof(mi_prof_config_t) || config->version != MI_PROF_CONFIG_VERSION) return false;
-  if (prof_callback_depth > 0) return false;
+  // #266: see mi_prof_start_seeded above -- must peek, never force.
+  if (prof_callback_depth_active()) return false;
   const bool is_override = (config->mode == MI_PROF_CONFIG_OVERRIDE);
 
   if (config->accum) {
@@ -21121,7 +21368,8 @@ bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept {
    would make every call walk the subproc's heap list for stats it then discards. */
 void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept { mi_prof_stats_t stats; _mi_memzero(&stats, sizeof(stats)); stats.size = offsetof(mi_prof_stats_t, dropped_samples); stats.version = 1; const bool ok = mi_prof_stats_get(&stats); MI_UNUSED(ok); if (records) *records=stats.live_samples; if (bytes) *bytes=stats.live_bytes; if (unique_stacks) *unique_stacks=stats.unique_stacks; }
 void mi_prof_stop(void) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return;
   mi_lock_acquire(&prof_lock);
   mi_atomic_store_release(&prof_enabled, false);
   for (mi_prof_record_t* rec = prof_all; rec != NULL; rec = rec->all_next) { rec->page->metadata = NULL; rec->page->has_metadata = false; }
@@ -21137,7 +21385,8 @@ void mi_prof_stop(void) mi_attr_noexcept {
 }
 bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
   if (write == NULL) return false;
-  if (prof_callback_depth > 0) return false;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return false;
   prof_dump_buffer_t out = { NULL, NULL, true };
 #if MI_DEBUG
   bool lock_held = true;
@@ -21195,22 +21444,38 @@ bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
   return ok;
 }
 static void prof_file_write(void* arg, const char* buf, size_t len) { (void)fwrite(buf,1,len,(FILE*)arg); }
-bool mi_prof_dump(const char* path) mi_attr_noexcept { if (prof_callback_depth > 0) return false; if (path==NULL) return false; FILE* f=fopen(path,"wb"); if(f==NULL)return false; bool ok=mi_prof_dump_writer(prof_file_write,f); fclose(f); return ok; }
+// #266: see prof_callback_depth_active's comment above (mi_prof_dump_writer below
+// re-checks on its own; this early check just avoids opening the file needlessly).
+bool mi_prof_dump(const char* path) mi_attr_noexcept { if (prof_callback_depth_active()) return false; if (path==NULL) return false; FILE* f=fopen(path,"wb"); if(f==NULL)return false; bool ok=mi_prof_dump_writer(prof_file_write,f); fclose(f); return ok; }
 void mi_prof_reset(void) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return;
   mi_lock_acquire(&prof_lock);
   _mi_prof_stack_reset();
   mi_atomic_store_relaxed(&prof_accum_records, (size_t)0); mi_atomic_store_relaxed(&prof_accum_bytes, (size_t)0);
   mi_lock_release(&prof_lock);
 }
 bool mi_prof_visit(mi_prof_visit_fun* visitor, void* arg) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return false;
   if (visitor == NULL) return false;
+  // #266: this is the one place in this file that deliberately forces thread init
+  // (mi_theap_get_default(), NOT the peek-only pattern the rest of this file uses --
+  // see hooks-tld.h's file comment on why forcing is normally unsafe). It is required
+  // here specifically because prof_lock is held across the `visitor` callback below: if
+  // that callback frees a sampled block on this SAME thread, the nested _mi_prof_on_free
+  // MUST see prof_lock_owner==true via a REAL, shared `mi_tld_t::hooks` -- a peek-or-local
+  // fallback would give _mi_prof_on_free its own independent (and NULL, hence
+  // not-lock-owner) view, which would then try to re-acquire prof_lock and deadlock.
+  // Forcing is safe here (unlike in the hot alloc/free hooks) because mi_prof_visit is a
+  // deliberate, top-level, user-initiated call -- never reachable from inside
+  // `_mi_meta_zalloc`'s locked region (mid-init) or from mimalloc's own thread-teardown
+  // machinery (mid-teardown).
+  mi_hooks_tld_t* const hooks = &mi_theap_get_default()->tld->hooks;
+  if (hooks->prof_callback_depth > 0) return false;
   mi_lock_acquire(&prof_lock);
   _mi_prof_stack_pin_all();
-  prof_lock_owner = true; prof_callback_depth++;
+  hooks->prof_lock_owner = true; hooks->prof_callback_depth++;
   _mi_prof_stack_visit_info(visitor, arg);
-  prof_callback_depth--; prof_lock_owner = false;
+  hooks->prof_callback_depth--; hooks->prof_lock_owner = false;
   _mi_prof_stack_unpin_all_and_sweep();
   mi_lock_release(&prof_lock);
   return true;
@@ -21245,7 +21510,8 @@ static bool prof_snapshot_copy(const mi_prof_sample_info_t* info, void* arg) {
   return true;
 }
 mi_prof_snapshot_t* mi_prof_snapshot_new(void) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return NULL;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return NULL;
   mi_lock_acquire(&prof_lock);
   prof_snap_count_t counted = { 0, 0 };
   _mi_prof_stack_visit_info(prof_snapshot_count, &counted);
@@ -21278,7 +21544,8 @@ void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { if (snap
 
 bool mi_prof_modules_visit(mi_prof_module_visit_fun* visitor, void* arg) mi_attr_noexcept {
   if (visitor == NULL) return false;
-  if (prof_callback_depth > 0) return false;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return false;
   return _mi_prof_maps_visit(visitor, arg);  // OS-owned module list: no profiler lock needed.
 }
 
@@ -21419,7 +21686,8 @@ static const char* const prof_proto_fixed_strings[PB_STR_FIXED_COUNT] = { "", "a
 
 bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
   if (write == NULL) return false;
-  if (prof_callback_depth > 0) return false;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return false;
   mi_prof_snapshot_t* snap = mi_prof_snapshot_new();  // deep-copies stacks+counts under prof_lock, then releases it.
   if (snap == NULL) return false;
 
@@ -21516,7 +21784,8 @@ bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noex
   return ok;
 }
 bool mi_prof_dump_proto(const char* path) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return false;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return false;
   if (path == NULL) return false;
   FILE* f = fopen(path, "wb"); if (f == NULL) return false;
   const bool ok = mi_prof_dump_proto_writer(prof_file_write, f);
@@ -21547,7 +21816,15 @@ void _mi_prof_process_done(void) {
 void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size) {
   prof_auto_start();
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;
-  if (prof_callback_depth > 0) return;
+  // #266: peek the CURRENT thread's hooks tld here, not `theap` (the theap performing
+  // the allocation, which during a meta allocation is the shared, always-initialized
+  // `subproc->theap_meta`, not necessarily this thread's own theap) -- see
+  // hooks-tld.h's file comment. This thread can be mid-init (inside
+  // `_mi_thread_init_with_heap` -> `_mi_meta_zalloc`, allocating its OWN tld/theap) when
+  // this hook fires, in which case bail out immediately, before touching anything else.
+  mi_hooks_tld_t* const prof_hooks = _mi_hooks_tld_peek();
+  if (prof_hooks == NULL) return;
+  if (prof_hooks->prof_callback_depth > 0) return;
 
   // #266: never sample allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
   // _mi_meta_zalloc onto subproc->theap_meta). These are large (sizeof(mi_theap_t) is
@@ -21608,8 +21885,11 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
 // the caller fires one corrected _mi_prof_on_alloc afterward. Reuses prof_callback_depth,
 // the same re-entrancy guard _mi_prof_on_alloc already checks, rather than adding new
 // per-theap state.
-void _mi_prof_suppress_begin(void) { prof_callback_depth++; }
-void _mi_prof_suppress_end(void)   { prof_callback_depth--; }
+// #266: called only from already-initialized-thread call sites (guarded/aligned alloc
+// paths, never from inside `_mi_meta_zalloc`'s own call chain), but peek defensively
+// rather than force -- see hooks-tld.h's file comment.
+void _mi_prof_suppress_begin(void) { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->prof_callback_depth++; }
+void _mi_prof_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->prof_callback_depth--; }
 
 static void prof_free_collect(mi_page_t* page, mi_block_t* head) { for (mi_block_t* b=head; b != NULL && page->has_metadata; b=mi_block_next(page,b)) prof_free_record(page,b); }
 static void prof_realloc_in_place(mi_page_t* page, void* p, size_t size) {
@@ -21622,19 +21902,30 @@ static void prof_realloc_in_place(mi_page_t* page, void* p, size_t size) {
     if (rec->ptr == block) { mi_atomic_store_relaxed(&prof_bytes, mi_atomic_load_relaxed(&prof_bytes) - rec->size + size); _mi_prof_stack_resize(rec->stack, rec->size, size); rec->size = size; break; }
   }
 }
+// #266: these run on the FREEING thread (which for a cross-thread free is not the
+// allocating thread), so each peeks its own current-thread hooks -- see hooks-tld.h's
+// file comment. `page->has_metadata` (checked first, not TLS) already means this page
+// was sampled, i.e. profiling is/was active, but the freeing thread itself may still be
+// mid-init (or simply never allocated anything through mimalloc); a NULL peek there
+// just means "definitely not the thread currently inside mi_prof_visit's callback"
+// (that path forces init -- see mi_prof_visit above), so fall through to the normal
+// locked path exactly like a peek that found prof_lock_owner == false.
 void _mi_prof_on_free(mi_page_t* page, void* p) {
   if mi_likely(!page->has_metadata) return;
-  if (prof_lock_owner) { prof_free_record(page,p); return; }
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks != NULL && hooks->prof_lock_owner) { prof_free_record(page,p); return; }
   mi_lock_acquire(&prof_lock); prof_free_record(page,p); mi_lock_release(&prof_lock);
 }
 void _mi_prof_on_free_collect(mi_page_t* page, mi_block_t* head) {
   if mi_likely(!page->has_metadata) return;
-  if (prof_lock_owner) { prof_free_collect(page,head); return; }
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks != NULL && hooks->prof_lock_owner) { prof_free_collect(page,head); return; }
   mi_lock_acquire(&prof_lock); prof_free_collect(page,head); mi_lock_release(&prof_lock);
 }
 void _mi_prof_on_realloc_in_place(mi_page_t* page, void* p, size_t size) {
   if mi_likely(!page->has_metadata) return;
-  if (prof_lock_owner) { prof_realloc_in_place(page,p,size); return; }
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks != NULL && hooks->prof_lock_owner) { prof_realloc_in_place(page,p,size); return; }
   mi_lock_acquire(&prof_lock); prof_realloc_in_place(page,p,size); mi_lock_release(&prof_lock);
 }
 

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fe76d060 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8e878f17 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -7307,6 +7307,41 @@ extern void* _mi_page_malloc_zero(mi_theap_t* theap, mi_page_t* page, size_t siz
 
 // main allocation primitives for small and generic allocation
 
+#if MI_GUARDED
+// The guarded allocator internally over-allocates (block + trailing guard page) and its
+// own inner allocation hooks would otherwise report that inflated size, and the wrong
+// (interior, block+offset) pointer identity, to observers instead of the caller's actual
+// request. Both call sites below (small and generic dispatch) need the identical
+// suppress-then-refire correction, so it lives once here (rule 6: each upstream call site
+// stays a single guarded line).
+//
+// Pointer identity matters as much as size: the free-side hooks (free.c) and DHAT
+// (dhat.c) key a live record by the BLOCK START, not the caller-visible pointer --
+// _mi_page_ptr_unalign(gpage, gp) recovers that. Get this wrong and every guarded
+// allocation leaks its DHAT/profiler record forever (never found on free, since free
+// looks it up by a different pointer than the one it was recorded under).
+static mi_decl_noinline void* mi_theap_malloc_guarded_hooked(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept {
+  _mi_memevt_suppress_begin();
+  #if MI_PPROF
+  _mi_prof_suppress_begin();
+  #endif
+  void* const gp = _mi_theap_malloc_guarded(theap, size, zero, ppage);
+  #if MI_PPROF
+  _mi_prof_suppress_end();
+  #endif
+  _mi_memevt_suppress_end();
+  if (gp != NULL) {
+    mi_page_t* const gpage = _mi_ptr_page(gp);
+    mi_block_t* const gblock = _mi_page_ptr_unalign(gpage, gp);
+    #if MI_PPROF
+    _mi_prof_on_alloc(theap, gpage, gblock, size);
+    #endif
+    _mi_memevt_on_alloc(gpage, gblock, size);
+  }
+  return gp;
+}
+#endif
+
 // internal small size allocation
 static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_nonnull(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
@@ -7320,35 +7355,7 @@ static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_non
   #endif
   #if MI_GUARDED
   if mi_unlikely(mi_theap_malloc_use_guarded(theap,size)) {
-    // The guarded allocator internally over-allocates (block + trailing guard page) and
-    // its own inner allocation hooks would otherwise report that inflated size to
-    // observers (memevt) and account it against the sampling budget (the profiler)
-    // instead of the caller's actual request. Suppress both and publish one corrected
-    // event/sample keyed by the real page/block, matching
-    // alloc-aligned.c:mi_theap_malloc_guarded_aligned's existing memevt pattern for the
-    // same underlying call.
-    _mi_memevt_suppress_begin();
-    #if MI_PPROF
-    _mi_prof_suppress_begin();
-    #endif
-    void* const gp = _mi_theap_malloc_guarded(theap, size, zero, ppage);
-    #if MI_PPROF
-    _mi_prof_suppress_end();
-    #endif
-    _mi_memevt_suppress_end();
-    if (gp != NULL) {
-      mi_page_t* const gpage = _mi_ptr_page(gp);
-      #if MI_PPROF
-      // The profiler's own free path (free.c) looks a sample up by the block start it
-      // computes via _mi_page_ptr_unalign, not by the caller-visible (possibly interior,
-      // for a guarded allocation) pointer -- see profile.c:prof_free_record's `ptr != p`
-      // match. Record under that same identity or the free-side lookup never finds it
-      // and the sample leaks until the page itself is reclaimed.
-      _mi_prof_on_alloc(theap, gpage, _mi_page_ptr_unalign(gpage, gp), size);
-      #endif
-      _mi_memevt_on_alloc(gpage, gp, size);
-    }
-    return gp;
+    return mi_theap_malloc_guarded_hooked(theap, size, zero, ppage);
   }
   #endif
 
@@ -7373,29 +7380,7 @@ static mi_decl_forceinline void* mi_theap_malloc_generic(mi_theap_t* theap, size
   if (theap!=NULL)
   #endif
   if (huge_alignment==0 && mi_theap_malloc_use_guarded(theap, size)) {
-    // See the matching comment in mi_theap_malloc_small_zero_nonnull above.
-    _mi_memevt_suppress_begin();
-    #if MI_PPROF
-    _mi_prof_suppress_begin();
-    #endif
-    void* const gp = _mi_theap_malloc_guarded(theap, size, zero, ppage);
-    #if MI_PPROF
-    _mi_prof_suppress_end();
-    #endif
-    _mi_memevt_suppress_end();
-    if (gp != NULL) {
-      mi_page_t* const gpage = _mi_ptr_page(gp);
-      #if MI_PPROF
-      // The profiler's own free path (free.c) looks a sample up by the block start it
-      // computes via _mi_page_ptr_unalign, not by the caller-visible (possibly interior,
-      // for a guarded allocation) pointer -- see profile.c:prof_free_record's `ptr != p`
-      // match. Record under that same identity or the free-side lookup never finds it
-      // and the sample leaks until the page itself is reclaimed.
-      _mi_prof_on_alloc(theap, gpage, _mi_page_ptr_unalign(gpage, gp), size);
-      #endif
-      _mi_memevt_on_alloc(gpage, gp, size);
-    }
-    return gp;
+    return mi_theap_malloc_guarded_hooked(theap, size, zero, ppage);
   }
   #endif
   #if !MI_THEAP_INITASNULL
@@ -8272,17 +8257,34 @@ static mi_decl_noinline mi_decl_restrict void* mi_theap_malloc_guarded_aligned(m
   }
   const size_t oversize = size + alignment - 1;
   /* The allocator needs oversize bytes internally, but observers describe the
-     caller's requested aligned block. Suppress the base allocation event and
-     publish one normalized event below keyed by the actual page block. */
+     caller's requested aligned block. Suppress the base allocation event/sample and
+     publish one normalized event/sample below keyed by the actual page block. */
   _mi_memevt_suppress_begin();
+  #if MI_PPROF
+  _mi_prof_suppress_begin();
+  #endif
   void* const base = _mi_theap_malloc_guarded(theap, oversize, zero, ppage);
+  #if MI_PPROF
+  _mi_prof_suppress_end();
+  #endif
   _mi_memevt_suppress_end();
   if (base==NULL) return NULL;
   void* const p = _mi_align_up_ptr(base, alignment);
   mi_track_align(base, p, (uint8_t*)p - (uint8_t*)base, size);
   mi_assert_internal(mi_usable_size(p) >= size);
   mi_assert_internal(_mi_is_aligned(p, alignment));
-  _mi_memevt_on_alloc(_mi_ptr_page(base), base, size);
+  {
+    // #266: key the event/sample by the block start, not `base` (still an interior,
+    // guard-offset pointer here) -- see alloc.c:mi_theap_malloc_guarded_hooked's
+    // matching comment. Getting this wrong leaks a DHAT/profiler record forever, since
+    // free-side lookups (free.c, dhat.c) key by block start and would never find it.
+    mi_page_t* const bpage = _mi_ptr_page(base);
+    mi_block_t* const bblock = _mi_page_ptr_unalign(bpage, base);
+    #if MI_PPROF
+    _mi_prof_on_alloc(theap, bpage, bblock, size);
+    #endif
+    _mi_memevt_on_alloc(bpage, bblock, size);
+  }
   return p;
 }
 
@@ -10440,6 +10442,18 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
   mi_assert_internal(!mi_page_all_free(page));
   mi_assert_internal(page->next==NULL && page->prev == NULL);
   mi_assert_internal(mi_theap_matches_thread(current_theap));
+
+  // #266: every caller of this function reaches it while still owning `page` (asserted
+  // above), so this is safe, and narrows -- though for a lock-free deferred free list
+  // cannot fully close -- the window in which a cross-thread free's memevt/profiler
+  // record collection (_mi_prof_on_free_collect via mi_page_thread_collect_to_local,
+  // page.c) waits on some theap later walking this exact page again, which an abandoned
+  // page is not guaranteed to happen for (mi_collect only visits pages the calling
+  // theap currently owns; an abandoned page sits in the arena's own bookkeeping until
+  // some thread specifically reclaims it, which may be never). Investigated as the
+  // suspected cause of ctest-shared (windows-latest)'s test-profile/-accum/-auto
+  // failures at test/test-profile.c's cross-thread-free-of-sampled-blocks check.
+  _mi_page_free_collect(page, false);
   // mi_assert_internal(current_theap == _mi_page_associated_theap(page));
 
   // add to abandoned?
@@ -14654,7 +14668,8 @@ static void mi_heap_main_init_once(void) {
   // application buffer-overrun to catch here) and corrupts memevt/profiler hook
   // accounting, since the guarded allocator's own inner request reports a different
   // (guard-page-inflated) size than the logical allocation. Never guard theap_meta,
-  // regardless of the global MIMALLOC_GUARDED_SAMPLE_RATE setting.
+  // regardless of the global MIMALLOC_GUARDED_SAMPLE_RATE setting. Diverges from
+  // upstream, which has no such exemption (see docs/fork-divergence.md).
   mi_process_theap_meta.guarded_sample_rate = 0;
   #endif
   subproc_main->theap_meta = &mi_process_theap_meta;
@@ -14957,31 +14972,49 @@ mi_decl_nodiscard bool mi_is_redirected(void) mi_attr_noexcept {
   return _mi_is_redirected();
 }
 
-// Called once by the process loader from `src/prim/prim.c` before `main` is called.
+// Called once by the process loader from `src/prim/prim.c` before `main` is called --
+// per this comment, always has been. But that "called once" guarantee is only as good
+// as whatever constructor mechanism actually calls it, and on win-gnu it is not: MinGW
+// registers `mi_tls_attach` in the `.CRT$XLB` TLS-callback table AND still emits a GCC
+// `__attribute__((constructor))` for the same entry point (src/prim/prim.c), because
+// `MI_PRIM_HAS_PROCESS_ATTACH` (src/prim/windows/prim.c) is only defined for the
+// `MI_WIN_INIT_USE_TLS_DLLMAIN`/`MI_SHARED_LIB` paths, not for the plain `__MINGW32__`
+// TLS-callback path upstream `1cf88691` switched MinGW onto (see docs/upstreaming.md;
+// at our previous pin, MinGW used MI_WIN_INIT_USE_FLS instead, which set that macro and
+// suppressed the constructor). So on win-gnu specifically this function really does run
+// twice: once via the TLS callback's DLL_PROCESS_ATTACH, once via the constructor.
+// `mi_process_init()` below already tolerates that (it has its own do-once guard), but
+// nothing else in this function did until now -- guard the whole body so a second call
+// is a true no-op rather than re-running side effects meant to happen exactly once
+// (_mi_options_post_init's mi_add_stderr_output is ALSO defensively idempotent now, as
+// belt-and-suspenders, but this is the actual fix for the "called once" contract this
+// function's own comment claims).
 void _mi_auto_process_init(void) {
-  os_preloading = false;
+  mi_atomic_do_once {
+    os_preloading = false;
 
-  mi_process_init();
-  mi_process_setup_auto_thread_done();
+    mi_process_init();
+    mi_process_setup_auto_thread_done();
 
-  _mi_options_post_init();  // now we can print to stderr
-  if (_mi_is_redirected()) _mi_verbose_message("malloc is redirected.\n");
+    _mi_options_post_init();  // now we can print to stderr
+    if (_mi_is_redirected()) _mi_verbose_message("malloc is redirected.\n");
 
-  // show message from the redirector (if present)
-  const char* msg = NULL;
-  _mi_allocator_init(&msg);
-  if (msg != NULL && (mi_option_is_enabled(mi_option_verbose) || mi_option_is_enabled(mi_option_show_errors))) {
-    _mi_fputs(NULL,NULL,NULL,msg);
-  }
+    // show message from the redirector (if present)
+    const char* msg = NULL;
+    _mi_allocator_init(&msg);
+    if (msg != NULL && (mi_option_is_enabled(mi_option_verbose) || mi_option_is_enabled(mi_option_show_errors))) {
+      _mi_fputs(NULL,NULL,NULL,msg);
+    }
 
-  // reseed random
-  mi_theap_t* theap = _mi_theap_default();
-  if (theap != NULL) {
-    _mi_random_reinit_if_weak(&theap->random);
-    mi_subproc_t* subproc = _mi_theap_subproc(theap);
-    if (subproc->theap_meta != NULL) {
-      mi_lock(&subproc->theap_meta_lock) {
-        _mi_random_reinit_if_weak(&subproc->theap_meta->random);
+    // reseed random
+    mi_theap_t* theap = _mi_theap_default();
+    if (theap != NULL) {
+      _mi_random_reinit_if_weak(&theap->random);
+      mi_subproc_t* subproc = _mi_theap_subproc(theap);
+      if (subproc->theap_meta != NULL) {
+        mi_lock(&subproc->theap_meta_lock) {
+          _mi_random_reinit_if_weak(&subproc->theap_meta->random);
+        }
       }
     }
   }
@@ -23058,23 +23091,66 @@ static mi_lock_t     mi_subprocs_lock = MI_LOCK_INITIALIZER;
   detached `theap_meta`.
 ----------------------------------------------------------- */
 
-void* _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid ) {
-  mi_assert_internal(subproc->theap_meta != NULL);
+// #266 (macOS ctest-debug-full test-stress-dynamic, ASan/DYLD_INSERT_LIBRARIES-style
+// early process bootstrap under MI_DEBUG_FULL's reentrancy checker): a thread's very
+// first touch of `heap_main` while THIS thread is already inside one of the three
+// functions below -- e.g. theap_meta's own allocation growing into a fresh arena page,
+// which needs arena bookkeeping allocated from `heap_main` (src/arena.c's
+// "arena-pages-metadata" site), which bootstraps that thread's `heap_main` theap
+// (src/theap.c:_mi_theap_init's caller, theap.c ~317), which calls `_mi_meta_zalloc`
+// again for the SAME subproc -- reaches this file recursively on the same thread while
+// `subproc->theap_meta_lock` (a plain, non-recursive pthread_mutex/SRWLock via
+// mi_lock_t) is still held by the outer call. That is a genuine reentrant-acquire
+// deadlock, not just a diagnostic false positive: MI_DEBUG_FULL's checker
+// (include/mimalloc/atomic.h's mi_lock_acquire, diagnostic.c) caught it before the
+// underlying primitive actually wedged.
+//
+// Track, per thread, the subproc currently being meta-allocated-into; if a nested call
+// targets the SAME subproc, the outer lock already protects it, so skip re-acquiring
+// (recursive-mutex semantics, implemented without changing mi_lock_t's type, which
+// backs every other lock in the codebase too). A nested call for a genuinely different
+// subproc is unaffected and still locks normally -- multi-subprocess reentrancy across
+// two different subprocs' meta locks is a separate, far rarer hazard this does not
+// claim to address.
+static mi_decl_thread mi_subproc_t* mi_meta_lock_thread_owner;
+
+static void* mi_meta_zalloc_locked(mi_subproc_t* subproc, size_t size) {
+  if (mi_meta_lock_thread_owner == subproc) {
+    // already holding this subproc's theap_meta_lock on this thread -- don't re-acquire
+    return mi_theap_zalloc(subproc->theap_meta, size);
+  }
   void* p = NULL;
   mi_lock(&subproc->theap_meta_lock) {
+    mi_subproc_t* const prev_owner = mi_meta_lock_thread_owner;
+    mi_meta_lock_thread_owner = subproc;
     p = mi_theap_zalloc(subproc->theap_meta, size);
-    if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
+    mi_meta_lock_thread_owner = prev_owner;
   }
+  return p;
+}
+
+void* _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid ) {
+  mi_assert_internal(subproc->theap_meta != NULL);
+  void* p = mi_meta_zalloc_locked(subproc, size);
+  if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
   return p;
 }
 
 void* _mi_meta_zalloc_aligned( mi_subproc_t* subproc, size_t size, size_t aligned, mi_memid_t* memid ) {
   mi_assert_internal(subproc->theap_meta != NULL);
   void* p = NULL;
-  mi_lock(&subproc->theap_meta_lock) {
+  if (mi_meta_lock_thread_owner == subproc) {
     p = mi_theap_zalloc_aligned(subproc->theap_meta, size, aligned);
-    if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
   }
+  else {
+    mi_lock(&subproc->theap_meta_lock) {
+      mi_subproc_t* const prev_owner = mi_meta_lock_thread_owner;
+      mi_meta_lock_thread_owner = subproc;
+      p = mi_theap_zalloc_aligned(subproc->theap_meta, size, aligned);
+      mi_meta_lock_thread_owner = prev_owner;
+    }
+  }
+  if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
   return p;
 }
 
@@ -23082,10 +23158,7 @@ void* _mi_meta_rezalloc( mi_subproc_t* subproc, void* oldp, size_t newsize, mi_m
   mi_assert_internal(subproc->theap_meta != NULL);
   // note: since we take a meta lock we cannot use `mi_theap_rezalloc` as that could call `mi_free` which
   // can call `mi_stat_free` which would try to take the meta lock again. See issue #1358.
-  void* p = NULL;  
-  mi_lock(&subproc->theap_meta_lock) {
-    p = mi_theap_zalloc(subproc->theap_meta, newsize);
-  }
+  void* p = mi_meta_zalloc_locked(subproc, newsize);
   if (p!=NULL) {
     if (oldp!=NULL) {
       const size_t oldsize  = mi_usable_size(oldp);
@@ -23222,7 +23295,8 @@ mi_subproc_id_t mi_subproc_new(void) {
   _mi_theap_init(theap_meta,heap_main,parent->theap_meta->tld /* detached tld */);
   #if MI_GUARDED
   // See the matching comment in init.c's process-main theap_meta bootstrap (#266):
-  // internal allocator bookkeeping must never be guarded.
+  // internal allocator bookkeeping must never be guarded. Diverges from upstream (see
+  // docs/fork-divergence.md).
   theap_meta->guarded_sample_rate = 0;
   #endif
   subproc->theap_meta = theap_meta;

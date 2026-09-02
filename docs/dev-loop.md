@@ -14,14 +14,14 @@ and fails if a job's flags drift out of sync with the script.
 uv run ci/verify_local.py                     # everything fast (slow ctest tier excluded)
 uv run ci/verify_local.py --only release,lint  # just these configs
 uv run ci/verify_local.py --slow               # also run the long-tail ctest tier
-uv run ci/verify_local.py --list                # print the config table and exit
+uv run ci/verify_local.py --list                # print the config + bundle tables
 uv run ci/verify_local.py --jobs 8              # override the total build/ctest job budget
 uv run ci/verify_local.py --keep-going          # run every config even after one fails
 uv run ci/verify_local.py --selftest            # trivially fast dry-run, no real builds
 ```
 
-Ten configs run concurrently (`release`, `off`, `debug-full`, `guarded`, `shared`,
-`memory-gate`, `diag`, `rust`, `lint`, `asan`), each building into its own directory
+Eleven configs run concurrently (`release`, `off`, `debug-full`, `guarded`, `shared`,
+`bundle`, `memory-gate`, `diag`, `rust`, `lint`, `asan`), each building into its own directory
 under `out/verify/<config>/` (gitignored, incremental across invocations) with Ninja
 and ccache when available. `asan` needs `clang`/`clang++` on `PATH` and reports
 SKIPPED with a reason otherwise. The long tests (`test-profile-race`,
@@ -31,6 +31,34 @@ expect on the order of a few minutes wall-clock for the fast tier -- well under 
 sum of the per-config times, which the final table reports alongside the wall clock so
 the parallel speedup is visible. A failed config prints the last ~40 lines of its full
 log (`out/verify/<config>/verify.log`) inline.
+
+## Reproducing a macOS or Windows CI bundle here
+
+The macOS and Windows gates do not build on the platform they target: `macos-bundles.yml`
+and `windows-bundles.yml` cross-compile the test binaries on Linux through soldr and ship
+them to one runner per OS as a portable *test bundle* (#277). That means everything up to
+the execution step is reproducible on this box, and `--bundle` does it:
+
+```bash
+uv run ci/verify_local.py --list                          # names, triples, cmake flags
+uv run ci/verify_local.py --bundle macos-arm64-release
+uv run ci/verify_local.py --bundle windows-gnu-x64-debug-full
+```
+
+Fourteen names, exactly the two workflows' build matrices:
+`macos-{arm64,x64}-{release,debug-full,leak}` and
+`windows-{gnu,msvc}-x64-{release,debug-full,shared,leak}`. Each one runs the same
+`soldr prepare --target <triple>`, the same `cmake/toolchains/soldr-<triple>.cmake`, the
+same matrix flags and the same `ci/bundle_tests.py` arguments CI uses, asserts the resolved
+`-- Link libraries` line the build job asserts, and prints the bundle path, its manifest
+summary and the `ci/run_test_bundle.py` command to replay it on the target OS. Output goes
+to `out/verify/bundles/<name>/` (gitignored, incremental).
+
+It cannot *run* the bundle -- that needs the target OS. Everything else fails here first:
+a configure that picked up a host library, a link that lost `__interpose` or its TLS
+directory, a bundle missing a toolchain runtime DLL, a manifest carrying an absolute path.
+`ci/tests/test_verify_local.py` parses both workflow matrices and fails if a name, triple,
+cmake flag or `bundle_tests.py` argument drifts.
 
 # Fast local Linux build loop
 

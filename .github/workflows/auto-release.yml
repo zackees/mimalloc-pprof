@@ -1,6 +1,47 @@
 name: auto-release
 
-# Cuts a release of the mimalloc-pprof C amalgamation + crates.io publish.
+# Cuts a release of the mimalloc-pprof C amalgamation + crates.io publish, plus the
+# cross-built binary assets (#277 phase E).
+#
+# WHO BUILDS THE SHIPPED BINARIES -- the decision, and why it is not the one #277's
+# phase table first wrote down:
+#
+#   Every binary release asset is CROSS-BUILT ON LINUX through soldr. Not one of them is
+#   produced by the platform's own toolchain on that platform's own runner.
+#
+# #277 row E originally said "shipped release assets stay built by the platform's own
+# toolchain". Two owner decisions since then overrode it:
+#
+#   1. No macOS build or test may run on a native Mac runner anywhere in this repository
+#      (enforced by ci/lint_no_macos_runners.py, which this workflow is checked by). There
+#      is therefore no Apple toolchain available to build an Apple asset with.
+#   2. Cross-compilation is a PRODUCT requirement, not a CI cost measure: mimalloc-pprof
+#      ships inside cross-compiled code, so the Linux-cross-built artifact IS the product.
+#      Shipping a natively-built binary while testing a cross-built one would mean the
+#      thing under test and the thing shipped are different binaries.
+#
+# So: the same `soldr prepare` toolchains, the same `cmake/toolchains/soldr-<triple>.cmake`
+# toolchain files and the same commit that produce the test bundles executed by
+# `macos-bundles.yml` and `windows-bundles.yml` also produce these assets. The bundles are
+# the evidence for the assets.
+#
+# What that costs, stated rather than hidden:
+#   - macOS assets are built by soldr's clang 21 against soldr's Apple SDK, NOT by Xcode's
+#     clang against Xcode's SDK. Nothing in this repository compiles with Apple's toolchain
+#     any more (docs/ci-gates.md, "macOS").
+#   - The `windows-x64-msvc` asset is MSVC-ABI, but built by clang-cl + lld-link with the
+#     CRT pinned to /MD -- it is not a `cl` binary. c-unit.yml keeps one native `cl`
+#     Release ctest job as the correctness gate for `cl` (CLAUDE.md rule 3); that job ships
+#     nothing, and never did. There has never been a natively-built release asset here to
+#     "retain".
+#   - The `windows-x64-gnu` asset is mingw-w64 gcc 15 UCRT. `mimalloc.dll` imports
+#     `libgcc_s_seh-1.dll` (for `__popcountdi2`), which a plain Windows machine does not
+#     have, so the archive SHIPS that DLL beside it and the job asserts the whole import
+#     closure resolves. Shipping it (rather than relinking `-static-libgcc`) keeps the
+#     shipped binary byte-identical to the one `windows-bundles.yml` tests.
+#   - The `windows-x64-msvc` asset imports VCRUNTIME140.dll/MSVCP140.dll: the Visual C++
+#     redistributable, which is not part of Windows. Recorded in the archive's
+#     PROVENANCE.txt rather than silently assumed.
 #
 # Trigger design (see rust/mimalloc-pprof/vendor/README.md for what gets shipped):
 #   - workflow_dispatch: manual, explicit human/agent decision. Default `dry_run: true`
@@ -41,12 +82,14 @@ env:
 
 jobs:
   build-and-package:
-    name: Build, validate, package (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+    name: Build, validate, package (ubuntu-latest)
+    # One row, not a matrix. #277's review addendum, item 5: everything this job does --
+    # `xtask check`, `cargo test`, `cargo publish --dry-run`, and packaging a vendored C
+    # amalgamation that is architecture-independent -- is platform-independent, so the
+    # `windows-latest` row it used to carry was a second Windows queue slot per release
+    # that verified nothing the ubuntu row does not. The binaries are built by
+    # `build-binaries` below, on Linux, for every shipped platform.
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: rust
@@ -83,10 +126,7 @@ jobs:
       - name: cargo publish --dry-run (mimalloc-pprof)
         run: soldr cargo publish --dry-run -p mimalloc-pprof --locked
 
-      # The vendor/ contents are identical across the matrix (xtask check above just
-      # proved that); only one OS needs to actually produce the release ZIP.
       - name: Package release ZIP (vendor/ files only)
-        if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
           set -euo pipefail
@@ -102,16 +142,252 @@ jobs:
           cp "$RUNNER_TEMP/mimalloc-pprof-c.zip" dist/
 
       - name: Upload release ZIP artifact
-        if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
           name: mimalloc-pprof-c-zip
           path: rust/dist/mimalloc-pprof-c.zip
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------------
+  # The shipped binaries. Four lanes, all on Linux, all through soldr -- see this file's
+  # header for why none of them runs on the platform it targets, and docs/ci-gates.md
+  # ("Release assets are cross-built") for the same decision written out at length.
+  #
+  # These use the SAME toolchain files and the SAME `soldr prepare` targets as
+  # macos-bundles.yml and windows-bundles.yml, so the binary a release ships is produced
+  # by the toolchain whose output those workflows actually execute. Locally reproducible
+  # with `uv run ci/verify_local.py --bundle <lane>-release` (#277 phase F), which builds
+  # the test bundle from the same configure line plus MI_BUILD_TESTS.
+  build-binaries:
+    name: Cross-build release binaries (${{ matrix.asset }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: macos-arm64
+            triple: aarch64-apple-darwin
+            archive: tar.gz
+          - asset: macos-x86_64
+            triple: x86_64-apple-darwin
+            archive: tar.gz
+          - asset: windows-x64-gnu
+            triple: x86_64-pc-windows-gnu
+            archive: zip
+          - asset: windows-x64-msvc
+            triple: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - uses: zackees/setup-soldr@v0
+        with:
+          # This job drives CMake directly; there is no `soldr cargo` for zccache to wrap.
+          cache: false
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+      - name: Cache the prepared ${{ matrix.triple }} toolchain
+        uses: actions/cache@v4
+        with:
+          # Deliberately the same path and key macos-bundles.yml / windows-bundles.yml use,
+          # so a release run hits the cache those workflows already warmed on this commit.
+          path: ~/soldr-${{ matrix.triple }}.tar.zst
+          key: soldr-prepare-${{ matrix.triple }}-${{ hashFiles('rust/rust-toolchain.toml') }}
+      - name: Prepare the soldr ${{ matrix.triple }} toolchain
+        # `soldr prepare` resolves rustc from a rust-toolchain.toml at or above the working
+        # directory, which is why this runs in rust/.
+        working-directory: rust
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          archive="$HOME/soldr-$TRIPLE.tar.zst"
+          args=(--target "$TRIPLE" --github-env "$GITHUB_ENV" --save "$archive")
+          if [ -f "$archive" ]; then
+            args=(--restore "$archive" "${args[@]}")
+          fi
+          soldr prepare "${args[@]}"
+      - name: Configure, build and install
+        # MI_BUILD_TESTS=OFF is the only difference from the bundle lanes' Release
+        # configure line: a release asset ships the library, not 35 test executables.
+        # The install rules carry this fork's own headers (include/mimalloc/profile.h and
+        # memory-events.h) as well as upstream's, plus the pkg-config and CMake package
+        # files and, on Windows, mimalloc-redirect.dll -- verified on all four lanes.
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_TESTS=OFF \
+            --toolchain cmake/toolchains/soldr-${{ matrix.triple }}.cmake \
+            --log-level=VERBOSE 2>&1 | tee configure.log
+          # Assert on the RESOLVED library list, not on the option that was passed in --
+          # the MI_GUARDED lesson from docs/ci-gates.md. On Darwin this is load-bearing:
+          # without the toolchain file's find-root confinement, CMakeLists.txt's
+          # find_link_library() hands the host's ELF librt.so to a Mach-O link.
+          case "${{ matrix.triple }}" in
+            *-apple-darwin) want='pthread' ;;
+            *)              want='psapi;shell32;user32;advapi32;bcrypt' ;;
+          esac
+          if ! grep -qE "^-- Link libraries *: *${want}\$" configure.log; then
+            echo "::error::the ${{ matrix.triple }} link resolved unexpected libraries; expected exactly '${want}'"
+            grep -E 'Link libraries' configure.log || true
+            exit 1
+          fi
+          cmake --build build --parallel
+          cmake --install build --prefix "$PWD/stage"
+      - name: Ship the toolchain runtime DLLs, and prove the import closure resolves
+        # windows-gnu only in effect: soldr's mingw-w64 links mimalloc.dll against
+        # libgcc_s_seh-1.dll (for __popcountdi2), which a plain Windows machine does not
+        # have -- and a missing DLL is a dialog-free 0xC0000135, not a legible error. The
+        # scan is the same one ci/bundle_tests.py runs for the test bundles, called
+        # directly so the asset and the tested bundle make the same guarantee.
+        #
+        # --allow-msvc-runtime for the MSVC-ABI lane: VCRUNTIME140.dll/MSVCP140.dll are the
+        # Visual C++ redistributable, not part of Windows. That is a real requirement on
+        # the consumer, so it is recorded in PROVENANCE.txt below rather than papered over.
+        if: startsWith(matrix.triple, 'x86_64-pc-windows')
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          if [ "$TRIPLE" = "x86_64-pc-windows-gnu" ]; then
+            objdump="$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump"
+            search="$MINGW_W64_CROSS_ROOT/x86_64-w64-mingw32/lib"
+            allow_msvc=0
+          else
+            objdump=llvm-objdump
+            search=""
+            allow_msvc=1
+          fi
+          OBJDUMP="$objdump" SEARCH="$search" ALLOW_MSVC="$allow_msvc" uv run python - <<'PY'
+          import os, shutil, sys
+          from pathlib import Path
+          sys.path.insert(0, "ci")
+          from bundle_tests import resolve_runtime_dlls
+          stage = Path("stage")
+          staged = [p for p in stage.rglob("*") if p.suffix.lower() in (".dll", ".exe")]
+          if not staged:
+              sys.exit("no PE files were installed into stage/ -- nothing to ship")
+          dirs = [Path(os.environ["SEARCH"])] if os.environ["SEARCH"] else []
+          extra = resolve_runtime_dlls(
+              staged, dirs, os.environ["OBJDUMP"], os.environ["ALLOW_MSVC"] == "1"
+          )
+          for src in extra:
+              shutil.copy2(src, stage / "bin" / src.name)
+              print(f"shipping toolchain runtime: {src}")
+          print(f"import closure resolves for {len(staged)} PE file(s)")
+          PY
+      - name: Prove the asset is really for ${{ matrix.asset }}
+        # A release that silently shipped host ELF objects under a macOS name is the
+        # failure this whole cross-built design risks. Assert on the artifact.
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          echo "## ${{ matrix.asset }}" >> "$GITHUB_STEP_SUMMARY"
+          case "$TRIPLE" in
+            aarch64-apple-darwin)
+              llvm-objdump --macho --private-headers stage/lib/libmimalloc.3*.dylib | tee hdr.txt
+              grep -E 'MH_MAGIC_64 +ARM64' hdr.txt
+              ;;
+            x86_64-apple-darwin)
+              llvm-objdump --macho --private-headers stage/lib/libmimalloc.3*.dylib | tee hdr.txt
+              grep -E 'MH_MAGIC_64 +X86_64' hdr.txt
+              ;;
+            x86_64-pc-windows-gnu)
+              "$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump" -f stage/bin/mimalloc.dll | tee hdr.txt
+              grep -q 'file format pei-x86-64' hdr.txt
+              test -f stage/bin/mimalloc-redirect.dll
+              test -f stage/bin/libgcc_s_seh-1.dll
+              ;;
+            x86_64-pc-windows-msvc)
+              llvm-objdump -f stage/bin/mimalloc.dll | tee hdr.txt
+              grep -q 'file format coff-x86-64' hdr.txt
+              test -f stage/bin/mimalloc-redirect.dll
+              ;;
+          esac
+          {
+            echo '```'
+            find stage -type f -o -type l | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Write PROVENANCE.txt
+        # The archive has to say what built it and what the consumer still needs. A user
+        # who downloads `windows-x64-msvc` and finds it needs the VC++ redistributable
+        # should learn that from the archive, not from a linker error.
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          {
+            echo "mimalloc-pprof ${GITHUB_REF_NAME} -- ${{ matrix.asset }}"
+            echo
+            echo "commit:   ${GITHUB_SHA}"
+            echo "target:   ${TRIPLE}"
+            echo "built on: ubuntu-latest (Linux), cross-compiled through soldr $(soldr --version 2>/dev/null || echo '?')"
+            echo "config:   -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_TESTS=OFF"
+            echo
+            echo "This binary was NOT built on the platform it targets. Every mimalloc-pprof"
+            echo "release asset is cross-compiled on Linux, deliberately: mimalloc-pprof ships"
+            echo "inside cross-compiled code, so the cross-built artifact is the product, and"
+            echo "it is the artifact this project's CI actually executes its test suite from"
+            echo "(.github/workflows/macos-bundles.yml, windows-bundles.yml)."
+            echo
+            case "${TRIPLE}" in
+              *-apple-darwin)
+                echo "compiler: soldr's clang (LLVM 21) + ld64.lld, against soldr's Apple SDK."
+                echo "          Not Xcode's clang and not Xcode's SDK."
+                echo "requires: nothing beyond the deployment target recorded in the Mach-O"
+                echo "          load commands."
+                ;;
+              x86_64-pc-windows-gnu)
+                echo "compiler: soldr's mingw-w64 gcc 15 (UCRT), not MSYS2's msvcrt lane."
+                echo "requires: libgcc_s_seh-1.dll, SHIPPED in bin/ beside mimalloc.dll."
+                echo "          mimalloc.dll imports it for __popcountdi2; keep them together."
+                ;;
+              x86_64-pc-windows-msvc)
+                echo "compiler: clang-cl + lld-link (LLVM 21), MSVC ABI, CRT pinned to /MD."
+                echo "          This is NOT a \`cl\` binary. A native \`cl\` Release ctest job"
+                echo "          remains a hard CI gate for cl compatibility (CLAUDE.md rule 3),"
+                echo "          but it ships nothing."
+                echo "requires: the Visual C++ redistributable (VCRUNTIME140.dll, MSVCP140.dll)."
+                echo "          These are not part of Windows."
+                ;;
+            esac
+            echo
+            echo "layout:   bin/ runtime DLLs (Windows), lib/ import+static libraries and the"
+            echo "          CMake package + pkg-config files, include/ headers (this fork's"
+            echo "          mimalloc/profile.h and mimalloc/memory-events.h included)."
+          } > stage/PROVENANCE.txt
+          cat stage/PROVENANCE.txt
+      - name: Archive
+        # tar.gz for macOS: the libmimalloc.dylib -> libmimalloc.3.dylib SONAME chain is
+        # symlinks, which zip does not preserve. zip for Windows, where nothing is a
+        # symlink and a .zip is what a Windows consumer can open with no extra tool.
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          name="mimalloc-pprof-${ASSET}"
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            tar -C stage -czf "dist/${name}.tar.gz" .
+          else
+            (cd stage && zip -r "$GITHUB_WORKSPACE/dist/${name}.zip" .)
+          fi
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: Create GitHub Release + publish to crates.io
-    needs: build-and-package
+    # build-binaries is a hard dependency, not a best-effort extra: a release that
+    # published to crates.io and then shipped three of its four platform archives would be
+    # a release nobody can tell is incomplete. `release-outcome` says so out loud too.
+    needs: [build-and-package, build-binaries]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -144,6 +420,15 @@ jobs:
           name: mimalloc-pprof-c-zip
           path: dist
 
+      - name: Download the cross-built binary assets
+        uses: actions/download-artifact@v4
+        with:
+          # merge-multiple so all four land directly in dist/ rather than in one
+          # subdirectory each -- the rename step and `files:` below both glob dist/.
+          pattern: release-binaries-*
+          merge-multiple: true
+          path: dist
+
       - name: Determine release tag
         id: tag
         shell: bash
@@ -167,11 +452,33 @@ jobs:
           fi
           echo "tag version $tag_version matches Cargo.toml version $cargo_version"
 
-      - name: Rename ZIP to versioned artifact name
+      - name: Rename assets to versioned artifact names, and require all five
+        # Five, counted: the architecture-independent C amalgamation ZIP plus one archive
+        # per cross lane. `needs:` already makes a failed lane fail this job, but an
+        # artifact that uploaded *nothing* under a green step would otherwise reach
+        # softprops/action-gh-release as a silently shorter `files:` list.
         shell: bash
         run: |
           set -euo pipefail
-          mv dist/mimalloc-pprof-c.zip "dist/mimalloc-pprof-c-${{ steps.tag.outputs.tag }}.zip"
+          tag='${{ steps.tag.outputs.tag }}'
+          mv dist/mimalloc-pprof-c.zip "dist/mimalloc-pprof-c-${tag}.zip"
+          for asset in macos-arm64 macos-x86_64 windows-x64-gnu windows-x64-msvc; do
+            case "$asset" in macos-*) ext=tar.gz ;; *) ext=zip ;; esac
+            src="dist/mimalloc-pprof-${asset}.${ext}"
+            if [ ! -f "$src" ]; then
+              echo "::error::${src} was not produced by build-binaries; refusing to cut a release missing the ${asset} asset"
+              ls -l dist
+              exit 1
+            fi
+            mv "$src" "dist/mimalloc-pprof-${asset}-${tag}.${ext}"
+          done
+          count=$(ls dist | wc -l)
+          if [ "$count" -ne 5 ]; then
+            echo "::error::expected exactly 5 release assets, found ${count}"
+            ls -l dist
+            exit 1
+          fi
+          ls -l dist
 
       - name: cargo publish (mimalloc-pprof)
         if: env.IS_DRY_RUN != 'true'
@@ -219,14 +526,21 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: mimalloc-pprof ${{ steps.tag.outputs.tag }}
           draft: ${{ env.IS_DRY_RUN == 'true' }}
-          files: dist/mimalloc-pprof-c-${{ steps.tag.outputs.tag }}.zip
+          files: |
+            dist/mimalloc-pprof-c-${{ steps.tag.outputs.tag }}.zip
+            dist/mimalloc-pprof-macos-arm64-${{ steps.tag.outputs.tag }}.tar.gz
+            dist/mimalloc-pprof-macos-x86_64-${{ steps.tag.outputs.tag }}.tar.gz
+            dist/mimalloc-pprof-windows-x64-gnu-${{ steps.tag.outputs.tag }}.zip
+            dist/mimalloc-pprof-windows-x64-msvc-${{ steps.tag.outputs.tag }}.zip
 
-  # Issue #55: the publish job is gated on all three OS builds, so a single transient
-  # runner failure silently turns a tagged release into a no-op. This job makes that
-  # outcome impossible to miss and says exactly how to recover.
+  # Issue #55: the publish job is gated on every build job, so a single transient runner
+  # failure silently turns a tagged release into a no-op. This job makes that outcome
+  # impossible to miss and says exactly how to recover. (The "three OS builds" this comment
+  # used to name are gone: #277 phase E made `build-and-package` one ubuntu row and moved
+  # the platform binaries into `build-binaries`, four Linux cross lanes.)
   release-outcome:
     name: Release outcome check
-    needs: [build-and-package, release]
+    needs: [build-and-package, build-binaries, release]
     if: always() && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
@@ -234,12 +548,14 @@ jobs:
         shell: bash
         run: |
           build='${{ needs.build-and-package.result }}'
+          binaries='${{ needs.build-binaries.result }}'
           release='${{ needs.release.result }}'
           echo "build-and-package: ${build}"
+          echo "build-binaries: ${binaries}"
           echo "release: ${release}"
           if [ "$release" = "success" ]; then
             echo "tag ${GITHUB_REF_NAME} released successfully"
             exit 0
           fi
-          echo "::error::Tag ${GITHUB_REF_NAME} was pushed but NOT released (build=${build}, release=${release}). Nothing was published to crates.io. If this was a transient runner failure, recover with: gh run rerun ${GITHUB_RUN_ID} --failed"
+          echo "::error::Tag ${GITHUB_REF_NAME} was pushed but NOT released (build=${build}, binaries=${binaries}, release=${release}). Nothing was published to crates.io. If this was a transient runner failure, recover with: gh run rerun ${GITHUB_RUN_ID} --failed"
           exit 1

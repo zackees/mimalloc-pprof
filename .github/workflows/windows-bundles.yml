@@ -1175,6 +1175,22 @@ jobs:
           gate "MSVC debug-full bundle" bundle/windows-msvc-x64-debug-full
           exit $failed
 
+      - name: TEMPORARY (#272) -- thread-idle-rss process exit under MIMALLOC_VERBOSE
+        # Diagnostic for the MSVC-bundle hang: run_test_bundle.py only echoes a test's output
+        # when it FAILS, so run the exe directly and always show it. Removed once the log has
+        # been read.
+        continue-on-error: true
+        run: |
+          set +e
+          for b in windows-msvc-x64-release windows-gnu-x64-release; do
+            echo "::group::$b -- thread-idle-rss (MIMALLOC_VERBOSE=1)"
+            PATH="$PWD/bundle/$b:$PATH" MIMALLOC_VERBOSE=1 \
+              timeout 30 "bundle/$b/mimalloc-test-thread-idle-rss.exe"
+            echo "exit=$?"
+            echo "::endgroup::"
+          done
+          exit 0
+
       - name: ctest (windows-latest) equivalent -- windows-msvc-x64-release
         # The one native MSVC job that is NOT replaced still runs this same set in
         # c-unit.yml (CLAUDE.md rule 3). Both arms run on every push; the coverage step
@@ -1365,6 +1381,73 @@ jobs:
             sentinel/benchmark-report.html
             sentinel/*.json
           if-no-files-found: warn
+
+      # ---------------------------------------------------------------------------------
+      # zero-tracking (#67), moved here by #277 phase E. See zero-tracking.yml's header for
+      # the full reasoning; the short version is that its `windows-latest` row built the
+      # tree natively and then ran an A/B on it, costing a whole extra Windows VM per
+      # matching PR, and both halves fit here for free:
+      #
+      #   * correctness is ALREADY covered, unconditionally: `test-zero-tracking` and
+      #     `test-zero-tracking-enabled` are registered ctest tests, so they are in every
+      #     bundle manifest and the `ctest (windows-latest) equivalent` step above ran both.
+      #   * only the interleaved A/B timing loop is new, and it is gated to the same paths
+      #     zero-tracking.yml triggers on so an unrelated PR does not pay for it.
+      #
+      # Runs on the MSVC release bundle -- the closest thing to the `windows-latest` row it
+      # replaces, with the honest caveat that soldr's clang-cl is not `cl`. The A/B's own
+      # design (interleaved, paired, single binary, raw numbers rather than a verdict)
+      # already exists to survive a noisy machine, and this job is entirely serial, so
+      # nothing else is running on the VM while it does.
+      - name: Does this PR touch the zero-tracking paths?
+        id: zt_scope
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "event is ${{ github.event_name }}; zero-tracking.yml only ever ran on pull_request"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Fail OPEN: if the API call breaks, run the A/B rather than silently skipping a
+          # gate. It costs ~1 minute on a job that is already several.
+          if ! files=$(gh api --paginate \
+                "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/files" \
+                --jq '.[].filename'); then
+            echo "::warning::could not list this PR's changed files; running the A/B anyway"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$files"
+          # zero-tracking.yml's own `paths:` list, minus zero-tracking.yml itself (which
+          # does not trigger THIS workflow, so keying on it would promise a run that the
+          # trigger cannot deliver -- see that file's header).
+          if echo "$files" | grep -qxE 'src/arena\.c|test/bench-zero-tracking\.c|\.github/workflows/windows-bundles\.yml'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no zero-tracking path touched; skipping the A/B"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: zero-tracking interleaved A/B (MSVC release bundle)
+        if: ${{ !cancelled() && steps.zt_scope.outputs.run == 'true' }}
+        run: |
+          set -euo pipefail
+          exe="bundle/windows-msvc-x64-release/mimalloc-test-zero-tracking.exe"
+          test -f "$exe"
+          echo "benchmark binary: $exe"
+          export MIMALLOC_PURGE_DELAY=0
+          for i in 1 2 3 4 5 6 7 8; do
+            MIMALLOC_PURGE_ZEROES=0 "$exe"
+            MIMALLOC_PURGE_ZEROES=1 "$exe"
+          done | tee ab.jsonl
+          uv run ci/zero_tracking_report.py ab.jsonl | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && steps.zt_scope.outputs.run == 'true' }}
+        with:
+          name: zero-tracking-windows-msvc-x64
+          path: ab.jsonl
 
       - uses: msys2/setup-msys2@v2
         if: ${{ !cancelled() }}

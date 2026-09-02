@@ -384,6 +384,7 @@ void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 void          _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
 void          _mi_arenas_purge_now(mi_subproc_t* subproc);
 void          _mi_arenas_fork_child(void);   // #272: clear the inherited one-purger-at-a-time guard
+bool          _mi_arenas_purge_guard_reset(void);  // #272: release the one-purger guard whose holder no longer exists; returns whether it was held
 
 // scavenger.c -- imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
 void          _mi_scavenger_start(void);

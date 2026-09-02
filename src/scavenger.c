@@ -180,6 +180,11 @@ void _mi_scavenger_start_lazy(void) { _mi_scavenger_start(); }
 #include <errno.h>
 
 static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = running
+// Set by `_mi_scavenger_stop` and never cleared: teardown has begun, so no start may create a
+// thread any more. Without it `_mi_scavenger_start_lazy` -- reachable from a thread that parks
+// while the process is tearing down -- can spawn a scavenger AFTER the stop that was supposed
+// to join it, leaving a thread walking a subproc that is being dismantled.
+static _Atomic(uintptr_t) _mi_scavenger_shutdown;
 
 // -----------------------------------------------------------------------------
 // Wait/wake on subproc->scavenger_wake (a uint32_t futex word).
@@ -440,6 +445,12 @@ void _mi_scavenger_wake(mi_subproc_t* subproc) {
 #if defined(_WIN32)
 
 static HANDLE _mi_scavenger_thread;
+// Set by the thread body as its very last act. It distinguishes "the thread ran to completion"
+// from "the handle is signalled because the OS killed the thread" -- which is not an edge case
+// on Windows but the NORMAL exit path for a statically linked exe: `mi_process_done` runs from
+// the `.CRT$XLY` TLS callback at DLL_PROCESS_DETACH, i.e. from inside `ExitProcess`, which
+// terminates every other thread first. See `_mi_scavenger_stop`.
+static _Atomic(uintptr_t) _mi_scavenger_exited;
 
 static DWORD WINAPI mi_scavenger_thread_main(LPVOID arg) {
   MI_UNUSED(arg);
@@ -453,14 +464,17 @@ static DWORD WINAPI mi_scavenger_thread_main(LPVOID arg) {
     if (set_desc != NULL) { set_desc(GetCurrentThread(), L"mi-scavenger"); }
   }
   mi_scavenger_run();
+  mi_atomic_store_release(&_mi_scavenger_exited, (uintptr_t)1);
   return 0;
 }
 
 void _mi_scavenger_start(void) {
   if (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) return;
+  if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) return;   // teardown has begun
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  mi_atomic_store_release(&_mi_scavenger_exited, (uintptr_t)0);
   _mi_scavenger_thread = CreateThread(NULL, 0, &mi_scavenger_thread_main, NULL, 0, NULL);
   if (_mi_scavenger_thread == NULL) {
     mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
@@ -468,12 +482,34 @@ void _mi_scavenger_start(void) {
 }
 
 void _mi_scavenger_stop(void) {
+  mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)1);   // before the exchange: no restart past here
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
   mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
   mi_scav_wake_one(&subproc->scavenger_wake);
   if (_mi_scavenger_thread != NULL) {
-    WaitForSingleObject(_mi_scavenger_thread, INFINITE);
+    // BOUNDED, never INFINITE. This runs first in `mi_process_done_once`, and on Windows that
+    // is reached from the `.CRT$XLY` TLS callback at DLL_PROCESS_DETACH -- inside `ExitProcess`,
+    // under the loader lock. A join that does not return there hangs the process for good, and
+    // the process is exiting anyway (`_mi_scavenger_running` is already 0).
+    const DWORD waited = WaitForSingleObject(_mi_scavenger_thread, 2000);
+    if (waited != WAIT_OBJECT_0) {
+      // Still running and not responding: leak the handle rather than close one the thread is
+      // still using, and leave the arena purge guard alone -- the thread may legitimately own it.
+      _mi_verbose_message("scavenger thread did not stop within 2s (wait result 0x%zx); detaching\n", (size_t)waited);
+      _mi_scavenger_thread = NULL;
+      return;
+    }
+    if (mi_atomic_load_acquire(&_mi_scavenger_exited) == 0) {
+      // Signalled, but the body never reached its epilogue: `ExitProcess` terminated it where it
+      // stood. If that was inside `mi_atomic_guard(&mi_arenas_purge_guard)` the guard is orphaned,
+      // and the forced purge that `mi_process_done_once` runs right after us
+      // (`mi_theap_collect(theap, true)` -> `_mi_arenas_try_purge(force)`) would spin on it
+      // forever. We are the only thread left, so releasing it races with nobody.
+      const bool was_held = _mi_arenas_purge_guard_reset();
+      _mi_verbose_message("scavenger thread was terminated by the process exit (arena purge guard was %s)\n",
+                          (was_held ? "held" : "free"));
+    }
     CloseHandle(_mi_scavenger_thread);
     _mi_scavenger_thread = NULL;
   }
@@ -512,6 +548,7 @@ static void* mi_scavenger_thread_main(void* arg) {
 
 void _mi_scavenger_start(void) {
   if (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) return;
+  if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) return;   // teardown has begun
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
@@ -547,6 +584,7 @@ void _mi_scavenger_start(void) {
 }
 
 void _mi_scavenger_stop(void) {
+  mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)1);   // before the exchange: no restart past here
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
   mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
@@ -560,6 +598,7 @@ void _mi_scavenger_stop(void) {
 // child would: take the wake path in `_mi_arenas_purge_now` and signal nobody (so never purge at
 // all), and `pthread_join` a `pthread_t` that names no thread at exit.
 void _mi_scavenger_forked_child(void) {
+  mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)0);   // a fresh image, not a teardown
   mi_atomic_store_release(&_mi_scavenger_joinable, (uintptr_t)0);
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
   mi_scav_fork_child_reset();

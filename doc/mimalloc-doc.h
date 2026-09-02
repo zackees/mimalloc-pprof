@@ -1292,7 +1292,7 @@ typedef enum mi_option_e {
   mi_option_eager_commit_delay,       ///< __v2__: the first N segments per thread are not eagerly committed (but per page in the segment on demand)
   mi_option_arena_eager_commit,       ///< eager commit arenas? Use 2 to enable just on overcommit systems (=2)
   mi_option_abandoned_page_purge,     ///< __v1__,__v2__: immediately purge delayed purges on thread termination
-  mi_option_purge_delay,              ///< memory purging is delayed by N milli seconds; use 0 for immediate purging or -1 for no purging at all. (=10)
+  mi_option_purge_delay,              ///< memory purging is delayed by N milli seconds; use 0 for immediate purging or -1 for no purging at all. (=100 in this fork; upstream =10)
   mi_option_use_numa_nodes,           ///< 0 = use all available numa nodes, otherwise use at most N nodes.
   mi_option_disallow_os_alloc,        ///< 1 = do not use OS memory for allocation (but only programmatically reserved arenas)  
   mi_option_max_segment_reclaim,        ///< __v2__: max. percentage of the abandoned segments can be reclaimed per try (=10%)
@@ -1303,6 +1303,8 @@ typedef enum mi_option_e {
   mi_option_disallow_arena_alloc,       ///< 1 = do not use arena's for allocation (except if using specific arena id's)
   mi_option_visit_abandoned,            ///< allow visiting heap blocks from abandoned threads (=0)
   mi_option_target_segments_per_thread, ///< __v1__,__v2__: experimental (=0)
+
+  mi_option_scavenger,                  ///< run a background thread that purges scheduled arena memory (=1). `MIMALLOC_SCAVENGER=0` disables it and purging stays allocation-driven, as upstream.
 
   // v3 options
   mi_option_page_reclaim_on_free,       ///< __v3__: reclaim abandoned pages on a free (=0). -1 disallowr always, 0 allows if the page originated from the current theap, 1 allow always

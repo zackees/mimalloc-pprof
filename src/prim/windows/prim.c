@@ -917,8 +917,20 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     mi_win_main(NULL, DLL_PROCESS_DETACH, 0);
   }
 
+  // #272: stop the background scavenger from `exit()`, while it is still alive and can be
+  // joined. The only teardown hook a statically linked exe otherwise has is the
+  // DLL_PROCESS_DETACH TLS callback below, and that runs from INSIDE `ExitProcess` -- after the
+  // loader has already terminated every other thread, possibly where it stood inside the arena
+  // purge guard or an SRWLOCK, which teardown then waits on forever.
+  static void mi_cdecl mi_scavenger_crt_stop(void) {
+    _mi_scavenger_stop();
+  }
+
   static int mi_cdecl mi_crt_init(void) {
     // mi_debug_out(mi_current_module_is_dll() ? "crt dll init\n" : "crt exe init\n");
+    // registered FIRST, so `atexit` (which runs in reverse order) calls it LAST: every user
+    // handler and static destructor still runs with a scavenger behind it.
+    atexit(&mi_scavenger_crt_stop);
     if (mi_current_module_is_dll()) {
       // in a dll, atexit (crt_done) is called after tls process detach
       atexit(&mi_crt_done);

@@ -32,8 +32,18 @@ terms of the MIT license. A copy of the license can be found in the file
 // `mi_atomic_load/store/exchange/cas` ONLY at `uintptr_t` width. A narrower field reached
 // through them is read and written a full word at a time, past its end. These four are the
 // fields this phase added; a build that narrows one again fails here rather than at runtime.
+//
+// The FIELDS are only half of it: the out-param of a `park_state` CAS is written through the
+// same `uintptr_t*` parameter, so a narrower local is a 4-byte stack slot written 8 bytes wide.
+// gcc/clang reject that outright through the C11 generic ("size mismatch in argument 2 of
+// `__atomic_compare_exchange`"), but the MSVC-C wrapper only warns (C4133, an incompatible
+// pointer it then casts) -- exactly the compiler this assert exists for. So every such local is
+// declared through `mi_park_state_t`, which the assert below pins to the field.
+typedef size_t mi_park_state_t;
+
 typedef char mi_scav_atomic_widths_assert_t[
-  (sizeof(((mi_tld_t*)0)->park_state)      == sizeof(uintptr_t) &&
+  (sizeof(mi_park_state_t)                 == sizeof(((mi_tld_t*)0)->park_state) &&
+   sizeof(((mi_tld_t*)0)->park_state)      == sizeof(uintptr_t) &&
    sizeof(((mi_tld_t*)0)->park_reclaim)    == sizeof(uintptr_t) &&
    sizeof(((mi_tld_t*)0)->park_swept)      == sizeof(uintptr_t) &&
    sizeof(((mi_subproc_t*)0)->parked_count)== sizeof(uintptr_t)
@@ -95,7 +105,7 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) {
 void _mi_park_leave(mi_tld_t* tld) {
   if (tld == NULL) return;
   for (;;) {
-    size_t expected = MI_PARK_PARKED;
+    mi_park_state_t expected = MI_PARK_PARKED;   // width-pinned to the field, see the assert above
     if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_RUNNING)) break;
     if (expected == MI_PARK_RUNNING) return;   // not parked: nothing to take back
     // it may re-claim the moment it releases, so re-race rather than store: only a CAS from
@@ -133,14 +143,21 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
       const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
         if (mi_atomic_load_acquire(&tld->park_swept) != 0) continue;   // already done for this park
+        // Read `park_state` BEFORE `holes_sweep_last`. That field is a PLAIN `mi_msecs_t` written
+        // by whoever last swept this tld -- including the OWNER while it is RUNNING, from its own
+        // `mi_on_thread_idle()` (see `_mi_purge_holes_of`). What makes reading it here race-free
+        // is not this lock (the owner takes no lock to write it) but the acquire below pairing
+        // with the owner's release-store of MI_PARK_PARKED in `mi_on_thread_idle_start`: a tld
+        // that reads PARKED has published every write it made before parking, and it cannot
+        // write the field again until it leaves the park. A tld that is not parked is skipped
+        // without the field ever being read.
+        if (mi_atomic_load_acquire(&tld->park_state) != MI_PARK_PARKED) continue;
         if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
-          if (mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_PARKED) {
-            const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
-            if (due_in == 0 || due < due_in) { due_in = due; }
-          }
+          const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
+          if (due_in == 0 || due < due_in) { due_in = due; }
           continue;
         }
-        size_t expected = MI_PARK_PARKED;   // must match the width of `park_state`; see types.h
+        mi_park_state_t expected = MI_PARK_PARKED;   // width-pinned to the field, see the assert above
         if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_SWEEPING)) {
           claimed = tld; theap0 = tld->park_theap0; break;
         }
@@ -154,7 +171,10 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     // parked thread's next sample depend on how often the scavenger happened to visit it.
     const mi_profiler_tld_t prof_before = claimed->profiler;
     #endif
-    claimed->holes_sweep_last = _mi_clock_now();
+    // NOTE: `holes_sweep_last` is stamped by `_mi_purge_holes_of` itself, not here -- it is the
+    // one path both the scavenger and a direct `mi_on_thread_idle()` go through, so the owner's
+    // own sweeps are paced by, and visible to, the same clock. Stamping here as well would make
+    // the interval check inside it see `now - last == 0` and skip every scavenger-driven sweep.
     _mi_thread_idle_work(claimed, theap0);
     #if MI_DEBUG
     mi_assert_internal(claimed->profiler.bytes_since_sample == prof_before.bytes_since_sample &&

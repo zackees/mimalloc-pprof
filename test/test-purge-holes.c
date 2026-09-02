@@ -22,6 +22,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>      // nanosleep, for the min_interval pacing case
 
 #include "mimalloc.h"
 #include "mimalloc-stats.h"
@@ -1629,6 +1630,105 @@ static void run_one_thread(void (*fun)(void)) {
 #endif
 
 // ---------------------------------------------------------------------------
+// 12. `purge_holes_min_interval` paces the OWNER's own sweeps, not only the
+//     scavenger's claim of a parked thread's tld.
+//
+//     `mi_on_thread_idle()` is the "do the idle work here, on this thread" entry
+//     point, and a sweep is a full walk of every page of every theap of the
+//     calling thread. An event loop that calls it on every turn must not pay that
+//     on every turn -- which is exactly what the option promises ("do not sweep
+//     one thread's heaps more often than every N milli-seconds", with no clause
+//     about which thread does the sweeping). The pacing lives in
+//     `_mi_purge_holes_of`, the one path the owner and the scavenger share.
+//
+//     Observable: `blocks_visited` + `pages_skipped`, both monotonic and both moved
+//     only from inside a sweep -- so they distinguish "the sweep ran and found
+//     nothing" from "the sweep did not run", which `discard_calls` cannot.
+// ---------------------------------------------------------------------------
+#define PACE_INTERVAL_MS  (1000)
+
+static void pace_sleep_ms(long ms) {
+  #if defined(_WIN32)
+  Sleep((DWORD)ms);
+  #else
+  struct timespec ts;
+  ts.tv_sec = (time_t)(ms / 1000);
+  ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+  nanosleep(&ts, NULL);
+  #endif
+}
+
+static int64_t pace_sweep_work(void) {   // monotonic; moves iff a sweep actually walked pages
+  const hole_stats_t h = hole_stats();
+  return h.visited + h.pages_skipped;
+}
+
+static bool pace_churn(void** ptrs, size_t n, size_t sz) {
+  for (size_t i = 0; i < n; i++) {
+    if (ptrs[i] == NULL) { ptrs[i] = mi_malloc(sz); if (ptrs[i] == NULL) return false; }
+    pattern_fill(ptrs[i], sz, i);
+  }
+  for (size_t i = 0; i < n; i++) {   // keep every 4th: scattered survivors, whole free OS pages
+    if ((i % 4) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; }
+  }
+  return true;
+}
+
+static bool test_owner_sweep_pacing(void) {
+  enum { N = 1024, SZ = 512 };
+  void** ptrs = (void**)calloc(N, sizeof(void*));
+  if (ptrs == NULL) return false;
+  bool ok_all = true;
+  const long saved = mi_option_get(mi_option_purge_holes_min_interval);
+
+  // (a) baseline: an unpaced sweep, which stamps this thread's `holes_sweep_last`.
+  mi_option_set(mi_option_purge_holes_min_interval, 0);
+  if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
+  mi_on_thread_idle();
+  const mi_msecs_t stamped_at = _mi_clock_now();
+
+  // (b) inside the window: a second `mi_on_thread_idle()` must not sweep at all.
+  mi_option_set(mi_option_purge_holes_min_interval, PACE_INTERVAL_MS);
+  if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
+  const int64_t before_in = pace_sweep_work();
+  mi_on_thread_idle();
+  const int64_t after_in = pace_sweep_work();
+  const mi_msecs_t elapsed = _mi_clock_now() - stamped_at;
+  if (elapsed >= PACE_INTERVAL_MS) {
+    // the churn itself outran the window (a very loaded box): the negative half is not
+    // decidable, say so rather than fail on the machine's timing
+    fprintf(stderr, "\n  SKIP in-window half: churn took %ldms, window is %dms\n",
+            (long)elapsed, PACE_INTERVAL_MS);
+  }
+  else if (after_in != before_in) {
+    fprintf(stderr, "\n  swept %ldms into a %dms window: sweep work %lld -> %lld\n",
+            (long)elapsed, PACE_INTERVAL_MS, (long long)before_in, (long long)after_in);
+    ok_all = false;
+  }
+
+  // (c) past the window: the very next `mi_on_thread_idle()` sweeps again. The deadline has
+  // to EXPIRE, not merely be disabled -- so wait it out rather than setting the option to 0.
+  pace_sleep_ms(PACE_INTERVAL_MS + (PACE_INTERVAL_MS / 2));
+  if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
+  const int64_t before_out = pace_sweep_work();
+  mi_on_thread_idle();
+  const int64_t after_out = pace_sweep_work();
+  if (purging_enabled && after_out <= before_out) {
+    fprintf(stderr, "\n  did not sweep %dms past a %dms window: sweep work %lld -> %lld\n",
+            PACE_INTERVAL_MS + (PACE_INTERVAL_MS / 2), PACE_INTERVAL_MS,
+            (long long)before_out, (long long)after_out);
+    ok_all = false;
+  }
+  // with `purge_holes=0` there is no hole phase to count, so (c) has no observable -- the
+  // stamp still runs (see `_mi_purge_holes_of`), which is what keeps the scavenger's own
+  // pacing identical in the two builds.
+
+done:
+  for (size_t i = 0; i < N; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
+  free(ptrs);
+  mi_option_set(mi_option_purge_holes_min_interval, saved);
+  return ok_all;
+}
 
 // ADAPTATION for this fork (Bun has no MI_GUARDED lane): `ctest-guarded`'s second pass runs
 // with `MIMALLOC_GUARDED_SAMPLE_RATE=1`, which turns EVERY allocation into an oversized,
@@ -1653,6 +1753,13 @@ int main(void) {
   // VACUOUS in a release build on macOS: MADV_FREE_REUSABLE is lazy, so a discard that
   // wrongly covers a live block leaves its data intact until the kernel reclaims the page.
   mi_option_set(mi_option_purge_holes_eager_zero, 1);
+  // Every case below drives the sweep directly, back to back, and asserts what one specific
+  // `mi_on_thread_idle()` discarded. `purge_holes_min_interval` (100ms by default) now paces the
+  // OWNER's own sweeps too, not just the scavenger's claim -- so with it left at the default the
+  // second and later cases would silently be handed a skipped sweep and the whole file would
+  // become a slow way of testing nothing. The pacing itself has its own case
+  // (`test_owner_sweeps_are_paced`), which sets the option back for its own duration.
+  mi_option_set(mi_option_purge_holes_min_interval, 0);
   fprintf(stderr, "purge_holes is %s, os page size is %zu\n",
           (purging_enabled ? "ON" : "OFF"), (size_t)_mi_os_page_size());
 
@@ -1707,6 +1814,7 @@ int main(void) {
   CHECK("option-off-is-noop", test_option_off());
   CHECK("sweep-does-not-unpurge-on-collect", test_sweep_no_unpurge_on_collect());
   CHECK("sweep-full-every-bounds-a-missed-hole", test_sweep_full_every());
+  CHECK("owner-sweeps-are-paced", test_owner_sweep_pacing());
 
   // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);

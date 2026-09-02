@@ -379,18 +379,25 @@ static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool di
   const size_t dsize = ((k1 - k0) + 1) * os_size;
   if (discarded) { _mi_os_reuse(mi_page_subproc(page), (void*)dstart, dsize); }
 
-  // clear the bits first: `mi_page_block_index_is_purged` then tells us exactly which
-  // blocks are whole again
-  for (size_t k = k0; k <= k1; k++) { mi_page_purged_clear(page, k); }
-  mi_page_sweep_state_invalidate(page);   // the free list is about to grow, but `used`/`capacity` will not
-                                          // (before any early return below: the bits are already cleared)
-
+  // Resolve the block range BEFORE touching the bitmap. Both lookups are total for a
+  // discarded OS page (it is always entirely inside the block area, which is what the
+  // discard side checks), but if one ever did fail, clearing first would leave the page in
+  // a state no invariant allows: the blocks in [k0,k1] would be marked not-purged while
+  // still off every free list, i.e. free memory that `mi_page_is_valid_init`'s
+  // conservation check counts as neither free nor live and that nothing can ever hand out
+  // again. Bailing before the clear leaves the range purged instead -- consistent, and the
+  // next sweep simply sees it as an already-discarded run.
   size_t first, last, first1, last1;
   if (!mi_page_os_page_blocks(page, k0, &first, &last) ||
       !mi_page_os_page_blocks(page, k1, &first1, &last1)) {
     mi_assert_internal(false);   // a discarded OS page is always entirely inside the block area
     return;
   }
+
+  // now clear the bits: `mi_page_block_index_is_purged` below then tells us exactly which
+  // blocks are whole again
+  for (size_t k = k0; k <= k1; k++) { mi_page_purged_clear(page, k); }
+  mi_page_sweep_state_invalidate(page);   // the free list is about to grow, but `used`/`capacity` will not
   // every block in [first,last1] was free when we discarded, and a purged block cannot be
   // allocated or freed, so they are all still free
   size_t nblocks = 0;
@@ -760,11 +767,50 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
 // The abandoned pages matter: with the default `allow_page_abandon`, every page that ever became
 // full ends up there. Non-default heaps matter too (JSC allocates its structure heap with
 // `mi_heap_new_in_arena`), which is why we sweep every theap and not just the default one.
+//
+// The abandoned pass needs the DISTINCT heaps behind this thread's theaps, and collects them
+// into a fixed-size on-stack array rather than a second pass or an allocation (this runs under
+// `tld->theaps_lock` on the sweeping thread, and CLAUDE.md rule 4 keeps sweep-internal state off
+// every hooked allocation path). 8 is a cap, not a limit on correctness: a thread with more than
+// 8 distinct heaps sweeps its theaps' OWN pages in full -- that is the loop below, which is not
+// capped -- and only the ABANDONED-page pass of the 9th and later heaps is skipped, permanently,
+// since the array is refilled in the same order on every sweep. That would be a slow leak of
+// abandoned-page holes for such a thread.
+//
+// It is deliberately not "resume across heaps at the next sweep": that needs a cursor on the tld
+// that survives heaps being created and deleted between sweeps, and the case does not arise --
+// a thread gets a theap only in a heap it actually allocates from, and the workloads this exists
+// for (Bun/JSC) use two (default + structure). `mi_heap_new` is per-heap, not per-thread, so 8
+// distinct heaps means one thread allocating from 8 heaps. If that ever becomes real, raise this
+// number first; the array is `8 * sizeof(void*)` = 64 bytes of stack.
 #define MI_PURGE_HOLES_MAX_HEAPS  (8)
 
 void _mi_purge_holes_of(mi_tld_t* tld) {
-  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   if (tld == NULL) return;
+  // `purge_holes_min_interval` pacing, for BOTH callers. It used to be applied only in
+  // `_mi_theap_sweep_parked`'s pre-claim loop, which left a thread calling `mi_on_thread_idle()`
+  // directly -- the documented "do the idle work here, on this thread" entry point -- walking
+  // every page of every one of its theaps on every call, however tight the loop. The option is
+  // documented as "do not sweep one thread's heaps more often than every N milli-seconds", with
+  // no clause about which thread does the sweeping, so it belongs here, on the path both go
+  // through. The scavenger keeps its own copy of the check because it must decide whether to
+  // CLAIM a park at all (and how long to sleep before the next one becomes due) before it can
+  // call this; the two agree because the clock only moves forward between them.
+  //
+  // The stamp is the sweep's START time, so the interval is start-to-start (what the scavenger's
+  // `due_in` arithmetic assumes), and a SKIPPED sweep must not stamp -- otherwise a tight
+  // `mi_on_thread_idle()` loop would push the deadline out on every call and never sweep again.
+  //
+  // Deliberately ahead of the `purge_holes` enabled check: with the option off there is no hole
+  // phase to pace, but the scavenger's pre-claim check reads this same field, and leaving it at
+  // 0 forever would make the `-off` build claim and re-sweep every park at full rate -- a
+  // behavioural difference between the two builds that has nothing to do with holes.
+  const mi_msecs_t now = _mi_clock_now();
+  const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
+  if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) return;
+  tld->holes_sweep_last = now;
+
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   _mi_page_purge_holes_sweep_begin(tld);  // decides whether this sweep skips unchanged pages
   _mi_page_holes_reset_ineligible();      // the ineligible counters are a gauge over this sweep
 

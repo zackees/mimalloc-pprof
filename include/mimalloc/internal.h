@@ -1278,8 +1278,11 @@ static inline size_t mi_page_purge_bits(const mi_page_t* page) {
 // Eligible when the page's OS pages fit the bitmap. This does not depend on the block size
 // at all: a discard covers a whole OS page, so any number of small free blocks can together
 // cover one (and a page whose free runs never cover a whole OS page simply discards nothing).
-// Small and medium pages always fit; a large (4 MiB) page only fits when the OS page is
-// 16 KiB, and a huge page is a singleton (one block) so there is nothing to purge in it.
+// Small and medium pages always fit; a large (4 MiB) page fits from a 16 KiB OS page up
+// (exactly 256 bits at 16 KiB, 64 at 64 KiB) and needs 1024 bits -- so stays ineligible --
+// on a 4 KiB OS page; a huge page is a singleton (one block) so there is nothing to purge
+// in it. The bit count is `ceil(block_area / os_page_size)` with no header page; see
+// `MI_PAGE_PURGE_BITS` in `types.h` for why there is no `+1`.
 // Pinned memory (large/huge OS pages) cannot be madvise'd away, and an arena with a custom
 // commit function owns its own commit/decommit -- like every other purge site
 // (`mi_arena_schedule_purge`, `_mi_os_purge_ex`), we stay away from both.

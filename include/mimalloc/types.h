@@ -229,12 +229,19 @@ terms of the MIT license. A copy of the license can be found in the file
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
 // Hole purging: a bitmap of the OS pages inside a mimalloc page whose memory has been
 // discarded. It is indexed by OS page (not by block), so its size does not depend on the
-// size class: a page needs `page_size/os_page_size` bits (plus one for the partial OS page
-// that holds the page header). 256 bits covers every small (64 KiB) and medium (512 KiB)
-// page on every OS page size, and a large (4 MiB) page when the OS page is 16 KiB. A large
-// page on a 4 KiB OS page needs 1025 bits and stays ineligible -- the capacity check is at
-// runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in
-// `src/page-holes.c`).
+// size class: a page needs `ceil(block_area / os_page_size)` bits. There is no extra bit
+// for the page header -- in v3 `mi_page_t` lives out of line, in the arena's meta slices
+// (`src/arena.c`, `page_ma_offset`), so the block area starts at the slice start and is
+// therefore OS-page aligned; `mi_page_purge_base`'s `align_down` is what keeps the count
+// (and the bit -> address mapping) right if a future layout ever put it back in the page.
+// So 256 bits covers, on every OS page size we support:
+//   4 KiB  OS page: small (64 KiB) = 16 bits, medium (512 KiB) = 128, large (4 MiB) = 1024
+//   16 KiB OS page: small = 4, medium = 32, large = 256  (fits, exactly at the limit)
+//   64 KiB OS page: small = 1, medium = 8,  large = 64
+// -- i.e. every small and medium page always, and a large page on a 16 KiB or larger OS
+// page. A large page on a 4 KiB OS page needs 1024 bits and stays ineligible. The check is
+// at runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in
+// `src/page-holes.c`), never at compile time: `_mi_os_page_size()` is not a constant.
 #define MI_PAGE_PURGE_BITS                (256)
 #define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
 

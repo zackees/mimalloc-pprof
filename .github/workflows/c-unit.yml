@@ -117,6 +117,41 @@ jobs:
       - uses: actions/checkout@v4
       - run: cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON && cmake --build build --config Debug && ctest --test-dir build -C Debug --output-on-failure
 
+  bundle-roundtrip:
+    # Issue #277 phase A. The plan in #277 is to build the macOS/Windows test binaries on
+    # Linux and ship them to one runner per OS as a portable *test bundle*. That is only
+    # credible if the bundle runs exactly the tests ctest runs and gets exactly the same
+    # results, so this job proves the equivalence on the config where every awkward
+    # command shape lives: MI_DEBUG_FULL emits 6 `cmake -P run-negative.cmake` negative
+    # controls and a `cmake -E env` LD_PRELOAD wrapper, none of which is a plain argv.
+    #
+    # The reference run and the bundle run are compared by name AND by pass/fail, so a
+    # bundle that silently drops a test fails here rather than reporting green on less.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
+      - run: cmake --build build --config Debug
+      - name: ctest (the reference the bundle must reproduce)
+        run: ctest --test-dir build -C Debug --output-on-failure --output-junit ctest.xml
+      - name: Build the bundle
+        run: python3 ci/bundle_tests.py build bundle --config Debug
+      - name: Move the build tree out of the way
+        # The test executables carry an RPATH into the build tree. Without this the bundle
+        # would "pass" by loading the original libraries off disk, and the whole
+        # portability claim would be untested on the only machine that can check it.
+        run: mv build build.moved-away
+      - name: Replay the bundle and require identical results
+        run: python3 ci/run_test_bundle.py bundle --compare-junit ctest.xml --junit bundle.xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-bundle-ubuntu-debug-full
+          path: |
+            bundle
+            ctest.xml
+            bundle.xml
+          retention-days: 7
+
   ctest-debug-full-win-gnu:
     runs-on: windows-latest
     defaults:

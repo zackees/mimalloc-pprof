@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -264,6 +265,47 @@ def _normalise(path: str) -> str:
     return os.path.normpath(path).replace("\\", "/")
 
 
+#: A Windows drive-qualified path (`C:\\build\\x`) or a UNC share. `os.path.isabs` does not
+#: recognise either when this script runs on Linux, which is exactly where every cross
+#: bundle is produced -- so the leak scan below cannot rely on `isabs` alone.
+_WINDOWS_ABSOLUTE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/])")
+
+
+def looks_absolute(value: str) -> bool:
+    return Path(value).is_absolute() or bool(_WINDOWS_ABSOLUTE.match(value))
+
+
+def leaked_paths(test: BundledTest) -> list[str]:
+    """Every absolute path in a lowered test that the bundle does not carry.
+
+    `PathRewriter` only rewrites paths under the *build* directory. An absolute path from
+    anywhere else -- the source tree, the toolchain, the runner's home -- is copied into
+    the manifest verbatim and then silently refers to a directory that does not exist on
+    the machine that replays the bundle. Phase A only checked `argv[0]`, which was enough
+    while the bundle never left the build host; phase B ships bundles to another machine,
+    so argv[1:], every env value and the working directory are checked too (review
+    follow-up on PR #279).
+
+    `os.pathsep`-joined values are split first, so a `PATH`-shaped variable is reported by
+    the element that leaked rather than as one unreadable blob.
+    """
+    leaked: list[str] = []
+
+    def scan(where: str, value: str) -> None:
+        for piece in value.split(os.pathsep) if os.pathsep in value else [value]:
+            if not piece or piece.startswith(BUNDLE_PLACEHOLDER):
+                continue
+            if looks_absolute(piece):
+                leaked.append(f"{where}: {piece}")
+
+    for index, argument in enumerate(test.argv):
+        scan(f"argv[{index}]", argument)
+    for key in sorted(test.env):
+        scan(f"env[{key}]", test.env[key])
+    scan("cwd", test.cwd)
+    return leaked
+
+
 class PathRewriter:
     """Rewrites absolute build-tree paths to `${BUNDLE}/<basename>` and records the files.
 
@@ -410,6 +452,13 @@ def convert(payload: object, build_dir: Path) -> tuple[list[BundledTest], dict[s
                 f"bundle cannot carry it"
             )
             continue
+        leaked = leaked_paths(test)
+        if leaked:
+            problems.append(
+                f"{name}: absolute path(s) that the bundle does not carry would be "
+                f"replayed verbatim on another machine: " + ", ".join(leaked)
+            )
+            continue
         tests.append(test)
 
     if problems:
@@ -472,7 +521,11 @@ def write_manifest(
     manifest = {
         "version": MANIFEST_VERSION,
         "generated_from": {
-            "build_dir": str(build_dir),
+            # The build directory's *name* only. Its absolute path was the one remaining
+            # host path in the manifest, which made "grep the manifest for absolute paths"
+            # -- the check phase B's bundles are shipped under -- impossible to state
+            # simply (review follow-up on PR #279).
+            "build_dir": build_dir.name,
             "config": config,
             "platform": sys.platform,
         },

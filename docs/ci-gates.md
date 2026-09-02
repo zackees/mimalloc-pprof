@@ -71,6 +71,14 @@ the expected non-zero exit — the script's own words are "negative control time
 instead of failing fast" — and the expected substring is searched in the *combined*
 stdout+stderr, so a control that fails for the wrong reason stays red.
 
+Every lowered test is then scanned for absolute paths that the bundle does not carry --
+across `argv`, every `env` value (split on `os.pathsep`) and `cwd`, not just `argv[0]` --
+and any hit is a hard error naming the test and the field. `PathRewriter` only rewrites
+paths under the *build* directory, so a source-tree, toolchain or runner-home path would
+otherwise be replayed verbatim on a machine that does not have it. Windows drive-qualified
+and UNC paths count as absolute even though `os.path.isabs` says otherwise on Linux, which
+is where every cross bundle is built.
+
 Test properties are an **allowlist** (`ENVIRONMENT`, `TIMEOUT`, `WORKING_DIRECTORY`,
 `LABELS`, `WILL_FAIL`, `DISABLED`). Anything else — `PASS_REGULAR_EXPRESSION`,
 `SKIP_RETURN_CODE`, `RESOURCE_LOCK` — is a hard error naming the test, as is any `cmake`

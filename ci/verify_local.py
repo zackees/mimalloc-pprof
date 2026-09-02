@@ -223,6 +223,7 @@ def ctest_run(
     exclude_slow: bool = True,
     timeout: int = DEFAULT_CTEST_TIMEOUT,
     env: dict[str, str] | None = None,
+    junit: Path | None = None,
 ) -> int:
     cmd = [
         "ctest",
@@ -236,6 +237,9 @@ def ctest_run(
     ]
     if config:
         cmd += ["-C", config]
+    if junit:
+        # Must be absolute: ctest resolves a relative --output-junit against --test-dir.
+        cmd += ["--output-junit", str(junit.resolve())]
     if filter_regex:
         cmd += ["-R", filter_regex]
     excluded_now = False
@@ -289,6 +293,72 @@ def run_debug_full(ctx: RunCtx) -> bool:
     if cmake_build(ctx, build, config="Debug"):
         return False
     return ctest_run(ctx, build, config="Debug") == 0
+
+
+def run_bundle(ctx: RunCtx) -> bool:
+    """c-unit.yml job `bundle-roundtrip`: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug.
+
+    Builds, records a reference `ctest --output-junit`, bundles with
+    `ci/bundle_tests.py`, moves the build tree away so the executables' RPATH cannot
+    rescue a broken bundle, then replays with `ci/run_test_bundle.py --compare-junit`
+    and requires the same test names with the same pass/fail (#277 phase A).
+
+    Note the absolute `--output-junit` path: ctest resolves a relative one against the
+    *build* directory, so a relative path would be carried off by the move.
+    """
+    build = ctx.dir / "build"
+    bundle = ctx.dir / "bundle"
+    junit = ctx.dir / "ctest.xml"
+    moved = ctx.dir / "build.moved-away"
+    for stale in (bundle, moved):
+        if stale.exists():
+            shutil.rmtree(stale)
+    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON"])
+    if rc:
+        return False
+    if cmake_build(ctx, build, config="Debug"):
+        return False
+    # The comparison is only meaningful if the reference ran the whole suite, so the
+    # slow tier is NOT excluded here regardless of --slow.
+    if ctest_run(
+        ctx,
+        build,
+        config="Debug",
+        exclude_slow=False,
+        timeout=DEFAULT_CTEST_TIMEOUT,
+        junit=junit,
+    ):
+        return False
+    rc, _ = run_logged(
+        [
+            sys.executable,
+            str(ROOT / "ci" / "bundle_tests.py"),
+            str(build),
+            str(bundle),
+            "--config",
+            "Debug",
+        ],
+        cwd=ROOT,
+        log=ctx.log,
+    )
+    if rc:
+        return False
+    build.rename(moved)
+    try:
+        rc, _ = run_logged(
+            [
+                sys.executable,
+                str(ROOT / "ci" / "run_test_bundle.py"),
+                str(bundle),
+                "--compare-junit",
+                str(junit),
+            ],
+            cwd=ROOT,
+            log=ctx.log,
+        )
+    finally:
+        moved.rename(build)
+    return rc == 0
 
 
 def run_guarded(ctx: RunCtx) -> bool:
@@ -684,6 +754,12 @@ CONFIGS: list[ConfigSpec] = [
     ),
     ConfigSpec(
         "shared", "c-unit.yml: ctest-shared", "shared lib only, no static/object", run_shared
+    ),
+    ConfigSpec(
+        "bundle",
+        "c-unit.yml: bundle-roundtrip",
+        "ctest vs. portable test bundle, build tree removed",
+        run_bundle,
     ),
     ConfigSpec(
         "memory-gate",

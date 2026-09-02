@@ -143,6 +143,7 @@ class VerifyLocalDriftTests(unittest.TestCase):
             "debug-full",
             "guarded",
             "shared",
+            "bundle",
             "memory-gate",
             "diag",
             "rust",

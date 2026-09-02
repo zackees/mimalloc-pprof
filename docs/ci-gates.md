@@ -33,6 +33,60 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 | **python-lint** | the gate scripts themselves — `ruff` + `pyright --strict` | — |
 | **zero-tracking** | correctness and footprint of `mi_option_purge_zeroes`, reported as paired interleaved A/B medians with the within-arm spread alongside | — |
 
+## Test bundles
+
+Issue #277 wants the macOS and Windows test binaries built once on Linux (through the
+soldr lanes, #277 §2) and executed on one runner per OS, instead of one fresh VM per job.
+That needs a *test bundle*: a directory a runner can execute with **no CMake and no repo
+checkout**.
+
+`uv run ci/bundle_tests.py <build-dir> <out-dir> [--config Debug]` writes one.
+`uv run ci/run_test_bundle.py <bundle> [--only NAME…] [--env K=V…] [--timeout-scale F]
+[--junit out.xml] [--compare-junit ctest.xml]` replays it serially and prints a
+ctest-shaped summary.
+
+### `tests.json`
+
+One entry per test: `name`, `argv`, `env`, `cwd`, `timeout`, `expect_nonzero`,
+`expect_text`, `labels`. Paths inside `argv` and `env` values are written as
+`${BUNDLE}/<file>`, which the runner expands to the bundle's own absolute path; files are
+flattened into the bundle root so a Windows DLL sits beside its exe and a Linux `.so` is
+found through `LD_LIBRARY_PATH` rather than a build-tree RPATH. A basename collision is a
+hard error, never a silent overwrite.
+
+### Lowering rules
+
+`ctest --show-only=json-v1` does not emit a list of plain executables. On the
+`MI_DEBUG_FULL` tree, **7 of 31 tests invoke `cmake` itself**, and both shapes are lowered
+into manifest fields:
+
+| ctest command | lowered to |
+|---|---|
+| `cmake -E env K=V … <exe> [args]` | `env` entries plus the real `argv`; leading `K=V` tokens are consumed up to the first token that is not one |
+| `cmake -D TEST_EXE=… -D TEST_ARG=… -D EXPECTED_TEXT=… -P test/run-negative.cmake` | `argv = [TEST_EXE, TEST_ARG?]`, `expect_nonzero: true`, `expect_text: EXPECTED_TEXT`, `timeout: 10` |
+
+The negative-control semantics come from `test/run-negative.cmake` and are reproduced
+exactly, including the part that is easy to get backwards: **a timeout is a failure**, not
+the expected non-zero exit — the script's own words are "negative control timed out
+instead of failing fast" — and the expected substring is searched in the *combined*
+stdout+stderr, so a control that fails for the wrong reason stays red.
+
+Test properties are an **allowlist** (`ENVIRONMENT`, `TIMEOUT`, `WORKING_DIRECTORY`,
+`LABELS`, `WILL_FAIL`, `DISABLED`). Anything else — `PASS_REGULAR_EXPRESSION`,
+`SKIP_RETURN_CODE`, `RESOURCE_LOCK` — is a hard error naming the test, as is any `cmake`
+argv shape not in the table, and so is an empty suite. All of that is the same principle
+as the rest of this document: a bundle that quietly carries fewer tests than ctest ran
+would report green while verifying less, which is precisely the failure mode the seven
+dead gates above shared.
+
+### The gate
+
+`bundle-roundtrip` (in `c-unit.yml`, ubuntu, `MI_PPROF=ON MI_DEBUG_FULL=ON`) builds, runs
+`ctest --output-junit`, bundles, **moves the build tree away**, replays the bundle, and
+requires the same test names with the same pass/fail (`--compare-junit`). Moving the build
+tree is the load-bearing step: the executables carry an RPATH into it, so without that
+`mv` a broken bundle would pass on the build machine by loading the original libraries.
+
 ## Concurrency: superseded runs are cancelled
 
 Every workflow now carries a `concurrency:` group. A second push to the same ref cancels

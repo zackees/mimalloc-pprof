@@ -292,6 +292,22 @@ if (mi_on_thread_idle_start()) {   /* ... or hand it to the scavenger instead */
 then `mi_on_thread_idle_end` is not required. Between the two calls the thread must
 not allocate or free — that is the whole precondition the sweep relies on.
 
+That idle sweep also punches **holes**: upstream mimalloc gives a page back only once
+*every* block in it is free, so a single long-lived object keeps a whole 64 KiB/512 KiB
+page resident. Hole purging discards the memory of the free blocks inside such a page,
+one OS page at a time, without changing its commit state — on a churn workload with
+scattered survivors that halves peak RSS. It is on by default
+(`MIMALLOC_PURGE_HOLES`, `mi_option_purge_holes`), costs the alloc/free fast path
+nothing, and reports what it got back:
+
+```c
+#include <mimalloc.h>
+
+mi_purge_holes_stats_t h;
+mi_purge_holes_stats_get(&h);   /* discarded bytes/blocks now, totals, syscalls, ... */
+mi_purge_holes_report();        /* per size class: what could NOT be discarded, and why */
+```
+
 ### Going deeper
 
 Everything deeper — CMake install and linking, the zeroing-realloc family,

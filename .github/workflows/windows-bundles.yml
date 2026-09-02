@@ -425,8 +425,9 @@ jobs:
         # The previous round's `head -30` cut that off before it appeared. Print
         # everything, under each env knob whose name is in the module's string table.
         if: ${{ !cancelled() }}
+        continue-on-error: true
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           bundle=bundle/windows-gnu-x64-release
           exe="$bundle/mimalloc-test-stress-dynamic.exe"
           run_one() {
@@ -461,6 +462,15 @@ jobs:
           uv run ci/pe_imports.py "$exe"
           echo "--- mimalloc.dll ---"
           uv run ci/pe_imports.py "$bundle/mimalloc.dll"
+          echo "::endgroup::"
+
+          echo "::group::DIAG redirect-first: does it redirect now?"
+          ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1; timeout 60 "$exe" 2 5 1 ) > rf0.raw 2>&1
+          rc=$?
+          if [ "$rc" -ne 0 ]; then echo "VERDICT=FAILED(rc=$rc)";
+          elif grep -q 'malloc is redirected' rf0.raw; then echo "VERDICT=REDIRECTED";
+          else echo "VERDICT=NOT-REDIRECTED"; fi
+          grep -v "^option '" rf0.raw
           echo "::endgroup::"
 
           echo "::group::DIAG redirect-first plain run"

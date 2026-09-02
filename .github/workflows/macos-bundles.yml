@@ -54,6 +54,10 @@ concurrency:
 
 jobs:
   build-macos:
+    # Disabled 2026-09-02 at the owner's request until the x64 golden image / unattended
+    # install question (#277, #283) is settled: set repo variable MACOS_LANE_ENABLED=true
+    # to re-enable. The no-native-macOS lint (ci/lint_no_macos_runners.py) stays active.
+    if: ${{ vars.MACOS_LANE_ENABLED == 'true' }}
     name: build-macos (${{ matrix.bundle }})
     runs-on: ubuntu-latest
     strategy:
@@ -273,6 +277,10 @@ jobs:
           retention-days: 7
 
   build-rust-apple:
+    # Disabled 2026-09-02 at the owner's request until the x64 golden image / unattended
+    # install question (#277, #283) is settled: set repo variable MACOS_LANE_ENABLED=true
+    # to re-enable. The no-native-macOS lint (ci/lint_no_macos_runners.py) stays active.
+    if: ${{ vars.MACOS_LANE_ENABLED == 'true' }}
     name: build-rust (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
@@ -408,6 +416,10 @@ jobs:
   # two minutes and costs one Linux runner.
   # ---------------------------------------------------------------------------------
   run-macos-x64-dockur:
+    # Disabled 2026-09-02 at the owner's request until the x64 golden image / unattended
+    # install question (#277, #283) is settled: set repo variable MACOS_LANE_ENABLED=true
+    # to re-enable. The no-native-macOS lint (ci/lint_no_macos_runners.py) stays active.
+    if: ${{ vars.MACOS_LANE_ENABLED == 'true' }}
     name: run-macos-x64 (dockurr/macos on Linux)
     needs: [build-macos, build-rust-apple]
     runs-on: ubuntu-24.04

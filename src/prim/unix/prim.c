@@ -1115,9 +1115,8 @@ bool _mi_prim_thread_is_in_threadpool(void) {
 void _mi_prim_thread_yield(void) {
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a, commit
   // 0b0153b2): `sleep(0)` is `nanosleep({0,0})` on glibc -- a syscall that returns without
-  // ever rescheduling, so every spin-then-yield back-off in the tree (`_mi_park_leave`,
-  // `_mi_tld_detach_theaps`/`_mi_heap_detach_theaps`'s try-acquire retry, which
-  // `_mi_process_fork_prepare` now depends on to acquire `tld->theaps_lock`) degenerated
-  // into a busy spin.
+  // ever rescheduling, so every spin-then-yield back-off in the tree -- `_mi_park_leave`,
+  // `_mi_tld_detach_theaps`/`_mi_heap_detach_theaps`'s try-acquire retry loop, and the
+  // forced-purge wait in `_mi_arenas_try_purge` -- degenerated into a busy spin.
   sched_yield();
 }

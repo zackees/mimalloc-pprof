@@ -423,10 +423,15 @@ jobs:
         run: |
           set -euo pipefail
           go install github.com/google/pprof@latest
-          # `go env GOPATH` answers a native path (C:\Users\...); pasting it into a
-          # bash command line produces mixed separators. Put its bin/ on PATH once, as a
-          # POSIX path, and call `pprof` by name from here on.
-          cygpath -u "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          # `go env GOPATH` answers a native path (C:\Users\...); pasting that into a
+          # bash command line produces mixed separators. Resolve it once, here, into a
+          # POSIX path the following steps can use verbatim.
+          #
+          # Deliberately NOT via $GITHUB_PATH: the runner treats every line there as a
+          # *Windows* PATH element, so a POSIX path written to it comes back through
+          # MSYS's conversion as a current-drive-relative path.
+          echo "PPROF=$(cygpath -u "$(go env GOPATH)")/bin/pprof.exe" >> "$GITHUB_ENV"
+          ls -l "$(cygpath -u "$(go env GOPATH)")/bin/pprof.exe"
       - name: Prove pprof parses a native dump
         # cross.yml's win-gnu row has `pprof: true`; these two steps are that row's
         # dump checks, unchanged in substance.
@@ -434,14 +439,14 @@ jobs:
           set -euo pipefail
           generator=$(ls rust-bins/t3_stats-*.exe | head -1)
           MIMALLOC_PPROF_CI_DUMP="$GITHUB_WORKSPACE/heap.prof" "$generator"
-          pprof -raw "$GITHUB_WORKSPACE/heap.prof" > raw.txt
+          "$PPROF" -raw "$GITHUB_WORKSPACE/heap.prof" > raw.txt
           grep -Eq 'PeriodType: space|heap_v2|inuse_space' raw.txt
       - name: Prove pprof parses a proto dump
         run: |
           set -euo pipefail
           generator=$(ls rust-bins/t12_proto-*.exe | head -1)
           MIMALLOC_PROF_PROTO_PATH="$GITHUB_WORKSPACE/heap.pb" "$generator"
-          pprof -raw "$GITHUB_WORKSPACE/heap.pb" > raw-pb.txt
+          "$PPROF" -raw "$GITHUB_WORKSPACE/heap.pb" > raw-pb.txt
           grep -Eq 'inuse_space|alloc_space' raw-pb.txt
 
       - name: Memory gate -- 8 runs from the release bundle

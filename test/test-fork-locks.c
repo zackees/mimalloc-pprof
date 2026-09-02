@@ -13,7 +13,7 @@
 
    Three complementary workloads run against the same 200-fork loop:
 
-   1. `churn_thread` (always): continuously creates and destroys heaps
+   1. `churn_thread` (default): continuously creates and destroys heaps
       (`mi_heap_new`/`mi_heap_delete`, contends `heaps_lock`) and does large allocations
       (contends `arena_reserve_lock`). This is the PROBABILISTIC repro, and on a fast,
       lightly loaded machine it has near-zero discriminating power: its real critical
@@ -22,15 +22,24 @@
       see the #270 PR discussion). It stays because it costs nothing and a slower or
       more loaded machine does hit it.
 
-   2. `spawn_thread` (opt-in, `MI_TEST_FORK_SPAWN=1`): continuously starts short-lived
-      threads that each allocate. Thread start is the interesting path for the lock
-      ORDER specifically: `_mi_thread_init_with_heap` allocates the new thread's own
-      `mi_tld_t`/`mi_theap_t` through `_mi_meta_zalloc`, which holds
-      `subproc->theap_meta_lock` across a full allocation on `heap_main` -- so it nests
-      `theap_meta_lock` OUTSIDE `heap_main->arena_pages_lock`, `arena_reserve_lock` and
-      the page-map lock. A prepare() that acquired those before `theap_meta_lock` (as
-      the first two revisions of this PR did) deadlocks the parent inside fork() against
-      a thread starting up. Combine with `MIMALLOC_PROF=1` for the CI variant.
+   2. `spawn_thread` (opt-in, `MI_TEST_FORK_SPAWN=1`): keeps up to `SPAWN_MAX_LIVE`
+      threads alive at once, starting new ones continuously. Thread start is the
+      interesting path for the lock ORDER specifically: `_mi_thread_init_with_heap`
+      allocates the new thread's own `mi_tld_t`/`mi_theap_t` through `_mi_meta_zalloc`,
+      which holds `subproc->theap_meta_lock` across a full allocation on `heap_main` --
+      so it nests `theap_meta_lock` OUTSIDE `heap_main->arena_pages_lock`,
+      `arena_reserve_lock` and the page-map lock, the inversion the first two revisions
+      of this PR had. Threads are held live (rather than joined immediately) so the meta
+      theap has to keep allocating instead of recycling one freed slot. Combine with
+      `MIMALLOC_PROF=1` for the CI variant.
+
+      HONEST SCOPE: this is a TIMING-based workload, not a proof. The meta theap only
+      reaches `mi_heap_ensure_arena_pages` / `mi_arena_reserve` / page-map growth on a
+      cold page, so those nestings are rare; running this variant against the OLD
+      (inverted) order did not hang here in 200 forks. The deterministic evidence for
+      the order is the MI_DEBUG>2 observed-edge checker in src/fork.c, which reports an
+      inversion the moment the process performs one -- see its comment there. This
+      variant is the cheap, always-on complement.
 
    3. `deterministic_hold_repro` (MI_DEBUG>0): the DETERMINISTIC complement, using the
       test hooks in src/fork.c. A holder thread takes the main subprocess's `heaps_lock`
@@ -101,24 +110,54 @@ static void* churn_thread(void* arg) {
 // `heap_main` -- the nesting the documented lock order has to get right. The large
 // allocation on top makes that inner allocation actually reach the arena/page-map
 // growth paths rather than a warm free list.
+#define SPAWN_MAX_LIVE 64
+static volatile int spawn_live = 0;
+static pthread_mutex_t spawn_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static void* spawned_worker(void* arg) {
   (void)arg;
   void* p1 = mi_malloc(64);
-  void* p2 = mi_malloc(4 * 1024 * 1024);
+  void* p2 = mi_malloc(8 * 1024 * 1024);   // large: pushes the arenas to grow
   if (p1 != NULL) mi_free(p1);
   if (p2 != NULL) mi_free(p2);
+  usleep(2000);   // stay alive a moment: many concurrent live tld/theaps mean the meta
+                  // theap has to allocate FRESH pages instead of recycling one slot
+  pthread_mutex_lock(&spawn_mutex);
+  spawn_live--;
+  pthread_mutex_unlock(&spawn_mutex);
   return NULL;
 }
 
 static void* spawn_thread(void* arg) {
   (void)arg;
   while (!stop_flag) {
-    pthread_t workers[4];
-    int n = 0;
-    for (int i = 0; i < 4; i++) {
-      if (pthread_create(&workers[n], NULL, spawned_worker, NULL) == 0) { n++; }
+    pthread_mutex_lock(&spawn_mutex);
+    const int live = spawn_live;
+    pthread_mutex_unlock(&spawn_mutex);
+    if (live >= SPAWN_MAX_LIVE) { usleep(200); continue; }
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 128 * 1024);
+    pthread_t w;
+    pthread_mutex_lock(&spawn_mutex);
+    spawn_live++;
+    pthread_mutex_unlock(&spawn_mutex);
+    if (pthread_create(&w, &attr, spawned_worker, NULL) != 0) {
+      pthread_mutex_lock(&spawn_mutex);
+      spawn_live--;
+      pthread_mutex_unlock(&spawn_mutex);
+      usleep(1000);
     }
-    for (int i = 0; i < n; i++) { pthread_join(workers[i], NULL); }
+    pthread_attr_destroy(&attr);
+  }
+  // let the detached workers drain before the test tears down
+  for (int i = 0; i < 1000; i++) {
+    pthread_mutex_lock(&spawn_mutex);
+    const int live = spawn_live;
+    pthread_mutex_unlock(&spawn_mutex);
+    if (live == 0) break;
+    usleep(2000);
   }
   return NULL;
 }
@@ -298,21 +337,17 @@ int main(void) {
   fprintf(stderr, "deterministic_hold_repro: skipped (needs MI_DEBUG>0 -- this is a Release build)\n");
   #endif
 
+  // Spawn mode replaces the heap-churn thread rather than running alongside it: heap
+  // create/destroy churn CONCURRENT with sustained thread starts trips a pre-existing,
+  // fork-unrelated assertion (`mi_theap_is_valid`, theap.c:71) that reproduces with zero
+  // fork() involved (3/5 runs of an equivalent standalone churn+spawn program on this
+  // tree, and on the pre-#270 tree) -- see the #270 PR discussion. Running the two
+  // workloads in separate ctest variants keeps this test's signal about fork safety.
   pthread_t th;
-  if (pthread_create(&th, NULL, churn_thread, NULL) != 0) {
-    fprintf(stderr, "FAIL: could not start churn thread\n");
+  void* (*workload)(void*) = (spawn_mode ? spawn_thread : churn_thread);
+  if (pthread_create(&th, NULL, workload, NULL) != 0) {
+    fprintf(stderr, "FAIL: could not start %s thread\n", spawn_mode ? "spawner" : "churn");
     return 1;
-  }
-  pthread_t spawner;
-  bool spawner_started = false;
-  if (spawn_mode) {
-    if (pthread_create(&spawner, NULL, spawn_thread, NULL) != 0) {
-      fprintf(stderr, "FAIL: could not start spawner thread\n");
-      stop_flag = 1;
-      pthread_join(th, NULL);
-      return 1;
-    }
-    spawner_started = true;
   }
 
   int failures = 0;
@@ -342,7 +377,6 @@ int main(void) {
 
   stop_flag = 1;
   pthread_join(th, NULL);
-  if (spawner_started) { pthread_join(spawner, NULL); }
 
   const int dump_rc = check_dump_in_child();
 

@@ -416,6 +416,12 @@ class RunnerTest(unittest.TestCase):
         outcomes = run_test_bundle.parse_junit(report)
         self.assertEqual(outcomes, {"t-ok": True, "t-bad": False})
 
+    def test_a_missing_reference_file_explains_the_ctest_gotcha(self) -> None:
+        self.write_manifest([self.spec("t-ok", "ok")])
+        proc = self.run_bundle("--compare-junit", str(self.bundle / "nope.xml"))
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("build directory", proc.stderr + proc.stdout)
+
     def test_compare_junit_detects_a_missing_test(self) -> None:
         reference = self.bundle / "ctest.xml"
         reference.write_text(

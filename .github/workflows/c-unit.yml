@@ -133,7 +133,10 @@ jobs:
       - run: cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
       - run: cmake --build build --config Debug
       - name: ctest (the reference the bundle must reproduce)
-        run: ctest --test-dir build -C Debug --output-on-failure --output-junit ctest.xml
+        # --output-junit resolves relative to the *build* directory, not the working
+        # directory, so an absolute path is required here: a relative one would land in
+        # build/ and be carried off by the `mv` below.
+        run: ctest --test-dir build -C Debug --output-on-failure --output-junit "$GITHUB_WORKSPACE/ctest.xml"
       - name: Build the bundle
         run: python3 ci/bundle_tests.py build bundle --config Debug
       - name: Move the build tree out of the way

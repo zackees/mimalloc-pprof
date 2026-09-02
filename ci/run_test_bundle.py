@@ -247,6 +247,14 @@ def parse_junit(path: Path) -> dict[str, bool]:
     `status="fail"` with one; a `<skipped>` child means it never ran. Presence of a
     `<failure>`/`<error>` child is the authoritative signal, with `status` as the fallback.
     """
+    if not path.is_file():
+        # ctest resolves --output-junit against the build directory, not the working
+        # directory, so a relative path silently lands somewhere else. Say that, rather
+        # than raising a bare FileNotFoundError from deep inside ElementTree.
+        raise FileNotFoundError(
+            f"{path} does not exist. `ctest --output-junit` writes relative paths into the "
+            f"build directory -- pass it an absolute path."
+        )
     tree = ElementTree.parse(path)
     outcomes: dict[str, bool] = {}
     for case in tree.getroot().iter("testcase"):
@@ -361,7 +369,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     reference = cast("Path | None", args.compare_junit)
     if reference is not None:
-        problems = compare_with_junit(reference, results)
+        try:
+            problems = compare_with_junit(reference, results)
+        except (FileNotFoundError, ElementTree.ParseError) as exc:
+            print(f"cannot read the ctest reference: {exc}", file=sys.stderr)
+            return 1
         if problems:
             print()
             print(f"bundle/ctest mismatch ({len(problems)}):", file=sys.stderr)

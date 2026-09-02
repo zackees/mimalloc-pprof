@@ -160,7 +160,7 @@ jobs:
           # Windows-GNU CMAKE_FIND_LIBRARY_SUFFIXES are `.dll.a;.a;.lib`, so a host
           # `librt.so` is not a candidate even with the search unconfined. Verified both
           # ways locally; the assertion is what would notice if that ever changed.
-          if ! grep -qE '^-- Link libraries *: *psapi;shell32;user32;advapi32;bcrypt$' configure.log; then
+          if ! grep -qE '^-- Link libraries *: *psapi;shell32;user32;advapi32;bcrypt;synchronization$' configure.log; then
             echo "::error::the MinGW link resolved unexpected libraries"
             grep -E 'Link libraries' configure.log || true
             exit 1
@@ -433,7 +433,7 @@ jobs:
             --log-level=VERBOSE 2>&1 | tee configure.log
           # Assert on the RESOLVED list, not on the option that was passed in -- the
           # MI_GUARDED lesson from docs/ci-gates.md.
-          if ! grep -qE '^-- Link libraries *: *psapi;shell32;user32;advapi32;bcrypt$' configure.log; then
+          if ! grep -qE '^-- Link libraries *: *psapi;shell32;user32;advapi32;bcrypt;synchronization$' configure.log; then
             echo "::error::the MSVC link resolved unexpected libraries"
             grep -E 'Link libraries' configure.log || true
             exit 1

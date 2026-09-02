@@ -828,6 +828,16 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;
   if (prof_callback_depth > 0) return;
 
+  // #266: never sample allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
+  // _mi_meta_zalloc onto subproc->theap_meta). These are large (sizeof(mi_theap_t) is
+  // several KB) relative to typical sample rates, so they sample almost every time, and
+  // on an MSVC DLL build they can be freed from DLL_THREAD_DETACH after the owning
+  // thread's tld has already been torn down -- a path mi_collect(true) never revisits --
+  // leaving the sample "live" forever. page->has_metadata is never set for a meta page as
+  // a result, so _mi_prof_on_free/_mi_prof_on_free_collect need no matching change: there
+  // is nothing on the page for them to find.
+  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
+
   // The sampling DECISION is thread-local and is made without taking prof_lock.
   //
   // This used to acquire prof_lock first and decide afterwards, so every allocating

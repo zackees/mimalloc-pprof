@@ -899,6 +899,69 @@ static void test_cross_thread_free_of_sampled(void) {
   mi_prof_stop();
 }
 
+/* ---- allocator-internal metadata is never sampled -----------------------------------
+   #266: mi_tld_t / mi_theap_t are allocated via _mi_meta_zalloc onto a dedicated,
+   detached theap (subproc->theap_meta) whenever a brand-new OS thread first touches
+   mimalloc. Both are large relative to the rate used here (sizeof(mi_theap_t) is
+   several KB), so before the fix they sampled almost every time a fresh thread was
+   created -- and on an MSVC DLL build could be freed from DLL_THREAD_DETACH after the
+   thread's own tld had already been torn down, a path mi_collect(true) never revisits,
+   leaving the sample "live" forever (the observed symptom: live_samples==2,
+   live_bytes==8200, deterministically on round 0). Each worker below allocates and
+   frees exactly one 256-byte block and exits, forcing a fresh tld/theap allocation per
+   thread; the assert on max_object_bytes is the targeted regression check -- it would
+   catch a meta-page sample (thousands of bytes) even if some other, unrelated small
+   residual kept live_samples from reaching exactly zero. */
+#ifdef _WIN32
+static DWORD WINAPI meta_page_worker(LPVOID arg) {
+  (void)arg;
+  void* p = mi_malloc(256);
+  assert(p != NULL);
+  mi_free(p);
+  return 0;
+}
+static void meta_page_spawn_join(void) {
+  HANDLE h = CreateThread(NULL, 0, meta_page_worker, NULL, 0, NULL);
+  assert(h != NULL); WaitForSingleObject(h, INFINITE); CloseHandle(h);
+}
+#else
+static void* meta_page_worker(void* arg) {
+  (void)arg;
+  void* p = mi_malloc(256);
+  assert(p != NULL);
+  mi_free(p);
+  return NULL;
+}
+static void meta_page_spawn_join(void) {
+  pthread_t t; assert(pthread_create(&t, NULL, meta_page_worker, NULL) == 0);
+  assert(pthread_join(t, NULL) == 0);
+}
+#endif
+typedef struct max_object_size_s { size_t max_object_bytes; } max_object_size_t;
+static bool max_object_size_visitor(const mi_prof_sample_info_t* info, void* arg) {
+  max_object_size_t* m = (max_object_size_t*)arg;
+  if (info->live_objects > 0) {
+    const size_t avg = info->live_bytes / info->live_objects;
+    if (avg > m->max_object_bytes) m->max_object_bytes = avg;
+  }
+  return true;
+}
+static void test_meta_pages_never_sampled(void) {
+  enum { thread_count = 64 };
+  assert(mi_prof_start_seeded(64, 314));   /* same low rate as test_cross_thread_free_of_sampled */
+  for (int i = 0; i < thread_count; i++) meta_page_spawn_join();
+  mi_collect(true);
+
+  mi_prof_stats_t_decl(after);
+  assert(mi_prof_stats_get(&after));
+  assert(after.live_samples == 0 && after.live_bytes == 0);
+
+  max_object_size_t m = { 0 };
+  assert(mi_prof_visit(max_object_size_visitor, &m));
+  assert(m.max_object_bytes < 4000);   /* would catch a meta-page sample even if live_samples above were nonzero for an unrelated reason */
+  mi_prof_stop();
+}
+
 int main(void) {
   enum { count = 1000, size = 512 };
   void* blocks[count];
@@ -995,6 +1058,7 @@ int main(void) {
   test_page_reuse_after_stop();
   test_sample_rate_one();
   test_cross_thread_free_of_sampled();
+  test_meta_pages_never_sampled();
   if (getenv("MIMALLOC_PROF_DUMP_AT_EXIT") != NULL) {
     assert(mi_prof_start_seeded(1, 47));
     assert(mi_malloc(4096) != NULL);  /* Preserve one real sample for pprof validation. */

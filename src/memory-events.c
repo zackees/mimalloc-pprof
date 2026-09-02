@@ -207,6 +207,14 @@ static void memevt_dispatch(mi_memory_change_kind_t kind, int64_t delta_bytes, u
    from both observers. */
 void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
   if (memevt_suppress_depth > 0) return;
+  // #266: never report allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
+  // _mi_meta_zalloc onto subproc->theap_meta) as a user allocation. This is the sole
+  // entry point DHAT's begin_alloc is reached through, so this one check excludes both
+  // observers; the matching _mi_memevt_on_free check below keeps ALLOCATE/FREE balanced
+  // (memevt_live_bytes/memevt_live_count are running deltas, so an unmatched free would
+  // under/overflow them) -- DHAT's own free path needs no matching check since it looks
+  // up the pointer in its own record table and no-ops when the alloc was never recorded.
+  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
   _mi_dhat_begin_alloc(page, p, request_size);
   size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
@@ -219,6 +227,8 @@ void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
 
 void _mi_memevt_on_free(mi_page_t* page, void* p) {
   if (memevt_suppress_depth > 0) return;
+  // #266: symmetric with the _mi_memevt_on_alloc check above -- see its comment.
+  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
   _mi_dhat_begin_free(p);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {

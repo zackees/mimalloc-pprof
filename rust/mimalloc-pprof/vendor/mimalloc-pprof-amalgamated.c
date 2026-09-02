@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit b3f10284 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 56a40b24 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4286,6 +4286,13 @@ mi_lock_t*    _mi_subprocs_lock(void);
 void          _mi_process_fork_prepare(void);
 void          _mi_process_fork_parent(void);
 void          _mi_process_fork_child(void);
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): set once by
+// `_mi_process_fork_child`, never cleared. See src/fork.c's definition for the full
+// rationale; consulted by `mi_heap_visit_page_claim` (arena.c) and `mi_heap_detach_theaps`
+// (heap.c) to avoid waiting on / walking pages of a theap whose owning thread did not
+// survive a multi-threaded fork().
+extern mi_decl_hidden bool _mi_process_is_forked_child;
 
 // #270: runtime lock-order detector. Every internal lock acquire already goes through
 // diagnostic.c's reentrancy checker (MI_DEBUG>2), which records the owning thread in
@@ -12042,10 +12049,16 @@ mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;  // impor
 // too. This is the same protocol the abandoned-page map already uses
 // (`mi_arena_try_claim_abandoned`).
 //
-// Dropped from the upstream version: the `_mi_process_is_forked_child` branch, which
-// re-derives a torn page snapshot after a multi-threaded `fork()`. `pthread_atfork`
-// handling does not exist in this tree yet (#270 / PR #289, not merged as of this PR); add
-// that branch back when it lands.
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): the
+// `_mi_process_is_forked_child` branch below was originally dropped here with a note to
+// "add it back once #270/PR #289 lands" -- #289 landed a handler-only fork design
+// (src/fork.c) without the persistent flag this branch needs, so the flag
+// (`_mi_process_is_forked_child`, src/fork.c) was added alongside restoring this branch.
+// Without it, a page belonging to a theap whose thread did not survive a multi-threaded
+// `fork()` hits the `!mi_page_is_abandoned` branch below and gets force-seized without
+// reconciling its (possibly torn, mid-update) `used`/`local_free`/`xthread_free`
+// bookkeeping, which can trip `mi_page_is_valid_init` downstream
+// (test-fork-user-heap.c's `case_a`, found while merging P5's fork.c into this branch).
 static void mi_heap_visit_page_seize(mi_page_t* page) {
   // the page sits in the queue of a theap whose thread is gone or misbehaving; leave that queue be
   page->next = page->prev = NULL;
@@ -12063,6 +12076,20 @@ static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* pag
       while (mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) == 2) { _mi_prim_thread_yield(); }
     }
     #endif
+    if mi_unlikely(_mi_process_is_forked_child) {
+      // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): after a
+      // multi-threaded fork() the (single-threaded) child may inherit a torn snapshot of a
+      // page that another thread was allocating or freeing when the fork happened -- the
+      // arena-pages bit propagated but the page-map entry or the owned bit did not, and that
+      // thread no longer exists in this process to finish the update. Re-derive what we can
+      // and take the page outright; there is nobody left to race.
+      if (mi_page_start(page) == NULL) return false;  // the page struct never made it across: leave it unpublished
+      if (_mi_safe_ptr_page(mi_page_start(page)) != page && !_mi_page_map_register(page)) return false;
+      mi_page_claim_ownership(page);   // ours now, whether or not the dead thread held it
+      mi_bitmap_set(pages, slice_index);
+      if (!mi_page_is_abandoned(page)) { mi_heap_visit_page_seize(page); }
+      break;
+    }
     if mi_unlikely(!mi_page_is_abandoned(page)) {
       // A thread that allocated from this heap before is using it during the delete (it
       // allocated this page, or reclaimed it on a free just now): that is outside the
@@ -14812,6 +14839,18 @@ static void mi_heap_detach_theaps(mi_heap_t* heap) {
   mi_lock(&heap->theaps_lock) { // paranoia
     for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
       mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // detached
+      // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): a
+      // theap whose owning thread did not survive a multi-threaded fork() (P5's src/fork.c
+      // reset `heap->theaps_lock` in the child, so we can still walk this list, but the
+      // theap's own bookkeeping -- page_count, queue links -- may be torn mid-update) must
+      // not be walked here: `_mi_theap_abandon` -> `_mi_page_abandon` asserts page validity
+      // that a torn theap can violate (test-fork-user-heap.c's `case_a`). Its arena pages
+      // get taken instead by `mi_heap_visit_page_claim`'s own forked-child branch
+      // (arena.c), which re-derives ownership from the page/arena bitmaps rather than the
+      // theap's queues.
+      if mi_unlikely(_mi_process_is_forked_child && theap->tld->thread_id != _mi_thread_id()) {
+        continue;
+      }
       _mi_theap_abandon(theap);
       _mi_stats_merge_into(&heap->stats, &theap->stats);
     }
@@ -15281,6 +15320,16 @@ static mi_lock_t mi_fork_serialize_lock = MI_LOCK_INITIALIZER;
 static _Atomic(mi_threadid_t) mi_fork_owner;   // 0 = unowned; else the thread id currently mid-fork
 static int mi_fork_depth;                      // nesting depth for `mi_fork_owner`; only touched while owning
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): set once in
+// `_mi_process_fork_child`, never cleared. The child is single-threaded from the moment
+// `fork()` returns, but it can still be holding page-map/arena-pages bits published by a
+// sibling thread that did not survive the fork -- that thread's theap may be torn mid
+// -update (an allocation or free that was between its bitmap-set and its owned-bit-set/
+// bookkeeping-update when the fork happened). `mi_heap_visit_page_claim` (arena.c) and
+// `mi_heap_detach_theaps` (heap.c) consult this flag to avoid waiting on / walking pages
+// belonging to those dead threads, since they will never be relinquished normally.
+mi_decl_hidden bool _mi_process_is_forked_child;
+
 // Mimalloc reserves the low bit of a thread id for exactly this purpose elsewhere
 // (see diagnostic.c's `mi_lock_debug_thread`): some platform's `_mi_thread_id()` can
 // legitimately return 0 for a real thread, which would collide with `mi_fork_owner`'s
@@ -15594,6 +15643,7 @@ void _mi_process_fork_child(void) {
   // in practice that only matters for the depth count -- resetting the shared locks
   // unconditionally below is always correct in the child regardless).
   if (mi_atomic_load_acquire(&mi_fork_owner) != mi_fork_thread_id()) return;
+  _mi_process_is_forked_child = true;  // set before anything below can touch a heap/theap (issue #271)
   mi_fork_depth = 0;
   mi_atomic_store_relaxed(&mi_fork_owner, (mi_threadid_t)0);
   mi_lock_init(&mi_fork_serialize_lock);  // fresh for this child's own future forks

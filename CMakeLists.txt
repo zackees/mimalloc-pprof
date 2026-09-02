@@ -515,8 +515,16 @@ if(MI_TLS_RECURSE_GUARD)
   list(APPEND mi_defines MI_TLS_RECURSE_GUARD=1)
 endif()
 
-if("$ENV{MSYSTEM}" STREQUAL "UCRT64")
-  message(STATUS "Detected MSYS2 UCRT64 environment")
+# MI_MINGW_UCRT64 may also be set by the caller (a cache entry or a toolchain file):
+# $ENV{MSYSTEM} is set only by an MSYS2 shell, so it cannot detect a mingw-w64 UCRT
+# toolchain used from anywhere else -- notably a cross build on Linux, where mingw-w64 13
+# configured `--with-default-msvcrt=ucrt` is UCRT while MSYSTEM is unset (#277 phase C).
+if(MI_MINGW_UCRT64 OR "$ENV{MSYSTEM}" STREQUAL "UCRT64")
+  if(MI_MINGW_UCRT64)
+    message(STATUS "Using the mingw-w64 UCRT runtime (MI_MINGW_UCRT64=ON)")
+  else()
+    message(STATUS "Detected MSYS2 UCRT64 environment")
+  endif()
   set(MI_MINGW_UCRT64 "ON")
   list(APPEND mi_defines MI_MINGW_UCRT64=1)
 elseif("$ENV{MSYSTEM}" STREQUAL "MSYS")
@@ -1278,10 +1286,18 @@ if (MI_BUILD_TESTS)
     if(WIN32)
       target_compile_definitions(mimalloc-test-stress-dynamic PRIVATE "MI_LINK_VERSION=1")  # link mi_version
       target_link_libraries(mimalloc-test-stress-dynamic PRIVATE mimalloc ${mi_libraries})  # link mi_version
-      if(MI_MINGW_UCRT64)
+      if(MI_MINGW_UCRT64 AND CMAKE_HOST_WIN32)
         # mingw always links mimalloc after system libraries.
         # post-process with `minject` to make sure mimalloc is the first dll in the load order.
         add_custom_command(TARGET mimalloc-test-stress-dynamic POST_BUILD COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/minject${MINJECT_SUFFIX} --postfix=${mi_libsuffix} -f -i $<TARGET_FILE:mimalloc-test-stress-dynamic>)
+      elseif(MI_MINGW_UCRT64)
+        # `minject` is a Windows PE utility, so it cannot run on the host of a cross build.
+        # Say so loudly: without it mimalloc.dll is imported after the UCRT and the
+        # override this test exists to exercise may not take effect. Run
+        #   bin/minject${MINJECT_SUFFIX} --postfix=${mi_libsuffix} -f -i <the exe>
+        # on the target machine before running test-stress-dynamic (#277 phase C:
+        # .github/workflows/windows-bundles.yml does exactly that).
+        message(STATUS "Cross-compiling: run `bin/minject${MINJECT_SUFFIX} --postfix=${mi_libsuffix} -f -i mimalloc-test-stress-dynamic` on the target before running it")
       endif()
       add_test(NAME test-stress-dynamic COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_VERBOSE=1 $<TARGET_FILE:mimalloc-test-stress-dynamic>)
     else()

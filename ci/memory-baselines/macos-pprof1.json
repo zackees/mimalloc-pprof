@@ -1,6 +1,8 @@
 {
+  "arch": "arm64",
   "baseline_runs": 4,
   "baseline_spread_pct": 0.7,
+  "compiler": "apple-clang",
   "counters": {
     "pages_end": 1,
     "pages_start": 0,

@@ -903,6 +903,30 @@ void _mi_prof_process_done(void) {
     MI_UNUSED(dumped);
   }
 }
+
+// #270: fork-safety. Child-side policy (decided here, not ported from Bun -- their fork
+// handlers predate the profiler): CONTINUE. Every profiler record, chunk, and stack is
+// allocated from the raw-OS-layer arena (`_mi_prof_arena_alloc`, rule 4), never from a
+// hooked path, so it is ordinary process memory that survives fork() by plain
+// copy-on-write -- nothing about it is thread-affine. Only `prof_lock` itself can be
+// left in a locked state by a thread that did not survive the fork, so only the lock is
+// reset. `mi_prof_dump`/`mi_prof_start`/`mi_prof_stop` all keep working in the child
+// (see test-fork-locks.c's `mi_prof_dump` check) since they only ever touch this lock
+// plus the (intact) records.
+//
+// Where this sits in the documented lock order (src/fork.c): `prof_lock` is also taken
+// by `_mi_prof_on_alloc` (below), an alloc/free HOOK that runs with a heap's
+// `arena_pages_lock` sometimes still held a few frames up the same call stack -- so
+// per that file's corrected rule, `prof_lock` is quiesced LAST, innermost, alongside
+// `dhat_lock`/`memevt_cb_lock`/`out_buf_lock`, not before the heap/arena locks (an
+// earlier version of this file had that backwards, ported unmodified from Bun's
+// stated rule, and it produced a real, reproducible AB-BA deadlock -- see the #270 PR
+// discussion). `mi_prof_visit` (above) holding `prof_lock` across a user callback is
+// a SEPARATE, pre-existing hazard this phase does not close -- see src/fork.c's file
+// comment and `mi_prof_visit`'s own declaration (profile.h) for why.
+void _mi_prof_fork_prepare(void) { mi_lock_acquire(&prof_lock); }
+void _mi_prof_fork_parent(void)  { mi_lock_release(&prof_lock); }
+void _mi_prof_fork_child(void)   { mi_lock_init(&prof_lock); }
 void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size) {
   // #266: never sample allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
   // _mi_meta_zalloc onto subproc->theap_meta). These are large (sizeof(mi_theap_t) is
@@ -1050,4 +1074,8 @@ bool mi_prof_snapshot_visit(const mi_prof_snapshot_t* snap, mi_prof_visit_fun* v
 void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { MI_UNUSED(snap); }
 void _mi_prof_process_init(void) { }
 void _mi_prof_process_done(void) { }
+// #270: no `prof_lock` exists when MI_PPROF is off -- nothing to quiesce.
+void _mi_prof_fork_prepare(void) { }
+void _mi_prof_fork_parent(void)  { }
+void _mi_prof_fork_child(void)   { }
 #endif

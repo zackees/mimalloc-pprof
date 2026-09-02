@@ -11,6 +11,9 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <string.h>  // memcpy, memset
 #include <stdlib.h>  // atexit
+#if !defined(_WIN32) && !defined(__wasi__)
+#include <pthread.h> // pthread_atfork (fork handlers, src/fork.c) -- #270
+#endif
 
 // Empty page used to initialize the small free pages array
 static const mi_page_t mi_page_empty = {
@@ -571,6 +574,14 @@ static void mi_process_init_once(void) {
   _mi_tls_slots_init();      // pthread key create
   _mi_thread_locals_init();  // pthread key create
   _mi_process_is_initialized = true;
+
+  // #270 (Bun parity P5): register once per process, in process init -- never per heap
+  // or per thread. Bun's own history is the cautionary tale here: an earlier version
+  // registered from `mi_heap_new` and exhausted glibc's fixed-size atfork table,
+  // aborting inside BoringSSL. See the lock-order block at the top of src/fork.c.
+  #if !defined(_WIN32) && !defined(__wasi__)
+  pthread_atfork(&_mi_process_fork_prepare, &_mi_process_fork_parent, &_mi_process_fork_child);
+  #endif
 
   #if defined(_WIN32) && defined(MI_WIN_INIT_USE_FLS)
   // On windows, when building as a static lib the FLS cleanup happens to early for the main thread.

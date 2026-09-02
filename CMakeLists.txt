@@ -396,6 +396,13 @@ if(MI_DEBUG_FULL)
   list(APPEND mi_sources src/diagnostic.c)
 endif()
 
+# pthread_atfork fork-safety handlers (#270, Bun parity P5). POSIX-only: the file body
+# is wrapped in `#if !defined(_WIN32) && !defined(__wasi__)` and src/static.c includes it
+# under the same guard, so keep it out of the Windows source list entirely.
+if(NOT WIN32)
+  list(APPEND mi_sources src/fork.c)
+endif()
+
 # NOTE: `!` is NOT negation in CMake -- `!MI_GUARDED` parses as a variable name, and an
 # undefined variable is false, so the original `if(MI_DEBUG AND !MI_GUARDED)` was ALWAYS
 # false. And `set(MI_GUARDED=ON)` created a variable literally named `MI_GUARDED=ON`.
@@ -1041,6 +1048,74 @@ if (MI_BUILD_TESTS)
   endif()
   add_test(NAME test-subproc-lifecycle COMMAND mimalloc-test-subproc-lifecycle)
   set_tests_properties(test-subproc-lifecycle PROPERTIES TIMEOUT 600)
+
+  # pthread_atfork fork-safety handlers (issue #270, Bun parity P5). POSIX-only --
+  # both sources compile to a Windows-skip stub via #ifdef _WIN32, but there is no
+  # pthread/fork() to link against on MSVC/MinGW, so only build+register them off
+  # Windows (matching src/init.c's own `#if !defined(_WIN32) && !defined(__wasi__)`
+  # guard around the pthread_atfork registration these tests exercise).
+  if(NOT WIN32)
+    find_package(Threads REQUIRED)
+
+    # test-fork-locks: the repro from #270's Step 1 -- see the file's header comment
+    # for how to reproduce the pre-#270 hang (revert the subproc.c/init.c fork-handler
+    # changes and re-run). TIMEOUT is generous: 200 forks x a 5s per-child watchdog is
+    # the worst case if every single fork hangs, which should never happen once the
+    # handlers are in place (a clean run finishes in well under a second).
+    add_executable(mimalloc-test-fork-locks test/test-fork-locks.c)
+    target_compile_definitions(mimalloc-test-fork-locks PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-fork-locks PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-fork-locks PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-fork-locks PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-fork-locks PRIVATE mimalloc ${mi_libraries})
+    endif()
+    target_link_libraries(mimalloc-test-fork-locks PRIVATE Threads::Threads)
+    add_test(NAME test-fork-locks COMMAND mimalloc-test-fork-locks)
+    set_tests_properties(test-fork-locks PROPERTIES TIMEOUT 300)
+
+    # #270 review follow-up: MIMALLOC_PROF/MIMALLOC_DHAT/MIMALLOC_MEMORY_EVENTS each
+    # activate an alloc/free HOOK lock (prof_lock/dhat_lock/memevt_cb_lock) that a
+    # default run of this test never touches. An earlier version of subproc.c's lock
+    # order took those hook locks before the heap/arena locks (porting Bun's stated
+    # rule unmodified) and deadlocked deterministically under MIMALLOC_PROF=1 in a
+    # Release build (see the #270 PR discussion) -- these variants keep that reproducer
+    # registered so a future reordering regresses loudly in CI instead of silently.
+    add_test(NAME test-fork-locks-prof-env COMMAND mimalloc-test-fork-locks)
+    set_tests_properties(test-fork-locks-prof-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_PROF=1")
+    add_test(NAME test-fork-locks-dhat-env COMMAND mimalloc-test-fork-locks)
+    set_tests_properties(test-fork-locks-dhat-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_DHAT=1")
+    add_test(NAME test-fork-locks-memevt-env COMMAND mimalloc-test-fork-locks)
+    set_tests_properties(test-fork-locks-memevt-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
+
+    # #270 review follow-up (F1): the lock-ORDER stress variant. `MI_TEST_FORK_SPAWN=1`
+    # makes the test start short-lived threads continuously while it forks; each thread
+    # start allocates its own tld/theap through `_mi_meta_zalloc`, which holds
+    # `theap_meta_lock` across a full allocation on `heap_main` and therefore nests it
+    # OUTSIDE `heap_main->arena_pages_lock` / `arena_reserve_lock` / the page-map lock.
+    # A prepare() that took any of those first deadlocks the parent inside fork() here.
+    # Paired with MIMALLOC_PROF=1 so the alloc/free hook locks are live at the same time.
+    add_test(NAME test-fork-locks-spawn-prof-env COMMAND mimalloc-test-fork-locks)
+    set_tests_properties(test-fork-locks-spawn-prof-env PROPERTIES TIMEOUT 300
+                         ENVIRONMENT "MIMALLOC_PROF=1;MI_TEST_FORK_SPAWN=1")
+
+    # test-fork-user-heap: imported from oven-sh/mimalloc @ 942b8342, MIT (see the
+    # file's header comment for provenance and for which cases are disabled here as
+    # `#if 0 // Phase 7` pending the scavenger/tld registry, #264 item 7 / #272).
+    add_executable(mimalloc-test-fork-user-heap test/test-fork-user-heap.c)
+    target_compile_definitions(mimalloc-test-fork-user-heap PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-fork-user-heap PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-fork-user-heap PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-fork-user-heap PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-fork-user-heap PRIVATE mimalloc ${mi_libraries})
+    endif()
+    target_link_libraries(mimalloc-test-fork-user-heap PRIVATE Threads::Threads)
+    add_test(NAME test-fork-user-heap COMMAND mimalloc-test-fork-user-heap)
+    set_tests_properties(test-fork-user-heap PROPERTIES TIMEOUT 300)
+  endif()
 
   # MI_NO_PROCESS_DETACH (issue #268, Bun parity P3): imported from
   # oven-sh/mimalloc @ 942b8342, MIT. The same test source is built and run twice --

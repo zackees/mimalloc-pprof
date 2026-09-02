@@ -188,6 +188,15 @@ static void mi_heap_main_init_once(void) {
   _mi_theap_init(&mi_process_theap_meta,&mi_process_heap_main,&mi_tld_detached);
   mi_process_theap_meta.allow_page_abandon = false;  // for security, don't share with other threads
   mi_process_theap_meta.page_full_retain = 2;
+  #if MI_GUARDED
+  // Internal allocator bookkeeping (tld/theap/subproc structs, TLS slot arrays -- see
+  // #266) is not a user-visible object: guarding it serves no purpose (there is no
+  // application buffer-overrun to catch here) and corrupts memevt/profiler hook
+  // accounting, since the guarded allocator's own inner request reports a different
+  // (guard-page-inflated) size than the logical allocation. Never guard theap_meta,
+  // regardless of the global MIMALLOC_GUARDED_SAMPLE_RATE setting.
+  mi_process_theap_meta.guarded_sample_rate = 0;
+  #endif
   subproc_main->theap_meta = &mi_process_theap_meta;
 
   // mi_heap_theap_set(&mi_process_heap_main,&mi_process_theap_main); // set in `mi_thread_init(_theap_default)`

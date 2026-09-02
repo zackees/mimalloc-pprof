@@ -870,10 +870,25 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   else { mi_atomic_increment_relaxed(&prof_dropped_samples); }  /* dropped sample: record-alloc itself failed (budget/arena exhausted). */
   mi_lock_release(&prof_lock);
 }
+
+// #266: pair around an inner allocation whose reported size is not the caller's actual
+// request (e.g. the guarded allocator's own over-allocated inner call in alloc.c) so its
+// _mi_prof_on_alloc doesn't touch the per-theap sampling counters with the wrong size;
+// the caller fires one corrected _mi_prof_on_alloc afterward. Reuses prof_callback_depth,
+// the same re-entrancy guard _mi_prof_on_alloc already checks, rather than adding new
+// per-theap state.
+void _mi_prof_suppress_begin(void) { prof_callback_depth++; }
+void _mi_prof_suppress_end(void)   { prof_callback_depth--; }
+
 static void prof_free_collect(mi_page_t* page, mi_block_t* head) { for (mi_block_t* b=head; b != NULL && page->has_metadata; b=mi_block_next(page,b)) prof_free_record(page,b); }
 static void prof_realloc_in_place(mi_page_t* page, void* p, size_t size) {
+  // #266: callers pass the caller-visible pointer, which for a guarded (interior)
+  // allocation is not the block start records are keyed by (see prof_free_record /
+  // _mi_prof_on_alloc's callers in alloc.c). Unalias first so both identities match;
+  // this is a no-op for an already block-aligned p (the common, non-guarded case).
+  void* const block = _mi_page_ptr_unalign(page, p);
   for (mi_prof_record_t* rec = (mi_prof_record_t*)page->metadata; rec != NULL; rec = rec->next) {
-    if (rec->ptr == p) { mi_atomic_store_relaxed(&prof_bytes, mi_atomic_load_relaxed(&prof_bytes) - rec->size + size); _mi_prof_stack_resize(rec->stack, rec->size, size); rec->size = size; break; }
+    if (rec->ptr == block) { mi_atomic_store_relaxed(&prof_bytes, mi_atomic_load_relaxed(&prof_bytes) - rec->size + size); _mi_prof_stack_resize(rec->stack, rec->size, size); rec->size = size; break; }
   }
 }
 void _mi_prof_on_free(mi_page_t* page, void* p) {

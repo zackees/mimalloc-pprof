@@ -188,6 +188,11 @@ mi_subproc_id_t mi_subproc_new(void) {
   mi_assert_internal(parent->theap_meta->tld!=NULL);
   mi_assert_internal(parent->theap_meta->tld->thread_id == MI_THREADID_DETACHED);
   _mi_theap_init(theap_meta,heap_main,parent->theap_meta->tld /* detached tld */);
+  #if MI_GUARDED
+  // See the matching comment in init.c's process-main theap_meta bootstrap (#266):
+  // internal allocator bookkeeping must never be guarded.
+  theap_meta->guarded_sample_rate = 0;
+  #endif
   subproc->theap_meta = theap_meta;
 
   return _mi_subproc_to_id(subproc);

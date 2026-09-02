@@ -242,6 +242,20 @@ static void test_event_correctness(void) {
      crash/corruption. Build with -DCMAKE_BUILD_TYPE=Debug (or -DMI_DEBUG=ON) to exercise it. */
 #if defined(MI_DEBUG) && (MI_DEBUG > 0)
   {
+    /* MI_GUARDED (issue #266): under MIMALLOC_GUARDED_SAMPLE_RATE forcing every
+       allocation to be guarded, this 64-byte block gets its own single-block page, and
+       freeing it immediately retires/returns that page to the arena (src/page.c's
+       _mi_page_free clears has_interior_pointers and hands the page back). The
+       double-free detector assumes a freed block's page sticks around for the
+       free-list scan that spots it -- an assumption a reclaimed page violates, so the
+       deliberate second mi_free below would fault in mi_validate_block_from_ptr before
+       mi_check_is_double_free ever runs, rather than testing the thing this sub-case
+       exists to test. Disable guarding for just this allocation so it exercises the
+       double-free detector under the conditions it actually assumes; nothing after
+       this sub-case in this function depends on guarding being active. */
+#if MI_GUARDED
+    mi_theap_guarded_set_sample_rate(mi_theap_get_default(), 0, 0);
+#endif
     void* a = mi_malloc(64); assert(a != NULL);
     mi_free(a);
     evt_ctx_reset(&ctx);

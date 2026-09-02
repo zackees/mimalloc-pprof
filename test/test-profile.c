@@ -16,7 +16,10 @@ static void profile_worker(void) {
   }
 }
 
-static char dump_text[65536];
+// MI_GUARDED (#266): under MIMALLOC_GUARDED_SAMPLE_RATE forcing every allocation to
+// be guarded, each sampled allocation gets its own distinct guard page, so the dump
+// carries more/larger entries than the un-guarded run this buffer was sized for.
+static char dump_text[4*1024*1024];
 static size_t dump_used;
 static void dump_write(void* arg, const char* buf, size_t len) {
   (void)arg; assert(len <= sizeof(dump_text)-dump_used-1); memcpy(dump_text+dump_used,buf,len); dump_used+=len; dump_text[dump_used]=0;

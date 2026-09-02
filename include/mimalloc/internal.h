@@ -343,6 +343,8 @@ bool          _mi_page_is_valid(mi_page_t* page);
 
 // "profile.c" / "profile-stack.c" / "profile-maps.c": allocation sampling profiler (MI_PPROF).
 void        _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size);
+void        _mi_prof_suppress_begin(void);  // like _mi_memevt_suppress_begin/end (#266): pair around
+void        _mi_prof_suppress_end(void);    // an inner allocation whose size the caller will correct
 void        _mi_prof_on_free(mi_page_t* page, void* p);
 void        _mi_prof_on_free_collect(mi_page_t* page, mi_block_t* head);
 void        _mi_prof_on_realloc_in_place(mi_page_t* page, void* p, size_t size);

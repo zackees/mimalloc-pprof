@@ -26,6 +26,18 @@ static void install_callbacks(callback_counts_t* counts) {
 }
 
 int main(void) {
+  /* MI_GUARDED (issue #266): this test's assertions are exact block/byte counts, which
+     assume DHAT sees precisely the caller's requested sizes. Under
+     MIMALLOC_GUARDED_SAMPLE_RATE forcing every allocation to be guarded, a guarded
+     block's own single-block page gets returned to the arena the moment it is freed
+     (src/page.c's _mi_page_free), which this test's exact-identity/in-place-resize
+     assumptions (and, separately, its counts) are not written to tolerate. This test is
+     about DHAT accounting precision, not the guarded allocator, so disable guarding for
+     the whole run rather than chasing guarded-specific behavior it was never meant to
+     exercise. */
+#if MI_GUARDED
+  mi_theap_guarded_set_sample_rate(mi_theap_get_default(), 0, 0);
+#endif
   assert(mi_memory_tracking_set_enabled(true));
   callback_counts_t callbacks = { 0, 0, 0 };
   install_callbacks(&callbacks);

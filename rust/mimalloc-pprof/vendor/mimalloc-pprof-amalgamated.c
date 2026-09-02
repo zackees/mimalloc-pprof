@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 78f7bcc9 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 9d8ca042 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -14030,6 +14030,18 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <unistd.h>
 #endif
 
+// #266 macOS escalation, round 2: a real same-thread reentrant_internal_lock_acquisition
+// (current_tid==owner_tid, both non-degenerate -- run 33581454510) needs to know WHICH
+// lock and WHAT nested call path, not just that thread ids match. backtrace_symbols_fd
+// (unlike backtrace_symbols) never calls malloc -- it writes directly to the fd -- so it
+// is safe to use from this file's never-allocate failure path; backtrace() itself is
+// widely relied on as safe here too (glibc/Darwin resolve their unwind tables lazily on
+// first use elsewhere in the process, not from this crash-only, _exit-terminated path).
+#if defined(__APPLE__) || defined(__GLIBC__)
+#include <execinfo.h>
+#define MI_DIAG_HAVE_BACKTRACE 1
+#endif
+
 static char* mi_diag_append(char* out, const char* end, const char* text) {
   while (out < end && *text != 0) { *out++ = *text++; }
   return out;
@@ -14076,6 +14088,39 @@ static void mi_lock_debug_fail(const char* reason, const void* lock, uintptr_t c
   out = mi_diag_append(out, end, ")\n");
   *out = 0;
   _mi_prim_out_stderr(message);
+
+  // Identify the lock by address against the subprocess locks we can reach without any
+  // new declarations in upstream headers (mi_subproc_t is a complete type already
+  // visible here via internal.h/types.h, and _mi_subproc_main is already declared in
+  // internal.h). mi_thread_locals_lock (threadlocal.c) is `static` to that TU and not
+  // reachable from here, so it is intentionally not named -- the backtrace below still
+  // covers it.
+  {
+    const mi_subproc_t* const subproc = _mi_subproc_main();
+    const char* lock_name = NULL;
+    if (lock == &subproc->theap_meta_lock)     { lock_name = "subproc->theap_meta_lock"; }
+    else if (lock == &subproc->heaps_lock)      { lock_name = "subproc->heaps_lock"; }
+    else if (lock == &subproc->arena_reserve_lock) { lock_name = "subproc->arena_reserve_lock"; }
+    if (lock_name != NULL) {
+      char name_msg[96] = { 0 };
+      char* nout = name_msg;
+      const char* const nend = name_msg + sizeof(name_msg) - 1;
+      nout = mi_diag_append(nout, nend, "mimalloc: lock identified as ");
+      nout = mi_diag_append(nout, nend, lock_name);
+      nout = mi_diag_append(nout, nend, "\n");
+      *nout = 0;
+      _mi_prim_out_stderr(name_msg);
+    }
+  }
+
+#if defined(MI_DIAG_HAVE_BACKTRACE)
+  {
+    void* frames[64];
+    const int n = backtrace(frames, 64);
+    if (n > 0) { backtrace_symbols_fd(frames, n, 2 /* stderr */); }
+  }
+#endif
+
   /* Do not run allocator teardown from a corrupted state, and do not spend
      seconds writing a core file in a timeout-bounded diagnostic test. */
   _exit(134);

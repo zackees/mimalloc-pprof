@@ -1008,6 +1008,11 @@ if (MI_BUILD_TESTS)
     target_include_directories(mimalloc-test-profile-race PRIVATE include)
     if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
       target_link_libraries(mimalloc-test-profile-race PRIVATE mimalloc-static ${mi_libraries})
+      # issue #272 (P7b): scenario 5's purged-block assertions need `_mi_ptr_page` /
+      # `mi_page_block_is_purged`, which a shared build hides. With the static library
+      # they are available; without it the scenario still runs (it is a concurrency test
+      # first) minus those two assertions -- see the test source.
+      target_compile_definitions(mimalloc-test-profile-race PRIVATE MI_TEST_LINKS_STATIC=1)
     else()
       target_link_libraries(mimalloc-test-profile-race PRIVATE mimalloc ${mi_libraries})
     endif()
@@ -1246,23 +1251,25 @@ if (MI_BUILD_TESTS)
     # tail, the OS-page arithmetic, the read-only hole report, and the `swept_state` skip
     # (including its `purge_holes_full_every` bound). It reaches internal headers, so it
     # links the static library and is built with the library's own defines.
-    add_executable(mimalloc-test-purge-holes test/test-purge-holes.c)
-    target_compile_definitions(mimalloc-test-purge-holes PRIVATE ${mi_defines})
-    target_compile_options(mimalloc-test-purge-holes PRIVATE ${mi_cflags})
-    target_include_directories(mimalloc-test-purge-holes PRIVATE include)
+    # It walks `mi_page_t` and calls `_mi_ptr_page` / `_mi_page_purged_count` /
+    # `_mi_page_purge_os_page_blocks` directly, and those are hidden in a shared build
+    # (`-fvisibility=hidden`), so this one is STATIC-ONLY -- the `ctest-shared` lane
+    # (`MI_BUILD_STATIC=OFF`) skips it rather than failing to link.
     if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      add_executable(mimalloc-test-purge-holes test/test-purge-holes.c)
+      target_compile_definitions(mimalloc-test-purge-holes PRIVATE ${mi_defines})
+      target_compile_options(mimalloc-test-purge-holes PRIVATE ${mi_cflags})
+      target_include_directories(mimalloc-test-purge-holes PRIVATE include)
       target_link_libraries(mimalloc-test-purge-holes PRIVATE mimalloc-static ${mi_libraries})
-    else()
-      target_link_libraries(mimalloc-test-purge-holes PRIVATE mimalloc ${mi_libraries})
+      target_link_libraries(mimalloc-test-purge-holes PRIVATE Threads::Threads)
+      add_test(NAME test-purge-holes COMMAND mimalloc-test-purge-holes)
+      set_tests_properties(test-purge-holes PROPERTIES TIMEOUT 600)
+      # ... and with the feature off: every data-integrity check still runs, and the test
+      # additionally asserts that nothing is ever discarded (the option's off-path).
+      add_test(NAME test-purge-holes-off COMMAND mimalloc-test-purge-holes)
+      set_tests_properties(test-purge-holes-off PROPERTIES TIMEOUT 600
+                           ENVIRONMENT "MIMALLOC_PURGE_HOLES=0")
     endif()
-    target_link_libraries(mimalloc-test-purge-holes PRIVATE Threads::Threads)
-    add_test(NAME test-purge-holes COMMAND mimalloc-test-purge-holes)
-    set_tests_properties(test-purge-holes PROPERTIES TIMEOUT 600)
-    # ... and with the feature off: every data-integrity check still runs, and the test
-    # additionally asserts that nothing is ever discarded (the option's off-path).
-    add_test(NAME test-purge-holes-off COMMAND mimalloc-test-purge-holes)
-    set_tests_properties(test-purge-holes-off PROPERTIES TIMEOUT 600
-                         ENVIRONMENT "MIMALLOC_PURGE_HOLES=0")
 
     # test-purge-zero: imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 /
     # Bun parity P7b). The purge path may hand a recycled slice back as "reads zero";

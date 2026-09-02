@@ -41,7 +41,24 @@
 #include <stdbool.h>
 #include "mimalloc.h"
 #include "mimalloc/profile.h"
-#include "mimalloc/internal.h"   /* scenario 5: _mi_ptr_page, mi_page_block_is_purged */
+/* Scenario 5 checks that no walk ever hands out a *purged* (discarded) block, which needs
+   `_mi_ptr_page` / `mi_page_block_is_purged`. Those are internal and hidden in a shared
+   build, so the checks compile only when this test links the static library
+   (`MI_TEST_LINKS_STATIC`, set by CMake); the `ctest-shared` lane still runs the whole
+   scenario as the concurrency test it also is. */
+#if defined(MI_TEST_LINKS_STATIC)
+#include "mimalloc/internal.h"
+#define hole_check_not_purged(p)  assert(!mi_page_block_is_purged(_mi_ptr_page(p), (p)))
+#define hole_os_page_size()       _mi_os_page_size()
+#else
+#define hole_check_not_purged(p)  ((void)(p))
+#ifdef _WIN32
+static size_t hole_os_page_size(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (size_t)si.dwPageSize; }
+#else
+#include <unistd.h>
+static size_t hole_os_page_size(void) { return (size_t)sysconf(_SC_PAGESIZE); }
+#endif
+#endif
 
 #define RACE_THREADS   8
 #define RACE_ROUNDS    3
@@ -350,7 +367,7 @@ static volatile int hole_stop;
 
 /* keep one block per 2 OS pages so a run of frees always covers a whole OS page */
 static size_t hole_keep_every(void) {
-  return (((2 * _mi_os_page_size()) + HOLE_BSZ - 1) / HOLE_BSZ) + 2;
+  return (((2 * hole_os_page_size()) + HOLE_BSZ - 1) / HOLE_BSZ) + 2;
 }
 
 /* allocate HOLE_LIVE blocks, then free all but every Nth: the survivors pin their own OS
@@ -383,7 +400,7 @@ static THREAD_RET hole_owner_worker(void* arg) {
     for (size_t i = 0; i < HOLE_LIVE; i++) {
       if (p[i] == NULL) continue;
       assert(((unsigned char*)p[i])[0] == (unsigned char)((i & 0x7f) + 1));
-      assert(!mi_page_block_is_purged(_mi_ptr_page(p[i]), p[i]));
+      hole_check_not_purged(p[i]);
     }
   }
   hole_release(p);
@@ -406,7 +423,7 @@ static THREAD_RET hole_parker_worker(void* arg) {
     for (size_t i = 0; i < HOLE_LIVE; i++) {
       if (p[i] == NULL) continue;
       assert(((unsigned char*)p[i])[0] == (unsigned char)((i & 0x7f) + 1));
-      assert(!mi_page_block_is_purged(_mi_ptr_page(p[i]), p[i]));
+      hole_check_not_purged(p[i]);
     }
   }
   hole_release(p);
@@ -431,9 +448,7 @@ static bool hole_block_visitor(const mi_heap_t* heap, const mi_heap_area_t* area
   (void)heap; (void)area;
   size_t* n = (size_t*)arg;
   if (block == NULL) return true;   /* the per-area callback */
-  mi_page_t* const page = _mi_ptr_page(block);
-  assert(page != NULL);
-  assert(!mi_page_block_is_purged(page, block));
+  hole_check_not_purged(block);
   /* touch it: a discarded OS page reads back zero and is poisoned under ASan */
   (void)*(volatile unsigned char*)block;
   (void)block_size;

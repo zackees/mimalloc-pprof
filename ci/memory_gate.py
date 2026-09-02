@@ -21,7 +21,7 @@ Usage:
     memory_gate.py check   [<result.json> ...]   # no paths: build/run the binary itself
     memory_gate.py update  <result.json> [more.json ...]   # deliberate, reviewed act
     memory_gate.py control <result.json> [more.json ...]   # positive control: must FAIL
-    memory_gate.py where   <result.json>                   # print the baseline it matches
+    memory_gate.py where   <result.json>                   # 0 = baseline exists, 3 = none
 
 `--arch <name>` and `--compiler <name>` (accepted by every command) declare the
 toolchain identity the binary cannot know about itself, and become part of the baseline
@@ -35,7 +35,7 @@ With no JSON paths, `check` locates the built `mimalloc-test-memory-gate` binary
 runs it RUNS_EXPECTED times (see run_gate_binary), and checks those results -- this
 is what makes `python ci/memory_gate.py check` alone reproduce the CI job locally.
 
-Exit codes: 0 pass, 1 regression, 2 usage/IO error.
+Exit codes: 0 pass, 1 regression, 2 usage/IO error, 3 (`where` only) no baseline yet.
 """
 
 from __future__ import annotations
@@ -461,16 +461,23 @@ def _identity_flags(arch: str | None, compiler: str | None) -> str:
 def where(result_paths: list[str], *, arch: str | None = None, compiler: str | None = None) -> int:
     """Print the baseline file a run of this identity is compared against.
 
-    Exit 0 if it exists, 2 if it does not. This is what lets a workflow ask "does this
-    lane have a baseline yet?" without hardcoding a filename that this module computes --
-    #277 phase B needs it because the *positive control* cannot run before a baseline
-    exists (`control` requires `check` to fail, and a missing baseline is not a failure,
-    it is a bootstrap to be committed), and a hardcoded path in YAML would drift silently.
+    Exit 0 if it exists, **3** if it does not, 2 if this run's JSON could not be read.
+
+    The three-way split is the point. `check` also exits 2 for "no baseline", but it exits
+    2 for an unreadable or absent result file as well -- so a workflow that treats `check`
+    rc=2 as "bootstrap me" turns a *crashed gate binary* into a green run with a
+    reassuring warning. Gating on this probe instead keeps those two apart: 3 means the
+    lane is genuinely new, 2 means something is wrong with the run itself.
+
+    #277 phase B needs the probe anyway, because the positive control cannot run before a
+    baseline exists (`control` requires `check` to fail, and a missing baseline is not a
+    failure), and hardcoding the filename in YAML would drift from what this module
+    computes from platform/arch/compiler/MI_PPROF.
     """
     result, _, _ = load_runs(result_paths, arch, compiler)
     path = baseline_path(result)
     print(path)
-    return 0 if path.exists() else 2
+    return 0 if path.exists() else 3
 
 
 def update(result_paths: list[str], *, arch: str | None = None, compiler: str | None = None) -> int:

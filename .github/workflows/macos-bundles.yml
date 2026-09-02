@@ -240,11 +240,14 @@ jobs:
           }
           # Plain `cargo`, NOT `soldr cargo` -- see the long note in cross.yml's
           # build-cross: the wrapper drops mi_prof_* symbols at link time on these targets.
-          cmd="cargo test -p mimalloc-pprof --no-run"
-          if ! run_build "$cmd"; then
-            echo "::warning::build failed; retrying with the soldr compile cache bypassed (soldr#1969)"
-            run_build "${cmd/soldr/soldr --no-cache}"
-          fi
+          #
+          # No soldr#1969 cache-bypass retry here, deliberately: that retry re-runs
+          # `${cmd/soldr/soldr --no-cache}`, and with `soldr` absent from cmd the
+          # substitution is a no-op, so the "retry" would just run the identical command
+          # a second time and report the same failure twice. (cross.yml carries the same
+          # dead retry; it is left alone here so this PR does not change the control arm
+          # of #277 phase B's comparison.)
+          run_build "cargo test -p mimalloc-pprof --no-run"
           test -s bins.txt
           mkdir -p "dist/$TARGET"
           xargs -r -a bins.txt -I{} cp {} "dist/$TARGET/"
@@ -264,6 +267,9 @@ jobs:
     # The point of the whole workflow: one macOS VM, one queue slot, everything serial.
     needs: [build-macos, build-rust-apple]
     runs-on: macos-latest
+    # Everything this job does is serial, so a hung test would otherwise hold the very
+    # macOS slot this workflow exists to stop wasting. Observed end-to-end: ~1m40s.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -326,27 +332,52 @@ jobs:
 
       - name: Memory gate -- 8 runs from the release bundle
         run: |
-          # GitHub invokes `bash -e`, so a plain `set -uo pipefail` does NOT disable
-          # errexit: `set +e` is required, not decorative, or the script dies on the
-          # gate's non-zero exit before the rc check runs.
-          set +e
-          set -uo pipefail
+          set -euo pipefail
           exe="$PWD/bundle/macos-arm64-release/mimalloc-test-memory-gate"
           for i in 1 2 3 4 5 6 7 8; do
             MI_BENCH_JSON="$PWD/result-$i.json" "$exe" > /dev/null
           done
+          # A gate binary that crashed writes no JSON, the glob stays unexpanded, and
+          # every downstream error would then be indistinguishable from "this lane has no
+          # baseline yet" -- i.e. a green step. Count first.
+          # Counted with a glob, not `ls | wc -l`: under `set -o pipefail` a pipeline
+          # whose `ls` finds nothing fails, and the failing assignment would then kill the
+          # step before it could say why.
+          count=0
+          for produced in result-*.json; do
+            if [ -e "$produced" ]; then count=$((count + 1)); fi
+          done
+          if [ "$count" -ne 8 ]; then
+            echo "::error::only $count of 8 memory-gate runs produced JSON"
+            exit 1
+          fi
           cat result-1.json
           # --arch/--compiler give this lane its own baseline. Without them it would be
           # compared against ci/memory-baselines/macos-pprof1.json, which Apple clang
           # recorded on this same runner -- a cross-toolchain comparison dressed as a
           # regression check (#277 phase B).
-          python3 ci/memory_gate.py check --arch arm64 --compiler soldr-clang-21 result-*.json
-          rc=$?
-          if [ $rc -eq 2 ]; then
-            echo "::warning::No committed baseline for the soldr arm64 lane yet -- bootstrap it from this run's memory-gate artifact."
-            exit 0
-          fi
-          exit $rc
+          #
+          # "Is this lane new?" is decided by `where`, which answers 3 for "no baseline"
+          # and 2 for "cannot read this run". `check` collapses both into 2, so gating the
+          # yellow bootstrap path on check's own status would report an unreadable or
+          # missing result as a bootstrap and exit green.
+          rc=0
+          python3 ci/memory_gate.py where --arch arm64 --compiler soldr-clang-21 result-1.json || rc=$?
+          case "$rc" in
+            0)
+              python3 ci/memory_gate.py check --arch arm64 --compiler soldr-clang-21 result-*.json
+              ;;
+            3)
+              echo "::warning::No committed baseline for the soldr arm64 lane yet -- bootstrap it from this run's memory-gate artifact."
+              # `check` exits 2 here by construction: the probe just proved the baseline is
+              # absent, so its status carries no information -- but its report does.
+              python3 ci/memory_gate.py check --arch arm64 --compiler soldr-clang-21 result-*.json || true
+              ;;
+            *)
+              echo "::error::memory_gate could not read this run's JSON (rc=$rc)"
+              exit 1
+              ;;
+          esac
       - name: Positive control -- the gate must catch an injected leak
         run: |
           set -euo pipefail
@@ -354,20 +385,44 @@ jobs:
           for i in 1 2 3 4 5 6 7 8; do
             MI_BENCH_JSON="$PWD/leak-$i.json" "$exe" > /dev/null || true
           done
-          # `control` requires `check` to FAIL. A missing baseline is not a failure, it is
-          # a bootstrap (exit 2), so before this lane's baseline is committed the control
-          # would go red for the wrong reason. Ask memory_gate.py where the baseline lives
-          # rather than hardcoding a name it computes.
-          if ! python3 ci/memory_gate.py where --arch arm64 --compiler soldr-clang-21 leak-1.json; then
-            echo "::warning::the soldr arm64 lane has no committed baseline yet, so its positive control cannot run. Commit the baseline, then this becomes a hard gate."
-            exit 0
+          # The leak build is *expected* to exit non-zero (hence `|| true` above), which
+          # makes the file count the only evidence that it ran at all.
+          count=0
+          for produced in leak-*.json; do
+            if [ -e "$produced" ]; then count=$((count + 1)); fi
+          done
+          if [ "$count" -ne 8 ]; then
+            echo "::error::only $count of 8 leak-control runs produced JSON"
+            exit 1
           fi
-          python3 ci/memory_gate.py control --arch arm64 --compiler soldr-clang-21 leak-*.json
+          # `control` requires `check` to FAIL. A missing baseline is not a failure, it is
+          # a bootstrap, so before this lane's baseline is committed the control would go
+          # red for the wrong reason. Ask memory_gate.py where the baseline lives rather
+          # than hardcoding a name it computes -- and distinguish "no baseline" (3) from
+          # "cannot read this run" (2), which must stay a hard failure.
+          rc=0
+          python3 ci/memory_gate.py where --arch arm64 --compiler soldr-clang-21 leak-1.json || rc=$?
+          case "$rc" in
+            0)
+              python3 ci/memory_gate.py control --arch arm64 --compiler soldr-clang-21 leak-*.json
+              ;;
+            3)
+              echo "::warning::the soldr arm64 lane has no committed baseline yet, so its positive control cannot run. Commit the baseline, then this becomes a hard gate."
+              ;;
+            *)
+              echo "::error::memory_gate could not read the leak control's JSON (rc=$rc)"
+              exit 1
+              ;;
+          esac
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: memory-gate-macos-arm64-soldr
-          path: result-*.json
+          # The leak runs too: they are what a reader needs to see why the control did or
+          # did not fire, and the gate runs are what the baseline is bootstrapped from.
+          path: |
+            result-*.json
+            leak-*.json
           if-no-files-found: error
 
       - name: Native compile-compat check (Xcode clang, no tests)
@@ -379,6 +434,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
+          # Must stay in step with c-unit.yml's `ctest` job (`cmake -B build -DMI_PPROF=ON`,
+          # built `--config Release`): this tree is the native half of the coverage
+          # comparison below, so if that job's flags change and these do not, the
+          # comparison silently stops describing the job being replaced. CMAKE_BUILD_TYPE
+          # is spelled out because there it is implied -- CMakeLists.txt (~137-145)
+          # defaults it to Release from the binary directory's name.
           cmake -B native-release -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build native-release --config Release --parallel
           cc --version
@@ -388,6 +449,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
+          # Same pairing as above, against c-unit.yml's `ctest-debug-full` job
+          # (`cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON`, built `--config Debug`).
+          # Release is not a typo: that job passes no CMAKE_BUILD_TYPE, its binary
+          # directory is `build`, and MI_DEBUG_FULL sets MI_DEBUG=3 independently of the
+          # build type -- so Release+MI_DEBUG_FULL is what it actually compiles.
           cmake -B native-debug-full -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DCMAKE_BUILD_TYPE=Release
           ctest --test-dir native-release --show-only=json-v1 > native-release.json
           ctest --test-dir native-debug-full --show-only=json-v1 > native-debug-full.json

@@ -171,10 +171,17 @@ Two coverage facts are stated rather than gated, because nothing can gate them:
 absent by default, so `linux-pprof1.json`, `windows-pprof1.json` and `macos-pprof1.json`
 keep their names and keep matching the runs that produced them — the ubuntu baseline is
 untouched. The soldr lane asks for `macos-arm64-soldr-clang-21-pprof1.json`, which does
-not exist yet, so its first run takes the existing "no baseline → bootstrap it" path
-(exit 2, a `::warning::`) and uploads its JSON. Its positive control is skipped with a
-warning until that baseline is committed, because `control` requires `check` to *fail* and
-a missing baseline is not a failure.
+not exist yet, so its first run takes the existing "no baseline → bootstrap it" path and
+uploads its JSON. Its positive control is skipped with a warning until that baseline is
+committed, because `control` requires `check` to *fail* and a missing baseline is not a
+failure.
+
+Which of those two states a run is in is decided by `memory_gate.py where`, not by
+`check`'s status. `check` exits 2 both for "no baseline" and for "this run's JSON could
+not be read", so a step that treated its 2 as "bootstrap me" would turn a **crashed gate
+binary** into a green run with a reassuring warning. `where` answers **3** for "no
+baseline" and keeps **2** for "cannot read this run", and `run-macos` additionally
+requires all eight result files to exist before it calls the gate at all.
 
 ### Rollout
 

@@ -124,10 +124,18 @@ class WhereTest(unittest.TestCase):
             path = self._write(Path(tmp), _result())
             self.assertEqual(memory_gate.where([path]), 0)
 
-    def test_exit_two_for_a_lane_with_no_baseline_yet(self) -> None:
+    def test_exit_three_for_a_lane_with_no_baseline_yet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(Path(tmp), _result())
-            self.assertEqual(memory_gate.where([path], arch="arm64", compiler="soldr-clang-21"), 2)
+            self.assertEqual(memory_gate.where([path], arch="arm64", compiler="soldr-clang-21"), 3)
+
+    def test_an_unreadable_run_is_exit_two_not_three(self) -> None:
+        # The distinction run-macos gates on: 3 is "this lane is new", 2 is "something is
+        # wrong with this run". Collapsing them would let a crashed gate binary be
+        # reported as a missing baseline and exit the step green.
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp) / "nope.json")
+            self.assertEqual(memory_gate.main(["memory_gate.py", "where", missing]), 2)
 
 
 class OptionParsingTest(unittest.TestCase):

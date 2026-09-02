@@ -34,7 +34,7 @@ set(_soldr_triple "aarch64_apple_darwin")
 foreach(_required SDKROOT CC_${_soldr_triple} CXX_${_soldr_triple} CFLAGS_${_soldr_triple})
   if(NOT DEFINED ENV{${_required}})
     message(FATAL_ERROR
-      "$ENV{${_required}} is not set: run `soldr prepare --target aarch64-apple-darwin` "
+      "${_required} is not set: run `soldr prepare --target aarch64-apple-darwin` "
       "(with --github-env \"$GITHUB_ENV\" on CI) before configuring with this toolchain.")
   endif()
 endforeach()

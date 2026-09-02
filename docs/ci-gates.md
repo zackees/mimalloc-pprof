@@ -201,7 +201,10 @@ clicked through in dockur's web viewer. So the disk is built **once, by a human*
 `macos-golden-bootstrap.yml` (`workflow_dispatch`, `timeout-minutes: 350`, tunnels the
 viewer out with cloudflared and prints the click-by-click procedure), compressed, and
 stored under an `actions/cache` key. A cache miss in `run-macos-x64-dockur` is a hard
-error naming that workflow, never a silent skip.
+error naming that workflow, never a silent skip — so **until that bootstrap has been run
+once, `run-macos-x64-dockur` is red**, on the PR that introduced it and on every push to
+`main` afterwards. That is deliberate: a gate that says "I have no disk to run on" is
+worth more than one that skips itself into a green tick. It fails in about two minutes.
 
 **`CPU_MODEL` is not dockur's default, and it is the difference between working and not.**
 Measured on an AMD Zen 2 host (Ryzen 7 3700X): with dockur's default profile for macOS 13

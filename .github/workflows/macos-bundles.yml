@@ -328,6 +328,13 @@ jobs:
   # is therefore not an option at any price. `macos-golden-bootstrap.yml` is the one-time,
   # human-driven job that produces the disk this job restores; a cache miss here is a hard
   # error that names it, rather than a silent skip.
+  #
+  # CONSEQUENCE, stated plainly rather than left for a reviewer to discover: until
+  # `macos-golden-bootstrap` has been run once, THIS JOB IS RED -- on the PR that
+  # introduces it and on every push to main after it merges. That is deliberate. A gate
+  # that reports "I have no disk to run on" is worth more than one that skips itself into
+  # a green tick, which is the exact failure mode docs/ci-gates.md exists to prevent. It
+  # fails in about two minutes and costs one Linux runner.
   # ---------------------------------------------------------------------------------
   run-macos-x64-dockur:
     name: run-macos-x64 (dockurr/macos on Linux)

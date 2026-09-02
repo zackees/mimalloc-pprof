@@ -493,7 +493,7 @@ static size_t mi_recurse_key_get(void) {
   size_t key = mi_atomic_load_acquire(&mi_recurse_key);
   if mi_unlikely(key == 0) {
     const DWORD index = TlsAlloc();      // does not allocate from the C heap
-    if (index == TLS_OUT_OF_INDEXES) return 0;
+    if (index == TLS_OUT_OF_INDEXES) return mi_atomic_load_acquire(&mi_recurse_key);  // another thread may have won
     size_t expected = 0;
     if (mi_atomic_cas_strong_acq_rel(&mi_recurse_key, &expected, (size_t)index + 1)) {
       key = (size_t)index + 1;

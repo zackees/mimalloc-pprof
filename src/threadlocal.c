@@ -75,7 +75,7 @@ static mi_thread_locals_t mi_thread_locals_empty = mi_init_struct_zero;
     size_t key = mi_atomic_load_acquire(&__##name##_key); \
     if mi_unlikely(key == 0) { \
       const DWORD index = TlsAlloc(); \
-      if (index == TLS_OUT_OF_INDEXES) return 0; \
+      if (index == TLS_OUT_OF_INDEXES) return mi_atomic_load_acquire(&__##name##_key); /* another thread may have won */ \
       size_t expected = 0; \
       if (mi_atomic_cas_strong_acq_rel(&__##name##_key, &expected, (size_t)index + 1)) { \
         key = (size_t)index + 1; \

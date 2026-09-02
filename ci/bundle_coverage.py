@@ -89,7 +89,7 @@ class Comparison:
 
 def render(comparisons: Sequence[Comparison]) -> str:
     lines = [
-        "### macOS coverage: native ctest vs cross-built bundle",
+        "### Coverage: native ctest vs cross-built bundle",
         "",
         "| config | native | bundle | missing from bundle | extra in bundle |",
         "|---|---:|---:|---|---|",

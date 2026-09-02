@@ -141,8 +141,18 @@ sub-issues (no new gaps found).
    draft issue's "we run your heap-teardown test corpus in CI" claim should be checked
    against exactly which files import cleanly before that sentence is repeated verbatim.
 
-No `MIMALLOC_FORKS.md` changes are needed this session: PR #275 already corrected the
-document's stale claims (see its title, "correct stale Bun fork claims from the parity
-gap analysis"), and this refresh found no further drift in that file specifically — the
-09-01 analysis's §6 corrections were about the fork's own state, which #275 addressed
-separately from consumer-surface parity.
+**`MIMALLOC_FORKS.md` was re-read (not just inferred from a PR title) this session** —
+`grep -n "942b8342\|6def7be9\|mi_on_thread_idle\|purge_delay\|superset" MIMALLOC_FORKS.md`
+and a manual read of every matching row. It is current: rows already exist and are
+correctly marked for every item merged since 09-01 (`MI_NO_PROCESS_DETACH` "5 —
+IMPORTED (#268)", `mi_heap_dump_json`/`mi_heap_get_seq` "5 — IMPORTED (#286)", heap
+teardown race protocol "5 — IMPORTED (PR #291)", stats.c snapshot/counter-at-a-time
+fixes "4 — IMPORTED (#286)", Windows PRNG/RAM-sizing "5 — IMPORTED (#297)", macOS TLS
+slots "5 — IMPORTED (#297)", `pthread_atfork` "5 on POSIX — IMPORTED (#270)"), and the
+still-open scavenger/hole-purging/`mi_on_thread_idle` row and the `purge_delay`
+1000→100 row are both correctly marked open. One minor staleness, not worth a same-day
+edit: both open rows still cite the now-split parent issue #272 rather than its two
+child PRs #299/#302 — accurate in substance (#272 tracks both), just one level less
+specific than this doc's own table above. No `MIMALLOC_FORKS.md` edit was made this
+session; none was required by 9b's own checklist beyond the re-verification recorded
+here.

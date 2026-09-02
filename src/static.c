@@ -29,6 +29,9 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "diagnostic.c"
 #endif
 #include "heap.c"
+#if !defined(_WIN32) && !defined(__wasi__)
+#include "fork.c"           // #270: pthread_atfork handlers (POSIX only; CMake guards the standalone build the same way)
+#endif
 #include "heap-dump.c"
 #include "init.c"
 #include "libc.c"

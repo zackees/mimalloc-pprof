@@ -1027,6 +1027,20 @@ if (MI_BUILD_TESTS)
     add_test(NAME test-fork-locks COMMAND mimalloc-test-fork-locks)
     set_tests_properties(test-fork-locks PROPERTIES TIMEOUT 300)
 
+    # #270 review follow-up: MIMALLOC_PROF/MIMALLOC_DHAT/MIMALLOC_MEMORY_EVENTS each
+    # activate an alloc/free HOOK lock (prof_lock/dhat_lock/memevt_cb_lock) that a
+    # default run of this test never touches. An earlier version of subproc.c's lock
+    # order took those hook locks before the heap/arena locks (porting Bun's stated
+    # rule unmodified) and deadlocked deterministically under MIMALLOC_PROF=1 in a
+    # Release build (see the #270 PR discussion) -- these variants keep that reproducer
+    # registered so a future reordering regresses loudly in CI instead of silently.
+    add_test(NAME test-fork-locks-prof-env COMMAND mimalloc-test-fork-locks)
+    set_tests_properties(test-fork-locks-prof-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_PROF=1")
+    add_test(NAME test-fork-locks-dhat-env COMMAND mimalloc-test-fork-locks)
+    set_tests_properties(test-fork-locks-dhat-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_DHAT=1")
+    add_test(NAME test-fork-locks-memevt-env COMMAND mimalloc-test-fork-locks)
+    set_tests_properties(test-fork-locks-memevt-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
+
     # test-fork-user-heap: imported from oven-sh/mimalloc @ 942b8342, MIT (see the
     # file's header comment for provenance and for which cases are disabled here as
     # `#if 0 // Phase 7` pending the scavenger/tld registry, #264 item 7 / #272).

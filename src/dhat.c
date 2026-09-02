@@ -581,7 +581,12 @@ void _mi_dhat_process_done(void) { if (dhat_dump_at_exit[0] != 0) { const bool d
 // too): CONTINUE, for the same reason as the profiler (see profile.c's matching
 // comment) -- the live/pp tables are process memory that survives fork() by ordinary
 // copy-on-write, and `mi_dhat_dump` must keep working in the child (test-fork-locks.c
-// checks this). Only `dhat_lock` needs resetting.
+// checks this). `dhat_lock` and `dhat_once` (the env-var lazy-init guard, in case a
+// thread was mid-resolve at fork time) both need resetting.
+// Like `prof_lock`, `dhat_lock` is an alloc/free HOOK lock (`_mi_dhat_begin_alloc`
+// etc, called from the same alloc.c/page.c sites) that can nest under a heap's
+// `arena_pages_lock`, so it sits innermost in the documented lock order too (see
+// subproc.c's file comment).
 void _mi_dhat_fork_prepare(void) { mi_lock_acquire(&dhat_lock); }
 void _mi_dhat_fork_parent(void)  { mi_lock_release(&dhat_lock); }
-void _mi_dhat_fork_child(void)   { mi_lock_init(&dhat_lock); }
+void _mi_dhat_fork_child(void)   { mi_lock_init(&dhat_lock); _mi_atomic_once_fork_child_reset(&dhat_once); }

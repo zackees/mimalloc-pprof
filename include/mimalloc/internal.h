@@ -186,6 +186,14 @@ void          _mi_subprocs_unsafe_destroy_all(void);
 void          _mi_process_fork_prepare(void);
 void          _mi_process_fork_parent(void);
 void          _mi_process_fork_child(void);
+#if (MI_DEBUG>0)
+// #270: test-only hooks (test/test-fork-locks.c) that let a test GUARANTEE the main
+// subprocess's `heaps_lock` is held at the moment of fork(), instead of relying on a
+// probabilistic race -- see subproc.c's "MI_DEBUG-only test hooks" section.
+void          _mi_test_hold_heaps_lock(void);
+bool          _mi_test_heaps_lock_is_held(void);
+void          _mi_test_release_heaps_lock(void);
+#endif
 
 void*         _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid );
 void*         _mi_meta_rezalloc( mi_subproc_t* subproc, void* p, size_t newsize, mi_memid_t* memid );
@@ -202,6 +210,12 @@ bool          _mi_is_redirected(void);
 bool          _mi_allocator_init(const char** message);
 void          _mi_allocator_done(void);
 bool          _mi_preloading(void);           // true while the C runtime is not initialized yet
+// #270: unconditional (was declared only inside prim-tls.h's `#if MI_TLS_MODEL_LOCAL`
+// branch, so any TU that includes internal.h but not that branch -- e.g. subproc.c on
+// macOS/pthreads or Windows, where MI_TLS_MODEL_LOCAL is off -- failed to compile
+// against `_mi_process_is_initialized`). Defined in init.c; do not use directly outside
+// the allocator (see prim-tls.h's `_mi_theap_default` for the intended MI_TLS_RECURSE_GUARD use).
+extern mi_decl_hidden bool _mi_process_is_initialized;
 void          _mi_thread_done(mi_theap_t* theap);
 mi_theap_t*   _mi_thread_init(void);
 mi_theap_t*   _mi_thread_init_with_heap(mi_heap_t* heap);

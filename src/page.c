@@ -119,7 +119,7 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   return true;
 }
 
-extern mi_decl_hidden bool _mi_process_is_initialized;             // has mi_process_init been called?
+// #270: _mi_process_is_initialized is now declared unconditionally in internal.h.
 
 bool _mi_page_is_valid(mi_page_t* page) {
   mi_assert_internal(mi_page_is_valid_init(page));

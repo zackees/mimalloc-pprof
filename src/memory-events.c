@@ -86,16 +86,18 @@ void _mi_memevt_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_p
 
 // #270: fork-safety. Child-side policy: CONTINUE. `memevt_cb_lock` only ever guards a
 // snapshot-copy of the callback table (see the comment above its declaration) and, per
-// that same comment, is never held while a user handler runs -- so it is one of the
-// "never held across an allocation" locks and does not need to sit before
-// `arena_reserve_lock` in the documented order (subproc.c), though quiescing it early
-// alongside the other global hook locks costs nothing and keeps the order simple. The
-// registered handlers themselves are the embedder's own responsibility across fork
-// (same as any other pthread_atfork-registered library) -- mimalloc does not know how to
-// make an arbitrary user callback fork-safe. Only the lock is reset.
+// that same comment, is never held while a user handler runs -- so unlike
+// `prof_lock`/`dhat_lock` it is not itself an alloc/free-hook lock that can nest under
+// a heap/arena lock (see subproc.c's lock-order block). It is still grouped with them
+// (innermost, alongside `out_buf_lock`) for simplicity rather than given its own
+// earlier slot, since there is no actual ordering requirement pulling it elsewhere.
+// The registered handlers themselves are the embedder's own responsibility across
+// fork (same as any other pthread_atfork-registered library) -- mimalloc does not know
+// how to make an arbitrary user callback fork-safe. The lock and the env-var lazy-init
+// guard (`memevt_once`, in case a thread was mid-resolve at fork time) are reset.
 void _mi_memevt_fork_prepare(void) { mi_lock_acquire(&memevt_cb_lock); }
 void _mi_memevt_fork_parent(void)  { mi_lock_release(&memevt_cb_lock); }
-void _mi_memevt_fork_child(void)   { mi_lock_init(&memevt_cb_lock); }
+void _mi_memevt_fork_child(void)   { mi_lock_init(&memevt_cb_lock); _mi_atomic_once_fork_child_reset(&memevt_once); }
 
 // ---------------------------------------------------------------------------------------
 // Lazy activation.

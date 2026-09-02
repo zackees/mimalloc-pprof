@@ -67,7 +67,7 @@ has reclaimed with `mi_purge_holes_stats_get()` (a `mi_purge_holes_stats_t` of
 running counters — bytes/blocks purged, discard and reuse syscalls, pages
 skipped) or print a per-size-class breakdown of what could **not** be discarded,
 and why, with `mi_purge_holes_report()`. See the
-[README's measured chart](../README.md#returning-memory-faster-scavenger-and-hole-purging)
+[README's measured chart](../README.md#hole-purging-measured)
 for numbers, and `include/mimalloc.h` / `doc/mimalloc-doc.h` for the full API
 and option reference. Neither mechanism costs the `mi_malloc`/`mi_free` fast
 path anything — both are ported from

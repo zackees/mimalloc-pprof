@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 661f0d46 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit da0658d7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -2550,12 +2550,19 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
 // Hole purging: a bitmap of the OS pages inside a mimalloc page whose memory has been
 // discarded. It is indexed by OS page (not by block), so its size does not depend on the
-// size class: a page needs `page_size/os_page_size` bits (plus one for the partial OS page
-// that holds the page header). 256 bits covers every small (64 KiB) and medium (512 KiB)
-// page on every OS page size, and a large (4 MiB) page when the OS page is 16 KiB. A large
-// page on a 4 KiB OS page needs 1025 bits and stays ineligible -- the capacity check is at
-// runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in
-// `src/page-holes.c`).
+// size class: a page needs `ceil(block_area / os_page_size)` bits. There is no extra bit
+// for the page header -- in v3 `mi_page_t` lives out of line, in the arena's meta slices
+// (`src/arena.c`, `page_ma_offset`), so the block area starts at the slice start and is
+// therefore OS-page aligned; `mi_page_purge_base`'s `align_down` is what keeps the count
+// (and the bit -> address mapping) right if a future layout ever put it back in the page.
+// So 256 bits covers, on every OS page size we support:
+//   4 KiB  OS page: small (64 KiB) = 16 bits, medium (512 KiB) = 128, large (4 MiB) = 1024
+//   16 KiB OS page: small = 4, medium = 32, large = 256  (fits, exactly at the limit)
+//   64 KiB OS page: small = 1, medium = 8,  large = 64
+// -- i.e. every small and medium page always, and a large page on a 16 KiB or larger OS
+// page. A large page on a 4 KiB OS page needs 1024 bits and stays ineligible. The check is
+// at runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in
+// `src/page-holes.c`), never at compile time: `_mi_os_page_size()` is not a constant.
 #define MI_PAGE_PURGE_BITS                (256)
 #define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
 
@@ -2995,6 +3002,25 @@ typedef struct mi_heap_s {
 // (and needs to call `mi_subproc_add_current_thread` before any allocations).
 // ------------------------------------------------------
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+// Width of the scavenger's wait word (`mi_subproc_t::scavenger_wake`). The OS wait
+// primitive fixes it: Linux `futex` and Darwin `__ulock_wait(UL_COMPARE_AND_WAIT)` compare
+// exactly 32 bits, while Windows `WaitOnAddress` takes 1/2/4/8 bytes.
+//
+// It is pointer-width on Windows on purpose. The MSVC **C** atomics wrapper
+// (`mimalloc/atomic.h`, taken whenever `__STDC_NO_ATOMICS__` is defined -- i.e. `cl` without
+// `/std:c11 /experimental:c11atomics`, which is exactly how `rust/mimalloc-pprof/build.rs`
+// compiles the amalgamation for `x86_64-pc-windows-msvc`) implements `mi_atomic_load` /
+// `store` / `exchange` / `cas` ONLY at `uintptr_t` width, via `__iso_volatile_load`/`_store`.
+// A 32-bit field there would be read and written 8 bytes at a time, silently clobbering
+// whatever follows it. Every field this tree touches with the generic `mi_atomic_*` macros
+// must therefore be exactly pointer-width; `src/scavenger.c` static-asserts it.
+#if defined(_WIN32)
+typedef size_t   mi_scav_word_t;
+#else
+typedef uint32_t mi_scav_word_t;
+#endif
+
 struct mi_subproc_s {
   size_t                subproc_seq;                    // unique id for sub-processes
   mi_subproc_t*         next;                           // list of all sub-processes
@@ -3035,8 +3061,9 @@ struct mi_subproc_s {
   mi_tld_t*             tlds;                           // list of tlds of this sub-process (walked by the scavenger for parked threads)
   mi_lock_t             tlds_lock;                      // guards the `tlds` list structure only -- never held across a sweep
   _Atomic(size_t)       parked_count;                   // threads currently parked; lets the scavenger skip the walk entirely
-  mi_decl_align(8)
-  _Atomic(uint32_t)     scavenger_wake;                 // futex word signalled when a purge is scheduled (the scavenger thread waits on this)
+  mi_decl_align(8)   // a LITERAL: MSVC's __declspec(align()) rejects `MI_SIZE_SIZE` (a parenthesized
+                     // expression) with C2059, and 8 over-aligns the 4-byte word harmlessly
+  _Atomic(mi_scav_word_t) scavenger_wake;               // wait word signalled when a purge is scheduled (the scavenger thread waits on this)
 };
 
 
@@ -3086,6 +3113,8 @@ typedef struct mi_hooks_tld_s {
 
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a):
 // idle handoff states for `mi_tld_t::park_state`.
+// `size_t`-typed, not `uint32_t`: see `mi_scav_word_t` above -- the MSVC C atomics wrapper
+// only has pointer-width accessors, so every field reached through `mi_atomic_*` is one word.
 #define MI_PARK_RUNNING   (0)   // the owner is running: only the owner may touch its theaps
 #define MI_PARK_PARKED    (1)   // the owner blocked in `mi_on_thread_idle_start`: the scavenger may claim it
 #define MI_PARK_SWEEPING  (2)   // the scavenger claimed it and is doing the idle work right now
@@ -3109,10 +3138,10 @@ struct mi_tld_s {
   // `mi_tld_detached` are initialized positionally in `src/init.c`, so a field inserted
   // above silently shifts them. Zero is the correct initial value for every one of these
   // (MI_PARK_RUNNING / NULL / unregistered).
-  _Atomic(uint32_t)     park_state;           // MI_PARK_*: whether another thread may sweep our theaps right now
-  _Atomic(uint32_t)     park_reclaim;         // set by the owner to get its theaps back; the sweep stops at the next page
+  _Atomic(size_t)       park_state;           // MI_PARK_*: whether another thread may sweep our theaps right now
+  _Atomic(size_t)       park_reclaim;         // set by the owner to get its theaps back; the sweep stops at the next page
   mi_theap_t*           park_theap0;          // default theap, captured at the park (the scavenger has no TLS to find it)
-  _Atomic(uint32_t)     park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
+  _Atomic(size_t)       park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
   mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
 
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
@@ -4830,6 +4859,12 @@ void        _mi_prof_fork_child(void);
 // `src/page-holes.c` just before every `_mi_os_discard` on a page that carries records; takes
 // `prof_lock` (unless this thread already holds it), so it is MI_DEBUG-only.
 void        _mi_prof_debug_assert_no_records_in(const mi_page_t* page, const void* addr, size_t size);
+// The predicate the assert is over, and how many records it has compared, both exported for
+// `test/test-profile-race.c`'s scenario 5 (review of PR #302): a REPEATABLE negative control --
+// aimed at a range that deliberately holds a live sampled block the first must return non-zero,
+// and the second must be non-zero after the run or the assert never saw a record-bearing page.
+size_t      _mi_prof_debug_records_in(const mi_page_t* page, const void* addr, size_t size);
+size_t      _mi_prof_debug_records_compared(void);
 #endif
 
 // "memory-events.c": opt-in allocation-change accounting/callbacks (issue #20). Independent of
@@ -5228,6 +5263,27 @@ static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
   return (mi_atomic_load_acquire(&theap->tld->park_state) == MI_PARK_SWEEPING);
 }
 
+// #272: the park contract is "the owner does not allocate or free between
+// `mi_on_thread_idle_start` and `mi_on_thread_idle_end`". A thread that EXITS while parked
+// breaks it through no fault of the caller: pthread-key destructors and C++ `thread_local`
+// destructors run in an unspecified order and can free ON THE OWNER THREAD before mimalloc's
+// own thread-done hook (`_mi_thread_done`, which does call `_mi_park_leave`) is reached --
+// `epoll_wait` being a cancellation point is exactly the shape Bun parks around. The scavenger
+// may be mid-sweep of those very theaps, and the owner then mutates page queues underneath the
+// walk: `test-park-handoff` trips `mi_theap_visit_pages`'s `count == total` (and
+// `mi_page_is_valid_init`'s block-conservation check) that way, ~2/120 runs pinned to 4 CPUs.
+//
+// So take the park back in the allocator's own slow paths as well, which makes the guarantee
+// hold for ANY owner-side allocation or free however it got there. Costs one relaxed load of an
+// already-hot cache line, and only on the generic/slow paths -- never on the fast path.
+static inline void _mi_park_leave_if_parked(mi_theap_t* theap) {
+  if (theap == NULL) return;
+  mi_tld_t* const tld = theap->tld;
+  if mi_likely(tld == NULL || mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_RUNNING) return;
+  if (tld->thread_id != _mi_thread_id()) return;   // only the owner may leave its own park
+  _mi_park_leave(tld);
+}
+
 /* -----------------------------------------------------------
   The page map maps addresses to `mi_page_t` pointers
 ----------------------------------------------------------- */
@@ -5538,8 +5594,11 @@ static inline size_t mi_page_purge_bits(const mi_page_t* page) {
 // Eligible when the page's OS pages fit the bitmap. This does not depend on the block size
 // at all: a discard covers a whole OS page, so any number of small free blocks can together
 // cover one (and a page whose free runs never cover a whole OS page simply discards nothing).
-// Small and medium pages always fit; a large (4 MiB) page only fits when the OS page is
-// 16 KiB, and a huge page is a singleton (one block) so there is nothing to purge in it.
+// Small and medium pages always fit; a large (4 MiB) page fits from a 16 KiB OS page up
+// (exactly 256 bits at 16 KiB, 64 at 64 KiB) and needs 1024 bits -- so stays ineligible --
+// on a 4 KiB OS page; a huge page is a singleton (one block) so there is nothing to purge
+// in it. The bit count is `ceil(block_area / os_page_size)` with no header page; see
+// `MI_PAGE_PURGE_BITS` in `types.h` for why there is no `+1`.
 // Pinned memory (large/huge OS pages) cannot be madvise'd away, and an arena with a custom
 // commit function owns its own commit/decommit -- like every other purge site
 // (`mi_arena_schedule_purge`, `_mi_os_purge_ex`), we stay away from both.
@@ -7274,6 +7333,7 @@ static inline bool mi_block_check_unguard(mi_page_t* page, mi_block_t* block, vo
 
 // free a local pointer  (page parameter comes first for better codegen)
 static void mi_decl_noinline mi_free_generic_local(mi_page_t* page, void* p) mi_attr_noexcept {
+  _mi_park_leave_if_parked(mi_page_theap(page));   // #272: an owner-side free while parked (e.g. from a TLS destructor)
   mi_assert_internal(p!=NULL && page != NULL);
   mi_block_t* const block = (mi_page_has_interior_pointers(page) ? _mi_page_ptr_unalign(page, p) : mi_validate_block_from_ptr(page,p));
   const bool was_guarded = mi_block_check_unguard(page, block, p);
@@ -15636,29 +15696,35 @@ mi_heap_t* mi_heap_new(void) {
 static void mi_heap_detach_theaps(mi_heap_t* heap) {
   // #272: a theap of this heap can be the `park_theap0` that a thread handed to the background
   // scavenger -- `mi_on_thread_idle_start` captures `_mi_theap_default()`, and after
-  // `mi_heap_set_default(heap)` that is a theap of a DELETABLE heap. Nothing below consults the
-  // park protocol, so a cross-thread `mi_heap_delete` would abandon (and `mi_heap_free_theaps`
-  // later free) a theap the scavenger is walking right now; both assertions that would have
-  // caught it are suppressed (`theap->heap==NULL` here, the MI_PARK_SWEEPING clause of
-  // `mi_theap_page_is_valid` there). So take every parked owner back first.
+  // `mi_theap_set_default(theap_of(heap))` that is a theap of a DELETABLE heap. Nothing below
+  // consults the park protocol, so a cross-thread `mi_heap_delete` would abandon (and
+  // `mi_heap_free_theaps` later free) a theap the scavenger is walking right now; both
+  // assertions that would have caught it are suppressed (`theap->heap==NULL` here, the
+  // MI_PARK_SWEEPING clause of `_mi_theap_can_touch` there). So take every parked owner back
+  // first.
   //
-  // Outside `theaps_lock`, one at a time: `_mi_park_leave` waits out an in-progress sweep, and
-  // the sweep can take locks a holder of `theaps_lock` would deadlock against. It terminates
-  // because a parked thread is blocked -- it cannot re-park -- and `_mi_park_leave` leaves it
-  // RUNNING; the owner's own `mi_on_thread_idle_end` then finds RUNNING and no-ops.
+  // Walked over `subproc->tlds` under `tlds_lock`, NOT over `heap->theaps`: `mi_tld_unregister`
+  // needs that same lock, so holding it is what keeps each `mi_tld_t` alive across the call.
+  // Reading a candidate from `heap->theaps` and then dropping the lock before `_mi_park_leave`
+  // is a use-after-free -- the owner can leave the park and run
+  // `_mi_thread_done -> _mi_tld_detach_theaps -> mi_tld_free -> _mi_meta_free` in that window,
+  // and the CAS lands on freed (possibly reused) meta memory.
+  //
+  // No deadlock: the sweep takes `tlds_lock` only to CLAIM a tld and releases it before
+  // `_mi_thread_idle_work`, so a scavenger in MI_PARK_SWEEPING holds nothing we hold and reaches
+  // its `store(park_state, MI_PARK_PARKED)` on its own; `_mi_park_leave`'s wait is bounded by
+  // that. `park_theap0` is published by the owner before it leaves MI_PARK_RUNNING, so it is
+  // stable for exactly the states we read it in.
   if (!_mi_process_is_forked_child) {   // a forked child's park_state may name a thread that is gone
-    for (;;) {
-      mi_tld_t* parked = NULL;
-      mi_lock(&heap->theaps_lock) {
-        for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
-          mi_tld_t* const tld = theap->tld;
-          if (tld != NULL && mi_atomic_load_acquire(&tld->park_state) != MI_PARK_RUNNING) {
-            parked = tld; break;
-          }
+    mi_subproc_t* const subproc = heap->subproc;
+    mi_lock(&subproc->tlds_lock) {
+      for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
+        if (mi_atomic_load_acquire(&tld->park_state) == MI_PARK_RUNNING) continue;
+        mi_theap_t* const theap0 = tld->park_theap0;
+        if (theap0 != NULL && mi_atomic_load_ptr_acquire(mi_heap_t, &theap0->heap) == heap) {
+          _mi_park_leave(tld);
         }
       }
-      if (parked == NULL) break;
-      _mi_park_leave(parked);
     }
   }
   _mi_heap_detach_theaps(heap);
@@ -16561,13 +16627,13 @@ void _mi_process_fork_child(void) {
     // cleared for the same reason: a stale 1 would make the coalescing edge in
     // `_mi_scavenger_wake` never fire again.
     mi_lock_init(&sp->tlds_lock);
-    mi_atomic_store_relaxed(&sp->scavenger_wake, (uint32_t)0);
+    mi_atomic_store_relaxed(&sp->scavenger_wake, (mi_scav_word_t)0);
     mi_atomic_store_relaxed(&sp->parked_count, (size_t)0);
     for (mi_tld_t* t = sp->tlds; t != NULL; t = t->subproc_next) {
       mi_lock_init(&t->theaps_lock);
-      mi_atomic_store_relaxed(&t->park_state, (uint32_t)MI_PARK_RUNNING);
-      mi_atomic_store_relaxed(&t->park_reclaim, (uint32_t)0);
-      mi_atomic_store_relaxed(&t->park_swept, (uint32_t)0);
+      mi_atomic_store_relaxed(&t->park_state, (size_t)MI_PARK_RUNNING);
+      mi_atomic_store_relaxed(&t->park_reclaim, (size_t)0);
+      mi_atomic_store_relaxed(&t->park_swept, (size_t)0);
     }
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       mi_lock_init(&h->theaps_lock);
@@ -22750,6 +22816,13 @@ static _Atomic(void*) deferred_free; // is `mi_deferred_free_fun*` (but some pla
 static _Atomic(void*) deferred_arg;   
 
 void _mi_deferred_free(mi_theap_t* theap, bool force) {
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): OWNER ONLY.
+  // `mi_theap_collect_ex` reaches here, and since this phase that has a non-owner caller: the
+  // background scavenger sweeping a parked thread's theaps. The embedder's deferred-free handler
+  // is documented to run on the thread that is allocating -- a JS runtime's is not thread-safe --
+  // and `theap->heartbeat` / `tld->recurse` are plain (non-atomic) owner-private fields that a
+  // sweep must not write. The owner runs its own deferred free on its next allocation.
+  if (theap->tld == NULL || theap->tld->thread_id != _mi_thread_id()) return;
   theap->heartbeat++;
   mi_deferred_free_fun* const fun = (mi_deferred_free_fun*)mi_atomic_load_ptr_acquire(void,&deferred_free);
   if (fun != NULL && !theap->tld->recurse) {
@@ -22860,6 +22933,7 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   #if !MI_THEAP_INITASNULL
   mi_assert_internal(theap != NULL);
   #endif
+  _mi_park_leave_if_parked(theap);   // #272: an owner-side alloc while parked (e.g. from a TLS destructor)
   const bool zero = ((zero_huge_alignment & 1) != 0);
   const size_t huge_alignment = (zero_huge_alignment & ~1);
   mi_page_t* page = NULL;
@@ -23518,24 +23592,60 @@ terms of the MIT license. A copy of the license can be found in the file
    3. the sweep of a parked thread never touches `mi_tld_t::profiler`: nothing
       in this file reads or writes it (asserted in `_mi_theap_sweep_parked`).
 
-  TEARDOWN AND HEAP DELETION (7a's exit-path hardening, PR #299). Neither needs a
-  check in this file, for reasons worth writing down:
-   - after `_mi_scavenger_stop` sets `_mi_scavenger_shutdown`, no sweep can start on
-     the scavenger: its run loop exits on `_mi_scavenger_running == 0` and the stop
-     joins it, and `_mi_scavenger_start_lazy` refuses to restart, so
-     `mi_on_thread_idle_start` returns false and hands nothing off. A direct
-     `mi_on_thread_idle()` after that still sweeps -- on the CALLING thread, over its
-     own theaps, which is safe at any point in the process's life.
-   - `mi_heap_delete`/`_destroy` calls `_mi_park_leave` on every parked owner of the
-     heap BEFORE `_mi_heap_detach_theaps`, and `_mi_park_leave` does not return until
-     MI_PARK_SWEEPING has cleared. So a sweep is never in progress while a theap is
-     being detached. `_mi_park_leave` terminates against this sweep because every
-     phase of it re-reads `tld->park_reclaim`: between heaps in `_mi_purge_holes_of`,
-     between pages in `mi_theap_page_purge_holes`, and between abandoned pages in
-     `mi_arena_page_purge_holes_at` -- so the wait is bounded by one page's walk, and
-     `tld->theaps_lock` (which the sweep holds across its passes, and which
-     `_mi_heap_detach_theaps` try-acquires) is always released before the deleter
-     needs it.
+  TEARDOWN, HEAP DELETION AND THE PARK LEAVE (7a, PR #299). Re-audited against 7a's
+  final head; still no check needed in this file. Line numbers are as of that audit.
+
+  (a) SCAVENGER SHUTDOWN. After `_mi_scavenger_stop` sets `_mi_scavenger_shutdown`, no
+      sweep can start on the scavenger: its run loop exits on `_mi_scavenger_running == 0`
+      and the stop joins it, and `_mi_scavenger_start_lazy` refuses to restart, so
+      `mi_on_thread_idle_start` returns false and hands nothing off. A direct
+      `mi_on_thread_idle()` after that still sweeps -- on the CALLING thread, over its own
+      theaps, which is safe at any point in the process's life.
+
+  (b) LOCK ORDER. This sweep is a LEAF: `_mi_purge_holes_of` takes `tld->theaps_lock`
+      (page-holes.c:862) and, while holding it, takes no other lock of the tld/heap
+      family. In particular the abandoned pass (`_mi_arenas_purge_abandoned_holes`,
+      arena.c) reads `heap->arena_pages[]` with an atomic load, never
+      `heap->arena_pages_lock`, and reaches the pages through the arena bitmaps, so it
+      needs neither `heap->theaps_lock` nor `subproc->tlds_lock`. The two locks that
+      could close a cycle with `tld->theaps_lock` are held the other way round and both
+      back off rather than block: `_mi_heap_detach_theaps` (theap.c:473) holds
+      `heap->theaps_lock` and TRY-acquires `tld->theaps_lock` (theap.c:480), and
+      `_mi_tld_detach_theaps` (theap.c:508) holds `tld->theaps_lock` and TRY-acquires
+      `heap->theaps_lock` (theap.c:515). A leaf cannot be in a cycle, and neither
+      try-acquire can be in one either.
+
+  (c) HEAP DELETION. `mi_heap_delete`/`_destroy` -> `mi_heap_detach_theaps` (heap.c) calls
+      `_mi_park_leave` on every parked owner of the heap (heap.c:219) under
+      `subproc->tlds_lock` (heap.c:214), and only THEN `_mi_heap_detach_theaps`
+      (heap.c:224). `_mi_park_leave` does not return until MI_PARK_SWEEPING has cleared,
+      so no theap is ever detached under a running sweep.
+      That wait terminates, and holding `tlds_lock` across it is safe, because this sweep
+      needs nothing the deleter holds: it never takes `tlds_lock` (the scavenger takes it
+      only to CLAIM a park, scavenger.c:138, and releases it before `_mi_thread_idle_work`),
+      and the deleter does not hold either `theaps_lock` yet -- theap.c:473/480 run after
+      `_mi_park_leave` has returned. The wait is bounded by one page's walk because every
+      phase re-reads `tld->park_reclaim`: page-holes.c:767 between pages, page-holes.c:873
+      between heaps in the abandoned pass, arena.c:1410 between abandoned pages.
+      The one loop that does NOT check between iterations is the theap loop at
+      page-holes.c:863 -- it does not need to: with `park_reclaim` set, each theap's
+      per-page callback (page-holes.c:767) returns false on its FIRST page, so a theap
+      costs O(1) and the loop as a whole is bounded by the theap count.
+
+  (d) A PARK LEFT MID-SWEEP. 7a put `_mi_park_leave_if_parked` on the allocator slow paths
+      (page.c:1159, free.c:162), so a parked thread that allocates or frees from a
+      `thread_local` destructor un-parks itself while this sweep may be walking its pages.
+      Nothing extra is needed here, and the reason is (c)'s machinery seen from the other
+      end: that call reaches `_mi_park_leave`, which publishes `park_reclaim = 1`
+      (scavenger.c:114) and then SPINS until `park_state` leaves MI_PARK_SWEEPING. The
+      sweeper only stores MI_PARK_PARKED after `_mi_thread_idle_work` has fully returned
+      (scavenger.c:199), so by the time the leaver's CAS to MI_PARK_RUNNING can succeed the
+      sweep has stopped touching that theap's pages entirely -- the same guarantee 7a's
+      queue sweep gets, from the same protocol, because both run inside
+      `_mi_thread_idle_work`. `test-park-handoff.c`'s `test_exit_while_hole_swept_stress`
+      is the empirical half: a destructor that both frees and allocates (so it takes both
+      slow paths), on threads exiting inside a sweep, with `purge_holes_min_interval` at 0
+      so every park is a full hole sweep.
 ----------------------------------------------------------- */
 
 
@@ -23825,18 +23935,25 @@ static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool di
   const size_t dsize = ((k1 - k0) + 1) * os_size;
   if (discarded) { _mi_os_reuse(mi_page_subproc(page), (void*)dstart, dsize); }
 
-  // clear the bits first: `mi_page_block_index_is_purged` then tells us exactly which
-  // blocks are whole again
-  for (size_t k = k0; k <= k1; k++) { mi_page_purged_clear(page, k); }
-  mi_page_sweep_state_invalidate(page);   // the free list is about to grow, but `used`/`capacity` will not
-                                          // (before any early return below: the bits are already cleared)
-
+  // Resolve the block range BEFORE touching the bitmap. Both lookups are total for a
+  // discarded OS page (it is always entirely inside the block area, which is what the
+  // discard side checks), but if one ever did fail, clearing first would leave the page in
+  // a state no invariant allows: the blocks in [k0,k1] would be marked not-purged while
+  // still off every free list, i.e. free memory that `mi_page_is_valid_init`'s
+  // conservation check counts as neither free nor live and that nothing can ever hand out
+  // again. Bailing before the clear leaves the range purged instead -- consistent, and the
+  // next sweep simply sees it as an already-discarded run.
   size_t first, last, first1, last1;
   if (!mi_page_os_page_blocks(page, k0, &first, &last) ||
       !mi_page_os_page_blocks(page, k1, &first1, &last1)) {
     mi_assert_internal(false);   // a discarded OS page is always entirely inside the block area
     return;
   }
+
+  // now clear the bits: `mi_page_block_index_is_purged` below then tells us exactly which
+  // blocks are whole again
+  for (size_t k = k0; k <= k1; k++) { mi_page_purged_clear(page, k); }
+  mi_page_sweep_state_invalidate(page);   // the free list is about to grow, but `used`/`capacity` will not
   // every block in [first,last1] was free when we discarded, and a purged block cannot be
   // allocated or freed, so they are all still free
   size_t nblocks = 0;
@@ -24206,11 +24323,50 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
 // The abandoned pages matter: with the default `allow_page_abandon`, every page that ever became
 // full ends up there. Non-default heaps matter too (JSC allocates its structure heap with
 // `mi_heap_new_in_arena`), which is why we sweep every theap and not just the default one.
+//
+// The abandoned pass needs the DISTINCT heaps behind this thread's theaps, and collects them
+// into a fixed-size on-stack array rather than a second pass or an allocation (this runs under
+// `tld->theaps_lock` on the sweeping thread, and CLAUDE.md rule 4 keeps sweep-internal state off
+// every hooked allocation path). 8 is a cap, not a limit on correctness: a thread with more than
+// 8 distinct heaps sweeps its theaps' OWN pages in full -- that is the loop below, which is not
+// capped -- and only the ABANDONED-page pass of the 9th and later heaps is skipped, permanently,
+// since the array is refilled in the same order on every sweep. That would be a slow leak of
+// abandoned-page holes for such a thread.
+//
+// It is deliberately not "resume across heaps at the next sweep": that needs a cursor on the tld
+// that survives heaps being created and deleted between sweeps, and the case does not arise --
+// a thread gets a theap only in a heap it actually allocates from, and the workloads this exists
+// for (Bun/JSC) use two (default + structure). `mi_heap_new` is per-heap, not per-thread, so 8
+// distinct heaps means one thread allocating from 8 heaps. If that ever becomes real, raise this
+// number first; the array is `8 * sizeof(void*)` = 64 bytes of stack.
 #define MI_PURGE_HOLES_MAX_HEAPS  (8)
 
 void _mi_purge_holes_of(mi_tld_t* tld) {
-  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   if (tld == NULL) return;
+  // `purge_holes_min_interval` pacing, for BOTH callers. It used to be applied only in
+  // `_mi_theap_sweep_parked`'s pre-claim loop, which left a thread calling `mi_on_thread_idle()`
+  // directly -- the documented "do the idle work here, on this thread" entry point -- walking
+  // every page of every one of its theaps on every call, however tight the loop. The option is
+  // documented as "do not sweep one thread's heaps more often than every N milli-seconds", with
+  // no clause about which thread does the sweeping, so it belongs here, on the path both go
+  // through. The scavenger keeps its own copy of the check because it must decide whether to
+  // CLAIM a park at all (and how long to sleep before the next one becomes due) before it can
+  // call this; the two agree because the clock only moves forward between them.
+  //
+  // The stamp is the sweep's START time, so the interval is start-to-start (what the scavenger's
+  // `due_in` arithmetic assumes), and a SKIPPED sweep must not stamp -- otherwise a tight
+  // `mi_on_thread_idle()` loop would push the deadline out on every call and never sweep again.
+  //
+  // Deliberately ahead of the `purge_holes` enabled check: with the option off there is no hole
+  // phase to pace, but the scavenger's pre-claim check reads this same field, and leaving it at
+  // 0 forever would make the `-off` build claim and re-sweep every park at full rate -- a
+  // behavioural difference between the two builds that has nothing to do with holes.
+  const mi_msecs_t now = _mi_clock_now();
+  const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
+  if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) return;
+  tld->holes_sweep_last = now;
+
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   _mi_page_purge_holes_sweep_begin(tld);  // decides whether this sweep skips unchanged pages
   _mi_page_holes_reset_ineligible();      // the ineligible counters are a gauge over this sweep
 
@@ -25814,8 +25970,27 @@ void _mi_prof_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_pee
 //  - the record STRUCT itself does not lie in the range: records come from the profiler's own
 //    raw-OS arena (`_mi_prof_arena_alloc`, CLAUDE.md rule 4), never from a mimalloc page, so a
 //    hit here means that invariant was broken somewhere else entirely.
-void _mi_prof_debug_assert_no_records_in(const mi_page_t* page, const void* addr, size_t size) {
-  if (page == NULL || !page->has_metadata || size == 0) return;
+//
+// Split into a PREDICATE plus the assert over it (review of PR #302). The predicate is exported
+// so `test-profile-race.c`'s scenario 5 can use it as a repeatable NEGATIVE control: pointed at
+// a range that deliberately contains a live, record-bearing block it must return non-zero.
+// Without that, "the assert never fired" is indistinguishable from "the assert is vacuous", and
+// the only evidence for the difference was a one-off local `mi_assert_internal(false)` patch.
+// `_mi_prof_debug_records_compared` is the other half of the same question: it counts the
+// records this has actually looked at, so the test can assert the sweep really does reach pages
+// that carry records rather than only ever record-free ones.
+static _Atomic(size_t) prof_debug_records_compared;
+
+size_t _mi_prof_debug_records_compared(void) {
+  return mi_atomic_load_relaxed(&prof_debug_records_compared);
+}
+
+// The number of records the range [addr,addr+size) would swallow. MUST be 0 at every discard.
+// NOTE: 0 is also what a failed try-acquire returns (see below) -- for the assert that is the
+// intended "skip", and the test calls this single-threaded where the acquire always succeeds.
+size_t _mi_prof_debug_records_in(const mi_page_t* page, const void* addr, size_t size) {
+  if (page == NULL || !page->has_metadata || size == 0) return 0;
+  size_t hits = 0;
   const uint8_t* const lo = (const uint8_t*)addr;
   const uint8_t* const hi = lo + size;
   // `page->metadata` is only mutated under `prof_lock`; a sweep runs on an arbitrary thread
@@ -25828,12 +26003,22 @@ void _mi_prof_debug_assert_no_records_in(const mi_page_t* page, const void* addr
   // a callback that deletes a heap then waits on `theaps_lock`. Blocking here would close that
   // ABBA cycle in debug builds. An assertion that occasionally does not run beats a deadlock;
   // the sweep visits the same pages again at the next idle point.
-  if (!own && !mi_lock_try_acquire(&prof_lock)) return;
+  if (!own && !mi_lock_try_acquire(&prof_lock)) return 0;
+  size_t compared = 0;
   for (mi_prof_record_t* rec = (mi_prof_record_t*)page->metadata; rec != NULL; rec = rec->next) {
-    mi_assert_internal((const uint8_t*)rec->ptr < lo || (const uint8_t*)rec->ptr >= hi);
-    mi_assert_internal((const uint8_t*)rec < lo || (const uint8_t*)rec >= hi);
+    compared++;
+    if ((const uint8_t*)rec->ptr >= lo && (const uint8_t*)rec->ptr < hi) { hits++; }
+    if ((const uint8_t*)rec      >= lo && (const uint8_t*)rec      < hi) { hits++; }
   }
   if (!own) { mi_lock_release(&prof_lock); }
+  if (compared > 0) { mi_atomic_add_relaxed(&prof_debug_records_compared, compared); }
+  return hits;
+}
+
+void _mi_prof_debug_assert_no_records_in(const mi_page_t* page, const void* addr, size_t size) {
+  const size_t hits = _mi_prof_debug_records_in(page, addr, size);
+  mi_assert_internal(hits == 0);
+  MI_UNUSED(hits);
 }
 #endif
 
@@ -26569,6 +26754,32 @@ terms of the MIT license. A copy of the license can be found in the file
 // `mi_on_thread_idle` delivers all three clauses of its documented contract.
 
 
+// #272 (blocker, MSVC-C): the MSVC **C** atomics wrapper in `mimalloc/atomic.h` -- taken by `cl`
+// without `/std:c11 /experimental:c11atomics`, which is how `rust/mimalloc-pprof/build.rs`
+// compiles the amalgamation for `x86_64-pc-windows-msvc` -- implements the generic
+// `mi_atomic_load/store/exchange/cas` ONLY at `uintptr_t` width. A narrower field reached
+// through them is read and written a full word at a time, past its end. These four are the
+// fields this phase added; a build that narrows one again fails here rather than at runtime.
+//
+// The FIELDS are only half of it: the out-param of a `park_state` CAS is written through the
+// same `uintptr_t*` parameter, so a narrower local is a 4-byte stack slot written 8 bytes wide.
+// gcc/clang reject that outright through the C11 generic ("size mismatch in argument 2 of
+// `__atomic_compare_exchange`"), but the MSVC-C wrapper only warns (C4133, an incompatible
+// pointer it then casts) -- exactly the compiler this assert exists for. So every such local is
+// declared through `mi_park_state_t`, which the assert below pins to the field.
+typedef size_t mi_park_state_t;
+
+typedef char mi_scav_atomic_widths_assert_t[
+  (sizeof(mi_park_state_t)                 == sizeof(((mi_tld_t*)0)->park_state) &&
+   sizeof(((mi_tld_t*)0)->park_state)      == sizeof(uintptr_t) &&
+   sizeof(((mi_tld_t*)0)->park_reclaim)    == sizeof(uintptr_t) &&
+   sizeof(((mi_tld_t*)0)->park_swept)      == sizeof(uintptr_t) &&
+   sizeof(((mi_subproc_t*)0)->parked_count)== sizeof(uintptr_t)
+   #if defined(_WIN32)
+   && sizeof(((mi_subproc_t*)0)->scavenger_wake) == sizeof(uintptr_t)
+   #endif
+  ) ? 1 : -1];
+
 /* -----------------------------------------------------------
   The idle handoff protocol.
 
@@ -26622,7 +26833,7 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) {
 void _mi_park_leave(mi_tld_t* tld) {
   if (tld == NULL) return;
   for (;;) {
-    uint32_t expected = MI_PARK_PARKED;
+    mi_park_state_t expected = MI_PARK_PARKED;   // width-pinned to the field, see the assert above
     if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_RUNNING)) break;
     if (expected == MI_PARK_RUNNING) return;   // not parked: nothing to take back
     // it may re-claim the moment it releases, so re-race rather than store: only a CAS from
@@ -26660,14 +26871,21 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
       const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
         if (mi_atomic_load_acquire(&tld->park_swept) != 0) continue;   // already done for this park
+        // Read `park_state` BEFORE `holes_sweep_last`. That field is a PLAIN `mi_msecs_t` written
+        // by whoever last swept this tld -- including the OWNER while it is RUNNING, from its own
+        // `mi_on_thread_idle()` (see `_mi_purge_holes_of`). What makes reading it here race-free
+        // is not this lock (the owner takes no lock to write it) but the acquire below pairing
+        // with the owner's release-store of MI_PARK_PARKED in `mi_on_thread_idle_start`: a tld
+        // that reads PARKED has published every write it made before parking, and it cannot
+        // write the field again until it leaves the park. A tld that is not parked is skipped
+        // without the field ever being read.
+        if (mi_atomic_load_acquire(&tld->park_state) != MI_PARK_PARKED) continue;
         if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
-          if (mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_PARKED) {
-            const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
-            if (due_in == 0 || due < due_in) { due_in = due; }
-          }
+          const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
+          if (due_in == 0 || due < due_in) { due_in = due; }
           continue;
         }
-        uint32_t expected = MI_PARK_PARKED;
+        mi_park_state_t expected = MI_PARK_PARKED;   // width-pinned to the field, see the assert above
         if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_SWEEPING)) {
           claimed = tld; theap0 = tld->park_theap0; break;
         }
@@ -26681,7 +26899,10 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     // parked thread's next sample depend on how often the scavenger happened to visit it.
     const mi_profiler_tld_t prof_before = claimed->profiler;
     #endif
-    claimed->holes_sweep_last = _mi_clock_now();
+    // NOTE: `holes_sweep_last` is stamped by `_mi_purge_holes_of` itself, not here -- it is the
+    // one path both the scavenger and a direct `mi_on_thread_idle()` go through, so the owner's
+    // own sweeps are paced by, and visible to, the same clock. Stamping here as well would make
+    // the interval check inside it see `now - last == 0` and skip every scavenger-driven sweep.
     _mi_thread_idle_work(claimed, theap0);
     #if MI_DEBUG
     mi_assert_internal(claimed->profiler.bytes_since_sample == prof_before.bytes_since_sample &&
@@ -26730,7 +26951,7 @@ static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = runnin
 static _Atomic(uintptr_t) _mi_scavenger_shutdown;
 
 // -----------------------------------------------------------------------------
-// Wait/wake on subproc->scavenger_wake (a uint32_t futex word).
+// Wait/wake on subproc->scavenger_wake (a `mi_scav_word_t` futex/wait word).
 //
 //   mi_scav_wait(addr, timeout_ms) : block while *addr == 0, up to timeout_ms.
 //   mi_scav_wake_one(addr)         : wake one waiter on addr.
@@ -26755,13 +26976,13 @@ static _Atomic(uintptr_t) _mi_scavenger_shutdown;
 #define MI_FUTEX_WAIT_PRIVATE  (0 | 128)
 #define MI_FUTEX_WAKE_PRIVATE  (1 | 128)
 
-static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+static void mi_scav_wait(_Atomic(mi_scav_word_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;
   struct timespec ts;
   ts.tv_sec  = (time_t)(timeout_ms / 1000);
   ts.tv_nsec = (long)((timeout_ms % 1000) * 1000000L);
   while (mi_atomic_load_acquire(addr) == 0) {
-    const long rc = syscall(SYS_futex, (uint32_t*)addr, MI_FUTEX_WAIT_PRIVATE, (uint32_t)0, &ts, NULL, 0);
+    const long rc = syscall(SYS_futex, (uint32_t*)addr,   /* mi_scav_word_t is uint32_t here: futex is 32-bit only */ MI_FUTEX_WAIT_PRIVATE, (uint32_t)0, &ts, NULL, 0);
     if (rc == 0) return;                 // woken by FUTEX_WAKE
     if (errno == ETIMEDOUT) return;
     if (errno == EAGAIN) return;         // *addr != 0 at kernel check; caller re-reads
@@ -26769,7 +26990,7 @@ static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
   }
 }
 
-static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+static void mi_scav_wake_one(_Atomic(mi_scav_word_t)* addr) {
   syscall(SYS_futex, (uint32_t*)addr, MI_FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
 }
 
@@ -26789,7 +27010,7 @@ extern int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);
 #define MI_UL_COMPARE_AND_WAIT  1
 #define MI_ULF_NO_ERRNO         0x01000000
 
-static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+static void mi_scav_wait(_Atomic(mi_scav_word_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;
   const uint32_t timeout_us = (uint32_t)timeout_ms * 1000u;
   while (mi_atomic_load_acquire(addr) == 0) {
@@ -26800,7 +27021,7 @@ static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
   }
 }
 
-static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+static void mi_scav_wake_one(_Atomic(mi_scav_word_t)* addr) {
   __ulock_wake(MI_UL_COMPARE_AND_WAIT | MI_ULF_NO_ERRNO, (void*)addr, 0);
 }
 
@@ -26823,18 +27044,20 @@ VOID WINAPI WakeByAddressSingle(PVOID Address);
 #pragma comment(lib, "synchronization")
 #endif
 
-static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+static void mi_scav_wait(_Atomic(mi_scav_word_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;
-  uint32_t expected = 0;
+  mi_scav_word_t expected = 0;
   while (mi_atomic_load_acquire(addr) == 0) {
-    if (!WaitOnAddress((volatile VOID*)addr, &expected, sizeof(uint32_t), (DWORD)timeout_ms)) {
+    // the size argument must follow `scavenger_wake`'s ACTUAL width (`mi_scav_word_t`), which is
+    // pointer-width on Windows so the MSVC C atomics wrapper's word-width accessors fit it.
+    if (!WaitOnAddress((volatile VOID*)addr, &expected, sizeof(mi_scav_word_t), (DWORD)timeout_ms)) {
       return;  // timeout (GetLastError() == ERROR_TIMEOUT)
     }
     // woken (possibly spuriously): loop re-checks *addr
   }
 }
 
-static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+static void mi_scav_wake_one(_Atomic(mi_scav_word_t)* addr) {
   WakeByAddressSingle((PVOID)addr);
 }
 
@@ -26858,7 +27081,7 @@ static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
 static pthread_mutex_t _mi_scav_mutex;   // initialized in `mi_scav_init` (from `_mi_scavenger_start`, before any wait or wake)
 static pthread_cond_t  _mi_scav_cond;
 
-static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+static void mi_scav_wait(_Atomic(mi_scav_word_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;
   struct timespec ts;
   #if defined(CLOCK_REALTIME)
@@ -26877,7 +27100,7 @@ static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
   pthread_mutex_unlock(&_mi_scav_mutex);
 }
 
-static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+static void mi_scav_wake_one(_Atomic(mi_scav_word_t)* addr) {
   MI_UNUSED(addr);
   pthread_mutex_lock(&_mi_scav_mutex);
   pthread_cond_signal(&_mi_scav_cond);
@@ -26924,7 +27147,7 @@ static void mi_scavenger_run(void) {
     // `parked_count` read below can pass the parker's increment and its exchange in opposite
     // directions (store-buffering) -- we see no parked thread, it sees a stale wake==1 and issues
     // no syscall, and that park is silently deferred to the safety timeout.
-    mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)0);
+    mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (mi_scav_word_t)0);
     // Do the idle work of any thread that parked and handed us its theaps. This is the expensive
     // part and it is why the owner gets to skip it.
     const mi_msecs_t park_due = _mi_theap_sweep_parked(subproc);
@@ -26976,7 +27199,7 @@ void _mi_scavenger_wake(mi_subproc_t* subproc) {
   // Coalesce: only issue the wake syscall on the 0->1 edge. Callers sit on
   // the page-free path and would otherwise turn every arena page free into a
   // syscall on the freeing thread.
-  if (mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)1) == 0) {
+  if (mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (mi_scav_word_t)1) == 0) {
     mi_scav_wake_one(&subproc->scavenger_wake);
   }
 }
@@ -27016,8 +27239,18 @@ void _mi_scavenger_start(void) {
   if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) return;   // teardown has begun
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
-  mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  // Claim `running` FIRST, then re-check `shutdown`. Loading `shutdown` before publishing
+  // `running` leaves a window in which `_mi_scavenger_stop` sets `shutdown`, reads `running == 0`
+  // and returns having joined nothing, and we then create a thread nobody will ever stop.
+  // Ordering it this way, one of the two always sees the other: either stop reads `running == 1`
+  // (and joins us), or we read `shutdown != 0` (and never start).
   mi_atomic_store_release(&_mi_scavenger_exited, (uintptr_t)0);
+  if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)1) != 0) return;  // someone else got there
+  if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) {
+    mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
+    return;
+  }
+  // published under the same edge that owns `running`, so a stop that sees `running == 1` sees this
   _mi_scavenger_thread = CreateThread(NULL, 0, &mi_scavenger_thread_main, NULL, 0, NULL);
   if (_mi_scavenger_thread == NULL) {
     mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
@@ -27028,7 +27261,7 @@ void _mi_scavenger_stop(void) {
   mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)1);   // before the exchange: no restart past here
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
-  mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
+  mi_atomic_store_release(&subproc->scavenger_wake, (mi_scav_word_t)1);
   mi_scav_wake_one(&subproc->scavenger_wake);
   if (_mi_scavenger_thread != NULL) {
     // BOUNDED, never INFINITE. This runs first in `mi_process_done_once`, and on Windows that
@@ -27094,7 +27327,13 @@ void _mi_scavenger_start(void) {
   if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) return;   // teardown has begun
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
-  mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  // Claim `running` FIRST, then re-check `shutdown` -- see the Windows `_mi_scavenger_start`
+  // above for why the other order lets a start slip past the stop that should have joined it.
+  if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)1) != 0) return;
+  if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) {
+    mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
+    return;
+  }
   mi_scav_init();
   // Block all signals on the scavenger thread. It runs before the host has set
   // up its own signal masking, and a thread that leaves (e.g.) SIGCHLD
@@ -27130,7 +27369,7 @@ void _mi_scavenger_stop(void) {
   mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)1);   // before the exchange: no restart past here
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
-  mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
+  mi_atomic_store_release(&subproc->scavenger_wake, (mi_scav_word_t)1);
   mi_scav_wake_one(&subproc->scavenger_wake);
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_joinable, (uintptr_t)0) != 0) {
     pthread_join(_mi_scavenger_thread, NULL);
@@ -27204,7 +27443,7 @@ bool mi_on_thread_idle_start(void) mi_attr_noexcept {
   tld->park_theap0 = theap0;
   mi_atomic_store_release(&tld->park_reclaim, 0);
   mi_atomic_store_release(&tld->park_swept, 0);
-  uint32_t expected = MI_PARK_RUNNING;
+  size_t expected = MI_PARK_RUNNING;
   if (!mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_PARKED)) return false;
   mi_atomic_increment_relaxed(&tld->subproc->parked_count);
   _mi_scavenger_wake(tld->subproc);

@@ -50,20 +50,42 @@ static void thread_yield(void) { sched_yield(); }
 #define ROUNDS          (64)
 #define ALLOCS_PER_ROUND (16)
 
-/* hand-shake between the two threads: B publishes a heap, A uses it, B recycles it */
+/* hand-shake between the two threads: B publishes a heap, A uses it, B recycles it.
+   Only load/store are needed (no CAS/fetch-add), via small portable wrappers -- mirrors
+   test-heap-mt.c / test-stress.c's own "Portable threading / atomics" block. Plain
+   assignment/comparison on a C11 _Atomic or C++ std::atomic works everywhere except MSVC C
+   compilation, where <stdatomic.h> #errors "C atomic support is not enabled" unless built
+   with `/std:c11 /experimental:c11atomics` (not set here) -- see
+   include/mimalloc/atomic.h's own MI_HAS_C11_ATOMICS detection for the same problem solved
+   inside mimalloc itself; that header is not included here since only load/store, not the
+   full atomic API, are needed. */
+#ifdef _WIN32
+#include <windows.h>
+static void* atomic_load_ptr(void* volatile* p)        { return InterlockedCompareExchangePointer(p, NULL, NULL); }
+static void  atomic_store_ptr(void* volatile* p, void* v) { InterlockedExchangePointer(p, v); }
+static long  atomic_load_l(volatile long* p)            { return InterlockedCompareExchange(p, 0, 0); }
+static void  atomic_store_l(volatile long* p, long v)   { InterlockedExchange(p, v); }
+static void* volatile g_heap;
+static volatile long  g_step;     /* even: B's turn, odd: A's turn */
+#else
 #ifdef __cplusplus
 #include <atomic>
 #define _Atomic(T) std::atomic<T>
 #else
 #include <stdatomic.h>
 #endif
-static _Atomic(mi_heap_t*) g_heap;
-static _Atomic(int) g_step;       /* even: B's turn, odd: A's turn */
+static _Atomic(void*) g_heap;
+static _Atomic(long)  g_step;     /* even: B's turn, odd: A's turn */
+static void* atomic_load_ptr(_Atomic(void*)* p)         { return *p; }
+static void  atomic_store_ptr(_Atomic(void*)* p, void* v) { *p = v; }
+static long  atomic_load_l(_Atomic(long)* p)            { return *p; }
+static void  atomic_store_l(_Atomic(long)* p, long v)   { *p = v; }
+#endif
 static int g_same_address;        /* rounds where the recycled heap came back at the same address */
 static int g_failures;
 
-static void wait_step(int s) {
-  while (g_step != s) { thread_yield(); }
+static void wait_step(long s) {
+  while (atomic_load_l(&g_step) != s) { thread_yield(); }
 }
 
 #ifdef _WIN32
@@ -77,15 +99,15 @@ static void* thread_main(void* arg)
     const int base = round * 4;
     // first use of H: this caches A's theap for H
     wait_step(base + 1);
-    mi_heap_t* const h = g_heap;
+    mi_heap_t* const h = (mi_heap_t*)atomic_load_ptr(&g_heap);
     void* p = mi_heap_malloc(h, 64);
     if (p == NULL || mi_heap_of(p) != h) { g_failures++; }
     memset(p, 0xA1, 64);
-    g_step = base + 2;
+    atomic_store_l(&g_step, base + 2);
 
     // H was destroyed and a new heap was created (usually at the same address)
     wait_step(base + 3);
-    mi_heap_t* const h2 = g_heap;
+    mi_heap_t* const h2 = (mi_heap_t*)atomic_load_ptr(&g_heap);
     if (h2 == h) { g_same_address++; }
     for (int i = 0; i < ALLOCS_PER_ROUND; i++) {
       void* q = mi_heap_malloc(h2, 64);
@@ -97,7 +119,7 @@ static void* thread_main(void* arg)
       }
       memset(q, 0xB2, 64);
     }
-    g_step = base + 4;
+    atomic_store_l(&g_step, base + 4);
   }
   return 0;
 }
@@ -110,15 +132,15 @@ int main(void) {
     mi_heap_t* h = mi_heap_new();
     void* warm = mi_heap_malloc(h, 64);
     memset(warm, 0xC3, 64);
-    g_heap = h;
-    g_step = base + 1;
+    atomic_store_ptr(&g_heap, h);
+    atomic_store_l(&g_step, base + 1);
     wait_step(base + 2);
     // destroy while A still caches its theap for `h`, then create the next heap: a LIFO reuse
     // of the freed heap block usually puts it at the same address
     mi_heap_destroy(h);
     mi_heap_t* h2 = mi_heap_new();
-    g_heap = h2;
-    g_step = base + 3;
+    atomic_store_ptr(&g_heap, h2);
+    atomic_store_l(&g_step, base + 3);
     wait_step(base + 4);
     mi_heap_destroy(h2);
   }

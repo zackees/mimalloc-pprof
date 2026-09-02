@@ -377,6 +377,32 @@ void*         _mi_arenas_alloc_aligned(mi_heap_t* heap, size_t size, size_t alig
 void          _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid);
 void          _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld);
 void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+void          _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
+void          _mi_arenas_purge_now(mi_subproc_t* subproc);
+void          _mi_arenas_fork_child(void);   // #272: clear the inherited one-purger-at-a-time guard
+bool          _mi_arenas_purge_guard_reset(void);  // #272: release the one-purger guard whose holder no longer exists; returns whether it was held
+
+// scavenger.c -- imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+void          _mi_scavenger_start(void);
+void          _mi_scavenger_start_lazy(void);
+void          _mi_scavenger_stop(void);
+void          _mi_scavenger_wake(mi_subproc_t* subproc);
+bool          _mi_scavenger_is_running(void);
+void          _mi_scavenger_forked_child(void);
+void          _mi_park_leave(mi_tld_t* tld);
+void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0);
+mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);
+// #272 test observable (test/test-park-handoff.c). `mi_decl_export` because the
+// `ctest-shared` job links that test against the shared library, where the default
+// `-fvisibility=hidden` would otherwise hide it -- same reason as the `mi_debug_*` hooks
+// above, except this one is NOT `MI_DEBUG`-only: the test is meaningful in a Release
+// build too, and one relaxed increment per park is not worth a config split.
+mi_decl_externc mi_decl_export size_t _mi_test_idle_work_count(void);
+#if MI_DEBUG > 0
+// #272 fork test hook (test/test-fork-user-heap.c case_b); see src/init.c
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
+#endif
 
 mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t page_alignment);
 void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
@@ -892,7 +918,40 @@ static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
   if (theap == NULL || theap->tld == NULL) return true;
   if (mi_atomic_load_ptr_relaxed(mi_heap_t, &theap->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`
   if (theap->tld->thread_id == _mi_thread_id()) return true;
-  return mi_theap_is_detached(theap);   // upstream's permanently-detached theaps (meta-data) belong to no thread
+  if (mi_theap_is_detached(theap)) return true;   // upstream's permanently-detached theaps (meta-data) belong to no thread
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a,
+  // `internal.h:731`): the owner published MI_PARK_PARKED and the scavenger claimed it, so the
+  // owner is quiesced by contract and the sweeping thread may touch these pages -- the same
+  // "owner is not allocating" precondition `mi_theap_collect` already relies on for its
+  // non-owner callers (python/cpython#112532).
+  return (mi_atomic_load_acquire(&theap->tld->park_state) == MI_PARK_SWEEPING);
+}
+
+// #272: the park contract is "the owner does not allocate or free between
+// `mi_on_thread_idle_start` and `mi_on_thread_idle_end`". A thread that EXITS while parked
+// breaks it through no fault of the caller: pthread-key destructors and C++ `thread_local`
+// destructors run in an unspecified order and can free ON THE OWNER THREAD before mimalloc's
+// own thread-done hook (`_mi_thread_done`, which does call `_mi_park_leave`) is reached --
+// `epoll_wait` being a cancellation point is exactly the shape Bun parks around. The scavenger
+// may be mid-sweep of those very theaps, and the owner then mutates page queues underneath the
+// walk: `test-park-handoff` trips `mi_theap_visit_pages`'s `count == total` (and
+// `mi_page_is_valid_init`'s block-conservation check) that way, ~2/120 runs pinned to 4 CPUs.
+//
+// So take the park back in the allocator's own generic/slow paths as well (`mi_page_malloc`'s
+// slow path and `mi_free_generic_local`), which closes the gap for those paths. Costs one
+// relaxed load of an already-hot cache line, and only there -- never on the fast path.
+//
+// Residual: `mi_free_ex`'s thread-local fast path (`src/free.c`, `xtid==0`) calls
+// `mi_free_block_local` directly, and `mi_page_malloc`'s free-list pop, without going through
+// this function -- a parked thread's fast-path free that ends up retiring a page (via
+// `_mi_page_retire`) still races the scavenger's walk on that path. `mi_free_block_local` carries
+// a permanent debug-only assert as a detector for that residual instead (see its definition).
+static inline void _mi_park_leave_if_parked(mi_theap_t* theap) {
+  if (theap == NULL) return;
+  mi_tld_t* const tld = theap->tld;
+  if mi_likely(tld == NULL || mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_RUNNING) return;
+  if (tld->thread_id != _mi_thread_id()) return;   // only the owner may leave its own park
+  _mi_park_leave(tld);
 }
 
 /* -----------------------------------------------------------

@@ -188,6 +188,39 @@ mi_heap_t* mi_heap_new(void) {
 // other party that can hold one is a concurrent mi_free collecting it -- the walk can then
 // safely claim and move/free each page without racing a still-live theap.
 static void mi_heap_detach_theaps(mi_heap_t* heap) {
+  // #272: a theap of this heap can be the `park_theap0` that a thread handed to the background
+  // scavenger -- `mi_on_thread_idle_start` captures `_mi_theap_default()`, and after
+  // `mi_theap_set_default(theap_of(heap))` that is a theap of a DELETABLE heap. Nothing below
+  // consults the park protocol, so a cross-thread `mi_heap_delete` would abandon (and
+  // `mi_heap_free_theaps` later free) a theap the scavenger is walking right now; both
+  // assertions that would have caught it are suppressed (`theap->heap==NULL` here, the
+  // MI_PARK_SWEEPING clause of `_mi_theap_can_touch` there). So take every parked owner back
+  // first.
+  //
+  // Walked over `subproc->tlds` under `tlds_lock`, NOT over `heap->theaps`: `mi_tld_unregister`
+  // needs that same lock, so holding it is what keeps each `mi_tld_t` alive across the call.
+  // Reading a candidate from `heap->theaps` and then dropping the lock before `_mi_park_leave`
+  // is a use-after-free -- the owner can leave the park and run
+  // `_mi_thread_done -> _mi_tld_detach_theaps -> mi_tld_free -> _mi_meta_free` in that window,
+  // and the CAS lands on freed (possibly reused) meta memory.
+  //
+  // No deadlock: the sweep takes `tlds_lock` only to CLAIM a tld and releases it before
+  // `_mi_thread_idle_work`, so a scavenger in MI_PARK_SWEEPING holds nothing we hold and reaches
+  // its `store(park_state, MI_PARK_PARKED)` on its own; `_mi_park_leave`'s wait is bounded by
+  // that. `park_theap0` is published by the owner before it leaves MI_PARK_RUNNING, so it is
+  // stable for exactly the states we read it in.
+  if (!_mi_process_is_forked_child) {   // a forked child's park_state may name a thread that is gone
+    mi_subproc_t* const subproc = heap->subproc;
+    mi_lock(&subproc->tlds_lock) {
+      for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
+        if (mi_atomic_load_acquire(&tld->park_state) == MI_PARK_RUNNING) continue;
+        mi_theap_t* const theap0 = tld->park_theap0;
+        if (theap0 != NULL && mi_atomic_load_ptr_acquire(mi_heap_t, &theap0->heap) == heap) {
+          _mi_park_leave(tld);
+        }
+      }
+    }
+  }
   _mi_heap_detach_theaps(heap);
   mi_lock(&heap->theaps_lock) { // paranoia
     for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {

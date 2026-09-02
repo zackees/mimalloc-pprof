@@ -418,6 +418,36 @@ static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub) {
 
 
 // ----------------------------------------------------------------------
+// CPU relax hint for a short spin (no syscall, no scheduler involvement).
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a):
+// used by `_mi_park_leave` (src/scavenger.c) to wait out an in-flight sweep, which is
+// bounded by one page's walk and so should not reach `_mi_prim_thread_yield`.
+// ----------------------------------------------------------------------
+
+#if defined(_WIN32)
+static inline void mi_atomic_pause(void) {
+  YieldProcessor();
+}
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+static inline void mi_atomic_pause(void) {
+  __asm__ volatile ("pause" ::: "memory");
+}
+#elif (defined(__GNUC__) || defined(__clang__)) && defined(__aarch64__)
+static inline void mi_atomic_pause(void) {
+  __asm__ volatile ("isb" ::: "memory");
+}
+#elif (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && (__ARM_ARCH >= 7)
+static inline void mi_atomic_pause(void) {
+  __asm__ volatile ("yield" ::: "memory");
+}
+#else
+static inline void mi_atomic_pause(void) {
+  mi_atomic_thread_fence(mi_memory_order_seq_cst);
+}
+#endif
+
+
+// ----------------------------------------------------------------------
 // Guard
 // ----------------------------------------------------------------------
 

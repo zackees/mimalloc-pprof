@@ -484,7 +484,7 @@ produces. Only `libgcc_s_seh-1.dll` is actually needed — this gcc's thread mod
   compiled is not the same as the callback surviving the link
 - `mimalloc-redirect.dll` in the DLL's import table: the Windows override goes through the
   redirection module, so a DLL that lost that import overrides nothing
-- resolved `Link libraries : psapi;shell32;user32;advapi32;bcrypt`, exactly
+- resolved `Link libraries : psapi;shell32;user32;advapi32;bcrypt;synchronization`, exactly
 - `tests.json` contains no absolute path; `libgcc_s_seh-1.dll` and `mimalloc-redirect.dll`
   are in the bundle
 
@@ -685,7 +685,7 @@ exported `PATH` would have broken the "consume only soldr's env" rule.
 - no `__emutls` reference anywhere in the DLL
 - `mimalloc-redirect.dll` imported, and ahead of every `api-ms-win-crt-*` / `ucrtbase` /
   `MSVCP140` / `VCRUNTIME140` descriptor
-- resolved `Link libraries : psapi;shell32;user32;advapi32;bcrypt`, exactly
+- resolved `Link libraries : psapi;shell32;user32;advapi32;bcrypt;synchronization`, exactly
 - `tests.json` contains no absolute path
 
 `CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY` is set here as well, and as on windows-gnu it is

@@ -228,6 +228,65 @@ pub fn heap_dump_json(include_blocks: bool, hash_addresses: bool) -> Option<Stri
     Some(json)
 }
 
+/// Tell mimalloc this thread is idle (issue #272, Bun parity P7a).
+///
+/// Collects this thread's pending frees, discards the free blocks inside its still-used
+/// pages, and hands the arena purge to the background scavenger thread so freed memory
+/// returns to the OS now instead of at the next allocation that happens to run a purge --
+/// which, on a genuinely idle process, is never.
+///
+/// Safe on any thread; a no-op on a thread that never allocated. Call it when the thread
+/// has nothing to do (an event loop about to block, a worker pool waiting on its queue),
+/// not on a hot path: it costs a few `madvise`/`DiscardVirtualMemory` calls.
+pub fn on_thread_idle() {
+    unsafe { sys::mi_on_thread_idle() }
+}
+
+/// Guard form of [`on_thread_idle`] for a thread that is about to BLOCK: hands this
+/// thread's heaps to the background scavenger, which does the idle work above while this
+/// thread sits in the kernel, and takes them back on drop.
+///
+/// Returns `None` when nothing was handed off (no scavenger running, this thread never
+/// allocated, or it is already parked). That case is deliberately NOT an inline sweep: a
+/// caller blocks far more often than it is truly idle. If this park is idle enough to
+/// afford the work, call [`on_thread_idle`] instead.
+///
+/// The thread must not allocate or free between the call and the drop -- that is the
+/// precondition that lets another thread rewrite its free lists -- which is why the guard
+/// is `!Send` and holds no data.
+#[must_use = "the park ends when the guard is dropped"]
+pub fn park_while_idle() -> Option<IdlePark> {
+    if unsafe { sys::mi_on_thread_idle_start() } {
+        Some(IdlePark {
+            _not_send: core::marker::PhantomData,
+        })
+    } else {
+        None
+    }
+}
+
+/// Returned by [`park_while_idle`]; ends the park when dropped.
+pub struct IdlePark {
+    // the park is per-thread state: `mi_on_thread_idle_end` must run on the parking thread
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+impl Drop for IdlePark {
+    fn drop(&mut self) {
+        unsafe { sys::mi_on_thread_idle_end() }
+    }
+}
+
+/// Stop the background scavenger thread (issue #272).
+///
+/// It restarts on demand (the next [`park_while_idle`], or the next thread that
+/// initializes), so this is a way to quiesce it -- e.g. before a `fork`/`exec` that counts
+/// threads, or in a test -- not a way to disable it permanently. For that, set the
+/// `scavenger` option to 0 (`MIMALLOC_SCAVENGER=0`) before the first allocation.
+pub fn scavenger_stop() {
+    unsafe { sys::mi_scavenger_stop() }
+}
+
 /// Exact DHAT v2 heap/lifetime profiling controls.
 ///
 /// DHAT records every non-internal allocation from the moment [`start`] succeeds.

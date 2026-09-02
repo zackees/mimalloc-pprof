@@ -16,6 +16,10 @@
         free hook attached.
      3. snapshot stability -- mi_prof_snapshot_new/visit while other threads
         actively mutate the sample table.
+     4. (issue #272) the background scavenger purging arenas -- decommitting whole
+        slices -- while mi_prof_visit / mi_prof_snapshot_new walk the profiler
+        tables, and while other threads hand their theaps to that same scavenger
+        with mi_on_thread_idle_start/_end.
 
    Each scenario is a pass/fail assert; the test is deliberately allocation-heavy
    so that sampling actually triggers rather than being skipped. */
@@ -223,10 +227,96 @@ static void test_snapshot_under_mutation(void) {
   mi_prof_stop();
 }
 
+/* ---- scenario 4: profiler visit vs the background scavenger (issue #272) ----
+
+   Design note, because this is the case the issue asked to design rather than assume.
+
+   The scavenger thread does two things that could in principle collide with the
+   profiler: it decommits arena slices (`_mi_arenas_try_purge`), and it runs a parked
+   thread's idle work (`_mi_thread_idle_work` -> `mi_theap_collect`, which frees pages).
+   Neither can be observed by a profiler walk, for two structural reasons:
+
+     - `mi_prof_visit` / `mi_prof_snapshot_new` walk the profiler's own stack/sample
+       tables under `prof_lock`. That memory comes from the profiler's raw-OS arena
+       (`_mi_os_alloc`, CLAUDE.md rule 4), never from a mimalloc page, so no arena purge
+       can ever decommit anything either of them dereferences. Neither one follows a
+       `mi_page_t*`, so "read a page that was just decommitted" has no code path.
+     - A page can only reach `mi_arena_schedule_purge` once every one of its blocks was
+       freed, and every block free unlinks that block's record under `prof_lock` first.
+       `mi_arenas_page_free_ex` (src/arena.c) asserts exactly that
+       (`!page->has_metadata`) in an MI_PPROF debug build, so a future fast path that
+       broke the invariant would fail here rather than silently hand a live record's page
+       to the purger.
+
+   This scenario is the empirical half: run the two walks continuously against a
+   scavenger that is being kept as busy as possible (`purge_delay` forced to its minimum
+   by the ctest environment, whole-slice allocations so purges actually happen, and
+   worker threads parking so the scavenger also sweeps their theaps). */
+
+static volatile int scav_stop;
+
+/* 256 KiB: large enough that each block is its own arena slices, so freeing one
+   actually schedules a purge rather than just recycling inside a page. */
+#define SCAV_BLOCK (256 * 1024)
+
+static THREAD_RET scav_churn_worker(void* arg) {
+  (void)arg;
+  gate_wait();
+  void* keep[8];
+  memset(keep, 0, sizeof(keep));
+  while (scav_stop == 0) {
+    for (size_t i = 0; i < 8; i++) {
+      keep[i] = mi_malloc(SCAV_BLOCK);
+      assert(keep[i] != NULL);
+      memset(keep[i], (int)i + 1, 64);
+    }
+    for (size_t i = 0; i < 8; i++) { mi_free(keep[i]); keep[i] = NULL; }
+    /* hand our theaps to the scavenger while it is also purging the slices we just freed */
+    if (mi_on_thread_idle_start()) { thread_yield_now(); mi_on_thread_idle_end(); }
+    else { mi_on_thread_idle(); }
+  }
+  return THREAD_OK;
+}
+
+static bool touch_visitor(const mi_prof_sample_info_t* info, void* arg) {
+  size_t* n = (size_t*)arg;
+  /* dereference every field the visitor contract exposes: a decommitted table would fault here */
+  assert(info->live_objects == 0 || info->live_bytes > 0);
+  (*n) += info->depth;
+  for (size_t i = 0; i < info->depth; i++) { (void)info->stack[i]; }
+  return true;
+}
+
+static void test_visit_vs_scavenger(void) {
+  thread_t threads[RACE_THREADS];
+  gate_open = 0; scav_stop = 0;
+  assert(mi_prof_start_seeded(4096, 11));
+  for (size_t i = 0; i < RACE_THREADS; i++) {
+    thread_start(&threads[i], (thread_fun_t)scav_churn_worker, NULL);
+  }
+  gate_open = 1;
+  for (size_t round = 0; round < 200; round++) {
+    size_t n = 0;
+    assert(mi_prof_visit(&touch_visitor, &n));
+    mi_prof_snapshot_t* snap = mi_prof_snapshot_new();
+    assert(snap != NULL);
+    size_t m = 0;
+    assert(mi_prof_snapshot_visit(snap, &touch_visitor, &m));
+    mi_prof_snapshot_free(snap);
+    /* and park the walking thread too, so the scavenger sweeps a theap that just
+       ran a profiler walk on it */
+    if (mi_on_thread_idle_start()) { thread_yield_now(); mi_on_thread_idle_end(); }
+  }
+  scav_stop = 1;
+  for (size_t i = 0; i < RACE_THREADS; i++) { thread_join(threads[i]); }
+  mi_prof_stop();
+}
+
 int main(void) {
   test_bootstrap_race();
   test_cross_thread_free();
   test_snapshot_under_mutation();
+  test_visit_vs_scavenger();   /* issue #272 */
   printf("test-profile-race: ok\n");
   return 0;
 }

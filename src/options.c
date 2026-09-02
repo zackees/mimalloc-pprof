@@ -137,7 +137,10 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { 0, MI_OPTION_UNINIT, MI_OPTION(deprecated_abandoned_page_purge) },
   { 0, MI_OPTION_UNINIT, MI_OPTION(deprecated_segment_reset) },   // reset segment memory on free (needs eager commit)
   { 1, MI_OPTION_UNINIT, MI_OPTION(deprecated_eager_commit_delay) },
-  { 1000,MI_OPTION_UNINIT, MI_OPTION_LEGACY(purge_delay,reset_delay) },  // purge delay in milli-seconds
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): 1000 -> 100 ms
+  // (oven-sh/bun#34217). The background scavenger (`mi_option_scavenger`) makes the shorter delay
+  // cheap: it purges on a wait instead of on the next allocation that happens to come along.
+  { 100, MI_OPTION_UNINIT, MI_OPTION_LEGACY(purge_delay,reset_delay) },  // purge delay in milli-seconds
   { 0,   MI_OPTION_UNINIT, MI_OPTION(use_numa_nodes) },           // 0 = use available numa nodes, otherwise use at most N nodes.
   { 0,   MI_OPTION_UNINIT, MI_OPTION_LEGACY(disallow_os_alloc,limit_os_alloc) },           // 1 = do not use OS memory for allocation (but only reserved arenas)
   { 240, MI_OPTION_UNINIT, MI_OPTION(os_tag) },                   // apple: VM_MEMORY_APPLICATION_SPECIFIC_1, so vmmap/Instruments attribute our arenas to us (#78)
@@ -183,6 +186,8 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(prof_max_bytes) }        // budget for profiler-internal arena memory; 0 = unbudgeted
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(memory_events) }         // opt-in allocation-change accounting/callbacks; read lazily by memory-events.c, not at startup
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_zeroes) }           // experimental (#67): treat decommit-purged slices as zeroed so mi_zalloc can skip its memset
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(scavenger) }              // background thread that purges scheduled arena memory (MIMALLOC_SCAVENGER)
 };
 
 static void mi_option_init(mi_option_desc_t* desc);

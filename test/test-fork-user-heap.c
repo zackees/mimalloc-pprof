@@ -36,24 +36,27 @@ terms of the MIT license.
 
    Expected with bugs present: case_b child times out (SIGALRM -> exit 2).
 
-   --- Adapted for this tree (#270) ---
-   This phase (#264 item 5) ports only the lock skeleton and the
-   threadlocal.c fork handler from Bun's patch (see the lock-order block at
-   the top of src/subproc.c); Bun's per-subprocess `tld` registry and
-   scavenger/park state land later with the scavenger (#264 item 7 / #272).
-   Two of the four cases here depend on infrastructure that does not exist
-   in this tree yet and are therefore disabled (`#if 0 // Phase 7`) rather
-   than adapted, per #270's step 6:
+   --- Adapted for this tree (#270, then #272) ---
+   #270 (#264 item 5) ported only the lock skeleton and the threadlocal.c
+   fork handler from Bun's patch (see the lock-order block at the top of
+   src/fork.c); two of the four cases here needed infrastructure that did
+   not exist in this tree yet and were disabled as `#if 0 // Phase 7`.
+   #272 (Bun parity P7a) landed both and re-enabled them:
 
-     - Case B needs `mi_debug_stall_in_thread_theaps_done` (a src/theap.c
-       debug hook Bun added to deterministically exercise the exact
-       `tld->theaps_lock` gap this phase's lock-order comment documents as a
-       KNOWN GAP -- see subproc.c). It does not compile here.
-     - Case C needs `mi_on_thread_idle` / the background scavenger (Bun
-       parity gaps B2/B3, tracked separately). It does not compile here.
+     - Case B needs `mi_debug_stall_in_thread_theaps_done` (src/init.c), the
+       debug hook that deterministically parks a terminating thread inside
+       the window where it holds `tld->theaps_lock`. This is the case that
+       decided #272's design for that lock: it must be RE-INITIALIZED in the
+       forked child, never acquired in `prepare` (acquiring it there moves
+       this case's child-side deadlock into the parent). See src/fork.c.
+     - Case C needs `mi_on_thread_idle` and the background scavenger; both
+       land in #272, including `_mi_scavenger_forked_child`, which is what
+       stops a forked child from signalling a scavenger thread that did not
+       survive the fork and then never purging at all -- exactly what this
+       case measures.
 
    Case A and Case D need nothing beyond the ordinary heap API + fork() +
-   pthread and run for real below. */
+   pthread. All four run for real below. */
 
 #ifdef _WIN32
 #include <stdio.h>
@@ -71,9 +74,6 @@ int main(void) { fprintf(stderr, "test-fork-user-heap: skipped on Windows\n"); r
 #include <stdatomic.h>
 #include <mimalloc.h>
 
-#if 0 // Phase 7: scavenger / tld registry -- mi_debug_stall_in_thread_theaps_done does
-      // not exist in this tree (see file comment above). Restore verbatim once the
-      // tld registry (subproc.c's KNOWN GAP) lands.
 #if MI_DEBUG > 0
 #include <stdint.h>
 #ifdef __cplusplus
@@ -83,7 +83,6 @@ extern "C" std::atomic<uintptr_t> mi_debug_stall_in_thread_theaps_done;
 extern _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
 #endif
 #endif
-#endif // Phase 7
 
 static mi_heap_t* g_heap;
 static atomic_int g_stop;
@@ -144,13 +143,11 @@ static int case_a(void) {
 // inside _mi_theap_init; child should be able to mi_heap_delete without
 // blocking on that vanished thread's tld lock.
 //
-// #270: disabled in this tree -- see the file comment's "Adapted for this
-// tree" section. `mi_debug_stall_in_thread_theaps_done` (src/theap.c) does
-// not exist here; this is exactly the KNOWN GAP the lock-order block at the
-// top of src/subproc.c documents (mi_tld_t::theaps_lock is not yet quiesced
-// around fork()). Restore verbatim once the Phase 7 tld registry lands.
+// #272 re-enabled this: `mi_debug_stall_in_thread_theaps_done` now exists (src/init.c) and
+// `_mi_process_fork_child` re-initializes every registered tld's `theaps_lock`. Note that
+// `prepare` deliberately does NOT acquire that lock -- see src/fork.c for why this very case
+// is the reason.
 // ---------------------------------------------------------------------------
-#if 0 // Phase 7: scavenger / tld registry
 #if MI_DEBUG > 0
 static void* stall_thread(void* arg) {
   (void)arg;
@@ -198,14 +195,11 @@ static int case_b(void) {
   return rc;
 }
 #endif
-#endif // Phase 7
 
 // ---------------------------------------------------------------------------
-// Case C: a forked child must still purge memory. #270: disabled in this
-// tree -- needs `mi_on_thread_idle` / the background scavenger, neither of
-// which exist yet (Bun parity gaps B2/B3, tracked separately from #270).
+// Case C: a forked child must still purge memory. Enabled by #272 (Bun parity P7a):
+// `mi_on_thread_idle` -> `_mi_arenas_purge_now`, and `_mi_scavenger_forked_child`.
 // ---------------------------------------------------------------------------
-#if 0 // Phase 7: scavenger
 static size_t rss_mb(void) {
   // no stdio: it allocates, and an allocation can purge inline -- the very channel case_c must not use
   char buf[128];
@@ -254,7 +248,6 @@ static int case_c(void) {
           rc ? "FAIL (forked child never purged)" : "ok");
   return rc;
 }
-#endif // Phase 7
 
 static void atfork_noop(void) { }
 
@@ -276,8 +269,12 @@ int main(void) {
   int rc = 0;
   rc |= case_d();   // first: case A forks, and each fork runs every handler registered so far
   rc |= (case_a() > 0 ? 1 : 0);
-  fprintf(stderr, "case_b: skipped (#270 Phase 7 -- needs the tld registry, see file comment)\n");
-  fprintf(stderr, "case_c: skipped (#270 Phase 7 -- needs the background scavenger, see file comment)\n");
+  #if MI_DEBUG > 0
+  rc |= case_b();   // #272: needs the MI_DEBUG-only stall hook in src/init.c
+  #else
+  fprintf(stderr, "case_b: skipped (needs MI_DEBUG > 0 for the stall hook)\n");
+  #endif
+  rc |= case_c();
   return rc;
 }
 

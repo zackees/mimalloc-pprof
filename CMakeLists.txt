@@ -97,6 +97,7 @@ set(mi_sources
     src/page-map.c
     src/profile.c
     src/random.c
+    src/scavenger.c
     src/stats.c
     src/subproc.c
     src/theap.c
@@ -688,7 +689,10 @@ function(find_link_library libname outlibname)
 endfunction()
 
 if(WIN32)
-  list(APPEND mi_libraries psapi shell32 user32 advapi32 bcrypt)
+  # `synchronization` is `WaitOnAddress`/`WakeByAddressSingle` (src/scavenger.c, #272). Needed for
+  # EVERY Windows toolchain: src/scavenger.c's `#pragma comment(lib, "synchronization")` reaches
+  # only MSVC/clang-cl, so MinGW (ld/lld) needs the explicit `-lsynchronization` this adds.
+  list(APPEND mi_libraries psapi shell32 user32 advapi32 bcrypt synchronization)
 else()
   find_link_library("pthread" MI_LIB_PTHREAD)
   if(MI_LIB_PTHREAD)
@@ -1012,6 +1016,12 @@ if (MI_BUILD_TESTS)
     endif()
     add_test(NAME test-profile-race COMMAND mimalloc-test-profile-race)
     set_tests_properties(test-profile-race PROPERTIES TIMEOUT 300)
+    # issue #272: the same source with the purge delay forced to its minimum, so the
+    # background scavenger is continuously decommitting arena slices underneath scenario 4's
+    # mi_prof_visit / mi_prof_snapshot_new walks (and sweeping the parked worker threads).
+    add_test(NAME test-profile-race-scavenger COMMAND mimalloc-test-profile-race)
+    set_tests_properties(test-profile-race-scavenger PROPERTIES TIMEOUT 300
+                         ENVIRONMENT "MIMALLOC_PURGE_DELAY=1;MIMALLOC_SCAVENGER=1")
   endif()
 
   # Memory + counter regression gate (issue #63). Emits JSON for CI baseline
@@ -1075,8 +1085,8 @@ if (MI_BUILD_TESTS)
 
   # Bun's heap delete/destroy teardown regression corpus (issue #271, Bun parity P6):
   # imported from oven-sh/mimalloc @ 942b8342, MIT, verbatim except for provenance headers
-  # and `#if 0 // Phase 7` around test-heap-teardown.c's `parked` case (needs the background
-  # scavenger / mi_on_thread_idle_*, neither of which exists in this tree, see issue #272).
+  # and, until #272 (Bun parity P7a) landed the background scavenger and mi_on_thread_idle_*,
+  # an `#if 0 // Phase 7` around test-heap-teardown.c's `parked` case -- now enabled.
   # test-theap-sentinel.c is deliberately NOT imported: it white-box-reproduces a
   # `(mi_theap_t*)1` sentinel-reservation bug in Bun's `mi_heap_init_theap` (heap.c) that
   # only exists because Bun reserves the thread-local slot with a sentinel before creating
@@ -1186,7 +1196,7 @@ if (MI_BUILD_TESTS)
 
     # test-fork-user-heap: imported from oven-sh/mimalloc @ 942b8342, MIT (see the
     # file's header comment for provenance and for which cases are disabled here as
-    # `#if 0 // Phase 7` pending the scavenger/tld registry, #264 item 7 / #272).
+    # were `#if 0 // Phase 7` pending the scavenger/tld registry and are re-enabled by #272).
     add_executable(mimalloc-test-fork-user-heap test/test-fork-user-heap.c)
     target_compile_definitions(mimalloc-test-fork-user-heap PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-fork-user-heap PRIVATE ${mi_cflags})
@@ -1199,6 +1209,29 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-fork-user-heap PRIVATE Threads::Threads)
     add_test(NAME test-fork-user-heap COMMAND mimalloc-test-fork-user-heap)
     set_tests_properties(test-fork-user-heap PROPERTIES TIMEOUT 300)
+
+    # test-park-handoff: imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 /
+    # Bun parity P7a). Exercises `mi_on_thread_idle_start`/`_end` -- the scavenger claiming
+    # and sweeping a parked thread's theaps -- including park-then-exit, park-then-cancel,
+    # fork() while parked, a third thread freeing into pages under sweep, and
+    # `mi_scavenger_stop`. See the file header for the two Phase-7b adaptations.
+    add_executable(mimalloc-test-park-handoff test/test-park-handoff.c)
+    target_compile_definitions(mimalloc-test-park-handoff PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-park-handoff PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-park-handoff PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-park-handoff PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-park-handoff PRIVATE mimalloc ${mi_libraries})
+    endif()
+    target_link_libraries(mimalloc-test-park-handoff PRIVATE Threads::Threads)
+    add_test(NAME test-park-handoff COMMAND mimalloc-test-park-handoff)
+    set_tests_properties(test-park-handoff PROPERTIES TIMEOUT 600)
+    # ... and with the scavenger disabled: every case must take its "nobody to hand off to"
+    # branch and still leave the heap correct (`mi_on_thread_idle` sweeping inline).
+    add_test(NAME test-park-handoff-no-scavenger COMMAND mimalloc-test-park-handoff)
+    set_tests_properties(test-park-handoff-no-scavenger PROPERTIES TIMEOUT 600
+                         ENVIRONMENT "MIMALLOC_SCAVENGER=0")
   endif()
 
   # MI_NO_PROCESS_DETACH (issue #268, Bun parity P3): imported from
@@ -1556,6 +1589,51 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-process-rss PRIVATE mimalloc ${mi_libraries})
   endif()
   add_test(NAME test-process-rss COMMAND mimalloc-test-process-rss)
+
+  # issue #272 (Bun parity P7a) acceptance test. A C++ TU that declares
+  # `extern "C" void mi_on_thread_idle(void) noexcept;` by hand, exactly as Bun's consumer
+  # code does (no mimalloc header), so a mangling or noexcept mismatch in the public header
+  # is a link error here. It then asserts the behaviour: RSS drops by at least half of a
+  # freed 256 MiB within one second of a worker thread going idle, with neither thread
+  # allocating in the meantime (so it measures the scavenger, not an inline purge).
+  # A C++ compiler is not required by this project (`project(libmimalloc C)`), so only add
+  # the target where one can actually be enabled.
+  #
+  # The Apple CROSS toolchain is the exception that has to be spelled out:
+  # `enable_language(CXX)` there dies with "Could not find install_name_tool, please check
+  # your installation" (CMakeFindBinUtils via CMakeDetermineCXXCompiler) -- CMake's Apple
+  # C++ path insists on that tool and soldr's Linux-hosted Apple SDK toolchain does not
+  # provide it under that name, while the C language never asks for it. Nothing is lost:
+  # macos-bundles is compile-only for arm64 and its x64 run is gated on #283's golden
+  # image, so this test would not be RUN there in any case, and its actual claim -- that
+  # `extern "C" void mi_on_thread_idle(void) noexcept;` written by hand, as Bun writes it,
+  # links against our library -- is covered by the native Linux jobs, the native `cl` job,
+  # the MinGW bundle lane, and the clang-cl bundle lane (where CMakeLists turns MI_USE_CXX
+  # on by itself, so CXX is already loaded by the time we get here).
+  set(mi_have_cxx_for_tests FALSE)
+  if(CMAKE_CXX_COMPILER_LOADED)
+    set(mi_have_cxx_for_tests TRUE)
+  elseif(NOT (APPLE AND CMAKE_CROSSCOMPILING))
+    include(CheckLanguage)
+    check_language(CXX)
+    if(CMAKE_CXX_COMPILER)
+      enable_language(CXX)
+      set(mi_have_cxx_for_tests TRUE)
+    endif()
+  endif()
+  if(mi_have_cxx_for_tests AND MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-thread-idle-rss test/test-thread-idle-rss.cpp)
+    target_compile_definitions(mimalloc-test-thread-idle-rss PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-thread-idle-rss PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-thread-idle-rss PRIVATE include)
+    target_link_libraries(mimalloc-test-thread-idle-rss PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-thread-idle-rss PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-thread-idle-rss COMMAND mimalloc-test-thread-idle-rss)
+    set_tests_properties(test-thread-idle-rss PROPERTIES TIMEOUT 120)
+  endif()
 
   # macOS VM tag must be application-specific (issue #78).
   add_executable(mimalloc-test-os-tag test/test-os-tag.c)

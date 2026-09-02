@@ -649,7 +649,16 @@ static void test_stats_v3_heap_stats(void) {
   assert(during.heap_reserved >= during.heap_committed);
   assert(during.heap_pages > 0);
   assert(during.heap_count > 0);
-  assert(during.heap_committed >= before.heap_committed);   /* allocator grew */
+  /* The allocator grew -- but "grew" is not a monotonic counter any more (issue #272):
+     `purge_delay` is 100 ms and a background scavenger decommits scheduled arena memory
+     without waiting for an allocation, so a purge of memory that was already committed
+     when `before` was read can land between the two reads and take `heap_committed` below
+     it. Reproduced as `during.heap_committed >= before.heap_committed` failing roughly 1
+     run in 30 under a loaded parallel `ctest` (the gap between the reads only has to
+     exceed 100 ms). What is actually being checked here is that the 2 MiB just allocated
+     is accounted for, so check exactly that instead of a delta against an unrelated
+     earlier sample. */
+  assert(during.heap_committed >= (size_t)count * size);
   assert(during.live_samples > 0);
 
   /* The dump must carry the same numbers as a comment block. */

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 788affa3 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 9191d406 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -194,6 +194,21 @@ typedef void (mi_cdecl mi_error_fun)(int err, void* arg);
 mi_decl_export void mi_register_error(mi_error_fun* fun, void* arg);
 
 mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+// Tell mimalloc this thread is idle: it collects this thread's pending frees, discards the
+// free blocks inside its still-used pages (`purge_holes`), and hands the arena purge to the
+// background scavenger. Safe on any thread; a no-op on a thread that never allocated.
+mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
+// Declare that this thread will not allocate or free until `mi_on_thread_idle_end`, so the
+// scavenger can do the idle work above while this thread blocks. Returns `false` when nothing
+// was handed off, and then `mi_on_thread_idle_end` must NOT be called.
+mi_decl_export bool mi_on_thread_idle_start(void) mi_attr_noexcept;
+// The other half of `mi_on_thread_idle_start`: take the theaps back before allocating again.
+mi_decl_export void mi_on_thread_idle_end(void) mi_attr_noexcept;
+// Stop the background scavenger thread (it restarts on demand; see `mi_option_scavenger`).
+mi_decl_export void mi_scavenger_stop(void)     mi_attr_noexcept;
+
 mi_decl_export int  mi_version(void);
 mi_decl_export void mi_options_print(void)      mi_attr_noexcept;
 mi_decl_export void mi_process_info_print(void) mi_attr_noexcept;
@@ -554,6 +569,7 @@ typedef enum mi_option_e {
   mi_option_prof_max_bytes,             // budget (in bytes) for profiler-internal arena memory; 0 = unbudgeted (=0)
   mi_option_memory_events,              // enable opt-in allocation-change accounting/callbacks (MIMALLOC_MEMORY_EVENTS) (=0)
   mi_option_purge_zeroes,               // treat decommit-purged slices as zeroed, letting mi_zalloc skip its memset (=0, experimental)
+  mi_option_scavenger,                  // run a background thread that purges scheduled arena memory (=1). imported from oven-sh/mimalloc @ 942b8342, MIT (#272)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

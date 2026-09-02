@@ -1197,6 +1197,18 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(unabandon || (page->next==NULL && page->prev==NULL));
   mi_assert_internal(_mi_theap_can_touch(current_theapx));
+  #if MI_PPROF
+  // #272 profiler-interaction invariant (1): no profiler record may be attached to a page that
+  // is going back to the arena, because the slices it occupies can be decommitted by the
+  // background scavenger at any point after `mi_arena_schedule_purge` below. The invariant holds
+  // by construction -- a page only reaches here once `mi_page_all_free`, and every block free
+  // ran `_mi_prof_on_free` / `_mi_prof_on_free_collect`, which unlink that block's record under
+  // `prof_lock` and clear `has_metadata` when the list empties -- but it is exactly the kind of
+  // thing a future fast path could break silently, so assert it where the page is handed over.
+  // (The records themselves live in the profiler's raw-OS arena, CLAUDE.md rule 4, so they are
+  // never inside a discarded range either way; this asserts nothing DANGLES INTO the range.)
+  mi_assert_internal(!page->has_metadata && page->metadata == NULL);
+  #endif
 
   // all we need from the heap, before the page is unpublished from it (see
   // mi_arenas_page_free_prim's provenance comment, above)
@@ -1370,7 +1382,6 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   Arena free
 ----------------------------------------------------------- */
 static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slices);
-static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
 
 void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid) {
   if (p==NULL) return;
@@ -1428,12 +1439,12 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
   }
 
   // try to purge expired decommits
-  // mi_arenas_try_purge(false, false, NULL);
+  // _mi_arenas_try_purge(false, false, NULL);
 }
 
 // Purge the arenas; if `force_purge` is true, amenable parts are purged even if not yet expired
 void _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld) {
-  mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq);
+  _mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq);
 }
 
 
@@ -1504,7 +1515,7 @@ static void mi_arenas_unsafe_destroy(mi_subproc_t* subproc) {
 // for dynamic libraries that are unloaded and need to release all their allocated memory.
 void _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc) {
   mi_arenas_unsafe_destroy(subproc);
-  // mi_arenas_try_purge(true /* force purge */, true /* visit all*/, subproc, 0 /* thread seq */);  // purge non-owned arenas
+  // _mi_arenas_try_purge(true /* force purge */, true /* visit all*/, subproc, 0 /* thread seq */);  // purge non-owned arenas
 }
 
 
@@ -2219,7 +2230,12 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
       // expiration was not yet set
       // maybe set the global arenas expire as well (if it wasn't set already)
       mi_assert_internal(expire0==0);
-      mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &expire0, expire);
+      // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+      if (mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &expire0, expire)) {
+        // subproc expire went 0 -> set: this is the only transition the scavenger actually
+        // needs to observe, so wake it here instead of on every free.
+        _mi_scavenger_wake(arena->subproc);
+      }
     }
     else {
       // already an expiration was set
@@ -2305,7 +2321,58 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
 }
 
 
-static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
+// Only one thread purges at a time. NOT a static inside `_mi_arenas_try_purge`: fork() can land
+// with it set by a thread that does not exist in the child (much more likely now that the
+// scavenger, #272, spends real time inside the guarded section), and the child would then never
+// purge again. `_mi_arenas_fork_child` clears it; see `src/fork.c`.
+static mi_atomic_guard_t mi_arenas_purge_guard;
+
+// Release the guard unconditionally, and report whether it was actually held. ONLY for the
+// cases where the thread that held it provably no longer exists, so there is no owner left to
+// race with: the child of a `fork()`, and a Windows process exit that terminated the scavenger
+// where it stood (`_mi_scavenger_stop`). An orphaned guard is fatal now that a forced purge
+// waits for it rather than skipping.
+bool _mi_arenas_purge_guard_reset(void) {
+  return (mi_atomic_exchange_release(&mi_arenas_purge_guard, (uintptr_t)0) != 0);
+}
+
+// #272: called from `_mi_process_fork_child`, on the single surviving thread.
+void _mi_arenas_fork_child(void) {
+  _mi_arenas_purge_guard_reset();
+}
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+// Bring every arena's scheduled purge forward to "now" and get it done: either by waking the
+// scavenger (which then runs `_mi_arenas_try_purge`), or inline when no scavenger is running.
+// This is the third phase of `mi_on_thread_idle`: the caller told us it is idle, so there is no
+// reason to sit on decommittable memory for the rest of `purge_delay`.
+void _mi_arenas_purge_now(mi_subproc_t* subproc) {
+  if (subproc == NULL) return;
+  const long delay = mi_arena_purge_delay();
+  if (delay <= 0) return;   // purging disabled, or already immediate at free time
+  const mi_msecs_t now = _mi_clock_now();
+  const size_t max_arena = mi_arenas_get_count(subproc);
+  bool any_scheduled = false;
+  for (size_t i = 0; i < max_arena; i++) {
+    mi_arena_t* const arena = mi_arena_from_index(subproc, i);
+    if (arena == NULL) continue;
+    const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+    if (expire == 0) continue;                 // nothing queued for this arena
+    any_scheduled = true;
+    if (expire > now) { mi_atomic_storei64_release(&arena->purge_expire, now); }
+  }
+  if (!any_scheduled) return;
+  const mi_msecs_t sexpire = mi_atomic_loadi64_relaxed(&subproc->purge_expire);
+  if (sexpire == 0 || sexpire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now); }
+  if (_mi_scavenger_is_running()) {
+    _mi_scavenger_wake(subproc);
+  }
+  else {
+    _mi_arenas_try_purge(false /* force */, true /* visit all */, subproc, 0 /* tseq */);  // no scavenger: purge here
+  }
+}
+
+void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
 {
   // try purge can be called often so try to only run when needed
   const long delay = mi_arena_purge_delay();
@@ -2320,15 +2387,51 @@ static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subpro
   if (max_arena == 0) return;
 
   // allow only one thread to purge at a time (todo: allow concurrent purging?)
-  static mi_atomic_guard_t purge_guard;
-  mi_atomic_guard(&purge_guard)
+  //
+  // #272: `mi_atomic_guard` is NON-blocking -- when another thread holds it, the purge is
+  // simply skipped. That is the right behaviour for the opportunistic callers, and it was
+  // harmless before this phase because only allocating threads ever entered here and the
+  // window is tiny. It is NOT harmless for a FORCED purge: `mi_collect(true)` promises the
+  // caller that everything due has gone back to the OS, and with the background scavenger
+  // sitting in this same function on a timer, a forced purge now loses that race often
+  // enough to matter (`test-degenerate`'s thread-churn RSS backstop failed 4 runs in 40:
+  // "memory grew with thread churn -- 5.1 MB -> 54.1 MB", i.e. `mi_collect(true)` returning
+  // having purged nothing at all). So a forced purge WAITS for the guard instead of
+  // skipping.
+  //
+  // Why that wait cannot deadlock, spelled out because it turns a non-blocking guard into a
+  // blocking one: the ONLY caller that passes `force` is `_mi_arenas_collect(force_purge=true)`
+  // from `mi_theap_collect_ex(MI_FORCE)`, i.e. an ordinary thread inside `mi_collect(true)`.
+  // The scavenger never does -- it reaches here through `mi_theap_collect(theap0, false)`
+  // (MI_NORMAL) and through `_mi_arenas_purge_now`, both `force == false`, and
+  // `mi_theap_collect_ex` skips `_mi_arenas_collect` outright while `park_state ==
+  // MI_PARK_SWEEPING`. So a waiter is always a user thread and a holder is always someone
+  // running a bounded pass over the arenas that acquires no mimalloc lock the waiter could
+  // be holding (the guarded body takes only arena bitmaps and the OS). The wait is therefore
+  // bounded by one purge pass, and in particular a holder is never itself blocked on
+  // `_mi_park_leave` waiting for a SWEEPING state the waiter would have to clear.
+  //
+  // And it is bounded in wall-clock time regardless, because "the holder no longer exists" is
+  // not hypothetical on Windows: `ExitProcess` terminates every other thread BEFORE the
+  // `.CRT$XLY` process-detach callback runs `mi_process_done`, so a thread killed inside the
+  // guarded section orphans the guard, and the forced purge in `mi_process_done_once`
+  // (`mi_theap_collect(theap, true)`) would then spin here for good. `_mi_scavenger_stop`
+  // clears the guard for the scavenger specifically; this deadline is the general backstop for
+  // any other thread the OS took. A forced purge that gave up is a missed optimization; a
+  // process that never exits is not.
+  bool ran = false;
+  mi_msecs_t purge_guard_deadline = 0;   // set on the first attempt that found the guard held
+  do {
+  mi_atomic_guard(&mi_arenas_purge_guard)
   {
+    ran = true;
     // increase global expire: at most one purge per delay cycle
     if (arenas_expire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now + (delay/10)); }
     const size_t arena_start = tseq % max_arena;
     size_t max_purge_count = (visit_all ? max_arena : (max_arena/4)+1);
     bool all_visited = true;
     bool any_purged = false;
+    mi_msecs_t next_expire = 0;   // earliest still-pending per-arena expire (#272)
     for (size_t _i = 0; _i < max_arena; _i++) {
       size_t i = _i + arena_start;
       if (i >= max_arena) { i -= max_arena; }
@@ -2345,12 +2448,31 @@ static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subpro
             max_purge_count--;
           }
         }
+        // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+        const mi_msecs_t aexpire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+        if (aexpire != 0 && (next_expire == 0 || aexpire < next_expire)) { next_expire = aexpire; }
       }
     }
-    if (all_visited && !any_purged) {
-      mi_atomic_storei64_release(&subproc->purge_expire, (mi_msecs_t)0);
+    MI_UNUSED(any_purged);
+    if (all_visited) {
+      // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a):
+      // we saw every arena, so `subproc->purge_expire` becomes the earliest still-pending
+      // per-arena expire (0 if none) and the scavenger's next wait is exact. A CAS, so a purge
+      // scheduled concurrently with this walk is never clobbered.
+      mi_msecs_t expected = arenas_expire;
+      mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
     }
   }
+    if (!ran && force) {   // #272, see above
+      const mi_msecs_t waited_now = _mi_clock_now();
+      if (purge_guard_deadline == 0) { purge_guard_deadline = waited_now + 1000; }
+      else if (waited_now > purge_guard_deadline) {
+        _mi_verbose_message("forced arena purge gave up waiting for the purge guard\n");
+        break;
+      }
+      _mi_prim_thread_yield();
+    }
+  } while (!ran && force);
 }
 
 

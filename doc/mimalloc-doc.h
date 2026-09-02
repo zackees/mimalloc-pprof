@@ -948,6 +948,33 @@ int  mi_version(void);
 /// resource usage by calling this every once in a while.
 void mi_collect(bool force);
 
+/// Do the idle work of the calling thread now, on the calling thread: collect its pending
+/// frees and bring its arena purges forward so freed memory goes back to the OS instead of
+/// waiting for the next allocation. Safe on any thread; a no-op on a thread that never
+/// allocated. Issue #272 (Bun parity P7a).
+void mi_on_thread_idle(void);
+
+/// Declare that this thread will not allocate or free until mi_on_thread_idle_end(), so the
+/// background scavenger can do the idle work above while this thread blocks in the kernel.
+/// Returns `false` when there was nothing to hand off, and then mi_on_thread_idle_end() is
+/// not required. Between a `true` return and the matching `_end` the thread must not
+/// allocate or free -- that is the precondition the sweep relies on.
+bool mi_on_thread_idle_start(void);
+
+/// Take this thread's heaps back from the background scavenger; pairs with a
+/// mi_on_thread_idle_start() that returned `true`.
+void mi_on_thread_idle_end(void);
+
+/// Stop the background scavenger thread (see \a mi_option_scavenger). Permanent: it is not
+/// restarted afterwards, and purging falls back to running inline on allocating threads, as
+/// upstream does. Called automatically at process exit.
+///
+/// On Windows the scavenger is stopped from an `atexit` handler, so it is joined even in a
+/// build with `MI_NO_PROCESS_DETACH` (where the rest of `mi_process_done` is skipped). On
+/// POSIX there is no such hook: with `MI_NO_PROCESS_DETACH` the scavenger keeps running
+/// through `exit()` unless the embedder calls this itself.
+void mi_scavenger_stop(void);
+
 /// __v3__: Communicate that a thread is in a threadpool. 
 /// This is done automatically for threads in the Windows threadpool,
 /// but if using a custom threadpool it is good to call this on worker threads.
@@ -1292,7 +1319,7 @@ typedef enum mi_option_e {
   mi_option_eager_commit_delay,       ///< __v2__: the first N segments per thread are not eagerly committed (but per page in the segment on demand)
   mi_option_arena_eager_commit,       ///< eager commit arenas? Use 2 to enable just on overcommit systems (=2)
   mi_option_abandoned_page_purge,     ///< __v1__,__v2__: immediately purge delayed purges on thread termination
-  mi_option_purge_delay,              ///< memory purging is delayed by N milli seconds; use 0 for immediate purging or -1 for no purging at all. (=10)
+  mi_option_purge_delay,              ///< memory purging is delayed by N milli seconds; use 0 for immediate purging or -1 for no purging at all. (=100 in this fork; upstream =10)
   mi_option_use_numa_nodes,           ///< 0 = use all available numa nodes, otherwise use at most N nodes.
   mi_option_disallow_os_alloc,        ///< 1 = do not use OS memory for allocation (but only programmatically reserved arenas)  
   mi_option_max_segment_reclaim,        ///< __v2__: max. percentage of the abandoned segments can be reclaimed per try (=10%)
@@ -1303,6 +1330,8 @@ typedef enum mi_option_e {
   mi_option_disallow_arena_alloc,       ///< 1 = do not use arena's for allocation (except if using specific arena id's)
   mi_option_visit_abandoned,            ///< allow visiting heap blocks from abandoned threads (=0)
   mi_option_target_segments_per_thread, ///< __v1__,__v2__: experimental (=0)
+
+  mi_option_scavenger,                  ///< run a background thread that purges scheduled arena memory (=1). `MIMALLOC_SCAVENGER=0` disables it and purging stays allocation-driven, as upstream.
 
   // v3 options
   mi_option_page_reclaim_on_free,       ///< __v3__: reclaim abandoned pages on a free (=0). -1 disallowr always, 0 allows if the page originated from the current theap, 1 allow always

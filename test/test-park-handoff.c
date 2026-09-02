@@ -679,6 +679,8 @@ static void test_exit_while_swept_stress(void) {
 #define HOLE_EXIT_DTOR_N   DTOR_BLOCKS
 #endif
 
+static atomic_int hole_exit_handoffs;
+
 static void dtor_frees_and_allocs(void* blocks_v) {
   void** blocks = (void**)blocks_v;
   if (blocks == NULL) return;
@@ -716,7 +718,7 @@ static void* park_then_exit_racing_alloc_dtor(void* arg) {
   }
   void** p = (void**)calloc(LIVE, sizeof(void*));
   if (p != NULL) { churn_pattern(p); free(p); }
-  (void)mi_on_thread_idle_start();
+  if (mi_on_thread_idle_start()) { atomic_fetch_add(&hole_exit_handoffs, 1); }
   // Three quarters exit 20-270us into the park, which lands the exit inside the scavenger's
   // walk -- that is the race. But at that spacing the sweep bails on `park_reclaim` before it
   // discards anything, so on its own this case can race a sweep that never does any work. Every
@@ -752,12 +754,18 @@ static void test_exit_while_hole_swept_stress(void) {
 
   mi_purge_holes_stats_t after;
   mi_purge_holes_stats_get(&after);
-  fprintf(stderr, "  hole-swept exit stress: %zu discards over the case\n",
-          after.discard_calls - before.discard_calls);
+  const int handoffs = atomic_load(&hole_exit_handoffs);
+  fprintf(stderr, "  hole-swept exit stress: %d parks handed off, %zu discards over the case\n",
+          handoffs, after.discard_calls - before.discard_calls);
   check("exit while HOLE-swept, racing a destructor that allocates, is race-free", true);
-  // otherwise the case ran but never actually raced a hole sweep
+  // Otherwise the case ran but never actually raced a hole sweep. Gated on a handoff having
+  // happened at all: the `-no-scavenger` variant (`MIMALLOC_SCAVENGER=0`) has nothing to hand
+  // off to, so `mi_on_thread_idle_start` reports false everywhere and there is no sweep to race
+  // -- the threads still exit through the same allocating destructor, which is worth running,
+  // but the discard check has no subject.
   check("... and the parks it raced really did discard holes",
-        !mi_option_is_enabled(mi_option_purge_holes) || after.discard_calls > before.discard_calls);
+        !mi_option_is_enabled(mi_option_purge_holes) || handoffs == 0 ||
+        after.discard_calls > before.discard_calls);
 }
 
 // ---------------------------------------------------------------------------

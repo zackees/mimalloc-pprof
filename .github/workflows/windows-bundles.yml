@@ -1117,6 +1117,13 @@ jobs:
         # checks, unchanged in substance. `$PPROF` was resolved by the win-gnu half above.
         run: |
           set -euo pipefail
+          # $PPROF is exported by the win-gnu half's `Install pprof` step. Say so out loud:
+          # when the win-gnu rows are eventually deleted, that step goes with them and this
+          # would otherwise fail as an unset-variable error nowhere near the cause.
+          test -n "${PPROF:-}" || {
+            echo "::error::PPROF is unset -- the 'Install pprof' step (win-gnu half) must run before this one"
+            exit 1
+          }
           generator=$(ls rust-bins-msvc/t3_stats-*.exe | head -1)
           MIMALLOC_PPROF_CI_DUMP="$GITHUB_WORKSPACE/heap-msvc.prof" "$generator"
           "$PPROF" -raw "$GITHUB_WORKSPACE/heap-msvc.prof" > raw-msvc.txt
@@ -1362,13 +1369,20 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          native_dll=$(find native-msvc-release -name 'mimalloc.dll' | head -1)
-          test -n "$native_dll"
+          # The Visual Studio generator puts per-config output in <build>/<Config>/. Look
+          # there specifically rather than anywhere under the tree: an unqualified find
+          # could pick up an intermediate copy under CMakeFiles/ and compare the wrong PE.
+          native_dll=$(find native-msvc-release/Release -maxdepth 1 -name 'mimalloc.dll' 2>/dev/null | head -1 || true)
+          if [ -z "$native_dll" ]; then
+            echo "::error::the native cl Release tree produced no mimalloc.dll"
+            ls -R native-msvc-release 2>/dev/null | head -40 || true
+            exit 1
+          fi
           uv run ci/pe_imports.py "$native_dll" > native-msvc-imports-dll.txt
           echo "::group::native cl: mimalloc.dll import order"
           cat native-msvc-imports-dll.txt
           echo "::endgroup::"
-          native_probe=$(find native-msvc-release -name 'mimalloc-test-redirect-probe.exe' | head -1)
+          native_probe=$(find native-msvc-release/Release -maxdepth 1 -name 'mimalloc-test-redirect-probe.exe' 2>/dev/null | head -1 || true)
           if [ -n "$native_probe" ]; then
             probe_dir=$(dirname "$native_probe")
             PATH="$PWD/$probe_dir:$PATH" "$native_probe" > native-msvc-probe.txt 2>&1 || true

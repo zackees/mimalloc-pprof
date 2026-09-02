@@ -392,7 +392,12 @@ void          _mi_scavenger_forked_child(void);
 void          _mi_park_leave(mi_tld_t* tld);
 void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0);
 mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);
-size_t        _mi_test_idle_work_count(void);   // #272 test observable (test/test-park-handoff.c)
+// #272 test observable (test/test-park-handoff.c). `mi_decl_export` because the
+// `ctest-shared` job links that test against the shared library, where the default
+// `-fvisibility=hidden` would otherwise hide it -- same reason as the `mi_debug_*` hooks
+// above, except this one is NOT `MI_DEBUG`-only: the test is meaningful in a Release
+// build too, and one relaxed increment per park is not worth a config split.
+mi_decl_export size_t _mi_test_idle_work_count(void);
 #if MI_DEBUG > 0
 // #272 fork test hook (test/test-fork-user-heap.c case_b); see src/init.c
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;

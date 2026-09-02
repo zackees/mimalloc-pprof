@@ -52,7 +52,7 @@ terms of the MIT license. A copy of the license can be found in the file
 // in the test; the counter stays as the "a pass ran at all" signal.
 static _Atomic(size_t) mi_idle_work_count;
 
-size_t _mi_test_idle_work_count(void) {
+mi_decl_export size_t _mi_test_idle_work_count(void) {
   return mi_atomic_load_relaxed(&mi_idle_work_count);
 }
 

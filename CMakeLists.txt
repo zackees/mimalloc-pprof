@@ -1001,6 +1001,49 @@ if (MI_BUILD_TESTS)
   add_test(NAME test-subproc-lifecycle COMMAND mimalloc-test-subproc-lifecycle)
   set_tests_properties(test-subproc-lifecycle PROPERTIES TIMEOUT 600)
 
+  # pthread_atfork fork-safety handlers (issue #270, Bun parity P5). POSIX-only --
+  # both sources compile to a Windows-skip stub via #ifdef _WIN32, but there is no
+  # pthread/fork() to link against on MSVC/MinGW, so only build+register them off
+  # Windows (matching src/init.c's own `#if !defined(_WIN32) && !defined(__wasi__)`
+  # guard around the pthread_atfork registration these tests exercise).
+  if(NOT WIN32)
+    find_package(Threads REQUIRED)
+
+    # test-fork-locks: the repro from #270's Step 1 -- see the file's header comment
+    # for how to reproduce the pre-#270 hang (revert the subproc.c/init.c fork-handler
+    # changes and re-run). TIMEOUT is generous: 200 forks x a 5s per-child watchdog is
+    # the worst case if every single fork hangs, which should never happen once the
+    # handlers are in place (a clean run finishes in well under a second).
+    add_executable(mimalloc-test-fork-locks test/test-fork-locks.c)
+    target_compile_definitions(mimalloc-test-fork-locks PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-fork-locks PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-fork-locks PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-fork-locks PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-fork-locks PRIVATE mimalloc ${mi_libraries})
+    endif()
+    target_link_libraries(mimalloc-test-fork-locks PRIVATE Threads::Threads)
+    add_test(NAME test-fork-locks COMMAND mimalloc-test-fork-locks)
+    set_tests_properties(test-fork-locks PROPERTIES TIMEOUT 300)
+
+    # test-fork-user-heap: imported from oven-sh/mimalloc @ 942b8342, MIT (see the
+    # file's header comment for provenance and for which cases are disabled here as
+    # `#if 0 // Phase 7` pending the scavenger/tld registry, #264 item 7 / #272).
+    add_executable(mimalloc-test-fork-user-heap test/test-fork-user-heap.c)
+    target_compile_definitions(mimalloc-test-fork-user-heap PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-fork-user-heap PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-fork-user-heap PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-fork-user-heap PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-fork-user-heap PRIVATE mimalloc ${mi_libraries})
+    endif()
+    target_link_libraries(mimalloc-test-fork-user-heap PRIVATE Threads::Threads)
+    add_test(NAME test-fork-user-heap COMMAND mimalloc-test-fork-user-heap)
+    set_tests_properties(test-fork-user-heap PROPERTIES TIMEOUT 300)
+  endif()
+
   # MI_NO_PROCESS_DETACH (issue #268, Bun parity P3): imported from
   # oven-sh/mimalloc @ 942b8342, MIT. The same test source is built and run twice --
   # once against a detach-*enabled* static library (the automatic exit path runs and

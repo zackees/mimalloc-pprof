@@ -903,6 +903,23 @@ void _mi_prof_process_done(void) {
     MI_UNUSED(dumped);
   }
 }
+
+// #270: fork-safety. Child-side policy (decided here, not ported from Bun -- their fork
+// handlers predate the profiler): CONTINUE. Every profiler record, chunk, and stack is
+// allocated from the raw-OS-layer arena (`_mi_prof_arena_alloc`, rule 4), never from a
+// hooked path, so it is ordinary process memory that survives fork() by plain
+// copy-on-write -- nothing about it is thread-affine. Only `prof_lock` itself can be
+// left in a locked state by a thread that did not survive the fork, so only the lock is
+// reset. `mi_prof_dump`/`mi_prof_start`/`mi_prof_stop` all keep working in the child
+// (see test-fork-locks.c's `mi_prof_dump` check) since they only ever touch this lock
+// plus the (intact) records. `prof_lock` can be held across a user-supplied
+// `mi_prof_visit`/`mi_prof_snapshot_visit` callback that may itself allocate (see the
+// `prof_lock_owner` reentrancy comment above), so per the documented lock order
+// (subproc.c) it is one of the "held across an allocation" locks and is quiesced before
+// any per-subprocess allocation lock (heaps_lock, arena_reserve_lock, ...).
+void _mi_prof_fork_prepare(void) { mi_lock_acquire(&prof_lock); }
+void _mi_prof_fork_parent(void)  { mi_lock_release(&prof_lock); }
+void _mi_prof_fork_child(void)   { mi_lock_init(&prof_lock); }
 void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size) {
   // #266: never sample allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
   // _mi_meta_zalloc onto subproc->theap_meta). These are large (sizeof(mi_theap_t) is
@@ -1050,4 +1067,8 @@ bool mi_prof_snapshot_visit(const mi_prof_snapshot_t* snap, mi_prof_visit_fun* v
 void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { MI_UNUSED(snap); }
 void _mi_prof_process_init(void) { }
 void _mi_prof_process_done(void) { }
+// #270: no `prof_lock` exists when MI_PPROF is off -- nothing to quiesce.
+void _mi_prof_fork_prepare(void) { }
+void _mi_prof_fork_parent(void)  { }
+void _mi_prof_fork_child(void)   { }
 #endif

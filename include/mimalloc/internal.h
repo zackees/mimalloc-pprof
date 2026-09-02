@@ -146,6 +146,10 @@ void          _mi_options_init(void);
 void          _mi_options_post_init(void);
 long          _mi_option_get_fast(mi_option_t option);
 void          _mi_error_message(int err, const char* fmt, ...);
+// #270: fork-safety -- quiesce/reset `out_buf_lock` around fork(). See subproc.c's lock-order block.
+void          _mi_options_fork_prepare(void);
+void          _mi_options_fork_parent(void);
+void          _mi_options_fork_child(void);
 
 // random.c
 void          _mi_random_init(mi_random_ctx_t* ctx);
@@ -173,6 +177,15 @@ mi_subproc_t* _mi_subproc(void);          // current subproc of this thread
 mi_heap_t*    _mi_subproc_heap_main(mi_subproc_t* subproc);
 mi_subproc_t* _mi_subproc_from_id(mi_subproc_id_t subproc_id);
 void          _mi_subprocs_unsafe_destroy_all(void);
+
+// #270: pthread_atfork fork-safety handlers (POSIX only; registered once in init.c's
+// mi_process_init_once). See the lock-order block at the top of subproc.c for the full
+// contract; the three functions below are the pthread_atfork prepare/parent/child
+// callbacks, also invoked (nested-call-safe via an internal depth counter) from the
+// macOS malloc-zone force_lock/force_unlock/reinit_lock callbacks (alloc-override-zone.c).
+void          _mi_process_fork_prepare(void);
+void          _mi_process_fork_parent(void);
+void          _mi_process_fork_child(void);
 
 void*         _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid );
 void*         _mi_meta_rezalloc( mi_subproc_t* subproc, void* p, size_t newsize, mi_memid_t* memid );
@@ -245,6 +258,12 @@ bool          _mi_thread_local_set(  mi_thread_local_t key, void* val );
 void*         _mi_thread_local_get(  mi_thread_local_t key );
 void          _mi_thread_locals_init(void);
 void          _mi_thread_locals_done(void);
+// #270: fork-safety -- quiesce/reset `mi_thread_locals_lock` around fork(). Imported
+// (design, not code) from oven-sh/mimalloc @ 942b8342, MIT (threadlocal.c's
+// `_mi_thread_locals_fork_prepare/parent/child`).
+void          _mi_thread_locals_fork_prepare(void);
+void          _mi_thread_locals_fork_parent(void);
+void          _mi_thread_locals_fork_child(void);
 void          _mi_thread_locals_thread_done(void);
 
 // arena.c
@@ -376,6 +395,12 @@ bool        _mi_prof_maps_append(_mi_prof_dump_append_fun* append, void* arg);
 bool        _mi_prof_maps_visit(mi_prof_module_visit_fun* visitor, void* arg);
 void        _mi_prof_process_init(void);
 void        _mi_prof_process_done(void);
+// #270: fork-safety -- quiesce/reset `prof_lock` around fork(). Child-side policy:
+// continue (profiler records are ordinary process memory, safe copy-on-write across
+// fork; only the lock itself needs resetting). See subproc.c's lock-order block.
+void        _mi_prof_fork_prepare(void);
+void        _mi_prof_fork_parent(void);
+void        _mi_prof_fork_child(void);
 
 // "memory-events.c": opt-in allocation-change accounting/callbacks (issue #20). Independent of
 // MI_PPROF: always compiled in and hooked; the runtime activation flag gates all real work.
@@ -391,6 +416,13 @@ void        _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size
 // from inside a memory-change callback itself.
 void        _mi_memevt_suppress_begin(void);
 void        _mi_memevt_suppress_end(void);
+// #270: fork-safety -- quiesce/reset `memevt_cb_lock` around fork(). Child-side policy:
+// continue (the callback table is ordinary process memory; handlers themselves are the
+// embedder's responsibility across fork, same as any other pthread_atfork-registered
+// library). See subproc.c's lock-order block.
+void        _mi_memevt_fork_prepare(void);
+void        _mi_memevt_fork_parent(void);
+void        _mi_memevt_fork_child(void);
 
 // "dhat.c": exact heap/lifetime observer, independent of MI_PPROF. The event
 // bracketing deliberately captures before the public callback and commits after it.
@@ -403,6 +435,13 @@ void        _mi_dhat_finish_event(void);
 void        _mi_dhat_process_init(void);
 void        _mi_dhat_process_done(void);
 size_t      _mi_dhat_stack_capture(void** pcs, size_t capacity);
+// #270: fork-safety -- quiesce/reset `dhat_lock` around fork(). Child-side policy:
+// continue (the live/pp tables are ordinary process memory, safe copy-on-write across
+// fork; only the lock itself needs resetting; `mi_dhat_dump` must keep working in the
+// child -- see test-fork-locks.c). See subproc.c's lock-order block.
+void        _mi_dhat_fork_prepare(void);
+void        _mi_dhat_fork_parent(void);
+void        _mi_dhat_fork_child(void);
 
 
 // ------------------------------------------------------

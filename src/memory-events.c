@@ -84,6 +84,19 @@ static void*                 memevt_args[MI_MEMORY_CHANGE_COUNT];
 void _mi_memevt_suppress_begin(void) { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth++; }
 void _mi_memevt_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth--; }
 
+// #270: fork-safety. Child-side policy: CONTINUE. `memevt_cb_lock` only ever guards a
+// snapshot-copy of the callback table (see the comment above its declaration) and, per
+// that same comment, is never held while a user handler runs -- so it is one of the
+// "never held across an allocation" locks and does not need to sit before
+// `arena_reserve_lock` in the documented order (subproc.c), though quiescing it early
+// alongside the other global hook locks costs nothing and keeps the order simple. The
+// registered handlers themselves are the embedder's own responsibility across fork
+// (same as any other pthread_atfork-registered library) -- mimalloc does not know how to
+// make an arbitrary user callback fork-safe. Only the lock is reset.
+void _mi_memevt_fork_prepare(void) { mi_lock_acquire(&memevt_cb_lock); }
+void _mi_memevt_fork_parent(void)  { mi_lock_release(&memevt_cb_lock); }
+void _mi_memevt_fork_child(void)   { mi_lock_init(&memevt_cb_lock); }
+
 // ---------------------------------------------------------------------------------------
 // Lazy activation.
 // ---------------------------------------------------------------------------------------

@@ -96,6 +96,12 @@ jobs:
             # has seen fire (docs/ci-gates.md). New on win-gnu: no native win-gnu job runs
             # the memory gate today -- see the coverage table in docs/ci-gates.md.
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
+          - bundle: windows-gnu-x64-redirect-first
+            # TEMPORARY (#277 investigation). Identical to the release bundle except that
+            # `mimalloc.dll` imports `mimalloc-redirect.dll` before `api-ms-win-crt-*`,
+            # which is the only layout the redirection module accepts. It is not run as a
+            # test suite -- only the DIAG steps below touch it.
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_MINGW_REDIRECT_FIRST=ON
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -426,7 +432,7 @@ jobs:
           run_one() {
             local label="$1"; shift
             echo "::group::DIAG $label"
-            ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1 "$@"; "$exe" 2 5 1 ) > diag.raw 2>&1
+            ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1 "$@"; timeout 45 "$exe" 2 5 1 ) > diag.raw 2>&1
             echo "rc=$?"
             grep -v "^option '" diag.raw
             echo "::endgroup::"
@@ -437,6 +443,53 @@ jobs:
           run_one "PATCH_NTHEAP"            MIMALLOC_PATCH_NTHEAP=1
           run_one "PRIORITIZE_LOAD_ORDER"   MIMALLOC_PRIORITIZE_LOAD_ORDER=1
           run_one "ENABLE_REDIRECT"         MIMALLOC_ENABLE_REDIRECT=1
+          run_one "VERBOSE=9"               MIMALLOC_VERBOSE=9
+
+      - name: DIAG (temporary, #277) -- the redirect-first bundle, under a debugger
+        # `mimalloc-redirect.dll` refuses to patch a CRT whose DllMain has already run
+        # (LDRP_PROCESS_ATTACH_CALLED), so it must be the first import descriptor of
+        # `mimalloc.dll` -- which is what `windows-gnu-x64-redirect-first` builds. That
+        # layout crashed at load in run 33614876511 with no output at all; this step gets
+        # the faulting instruction and a stack instead of an exit code.
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          bundle=bundle/windows-gnu-x64-redirect-first
+          exe="$bundle/mimalloc-test-stress-dynamic.exe"
+          echo "::group::DIAG redirect-first import tables"
+          uv run ci/pe_imports.py "$exe"
+          echo "--- mimalloc.dll ---"
+          uv run ci/pe_imports.py "$bundle/mimalloc.dll"
+          echo "::endgroup::"
+
+          echo "::group::DIAG redirect-first plain run"
+          ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1; timeout 60 "$exe" 2 5 1 ) > rf.raw 2>&1
+          echo "rc=$?"
+          grep -v "^option '" rf.raw
+          echo "::endgroup::"
+
+          echo "::group::DIAG redirect-first NTSTATUS (cmd reports the real exit code)"
+          PATH="$PWD/$bundle:$PATH" cmd //c "$(cygpath -w "$exe") 2 5 1 & echo EXITCODE=%ERRORLEVEL%" 2>&1 | tail -5
+          echo "::endgroup::"
+
+          cdb=""
+          for c in "/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe" \
+                   "/c/Program Files/Windows Kits/10/Debuggers/x64/cdb.exe"; do
+            [ -x "$c" ] && cdb="$c" && break
+          done
+          echo "cdb: ${cdb:-<not found>}"
+          if [ -n "$cdb" ]; then
+            echo "::group::DIAG redirect-first under cdb"
+            ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1
+              timeout 240 "$cdb" -g -G -c '.lines -e; g; .lastevent; r; kb; ub .; lm; q' \
+                "$(cygpath -w "$exe")" 2 5 1 ) 2>&1 | tail -120
+            echo "::endgroup::"
+          else
+            echo "::group::DIAG what debuggers exist"
+            ls "/c/Program Files (x86)/Windows Kits/10/Debuggers" 2>/dev/null || true
+            ls "/c/Program Files/Windows Kits/10/Debuggers" 2>/dev/null || true
+            echo "::endgroup::"
+          fi
 
       - name: ctest-win-gnu equivalent -- windows-gnu-x64-release
         run: |

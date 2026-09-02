@@ -402,7 +402,7 @@ the outcome. See below.
 
 ### The override is gated on the bundle's own binaries
 
-`run-windows-gnu` asserts all of this, as hard failures, on the artifacts it ships:
+`run-windows` (`run-windows-gnu` before phase D) asserts all of this, as hard failures, on the artifacts it ships:
 
 - **the exe's table:** `mimalloc*.dll` is import #0 of `mimalloc-test-stress-dynamic.exe`
   in the release, debug-full and shared bundles. Read with `ci/pe_imports.py`, a PE
@@ -496,7 +496,8 @@ candidate for `find_link_library()` even with the search unconfined (verified bo
 
 ### Coverage accounting
 
-`ci/bundle_coverage.py` runs on every `run-windows-gnu`. The runner installs MSYS2
+`ci/bundle_coverage.py` runs on every `run-windows` (called `run-windows-gnu` before
+phase D). The runner installs MSYS2
 MINGW64, configures the same three CMake trees with **msvcrt gcc**, and the script fails if
 any test name the native `ctest` would run is absent from the bundles. That same MSYS2 step
 is the native compile-compat check: it *builds* the Release tree (no tests — the bundles do
@@ -529,6 +530,274 @@ The native jobs stay as a control arm, `continue-on-error: true`, for at least t
 `test (x86_64-pc-windows-gnu)`. Each carries a dated TODO naming what deletes it. Because
 this phase changes the CRT, that window is the only place the two runtimes are exercised
 side by side — do not delete the msvcrt arm before the comparison has actually happened.
+
+## windows-msvc via cross-built bundles, and the one native `cl` gate that stays
+
+Issue #277 phase D. The same `windows-bundles.yml` that carries the MinGW lane now also
+builds the **MSVC-ABI** test binaries on **ubuntu-latest**, through soldr's `blessed-msvc`
+toolchain — clang-cl + lld-link + llvm-lib against an xwin-materialised Microsoft CRT and
+Windows SDK — and the single `windows-latest` job (`run-windows-gnu` is now
+**`run-windows`**) runs them alongside the win-gnu ones.
+
+| Linux job | produces | replaces |
+|---|---|---|
+| `build-windows-msvc (windows-msvc-x64-release)` | `bundle-windows-msvc-x64-release` | *(comparison arm for the retained native `ctest`)* |
+| `build-windows-msvc (windows-msvc-x64-debug-full)` | `bundle-windows-msvc-x64-debug-full` | `ctest-debug-full (windows-latest)` |
+| `build-windows-msvc (windows-msvc-x64-shared)` | `bundle-windows-msvc-x64-shared` | `ctest-shared (windows-latest)` |
+| `build-windows-msvc (windows-msvc-x64-leak)` | `bundle-windows-msvc-x64-leak` | the positive control half of `memory-gate (windows-latest)` |
+| `build-rust (x86_64-pc-windows-msvc)` | `rust-test-bins-…`, `rust-sentinel-…` | `cross.yml` `test (x86_64-pc-windows-msvc)`, `rust-native.yml` `test (windows-latest)`, `benchmark-sentinel.yml` `benchmark-sentinel (windows-latest)` |
+
+### One native `cl` job is retained, deliberately
+
+CLAUDE.md rule 3 makes MSVC a priority platform. **A clang-cl binary is not a `cl`
+binary**: clang-cl accepts `__attribute__`s that `cl` rejects, and `cl`'s codegen, TLS
+lowering and DLL runtime are its own. So `c-unit.yml`'s **`ctest (windows-latest)`
+(Release) stays native and stays a hard gate** — it is not `continue-on-error`, and it is
+not scheduled for deletion. Every *other* `windows-latest` row in the repository is now
+informational with a dated TODO. Windows runner jobs per push: **13 → 2**.
+
+`run-windows` additionally configures all three MSVC configs with `cl` and builds the
+Release tree. That is not a duplicate gate; it is what gives the coverage comparison a real
+native `ctest` name set, and what lets the job print the native and cross `mimalloc.dll`
+import tables and redirect probes side by side.
+
+### `/MD` only: today's `/MDd` debug-full config cannot be reproduced
+
+soldr's CRT splat carries the **release** import libraries only — `msvcrt.lib`,
+`libcmt.lib`, `ucrt.lib`, `libucrt.lib` — and no `msvcrtd.lib`, `libcmtd.lib` or
+`ucrtd.lib`. `cmake/toolchains/soldr-x86_64-pc-windows-msvc.cmake` therefore pins
+`CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL`. Measured, with that one line removed:
+
+```
+lld-link: error: could not open 'msvcrtd.lib': No such file or directory
+```
+
+`/MD` is also the only runtime the `mimalloc-redirect` override can work against at all: a
+statically-linked CRT has no `ucrtbase.dll` for the module to patch.
+
+**What that costs, precisely.** The `windows-msvc-x64-debug-full` bundle is configured
+`-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON`, *not* `Debug`. That is not
+only the CRT constraint — it is also what reproduces the native job. `ctest-debug-full
+(windows-latest)` runs `cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON` with **no `-G`**,
+which selects the Visual Studio generator; `CMAKE_BUILD_TYPE` is empty at configure time,
+so `CMakeLists.txt` (~142-150) defaults it from the binary directory's name — `build` →
+Release. The native job's *resolved* configuration is therefore:
+
+```
+MI_DEBUG=3  MI_GUARDED=1  MI_FREE_IS_CHECKED=1  MI_BUILD_RELEASE   library: mimalloc
+```
+
+which is byte-for-byte what this bundle configures. Passing `-DCMAKE_BUILD_TYPE=Debug`
+would have been *less* faithful: it drops `MI_BUILD_RELEASE` and renames the library
+`mimalloc-debug`. The genuine loss is the **compile flavour** that `--config Debug` selects
+on the multi-config generator: native compiles `/MDd /Od /RTC1`, the bundle `/MD /O2`. The
+assertions and expensive invariant checks — what `MI_DEBUG_FULL` exists for — are
+identical, and the test-name sets are compared on every run.
+
+(#277 phase C correction 4 said phase B's "debug-full is really Release + `MI_DEBUG=3`"
+finding was macOS-only. It is not: it holds for windows-MSVC too, for the different reason
+above. windows-GNU remains the one lane that really does configure `Debug`.)
+
+### Import order: the redirect module must precede the CRT, not be index 0
+
+`mimalloc-redirect.dll` reads `ucrtbase.dll`'s `LDR_DATA_TABLE_ENTRY.Flags` and refuses to
+patch a runtime whose `DllMain` has already run (`LDRP_PROCESS_ATTACH_CALLED`, `0x00080000`
+— disassembled at `0x180003720` in v1.3.3). The loader initialises a module's dependencies
+in *that module's* import-descriptor order, so the requirement is an ordering **inside
+`mimalloc.dll`**.
+
+#277 phase D asked for the redirect module at **import #0**. It is not, on either arm.
+Measured, identically for cross clang-cl and native `cl`:
+
+```
+ADVAPI32.dll  mimalloc-redirect.dll  KERNEL32.dll  MSVCP140.dll  VCRUNTIME140.dll
+api-ms-win-crt-stdio-…  api-ms-win-crt-runtime-…  …
+```
+
+`ADVAPI32.dll` is #0 because `${mi_libraries}` is attached to the target before the
+redirect import library is, and lld-link emits descriptors in link order. It is harmless:
+ADVAPI32 is a KnownDLL whose own subtree uses legacy `msvcrt.dll`, not `ucrtbase`, so
+initialising it first does not set the flag the module checks. **The gate is therefore
+"redirect before every CRT module", not a fixed index** — asserting index 0 would fail a
+layout that works. MinGW needed the `MI_MINGW_REDIRECT_FIRST` trick because `ld` sorted the
+redirect module *behind* `api-ms-win-crt-*`; lld-link needs no equivalent.
+
+### No emulated TLS, asserted
+
+The windows-gnu lane's second bug was GCC emulated TLS: `__thread` became
+`__emutls_get_address`, which allocates with `malloc`, which is `mi_malloc` once the
+override is live — unbounded recursion, dead before `main`, with no diagnostic. clang-cl
+emits real `__declspec(thread)`, so this cannot happen; the build job **asserts** it
+(`__emutls` must not appear in the linked DLL) rather than assuming it, because the failure
+mode is silent.
+
+### The override is gated behaviourally, on the cross-built binary
+
+Same standard as phase C, and the same reason: `mi_is_redirected()` reports only what the
+redirection module *believed* it did, and that flag has been observed true on a binary
+whose own allocations were never touched. `mimalloc-test-redirect-probe` takes a pointer
+from the CRT's own `malloc` and asks `mi_is_in_heap_region`. All three shared-library MSVC
+bundles must print `REDIRECT_BEHAVIOURAL=1`; it is a **hard failure**. The native `cl`
+Release build runs the same probe on the same commit and the two are printed together.
+
+### The runtime DLLs are the runner's, and that is checked
+
+Unlike the mingw lane there is nothing to ship: soldr's xwin splat is import libraries
+only. But `mimalloc.dll` imports **`VCRUNTIME140.dll` and `MSVCP140.dll`** — the latter
+because `CMakeLists.txt` (~205-212) detects clang-cl as MSVC-like and turns `MI_USE_CXX` on
+by itself, exactly as it does for `cl`. Those are the **Visual C++ redistributable, not
+part of Windows**; `windows-latest` has them because Visual Studio is installed.
+
+So the assumption is declared and then checked, in two places:
+
+- `bundle_tests.py --check-dll-closure --allow-msvc-runtime` runs the transitive PE import
+  scan with nothing to copy from, so a bundle that imports anything *else* unresolvable is
+  still refused at build time. `--allow-msvc-runtime` is opt-in and lane-scoped: the
+  win-gnu lane cannot silently acquire a VC++ dependency it could not satisfy.
+- `run-windows` runs `where VCRUNTIME140.dll` / `where MSVCP140.dll` before anything else,
+  so a runner image that dropped them fails with a sentence instead of a dialog-free
+  `0xC0000135`.
+
+### `llvm-rc` is absent, so manifests are off
+
+CMake's Windows-MSVC module wraps every link in `cmake -E vs_link_exe --rc=… --mt=…
+--manifests`, which compiles and embeds a default side-by-side manifest. soldr's LLVM ships
+**neither `llvm-rc` nor `llvm-mt`**. Without an opt-out the lane's outcome depends on
+whether the *host* happens to have some other `llvm-rc` ahead on `PATH`: with one, CMake
+bakes that absolute host path into the cache; without one, `CMAKE_RC_COMPILER` falls back to
+`rc` and configure dies inside `CMakeTestCCompiler` with `RC Pass 1: command "rc /fo
+…/manifest.rc" failed`. The toolchain file passes `/MANIFEST:NO`, which `cmVSLink` parses
+and which skips the rc/mt pass entirely. The tree registers no `.rc` source and none of its
+test executables needs a manifest; hardcoding the `llvm-rc` that lives outside soldr's
+exported `PATH` would have broken the "consume only soldr's env" rule.
+
+### What the build job proves before shipping a bundle
+
+- `file format coff-x86-64`
+- the `/MD` pin **on the artifact**: `prim.c.obj`'s `.drectve` requests `msvcrt.lib` and no
+  `*d.lib` — a flag that never reaches the compiler is this repository's most-repeated CI
+  bug
+- clang-cl was detected as MSVC-like, via `/Zc:__cplusplus` in the resolved compiler flags
+  (the toolchain deliberately does not pass `MI_USE_CXX`; if the detection stopped firing
+  the library would quietly switch from C++ atomics to C11 ones with no other symptom)
+- `.CRT$XLB`, `.CRT$XLY`, `.CRT$XIB` in `prim.c.obj`, **and** a non-empty Thread Storage
+  Directory in the linked DLL
+- no `__emutls` reference anywhere in the DLL
+- `mimalloc-redirect.dll` imported, and ahead of every `api-ms-win-crt-*` / `ucrtbase` /
+  `MSVCP140` / `VCRUNTIME140` descriptor
+- resolved `Link libraries : psapi;shell32;user32;advapi32;bcrypt`, exactly
+- `tests.json` contains no absolute path
+
+`CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY` is set here as well, and as on windows-gnu it is
+belt-and-braces rather than load-bearing: CMake's Windows-MSVC
+`CMAKE_FIND_LIBRARY_SUFFIXES` is `.lib;.a`, so a host `librt.so` is not a candidate.
+
+### Coverage accounting
+
+`ci/bundle_coverage.py` compares all six bundles against native `ctest --show-only`
+enumerations produced on the runner — three from MSYS2 gcc, three from `cl` — and fails if
+a name the native job would run is missing.
+
+The Rust side is where the accounting needed care. `cross.yml`'s
+`test (x86_64-pc-windows-msvc)` runs the 19 `mimalloc-pprof` test binaries;
+`rust-native.yml`'s `test (windows-latest)` runs `cargo test` across the **whole
+workspace**, which is 110 further tests in `bench-harness`, `benchmark-suite`, `dashboard`
+and `stress-harness`. They also differ in **profile**, and collapsing that would quietly change what is tested.
+So `build-rust (x86_64-pc-windows-msvc)` runs cargo **twice**, staging into
+`dist/msvc-tests/{debug,release}/`:
+
+| build | stands in for | staged / built |
+|---|---|---:|
+| `cargo test --workspace --no-run` (**debug**) | `rust-native.yml` `test (windows-latest)` | 49 / 53 |
+| `cargo test -p mimalloc-pprof --no-run --release` | `cross.yml` `test (x86_64-pc-windows-msvc)` | 19 / 19 |
+
+**68 test binaries execute on the runner.** Building only the narrow set would have cut
+Windows Rust coverage by more than half while the table claimed parity; building the
+*workspace* in release instead — which this job did first — is not a free "stricter" choice
+either. `stress-harness`'s `timing_contract` tests assert
+`outer_started.elapsed().as_millis() >= 100` around a 100 ms test-hook sleep, and with the
+surrounding work optimised away that lands on 99. Measured, and **not** a Windows or
+clang-cl property: the same test binary built natively for **Linux** fails 3/3 in release
+at `--test-threads=1` and passes 3/3 in debug, on unmodified `main`. `cargo test` is a
+debug build, which is why no native job has ever run it. Reported on #277 rather than
+fixed here — "changing what any test asserts" is out of scope for that issue, and a test
+fix is a `rust/` commit (rule 2).
+
+The two profiles stage into separate directories rather than one flat one because
+`t3_stats` and `t12_proto` exist in both, and the pprof dump checks stand in for a
+*release* row — a flat directory would leave `ls … | head -1` picking a profile by hash
+ordering.
+
+**Four cannot be executed anywhere but the machine that built them, and this is
+structural.** `env!("CARGO_BIN_EXE_<name>")` is expanded by cargo *at compile time* into
+the absolute path of a companion binary in the builder's target directory. Four tests spawn
+`stress-child` that way — `bench-harness`'s `planted_control`, `rejections` and
+`throughput`, and `dashboard`'s `stress_child` — so their images carry a literal
+`/home/runner/work/…/target/x86_64-pc-windows-msvc/release/stress-child.exe`. There is no
+environment override (the string is frozen into the binary), and a Linux path cannot be
+reconstructed on a Windows runner, so shipping `stress-child.exe` beside them would not
+help either. They fail with `expect("valid normal benchmark")` — measured, on the first
+green-everywhere-else run of this lane.
+
+They are excluded by **detecting the property**, not by a hardcoded list of names that
+would rot the moment a test is added or renamed: the build job greps each staged image for
+the builder's own target path, which is the same "a portable artifact contains no
+build-tree absolute path" rule `ci/bundle_tests.py` enforces on the C bundles. Two guards
+around it:
+
+- the scanner **self-tests on a known-positive first** (a control file containing that path
+  *and a NUL byte*, so it is genuinely binary). `grep -F` without `-a` reports no match on
+  binary input, which would silently stage an unrelocatable binary and surface much later
+  as a panic that says nothing about paths — the scan's negatives are only worth having if
+  its positives are proven;
+- a `mimalloc-pprof` test binary landing in the excluded set is a **hard error**. That
+  crate is the reason the lane exists, and losing it silently is exactly the failure this
+  phase is meant to make impossible.
+
+Those four tests still run on `ubuntu-latest`, where builder and runner are the same
+machine. Restoring them on Windows needs an upstream change to the tests (resolve
+`stress-child` relative to `current_exe()` instead of `CARGO_BIN_EXE_*`), which is a Rust
+change and out of scope for a CI phase (rule 2, rule 7).
+
+Stated rather than gated:
+
+- **Doctests.** `cargo test` includes the 8 doctests in `rust/mimalloc-pprof/src/lib.rs`;
+  cross-built `--tests` binaries cannot. Linux-only since phase B, and now on Windows too.
+- **`xtask check` / `cargo publish --dry-run` / `check_crate_package.py`** are platform-
+  independent (they compare the vendored amalgamation against `src/` and inspect a
+  `.crate` archive). Per #277's review addendum item 5 they are now skipped on the Windows
+  row rather than carried into a bundle; the ubuntu row still runs them.
+- **The PR benchmark sentinel** moves into `run-windows` as a cross-built `dashboard.exe`,
+  guarded on `github.event_name == 'pull_request'` so folding it into a push-triggered
+  workflow does not turn a PR-only benchmark into a per-push one. It is
+  `continue-on-error`: #171/#170 already label hosted-runner numbers informational and no
+  gate reads them, which is also what makes it acceptable to measure on a VM that has just
+  run four ctest suites.
+
+### Memory-gate baseline
+
+The MSVC bundle lane asks for
+`ci/memory-baselines/windows-x64-soldr-clang-cl-21-pprof1.json` via
+`--arch x64 --compiler soldr-clang-cl-21`. It must **not** borrow `windows-pprof1.json`,
+which native `cl` recorded on the same runner — that would be a cross-toolchain comparison
+dressed as a regression check. That file does not exist yet, so the first runs take the
+"no baseline → bootstrap it" path (`memory_gate.py where` exits 3) and upload their JSON;
+the positive control is skipped with a warning until the baseline is committed, because
+`control` requires `check` to *fail* and a missing baseline is not a failure. Same
+follow-up as phase B's correction 8 and phase C's correction 7.
+
+### Rollout
+
+Informational (`continue-on-error`) for at least ten pushes, each with a dated TODO naming
+what deletes it: `c-unit.yml`'s `ctest-debug-full`, `ctest-shared` and `memory-gate`
+**windows rows only**, `rust-native.yml`'s `test (windows-latest)`, `cross.yml`'s
+`test (x86_64-pc-windows-msvc)`, and `benchmark-sentinel.yml`'s
+`benchmark-sentinel (windows-latest)`. When `cross.yml`'s msvc row goes, `build-cross`'s
+`x86_64-pc-windows-msvc` row goes with it — but **not** `aarch64-pc-windows-msvc`, which is
+build-only and has no runner.
+
+`c-unit.yml`'s `ctest (windows-latest)` is **not** on that list and must not be added to it
+without the owner amending CLAUDE.md rule 3.
 
 ## Concurrency: superseded runs are cancelled
 

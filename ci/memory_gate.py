@@ -37,7 +37,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Callable, TypedDict, cast
 
 BASELINE_DIR = Path(__file__).resolve().parent / "memory-baselines"
 
@@ -122,8 +122,8 @@ MAX_LIVE_THREADS = 32
 MAX_GATE_CPUS = 4
 
 
-def _cpu_affinity_preexec(cpus: list[int]):
-    def _set():
+def _cpu_affinity_preexec(cpus: list[int]) -> Callable[[], None]:
+    def _set() -> None:
         os.sched_setaffinity(0, cpus)
 
     return _set
@@ -184,10 +184,10 @@ def run_gate_binary(binary: Path, runs: int = RUNS_EXPECTED) -> list[str]:
         out_path = tmpdir / f"result-{i}.json"
         env = dict(os.environ)
         env["MI_BENCH_JSON"] = str(out_path)
-        kwargs = {}
-        if can_pin:
-            kwargs["preexec_fn"] = _cpu_affinity_preexec(pin_cpus)
-        subprocess.run([str(binary)], env=env, stdout=subprocess.DEVNULL, check=True, **kwargs)
+        preexec: Callable[[], None] | None = _cpu_affinity_preexec(pin_cpus) if can_pin else None
+        subprocess.run(
+            [str(binary)], env=env, stdout=subprocess.DEVNULL, check=True, preexec_fn=preexec
+        )
         result_paths.append(str(out_path))
     return result_paths
 

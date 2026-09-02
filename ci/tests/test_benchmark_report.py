@@ -1104,8 +1104,9 @@ class BenchmarkReportTests(unittest.TestCase):
         # Every embedded name must be a file the renderer actually emits, or
         # the README links 404 on the published branch.
         self.assertTrue(set(expected) <= report.SITE_FILES)
-        for anchor in ("#throughput", "#history"):
-            self.assertIn(f"](https://zackees.github.io/mimalloc-pprof/{anchor})", source)
+        # The headline numbers link to the live dashboard (the README's Performance
+        # section was restructured in #257-#263; it links the dashboard root now).
+        self.assertIn("](https://zackees.github.io/mimalloc-pprof/)", source)
         for not_embedded in (
             "benchmark-throughput.png",
             "benchmark-history.png",

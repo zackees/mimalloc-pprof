@@ -84,6 +84,7 @@ set(mi_sources
     src/arena.c
     src/bitmap.c
     src/heap.c
+    src/heap-dump.c
     src/init.c
     src/libc.c
     src/memory-events.c
@@ -1205,6 +1206,24 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-dhat PRIVATE mimalloc ${mi_libraries})
   endif()
   add_test(NAME test-dhat COMMAND mimalloc-test-dhat)
+
+  # mi_heap_dump_json / mi_heap_get_seq (issue #269, Bun parity P4): backs bun:jsc
+  # heapStats({dump:true|"blocks"}).mimallocDump. Independent of MI_PPROF, same as
+  # memory-events/dhat above.
+  add_executable(mimalloc-test-heap-dump-json test/test-heap-dump-json.c)
+  target_compile_definitions(mimalloc-test-heap-dump-json PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-heap-dump-json PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-heap-dump-json PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-heap-dump-json PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-heap-dump-json PRIVATE mimalloc ${mi_libraries})
+  endif()
+  if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(mimalloc-test-heap-dump-json PRIVATE Threads::Threads)
+  endif()
+  add_test(NAME test-heap-dump-json COMMAND mimalloc-test-heap-dump-json)
 
   # thread-local slot array provenance (issue #128 B3): the array must not be
   # allocated from whatever heap the application happens to have set as its default,

@@ -350,7 +350,20 @@ mi_decl_export void mi_process_info_print_out(mi_output_fun* out, void* arg) mi_
   _mi_fprintf(out, arg, "\n");
 }
 
-void _mi_stats_print(const char* name, size_t id, const mi_stats_t* stats, mi_output_fun* out0, void* arg0) mi_attr_noexcept {
+// imported from oven-sh/mimalloc @ 942b8342, MIT (src/stats.c:352-360; issue #269 step 4a)
+// print a snapshot: heap and subproc stats are live and updated concurrently by other
+// threads via mi_stats_add's atomic adds (see mi_stats_add above), so printing straight
+// from `stats` risked a torn read across the many mi_stat_print_ex/mi_stat_print calls
+// below. mi_stats_t_decl + mi_stats_add gives a coherent, non-live copy first.
+static void mi_stats_print_copy(const char* name, size_t id, const mi_stats_t* stats, mi_output_fun* out0, void* arg0) mi_attr_noexcept;
+
+void _mi_stats_print(const char* name, size_t id, const mi_stats_t* stats0, mi_output_fun* out0, void* arg0) mi_attr_noexcept {
+  mi_stats_t_decl(stats);
+  mi_stats_add(&stats, stats0);
+  mi_stats_print_copy(name, id, &stats, out0, arg0);
+}
+
+static void mi_stats_print_copy(const char* name, size_t id, const mi_stats_t* stats, mi_output_fun* out0, void* arg0) mi_attr_noexcept {
   // wrap the output function to be line buffered
   char buf[256]; _mi_memzero_var(buf);
   buffered_t buffer = { out0, arg0, NULL, 0, 255 };
@@ -605,7 +618,12 @@ size_t mi_stats_get_bin_size(size_t bin) mi_attr_noexcept {
 static bool mi_stats_copy(mi_stats_t* stats_to, const mi_stats_t* stats_from) mi_attr_noexcept {
   if (stats_to == NULL || stats_to->size != sizeof(mi_stats_t) || stats_to->version != MI_STAT_VERSION) return false;
   if (stats_from == NULL || stats_from->size != stats_to->size) return false;
-  _mi_memcpy(stats_to, stats_from, stats_to->size);
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (src/stats.c:625-627; issue #269 step 4b)
+  // stats_from is live (other threads update it with atomic operations): a plain
+  // _mi_memcpy can tear a multi-word counter mid-update, so copy it a counter at a time
+  // through the same atomic-add path mi_stats_add uses elsewhere in this file.
+  mi_stats_init(stats_to);
+  mi_stats_add(stats_to, stats_from);
   return true;
 }
 

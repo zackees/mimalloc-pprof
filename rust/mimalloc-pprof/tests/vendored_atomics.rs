@@ -41,3 +41,37 @@ fn msvc_wrapper_is_gated_on_missing_c11_atomics() {
          would get C11 atomics in one chain and Interlocked in the other"
     );
 }
+
+/// Issue #272: the MSVC **C** wrapper above implements `mi_atomic_load/store/exchange/cas`
+/// ONLY at `uintptr_t` width (`__iso_volatile_load`/`_store` on a `volatile intptr_t*`), and
+/// this crate's `build.rs` compiles the amalgamation as C -- so on `x86_64-pc-windows-msvc`
+/// that wrapper is what ships. A narrower `_Atomic` field reached through those macros is
+/// read and written a whole word at a time, past its end: the P7a park fields sit next to
+/// `mi_theap_t* park_theap0`, so a 32-bit `park_reclaim` store zeroed half of that pointer.
+///
+/// `t18_thread_idle` exercises the runtime path; these assert the vendored source itself, so
+/// a re-sync or a "tidy the types" edit that narrows them again fails here rather than
+/// corrupting a pointer only on one target.
+#[test]
+fn park_fields_are_word_width() {
+    for field in ["park_state", "park_reclaim", "park_swept"] {
+        let decl = format!("_Atomic(size_t)       {field};");
+        assert!(
+            AMALGAMATION.contains(&decl),
+            "mi_tld_t::{field} is no longer `_Atomic(size_t)`; the MSVC C atomics wrapper \
+             would access it a full word at a time (#272)"
+        );
+    }
+    assert!(
+        AMALGAMATION.contains("_Atomic(mi_scav_word_t) scavenger_wake;"),
+        "scavenger_wake is no longer `mi_scav_word_t`-typed (#272)"
+    );
+}
+
+#[test]
+fn the_width_static_assert_is_vendored_too() {
+    assert!(
+        AMALGAMATION.contains("mi_scav_atomic_widths_assert_t"),
+        "src/scavenger.c's atomic-width static assert did not reach the amalgamation (#272)"
+    );
+}

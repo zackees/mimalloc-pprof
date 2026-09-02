@@ -438,11 +438,9 @@ static void test_two_deletes(void) {
   parked: B used the heap and parks; the scavenger may be sweeping B's theaps
   (including the one for this heap) when the delete detaches them.
 
-  #if 0 // Phase 7 (issue #272): needs mi_on_thread_idle_start/_end and the
-  background scavenger, neither of which exists in this tree yet.
+  Enabled by issue #272 (Bun parity P7a): `mi_on_thread_idle_start`/`_end` and the
+  background scavenger.
 ----------------------------------------------------------- */
-
-#if 0 // Phase 7
 
 static volatile void* pk_heap;
 static volatile long  pk_state;
@@ -478,7 +476,6 @@ static void test_parked(void) {
   }
 }
 
-#endif // Phase 7
 
 
 /* -----------------------------------------------------------
@@ -500,9 +497,7 @@ int main(int argc, char** argv) {
   fprintf(stderr, "test: foreign-theap...  ");  test_foreign_theap(); fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");
   fprintf(stderr, "test: page-churn...  ");     test_page_churn();    fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");
   fprintf(stderr, "test: two-deletes...  ");    test_two_deletes();   fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");
-  #if 0 // Phase 7 (issue #272): needs mi_on_thread_idle_start/_end and the background scavenger
   fprintf(stderr, "test: parked...  ");         test_parked();        fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");
-  #endif
 
   mi_collect(true);
   mi_stats_print(NULL);

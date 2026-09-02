@@ -122,6 +122,14 @@ terms of the MIT license. A copy of the license can be found in the file
       -> heap->arena_pages_lock     `mi_subproc_unsafe_destroy` -> `_mi_heap_force_destroy` -> `mi_heap_free` (heap.c:203)
       -> heap->os_abandoned_pages_lock, sp->theap_meta_lock   (same teardown path, via frees)
 
+    subproc->tlds_lock              init.c           #272: the subproc's registry of live tlds
+      -> (nothing)                  `mi_tld_register`/`mi_tld_unregister` (init.c) and the
+                                    scavenger's parked-thread walk (`_mi_theap_sweep_parked`,
+                                    scavenger.c) only touch list links and atomics under it,
+                                    and no caller holds another lock while acquiring it. A LEAF
+                                    in both directions; its step number below is therefore free,
+                                    and it sits where the child needs the list stable to walk it.
+
     heap->theaps_lock               heap.c/theap.c   the heap's list of theaps
       -> sp->theap_meta_lock        `mi_heap_free_theaps` (heap.c:174) -> `_mi_theap_decref`
                                     -> `mi_theap_free_mem` -> `_mi_meta_free` (theap.c:363)
@@ -204,17 +212,18 @@ terms of the MIT license. A copy of the license can be found in the file
      1. mi_subprocs_lock
      2. for each sp:                sp->heaps_lock
      3. for each sp, each heap h:   h->theaps_lock
-     4. for each sp, each NON-main h: h->arena_pages_lock
-     5. mi_thread_locals_lock
-     6. for each sp:                sp->theap_meta_lock
-     7. for each sp:                sp->heap_main->arena_pages_lock
-     8. for each sp:                sp->arena_reserve_lock
-     9. for each sp, each heap h:   h->os_abandoned_pages_lock
-    10. _mi_page_map()->lock
-    11. prof_lock                   (profile.c, MI_PPROF; no-op otherwise)
-    12. dhat_lock                   (dhat.c)
-    13. memevt_cb_lock              (memory-events.c)
-    14. out_buf_lock                (options.c)
+     4. for each sp:                sp->tlds_lock                (#272)
+     5. for each sp, each NON-main h: h->arena_pages_lock
+     6. mi_thread_locals_lock
+     7. for each sp:                sp->theap_meta_lock
+     8. for each sp:                sp->heap_main->arena_pages_lock
+     9. for each sp:                sp->arena_reserve_lock
+    10. for each sp, each heap h:   h->os_abandoned_pages_lock
+    11. _mi_page_map()->lock
+    12. prof_lock                   (profile.c, MI_PPROF; no-op otherwise)
+    13. dhat_lock                   (dhat.c)
+    14. memevt_cb_lock              (memory-events.c)
+    15. out_buf_lock                (options.c)
 
   Both list walks are stable from step 2 onwards: `mi_subprocs` is pinned by step 1 and
   every `sp->heaps` by step 2, so later passes see exactly the same sets.
@@ -223,15 +232,23 @@ terms of the MIT license. A copy of the license can be found in the file
   is irrelevant -- only ACQUIRE order can deadlock -- so each release pass walks its
   list forward rather than reconstructing a reverse walk.
 
-  // Phase 7: scavenger -- Bun also quiesces a per-subprocess `tlds` registry and its own
-  // `tlds_lock` here (walking every thread's `tld->theaps_lock` and park state). That
-  // registry does not exist yet in this tree; it lands with the scavenger (#264 item 7 /
-  // #272). `mi_tld_t::theaps_lock` (types.h, "sometimes accessed from another thread on
-  // mi_heap_free") is therefore a KNOWN GAP not covered by this phase -- see the P5 PR
-  // description and MIMALLOC_FORKS.md. It is deliberately not approximated by an ad hoc
-  // walk here: a heap's theaps list can reach the same `tld` through more than one theap
-  // (one thread, several heaps), and locking a non-recursive mutex twice would turn a
-  // currently-rare hang into a guaranteed one inside this very handler.
+  ---- `mi_tld_t::theaps_lock`: re-initialized in the child, never acquired here (#272) ----
+
+  P5 left this lock as a documented KNOWN GAP because there was no way to enumerate live
+  tlds. #272's `sp->tlds` registry removes that obstacle -- and shows the gap must be closed
+  the other way round. This lock is the one in the tree whose holder is REQUIRED to be able
+  to outlive a fork(): `mi_thread_theaps_done` (init.c) holds it across an entire theap
+  teardown (`_mi_theap_collect_abandon` per theap), and `test/test-fork-user-heap.c`'s case_b
+  forks deliberately while a sibling thread sits inside exactly that window. Acquiring it in
+  `prepare` turns that case's child-side deadlock into a PARENT-side one -- strictly worse,
+  since the parent is the process that is supposed to survive.
+
+  So `_mi_process_fork_child` re-initializes every registered tld's `theaps_lock` instead
+  (which is also what Bun does, `subproc.c:416-424`). That is correct rather than merely
+  pragmatic: the thread that held it does not exist in the child, so nothing will ever
+  release it, and every consumer of a pre-fork thread's theaps in the child is already gated
+  on `_mi_process_is_forked_child` (#271) into re-deriving ownership from the bitmaps.
+  Verified by case_b of `test-fork-user-heap`, re-enabled in #272.
 
   ---- Why Bun's stated rule does not transfer ----
 
@@ -272,19 +289,18 @@ typedef enum mi_fork_lock_level_e {
   MI_FORK_LOCK_HEAPS             = 2,
   MI_FORK_LOCK_THEAPS            = 3,
   MI_FORK_LOCK_TLDS              = 4,   // #272: subproc->tlds_lock
-  MI_FORK_LOCK_TLD_THEAPS        = 5,   // #272: tld->theaps_lock (untracked, see below)
-  MI_FORK_LOCK_ARENA_PAGES       = 6,   // non-main heaps
-  MI_FORK_LOCK_THREAD_LOCALS     = 7,
-  MI_FORK_LOCK_THEAP_META        = 8,
-  MI_FORK_LOCK_ARENA_PAGES_MAIN  = 9,
-  MI_FORK_LOCK_ARENA_RESERVE     = 10,
-  MI_FORK_LOCK_OS_ABANDONED      = 11,
-  MI_FORK_LOCK_PAGE_MAP          = 12,
-  MI_FORK_LOCK_PROF              = 13,
-  MI_FORK_LOCK_DHAT              = 14,
-  MI_FORK_LOCK_MEMEVT            = 15,
-  MI_FORK_LOCK_OUT_BUF           = 16,
-  MI_FORK_LOCK_LEVEL_COUNT       = 17
+  MI_FORK_LOCK_ARENA_PAGES       = 5,   // non-main heaps
+  MI_FORK_LOCK_THREAD_LOCALS     = 6,
+  MI_FORK_LOCK_THEAP_META        = 7,
+  MI_FORK_LOCK_ARENA_PAGES_MAIN  = 8,
+  MI_FORK_LOCK_ARENA_RESERVE     = 9,
+  MI_FORK_LOCK_OS_ABANDONED      = 10,
+  MI_FORK_LOCK_PAGE_MAP          = 11,
+  MI_FORK_LOCK_PROF              = 12,
+  MI_FORK_LOCK_DHAT              = 13,
+  MI_FORK_LOCK_MEMEVT            = 14,
+  MI_FORK_LOCK_OUT_BUF           = 15,
+  MI_FORK_LOCK_LEVEL_COUNT       = 16
 } mi_fork_lock_level_t;
 
 #if MI_FORK_LOCK_ORDER_CHECK
@@ -294,7 +310,6 @@ static const char* mi_fork_lock_level_name(int lvl) {
     case MI_FORK_LOCK_HEAPS:            return "subproc->heaps_lock";
     case MI_FORK_LOCK_THEAPS:           return "heap->theaps_lock";
     case MI_FORK_LOCK_TLDS:             return "subproc->tlds_lock";
-    case MI_FORK_LOCK_TLD_THEAPS:       return "tld->theaps_lock";
     case MI_FORK_LOCK_ARENA_PAGES:      return "heap->arena_pages_lock";
     case MI_FORK_LOCK_THREAD_LOCALS:    return "mi_thread_locals_lock";
     case MI_FORK_LOCK_THEAP_META:       return "subproc->theap_meta_lock";
@@ -541,58 +556,57 @@ void _mi_process_fork_prepare(void) {
     }
   }
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): the tld
-  // registry. Steps 4 and 5 close the KNOWN GAP the P5 file comment left open -- with
-  // `sp->tlds` we reach every live `tld` exactly once, which an `sp->heaps` walk cannot do
-  // (one thread can appear in several heaps' theap lists, and locking a non-recursive mutex
-  // twice inside this handler would be a guaranteed hang).
+  // registry, which lets `_mi_process_fork_child` reach every live tld exactly once -- something
+  // an `sp->heaps` walk cannot do, since one thread can appear in several heaps' theap lists.
+  //
+  // NOTE: the per-tld `theaps_lock` is deliberately NOT acquired here, only re-initialized in
+  // the child. It is the one lock in the tree whose holder is REQUIRED to be able to outlive the
+  // fork: `mi_thread_theaps_done` (init.c) holds it across a whole theap teardown, and
+  // `test-fork-user-heap`'s case_b forks precisely while a sibling thread is parked inside that
+  // window. Blocking on it here would move that case's child-side deadlock into the parent,
+  // which is strictly worse. Re-initializing it in the child is correct instead: the thread that
+  // held it does not exist there, so nobody will ever release it, and every consumer of a
+  // pre-fork thread's theaps in the child is already gated on `_mi_process_is_forked_child`
+  // (#271). This supersedes the P5 file comment's KNOWN GAP: the gap was "we cannot even reach
+  // those locks"; with the registry we can, and re-init is the right thing to do to them.
   for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 4
     if (sp == sp_main) { mi_fork_acquire(MI_FORK_LOCK_TLDS, &sp->tlds_lock); }
                   else { mi_fork_acquire_local(MI_FORK_LOCK_TLDS, &sp->tlds_lock); }
   }
   for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 5
-    // Always `_local` (untracked by the MI_DEBUG>2 observer), even for the main thread's
-    // process-lifetime tld: `_mi_tld_detach_theaps` (theap.c) holds `tld->theaps_lock` while
-    // TRY-acquiring `heap->theaps_lock` (step 3), and the observer cannot tell a try-acquire
-    // -- which backs off and releases, so it can never deadlock -- from a blocking one, so
-    // tracking this level would report that back-off pair as an order violation.
-    for (mi_tld_t* t = sp->tlds; t != NULL; t = t->subproc_next) {
-      mi_fork_acquire_local(MI_FORK_LOCK_TLD_THEAPS, &t->theaps_lock);
-    }
-  }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 6
     mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
-      if (h == heap_main) continue;   // main heap's arena_pages_lock is step 9
+      if (h == heap_main) continue;   // main heap's arena_pages_lock is step 8
       mi_fork_acquire_local(MI_FORK_LOCK_ARENA_PAGES, &h->arena_pages_lock);
     }
   }
-  mi_fork_enter(MI_FORK_LOCK_THREAD_LOCALS); _mi_thread_locals_fork_prepare(); mi_fork_leave();   // 7
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 8
+  mi_fork_enter(MI_FORK_LOCK_THREAD_LOCALS); _mi_thread_locals_fork_prepare(); mi_fork_leave();   // 6
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 7
     if (sp == sp_main) { mi_fork_acquire(MI_FORK_LOCK_THEAP_META, &sp->theap_meta_lock); }
                   else { mi_fork_acquire_local(MI_FORK_LOCK_THEAP_META, &sp->theap_meta_lock); }
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 9
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 8
     mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
     if (heap_main == NULL) continue;
     if (sp == sp_main) { mi_fork_acquire(MI_FORK_LOCK_ARENA_PAGES_MAIN, &heap_main->arena_pages_lock); }
                   else { mi_fork_acquire_local(MI_FORK_LOCK_ARENA_PAGES_MAIN, &heap_main->arena_pages_lock); }
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 10
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 9
     if (sp == sp_main) { mi_fork_acquire(MI_FORK_LOCK_ARENA_RESERVE, &sp->arena_reserve_lock); }
                   else { mi_fork_acquire_local(MI_FORK_LOCK_ARENA_RESERVE, &sp->arena_reserve_lock); }
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 11
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 10
     mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       if (h == heap_main && sp == sp_main) { mi_fork_acquire(MI_FORK_LOCK_OS_ABANDONED, &h->os_abandoned_pages_lock); }
                                       else { mi_fork_acquire_local(MI_FORK_LOCK_OS_ABANDONED, &h->os_abandoned_pages_lock); }
     }
   }
-  mi_fork_acquire(MI_FORK_LOCK_PAGE_MAP, &_mi_page_map()->lock);                                 // 12
-  mi_fork_enter(MI_FORK_LOCK_PROF);   _mi_prof_fork_prepare();    mi_fork_leave();               // 13 (no-op when MI_PPROF is off)
-  mi_fork_enter(MI_FORK_LOCK_DHAT);   _mi_dhat_fork_prepare();    mi_fork_leave();               // 14
-  mi_fork_enter(MI_FORK_LOCK_MEMEVT); _mi_memevt_fork_prepare();  mi_fork_leave();               // 15
-  mi_fork_enter(MI_FORK_LOCK_OUT_BUF);_mi_options_fork_prepare(); mi_fork_leave();               // 16: innermost
+  mi_fork_acquire(MI_FORK_LOCK_PAGE_MAP, &_mi_page_map()->lock);                                 // 11
+  mi_fork_enter(MI_FORK_LOCK_PROF);   _mi_prof_fork_prepare();    mi_fork_leave();               // 12 (no-op when MI_PPROF is off)
+  mi_fork_enter(MI_FORK_LOCK_DHAT);   _mi_dhat_fork_prepare();    mi_fork_leave();               // 13
+  mi_fork_enter(MI_FORK_LOCK_MEMEVT); _mi_memevt_fork_prepare();  mi_fork_leave();               // 14
+  mi_fork_enter(MI_FORK_LOCK_OUT_BUF);_mi_options_fork_prepare(); mi_fork_leave();               // 15: innermost
 }
 
 void _mi_process_fork_parent(void) {
@@ -609,34 +623,31 @@ void _mi_process_fork_parent(void) {
   if (mi_fork_depth != 0) return;  // still nested (same thread): outermost call handles the release
   // Release the levels in reverse. Within a level the order does not matter (only
   // acquire order can deadlock), so each pass walks its list forward.
-  _mi_options_fork_parent();                                                   // 16
-  _mi_memevt_fork_parent();                                                    // 15
-  _mi_dhat_fork_parent();                                                      // 14
-  _mi_prof_fork_parent();                                                      // 13
-  mi_lock_release(&_mi_page_map()->lock);                                      // 12
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 11
+  _mi_options_fork_parent();                                                   // 15
+  _mi_memevt_fork_parent();                                                    // 14
+  _mi_dhat_fork_parent();                                                      // 13
+  _mi_prof_fork_parent();                                                      // 12
+  mi_lock_release(&_mi_page_map()->lock);                                      // 11
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 10
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) { mi_lock_release(&h->os_abandoned_pages_lock); }
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 10
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 9
     mi_lock_release(&sp->arena_reserve_lock);
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 9
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 8
     mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
     if (heap_main != NULL) { mi_lock_release(&heap_main->arena_pages_lock); }
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 8
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 7
     mi_lock_release(&sp->theap_meta_lock);
   }
-  _mi_thread_locals_fork_parent();                                             // 7
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 6
+  _mi_thread_locals_fork_parent();                                             // 6
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 5
     mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       if (h == heap_main) continue;
       mi_lock_release(&h->arena_pages_lock);
     }
-  }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 5 (#272)
-    for (mi_tld_t* t = sp->tlds; t != NULL; t = t->subproc_next) { mi_lock_release(&t->theaps_lock); }
   }
   for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 4 (#272)
     mi_lock_release(&sp->tlds_lock);
@@ -688,6 +699,11 @@ void _mi_process_fork_child(void) {
   // that does not exist. `_mi_scavenger_start_lazy` restarts one on this child's next park or
   // second thread (not here: most children exec immediately).
   _mi_scavenger_forked_child();
+  // #272: `_mi_arenas_try_purge`'s one-purger-at-a-time guard is a plain atomic flag, not a
+  // lock, so nothing above quiesces it -- and a fork() that landed while the scavenger was
+  // inside the guarded section leaves the child with a flag no thread will ever clear, i.e. a
+  // child that never purges again. Not a `mi_lock_t`, so it gets its own reset here.
+  _mi_arenas_fork_child();
   mi_fork_depth = 0;
   mi_atomic_store_relaxed(&mi_fork_owner, (mi_threadid_t)0);
   mi_lock_init(&mi_fork_serialize_lock);  // fresh for this child's own future forks

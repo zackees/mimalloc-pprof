@@ -2309,6 +2309,17 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
 }
 
 
+// Only one thread purges at a time. NOT a static inside `_mi_arenas_try_purge`: fork() can land
+// with it set by a thread that does not exist in the child (much more likely now that the
+// scavenger, #272, spends real time inside the guarded section), and the child would then never
+// purge again. `_mi_arenas_fork_child` clears it; see `src/fork.c`.
+static mi_atomic_guard_t mi_arenas_purge_guard;
+
+// #272: called from `_mi_process_fork_child`, on the single surviving thread.
+void _mi_arenas_fork_child(void) {
+  mi_atomic_store_release(&mi_arenas_purge_guard, (uintptr_t)0);
+}
+
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
 // Bring every arena's scheduled purge forward to "now" and get it done: either by waking the
 // scavenger (which then runs `_mi_arenas_try_purge`), or inline when no scavenger is running.
@@ -2355,8 +2366,7 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
   if (max_arena == 0) return;
 
   // allow only one thread to purge at a time (todo: allow concurrent purging?)
-  static mi_atomic_guard_t purge_guard;
-  mi_atomic_guard(&purge_guard)
+  mi_atomic_guard(&mi_arenas_purge_guard)
   {
     // increase global expire: at most one purge per delay cycle
     if (arenas_expire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now + (delay/10)); }

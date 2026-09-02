@@ -64,7 +64,12 @@ static bool mi_theap_page_is_valid(mi_theap_t* theap, mi_page_queue_t* pq, mi_pa
   // exception already used for this in page.c:91,133 (`_mi_page_is_valid`); it was
   // missing here, which is what the multi-threaded mi_heap_new/mi_heap_delete churn
   // repro in issue #271 / PR #289 tripped (mi_theap_collect on `theap_meta` itself).
-  mi_assert_internal(page_theap == NULL || theap == page_theap || mi_theap_is_detached(theap));
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a, `theap.c:61`):
+  // ... and only the OWNING thread's lookup has to agree at all -- the scavenger sweeps a
+  // parked thread's theaps while having theaps of its own, so `_mi_heap_theap_peek` returns
+  // the scavenger's theap for that heap, not the one being walked.
+  mi_assert_internal(page_theap == NULL || theap == page_theap || mi_theap_is_detached(theap)
+                     || theap->tld == NULL || theap->tld->thread_id != _mi_thread_id());
   mi_assert_expensive(_mi_page_is_valid(page));
   return true;
 }
@@ -75,7 +80,9 @@ static bool mi_theap_is_valid(mi_theap_t* theap) {
   mi_assert_internal(heap != NULL);
   mi_theap_t* const heap_theap = _mi_heap_theap_peek(heap);  // don't use mi_heap_theap as that may re-initialize the thread
   // see the comment in mi_theap_page_is_valid above
-  mi_assert_internal(heap_theap==NULL || heap_theap == theap || mi_theap_is_detached(theap));
+  // ... plus the scavenger-sweeps-a-parked-thread case, see mi_theap_page_is_valid (#272)
+  mi_assert_internal(heap_theap==NULL || heap_theap == theap || mi_theap_is_detached(theap)
+                     || theap->tld == NULL || theap->tld->thread_id != _mi_thread_id());
   mi_theap_visit_pages(theap, &mi_theap_page_is_valid, true, NULL, NULL);
   for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
     mi_assert_internal(_mi_page_queue_is_valid(theap, &theap->pages[bin]));

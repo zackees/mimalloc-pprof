@@ -441,11 +441,26 @@ void mi_decl_noinline mi_thread_init(void) mi_attr_noexcept {
   Theaps done
 ----------------------------------------------------------- */
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a, `init.c:417`):
+// fork test hook. Set to 1 by `test/test-fork-user-heap.c`'s case_b to make a terminating thread
+// park inside the window where it holds `tld->theaps_lock` -- deterministically reproducing the
+// state `_mi_process_fork_child` must recover from (a lock held by a thread that will not exist
+// in the child). Debug builds only; nothing reads it otherwise.
+#if MI_DEBUG > 0
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
+#endif
+
 // Free the thread local theaps
 static void mi_thread_theaps_done(mi_tld_t* tld)
 {
   // abandon the pages of all theaps in this thread
   mi_lock(&tld->theaps_lock) {
+    #if MI_DEBUG > 0
+    if mi_unlikely(mi_atomic_load_acquire(&mi_debug_stall_in_thread_theaps_done) != 0) {
+      mi_atomic_store_release(&mi_debug_stall_in_thread_theaps_done, (uintptr_t)2); // signal: tld->theaps_lock held
+      while (mi_atomic_load_acquire(&mi_debug_stall_in_thread_theaps_done) != 0) { _mi_prim_thread_yield(); }
+    }
+    #endif
     mi_theap_t* theap = tld->theaps;
     while (theap != NULL) {
       mi_theap_t* next = theap->tnext;
@@ -531,12 +546,16 @@ void _mi_thread_done(mi_theap_t* _theap_main)
   // get the current tld
   mi_tld_t* const tld = _theap_main->tld;
 
-  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a):
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a, `init.c:531`):
   // a thread can reach teardown still parked (a park is left by `mi_on_thread_idle_end`, which
   // an `epoll_wait` cancellation never reaches). Leave the park -- waiting out any in-flight
   // sweep of our theaps -- before ANY owner-side free below, since everything after this frees
-  // or rewrites what the scavenger would otherwise still be walking.
-  _mi_park_leave(tld);
+  // or rewrites what the scavenger would otherwise still be walking. Owner only: on Windows
+  // FLS shutdown the exiting main thread runs this for OTHER threads' theaps, and their park is
+  // not ours to leave (the thread-id check further down guards the rest of the teardown the
+  // same way, but the dynamic thread_local release below is the CALLING thread's own and must
+  // still happen).
+  if (tld->thread_id == _mi_prim_thread_id()) { _mi_park_leave(tld); }
 
   // release dynamic thread_local's
   _mi_thread_locals_thread_done();

@@ -380,6 +380,7 @@ void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
 void          _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
 void          _mi_arenas_purge_now(mi_subproc_t* subproc);
+void          _mi_arenas_fork_child(void);   // #272: clear the inherited one-purger-at-a-time guard
 
 // scavenger.c -- imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
 void          _mi_scavenger_start(void);
@@ -391,6 +392,11 @@ void          _mi_scavenger_forked_child(void);
 void          _mi_park_leave(mi_tld_t* tld);
 void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0);
 mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);
+size_t        _mi_test_idle_work_count(void);   // #272 test observable (test/test-park-handoff.c)
+#if MI_DEBUG > 0
+// #272 fork test hook (test/test-fork-user-heap.c case_b); see src/init.c
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
+#endif
 
 mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t page_alignment);
 void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
@@ -906,7 +912,13 @@ static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
   if (theap == NULL || theap->tld == NULL) return true;
   if (mi_atomic_load_ptr_relaxed(mi_heap_t, &theap->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`
   if (theap->tld->thread_id == _mi_thread_id()) return true;
-  return mi_theap_is_detached(theap);   // upstream's permanently-detached theaps (meta-data) belong to no thread
+  if (mi_theap_is_detached(theap)) return true;   // upstream's permanently-detached theaps (meta-data) belong to no thread
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a,
+  // `internal.h:731`): the owner published MI_PARK_PARKED and the scavenger claimed it, so the
+  // owner is quiesced by contract and the sweeping thread may touch these pages -- the same
+  // "owner is not allocating" precondition `mi_theap_collect` already relies on for its
+  // non-owner callers (python/cpython#112532).
+  return (mi_atomic_load_acquire(&theap->tld->park_state) == MI_PARK_SWEEPING);
 }
 
 /* -----------------------------------------------------------

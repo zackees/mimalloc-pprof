@@ -42,6 +42,20 @@ terms of the MIT license. A copy of the license can be found in the file
   teardown / fork-prepare via `_mi_park_leave`) waits for SWEEPING to clear first.
 ----------------------------------------------------------- */
 
+// #272 test hook: how many idle-work passes have completed in this process, on the owner
+// (`mi_on_thread_idle`) or on the scavenger for a parked thread. Not in `mimalloc.h` -- it is an
+// internal observable for `test/test-park-handoff.c`, which otherwise has no way to tell "the
+// handoff swept" from "the handoff silently did nothing". Unconditional (not `MI_DEBUG`-only, as
+// the fork test hooks in `src/fork.c` are) so the test is meaningful in a Release build too; one
+// relaxed increment per park costs nothing, and nothing on the alloc/free path reads it.
+// Phase 7b replaces the *content* of this observable with `mi_purge_holes_stats_get().discard_calls`
+// in the test; the counter stays as the "a pass ran at all" signal.
+static _Atomic(size_t) mi_idle_work_count;
+
+size_t _mi_test_idle_work_count(void) {
+  return mi_atomic_load_relaxed(&mi_idle_work_count);
+}
+
 // Fold in pending frees and drain the arena purge queue. Runs on the owner
 // (`mi_on_thread_idle`) or on the scavenger for a parked thread; both require that the owner
 // of `tld` is not allocating while we rewrite its free lists.
@@ -56,6 +70,7 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept {
   // Phase 7b (#272): `mi_purge_holes_of(tld)` -- discard the free blocks inside still-used
   // pages -- goes here, between the collect and the arena purge.
   _mi_arenas_purge_now(tld->subproc);
+  mi_atomic_increment_relaxed(&mi_idle_work_count);   // #272 test observable, see above
 }
 
 // Take the theaps of `tld` back from the scavenger. Also called from teardown and from
@@ -107,6 +122,15 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     }
     if (claimed == NULL) return due_in;   // nothing parked (any more) that is due yet
     _mi_thread_idle_work(claimed, theap0);
+    // #272 profiler-interaction invariant (3): the sweep must leave this thread without a theap
+    // of its own. If any hook or stat on the sweep path forced `_mi_theap_default()` into
+    // existence here, the scavenger would (a) acquire this fork's per-thread profiler/hook
+    // state (`mi_tld_t.profiler` / `.hooks`) and mutate it from a thread the user never sees,
+    // and (b) register itself in `subproc->tlds` as a parkable thread. Everything it runs is
+    // either a pure atomic/OS operation or takes the swept `tld` explicitly, and every hook
+    // accessor peeks (`_mi_hooks_tld_peek` returns NULL, `_peek_or_local` falls back to the
+    // caller's stack) rather than forcing -- this asserts it stays that way.
+    mi_assert_internal(!mi_theap_is_initialized(_mi_theap_default()));
     // Mark BEFORE releasing: a `park_swept` set after the store could land on the thread's *next*
     // park and silently skip that sweep. Cleared by `mi_on_thread_idle_start`. If we bailed out
     // early on `park_reclaim`, the owner is leaving the park anyway, so the rest is its next park's.

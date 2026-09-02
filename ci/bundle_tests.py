@@ -113,12 +113,12 @@ def _str_list(value: object) -> list[str]:
 class BundledTest:
     name: str
     argv: list[str]
-    env: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict[str, str])
     cwd: str = BUNDLE_PLACEHOLDER
     timeout: float = DEFAULT_TIMEOUT_SECONDS
     expect_nonzero: bool = False
     expect_text: str | None = None
-    labels: list[str] = field(default_factory=list)
+    labels: list[str] = field(default_factory=list[str])
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -138,7 +138,7 @@ class _Lowered:
     """Result of stripping any `cmake` wrapper off a ctest command."""
 
     argv: list[str]
-    env: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict[str, str])
     timeout: float | None = None
     expect_nonzero: bool = False
     expect_text: str | None = None

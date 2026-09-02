@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 73f22a43 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ee890758 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -786,6 +786,16 @@ typedef struct mi_prof_sample_info_s {
   size_t accum_objects; size_t accum_bytes;
 } mi_prof_sample_info_t;
 typedef bool (mi_prof_visit_fun)(const mi_prof_sample_info_t* info, void* arg);
+/* #270: `visitor` runs while this call holds the profiler's internal lock (so
+   concurrent mi_prof_start/stop/dump etc. block until the visit completes) --
+   `visitor` MUST NOT allocate (directly or indirectly, e.g. via a library call that
+   allocates). A visitor that allocates can deadlock against an ordinary mi_malloc on
+   another thread: this lock is an alloc/free-hook lock (see the alloc/free hooks'
+   own contract) that mimalloc's own hot path can still be holding a *different*
+   allocator lock while trying to acquire, and an allocating visitor inverts that
+   same pair from the other side. This is a general property of the API, not
+   specific to fork() -- see subproc.c's lock-order comment (src/subproc.c) for the
+   fork-specific instance of the same hazard. */
 mi_decl_nodiscard mi_decl_export bool mi_prof_visit(mi_prof_visit_fun* visitor, void* arg) mi_attr_noexcept;
 
 typedef struct mi_prof_snapshot_s mi_prof_snapshot_t;

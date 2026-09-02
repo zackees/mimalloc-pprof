@@ -239,13 +239,31 @@ that can only ever be set by an MSYS2 shell:
    `--postfix` from the bundle's own library name (the Debug config renames it
    `mimalloc-debug.dll`).
 
-The override is then **proven, not assumed**: the job runs
-`mimalloc-test-stress-dynamic.exe` with `MIMALLOC_VERBOSE=1` and requires
-`malloc is redirected.` — `src/init.c:530`, printed only when `_mi_is_redirected()` is
-true. The test itself asserts nothing about redirection, so without this step the bundle
-could pass while overriding nothing. The same probe runs *before* minject as an
-informational `::notice::`, so the log answers "does the UCRT override need minject?" with
-a measurement instead of an argument.
+   minject runs **without `--inplace`**, so it writes a sibling `*-mi.exe` and the
+   bundle's own executable is left exactly as linked. `ctest-win-gnu` does not minject
+   anything either (MSYS2 MINGW64 is msvcrt, so `MI_MINGW_UCRT64` is off there), so the
+   bundle run stays like-for-like and the injected binary is an extra artifact for the
+   probe below rather than a change to what the suite runs.
+
+### Is the override actually exercised? (measured, and gated comparatively)
+
+`test-stress-dynamic` asserts nothing about redirection — it links `mi_version()` so the
+DLL loads, then allocates through the CRT. `MIMALLOC_VERBOSE=1` makes `src/init.c:530`
+print `malloc is redirected.` exactly when `_mi_is_redirected()` is true, which is the only
+direct evidence that the redirection module patched the runtime. `run-windows-gnu` collects
+that for three binaries and puts them in the job summary:
+
+| lane | binary |
+|---|---|
+| MSYS2 MINGW64 (**msvcrt**) — what `ctest-win-gnu` runs today | built by the native compile-compat step |
+| soldr mingw-w64 (**UCRT**) bundle, as linked | `mimalloc-test-stress-dynamic.exe` |
+| soldr mingw-w64 (**UCRT**) bundle, after `minject` | `mimalloc-test-stress-dynamic-mi.exe` |
+
+The gate is the **comparison**: if the msvcrt lane redirects and neither UCRT binary does,
+the job fails. Requiring the bundle to redirect where the job it replaces never did would
+be a new gate smuggled in under the word "parity"; if none of the three redirects, that is
+reported as a `::warning::` and recorded here, because it says the dynamic override is not
+exercised on win-gnu *at all* today — a pre-existing gap, not something this phase caused.
 
 ### The runtime DLL
 

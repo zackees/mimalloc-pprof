@@ -521,6 +521,20 @@ void mi_subproc_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, 
   if (mi_subproc_stats_get(subproc_id, &stats)) {
     _mi_stats_print("subproc", subproc->subproc_seq, &stats, out, arg);
   }
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b): hole purging is
+  // process wide (it also covers pages no theap owns), so it has its own counters.
+  mi_purge_holes_stats_t hs;
+  mi_purge_holes_stats_get(&hs);
+  if (hs.discard_calls > 0 || hs.purged_bytes_total > 0 || hs.ineligible_pages > 0) {
+    _mi_fprintf(out, arg, "holes: %zu bytes / %zu blocks discarded now, %zu bytes total, %zu discards, %zu reuses, %zu pages freed by the sweep\n",
+                hs.purged_bytes, hs.purged_blocks, hs.purged_bytes_total, hs.discard_calls, hs.reuse_calls, hs.pages_freed);
+    _mi_fprintf(out, arg, "holes: %zu ineligible pages in the last sweep (%zu bytes, of which %zu bytes are free)\n",
+                hs.ineligible_pages, hs.ineligible_bytes, hs.ineligible_free_bytes);
+    _mi_fprintf(out, arg, "holes: the sweeps walked %zu free blocks and skipped %zu unchanged pages (%zu full sweeps)\n",
+                hs.blocks_visited, hs.pages_skipped, hs.full_sweeps);
+    _mi_fprintf(out, arg, "holes: unformed tail %zu bytes discarded now, %zu bytes total, %zu discards, %zu reuses\n",
+                hs.unformed_bytes, hs.unformed_bytes_total, hs.unformed_discard_calls, hs.unformed_reuse_calls);
+  }
 }
 
 void mi_stats_print_out(mi_output_fun* out, void* arg) mi_attr_noexcept {

@@ -95,6 +95,7 @@ set(mi_sources
     src/os.c
     src/page.c
     src/page-map.c
+    src/page-holes.c
     src/profile.c
     src/random.c
     src/scavenger.c

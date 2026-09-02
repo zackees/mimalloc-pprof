@@ -19,10 +19,12 @@ terms of the MIT license. A copy of the license can be found in the file
 ----------------------------------------------------------- */
 
 // return `true` if ok, `false` to break
-typedef bool (theap_page_visitor_fun)(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2);
+// #272: `theap_page_visitor_fun` moved to `mimalloc/internal.h` with `_mi_theap_visit_pages`.
 
 // Visit all pages in a theap; returns `false` if break was called.
-static bool mi_theap_visit_pages(mi_theap_t* theap, theap_page_visitor_fun* fn, bool include_full, void* arg1, void* arg2)
+// #272 (Bun parity P7b): exported so the hole engine in `src/page-holes.c` can drive the same
+// walk without a second copy of it (CLAUDE.md rule 6 keeps that engine out of this file).
+bool _mi_theap_visit_pages(mi_theap_t* theap, theap_page_visitor_fun* fn, bool include_full, void* arg1, void* arg2)
 {
   if (theap==NULL || theap->page_count==0) return true;
 
@@ -83,7 +85,7 @@ static bool mi_theap_is_valid(mi_theap_t* theap) {
   // ... plus the scavenger-sweeps-a-parked-thread case, see mi_theap_page_is_valid (#272)
   mi_assert_internal(heap_theap==NULL || heap_theap == theap || mi_theap_is_detached(theap)
                      || theap->tld == NULL || theap->tld->thread_id != _mi_thread_id());
-  mi_theap_visit_pages(theap, &mi_theap_page_is_valid, true, NULL, NULL);
+  _mi_theap_visit_pages(theap, &mi_theap_page_is_valid, true, NULL, NULL);
   for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
     mi_assert_internal(_mi_page_queue_is_valid(theap, &theap->pages[bin]));
   }
@@ -117,7 +119,10 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
   // scavenger is doing this for a parked thread, the owner may wake at any moment and has to
   // wait for us in `_mi_park_leave`. Stopping between pages bounds that wait to one page.
   if (theap->tld != NULL && mi_atomic_load_relaxed(&theap->tld->park_reclaim) != 0) return false;
-  _mi_page_free_collect(page, collect >= MI_FORCE);
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b): never un-purge here. A collect
+  // serves no allocation, so a run brought back would only be re-discarded by the next sweep --
+  // and on macOS bringing it back costs an `_mi_os_reuse` syscall.
+  _mi_page_free_collect_no_unpurge(page, collect >= MI_FORCE);
   if (mi_page_all_free(page)) {
     // no more used blocks, possibly free the page.
     if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced/abandon, or not already retired
@@ -153,7 +158,7 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   _mi_theap_collect_retired(theap, force); 
 
   // collect all pages owned by this thread
-  mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
+  _mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
 
   // collect arenas (this is program wide so don't force purges on abandonment of threads).
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): not from a
@@ -194,7 +199,7 @@ static bool mi_theap_page_abandon(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
 void _mi_theap_abandon(mi_theap_t* theap) {
   mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // must already be detached
   mi_assert_internal(theap->tnext==NULL && theap->tprev==NULL);
-  mi_theap_visit_pages(theap, &mi_theap_page_abandon, true /* include full pages */, NULL, NULL);
+  _mi_theap_visit_pages(theap, &mi_theap_page_abandon, true /* include full pages */, NULL, NULL);
   mi_assert_internal(theap->page_count==0);
   #if MI_DEBUG>1
   for (size_t i = 0; i <= MI_BIN_FULL; i++) { mi_assert_internal(theap->pages[i].first == NULL); }
@@ -653,7 +658,10 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
   mi_assert(page != NULL);
   if (page == NULL) return true;
 
-  _mi_page_free_collect(page,true);              // collect both thread_delayed and local_free
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b):
+  // visiting must not un-purge a hole -- inspection may not mutate the heap, and a discarded
+  // block is reported as free here either way (see the `purged` marking below).
+  _mi_page_free_collect_no_unpurge(page,true);   // collect both thread_delayed and local_free
   mi_assert_internal(page->local_free == NULL);
   if (page->used == 0) return true;
 
@@ -715,7 +723,23 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
     size_t bit = blockidx - (bitidx * MI_INTPTR_BITS);
     free_map[bitidx] |= ((uintptr_t)1 << bit);
   }
-  mi_assert_internal(page->capacity == (free_count + page->used));
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b):
+  // purged blocks are free too, but held off the free list (see `src/page-holes.c`): a block is
+  // purged exactly when it overlaps a discarded OS page. Marking them free here is what keeps a
+  // visitor (mi_heap_visit_blocks, the DHAT/memory-events walkers, mi_prof_snapshot) from ever
+  // being handed a pointer into discarded memory (#272 profiler-interaction point 2).
+  size_t purged_count = 0;
+  if (mi_page_has_purged(page)) {
+    for (size_t blockidx = 0; blockidx < page->capacity; blockidx++) {
+      if (!mi_page_block_index_is_purged(page, blockidx)) continue;
+      purged_count++;
+      size_t bitidx = (blockidx / MI_INTPTR_BITS);
+      size_t bit = blockidx - (bitidx * MI_INTPTR_BITS);
+      free_map[bitidx] |= ((uintptr_t)1 << bit);
+    }
+  }
+  mi_assert_internal(page->capacity == (free_count + purged_count + page->used));
+  MI_UNUSED(purged_count);
 
   // walk through all blocks skipping the free ones
   #if MI_DEBUG>1
@@ -779,7 +803,7 @@ static bool mi_theap_visit_areas_page(mi_theap_t* theap, mi_page_queue_t* pq, mi
 // Visit all theap pages as areas
 static bool mi_theap_visit_areas(const mi_theap_t* theap, mi_theap_area_visit_fun* visitor, void* arg) {
   if (visitor == NULL) return false;
-  return mi_theap_visit_pages((mi_theap_t*)theap, &mi_theap_visit_areas_page, true, (void*)(visitor), arg); // note: function pointer to void* :-{
+  return _mi_theap_visit_pages((mi_theap_t*)theap, &mi_theap_visit_areas_page, true, (void*)(visitor), arg); // note: function pointer to void* :-{
 }
 
 // Just to pass arguments

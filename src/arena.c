@@ -1210,6 +1210,13 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   mi_assert_internal(!page->has_metadata && page->metadata == NULL);
   #endif
 
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+  // Undo any hole in the page: the arena can hand this memory out again as committed without
+  // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
+  // until it is MADV_FREE_REUSE'd. This function is the single choke point for a page going
+  // back to the arena (`_mi_page_free` and the abandoned-page free in `free.c` both land here).
+  _mi_page_unpurge_all(page);
+
   // all we need from the heap, before the page is unpublished from it (see
   // mi_arenas_page_free_prim's provenance comment, above)
   mi_heap_t* const heap = mi_page_heap(page);
@@ -1375,6 +1382,150 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   else {
     mi_heap_stat_decrease(heap, pages_abandoned, 1);
   }
+}
+
+
+
+/* -----------------------------------------------------------
+  Purge the holes in abandoned pages   (issue #272 / Bun parity P7b)
+  imported from oven-sh/mimalloc @ 942b8342, MIT.
+
+  Abandoned pages have no owning thread, so the idle sweep of a theap never sees them --
+  yet with the default `allow_page_abandon` every page that ever became full ends up here.
+  We claim each page with the arena's ownership protocol before touching its free list.
+  (The engine itself is in `src/page-holes.c`; only the arena walk lives here, because it
+  needs the arena bitmaps and the claim protocol.)
+----------------------------------------------------------- */
+
+typedef struct mi_purge_holes_arg_s {
+  mi_bitmap_t* bitmap;
+  mi_tld_t*    tld;      // the thread whose sweep this is (its own, or the parked one the scavenger is sweeping for)
+} mi_purge_holes_arg_t;
+
+static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  MI_UNUSED(slice_count);
+  mi_purge_holes_arg_t* const parg = (mi_purge_holes_arg_t*)arg;
+  // this pass holds every page that ever became full, so it is most of a cold sweep: an owner
+  // waiting in `_mi_park_leave` cannot allocate until we stop
+  if (mi_atomic_load_relaxed(&parg->tld->park_reclaim) != 0) return false;
+  mi_bitmap_t* const bitmap = parg->bitmap;
+
+  // Take the page out of the abandoned map first: this is the reader side of the protocol in
+  // `mi_arena_try_claim_abandoned`. A concurrent `_mi_arenas_page_unabandon` busy-waits for the
+  // bit to reappear (`mi_bitmap_clear_once_set`), so while we hold it cleared the page cannot be
+  // freed under us. If the bit is already clear, someone else has the page: skip it.
+  if (!mi_bitmap_clear(bitmap, slice_index)) return true;
+
+  mi_page_t* const page = mi_arena_page_at_slice(arena, slice_index);
+  if (!mi_page_claim_ownership(page)) {
+    mi_bitmap_set(bitmap, slice_index);   // a concurrent free owns it: keep it abandoned (as `mi_arena_try_claim_abandoned` does)
+    return true;
+  }
+
+  // We own the page: no other thread can reclaim, unabandon, or free it now, and only the
+  // atomic `xthread_free` can still change under us. (No un-purging: we are about to purge.)
+  _mi_page_free_collect_no_unpurge(page, true);
+  if (mi_page_all_free(page)) {
+    mi_bitmap_set(bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
+    _mi_arenas_abandoned_page_free(page, NULL);
+    _mi_page_holes_count_page_freed();
+    return true;
+  }
+  _mi_page_purge_holes(page, parg->tld);
+  mi_bitmap_set(bitmap, slice_index);     // back in the map *before* unowning: unown may free the page
+  mi_abandoned_page_unown(page, NULL);
+  return true;
+}
+
+// note: this only reaches the *mapped* abandoned pages (the ones in `pages_abandoned`).
+// A page abandoned while full is not mapped; it has no free blocks at that point, and once
+// enough blocks are freed in it, `_mi_arenas_page_try_reabandon_to_mapped` puts it in the map.
+void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
+  if (heap == NULL || tld == NULL) return;
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  _mi_page_purge_holes_begin(tld);
+  mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
+    mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
+    if (arena_pages != NULL) {
+      // pages_abandoned[] is MI_ARENA_BIN_COUNT wide, not MI_BIN_COUNT: bins above the
+      // singleton bins have no abandoned bitmap (upstream ad1bcdbf, to shrink arena meta).
+      for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
+        if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
+        mi_bitmap_t* const bitmap = arena_pages->pages_abandoned[bin];
+        mi_purge_holes_arg_t parg = { bitmap, tld };
+        (void)_mi_bitmap_forall_set(bitmap, &mi_arena_page_purge_holes_at, arena, &parg);
+      }
+    }
+  }
+  mi_forall_arenas_end();
+  _mi_page_purge_holes_end(tld);
+}
+
+// The read-only counterpart of the sweep above: account for the holes in the abandoned pages
+// instead of purging them. Same claim protocol -- the page must not be reclaimed or freed
+// while we read its free lists -- but nothing inside the page is modified.
+typedef struct mi_arena_holes_report_arg_s {
+  mi_bitmap_t*       bitmap;
+  mi_holes_report_t* rep;
+} mi_arena_holes_report_arg_t;
+
+static bool mi_arena_page_holes_report_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  MI_UNUSED(slice_count);
+  mi_arena_holes_report_arg_t* const ra = (mi_arena_holes_report_arg_t*)arg;
+  if (!mi_bitmap_clear(ra->bitmap, slice_index)) return true;   // someone else has the page
+
+  mi_page_t* const page = mi_arena_page_at_slice(arena, slice_index);
+  if (!mi_page_claim_ownership(page)) {
+    mi_bitmap_set(ra->bitmap, slice_index);   // a concurrent free owns it: keep it abandoned
+    return true;
+  }
+  _mi_page_holes_report_page(page, ra->rep);
+  mi_bitmap_set(ra->bitmap, slice_index);     // back in the map *before* unowning: unown may free the page
+  // Unown collects a pending `xthread_free`, but that collect always lands a block on `page->free`,
+  // so it can never take the `free == NULL` branch that would un-purge a run of holes.
+  mi_abandoned_page_unown(page, NULL);
+  return true;
+}
+
+void _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep) {
+  if (heap == NULL || rep == NULL) return;
+  mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
+    mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
+    if (arena_pages != NULL) {
+      for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {   // see above: not MI_BIN_COUNT
+        if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
+        mi_arena_holes_report_arg_t ra = { arena_pages->pages_abandoned[bin], rep };
+        (void)_mi_bitmap_forall_set(ra.bitmap, &mi_arena_page_holes_report_at, arena, &ra);
+      }
+    }
+  }
+  mi_forall_arenas_end();
+}
+
+// Where the memory IS: the arena slack, i.e. the memory mimalloc holds OUTSIDE any page. If what
+// we are chasing lands here instead of inside the pages, the problem is the arena / purge delay
+// and not free blocks contaminating pages -- a completely different fix.
+//
+// A slice in `slices_free` belongs to no page. Of those, a slice that was never touched costs
+// nothing, so residency is carried by `slices_dirty` (ever handed out, hence written) and
+// `slices_purge` (queued for purge, so still resident right now). `slices_committed` is NOT a
+// residency signal: it is set for the whole arena at reserve time for any `initially_committed`
+// memory (every POSIX mmap) and a reset-style purge does not clear it -- we report it only so the
+// caveat is visible in the output rather than silently misleading.
+void _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep) {
+  if (heap == NULL || rep == NULL) return;
+  mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
+    rep->arena_meta_bytes += mi_size_of_slices(mi_arena_info_slices(arena));
+    rep->arena_reserved_bytes += mi_size_of_slices(arena->slice_count);
+    const size_t slice_count = arena->slice_count;
+    for (size_t i = 0; i < slice_count; i++) {
+      if (mi_bitmap_is_set(arena->slices_committed, i)) { rep->arena_committed_bytes += MI_ARENA_SLICE_SIZE; }
+      if (!mi_bbitmap_is_setN(arena->slices_free, i, 1)) continue;   // in a page (or reserved meta): not slack
+      if (mi_bitmap_is_set(arena->slices_dirty, i)) { rep->arena_free_dirty_bytes += MI_ARENA_SLICE_SIZE; }
+      if (mi_bitmap_is_set(arena->slices_purge, i)) { rep->arena_purge_pending_bytes += MI_ARENA_SLICE_SIZE; }
+    }
+  }
+  mi_forall_arenas_end();
 }
 
 

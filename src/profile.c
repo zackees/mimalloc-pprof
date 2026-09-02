@@ -1021,6 +1021,36 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
 void _mi_prof_suppress_begin(void) { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->prof_callback_depth++; }
 void _mi_prof_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->prof_callback_depth--; }
 
+#if MI_DEBUG
+// #272 profiler-interaction invariant (1), see `mimalloc/internal.h`. Called from the hole
+// sweep (`src/page-holes.c`) just BEFORE `_mi_os_discard` on a range of `page`, so a wrong
+// range is caught before the debug eager-zero destroys the evidence.
+//
+// Two things are asserted:
+//  - no sampled record's block (`rec->ptr`) lies in the range. A record is attached to a LIVE
+//    block, and hole purging only ever discards OS pages in which every block is free, so this
+//    is a direct check of the sweep's central invariant against an independent bookkeeping.
+//  - the record STRUCT itself does not lie in the range: records come from the profiler's own
+//    raw-OS arena (`_mi_prof_arena_alloc`, CLAUDE.md rule 4), never from a mimalloc page, so a
+//    hit here means that invariant was broken somewhere else entirely.
+void _mi_prof_debug_assert_no_records_in(const mi_page_t* page, const void* addr, size_t size) {
+  if (page == NULL || !page->has_metadata || size == 0) return;
+  const uint8_t* const lo = (const uint8_t*)addr;
+  const uint8_t* const hi = lo + size;
+  // `page->metadata` is only mutated under `prof_lock`; a sweep runs on an arbitrary thread
+  // (the owner, or the scavenger for a parked one), so take it -- unless this thread is already
+  // inside it (mi_prof_visit's callback), where the list is ours to read anyway.
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  const bool own = (hooks != NULL && hooks->prof_lock_owner);
+  if (!own) { mi_lock_acquire(&prof_lock); }
+  for (mi_prof_record_t* rec = (mi_prof_record_t*)page->metadata; rec != NULL; rec = rec->next) {
+    mi_assert_internal((const uint8_t*)rec->ptr < lo || (const uint8_t*)rec->ptr >= hi);
+    mi_assert_internal((const uint8_t*)rec < lo || (const uint8_t*)rec >= hi);
+  }
+  if (!own) { mi_lock_release(&prof_lock); }
+}
+#endif
+
 static void prof_free_collect(mi_page_t* page, mi_block_t* head) { for (mi_block_t* b=head; b != NULL && page->has_metadata; b=mi_block_next(page,b)) prof_free_record(page,b); }
 static void prof_realloc_in_place(mi_page_t* page, void* p, size_t size) {
   // #266: callers pass the caller-visible pointer, which for a guarded (interior)

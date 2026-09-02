@@ -430,6 +430,10 @@ void          _mi_page_free(mi_page_t* page, mi_page_queue_t* pq);     // free t
 void          _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq);  // abandon the page, to be picked up by another thread...
 void          _mi_deferred_free(mi_theap_t* theap, bool force);
 void          _mi_page_free_collect(mi_page_t* page, bool force);
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b): the same, but
+// never brings a discarded hole back (heap inspection must not mutate the heap, and a sweep is
+// about to discard anyway). See `mi_page_free_collect_ex` in `src/page.c`.
+void          _mi_page_free_collect_no_unpurge(mi_page_t* page, bool force);
 void          _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head);
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page);
 bool          _mi_page_queue_is_valid(mi_theap_t* theap, const mi_page_queue_t* pq);
@@ -445,6 +449,10 @@ mi_theap_t*   _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld);
 void          _mi_theap_collect_retired(mi_theap_t* theap, bool force);
 void          _mi_theap_collect_abandon(mi_theap_t* theap);
 bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi_block_visit_fun* visitor, void* arg);
+// #272 (Bun parity P7b): visit every page of a theap (see `src/theap.c`). Exported for the hole
+// engine in `src/page-holes.c`, which sweeps and reports over exactly this walk.
+typedef bool (theap_page_visitor_fun)(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2);
+bool          _mi_theap_visit_pages(mi_theap_t* theap, theap_page_visitor_fun* fn, bool include_full, void* arg1, void* arg2);
 void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 
 void          _mi_heap_detach_theaps( mi_heap_t* heap );
@@ -532,6 +540,15 @@ void        _mi_prof_process_done(void);
 void        _mi_prof_fork_prepare(void);
 void        _mi_prof_fork_parent(void);
 void        _mi_prof_fork_child(void);
+#if MI_DEBUG
+// #272 profiler-interaction invariant (1): hole purging discards the memory of FREE blocks only.
+// A sampled record is attached to a LIVE block, so no record's block may lie in a range the hole
+// sweep is about to discard -- and the record structs themselves live in the profiler's own
+// raw-OS arena (CLAUDE.md rule 4), never inside a page, which this also asserts. Called from
+// `src/page-holes.c` just before every `_mi_os_discard` on a page that carries records; takes
+// `prof_lock` (unless this thread already holds it), so it is MI_DEBUG-only.
+void        _mi_prof_debug_assert_no_records_in(const mi_page_t* page, const void* addr, size_t size);
+#endif
 
 // "memory-events.c": opt-in allocation-change accounting/callbacks (issue #20). Independent of
 // MI_PPROF: always compiled in and hooked; the runtime activation flag gates all real work.
@@ -1153,6 +1170,74 @@ void          _mi_page_purge_holes_begin(mi_tld_t* tld);         // around each 
 void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
 void          _mi_purge_holes_of(mi_tld_t* tld);                 // the sweep itself (src/page-holes.c)
+void          _mi_page_holes_assert_valid(const mi_page_t* page);   // MI_DEBUG hole invariants, called from `_mi_page_is_valid`
+
+/* ------------------------------------------------------
+   Hole report  (`mi_purge_holes_report`, see the "Hole report" section in `src/page-holes.c`)
+   imported from oven-sh/mimalloc @ 942b8342, MIT.
+
+   What is left behind after a sweep, per size class: the free bytes that share an OS page
+   with a live block cannot be discarded, and this says how much of that there is and how
+   few live blocks are holding it down.
+   ------------------------------------------------------ */
+
+#define MI_HOLES_HIST_BUCKETS  (5)    // live blocks per pinned OS page: 1, 2, 3-4, 5-8, 9+
+#define MI_HOLES_GRAN_COUNT    (5)    // the hypothetical OS page sizes of the granularity curve
+
+typedef struct mi_holes_bin_s {
+  size_t block_size;           // the largest block size seen in this bin
+  size_t pages;
+  size_t ineligible_pages;     // pages `mi_page_can_purge_holes` rejects (nothing in them is discardable)
+  size_t live_bytes;           // bytes of allocated blocks
+  size_t free_bytes;           // bytes of free blocks (free-listed *and* already discarded)
+  size_t undiscardable_bytes;  // free bytes in an OS page that a live block pins (or that is not entirely inside the block area)
+  size_t discarded_bytes;      // bytes of the OS pages that are discarded right now
+  size_t edge_bytes;           // of `undiscardable_bytes`: those in a partial OS page (holds the page header, or memory past `capacity`)
+  size_t pending_bytes;        // free bytes in a fully free OS page that is not discarded (no sweep yet, or the discard failed)
+  size_t pinned_ospages;       // OS pages holding >= 1 live block
+  size_t pinned_live_blocks;   // live blocks over those (a block straddling two pinned OS pages counts in both)
+  size_t pinned_free_bytes;    // free bytes trapped inside those pinned OS pages
+  size_t pinned_live_bytes;    // live bytes inside those pinned OS pages
+  size_t hist[MI_HOLES_HIST_BUCKETS];
+} mi_holes_bin_t;
+
+typedef struct mi_holes_report_s {
+  mi_holes_bin_t bin[MI_BIN_COUNT];
+  size_t total_pages;
+  size_t ineligible_pages;
+  size_t unformed_bytes;       // memory of blocks not formed yet (`capacity < reserved`)
+  size_t unformed_discarded_bytes;  // of those: the OS pages the sweep discarded (`page->unformed_purged_*`)
+  // The granularity curve: how many bytes WOULD be discardable if the OS page size were
+  // `mi_holes_granularity(g)` -- the total size of the G-aligned, G-sized spans that lie wholly
+  // inside a page's block area and hold not one live block. Nothing is discarded to measure it;
+  // it is pure counting over the same free/live classification the sweep uses.
+  size_t discardable_at[MI_HOLES_GRAN_COUNT];
+  size_t unmadvisable_pages;   // excluded from the curve: their memory cannot be discarded at ANY granularity
+
+  // Where the memory actually IS. If the curve turns out flat, the free memory is not
+  // contaminating the pages -- and then this says where it went instead.
+  //
+  // CAVEAT, and it is why these fields are named the way they are: `slices_committed` is set for
+  // the WHOLE arena at reserve time whenever the OS memory is `initially_committed` (which every
+  // POSIX mmap is), and a reset-style purge (MADV_FREE_REUSABLE on darwin) does NOT clear it. So
+  // there that bitmap is address space, not residency, and `arena_committed_bytes` must not be
+  // read as "memory we are paying for". `slices_dirty` (ever touched) and `slices_purge`
+  // (scheduled but not yet purged) are the bitmaps that carry residency information.
+  size_t page_committed_bytes;       // committed bytes of the pages this walk reached
+  size_t arena_reserved_bytes;       // total arena address space
+  size_t arena_committed_bytes;      // popcount(slices_committed) -- see the caveat: on POSIX this is ~= reserved
+  size_t arena_free_dirty_bytes;     // slices in NO page that were touched at least once: the UPPER bound on arena slack still resident
+  size_t arena_purge_pending_bytes;  // slices in NO page, scheduled for purge but not purged yet: definitely still resident (the purge delay)
+  size_t arena_meta_bytes;           // the arenas' own bitmaps (`info_slices`) -- ROUGH: excludes the `mi_meta` heaps
+} mi_holes_report_t;
+
+size_t        mi_holes_granularity(size_t g);
+void          _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep);
+void          _mi_page_holes_report_print(const mi_holes_report_t* rep);
+void          _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep);
+void          _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep);
+void          _mi_purge_holes_report_collect(mi_holes_report_t* rep);
+void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld);   // src/arena.c
 
 // The base of the OS-page bitmap: the start of the first OS page that the block area of
 // this page overlaps. It is OS-page aligned by construction, so bit `k` always names the

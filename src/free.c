@@ -597,6 +597,15 @@ static inline bool mi_block_could_be_double_free(const mi_page_t* page, const mi
 
 // check if `block` was free'd before
 static inline bool mi_check_is_double_free(const mi_page_t* page, const mi_block_t* block) {
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b). A purged block
+  // is free but held off every free list and its memory is discarded, so neither the decoded-
+  // `next` heuristic nor the free-list walk below can recognize it. This is inside
+  // MI_CHECK_DOUBLE_FREE (debug/secure builds only): the real free fast path gains nothing --
+  // a block being freed was live, hence never inside a discarded OS page.
+  if mi_unlikely(mi_page_block_is_purged(page, block)) {
+    _mi_error_message(EAGAIN, "double free detected of block %p with size %zu\n", block, mi_page_block_size(page));
+    return true;
+  }
   if mi_unlikely(mi_block_could_be_double_free(page,block))  // quick check: next field is aligned in the same page or NULL?
   {
     // Suspicious: decoded value a in block is in the same page (or NULL) -- maybe a double free?

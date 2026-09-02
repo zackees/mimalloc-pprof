@@ -17,10 +17,9 @@ terms of the MIT license. A copy of the license can be found in the file
 // (CLAUDE.md rule 6), and none of them need theap file statics.
 //
 // DEVIATION from Bun: the second phase of `_mi_thread_idle_work` -- discarding the free
-// blocks inside still-used pages (`mi_option_purge_holes`) -- is Phase 7b (#272) and is
-// not in this file yet. Everything here works without it; `mi_on_thread_idle` currently
-// delivers clauses 1 and 3 of its documented contract (collect pending frees, hand the
-// arena purge to the scavenger) and gains clause 2 with 7b.
+// blocks inside still-used pages (`mi_option_purge_holes`) -- lives in `src/page-holes.c`
+// (CLAUDE.md rule 6), and is called from here as `_mi_purge_holes_of`. With Phase 7b landed,
+// `mi_on_thread_idle` delivers all three clauses of its documented contract.
 
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
@@ -67,8 +66,8 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) {
     mi_theap_collect(theap0, false /* not forced */);
   }
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
-  // Phase 7b (#272): `mi_purge_holes_of(tld)` -- discard the free blocks inside still-used
-  // pages -- goes here, between the collect and the arena purge.
+  _mi_purge_holes_of(tld);   // #272 (P7b): every theap of this thread + its heaps' abandoned pages
+  if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
   _mi_arenas_purge_now(tld->subproc);
   mi_atomic_increment_relaxed(&mi_idle_work_count);   // #272 test observable, see above
 }
@@ -101,19 +100,30 @@ void _mi_park_leave(mi_tld_t* tld) {
 
 // Sweep the theaps of every parked thread of `subproc`; scavenger only.
 //
-// Returns in how many msecs a park that was passed over becomes due (0: none was), so the
-// scavenger can wake for it instead of leaving it to its safety timeout. Always 0 until
-// Phase 7b adds `purge_holes_min_interval` pacing.
+// Returns in how many msecs a park that was passed over for `purge_holes_min_interval` becomes
+// due (0: none was), so the scavenger can wake for it instead of leaving it to its safety timeout.
 mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
   if (subproc == NULL) return 0;
   if (mi_atomic_load_relaxed(&subproc->parked_count) == 0) return 0;
   for (;;) {
     mi_tld_t* claimed = NULL;
     mi_theap_t* theap0 = NULL;
-    const mi_msecs_t due_in = 0;   // Phase 7b: `purge_holes_min_interval` pacing
+    mi_msecs_t due_in = 0;
     mi_lock(&subproc->tlds_lock) {
+      // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b):
+      // `purge_holes_min_interval` pacing -- a thread that parks in a tight loop must not have
+      // its heaps swept on every park (the sweep is a full walk of its pages).
+      const mi_msecs_t now = _mi_clock_now();
+      const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
         if (mi_atomic_load_acquire(&tld->park_swept) != 0) continue;   // already done for this park
+        if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
+          if (mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_PARKED) {
+            const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
+            if (due_in == 0 || due < due_in) { due_in = due; }
+          }
+          continue;
+        }
         uint32_t expected = MI_PARK_PARKED;
         if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_SWEEPING)) {
           claimed = tld; theap0 = tld->park_theap0; break;
@@ -128,6 +138,7 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     // parked thread's next sample depend on how often the scavenger happened to visit it.
     const mi_profiler_tld_t prof_before = claimed->profiler;
     #endif
+    claimed->holes_sweep_last = _mi_clock_now();
     _mi_thread_idle_work(claimed, theap0);
     #if MI_DEBUG
     mi_assert_internal(claimed->profiler.bytes_since_sample == prof_before.bytes_since_sample &&

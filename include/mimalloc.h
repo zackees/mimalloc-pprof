@@ -206,6 +206,47 @@ mi_decl_export void mi_on_thread_idle_end(void) mi_attr_noexcept;
 // Stop the background scavenger thread (it restarts on demand; see `mi_option_scavenger`).
 mi_decl_export void mi_scavenger_stop(void)     mi_attr_noexcept;
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+// How much hole punching actually reclaims (process wide, monotonic except for the
+// gauges marked below). These are not part of `mi_stats_t`: hole purging also covers
+// pages that no heap owns, and `mi_stats_t` cannot grow (it is embedded in a theap,
+// which is at the meta-allocator's 8KB block limit).
+typedef struct mi_purge_holes_stats_s {
+  size_t purged_bytes;        // bytes of free blocks that are discarded right now
+  size_t purged_blocks;       // free blocks held off the free lists right now
+  size_t purged_bytes_total;  // bytes ever discarded
+  size_t discard_calls;       // discard syscalls (madvise/MEM_RESET)
+  size_t reuse_calls;         // reuse syscalls made when handing a hole back
+  size_t pages_freed;         // pages the sweep found completely free and gave back to the arena
+  // What hole punching cannot reach: the pages the sweep found ineligible (a huge page, a
+  // large page whose OS pages do not fit the bitmap, pinned memory, a custom-commit arena).
+  // Gauges over the last idle sweep (`mi_on_thread_idle`), which resets them.
+  size_t ineligible_pages;
+  size_t ineligible_bytes;      // total size of those pages
+  size_t ineligible_free_bytes; // the free (but not discardable) blocks inside them
+  // The unformed tail: the blocks of a page that were never handed out (`capacity < reserved`).
+  // Carved from a recycled arena slice, that memory is already resident, so the sweep discards
+  // it as well; `mi_page_extend_free` hands it back before it formats a block in it.
+  size_t unformed_bytes;        // bytes of unformed tail discarded right now
+  size_t unformed_bytes_total;  // bytes of unformed tail ever discarded
+  size_t unformed_discard_calls;
+  size_t unformed_reuse_calls;  // reuse syscalls made when a page extends back into its tail
+  // What the sweep costs. A page in which nothing was allocated or freed since the last sweep is
+  // skipped without its free list being walked at all (see `_mi_page_purge_holes`).
+  size_t pages_skipped;         // pages skipped that way (monotonic)
+  size_t blocks_visited;        // free-list blocks the sweep did walk (monotonic): what the skip avoids
+  size_t full_sweeps;           // sweeps that walked every page anyway (`purge_holes_full_every`)
+} mi_purge_holes_stats_t;
+
+mi_decl_export void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept;
+
+// Print, per size class, what hole punching leaves behind: the free bytes that share an OS
+// page with a live block and therefore cannot be discarded, and how few live blocks pin each
+// such OS page. Read-only (it purges nothing, and mutates no free list). Like the idle sweep
+// it only covers what the calling thread may safely read: its own theaps, plus the abandoned
+// pages of the heaps behind them. Call it right after a sweep.
+mi_decl_export void mi_purge_holes_report(void) mi_attr_noexcept;
+
 mi_decl_export int  mi_version(void);
 mi_decl_export void mi_options_print(void)      mi_attr_noexcept;
 mi_decl_export void mi_process_info_print(void) mi_attr_noexcept;
@@ -565,14 +606,17 @@ typedef enum mi_option_e {
   mi_option_prof_seed,                  // profiler sampling PRNG seed; 0 = nondeterministic (=0)
   mi_option_prof_max_bytes,             // budget (in bytes) for profiler-internal arena memory; 0 = unbudgeted (=0)
   mi_option_memory_events,              // enable opt-in allocation-change accounting/callbacks (MIMALLOC_MEMORY_EVENTS) (=0)
-  mi_option_purge_zeroes,               // treat decommit-purged slices as zeroed, letting mi_zalloc skip its memset (=0, experimental)
+  mi_option_purge_zeroes,               // DEAD since #80: the implementation added by #79 went away with the v3 pin bump and was never
+                                        // restored (see issue #67). The option slot is kept -- never renumber -- and setting
+                                        // MIMALLOC_PURGE_ZEROES still parses, it just has no effect. NOT related to
+                                        // `purge_holes_eager_zero` below, which is the opposite knob (it zeroes MORE, for testing).
   mi_option_scavenger,                  // run a background thread that purges scheduled arena memory (=1). imported from oven-sh/mimalloc @ 942b8342, MIT (#272)
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b). Appended
   // after `scavenger`, NOT at Bun's slot numbers 50-53: slots 47+ diverged long ago (#264).
   mi_option_purge_holes,                // discard the memory of free blocks inside still-used pages, on `mi_on_thread_idle` (=1)
   mi_option_purge_holes_eager_zero,     // zero a range before discarding it, so a mis-scoped discard corrupts visibly (=0; forced on in debug builds). NOT zero-tracking -- see mi_option_purge_zeroes
   mi_option_purge_holes_min_interval,   // do not sweep one thread's heaps more often than every N milli-seconds (=100)
-  mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=16); 0 disables
+  mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=64); 0 disables
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

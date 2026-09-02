@@ -793,6 +793,21 @@ struct mi_tld_s {
   mi_theap_t*           park_theap0;          // default theap, captured at the park (the scavenger has no TLS to find it)
   _Atomic(uint32_t)     park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
   mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+  // State of a running hole sweep of THIS thread's heaps. It lives on the tld being swept and
+  // never in a thread-local of the sweeping thread: besides the scavenger sweeping many tlds
+  // from one thread, `_mi_page_purge_holes_in_progress` is read from inside the allocator
+  // (`mi_page_free_collect_ex`), and on targets where `__thread` is emulated the first access
+  // on a thread allocates -- re-entering the collect that is reading it, without bound
+  // (oven-sh/bun#38051). Plain (non-atomic) fields: only the one thread doing the sweep -- the
+  // owner, or the scavenger holding this tld in MI_PARK_SWEEPING -- ever touches them.
+  size_t                holes_sweep_seq;      // idle sweeps of this thread's heaps so far (`purge_holes_full_every`)
+  mi_msecs_t            holes_sweep_last;     // when the last one ran (`purge_holes_min_interval` pacing)
+  bool                  holes_sweeping;       // a sweep of this thread's heaps is in progress right now
+  bool                  holes_sweep_full;     // ... and it ignores `page->swept_state` (every N'th sweep)
+  size_t                holes_sweep_skipped;  // per-pass counters, folded into the process-wide ones by
+  size_t                holes_sweep_visited;  // `_mi_page_purge_holes_end` (a per-page atomic would cost real time)
 };
 
 

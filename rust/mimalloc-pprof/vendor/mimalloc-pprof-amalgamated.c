@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 9f953225 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 67c879a2 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4251,6 +4251,24 @@ void*         _mi_meta_zalloc_aligned( mi_subproc_t* subproc, size_t size, size_
 void          _mi_meta_free(mi_subproc_t* subproc, void* p, mi_memid_t memid);
 bool          _mi_meta_is_meta_page(const mi_subproc_t* subproc, const mi_page_t* p);
 
+// issue #271 (Bun parity P6, "keep our profiler hooks consistent -- a page unpublished
+// from its heap must not be visited with a dangling heap pointer"): a hook that runs for a
+// cross-thread free (free.c:mi_free_block_mt) can race a concurrent mi_heap_delete /
+// mi_heap_destroy of the page's heap on another thread. The block being freed keeps the
+// *page* struct alive (see free.c's _mi_page_ptr_unalign comment), but NOT the heap or
+// theap it points to -- `mi_heap_free`/`_mi_theap_decref` can free and (in MI_DEBUG builds)
+// poison that memory out from under a concurrent reader with no synchronization of its own
+// (reproduced: `mi_page_subproc(page)` / `page->heap->subproc` reading freed, poisoned
+// mi_heap_t memory from `_mi_memevt_on_free`, SIGSEGV inside `_mi_meta_is_meta_page`).
+// `page->memid` is immutable after page creation and safe to read; for an arena-backed page
+// (the only kind a meta-allocator page ever is -- mi_heap_t/mi_theap_t are always small,
+// arena-sized allocations, never OS/oversized) its arena's `subproc` field is set once at
+// arena creation and outlives every heap in it, so this never touches page->heap/page->theap.
+static inline bool _mi_meta_is_meta_page_safe(const mi_page_t* page) {
+  mi_arena_t* const arena = mi_memid_arena(page->memid);
+  return (arena != NULL && _mi_meta_is_meta_page(arena->subproc, page));
+}
+
 
 // init.c
 mi_page_t*    _mi_page_empty_get(void);
@@ -4285,6 +4303,26 @@ bool          _mi_os_decommit(mi_subproc_t* subproc, void* addr, size_t size);
 void          _mi_os_reuse(mi_subproc_t* subproc, void* p, size_t size);
 mi_decl_nodiscard bool _mi_os_commit(mi_subproc_t* subproc, void* p, size_t size, bool* is_zero);
 mi_decl_nodiscard bool _mi_os_commit_ex(mi_subproc_t* subproc, void* addr, size_t size, bool* is_zero, size_t stat_size);
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT: MI_DEBUG-only test hooks (issue #271 /
+// Bun parity P6). Declared with C linkage so a C test links against a library that may be
+// compiled as C++ (mirrors the other `mi_debug_*` test hooks).
+#if MI_DEBUG > 0
+#ifdef __cplusplus
+extern "C" {
+#endif
+// After `fail_after` successful commits, the next `_mi_os_commit_ex` call fails instead of
+// calling into the OS (test-commit-fail.c).
+extern mi_decl_export volatile long mi_debug_fail_os_commit_after;
+// test-heap-teardown.c's `pin` case: set to 1 before a `mi_heap_delete`; the claim loop in
+// `arena.c` (`mi_heap_visit_page_claim`) sets it to 2 once it has a page pinned but not yet
+// claimed, and stalls there until the test sets it back to 0.
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+#ifdef __cplusplus
+}
+#endif
+#endif
+
 mi_decl_nodiscard bool _mi_os_protect(void* addr, size_t size);
 bool          _mi_os_unprotect(void* addr, size_t size);
 bool          _mi_os_purge(mi_subproc_t* subproc, void* p, size_t size);
@@ -4331,6 +4369,7 @@ void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 
 mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t page_alignment);
 void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
+void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271)
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
@@ -4370,6 +4409,7 @@ bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t*
 void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 
 void          _mi_heap_detach_theaps( mi_heap_t* heap );
+void          _mi_theap_abandon(mi_theap_t* theap);  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271)
 void          _mi_tld_detach_theaps( mi_tld_t* tld );
 void          _mi_theap_incref(mi_theap_t* theap);
 void          _mi_theap_decref(mi_theap_t* theap);
@@ -4807,6 +4847,21 @@ static inline bool mi_theap_is_detached(mi_theap_t* theap) {
 static inline bool mi_theap_matches_thread(mi_theap_t* theap) {
   const mi_threadid_t tid = _mi_thread_id();
   return (theap==NULL || theap->tld->thread_id == tid || mi_theap_is_detached(theap));
+}
+
+// adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// 8286bfb6): like mi_theap_matches_thread, but additionally allows a theap that
+// mi_heap_delete/mi_heap_destroy detached from its heap (`_mi_heap_detach_theaps` clears
+// `theap->heap`, see theap.c) -- `_mi_theap_abandon` (theap.c) calls
+// `_mi_arenas_page_abandon` on behalf of such a theap from the *deleting* thread, which
+// is not the theap's own owning thread. Bun's version also allows the park state the
+// background scavenger sets while sweeping a parked thread's theaps; that state does not
+// exist in this tree (#272), so that clause is omitted here.
+static inline bool _mi_theap_can_touch(const mi_theap_t* theap) {
+  if (theap == NULL || theap->tld == NULL) return true;
+  if (mi_atomic_load_ptr_relaxed(mi_heap_t, &((mi_theap_t*)theap)->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`
+  if (theap->tld->thread_id == _mi_thread_id()) return true;
+  return mi_theap_is_detached((mi_theap_t*)theap);   // upstream's permanently-detached theaps (meta-data) belong to no thread
 }
 
 /* -----------------------------------------------------------
@@ -6037,7 +6092,14 @@ static inline mi_theap_t* _mi_heap_theap_peek(const mi_heap_t* heap) {
   if mi_likely(_mi_theap_heap_peek(theap)==heap) return theap;
   #endif
   theap = (mi_theap_t*)_mi_thread_local_get(heap->theap);  // don't update the cache on a query
-  mi_assert_internal(theap==NULL || (!_mi_is_empty_theap(theap) && theap->heap==heap));
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): a theap
+  // detached from `heap` by a concurrent `mi_heap_delete`/`mi_heap_destroy`
+  // (`_mi_heap_detach_theaps`) has `theap->heap == NULL` here, not `heap` -- return NULL
+  // instead of asserting, so callers stop reclaiming into / abandoning through it.
+  if (theap==NULL) return NULL;
+  mi_assert_internal(!_mi_is_empty_theap(theap));
+  mi_assert_internal(_mi_theap_heap_peek(theap)==heap || _mi_theap_heap_peek(theap)==NULL);
+  if (_mi_theap_heap_peek(theap) != heap) return NULL;
   return theap;
 }
 
@@ -6047,7 +6109,12 @@ static inline mi_theap_t* _mi_page_associated_theap_peek(mi_page_t* page) {
   mi_heap_t* const heap = mi_page_heap(page);
   mi_theap_t* const theap = (mi_theap_t*)_mi_thread_local_get(heap->theap);
   if (theap==NULL) return NULL;
-  if (theap->heap != heap) return NULL; // should never happen, but can happen for a free across subprocesses, which can happen during pthread tls storage deallocation
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): the theap no
+  // longer belongs to the heap when it was detached by a concurrent `mi_heap_delete`
+  // (`_mi_heap_detach_theaps`; the theap struct itself is freed only after the page has left
+  // the heap, so it is still safe to read here). It also does not belong to it for a free
+  // across subprocesses, which can happen during pthread tls storage deallocation.
+  if (_mi_theap_heap_peek(theap) != heap) return NULL;
   mi_assert_internal(!_mi_is_empty_theap(theap) && mi_theap_matches_thread(theap));
   // note: for pages allocated by a detached theap, the returned theap may not be detached
   return theap;
@@ -6761,9 +6828,11 @@ void _mi_free_subproc_safe(void* p) mi_attr_noexcept {
 static bool mi_abandoned_page_try_free(mi_page_t* page)
 {
   if (!mi_page_all_free(page)) return false;
-  // first remove it from the abandoned pages in the arena (if mapped, this might wait for any readers to finish)
-  _mi_arenas_page_unabandon(page,NULL);
-  _mi_arenas_page_free(page,NULL); // we can now free the page directly
+  // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+  // ff96441a): _mi_arenas_abandoned_page_free captures what it needs from the heap before
+  // unabandoning (which, for an OS page, is where it is unpublished from the heap) instead
+  // of after -- see mi_arenas_page_free_ex's provenance comment in arena.c.
+  _mi_arenas_abandoned_page_free(page,NULL);
   return true;
 }
 
@@ -7197,10 +7266,20 @@ static void mi_check_padding(const mi_page_t* page, const mi_block_t* block) {
 // only maintain stats for smaller objects if requested
 #if (MI_STAT>0)
 static void mi_stat_free(const mi_page_t* page, const mi_block_t* block) {
-  MI_UNUSED(block);  
+  MI_UNUSED(block);
   mi_theap_t* theap = _mi_theap_default();
   mi_lock_t* lock = NULL;
-  mi_subproc_t* const subproc = mi_page_subproc(page);
+  // adapted for issue #271 (Bun parity P6): was mi_page_subproc(page), i.e. page->heap->subproc.
+  // This can run for a cross-thread free (mi_free_block_mt) racing a concurrent
+  // mi_heap_delete/mi_heap_destroy of page's heap on another thread -- reproduced as a
+  // SIGSEGV reading page->heap->subproc here (see memory-events.c's _mi_memevt_on_free
+  // provenance comment for the first instance of this class of bug and its fix). _mi_subproc()
+  // is this (the freeing) thread's own subproc -- always safe, no dereference of anything
+  // reachable only through `page`. Matches the pre-existing (commented out, "never collect
+  // across subprocesses") assumption a few lines below that the two agree in the normal case;
+  // the rare cross-subprocess free this could get wrong (attributing the stat decrease to the
+  // wrong subproc's theap_meta) was already an unverified edge case, not a memory-safety one.
+  mi_subproc_t* const subproc = _mi_subproc();
   mi_theap_t* const theap_meta = subproc->theap_meta;
   if mi_unlikely(!mi_theap_is_initialized(theap) || // can happen if free'd after thread_done was called (usually a thread cleanup call by the OS)
                   // page->theap == subproc->theap_meta  .. but we cannot read `theap` if we don't own the page
@@ -9005,6 +9084,143 @@ to reserve large arenas upfront and be able to reuse the memory more effectively
 The arena allocation needs to be thread safe and we use an atomic bitmap to allocate.
 -----------------------------------------------------------------------------*/
 
+/* ---- begin inlined: include/mimalloc/prim.h ---- */
+/* ----------------------------------------------------------------------------
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
+This is free software; you can redistribute it and/or modify it under the
+terms of the MIT license. A copy of the license can be found in the file
+"LICENSE" at the root of this distribution.
+-----------------------------------------------------------------------------*/
+#pragma once
+#ifndef MIMALLOC_PRIM_H
+#define MIMALLOC_PRIM_H
+
+
+// --------------------------------------------------------------------------
+// This file specifies the primitive portability API.
+// Each OS/host needs to implement these primitives, see `src/prim`
+// for implementations on Window, macOS, WASI, and Linux/Unix.
+//
+// note: on all primitive functions, we always have result parameters != NULL, and:
+//  addr != NULL and page aligned
+//  size > 0     and page aligned
+//  the return value is an error code as an `int` where 0 is success
+// --------------------------------------------------------------------------
+
+// OS memory configuration
+typedef struct mi_os_mem_config_s {
+  size_t  page_size;              // default to 4KiB
+  size_t  large_page_size;        // 0 if not supported, usually 2MiB 
+  size_t  alloc_granularity;      // smallest allocation size (usually 4KiB, on Windows 64KiB)
+  size_t  physical_memory_in_kib; // physical memory size in KiB
+  size_t  virtual_address_bits;   // usually 48 or 56 bits on 64-bit systems. (used to determine secure randomization)
+  bool    has_overcommit;         // can we reserve more memory than can be actually committed?
+  bool    has_partial_free;       // can allocated blocks be freed partially? (true for mmap, false for VirtualAlloc)
+  bool    has_virtual_reserve;    // supports virtual address space reservation? (if true we can reserve virtual address space without using commit or physical memory)
+  bool    has_transparent_huge_pages;  // true if transparent huge pages are enabled (on Linux)
+} mi_os_mem_config_t;
+
+// Initialize
+void _mi_prim_mem_init( mi_os_mem_config_t* config );
+
+// Free OS memory
+int _mi_prim_free(void* addr, size_t size );
+
+// Allocate OS memory. Return NULL on error.
+// The `try_alignment` is just a hint and the returned pointer does not have to be aligned.
+// If `commit` is false, the virtual memory range only needs to be reserved (with no access)
+// which will later be committed explicitly using `_mi_prim_commit`.
+// `is_zero` is set to true if the memory was zero initialized (as on most OS's)
+// The `hint_addr` address is either `NULL` or a preferred allocation address but can be ignored.
+// pre: !commit => !allow_large
+//      try_alignment >= _mi_os_page_size() and a power of 2
+int _mi_prim_alloc(void* hint_addr, size_t size, size_t try_alignment, bool commit, bool allow_large, bool* is_large, bool* is_zero, void** addr);
+
+// Commit memory. Returns error code or 0 on success.
+// For example, on Linux this would make the memory PROT_READ|PROT_WRITE.
+// `is_zero` is set to true if the memory was zero initialized (e.g. on Windows)
+int _mi_prim_commit(void* addr, size_t size, bool* is_zero);
+
+// Decommit memory. Returns error code or 0 on success. The `needs_recommit` result is true
+// if the memory would need to be re-committed. For example, on Windows this is always true,
+// but on Linux we could use MADV_DONTNEED to decommit which does not need a recommit.
+// pre: needs_recommit != NULL
+int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit);
+
+// Reset memory. The range keeps being accessible but the content might be reset to zero at any moment.
+// Returns error code or 0 on success.
+int _mi_prim_reset(void* addr, size_t size);
+
+// Reuse memory. This is called for memory that is already committed but
+// may have been reset (`_mi_prim_reset`) or decommitted (`_mi_prim_decommit`) where `needs_recommit` was false.
+// Returns error code or 0 on success. On most platforms this is a no-op.
+int _mi_prim_reuse(void* addr, size_t size);
+
+// Protect memory. Returns error code or 0 on success.
+int _mi_prim_protect(void* addr, size_t size, bool protect);
+
+// Allocate huge (1GiB) pages possibly associated with a NUMA node.
+// `is_zero` is set to true if the memory was zero initialized (as on most OS's)
+// pre: size > 0  and a multiple of 1GiB.
+//      numa_node is either negative (don't care), or a numa node number.
+int _mi_prim_alloc_huge_os_pages(void* hint_addr, size_t size, int numa_node, bool* is_zero, void** addr);
+
+// Return the current NUMA node
+size_t _mi_prim_numa_node(void);
+
+// Return the number of logical NUMA nodes
+size_t _mi_prim_numa_node_count(void);
+
+// Clock ticks
+mi_msecs_t _mi_prim_clock_now(void);
+
+// Return process information (only for statistics)
+typedef struct mi_process_info_s {
+  mi_msecs_t  elapsed;
+  mi_msecs_t  utime;
+  mi_msecs_t  stime;
+  size_t      current_rss;
+  size_t      peak_rss;
+  size_t      current_commit;
+  size_t      peak_commit;
+  size_t      page_faults;
+} mi_process_info_t;
+
+void _mi_prim_process_info(mi_process_info_t* pinfo);
+
+// Default stderr output. (only for warnings etc. with verbose enabled)
+// msg != NULL && _mi_strlen(msg) > 0
+void _mi_prim_out_stderr( const char* msg );
+
+// Get an environment variable. (only for options)
+// name != NULL, result != NULL, result_size >= 64
+// Return 1 for success, 0 if not found,
+// and -1 on error (for example, if `getenv` cannot be called yet during preloading).
+int _mi_prim_getenv(const char* name, char* result, size_t result_size);
+
+
+// Fill a buffer with strong randomness; return `false` on error or if
+// there is no strong randomization available.
+bool _mi_prim_random_buf(void* buf, size_t buf_len);
+
+// Called on the first thread start, and should ensure `_mi_thread_done` is called on thread termination.
+void _mi_prim_thread_init_auto_done(void);
+
+// Called on process exit and may take action to clean up resources associated with the thread auto done.
+void _mi_prim_thread_done_auto_done(void);
+
+// Called when the default theap for a thread changes
+void _mi_prim_thread_associate_default_theap(mi_theap_t* theap);
+
+// Is this thread part of a thread pool?
+bool _mi_prim_thread_is_in_threadpool(void);
+
+// Yield to other threads. Should be similar to `sleep(0)`.
+// Is called only in rare situations and does not have to be lightning fast.
+void _mi_prim_thread_yield(void);
+
+#endif  // MI_PRIM_H
+/* ---- end inlined: include/mimalloc/prim.h ---- */
 /* ---- begin inlined: src/bitmap.h ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2019-2024 Microsoft Research, Daan Leijen
@@ -9939,7 +10155,7 @@ void* _mi_arenas_alloc(mi_heap_t* heap, size_t size, bool commit, bool allow_lar
 static bool mi_abandoned_page_unown(mi_page_t* page, mi_theap_t* current_theap) {
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(mi_theap_matches_thread(current_theap));
+  mi_assert_internal(_mi_theap_can_touch(current_theap));  // adapted from 942b8342 (issue #271): was mi_theap_matches_thread
   mi_thread_free_t tf_new;
   mi_thread_free_t tf_old = mi_atomic_load_relaxed(&page->xthread_free);
   do {
@@ -9947,8 +10163,10 @@ static bool mi_abandoned_page_unown(mi_page_t* page, mi_theap_t* current_theap) 
     while mi_unlikely(mi_tf_block(tf_old) != NULL) {
       _mi_page_free_collect(page, false);  // update used
       if (mi_page_all_free(page)) {        // it may become free just before unowning it
-        _mi_arenas_page_unabandon(page, current_theap);
-        _mi_arenas_page_free(page, current_theap);
+        // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6,
+        // commit ff96441a): was _mi_arenas_page_unabandon + _mi_arenas_page_free
+        // separately, see mi_arenas_page_free_ex's provenance comment above.
+        _mi_arenas_abandoned_page_free(page, current_theap);
         return true;
       }
       tf_old = mi_atomic_load_relaxed(&page->xthread_free);
@@ -9998,7 +10216,11 @@ static mi_arena_t* mi_page_arena_pages(mi_page_t* page, size_t* slice_index, siz
     mi_heap_t* heap = mi_page_heap(page);
     mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
     mi_assert_internal(arena_pages != NULL);
-    mi_assert_internal(slice_index==NULL || mi_bitmap_is_set(arena_pages->pages, *slice_index));
+    // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+    // 8286bfb6): dropped. No longer holds under the heap delete/destroy claim protocol --
+    // mi_heap_visit_page_claim (above) legitimately holds this bit clear for a moment
+    // while it pins an owned, abandoned page it has not claimed yet, and this function can
+    // run on that page in the meantime (e.g. from mi_arenas_page_free_prim's own call).
     *parena_pages = arena_pages;
   }
   return arena;
@@ -10173,8 +10395,14 @@ static size_t mi_page_block_start(size_t block_size, bool os_align)
   return _mi_align_up(offset,MI_MAX_ALIGN_SIZE);
 }
 
-// Free a page without modifying page_bin stats
-static void mi_arenas_page_free_prim(mi_page_t* page);
+// Free a page without modifying page_bin stats. `subproc` and `arena_pages` (NULL for an
+// OS page) are resolved from the page's heap by the caller -- adapted from
+// oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit ff96441a): this
+// function must not read `page->heap` (via `mi_page_subproc`/`mi_page_arena_pages`)
+// anymore, since the unpublish that happens inside it (the arena_pages->pages bit clear,
+// or, for an OS page, the caller's unlink from `heap->os_abandoned_pages` before calling
+// this) is what a concurrent `mi_heap_delete` waits for before it frees the heap.
+static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_arena_pages_t* arena_pages);
 
 // Allocate a fresh page
 static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_count, size_t block_size, size_t block_alignment, bool commit)
@@ -10313,7 +10541,7 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
 
   // register in the page map
   if mi_unlikely(!_mi_page_map_register(page)) {
-    mi_arenas_page_free_prim(page);
+    mi_arenas_page_free_prim(page, _mi_theap_subproc(theap), arena_pages);
     return NULL;
   }
 
@@ -10413,24 +10641,27 @@ mi_page_t* _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t bl
   return page;
 }
 
-static void mi_arenas_page_free_prim(mi_page_t* page) {
+static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_arena_pages_t* arena_pages) {
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_all_free(page));
   mi_assert_internal(page->next==NULL && page->prev==NULL);
-  
+  mi_assert_internal((page->memid.memkind == MI_MEM_ARENA) == (arena_pages != NULL));
+
   #if MI_DEBUG>1
   if (page->memid.memkind==MI_MEM_ARENA && !mi_page_is_full(page)) {
     size_t bin = _mi_bin(mi_page_block_size(page));
     size_t slice_index;
     size_t slice_count;
-    mi_arena_pages_t* arena_pages = NULL;
-    mi_arena_t* const arena = mi_page_arena_pages(page, &slice_index, &slice_count, &arena_pages);
+    mi_arena_t* const arena = mi_arena_from_memid(page->memid, &slice_index, &slice_count);
     mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
     mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
     mi_assert_internal(bin >= MI_ARENA_BIN_COUNT || mi_bitmap_is_clearN(arena_pages->pages_abandoned[bin], slice_index, 1));
-    mi_assert_internal(mi_bitmap_is_setN(arena_pages->pages, slice_index, 1));
+    // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+    // 8286bfb6): dropped `mi_assert_internal(mi_bitmap_is_setN(arena_pages->pages, slice_index, 1))`.
+    // No longer holds under the heap delete/destroy claim protocol: a concurrent
+    // mi_heap_visit_page_claim may legitimately hold this bit clear (pinned) right now.
     // note: we cannot check for `!mi_page_is_abandoned_and_mapped` since that may
     // be (temporarily) not true if the free happens while trying to reclaim
     // see `mi_arena_try_claim_abandoned`
@@ -10444,19 +10675,26 @@ static void mi_arenas_page_free_prim(mi_page_t* page) {
   // we must do this since we may later allocate large spans over this page and cannot have a guard page in between
   #if MI_SECURE >= 5
   if (!page->memid.is_pinned) {
-    _mi_os_secure_guard_page_reset_before(mi_page_subproc(page), mi_page_slice_start(page) + mi_page_full_size(page), page->memid);
+    _mi_os_secure_guard_page_reset_before(subproc, mi_page_slice_start(page) + mi_page_full_size(page), page->memid);
   }
   #endif
 
   // and free
   if (page->memid.memkind == MI_MEM_ARENA) {
-    mi_arena_pages_t* arena_pages;
     size_t slice_index;
-    size_t slice_count; MI_UNUSED(slice_count);
-    mi_arena_t* const arena = mi_page_arena_pages(page, &slice_index, &slice_count, &arena_pages);
+    size_t slice_count;
+    mi_arena_t* const arena = mi_arena_from_memid(page->memid, &slice_index, &slice_count);
     mi_assert_internal(arena_pages!=NULL);
-    mi_assert_internal(arena->subproc == mi_page_subproc(page));
-    mi_bitmap_clear(arena_pages->pages, slice_index);
+    mi_assert_internal(arena->subproc == subproc);
+    // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+    // 8286bfb6): a heap walker (mi_heap_visit_page_claim, below) may hold this bit clear
+    // for a moment to pin the page while it tries to claim it; mi_bitmap_clear (which does
+    // not wait) could unpublish the page here while it is pinned, racing the walker's own
+    // clear/set pair. mi_bitmap_clear_once_set waits for the bit to be set (i.e. not
+    // currently pinned) before clearing it. This is also the last access to `arena_pages`
+    // (and, through it, the heap): a concurrent mi_heap_delete frees the heap once it sees
+    // the bit clear.
+    mi_bitmap_clear_once_set(subproc, arena_pages->pages, slice_index);
     const size_t slice_committed = mi_page_slice_committed(page);
     if (slice_committed > 0) {
       // if committed on-demand, set the commit bits to account commit properly
@@ -10479,28 +10717,61 @@ static void mi_arenas_page_free_prim(mi_page_t* page) {
     }
   }
   if (mi_page_meta_is_separated(page)) { page->block_size = 0; }  // for assertion checking
-  _mi_arenas_free( mi_page_subproc(page), mi_page_slice_start(page), mi_page_full_size(page), page->memid);
+  _mi_arenas_free( subproc, mi_page_slice_start(page), mi_page_full_size(page), page->memid);
 }
 
-void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
+// adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// ff96441a): free a page that is not in the abandoned map or list (anymore) -- held by a
+// theap until now, or claimed by a heap delete. `unabandon`, when set, takes it out of the
+// abandoned page map/list first (this is `_mi_arenas_abandoned_page_free`, below): the
+// `subproc`/`arena_pages` this function needs from the page's heap are captured *before*
+// that unabandon call, which is what unpublishes an OS page from the heap
+// (`heap->os_abandoned_pages`, `_mi_arenas_page_unabandon`) -- reading `page->heap` after
+// that (the old `_mi_arenas_page_free(page,...)` immediately-after-unabandon pattern this
+// replaces) raced a concurrent `mi_heap_delete` that had already freed the heap once it
+// saw the page unpublished, a real use-after-free (this port's before-matrix reproduced it
+// as a SIGSEGV in `mi_arenas_page_free_prim` -> `mi_page_subproc` -> `_mi_os_free`, from
+// `test-heap-teardown`'s `os-pages` case, Release build).
+static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, bool unabandon) {
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_all_free(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(page->next==NULL && page->prev==NULL);
-  mi_assert_internal(mi_theap_matches_thread(current_theapx));
+  mi_assert_internal(unabandon || (page->next==NULL && page->prev==NULL));
+  mi_assert_internal(_mi_theap_can_touch(current_theapx));
+
+  // all we need from the heap, before the page is unpublished from it (see
+  // mi_arenas_page_free_prim's provenance comment, above)
+  mi_heap_t* const heap = mi_page_heap(page);
+  mi_subproc_t* const subproc = heap->subproc;
+  mi_arena_pages_t* arena_pages = NULL;
+  if (page->memid.memkind == MI_MEM_ARENA) { mi_page_arena_pages(page, NULL, NULL, &arena_pages); }
 
   if (current_theapx != NULL) {
     mi_theap_stat_decrease(current_theapx, page_bins[_mi_page_stats_bin(page)], 1);
     mi_theap_stat_decrease(current_theapx, pages, 1);
   }
   else {
-    mi_heap_t* const heap = mi_page_heap(page);
     mi_heap_stat_decrease(heap, page_bins[_mi_page_stats_bin(page)], 1);
     mi_heap_stat_decrease(heap, pages, 1);
   }
-  mi_arenas_page_free_prim(page);
+  if (unabandon) {
+    _mi_arenas_page_unabandon(page, current_theapx);   // for an OS page this is where it is unpublished from the heap
+  }
+  mi_arenas_page_free_prim(page, subproc, arena_pages);
+}
+
+void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
+  mi_arenas_page_free_ex(page, current_theapx, false);
+}
+
+// adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// ff96441a): free an abandoned page (that the caller owns and found all free) -- take it
+// out of the abandoned page map or list of its heap and free it, without re-reading the
+// heap in between (see mi_arenas_page_free_ex, above).
+void _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
+  mi_arenas_page_free_ex(page, current_theapx, true);
 }
 
 /* -----------------------------------------------------------
@@ -10514,12 +10785,11 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(!mi_page_all_free(page));
   mi_assert_internal(page->next==NULL && page->prev == NULL);
-  mi_assert_internal(mi_theap_matches_thread(current_theap));
+  mi_assert_internal(_mi_theap_can_touch(current_theap));  // adapted from 942b8342 (issue #271): was mi_theap_matches_thread + an assert requiring current_theap's own heap to match, which does not hold for a detached theap that _mi_theap_abandon (theap.c) is abandoning on behalf of its (foreign) owning thread
   // mi_assert_internal(current_theap == _mi_page_associated_theap(page));
 
   // add to abandoned?
   mi_heap_t* heap = mi_page_heap(page); 
-  mi_assert_internal(heap==_mi_theap_heap(current_theap));
   if (page->memid.memkind==MI_MEM_ARENA && !mi_page_is_full(page)) {
     // make available for allocations
     size_t bin = _mi_bin(mi_page_block_size(page));
@@ -10596,7 +10866,7 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(mi_theap_matches_thread(current_theapx));
+  mi_assert_internal(_mi_theap_can_touch(current_theapx));  // adapted from 942b8342 (issue #271): was mi_theap_matches_thread
 
   mi_heap_t* const heap = mi_page_heap(page);
   if (mi_page_is_abandoned_mapped(page)) {
@@ -11636,6 +11906,8 @@ typedef struct mi_heap_visit_info_s {
   mi_block_visit_fun* visitor;
   void* arg;
   bool visit_blocks;
+  bool claim_pages;      // adapted from 942b8342 (issue #271): claim ownership before visiting (for delete/destroy)
+  mi_arena_pages_t* arena_pages;
 } mi_heap_visit_info_t;
 
 static bool mi_heap_visit_page(mi_page_t* page, mi_heap_visit_info_t* vinfo) {
@@ -11653,25 +11925,136 @@ static bool mi_heap_visit_page(mi_page_t* page, mi_heap_visit_info_t* vinfo) {
   }
 }
 
+#if MI_DEBUG > 0
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271): test-heap-teardown.c's `pin` case
+#endif
+
+// adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// 8286bfb6 "heap delete/destroy: one teardown protocol instead of per-reader fixes"):
+// claim a page of `vinfo->heap` for `mi_heap_delete`/`mi_heap_destroy` (`claim_pages`). By
+// the time this runs, `heap.c:mi_heap_detach_theaps` has detached and abandoned every theap
+// of the heap (`_mi_theap_abandon`), so every page still published in `arena_pages->pages`
+// is an abandoned page of this heap, and the only other party that can own one is a
+// concurrent `mi_free` that collects it (`free.c:mi_free_try_collect_mt`) -- which may free
+// the page, after which the slice can be reused for anything at once. So we must not write
+// to the page (claiming is a write) unless it is pinned: we pin it by clearing its `pages`
+// bit while it is set. The owner of a page unpublishes it with `mi_bitmap_clear_once_set`
+// (`mi_arenas_page_free_prim`, above), which waits while we hold the bit, so a pinned page
+// stays a page of this heap. If the page turns out to be owned by a concurrent free, we
+// give the bit back and retry; once we own it nobody else can free it and the bit goes back
+// too. This is the same protocol the abandoned-page map already uses
+// (`mi_arena_try_claim_abandoned`).
+//
+// Dropped from the upstream version: the `_mi_process_is_forked_child` branch, which
+// re-derives a torn page snapshot after a multi-threaded `fork()`. `pthread_atfork`
+// handling does not exist in this tree yet (#270 / PR #289, not merged as of this PR); add
+// that branch back when it lands.
+static void mi_heap_visit_page_seize(mi_page_t* page) {
+  // the page sits in the queue of a theap whose thread is gone or misbehaving; leave that queue be
+  page->next = page->prev = NULL;
+  mi_page_set_theap(page, NULL);
+}
+
+static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* page, size_t slice_index) {
+  mi_bitmap_t* const pages = vinfo->arena_pages->pages;
+  for (;;) {
+    if (!mi_bitmap_clear(pages, slice_index)) return false;   // freed by a concurrent `mi_free`
+    // pinned
+    #if MI_DEBUG > 0
+    if (mi_atomic_load_relaxed(&mi_debug_stall_in_heap_delete_claim) == 1) {
+      mi_atomic_store_release(&mi_debug_stall_in_heap_delete_claim, (uintptr_t)2);  // signal: pinned, not yet claimed
+      while (mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) == 2) { _mi_prim_thread_yield(); }
+    }
+    #endif
+    if mi_unlikely(!mi_page_is_abandoned(page)) {
+      // A thread that allocated from this heap before is using it during the delete (it
+      // allocated this page, or reclaimed it on a free just now): that is outside the
+      // contract of `mi_heap_delete`.
+      _mi_error_message(EINVAL, "heap 0x%zx is deleted while thread 0x%zx still uses it\n", (uintptr_t)vinfo->heap, (uintptr_t)mi_page_thread_id(page));
+      mi_bitmap_set(pages, slice_index);
+      mi_heap_visit_page_seize(page);
+      break;
+    }
+    if (mi_page_claim_ownership(page)) {
+      mi_bitmap_set(pages, slice_index);
+      break;
+    }
+    // owned by a concurrent `mi_free`: let it finish (it may free the page, re-abandon it, or just release it)
+    mi_bitmap_set(pages, slice_index);
+    mi_subproc_stat_counter_increase(vinfo->heap->subproc, heaps_delete_wait, 1);
+    _mi_prim_thread_yield();
+  }
+  mi_assert_internal(mi_page_is_owned(page) && mi_page_is_abandoned(page));
+  mi_assert_internal(mi_bitmap_is_set(pages, slice_index));
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page)) == page && mi_page_heap(page) == vinfo->heap);
+  return true;
+}
+
 static bool mi_heap_visit_page_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   MI_UNUSED(slice_count);
   mi_heap_visit_info_t* vinfo = (mi_heap_visit_info_t*)arg;
   mi_page_t* page = mi_arena_page_at_slice(arena, slice_index);
+  if (vinfo->claim_pages) {
+    if (!mi_heap_visit_page_claim(vinfo, page, slice_index)) return true;  // gone: skip
+  }
   return mi_heap_visit_page(page, vinfo);
 }
 
-bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
+// adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// 8286bfb6): visit the abandoned OS-allocated pages of a heap. When `claim_pages` is set
+// (delete/destroy), a page on the list is pinned by holding the list lock: a concurrent
+// `mi_free` that owns it has to take the lock to unlink it before it can free it
+// (`_mi_arenas_page_unabandon`). So we claim under the lock, and if the page is owned we
+// drop the lock to let that free finish and start over, until the list is empty.
+static bool mi_heap_visit_os_pages(mi_heap_t* heap, mi_heap_visit_info_t* vinfo) {
+  if (!vinfo->claim_pages) {
+    // (we assume we are the only thread running in this heap)
+    mi_page_t* page = NULL;
+    mi_lock(&heap->os_abandoned_pages_lock) { page = heap->os_abandoned_pages; }
+    while (page != NULL) {
+      mi_page_t* const next = page->next;  // read upfront in case the visitor frees the page
+      if (!mi_heap_visit_page(page, vinfo)) return false;
+      page = next;
+    }
+    return true;
+  }
+  for (;;) {
+    mi_page_t* page = NULL;
+    bool owned = false;
+    mi_lock(&heap->os_abandoned_pages_lock) {
+      page = heap->os_abandoned_pages;
+      if (page != NULL) { owned = mi_page_claim_ownership(page); }
+    }
+    if (page == NULL) return true;
+    if (owned) {
+      mi_assert_internal(mi_page_is_abandoned(page) && mi_page_heap(page) == heap);
+      if (!mi_heap_visit_page(page, vinfo)) return false;  // the visitor unlinks it from the list
+    }
+    else {
+      mi_subproc_stat_counter_increase(heap->subproc, heaps_delete_wait, 1);
+      _mi_prim_thread_yield();
+    }
+  }
+}
+
+bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_blocks, bool claim_pages, mi_block_visit_fun* visitor, void* arg) {
   mi_assert(visitor!=NULL);
   if (visitor==NULL) return false;
   if (heap==NULL) { heap = mi_heap_main(); }
-  // visit all pages in a heap
-  // we don't have to claim because we assume we are the only thread running (with this heap).
-  // (but we could atomically claim as well by first doing abandoned_reclaim and afterwards reabandoning).
-  mi_heap_visit_info_t visit_info = { heap, visitor, arg, visit_blocks };
+  // no caller combines these today (claim_pages is only true from mi_heap_delete_pages,
+  // which always passes abandoned_only=false); mi_heap_visit_page_at's claim path was
+  // never exercised against the pages_abandoned[] bitmaps -- keep it that way explicitly.
+  mi_assert_internal(!(abandoned_only && claim_pages));
+  // when `claim_pages` is not set we don't have to claim: we assume we are the only thread
+  // running (with this heap). When it is set (delete/destroy), mi_heap_visit_page_at /
+  // mi_heap_visit_os_pages claim each page first so concurrent `mi_free` calls (which may
+  // briefly own abandoned pages) cannot race with the visitor.
+  mi_heap_visit_info_t visit_info = { heap, visitor, arg, visit_blocks, claim_pages, NULL };
   bool ok = true;
   mi_forall_arenas(heap, NULL, 0, arena) {
     mi_arena_pages_t* arena_pages = mi_heap_arena_pages(heap, arena);
     if (ok && arena_pages != NULL) {
+      visit_info.arena_pages = arena_pages;
       if (abandoned_only) {
         for (size_t bin = 0; ok && bin < MI_ARENA_BIN_COUNT; bin++) {
           // todo: if we had a single abandoned page map as well, this can be faster.
@@ -11689,26 +12072,15 @@ bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_bloc
   if (!ok) return false;
 
   // visit abandoned pages in OS allocated memory
-  // (technically we don't need the initial lock as we assume we are the only thread running in this subproc)
-  mi_page_t* page = NULL;
-  mi_lock(&heap->os_abandoned_pages_lock) {
-    page = heap->os_abandoned_pages;
-  }
-  while (ok && page != NULL) {
-    mi_page_t* next = page->next;  // read upfront in case the visitor frees the page
-    ok = mi_heap_visit_page(page, &visit_info);
-    page = next;
-  }
-
-  return ok;
+  return mi_heap_visit_os_pages(heap, &visit_info);
 }
 
 bool mi_heap_visit_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
-  return _mi_heap_visit_blocks(heap, false, visit_blocks, visitor, arg);
+  return _mi_heap_visit_blocks(heap, false, visit_blocks, false, visitor, arg);
 }
 
 bool mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
-  return _mi_heap_visit_blocks(heap, true, visit_blocks, visitor, arg);
+  return _mi_heap_visit_blocks(heap, true, visit_blocks, false, visitor, arg);
 }
 
 
@@ -11725,16 +12097,15 @@ static bool mi_heap_delete_page(const mi_heap_t* heap, const mi_heap_area_t* are
   mi_theap_t* const theap           = NULL; // info->theap;       mi_assert_internal(_mi_theap_heap(theap) == heap);
   mi_page_t*  const page            = (mi_page_t*)area->reserved1;
 
-  mi_page_claim_ownership(page);       // claim ownership
-  if (mi_page_is_abandoned(page)) {
-    _mi_arenas_page_unabandon(page,theap);
-  }
-  else {
-    page->next = page->prev = NULL;    // yikes.. better not to try to access this from a thread later on..
-    mi_page_set_theap(page,NULL);      // set threadid to abandoned
-  }
-  mi_assert_internal(mi_page_is_abandoned(page));
+  // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+  // 8286bfb6): claimed by mi_heap_visit_page_claim (or mi_heap_visit_os_pages) before this
+  // visitor runs -- every page reachable here is guaranteed abandoned (heap.c's
+  // mi_heap_detach_theaps abandons every theap of the heap, via _mi_theap_abandon, before
+  // the walk starts), so there is no longer an else-branch that force-abandons a
+  // theap-owned page inline.
   mi_assert_internal(mi_page_is_owned(page));
+  mi_assert_internal(mi_page_is_abandoned(page));
+  _mi_arenas_page_unabandon(page,theap);
 
   if (page->used==0) {
     // free the page
@@ -11802,7 +12173,7 @@ static void mi_heap_delete_pages(mi_heap_t* heap, mi_heap_t* heap_target) {
   mi_theap_t* const theap_target = (heap_target != NULL ? _mi_heap_theap(heap_target) : NULL);
   // mi_theap_t* const theap = _mi_heap_theap(heap);
   mi_heap_delete_visit_info_t info = { heap_target, theap_target, NULL };
-  _mi_heap_visit_blocks(heap, false, false, &mi_heap_delete_page, &info);
+  _mi_heap_visit_blocks(heap, false, false, true /* claim_pages: issue #271 */, &mi_heap_delete_page, &info);
   #if MI_DEBUG>1
   // no more arena pages?
   for (size_t i = 0; i < MI_MAX_ARENAS; i++) {
@@ -11956,143 +12327,6 @@ terms of the MIT license. A copy of the license can be found in the file
 Concurrent bitmap that can set/reset sequences of bits atomically
 ---------------------------------------------------------------------------- */
 
-/* ---- begin inlined: include/mimalloc/prim.h ---- */
-/* ----------------------------------------------------------------------------
-Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
-This is free software; you can redistribute it and/or modify it under the
-terms of the MIT license. A copy of the license can be found in the file
-"LICENSE" at the root of this distribution.
------------------------------------------------------------------------------*/
-#pragma once
-#ifndef MIMALLOC_PRIM_H
-#define MIMALLOC_PRIM_H
-
-
-// --------------------------------------------------------------------------
-// This file specifies the primitive portability API.
-// Each OS/host needs to implement these primitives, see `src/prim`
-// for implementations on Window, macOS, WASI, and Linux/Unix.
-//
-// note: on all primitive functions, we always have result parameters != NULL, and:
-//  addr != NULL and page aligned
-//  size > 0     and page aligned
-//  the return value is an error code as an `int` where 0 is success
-// --------------------------------------------------------------------------
-
-// OS memory configuration
-typedef struct mi_os_mem_config_s {
-  size_t  page_size;              // default to 4KiB
-  size_t  large_page_size;        // 0 if not supported, usually 2MiB 
-  size_t  alloc_granularity;      // smallest allocation size (usually 4KiB, on Windows 64KiB)
-  size_t  physical_memory_in_kib; // physical memory size in KiB
-  size_t  virtual_address_bits;   // usually 48 or 56 bits on 64-bit systems. (used to determine secure randomization)
-  bool    has_overcommit;         // can we reserve more memory than can be actually committed?
-  bool    has_partial_free;       // can allocated blocks be freed partially? (true for mmap, false for VirtualAlloc)
-  bool    has_virtual_reserve;    // supports virtual address space reservation? (if true we can reserve virtual address space without using commit or physical memory)
-  bool    has_transparent_huge_pages;  // true if transparent huge pages are enabled (on Linux)
-} mi_os_mem_config_t;
-
-// Initialize
-void _mi_prim_mem_init( mi_os_mem_config_t* config );
-
-// Free OS memory
-int _mi_prim_free(void* addr, size_t size );
-
-// Allocate OS memory. Return NULL on error.
-// The `try_alignment` is just a hint and the returned pointer does not have to be aligned.
-// If `commit` is false, the virtual memory range only needs to be reserved (with no access)
-// which will later be committed explicitly using `_mi_prim_commit`.
-// `is_zero` is set to true if the memory was zero initialized (as on most OS's)
-// The `hint_addr` address is either `NULL` or a preferred allocation address but can be ignored.
-// pre: !commit => !allow_large
-//      try_alignment >= _mi_os_page_size() and a power of 2
-int _mi_prim_alloc(void* hint_addr, size_t size, size_t try_alignment, bool commit, bool allow_large, bool* is_large, bool* is_zero, void** addr);
-
-// Commit memory. Returns error code or 0 on success.
-// For example, on Linux this would make the memory PROT_READ|PROT_WRITE.
-// `is_zero` is set to true if the memory was zero initialized (e.g. on Windows)
-int _mi_prim_commit(void* addr, size_t size, bool* is_zero);
-
-// Decommit memory. Returns error code or 0 on success. The `needs_recommit` result is true
-// if the memory would need to be re-committed. For example, on Windows this is always true,
-// but on Linux we could use MADV_DONTNEED to decommit which does not need a recommit.
-// pre: needs_recommit != NULL
-int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit);
-
-// Reset memory. The range keeps being accessible but the content might be reset to zero at any moment.
-// Returns error code or 0 on success.
-int _mi_prim_reset(void* addr, size_t size);
-
-// Reuse memory. This is called for memory that is already committed but
-// may have been reset (`_mi_prim_reset`) or decommitted (`_mi_prim_decommit`) where `needs_recommit` was false.
-// Returns error code or 0 on success. On most platforms this is a no-op.
-int _mi_prim_reuse(void* addr, size_t size);
-
-// Protect memory. Returns error code or 0 on success.
-int _mi_prim_protect(void* addr, size_t size, bool protect);
-
-// Allocate huge (1GiB) pages possibly associated with a NUMA node.
-// `is_zero` is set to true if the memory was zero initialized (as on most OS's)
-// pre: size > 0  and a multiple of 1GiB.
-//      numa_node is either negative (don't care), or a numa node number.
-int _mi_prim_alloc_huge_os_pages(void* hint_addr, size_t size, int numa_node, bool* is_zero, void** addr);
-
-// Return the current NUMA node
-size_t _mi_prim_numa_node(void);
-
-// Return the number of logical NUMA nodes
-size_t _mi_prim_numa_node_count(void);
-
-// Clock ticks
-mi_msecs_t _mi_prim_clock_now(void);
-
-// Return process information (only for statistics)
-typedef struct mi_process_info_s {
-  mi_msecs_t  elapsed;
-  mi_msecs_t  utime;
-  mi_msecs_t  stime;
-  size_t      current_rss;
-  size_t      peak_rss;
-  size_t      current_commit;
-  size_t      peak_commit;
-  size_t      page_faults;
-} mi_process_info_t;
-
-void _mi_prim_process_info(mi_process_info_t* pinfo);
-
-// Default stderr output. (only for warnings etc. with verbose enabled)
-// msg != NULL && _mi_strlen(msg) > 0
-void _mi_prim_out_stderr( const char* msg );
-
-// Get an environment variable. (only for options)
-// name != NULL, result != NULL, result_size >= 64
-// Return 1 for success, 0 if not found,
-// and -1 on error (for example, if `getenv` cannot be called yet during preloading).
-int _mi_prim_getenv(const char* name, char* result, size_t result_size);
-
-
-// Fill a buffer with strong randomness; return `false` on error or if
-// there is no strong randomization available.
-bool _mi_prim_random_buf(void* buf, size_t buf_len);
-
-// Called on the first thread start, and should ensure `_mi_thread_done` is called on thread termination.
-void _mi_prim_thread_init_auto_done(void);
-
-// Called on process exit and may take action to clean up resources associated with the thread auto done.
-void _mi_prim_thread_done_auto_done(void);
-
-// Called when the default theap for a thread changes
-void _mi_prim_thread_associate_default_theap(mi_theap_t* theap);
-
-// Is this thread part of a thread pool?
-bool _mi_prim_thread_is_in_threadpool(void);
-
-// Yield to other threads. Should be similar to `sleep(0)`.
-// Is called only in rare situations and does not have to be lightning fast.
-void _mi_prim_thread_yield(void);
-
-#endif  // MI_PRIM_H
-/* ---- end inlined: include/mimalloc/prim.h ---- */
 
 #ifndef MI_OPT_SIMD
 #define MI_OPT_SIMD   0
@@ -14445,15 +14679,47 @@ mi_heap_t* mi_heap_new(void) {
   return mi_heap_new_in_arena(0);
 }
 
-// free all theaps belonging to this heap (without deleting their pages as we do this arena wise for efficiency)
-static void mi_heap_free_theaps(mi_heap_t* heap) {
-  // This can run concurrently with a thread that terminates (see `init.c:mi_thread_theaps_done`),
-  // and we need to ensure we free theaps atomically.
-
-  // We first detach our theaps list from any thread local lists
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// ec238987 "mi_heap_delete: detach the theaps before the pages are moved, free them
+// after"): `mi_heap_delete`/`mi_heap_destroy` used to free the theaps of the heap before
+// it walked the pages, and the detach marked a theap by clearing `theap->tld`. A thread
+// that used the heap before still reaches its theap for the heap through the heap's
+// thread local while it frees blocks of the heap during the delete
+// (`_mi_page_associated_theap_peek` on the reclaim/re-abandon paths of
+// `mi_free_try_collect_mt`); that theap was then detached-and-freed under it, or already
+// gone. It is also the root cause of the `mi_theap_is_valid` ABA hazard reproduced from
+// PR #289's evidence (issue #271): `_mi_heap_detach_theaps` (theap.c) only cleared
+// `theap->tld`, not `theap->heap`, so a theap referenced by `_mi_theap_cached()` on some
+// thread kept pointing at a `mi_heap_t` address that could be reused by a later
+// `mi_heap_new()` (test-heap-aba.c covers this directly).
+//
+// Detach is now split from free: `mi_heap_detach_theaps` clears `theap->heap` (not
+// `theap->tld`) via `_mi_heap_detach_theaps` (theap.c) and merges each theap's stats into
+// the heap, so no thread finds a theap for this heap anymore, but the theap structs (and
+// their `tld`) stay valid until `mi_heap_free_theaps` runs -- after the pages have moved
+// or been destroyed -- for a free that obtained the theap just before the detach.
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// 8286bfb6): also abandon every page of each now-detached theap (_mi_theap_abandon,
+// theap.c), so by the time the page walk (_mi_heap_move_pages / _mi_heap_destroy_pages,
+// with claim_pages=true) starts, every page of the heap is an abandoned page and the only
+// other party that can hold one is a concurrent mi_free collecting it -- the walk can then
+// safely claim and move/free each page without racing a still-live theap.
+static void mi_heap_detach_theaps(mi_heap_t* heap) {
   _mi_heap_detach_theaps(heap);
+  mi_lock(&heap->theaps_lock) { // paranoia
+    for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
+      mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // detached
+      _mi_theap_abandon(theap);
+      _mi_stats_merge_into(&heap->stats, &theap->stats);
+    }
+  }
+}
 
-  // Now we can safely free the theaps
+// Free the detached theaps of this heap (without deleting their pages as we do this arena wise for efficiency).
+// This must run after the pages have left the heap: a concurrent `mi_free` of a block in a page that was
+// still in the heap may have found its theap through `heap->theap` just before the detach
+// (`_mi_page_associated_theap_peek`), and uses the theap (and its `tld`) while it owns the page.
+static void mi_heap_free_theaps(mi_heap_t* heap) {
   mi_lock(&heap->theaps_lock) { // paranoia
     mi_theap_t* theap = heap->theaps;
     heap->theaps = NULL;
@@ -14461,14 +14727,12 @@ static void mi_heap_free_theaps(mi_heap_t* heap) {
       mi_theap_t* next = theap->hnext;
       theap->hnext = NULL;
       theap->hprev = NULL;
-      mi_assert_internal(theap->tld==NULL);
-      // merge stats into the owning heap stats
-      _mi_stats_merge_into(&heap->stats, &theap->stats);
-      // and free
+      mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // detached
+      theap->tld = NULL;
       _mi_theap_decref(theap);  // a cached entry can still point to the theap
       theap = next;
     }
-  }  
+  }
 }
 
 // free the heap resources (assuming the pages are already moved/destroyed, and all theaps have been freed)
@@ -14525,16 +14789,18 @@ void mi_heap_delete(mi_heap_t* heap) {
     _mi_warning_message("cannot delete the main heap\n");
     return;
   }
-  mi_heap_free_theaps(heap);
+  mi_heap_detach_theaps(heap);
   _mi_heap_move_pages(heap, heap_main);
+  mi_heap_free_theaps(heap);
   mi_heap_free(heap,true /* acquire subproc->heaps_lock */);
 }
 
 void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   if (heap==NULL) return;
-  mi_heap_free_theaps(heap);
+  mi_heap_detach_theaps(heap);
   _mi_dhat_forget_heap(heap);
   _mi_heap_destroy_pages(heap);
+  mi_heap_free_theaps(heap);
   // Free unless this is the PROCESS main heap (which is statically allocated and must
   // outlive everything). _mi_is_heap_main alone is not the right test: it resolves via
   // heap->subproc, so a *subproc's* heap_main is "main" by that definition too -- yet it
@@ -16166,7 +16432,7 @@ void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
   // (memevt_live_bytes/memevt_live_count are running deltas, so an unmatched free would
   // under/overflow them) -- DHAT's own free path needs no matching check since it looks
   // up the pointer in its own record table and no-ops when the alloc was never recorded.
-  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
+  if (_mi_meta_is_meta_page_safe(page)) return;  // adapted for issue #271: was _mi_meta_is_meta_page(mi_page_subproc(page), page)
   _mi_dhat_begin_alloc(page, p, request_size);
   size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
@@ -16194,8 +16460,16 @@ void _mi_memevt_on_free(mi_page_t* page, void* p) {
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
   if (hooks->memevt_suppress_depth > 0) return;
+  // issue #271 (Bun parity P6, "keep our profiler hooks consistent -- a page unpublished
+  // from its heap must not be visited with a dangling heap pointer"): this can run for a
+  // cross-thread free (mi_free_block_mt) concurrently with a mi_heap_delete/mi_heap_destroy
+  // of `page`'s heap on another thread. The block being freed keeps `page` itself alive
+  // (see free.c's _mi_page_ptr_unalign comment), but NOT `page->heap` -- reproduced as a
+  // SIGSEGV (and, in MI_DEBUG builds, a read of MI_DEBUG_FREED-poisoned memory) reading
+  // page->heap->subproc here. _mi_meta_is_meta_page_safe (internal.h) answers the same
+  // question from page->memid's arena instead, which never touches page->heap.
   // #266: symmetric with the _mi_memevt_on_alloc check above -- see its comment.
-  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
+  if (_mi_meta_is_meta_page_safe(page)) return;
   _mi_dhat_begin_free(p);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
@@ -18356,6 +18630,11 @@ static void* mi_os_page_align_area_conservative(void* addr, size_t size, size_t*
   return mi_os_page_align_areax(true, addr, size, newsize);
 }
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT
+#if MI_DEBUG > 0
+mi_decl_export volatile long mi_debug_fail_os_commit_after = 0;
+#endif
+
 bool _mi_os_commit_ex(mi_subproc_t* subproc, void* addr, size_t size, bool* is_zero, size_t stat_size) {
   if (is_zero != NULL) { *is_zero = false; }
   mi_subproc_stat_counter_increase(subproc, commit_calls, 1);
@@ -18367,6 +18646,15 @@ bool _mi_os_commit_ex(mi_subproc_t* subproc, void* addr, size_t size, bool* is_z
 
   // commit
   bool os_is_zero = false;
+  // imported from oven-sh/mimalloc @ 942b8342, MIT: MI_DEBUG fault injection hook (issue #271)
+  #if MI_DEBUG > 0
+  const long fail_after = mi_debug_fail_os_commit_after;
+  if (fail_after > 0) { mi_debug_fail_os_commit_after = fail_after - 1; }
+  if (fail_after == 1) {
+    _mi_warning_message("mi_debug_fail_os_commit_after: injecting commit failure at %p, size 0x%zx\n", start, csize);
+    return false;
+  }
+  #endif
   int err = _mi_prim_commit(start, csize, &os_is_zero);
   if (err != 0) {
     _mi_warning_message("cannot commit OS memory (error: %d (0x%x), address: %p, size: 0x%zx bytes)\n", err, err, start, csize);
@@ -22006,7 +22294,12 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   // reach prof_auto_start() here. Meta pages are never sampled anyway, so skipping
   // auto-start for them too costs nothing: it still fires on the first genuine user
   // allocation, which happens strictly after thread/process init releases those locks.
-  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
+  // adapted for issue #271 (Bun parity P6): was _mi_meta_is_meta_page(mi_page_subproc(page),
+  // page). _mi_prof_on_alloc always runs on the allocating thread itself (never cross-thread,
+  // unlike _mi_memevt_on_free -- see that function's provenance comment in
+  // memory-events.c), so page->heap is not actually at risk here, but the arena-derived
+  // helper is equally correct and keeps both meta-page checks on the same, provably-safe path.
+  if (_mi_meta_is_meta_page_safe(page)) return;
 
   prof_auto_start();
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;
@@ -24054,7 +24347,13 @@ static bool mi_theap_page_is_valid(mi_theap_t* theap, mi_page_queue_t* pq, mi_pa
   MI_UNUSED(pq);
   mi_assert_internal(mi_page_theap(page) == theap);
   mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
-  mi_assert_internal(page_theap == NULL || theap == page_theap);
+  // a detached theap (e.g. `subproc->theap_meta`, used under a lock from any thread for
+  // meta-data allocation) is not what `_mi_heap_theap_peek` returns for the calling
+  // thread's own theap of the same heap -- that mismatch is expected, not a bug. Same
+  // exception already used for this in page.c:91,133 (`_mi_page_is_valid`); it was
+  // missing here, which is what the multi-threaded mi_heap_new/mi_heap_delete churn
+  // repro in issue #271 / PR #289 tripped (mi_theap_collect on `theap_meta` itself).
+  mi_assert_internal(page_theap == NULL || theap == page_theap || mi_theap_is_detached(theap));
   mi_assert_expensive(_mi_page_is_valid(page));
   return true;
 }
@@ -24064,7 +24363,8 @@ static bool mi_theap_is_valid(mi_theap_t* theap) {
   mi_heap_t* const heap = _mi_theap_heap_peek(theap);
   mi_assert_internal(heap != NULL);
   mi_theap_t* const heap_theap = _mi_heap_theap_peek(heap);  // don't use mi_heap_theap as that may re-initialize the thread
-  mi_assert_internal(heap_theap==NULL || heap_theap == theap);
+  // see the comment in mi_theap_page_is_valid above
+  mi_assert_internal(heap_theap==NULL || heap_theap == theap || mi_theap_is_detached(theap));
   mi_theap_visit_pages(theap, &mi_theap_page_is_valid, true, NULL, NULL);
   for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
     mi_assert_internal(_mi_page_queue_is_valid(theap, &theap->pages[bin]));
@@ -24143,6 +24443,33 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
 
 void _mi_theap_collect_abandon(mi_theap_t* theap) {
   mi_theap_collect_ex(theap, MI_ABANDON);
+}
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// 8286bfb6): abandon every page of a theap that mi_heap_delete/mi_heap_destroy detached
+// from its heap (heap.c:mi_heap_detach_theaps -> _mi_heap_detach_theaps), as if its thread
+// had terminated. That thread no longer reaches the theap (_mi_heap_theap_peek /
+// _mi_page_associated_theap_peek return NULL for a detached theap, see prim-tls.h), and by
+// the contract of mi_heap_delete it is not allocating from or freeing into these pages
+// itself -- so after this call every page of the heap is an abandoned page, and the only
+// other party that can touch one is a concurrent mi_free collecting it. Called from the
+// deleting thread, on behalf of the (possibly different) thread that owned the theap --
+// _mi_arenas_page_abandon's assertions use _mi_theap_can_touch, not
+// mi_theap_matches_thread, to allow that.
+static bool mi_theap_page_abandon(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2) {
+  MI_UNUSED(theap); MI_UNUSED(arg1); MI_UNUSED(arg2);
+  _mi_page_abandon(page, pq);  // frees it instead if all blocks turn out to be free
+  return true;
+}
+
+void _mi_theap_abandon(mi_theap_t* theap) {
+  mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // must already be detached
+  mi_assert_internal(theap->tnext==NULL && theap->tprev==NULL);
+  mi_theap_visit_pages(theap, &mi_theap_page_abandon, true /* include full pages */, NULL, NULL);
+  mi_assert_internal(theap->page_count==0);
+  #if MI_DEBUG>1
+  for (size_t i = 0; i <= MI_BIN_FULL; i++) { mi_assert_internal(theap->pages[i].first == NULL); }
+  #endif
 }
 
 void mi_theap_collect(mi_theap_t* theap, bool force) mi_attr_noexcept {
@@ -24395,6 +24722,16 @@ void _mi_theap_decref(mi_theap_t* theap) {
 // via `git grep _mi_theap_free` across src/include at 6def7be9.
 
 // Remove the theaps in this heap from any thread local tld lists.
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// ec238987): a detached theap has `theap->heap == NULL`, so `_mi_heap_theap_peek` /
+// `_mi_page_associated_theap_peek` no longer return it and a concurrent `mi_free` of a
+// block in the heap no longer reclaims into it or re-abandons through it -- and, just as
+// importantly, no thread's `_mi_theap_cached()` fast path can mistake it for a theap of a
+// *different*, later heap allocated at the same (reused) address (the ABA reproduced by
+// test-heap-aba.c / the standalone repro in this PR). The theap struct itself (and its
+// `tld`) stays valid until `heap.c:mi_heap_free_theaps`, which runs after all the pages
+// have left the heap, for a free that found the theap just before it was detached here.
+// Previously this cleared `theap->tld` instead, which left `theap->heap` stale.
 void _mi_heap_detach_theaps( mi_heap_t* heap ) {
   bool all_detached;
   do {
@@ -24403,15 +24740,16 @@ void _mi_heap_detach_theaps( mi_heap_t* heap ) {
       mi_theap_t* theap = heap->theaps;
       while (theap != NULL) {
         mi_theap_t* next = theap->hnext;
-        mi_tld_t* tld = theap->tld;
-        if (tld != NULL) {
+        if (_mi_theap_heap_peek(theap) != NULL) {   // not detached yet in an earlier round?
+          mi_tld_t* const tld = theap->tld;
+          mi_assert_internal(tld != NULL);
           if (mi_lock_try_acquire(&tld->theaps_lock)) {
             // remove the theap from the tld theaps list
             if (theap->tnext != NULL) { theap->tnext->tprev = theap->tprev;  }
             if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
-                                else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
+                                else { mi_assert_internal(tld->theaps == theap); tld->theaps = theap->tnext; }
             theap->tnext = theap->tprev = NULL;
-            theap->tld = NULL;
+            mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
             mi_lock_release(&tld->theaps_lock);
           }
           else {

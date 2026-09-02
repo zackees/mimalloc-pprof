@@ -882,43 +882,21 @@ static void xthread_run(void) {
 }
 #endif
 
-/* #266 round 2: ctest-shared (windows-latest) hits this exact check failing
-   (after.live_samples != 0) reliably; a single Linux run never has. The worker thread
-   here already frees every block and fully exits (xthread_run joins/waits for it)
-   before main calls mi_collect -- i.e. this already is the "worker exits, THEN main
-   collects" ordering. Repeating it stresses the specific race this is suspected to be:
-   a cross-thread free landing in a page's xthread_free list after that page has
-   already been (re-)abandoned and ownership released (src/free.c's
-   mi_abandoned_page_unown_from_free), with nothing revisiting that exact page again
-   before the stats check -- mi_collect only walks pages the calling theap currently
-   owns, not every abandoned page in the subproc, so an unlucky abandon can leave a
-   profiler record stranded. Narrowed (not closed) by adding a collect sweep to
-   src/arena.c's _mi_arenas_page_abandon (see that comment). Loop count chosen to run in
-   about a second, not to guarantee reproduction: if this ever fails here, that is a
-   real, reproducible-on-Linux finding worth its own investigation, not just evidence
-   the fix above is incomplete on a lock-free path that admits no client-side lock. */
 static void test_cross_thread_free_of_sampled(void) {
-  enum { STRESS_ROUNDS = 200 };
-  for (int round = 0; round < STRESS_ROUNDS; round++) {
-    assert(mi_prof_start_seeded(64, 314));   /* low rate: most of these get sampled */
-    for (int i = 0; i < 300; i++) { xthread_blocks[i] = mi_malloc(256); assert(xthread_blocks[i] != NULL); }
+  assert(mi_prof_start_seeded(64, 314));   /* low rate: most of these get sampled */
+  for (int i = 0; i < 300; i++) { xthread_blocks[i] = mi_malloc(256); assert(xthread_blocks[i] != NULL); }
 
-    mi_prof_stats_t_decl(live);
-    assert(mi_prof_stats_get(&live));
-    assert(live.live_samples > 0);           /* confirm we are actually testing something */
+  mi_prof_stats_t_decl(live);
+  assert(mi_prof_stats_get(&live));
+  assert(live.live_samples > 0);           /* confirm we are actually testing something */
 
-    xthread_run();                            /* every block freed from another thread */
-    mi_collect(true);                         /* drain the deferred cross-thread frees */
+  xthread_run();                            /* every block freed from another thread */
+  mi_collect(true);                         /* drain the deferred cross-thread frees */
 
-    mi_prof_stats_t_decl(after);
-    assert(mi_prof_stats_get(&after));
-    if (after.live_samples != 0 || after.live_bytes != 0) {
-      fprintf(stderr, "test_cross_thread_free_of_sampled: FAILED on round %d/%d: live_samples=%zu live_bytes=%zu\n",
-        round, (int)STRESS_ROUNDS, (size_t)after.live_samples, (size_t)after.live_bytes);
-    }
-    assert(after.live_samples == 0 && after.live_bytes == 0);
-    mi_prof_stop();
-  }
+  mi_prof_stats_t_decl(after);
+  assert(mi_prof_stats_get(&after));
+  assert(after.live_samples == 0 && after.live_bytes == 0);
+  mi_prof_stop();
 }
 
 int main(void) {

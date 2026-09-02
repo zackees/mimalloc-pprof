@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8e878f17 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 78f7bcc9 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -10442,18 +10442,6 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
   mi_assert_internal(!mi_page_all_free(page));
   mi_assert_internal(page->next==NULL && page->prev == NULL);
   mi_assert_internal(mi_theap_matches_thread(current_theap));
-
-  // #266: every caller of this function reaches it while still owning `page` (asserted
-  // above), so this is safe, and narrows -- though for a lock-free deferred free list
-  // cannot fully close -- the window in which a cross-thread free's memevt/profiler
-  // record collection (_mi_prof_on_free_collect via mi_page_thread_collect_to_local,
-  // page.c) waits on some theap later walking this exact page again, which an abandoned
-  // page is not guaranteed to happen for (mi_collect only visits pages the calling
-  // theap currently owns; an abandoned page sits in the arena's own bookkeeping until
-  // some thread specifically reclaims it, which may be never). Investigated as the
-  // suspected cause of ctest-shared (windows-latest)'s test-profile/-accum/-auto
-  // failures at test/test-profile.c's cross-thread-free-of-sampled-blocks check.
-  _mi_page_free_collect(page, false);
   // mi_assert_internal(current_theap == _mi_page_associated_theap(page));
 
   // add to abandoned?
@@ -14058,7 +14046,15 @@ static char* mi_diag_append_uint(char* out, const char* end, uintptr_t value) {
   return out;
 }
 
-static void mi_lock_debug_fail(const char* reason, const void* lock,
+// #266 macOS escalation: `current`/`owner` are the same mi_lock_debug_thread()-tagged
+// values compared by the callers below (0 when not applicable to the failure kind, e.g.
+// the TLS/zero checks below), so a printed value of 0 always means "no owner" the same
+// way it does in the comparisons themselves. Reported to tell a colliding/zero thread id
+// during dylib bootstrap (this is macOS's actual failure) apart from a genuine
+// cross-thread reentrancy: identical current/owner with both nonzero is reentrancy;
+// owner==0 with the fail still firing, or current==owner==some degenerate value across
+// unrelated threads, points at the thread-id primitive instead.
+static void mi_lock_debug_fail(const char* reason, const void* lock, uintptr_t current, uintptr_t owner,
                                const char* file, unsigned line, const char* func) {
   char message[512] = { 0 };
   char* out = message;
@@ -14067,6 +14063,10 @@ static void mi_lock_debug_fail(const char* reason, const void* lock,
   out = mi_diag_append(out, end, reason);
   out = mi_diag_append(out, end, " lock=");
   out = mi_diag_append_uint(out, end, (uintptr_t)lock);
+  out = mi_diag_append(out, end, " current_tid=");
+  out = mi_diag_append_uint(out, end, current);
+  out = mi_diag_append(out, end, " owner_tid=");
+  out = mi_diag_append_uint(out, end, owner);
   out = mi_diag_append(out, end, " at ");
   out = mi_diag_append(out, end, file);
   out = mi_diag_append(out, end, ":");
@@ -14084,7 +14084,7 @@ static void mi_lock_debug_fail(const char* reason, const void* lock,
 void _mi_diagnostic_check_tls_owner(const void* p) {
   mi_page_t* const page = _mi_ptr_page(p);
   if (page == NULL || !_mi_is_heap_main(mi_page_heap(page))) {
-    mi_lock_debug_fail("internal_tls_storage_not_main_owned", p,
+    mi_lock_debug_fail("internal_tls_storage_not_main_owned", p, 0, 0,
                        __FILE__, __LINE__, __func__);
   }
 }
@@ -14093,7 +14093,7 @@ void _mi_diagnostic_check_zero(const void* p, size_t size, const char* reason) {
   const uint8_t* const bytes = (const uint8_t*)p;
   for (size_t i = 0; i < size; i++) {
     if (bytes[i] != 0) {
-      mi_lock_debug_fail(reason, p, __FILE__, __LINE__, __func__);
+      mi_lock_debug_fail(reason, p, 0, 0, __FILE__, __LINE__, __func__);
     }
   }
 }
@@ -14126,23 +14126,27 @@ static uintptr_t mi_lock_debug_thread(void) {
 void _mi_lock_debug_before_acquire(const void* lock, const _Atomic(uintptr_t)* owner,
                                    const char* file, unsigned line, const char* func) {
   const uintptr_t current = mi_lock_debug_thread();
-  if (mi_atomic_load_relaxed(owner) == current) {
-    mi_lock_debug_fail("reentrant_internal_lock_acquisition", lock, file, line, func);
+  const uintptr_t owned_by = mi_atomic_load_relaxed(owner);
+  if (owned_by == current) {
+    mi_lock_debug_fail("reentrant_internal_lock_acquisition", lock, current, owned_by, file, line, func);
   }
 }
 
 void _mi_lock_debug_after_acquire(const void* lock, _Atomic(uintptr_t)* owner,
                                   const char* file, unsigned line, const char* func) {
-  if (mi_atomic_load_relaxed(owner) != 0) {
-    mi_lock_debug_fail("internal_lock_owner_not_cleared", lock, file, line, func);
+  const uintptr_t owned_by = mi_atomic_load_relaxed(owner);
+  if (owned_by != 0) {
+    mi_lock_debug_fail("internal_lock_owner_not_cleared", lock, mi_lock_debug_thread(), owned_by, file, line, func);
   }
   mi_atomic_store_relaxed(owner, mi_lock_debug_thread());
 }
 
 void _mi_lock_debug_before_release(const void* lock, _Atomic(uintptr_t)* owner,
                                    const char* file, unsigned line, const char* func) {
-  if (mi_atomic_load_relaxed(owner) != mi_lock_debug_thread()) {
-    mi_lock_debug_fail("internal_lock_release_by_non_owner", lock, file, line, func);
+  const uintptr_t current = mi_lock_debug_thread();
+  const uintptr_t owned_by = mi_atomic_load_relaxed(owner);
+  if (owned_by != current) {
+    mi_lock_debug_fail("internal_lock_release_by_non_owner", lock, current, owned_by, file, line, func);
   }
   mi_atomic_store_relaxed(owner, (uintptr_t)0);
 }
@@ -14153,8 +14157,9 @@ void _mi_lock_debug_init(_Atomic(uintptr_t)* owner) {
 
 void _mi_lock_debug_done(const void* lock, const _Atomic(uintptr_t)* owner,
                          const char* file, unsigned line, const char* func) {
-  if (mi_atomic_load_relaxed(owner) != 0) {
-    mi_lock_debug_fail("destroying_owned_internal_lock", lock, file, line, func);
+  const uintptr_t owned_by = mi_atomic_load_relaxed(owner);
+  if (owned_by != 0) {
+    mi_lock_debug_fail("destroying_owned_internal_lock", lock, mi_lock_debug_thread(), owned_by, file, line, func);
   }
 }
 
@@ -15931,6 +15936,14 @@ static void memevt_dispatch(mi_memory_change_kind_t kind, int64_t delta_bytes, u
    from both observers. */
 void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
   if (memevt_suppress_depth > 0) return;
+  // #266: never report allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
+  // _mi_meta_zalloc onto subproc->theap_meta) as a user allocation. This is the sole
+  // entry point DHAT's begin_alloc is reached through, so this one check excludes both
+  // observers; the matching _mi_memevt_on_free check below keeps ALLOCATE/FREE balanced
+  // (memevt_live_bytes/memevt_live_count are running deltas, so an unmatched free would
+  // under/overflow them) -- DHAT's own free path needs no matching check since it looks
+  // up the pointer in its own record table and no-ops when the alloc was never recorded.
+  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
   _mi_dhat_begin_alloc(page, p, request_size);
   size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
@@ -15943,6 +15956,8 @@ void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
 
 void _mi_memevt_on_free(mi_page_t* page, void* p) {
   if (memevt_suppress_depth > 0) return;
+  // #266: symmetric with the _mi_memevt_on_alloc check above -- see its comment.
+  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
   _mi_dhat_begin_free(p);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
@@ -21489,6 +21504,16 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;
   if (prof_callback_depth > 0) return;
 
+  // #266: never sample allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
+  // _mi_meta_zalloc onto subproc->theap_meta). These are large (sizeof(mi_theap_t) is
+  // several KB) relative to typical sample rates, so they sample almost every time, and
+  // on an MSVC DLL build they can be freed from DLL_THREAD_DETACH after the owning
+  // thread's tld has already been torn down -- a path mi_collect(true) never revisits --
+  // leaving the sample "live" forever. page->has_metadata is never set for a meta page as
+  // a result, so _mi_prof_on_free/_mi_prof_on_free_collect need no matching change: there
+  // is nothing on the page for them to find.
+  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
+
   // The sampling DECISION is thread-local and is made without taking prof_lock.
   //
   // This used to acquire prof_lock first and decide afterwards, so every allocating
@@ -23091,66 +23116,23 @@ static mi_lock_t     mi_subprocs_lock = MI_LOCK_INITIALIZER;
   detached `theap_meta`.
 ----------------------------------------------------------- */
 
-// #266 (macOS ctest-debug-full test-stress-dynamic, ASan/DYLD_INSERT_LIBRARIES-style
-// early process bootstrap under MI_DEBUG_FULL's reentrancy checker): a thread's very
-// first touch of `heap_main` while THIS thread is already inside one of the three
-// functions below -- e.g. theap_meta's own allocation growing into a fresh arena page,
-// which needs arena bookkeeping allocated from `heap_main` (src/arena.c's
-// "arena-pages-metadata" site), which bootstraps that thread's `heap_main` theap
-// (src/theap.c:_mi_theap_init's caller, theap.c ~317), which calls `_mi_meta_zalloc`
-// again for the SAME subproc -- reaches this file recursively on the same thread while
-// `subproc->theap_meta_lock` (a plain, non-recursive pthread_mutex/SRWLock via
-// mi_lock_t) is still held by the outer call. That is a genuine reentrant-acquire
-// deadlock, not just a diagnostic false positive: MI_DEBUG_FULL's checker
-// (include/mimalloc/atomic.h's mi_lock_acquire, diagnostic.c) caught it before the
-// underlying primitive actually wedged.
-//
-// Track, per thread, the subproc currently being meta-allocated-into; if a nested call
-// targets the SAME subproc, the outer lock already protects it, so skip re-acquiring
-// (recursive-mutex semantics, implemented without changing mi_lock_t's type, which
-// backs every other lock in the codebase too). A nested call for a genuinely different
-// subproc is unaffected and still locks normally -- multi-subprocess reentrancy across
-// two different subprocs' meta locks is a separate, far rarer hazard this does not
-// claim to address.
-static mi_decl_thread mi_subproc_t* mi_meta_lock_thread_owner;
-
-static void* mi_meta_zalloc_locked(mi_subproc_t* subproc, size_t size) {
-  if (mi_meta_lock_thread_owner == subproc) {
-    // already holding this subproc's theap_meta_lock on this thread -- don't re-acquire
-    return mi_theap_zalloc(subproc->theap_meta, size);
-  }
-  void* p = NULL;
-  mi_lock(&subproc->theap_meta_lock) {
-    mi_subproc_t* const prev_owner = mi_meta_lock_thread_owner;
-    mi_meta_lock_thread_owner = subproc;
-    p = mi_theap_zalloc(subproc->theap_meta, size);
-    mi_meta_lock_thread_owner = prev_owner;
-  }
-  return p;
-}
-
 void* _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid ) {
   mi_assert_internal(subproc->theap_meta != NULL);
-  void* p = mi_meta_zalloc_locked(subproc, size);
-  if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
+  void* p = NULL;
+  mi_lock(&subproc->theap_meta_lock) {
+    p = mi_theap_zalloc(subproc->theap_meta, size);
+    if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
+  }
   return p;
 }
 
 void* _mi_meta_zalloc_aligned( mi_subproc_t* subproc, size_t size, size_t aligned, mi_memid_t* memid ) {
   mi_assert_internal(subproc->theap_meta != NULL);
   void* p = NULL;
-  if (mi_meta_lock_thread_owner == subproc) {
+  mi_lock(&subproc->theap_meta_lock) {
     p = mi_theap_zalloc_aligned(subproc->theap_meta, size, aligned);
+    if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
   }
-  else {
-    mi_lock(&subproc->theap_meta_lock) {
-      mi_subproc_t* const prev_owner = mi_meta_lock_thread_owner;
-      mi_meta_lock_thread_owner = subproc;
-      p = mi_theap_zalloc_aligned(subproc->theap_meta, size, aligned);
-      mi_meta_lock_thread_owner = prev_owner;
-    }
-  }
-  if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
   return p;
 }
 
@@ -23158,7 +23140,10 @@ void* _mi_meta_rezalloc( mi_subproc_t* subproc, void* oldp, size_t newsize, mi_m
   mi_assert_internal(subproc->theap_meta != NULL);
   // note: since we take a meta lock we cannot use `mi_theap_rezalloc` as that could call `mi_free` which
   // can call `mi_stat_free` which would try to take the meta lock again. See issue #1358.
-  void* p = mi_meta_zalloc_locked(subproc, newsize);
+  void* p = NULL;  
+  mi_lock(&subproc->theap_meta_lock) {
+    p = mi_theap_zalloc(subproc->theap_meta, newsize);
+  }
   if (p!=NULL) {
     if (oldp!=NULL) {
       const size_t oldsize  = mi_usable_size(oldp);
@@ -23295,8 +23280,7 @@ mi_subproc_id_t mi_subproc_new(void) {
   _mi_theap_init(theap_meta,heap_main,parent->theap_meta->tld /* detached tld */);
   #if MI_GUARDED
   // See the matching comment in init.c's process-main theap_meta bootstrap (#266):
-  // internal allocator bookkeeping must never be guarded. Diverges from upstream (see
-  // docs/fork-divergence.md).
+  // internal allocator bookkeeping must never be guarded.
   theap_meta->guarded_sample_rate = 0;
   #endif
   subproc->theap_meta = theap_meta;

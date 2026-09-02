@@ -811,7 +811,33 @@ if(MI_BUILD_SHARED)
       set(MINJECT_SUFFIX "-${MI_ARCH}")
     endif()
 
-    target_link_libraries(mimalloc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib)  # the DLL import library
+    if(MINGW)
+      # `mimalloc-redirect.dll` must be initialised BEFORE the C runtime it patches, and
+      # the loader initialises a module's dependencies in ITS import-table order -- so the
+      # redirect module has to precede the CRT in *this DLL's* import table, not just in
+      # the executable's.
+      #
+      # `ld` sorts those descriptors by the input file path as spelled on the link line
+      # (see the note on mimalloc-test-stress-dynamic below), and the path CMake would
+      # otherwise use here is the absolute source directory. Whether that beats the
+      # absolute sysroot path the CRT arrives on is then an accident of where the checkout
+      # happens to live: `/home/user/src/...` wins against `/home/user/.mingw/...` and
+      # loses against `/opt/...`. It was measured going both ways on the same commit --
+      # working in a local tree and failing on CI.
+      #
+      # A copy spelled `./…` (0x2e) sorts ahead of every absolute path (0x2f) instead, so
+      # the redirect module is always first. This is also the real explanation for
+      # "msvcrt redirects but UCRT does not": `mimalloc-redirect` sorts before `msvcrt.dll`
+      # but after `api-ms-win-crt-*`, so the same defect only shows up on UCRT.
+      configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib"
+        "${CMAKE_CURRENT_BINARY_DIR}/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib"
+        COPYONLY)
+      target_link_libraries(mimalloc PRIVATE
+        "-L." "-l:mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib")  # the DLL import library
+    else()
+      target_link_libraries(mimalloc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.lib)  # the DLL import library
+    endif()
     add_custom_command(TARGET mimalloc POST_BUILD
       COMMAND "${CMAKE_COMMAND}" -E copy "${CMAKE_CURRENT_SOURCE_DIR}/bin/mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.dll" $<TARGET_FILE_DIR:mimalloc>
       COMMENT "Copy mimalloc-redirect${MIMALLOC_REDIRECT_SUFFIX}.dll to output directory")

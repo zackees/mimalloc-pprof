@@ -64,7 +64,22 @@ class CoverageTest(unittest.TestCase):
         table = bundle_coverage.render([comparison])
         self.assertIn("`b`", table)
         self.assertIn("`c`", table)
-        self.assertIn("1 test(s) the native runner executes are absent", table)
+        self.assertIn("1 test(s) present in the native side are absent", table)
+
+    def test_the_report_can_name_both_sides(self) -> None:
+        """#277 phase B2: on macOS the reference side is the arm64 bundle, not a ctest run.
+
+        The heading and column names are the only thing that says which comparison was
+        actually made, so a report that still claimed "native ctest" would be a lie.
+        """
+        comparison = bundle_coverage.Comparison(label="release", native={"a", "b"}, bundle={"a"})
+        table = bundle_coverage.render(
+            [comparison], heading="arm64 vs x86_64", reference="arm64", candidate="x86_64"
+        )
+        self.assertIn("### arm64 vs x86_64", table)
+        self.assertIn("| config | arm64 | x86_64 | missing from x86_64 |", table)
+        self.assertIn("1 test(s) present in the arm64 side are absent from the x86_64 side", table)
+        self.assertNotIn("native", table)
 
     def test_a_ctest_show_only_payload_reads_the_same_as_a_manifest(self) -> None:
         # bundle_tests.py derives one from the other, so one reader covers both shapes.

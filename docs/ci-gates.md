@@ -22,9 +22,9 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 
 | Gate | What it catches | Positive control |
 |---|---|---|
-| **memory-gate** (`ci/memory_gate.py`) | peak memory or thread-count regressions vs a committed per-platform baseline | builds a copy with an injected leak; the gate must fail — verified at +212% / +98% / +27% on linux/windows/macos |
+| **memory-gate** (`ci/memory_gate.py`) | peak memory or thread-count regressions vs a committed per-platform/arch/compiler baseline | builds a copy with an injected leak; the gate must fail — verified at +212% / +98% / +27% on linux/windows/macos. The macOS lane now measures inside the `dockurr/macos` guest and bootstraps its own `macos-x86_64-soldr-clang-21-pprof1.json` |
 | **isa-baseline** (`ci/check_isa_baseline.py`) | binaries containing instructions above the CPU baseline, which SIGILL on older hardware | builds with `MI_OPT_ARCH=ON`; the scanner must fire. The parser also self-tests against x86 and arm64 fixtures on every run |
-| **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW. **macOS is gated from Linux-built bundles run on one runner** (`macos-bundles.yml`, #277 phase B); the native macOS jobs are informational during the comparison window | `ci/bundle_coverage.py` fails if any test the native macOS `ctest` would run is missing from a bundle |
+| **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW. **macOS uses no Apple hardware** (#277 phase B2): both arches are cross-built on Linux, x86_64 is executed under `dockurr/macos` on a Linux runner, arm64 is compile-only | `ci/bundle_coverage.py` fails if a test in the arm64 bundle is missing from the executed x86_64 one; `ci/lint_no_macos_runners.py` fails if any workflow names a macOS runner |
 | **ctest-guarded** | the `MI_GUARDED` guard-page path, run twice: at the default sample rate and again with `MIMALLOC_GUARDED_SAMPLE_RATE=1` so every eligible allocation is guarded | configure step greps the resolved compiler defines for `MI_GUARDED=1`, since the original bug was the flag never reaching the compiler |
 | **asan** | use-after-free, overflow and leaks under AddressSanitizer | — |
 | **fuzz** (`test/fuzz/`) | crashes from structured random allocator-API sequences, with ASan as the oracle | builds with a planted use-after-free and requires an anchored `(ERROR\|SUMMARY): AddressSanitizer:` report naming it |
@@ -95,30 +95,55 @@ requires the same test names with the same pass/fail (`--compare-junit`). Moving
 tree is the load-bearing step: the executables carry an RPATH into it, so without that
 `mv` a broken bundle would pass on the build machine by loading the original libraries.
 
-## macOS via cross-built bundles
+## macOS: cross-built on Linux, x86_64 executed under emulation
 
-Issue #277 phase B. The macOS gates no longer build on macOS. `macos-bundles.yml` builds
-the arm64 test binaries on **ubuntu-latest** through soldr's Darwin toolchain, packs them
-with `ci/bundle_tests.py`, and one `macos-latest` job runs everything serially.
+Issue #277 phase B, then **phase B2**. **No workflow in this repository schedules a job
+onto a macOS runner.** Both Apple architectures are cross-compiled on `ubuntu-latest`
+through soldr's Darwin toolchains, and the x86_64 bundle is *executed* on an
+`ubuntu-24.04` runner inside a [`dockurr/macos`](https://github.com/dockur/macos) guest
+(QEMU + KVM). `ci/lint_no_macos_runners.py` fails `python-lint` if a macOS runner label
+reappears in any workflow.
 
-The reason is queue wait, not build time. Over 20 runs per workflow, `cross.yml`'s Apple
-rows executed in 8–14 s and waited up to 5h26m (arm64) / 6h13m (Intel), p90 1h29m / 2h32m,
-while every ubuntu row waited 4–5 s. Six macOS jobs per push become one.
+Phase B's motivation was queue wait: over 20 runs per workflow, `cross.yml`'s Apple rows
+executed in 8–14 s and waited up to 5h26m (arm64) / 6h13m (Intel) — p90 1h29m / 2h32m —
+while every ubuntu row waited 4–5 s. Phase B2's motivation is a product requirement:
+mimalloc-pprof ships inside cross-compiled code, so the Linux-cross-built artifact is the
+one that must be proven to work, not a convenience.
 
-| Linux job | produces | replaces |
-|---|---|---|
-| `build-macos (macos-arm64-release)` | `bundle-macos-arm64-release` | `ctest (macos-latest)` |
-| `build-macos (macos-arm64-debug-full)` | `bundle-macos-arm64-debug-full` | `ctest-debug-full (macos-latest)` |
-| `build-macos (macos-arm64-leak)` | `bundle-macos-arm64-leak` | the `memory-gate` positive control |
-| `build-rust (aarch64-apple-darwin)` | `rust-test-bins-…` | `cross.yml` `test (aarch64-apple-darwin)` |
-| `build-rust (x86_64-apple-darwin)` | `rust-test-bins-…` | `cross.yml` `test (x86_64-apple-darwin)`, run under Rosetta 2 |
+| arch | built | executed | gate |
+|---|---|---|---|
+| `x86_64-apple-darwin` | Linux, soldr clang 21 | **yes** — `dockurr/macos` guest on `ubuntu-24.04` | full: ctest-equivalent bundles, Rust test binaries, memory gate + leak control |
+| `aarch64-apple-darwin` | Linux, soldr clang 21 | no | **compile-only**, plus the Mach-O evidence below and a suite-parity check against x86_64 |
 
-### The toolchain
+### Why arm64 is compile-only, and what that costs
 
-`cmake/toolchains/soldr-aarch64-apple-darwin.cmake` consumes only what `soldr prepare
---target aarch64-apple-darwin` exports (`CC_`/`CXX_`/`CFLAGS_`/`CXXFLAGS_`/`AR_`/`RANLIB_`
-per triple, plus `SDKROOT`), so no path, SDK version or compiler version is written down
-in the repository. One line in it is load-bearing:
+dockur publishes no arm64 image, and Apple ships no arm64 macOS that boots under QEMU on
+Linux; the only way to execute arm64 Mach-O binaries is Apple hardware, which is exactly
+what phase B2 removes. So arm64 gets a build, the header assertions below, and
+`ci/bundle_coverage.py` comparing its test-name set against the x86_64 bundle that *is*
+executed — which stops an arm64-only test from silently never running anywhere, but does
+not catch an arm64 runtime bug.
+
+Two further things are stated rather than gated, because nothing here can gate them:
+
+- **Nothing compiles this code with Apple's clang any more.** Header compatibility with
+  Apple's SDK *is* retained — soldr provisions a real Apple SDK (15.5 as of soldr 0.9.11)
+  and both toolchain files build against it, so a header-level incompatibility still
+  fails here. What is lost is narrower and worth naming precisely: **Apple-clang codegen**
+  (soldr's clang 21 and Apple's fork can differ in what they emit), and **Xcode drift** —
+  a change in a newer Xcode's SDK than the one soldr pins surfaces downstream, not here.
+  The native compile-compat build that would have caught the second went with the runners.
+- The **8 doctests** in `rust/mimalloc-pprof/src/lib.rs` run under `cargo test` and cannot
+  run from a `--tests` binary; they are Linux-only (#277 §4).
+
+### The toolchains
+
+`cmake/toolchains/soldr-aarch64-apple-darwin.cmake` and
+`cmake/toolchains/soldr-x86_64-apple-darwin.cmake` consume only what `soldr prepare
+--target <triple>` exports (`CC_`/`CXX_`/`CFLAGS_`/`CXXFLAGS_`/`AR_`/`RANLIB_` per triple,
+plus `SDKROOT`), so no path, SDK version or compiler version is written down in the
+repository. soldr 0.9.11 reports `dispatch=blessed-darwin` for both triples. One line in
+each is load-bearing:
 
 ```cmake
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
@@ -127,69 +152,169 @@ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 `CMakeLists.txt`'s `find_link_library()` falls back to `find_library()` when
 `check_linker_flag()` rejects `-l<name>`, and a Darwin link rejects both `-lrt` and
 `-latomic` — so without confining the search to the SDK, the host's ELF `librt.so` and
-`libatomic.so` are found and handed to a Mach-O link. `build-macos` asserts on the
-resolved list (`Link libraries : pthread`, exactly), not on the flag that was passed in.
+`libatomic.so` are found and handed to a Mach-O link. This matters *more* on the x86_64
+lane, where host and target share an architecture and a leaked host library is not even
+rejected for the obvious reason. `build-macos` asserts on the resolved list
+(`Link libraries : pthread`, exactly), not on the flag that was passed in.
+
+Neither file sets `CMAKE_OSX_ARCHITECTURES`: it is the switch `CMakeLists.txt` reads to
+choose universal-binary `-Xarch_*` flags. On x86_64 it decides nothing else either, since
+`CMakeLists.txt` leaves `MI_OPT_ARCH` **off** for `MI_ARCH=x64` and force-enables it only
+for arm64 — so the Intel build emits no `-march` and stays runnable on the guest's
+emulated CPU.
 
 ### What the build job proves before shipping a bundle
 
 Cross-compilation can produce a plausible-looking file that does nothing on the target, so
-the artifact is inspected rather than trusted:
+the artifact is inspected rather than trusted. Common to both arches:
 
-- arm64 Mach-O with `LC_BUILD_VERSION` (platform, `minos`, `sdk` printed into the job
-  summary — soldr's SDK moves, so it is recorded, never asserted against a constant)
 - `__DATA,__interpose` and `__DATA,__thread_vars` present: `MI_OSX_INTERPOSE` puts the
   malloc replacements in the first, and a dylib that quietly lost the section would load
-  on the runner and override nothing
-- `LC_CODE_SIGNATURE` present (ad-hoc, from `ld64.lld`) — arm64 macOS kills an unsigned
-  image before `main()` with no diagnostic
+  in the guest and override nothing
 - `tests.json` contains no absolute path, and the bundle carries a `.dylib`
+
+Per arch, and the differences are real rather than an oversight:
+
+| | arm64 | x86_64 |
+|---|---|---|
+| header | `MH_MAGIC_64 ARM64` | `MH_MAGIC_64 X86_64` |
+| version load command | `LC_BUILD_VERSION` | `LC_VERSION_MIN_MACOSX` **or** `LC_BUILD_VERSION` |
+| `LC_CODE_SIGNATURE` | **required** | not required |
+
+soldr's x86_64 lane targets `-mmacosx-version-min=10.12`, which predates
+`LC_BUILD_VERSION`, so `ld64.lld` emits the older `LC_VERSION_MIN_MACOSX`; the job accepts
+either rather than pinning today's, so a soldr bump that raises `minos` does not break the
+build for no reason. And only arm64 macOS refuses to run an unsigned image — on arm64 the
+kernel kills the process before `main()` with no diagnostic, which is why that assertion
+exists there and would be noise here.
 
 The bundle is shipped as a **tar**, not as a plain artifact upload: `upload-artifact@v4`
 drops the executable bit and does not preserve symlinks, and the bundle needs both (every
 test executable, and the `libmimalloc.dylib → libmimalloc.3.dylib` chain).
 
+### Running macOS on a Linux runner
+
+`run-macos-x64-dockur` boots a `dockurr/macos` guest, waits for ssh, copies the bundles
+and the Rust test binaries in with `ci/dockur_guest.sh`, and runs everything serially.
+Three things about it are not obvious:
+
+**There is no unattended macOS install.** dockur/windows takes an answer file; the macOS
+image has no equivalent — `/run/install.sh` exposes no automation hook and no
+unattended/answer-file variable exists. Apple's Recovery installer is a GUI that has to be
+clicked through in dockur's web viewer.
+
+That viewer is an **unauthenticated noVNC console with keyboard and mouse control of the
+VM**, so driving it from a runner would mean publishing it to the internet for the hours
+an emulated install takes, from a public repository. An earlier draft did exactly that
+behind a cloudflared quick tunnel and printed the URL into the run log. It does not exist
+any more. Instead:
+
+1. A maintainer runs **`ci/macos_golden_local.sh`** on their own Linux box — `boot` (guest
+   on `127.0.0.1:8006` only, with the click-by-click list), `check` (poll for ssh), `pack`
+   (shut down, `tar -cSf | zstd -19`, sha256, 9 GB gate).
+2. They upload the result somewhere private and run **`macos-golden-upload.yml`** with the
+   URL and sha256. Both inputs are `::add-mask::`ed before any step can echo them; the job
+   verifies the checksum, re-checks the size, proves the archive is readable, and saves it
+   to the cache. Neither the expected nor the actual digest is printed on mismatch — that
+   would let the masked value be recovered by comparison.
+3. **`macos-golden-touch.yml`** restores it weekly with `lookup-only: true`. Actions caches
+   are evicted after **7 days without a read**, and this is the one entry in the repository
+   CI cannot rebuild by itself.
+
+A cache miss in `run-macos-x64-dockur` is a hard error naming both, never a silent skip —
+so **until that image has been built and uploaded once, `run-macos-x64-dockur` is red**, on
+the PR that introduced it and on every push to `main` afterwards. That is deliberate: a
+gate that says "I have no disk to run on" is worth more than one that skips itself into a
+green tick. It fails in about two minutes.
+
+**Two archive flags are load-bearing, and both were wrong first time.** Packing uses
+`tar -cSf`: the guest disk is a raw image that is mostly holes, and without `-S` GNU tar
+stores every hole as literal zeros. zstd still compresses those to almost nothing, so the
+archive looks fine — but *extraction* then writes them as real blocks, and passing `-S` at
+extraction time does not help, because sparseness has to be recorded at creation.
+Measured on a 2 GB/21 MB sparse file: 21 MB extracted with `-S` at pack time, **2.1 GB
+without**. Scaled to a 64 GB disk that exhausts the runner, which has ~87 GB free in total.
+Unpacking uses `zstd -dc`, **not** `zstd -d --sparse … -c`: sparse mode cannot apply to a
+pipe and zstd does not ignore the flag, it fails with `zstd: error 92 : Sparse skip error`
+(reproduced on zstd 1.5.7) and hands `tar` a truncated stream.
+
+**The cache budget is the open risk.** GitHub gives a repository **10 GB of Actions cache
+in total**, shared with the soldr toolchain caches. The golden image is gated at 9 GB, and
+an image near that ceiling will LRU-evict those caches continuously — slower runs that
+never actually fail. If that happens the fix is a smaller image or a self-hosted runner.
+
+**`CPU_MODEL` is not dockur's default, and it is the difference between working and not.**
+Measured on an AMD Zen 2 host (Ryzen 7 3700X): with dockur's default profile for macOS 13
+(`Haswell-noTSX`) the guest resets immediately after `HANDOFF TO XNU` and loops forever —
+**987 resets in 7 hours, 685 MB ever written, no installer screen**. Holding everything
+else identical and setting `CPU_MODEL=Skylake-Client-v4` boots macOS Recovery in about
+**5 minutes**. dockur#268 documents the AMD symptom and the single-core mitigation
+(`CPU_CORES=1`, which both jobs apply after detecting `AuthenticAMD`); the CPU model is
+the other half of it. A guest that is *slow* and a guest that is *looping* look identical
+from outside, so the ssh-wait step prints the `HANDOFF TO XNU` count on timeout — a
+climbing count is a panic loop, a flat one is a slow boot.
+
+**The guest ships its own Python.** macOS's `/usr/bin/python3` is a Command Line Tools
+stub that opens a GUI dialog on a machine with nobody to click it, and the golden image
+deliberately carries no Xcode (every GB is a GB of cache on every run). The job downloads
+a relocatable `python-build-standalone` interpreter on the Linux side and copies it in;
+`run_test_bundle.py` and `memory_gate.py` are stdlib-only, so that is enough.
+
+`ci/dockur_guest.sh` is the only place the ssh incantation lives. It authenticates with a
+fixed local password rather than a repository secret: the guest is created fresh from a
+disk image on that runner, reachable only over loopback, and holds nothing but test
+binaries.
+
+> Apple's macOS Software Licence Agreement permits running macOS in a virtual machine only
+> on Apple-branded hardware; these jobs run it under QEMU on non-Apple Linux runners, and
+> dockur/macos states the same caveat in its own README. Recorded as a fact for whoever
+> owns that decision. The golden disk is kept in a private `actions/cache` entry, not
+> published as a release asset.
+
 ### Coverage accounting
 
-`ci/bundle_coverage.py` runs on every `run-macos`. The runner configures the same two
-CMake trees with **Xcode's** clang (`--show-only=json-v1` needs a configured tree, not a
-built one) and the script fails if any test name the native `ctest` would run is absent
-from the bundles. A name only the bundle has is reported, not fatal.
-
-Two coverage facts are stated rather than gated, because nothing can gate them:
-
-- the **8 doctests** in `rust/mimalloc-pprof/src/lib.rs` run under `cargo test` and cannot
-  run from a `--tests` binary; after phase B they are Linux-only (#277 §4)
-- the native compile-compat build uses Xcode clang and runs **no tests**: it catches
-  compile-only breakage, not codegen or runtime differences between Apple clang and
-  soldr's clang
+`ci/bundle_coverage.py` runs on every `run-macos-x64-dockur`. There is no macOS runner
+left to enumerate a native ctest suite on, so the reference side is now the **arm64
+bundle** and the candidate side the executed **x86_64** one; the script fails if a name on
+the reference side is missing from the candidate. It reads either shape — `ctest
+--show-only=json-v1` or a bundle `tests.json` — because `bundle_tests.py` derives one from
+the other, and `--heading`/`--names` make the report say which comparison was actually
+made. Both configs currently agree exactly: **27 tests** release, **34** debug-full.
 
 ### Memory-gate baselines are per toolchain now
 
-`macos-latest` now executes two differently-built arm64 binaries, and they report the same
-`platform` and the same `platform.machine()`. `ci/memory_gate.py` therefore accepts
-`--arch` and `--compiler`, which join the baseline file's name. Both are optional and
-absent by default, so `linux-pprof1.json`, `windows-pprof1.json` and `macos-pprof1.json`
-keep their names and keep matching the runs that produced them — the ubuntu baseline is
-untouched. The soldr lane asks for `macos-arm64-soldr-clang-21-pprof1.json`, which does
-not exist yet, so its first run takes the existing "no baseline → bootstrap it" path and
-uploads its JSON. Its positive control is skipped with a warning until that baseline is
-committed, because `control` requires `check` to *fail* and a missing baseline is not a
-failure.
+Binaries built by different toolchains report the same `platform` and the same
+`platform.machine()`, so `ci/memory_gate.py` accepts `--arch` and `--compiler`, which join
+the baseline file's name. Both are optional and absent by default, so `linux-pprof1.json`
+and `windows-pprof1.json` keep their names and keep matching the runs that produced them.
+The dockur lane asks for `macos-x86_64-soldr-clang-21-pprof1.json`, which does not exist
+yet, so its first run takes the "no baseline → bootstrap it" path and uploads its JSON;
+its positive control is skipped with a warning until that baseline is committed, because
+`control` requires `check` to *fail* and a missing baseline is not a failure. **These
+numbers are taken under emulation**, which is a further reason the lane must not borrow
+`macos-pprof1.json` — that file was recorded by Apple clang on native Intel hardware and
+is now orphaned.
 
 Which of those two states a run is in is decided by `memory_gate.py where`, not by
 `check`'s status. `check` exits 2 both for "no baseline" and for "this run's JSON could
 not be read", so a step that treated its 2 as "bootstrap me" would turn a **crashed gate
 binary** into a green run with a reassuring warning. `where` answers **3** for "no
-baseline" and keeps **2** for "cannot read this run", and `run-macos` additionally
-requires all eight result files to exist before it calls the gate at all.
+baseline" and keeps **2** for "cannot read this run", and the job additionally requires
+all eight result files to exist before it calls the gate at all.
 
-### Rollout
+### What was deleted
 
-The native jobs stay as a control arm, `continue-on-error: true`, for at least ten pushes:
-`c-unit.yml`'s `ctest`, `ctest-debug-full` and `memory-gate` macOS rows, `cross.yml`'s two
-Apple `test` rows, and `rust-native.yml`'s macOS row. Each carries a dated TODO naming
-what deletes it. A permanently-yellow job is worse than an absent one, so the comparison
-window is meant to end.
+Phase B2 removed, not muted: `c-unit.yml`'s `ctest` / `ctest-debug-full` / `memory-gate`
+macOS rows, `cross.yml`'s two Apple `test` rows, `rust-native.yml`'s macOS row,
+`zero-tracking.yml`'s and `auto-release.yml`'s macOS rows, `macos-bundles.yml`'s
+`run-macos` job (including its native compile-compat build), and the macOS rows of the
+inherited upstream `release.yaml` and `test.yaml` — which also ends the dormant
+`bin/bundle.sh` macOS tarballs those would have produced on a manual dispatch.
+
+`auto-release.yml` uploads **no** macOS asset and never did: only its `ubuntu-latest` row
+packages the release ZIP (the vendored C amalgamation, which is architecture-independent),
+and its macOS row ran `xtask check`, `cargo test` and `cargo publish --dry-run` — all
+platform-independent. Removing it changes no published artifact.
 
 ## Concurrency: superseded runs are cancelled
 

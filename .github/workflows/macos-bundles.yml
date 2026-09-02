@@ -1,14 +1,23 @@
 name: macos-bundles
 
-# Issue #277 phase B: build the macOS test binaries on Linux, execute them on ONE macOS
-# runner.
+# Issue #277 phase B/B2: build the macOS test binaries on Linux, and execute them on a
+# Linux runner inside a dockurr/macos guest. NO NATIVE macOS RUNNER IS USED ANYWHERE IN
+# THIS REPOSITORY (ci/lint_no_macos_runners.py enforces that).
 #
 # The motivation is not build time. Measured over 20 runs per workflow (#277 phase 0),
 # cross.yml's Apple rows EXECUTE in 8-14 seconds and WAIT up to 5h26m (arm64) / 6h13m
 # (Intel) for a runner, p90 1h29m / 2h32m, while every ubuntu row waits 4-5 s. Per push
 # there are 5-6 macOS jobs, each spinning up its own VM to check out, build and run a
 # slice of the suite. This workflow replaces all of that with two Linux build jobs and one
-# macOS job.
+# macOS job -- and phase B2 then removed that macOS job too, on the owner's requirement
+# that not one Mac build run on a native Mac device.
+#
+# What replaces it: both Apple architectures are cross-built here on Linux, and the
+# x86_64 bundle is EXECUTED under emulation (dockurr/macos, QEMU+KVM) on ubuntu-24.04.
+# aarch64 is compile-only -- there is no arm64 dockur image, and Apple ships no arm64
+# macOS VM that runs on Linux, so a compile plus the Mach-O evidence below is the whole
+# arm64 gate. Its test suite is still checked for parity against the executed x86_64 one
+# (`ci/bundle_coverage.py`), so an arm64-only test cannot be silently dropped.
 #
 # The Linux side needs no Apple hardware and no Xcode: `soldr prepare --target
 # aarch64-apple-darwin` provisions clang 21 + ld64.lld + an Apple SDK, and
@@ -16,10 +25,10 @@ name: macos-bundles
 # exported. `ci/bundle_tests.py` then turns the build tree into a directory that runs with
 # no CMake and no checkout (see docs/ci-gates.md, "Test bundles").
 #
-# While this is being compared against the jobs it replaces, the native macOS entries of
-# c-unit.yml's `ctest`/`ctest-debug-full`/`memory-gate`, cross.yml's Apple `test (*)` rows
-# and rust-native.yml's macOS row are `continue-on-error: true`. They are the control arm,
-# not decoration -- see the dated TODO on each.
+# The control arm those jobs formed is gone with them: c-unit.yml's, cross.yml's and
+# rust-native.yml's macOS rows are deleted, not muted. That is deliberate and it is a real
+# trade -- see docs/ci-gates.md "macOS" for what is and is not covered now, in particular
+# that nothing compiles this code with *Apple's* clang or against Xcode's SDK any more.
 
 env:
   SOLDR_GITHUB_TOKEN: ${{ github.token }}
@@ -50,6 +59,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Both Apple architectures, three configs each. arm64 stops after the build +
+        # Mach-O evidence (compile-only); x86_64 is carried on to `run-macos-x64-dockur`
+        # and actually executed.
         include:
           # Exactly today's macOS C coverage, no more: `ctest (macos-latest)` and
           # `ctest-debug-full (macos-latest)`. #277's review found the first draft
@@ -63,8 +75,12 @@ jobs:
           # type, and the registered test set is identical either way (verified: 32 tests
           # both ways) -- so this is parity with the job being replaced, not a downgrade.
           - bundle: macos-arm64-release
+            arch: arm64
+            triple: aarch64-apple-darwin
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON
           - bundle: macos-arm64-debug-full
+            arch: arm64
+            triple: aarch64-apple-darwin
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
           # The memory gate's positive control. It is a separate *build*
           # (MI_BENCH_INJECT_LEAK), not a separate run, so it cannot be an entry in
@@ -72,6 +88,21 @@ jobs:
           # on macOS, because a gate whose control never runs is a gate nobody has seen
           # fire (docs/ci-gates.md).
           - bundle: macos-arm64-leak
+            arch: arm64
+            triple: aarch64-apple-darwin
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
+          # x86_64: the executed lane.
+          - bundle: macos-x64-release
+            arch: x86_64
+            triple: x86_64-apple-darwin
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON
+          - bundle: macos-x64-debug-full
+            arch: x86_64
+            triple: x86_64-apple-darwin
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
+          - bundle: macos-x64-leak
+            arch: x86_64
+            triple: x86_64-apple-darwin
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
     steps:
       - uses: actions/checkout@v4
@@ -86,27 +117,29 @@ jobs:
       - name: Cache the prepared Darwin toolchain
         uses: actions/cache@v4
         with:
-          path: ~/soldr-aarch64-apple-darwin.tar.zst
-          key: soldr-prepare-aarch64-apple-darwin-${{ hashFiles('rust/rust-toolchain.toml') }}
+          path: ~/soldr-${{ matrix.triple }}.tar.zst
+          key: soldr-prepare-${{ matrix.triple }}-${{ hashFiles('rust/rust-toolchain.toml') }}
       - name: Prepare the soldr Darwin toolchain
         # `soldr prepare` resolves rustc from a rust-toolchain.toml at or above the
         # working directory, which is why this runs in rust/ like cross.yml does.
         working-directory: rust
+        env:
+          TRIPLE: ${{ matrix.triple }}
         run: |
           set -euo pipefail
-          archive="$HOME/soldr-aarch64-apple-darwin.tar.zst"
-          args=(--target aarch64-apple-darwin --github-env "$GITHUB_ENV" --save "$archive")
+          archive="$HOME/soldr-$TRIPLE.tar.zst"
+          args=(--target "$TRIPLE" --github-env "$GITHUB_ENV" --save "$archive")
           # --restore on a nonexistent archive is not a documented no-op, so only pass it
           # on a cache hit.
           if [ -f "$archive" ]; then
             args=(--restore "$archive" "${args[@]}")
           fi
           soldr prepare "${args[@]}"
-      - name: Configure for aarch64-apple-darwin
+      - name: Configure for ${{ matrix.triple }}
         run: |
           set -euo pipefail
           cmake -S . -B build -G Ninja ${{ matrix.cmake }} \
-            --toolchain cmake/toolchains/soldr-aarch64-apple-darwin.cmake \
+            --toolchain cmake/toolchains/soldr-${{ matrix.triple }}.cmake \
             --log-level=VERBOSE 2>&1 | tee configure.log
           # The find-root fix in the toolchain file is the difference between linking
           # `pthread` and silently handing the host's ELF librt.so to a Mach-O link.
@@ -118,22 +151,37 @@ jobs:
             exit 1
           fi
       - run: cmake --build build --parallel
-      - name: Prove the output is arm64 Mach-O with the profiler's Darwin sections
+      - name: Prove the output is ${{ matrix.arch }} Mach-O with the profiler's Darwin sections
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           lib=$(ls build/libmimalloc*.dylib | head -1)
           echo "## ${{ matrix.bundle }}" >> "$GITHUB_STEP_SUMMARY"
           llvm-objdump --macho --private-headers "$lib" > headers.txt
-          grep -E 'MH_MAGIC_64 +ARM64' headers.txt
-          grep -A3 'cmd LC_BUILD_VERSION' headers.txt | tee -a "$GITHUB_STEP_SUMMARY"
           # MI_OSX_INTERPOSE puts the malloc replacements in __DATA,__interpose. If a
-          # cross build silently dropped that section the dylib would load on the runner
+          # cross build silently dropped that section the dylib would load in the guest
           # and override nothing, which no test failure would obviously explain.
           llvm-objdump --macho --section-headers "$lib" | grep -q '__interpose'
           llvm-objdump --macho --section-headers "$lib" | grep -q '__thread_vars'
-          # ld64.lld ad-hoc signs arm64 images. Without a signature every process is
-          # killed by the kernel on arm64 macOS before main(), with no diagnostic.
-          grep -q 'cmd LC_CODE_SIGNATURE' headers.txt
+          if [ "$ARCH" = "arm64" ]; then
+            grep -E 'MH_MAGIC_64 +ARM64' headers.txt
+            grep -A3 'cmd LC_BUILD_VERSION' headers.txt | tee -a "$GITHUB_STEP_SUMMARY"
+            # ld64.lld ad-hoc signs arm64 images. Without a signature every process is
+            # killed by the kernel on arm64 macOS before main(), with no diagnostic.
+            grep -q 'cmd LC_CODE_SIGNATURE' headers.txt
+          else
+            grep -E 'MH_MAGIC_64 +X86_64' headers.txt
+            # NOT LC_BUILD_VERSION and NOT LC_CODE_SIGNATURE, and neither is an oversight:
+            # soldr's x86_64 lane targets -mmacosx-version-min=10.12, which predates
+            # LC_BUILD_VERSION, so ld64.lld emits the older LC_VERSION_MIN_MACOSX; and
+            # only arm64 macOS requires every image to carry a signature. Accept either
+            # version load command rather than pinning the one today's soldr happens to
+            # emit -- a soldr bump that raises minos would otherwise break this build for
+            # no real reason.
+            grep -A3 -E 'cmd (LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION)' headers.txt \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Bundle the tests
         run: python3 ci/bundle_tests.py build bundle
       - name: The manifest must carry no absolute path
@@ -263,207 +311,347 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  run-macos:
-    # The point of the whole workflow: one macOS VM, one queue slot, everything serial.
+
+  # ---------------------------------------------------------------------------------
+  # The execution lane. No Apple hardware, no macOS runner: a dockurr/macos guest
+  # (QEMU + KVM) on an ordinary ubuntu-24.04 runner runs the x86_64 bundles.
+  #
+  # Why x86_64 only: dockur publishes no arm64 image and Apple ships no arm64 macOS that
+  # boots under QEMU on Linux, so arm64 is compile-only (see this file's header). The
+  # arm64 suite is still compared against this one, below, so an arm64-only test cannot
+  # go missing unnoticed.
+  #
+  # Why a prebuilt disk: macOS has no unattended installer. Apple's Recovery installer is
+  # a GUI that must be driven by a human through dockur's web viewer on :8006 (verified
+  # against the image: /run/install.sh has no automation hook, and the image exposes no
+  # unattended/answer-file variable the way dockur/windows does). Installing on every run
+  # is therefore not an option at any price. The disk is built ONCE, on a maintainer's own
+  # machine, by `ci/macos_golden_local.sh`, and published into the Actions cache by
+  # `macos-golden-upload.yml`. A cache miss here is a hard error naming both, never a
+  # silent skip.
+  #
+  # The install is deliberately NOT done on a runner. Driving Apple's Recovery GUI in CI
+  # would mean exposing dockur's web viewer -- an unauthenticated noVNC console with
+  # keyboard and mouse control of the VM -- to the public internet for the hours an
+  # emulated install takes, from a public repository. Loopback on a maintainer's machine
+  # costs nothing and risks nothing.
+  #
+  # CONSEQUENCE, stated plainly rather than left for a reviewer to discover: until that
+  # image has been built and uploaded once, THIS JOB IS RED -- on the PR that introduces
+  # it and on every push to main after it merges. That is deliberate. A gate that reports
+  # "I have no disk to run on" is worth more than one that skips itself into a green tick,
+  # which is the exact failure mode docs/ci-gates.md exists to prevent. It fails in about
+  # two minutes and costs one Linux runner.
+  # ---------------------------------------------------------------------------------
+  run-macos-x64-dockur:
+    name: run-macos-x64 (dockurr/macos on Linux)
     needs: [build-macos, build-rust-apple]
-    runs-on: macos-latest
-    # Everything this job does is serial, so a hung test would otherwise hold the very
-    # macOS slot this workflow exists to stop wasting. Observed end-to-end: ~1m40s.
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    # Generous on purpose: the guest is emulated, the host may be AMD (which dockur pins
+    # to a single core, see below), and everything in it runs serially.
+    timeout-minutes: 120
+    env:
+      # Bump the trailing version when the golden image is rebuilt, so a stale disk can
+      # never be silently reused after the guest's toolchain or user setup changes.
+      GOLDEN_KEY: macos-x64-golden-ventura-v1
+      # The guest is ephemeral, reachable only on this runner's loopback, and holds
+      # nothing but test binaries; a fixed local password is what the golden image is
+      # built with so that this job needs no repository secret and no key distribution.
+      GUEST_USER: ci
+      GUEST_PASS: ci
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
-          pattern: bundle-macos-*
+          pattern: bundle-macos-x64-*
           path: artifacts
       - uses: actions/download-artifact@v4
         with:
-          pattern: rust-test-bins-*
+          pattern: bundle-macos-arm64-*
+          path: arm64-artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-test-bins-x86_64-apple-darwin
           path: rust-bins
-      - name: Unpack the bundles
+
+      # Measured on ubuntu-24.04 (#277 phase B2 probe): one 145 GB `/dev/root` with
+      # ~87 GB free, and `/mnt` on that same filesystem rather than a separate temp disk.
+      # 87 GB is ample for a 64 GB sparse guest disk, but print it -- a full disk during a
+      # macOS boot surfaces as an unexplained QEMU exit.
+      - name: Unpack both arches' bundles on the runner
+        # Done here, before anything touches the guest, because the coverage comparison
+        # below is a property of the two bundles and not of the guest: if macOS never
+        # boots, "do these two bundles cover the same tests" is still a question with an
+        # answer, and still worth failing on. Staging into the guest copies from here.
         run: |
           set -euo pipefail
-          for archive in artifacts/*/*.tar.gz; do
+          for archive in artifacts/*/*.tar.gz arm64-artifacts/*/*.tar.gz; do
             name=$(basename "$archive" .tar.gz)
-            mkdir -p "bundle/$name"
-            tar -C "bundle/$name" -xzf "$archive"
+            mkdir -p "bundles/$name"
+            tar -C "bundles/$name" -xzf "$archive"
           done
-          # A cross-built binary that will not even load is the failure this whole phase
-          # risks, so say what these files are before running anything.
-          file bundle/macos-arm64-release/mimalloc-test-api
-          ls -l bundle/macos-arm64-release | head -40
+          ls -1 bundles
 
-      - name: ctest (macos-latest) equivalent -- macos-arm64-release
+      - name: Coverage -- the executed x86_64 bundles must run the whole arm64 suite
+        # There is no native macOS runner left to enumerate a ctest suite on, so the
+        # reference side is the arm64 bundle: arm64 is compile-only, and this is what
+        # stops a test that exists only there from quietly never running anywhere.
         run: |
-          python3 ci/run_test_bundle.py bundle/macos-arm64-release \
-            --junit "$GITHUB_WORKSPACE/bundle-release.xml"
-      - name: ctest-debug-full (macos-latest) equivalent -- macos-arm64-debug-full
+          set -euo pipefail
+          python3 ci/bundle_coverage.py \
+            --heading "macOS coverage: arm64 (compile-only) vs x86_64 (executed under dockurr/macos)" \
+            --names arm64 x86_64 \
+            --compare "release" bundles/macos-arm64-release/tests.json bundles/macos-x64-release/tests.json \
+            --compare "debug-full" bundles/macos-arm64-debug-full/tests.json bundles/macos-x64-debug-full/tests.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Make room for the guest disk
+        run: |
+          set -euo pipefail
+          df -h / /mnt
+          sudo mkdir -p /mnt/macstore /mnt/golden
+          sudo chown "$USER" /mnt/macstore /mnt/golden
+
+      - name: Restore the golden macOS disk
+        id: golden
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/golden
+          key: ${{ env.GOLDEN_KEY }}
+
+      - name: A golden disk is required
+        if: steps.golden.outputs.cache-hit != 'true'
+        run: |
+          echo "::error::No golden macOS disk under cache key '$GOLDEN_KEY'." \
+               "macOS has no unattended installer, so this job cannot bootstrap itself." \
+               "Build the image once on your own machine with ci/macos_golden_local.sh" \
+               "(boot -> click through Apple's installer -> pack), then publish it with" \
+               "the 'macos-golden-upload' workflow and re-run this job."
+          exit 1
+
+      - name: Give containers access to /dev/kvm
+        # This is the sequence GitHub's nested-virtualisation documentation prescribes.
+        # Measured caveat (#277 phase B2 probe on ubuntu-24.04): the rule does NOT change
+        # the mode -- /dev/kvm is `crw-rw---- root kvm` before and after -- and containers
+        # can open it anyway. So the rule is kept as documented-but-harmless, and the
+        # `docker run` below is the check that actually decides, because it tests the
+        # thing the guest needs rather than the permission bits it was assumed to need.
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          # Assert the container can really open it. Without this the failure surfaces
+          # much later as an unexplained QEMU exit.
+          docker run --rm --device=/dev/kvm alpine ls -l /dev/kvm
+
+      - name: Unpack the golden disk and boot the guest
+        id: boot
+        run: |
+          set -euo pipefail
+          # NOT `zstd -d --sparse ... -c`: sparse mode cannot apply to a pipe, and zstd
+          # does not ignore the flag, it fails -- `zstd: error 92 : Sparse skip error`,
+          # reproduced on zstd 1.5.7, which then feeds tar a truncated stream and reports
+          # "This does not look like a tar archive". The holes are preserved anyway,
+          # because `macos_golden_local.sh pack` recorded them with `tar -cSf`; GNU tar
+          # restores a sparse member's holes on extraction from that format on its own.
+          zstd -dc /mnt/golden/macstore.tar.zst | tar -C /mnt/macstore -xSf -
+          du -sh /mnt/macstore
+
+          # dockur pins AMD hosts to one core (dockur/macos#268: the guest panics with
+          # more). Detect rather than hardcode -- GitHub's Linux pool mixes Intel Xeon and
+          # AMD EPYC, and picking wrong is either a panic loop or a needless 4x slowdown.
+          vendor=$(lscpu | awk -F: '/Vendor ID/{gsub(/ /,"",$2); print $2}')
+          if [ "$vendor" = "AuthenticAMD" ]; then cores=1; else cores=$(nproc); fi
+          echo "host CPU vendor=$vendor -> CPU_CORES=$cores"
+          echo "cores=$cores" >> "$GITHUB_OUTPUT"
+
+          # CPU_MODEL is NOT dockur's default, and this is the single most load-bearing
+          # line in the job. Measured on an AMD Zen 2 host (Ryzen 7 3700X): with dockur's
+          # default profile for macOS 13 (`Haswell-noTSX`) the guest resets immediately
+          # after "HANDOFF TO XNU" and loops forever -- 987 resets in 7 hours, 685 MB ever
+          # written, no installer screen. Holding everything else identical and setting
+          # `Skylake-Client-v4` boots macOS Recovery in about 5 minutes. dockur#268
+          # describes the AMD symptom and the single-core mitigation; the CPU model is the
+          # other half and it is not defaulted for macOS 13.
+          # 127.0.0.1 explicitly: Docker's default publish address is 0.0.0.0, and the
+          # guest's sshd accepts a fixed password. Nothing outside this runner has any
+          # business reaching it. (Port 8006, dockur's VNC console, is not published at
+          # all -- nothing here drives the GUI.)
+          docker run -d --name macguest \
+            --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
+            -p 127.0.0.1:2222:22 \
+            -e VERSION=13 -e RAM_SIZE=6G -e CPU_CORES="$cores" -e DISK_SIZE=64G \
+            -e CPU_MODEL="Skylake-Client-v4" \
+            -v /mnt/macstore:/storage \
+            dockurr/macos
+
+      - name: Wait for the guest to accept ssh
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          # A boot probe, never a fixed sleep: an emulated macOS boot is minutes and
+          # varies with the host. Poll the thing that actually has to work.
+          deadline=$(( $(date +%s) + 1800 ))
+          until sshpass -p "$GUEST_PASS" ssh -p 2222 \
+                  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                  -o ConnectTimeout=5 -o ConnectionAttempts=1 "$GUEST_USER@127.0.0.1" true 2>/dev/null; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::the macOS guest never accepted ssh within 30 minutes"
+              docker logs macguest 2>&1 | grep -viE 'BdsDxe|EXITBS|EB\.BST|B:BOOT|HANDOFF|End of efiboot' | tail -40
+              # A boot LOOP and a slow boot look identical from outside; this is what
+              # tells them apart in the log.
+              echo "XNU handoffs (a climbing count means a panic loop, not a slow boot): \
+                $(docker logs macguest 2>&1 | grep -c 'HANDOFF TO XNU' || true)"
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "guest is up after $SECONDS s"
+          sshpass -p "$GUEST_PASS" ssh -p 2222 -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null "$GUEST_USER@127.0.0.1" \
+            'sw_vers; uname -m; sysctl -n machdep.cpu.brand_string'
+
+      - name: Stage the payload into the guest
+        run: |
+          set -euo pipefail
+          mkdir -p payload
+          # Only the x86_64 bundles go into the guest; the arm64 ones exist on the runner
+          # for the coverage comparison and are never executed anywhere.
+          cp -r bundles/macos-x64-* payload/
+          chmod +x rust-bins/* || true
+          cp -r rust-bins payload/rust-bins
+          cp ci/run_test_bundle.py ci/memory_gate.py payload/
+          cp -r ci/memory-baselines payload/memory-baselines
+
+          # A relocatable CPython, because the guest's /usr/bin/python3 is a Command Line
+          # Tools stub that pops a GUI dialog on a machine with no one to click it, and
+          # the golden image deliberately does not carry Xcode. run_test_bundle.py and
+          # memory_gate.py are stdlib-only, so a bare interpreter is enough.
+          curl -fsSL -o cpython.tar.gz \
+            "https://github.com/astral-sh/python-build-standalone/releases/download/20250612/cpython-3.12.11+20250612-x86_64-apple-darwin-install_only.tar.gz"
+          cp cpython.tar.gz payload/
+
+          tar -czf payload.tar.gz payload
+          ls -lh payload.tar.gz
+          sshpass -p "$GUEST_PASS" scp -P 2222 -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null payload.tar.gz "$GUEST_USER@127.0.0.1:~/"
+          sshpass -p "$GUEST_PASS" ssh -p 2222 -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null "$GUEST_USER@127.0.0.1" \
+            'set -e; rm -rf ~/w; mkdir ~/w; tar -C ~/w -xzf ~/payload.tar.gz; \
+             tar -C ~/w/payload -xzf ~/w/payload/cpython.tar.gz; \
+             ~/w/payload/python/bin/python3 -VV; \
+             file ~/w/payload/macos-x64-release/mimalloc-test-api'
+
+      # Everything below runs INSIDE the guest. `G` is the one place the ssh incantation
+      # lives; every step reuses it so a change to the transport cannot half-apply.
+      - name: ctest (macOS x86_64) equivalent -- macos-x64-release
+        run: |
+          set -euo pipefail
+          ./ci/dockur_guest.sh run \
+            'cd ~/w/payload && ./python/bin/python3 run_test_bundle.py macos-x64-release --junit ~/bundle-release.xml'
+      - name: ctest-debug-full (macOS x86_64) equivalent -- macos-x64-debug-full
         # Carries the six run-negative.cmake controls and the DYLD_INSERT_LIBRARIES
         # interposition test; run serially after the release bundle, never alongside it.
         run: |
-          python3 ci/run_test_bundle.py bundle/macos-arm64-debug-full \
-            --junit "$GITHUB_WORKSPACE/bundle-debug-full.xml"
+          set -euo pipefail
+          ./ci/dockur_guest.sh run \
+            'cd ~/w/payload && ./python/bin/python3 run_test_bundle.py macos-x64-debug-full --junit ~/bundle-debug-full.xml'
 
-      - name: Install Rosetta if x86_64 binaries cannot run
-        run: |
-          if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
-            sudo softwareupdate --install-rosetta --agree-to-license
-          fi
       - name: Run the cross-built Rust test binaries
-        # Replaces cross.yml's `test (aarch64-apple-darwin)` and
-        # `test (x86_64-apple-darwin)`. Those rows have `pprof: false`, so there is no
-        # pprof-parses-a-dump step here either -- parity, not a silent reduction.
-        # These link MI_STATIC_LIB, so Rosetta is translating an ordinary static binary;
-        # no dylib interposition is involved.
+        # Replaces cross.yml's `test (x86_64-apple-darwin)` row. That row had
+        # `pprof: false`, so there is no pprof-parses-a-dump step here either -- parity,
+        # not a silent reduction. These link MI_STATIC_LIB, so no dylib interposition is
+        # involved. Native x86_64 in this guest: no Rosetta anywhere, which is one whole
+        # class of "is this Rosetta or is this us" ambiguity gone.
         run: |
           set -euo pipefail
-          for target_dir in rust-bins/rust-test-bins-*; do
-            target=${target_dir#rust-bins/rust-test-bins-}
-            echo "::group::$target"
-            chmod +x "$target_dir"/*
-            for test_binary in "$target_dir"/*; do
-              case "$target" in
-                x86_64-*) arch -x86_64 "$test_binary" --test-threads=4 ;;
-                *) "$test_binary" --test-threads=4 ;;
-              esac
-            done
-            echo "::endgroup::"
-          done
+          ./ci/dockur_guest.sh run \
+            'set -e; cd ~/w/payload/rust-bins; chmod +x *; \
+             for t in *; do echo "== $t"; ./"$t" --test-threads=4; done'
 
       - name: Memory gate -- 8 runs from the release bundle
         run: |
           set -euo pipefail
-          exe="$PWD/bundle/macos-arm64-release/mimalloc-test-memory-gate"
-          for i in 1 2 3 4 5 6 7 8; do
-            MI_BENCH_JSON="$PWD/result-$i.json" "$exe" > /dev/null
-          done
-          # A gate binary that crashed writes no JSON, the glob stays unexpanded, and
-          # every downstream error would then be indistinguishable from "this lane has no
-          # baseline yet" -- i.e. a green step. Count first.
-          # Counted with a glob, not `ls | wc -l`: under `set -o pipefail` a pipeline
-          # whose `ls` finds nothing fails, and the failing assignment would then kill the
-          # step before it could say why.
-          count=0
-          for produced in result-*.json; do
-            if [ -e "$produced" ]; then count=$((count + 1)); fi
-          done
-          if [ "$count" -ne 8 ]; then
-            echo "::error::only $count of 8 memory-gate runs produced JSON"
-            exit 1
-          fi
-          cat result-1.json
           # --arch/--compiler give this lane its own baseline. Without them it would be
           # compared against ci/memory-baselines/macos-pprof1.json, which Apple clang
-          # recorded on this same runner -- a cross-toolchain comparison dressed as a
-          # regression check (#277 phase B).
-          #
-          # "Is this lane new?" is decided by `where`, which answers 3 for "no baseline"
-          # and 2 for "cannot read this run". `check` collapses both into 2, so gating the
-          # yellow bootstrap path on check's own status would report an unreadable or
-          # missing result as a bootstrap and exit green.
+          # recorded on a native Intel runner -- a cross-toolchain, cross-machine
+          # comparison dressed as a regression check. The numbers here are additionally
+          # taken under emulation, which is exactly why they need their own file.
+          ./ci/dockur_guest.sh run 'set -e; cd ~/w/payload; \
+            for i in 1 2 3 4 5 6 7 8; do \
+              MI_BENCH_JSON="$PWD/result-$i.json" ./macos-x64-release/mimalloc-test-memory-gate > /dev/null; \
+            done; \
+            count=0; for f in result-*.json; do [ -e "$f" ] && count=$((count+1)); done; \
+            if [ "$count" -ne 8 ]; then echo "only $count of 8 memory-gate runs produced JSON"; exit 1; fi; \
+            cat result-1.json'
+          # `where` distinguishes "no baseline yet" (3) from "cannot read this run" (2);
+          # `check` collapses both into 2, so gating the yellow bootstrap path on check's
+          # own status would report an unreadable result as a bootstrap and exit green.
           rc=0
-          python3 ci/memory_gate.py where --arch arm64 --compiler soldr-clang-21 result-1.json || rc=$?
+          ./ci/dockur_guest.sh run 'cd ~/w/payload && ./python/bin/python3 memory_gate.py where \
+             --arch x86_64 --compiler soldr-clang-21 result-1.json' || rc=$?
           case "$rc" in
-            0)
-              python3 ci/memory_gate.py check --arch arm64 --compiler soldr-clang-21 result-*.json
-              ;;
-            3)
-              echo "::warning::No committed baseline for the soldr arm64 lane yet -- bootstrap it from this run's memory-gate artifact."
-              # `check` exits 2 here by construction: the probe just proved the baseline is
-              # absent, so its status carries no information -- but its report does.
-              python3 ci/memory_gate.py check --arch arm64 --compiler soldr-clang-21 result-*.json || true
-              ;;
-            *)
-              echo "::error::memory_gate could not read this run's JSON (rc=$rc)"
-              exit 1
-              ;;
+            0) ./ci/dockur_guest.sh run 'cd ~/w/payload && ./python/bin/python3 memory_gate.py check \
+                 --arch x86_64 --compiler soldr-clang-21 result-*.json' ;;
+            3) echo "::warning::No committed baseline for the dockur x86_64 lane yet -- bootstrap it from this run's memory-gate artifact."
+               ./ci/dockur_guest.sh run 'cd ~/w/payload && ./python/bin/python3 memory_gate.py check \
+                 --arch x86_64 --compiler soldr-clang-21 result-*.json' || true ;;
+            *) echo "::error::memory_gate could not read this run's JSON (rc=$rc)"; exit 1 ;;
           esac
+
       - name: Positive control -- the gate must catch an injected leak
         run: |
           set -euo pipefail
-          exe="$PWD/bundle/macos-arm64-leak/mimalloc-test-memory-gate"
-          for i in 1 2 3 4 5 6 7 8; do
-            MI_BENCH_JSON="$PWD/leak-$i.json" "$exe" > /dev/null || true
-          done
-          # The leak build is *expected* to exit non-zero (hence `|| true` above), which
-          # makes the file count the only evidence that it ran at all.
-          count=0
-          for produced in leak-*.json; do
-            if [ -e "$produced" ]; then count=$((count + 1)); fi
-          done
-          if [ "$count" -ne 8 ]; then
-            echo "::error::only $count of 8 leak-control runs produced JSON"
-            exit 1
-          fi
+          ./ci/dockur_guest.sh run 'set -e; cd ~/w/payload; \
+            for i in 1 2 3 4 5 6 7 8; do \
+              MI_BENCH_JSON="$PWD/leak-$i.json" ./macos-x64-leak/mimalloc-test-memory-gate > /dev/null || true; \
+            done; \
+            count=0; for f in leak-*.json; do [ -e "$f" ] && count=$((count+1)); done; \
+            if [ "$count" -ne 8 ]; then echo "only $count of 8 leak-control runs produced JSON"; exit 1; fi'
           # `control` requires `check` to FAIL. A missing baseline is not a failure, it is
           # a bootstrap, so before this lane's baseline is committed the control would go
-          # red for the wrong reason. Ask memory_gate.py where the baseline lives rather
-          # than hardcoding a name it computes -- and distinguish "no baseline" (3) from
-          # "cannot read this run" (2), which must stay a hard failure.
+          # red for the wrong reason.
           rc=0
-          python3 ci/memory_gate.py where --arch arm64 --compiler soldr-clang-21 leak-1.json || rc=$?
+          ./ci/dockur_guest.sh run 'cd ~/w/payload && ./python/bin/python3 memory_gate.py where \
+             --arch x86_64 --compiler soldr-clang-21 leak-1.json' || rc=$?
           case "$rc" in
-            0)
-              python3 ci/memory_gate.py control --arch arm64 --compiler soldr-clang-21 leak-*.json
-              ;;
-            3)
-              echo "::warning::the soldr arm64 lane has no committed baseline yet, so its positive control cannot run. Commit the baseline, then this becomes a hard gate."
-              ;;
-            *)
-              echo "::error::memory_gate could not read the leak control's JSON (rc=$rc)"
-              exit 1
-              ;;
+            0) ./ci/dockur_guest.sh run 'cd ~/w/payload && ./python/bin/python3 memory_gate.py control \
+                 --arch x86_64 --compiler soldr-clang-21 leak-*.json' ;;
+            3) echo "::warning::the dockur x86_64 lane has no committed baseline yet, so its positive control cannot run. Commit the baseline, then this becomes a hard gate." ;;
+            *) echo "::error::memory_gate could not read the leak control's JSON (rc=$rc)"; exit 1 ;;
           esac
+
+      - name: Retrieve results from the guest
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          ./ci/dockur_guest.sh pull '~/bundle-release.xml' bundle-release.xml || true
+          ./ci/dockur_guest.sh pull '~/bundle-debug-full.xml' bundle-debug-full.xml || true
+          ./ci/dockur_guest.sh pull '~/w/payload/result-\*.json' . || true
+          ./ci/dockur_guest.sh pull '~/w/payload/leak-\*.json' . || true
+          ls -l bundle-*.xml result-*.json leak-*.json 2>/dev/null || true
+
+      - name: Guest and QEMU logs
+        if: ${{ !cancelled() }}
+        run: |
+          docker logs macguest 2>&1 \
+            | grep -viE 'BdsDxe|EXITBS|EB\.BST|B:BOOT|HANDOFF|End of efiboot' \
+            | tail -60 > dockur.log || true
+          echo "XNU handoffs: $(docker logs macguest 2>&1 | grep -c 'HANDOFF TO XNU' || true)" >> dockur.log
+          cat dockur.log
+
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: memory-gate-macos-arm64-soldr
-          # The leak runs too: they are what a reader needs to see why the control did or
-          # did not fire, and the gate runs are what the baseline is bootstrapped from.
+          name: memory-gate-macos-x64-dockur
           path: |
             result-*.json
             leak-*.json
-          if-no-files-found: error
-
-      - name: Native compile-compat check (Xcode clang, no tests)
-        # The bundles are built by soldr's clang against soldr's SDK. This is the only
-        # thing on this runner that still uses Xcode's compiler and headers, and it
-        # catches compile-only breakage (an Apple-clang-specific rejection, an SDK
-        # header change) that a cross build would not. It deliberately runs NO tests --
-        # the bundles do that -- so it costs a configure and a build, not a VM.
-        if: ${{ !cancelled() }}
-        run: |
-          set -euo pipefail
-          # Must stay in step with c-unit.yml's `ctest` job (`cmake -B build -DMI_PPROF=ON`,
-          # built `--config Release`): this tree is the native half of the coverage
-          # comparison below, so if that job's flags change and these do not, the
-          # comparison silently stops describing the job being replaced. CMAKE_BUILD_TYPE
-          # is spelled out because there it is implied -- CMakeLists.txt (~137-145)
-          # defaults it to Release from the binary directory's name.
-          cmake -B native-release -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build native-release --config Release --parallel
-          cc --version
-      - name: Enumerate what the native runner's own ctest would run
-        # `--show-only` needs a configured tree, not a built one, so the debug-full side
-        # of the coverage comparison costs a configure and nothing more.
-        if: ${{ !cancelled() }}
-        run: |
-          set -euo pipefail
-          # Same pairing as above, against c-unit.yml's `ctest-debug-full` job
-          # (`cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON`, built `--config Debug`).
-          # Release is not a typo: that job passes no CMAKE_BUILD_TYPE, its binary
-          # directory is `build`, and MI_DEBUG_FULL sets MI_DEBUG=3 independently of the
-          # build type -- so Release+MI_DEBUG_FULL is what it actually compiles.
-          cmake -B native-debug-full -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DCMAKE_BUILD_TYPE=Release
-          ctest --test-dir native-release --show-only=json-v1 > native-release.json
-          ctest --test-dir native-debug-full --show-only=json-v1 > native-debug-full.json
-      - name: Coverage -- the bundles must run every test the native runner would
-        if: ${{ !cancelled() }}
-        run: |
-          python3 ci/bundle_coverage.py \
-            --compare "ctest (macos-latest)" native-release.json bundle/macos-arm64-release/tests.json \
-            --compare "ctest-debug-full (macos-latest)" native-debug-full.json bundle/macos-arm64-debug-full/tests.json \
-            --summary "$GITHUB_STEP_SUMMARY"
+          if-no-files-found: warn
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
@@ -471,7 +659,6 @@ jobs:
           path: |
             bundle-release.xml
             bundle-debug-full.xml
-            native-release.json
-            native-debug-full.json
+            dockur.log
           if-no-files-found: warn
           retention-days: 7

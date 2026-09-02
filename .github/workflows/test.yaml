@@ -18,11 +18,8 @@ jobs:
     strategy:
       matrix:
         tests: [basic,extra]
-        os: [windows-latest, macos-latest, ubuntu-latest, macos-14, macos-15-intel, ubuntu-22.04-arm, windows-11-arm]
-        exclude:
-          - os: macos-14
-            tests: extra          
-        
+        os: [windows-latest, ubuntu-latest, ubuntu-22.04-arm, windows-11-arm]
+
     steps:
       # Checkout: https://github.com/actions/checkout
       - name: Checkout repository

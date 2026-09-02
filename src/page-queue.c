@@ -213,11 +213,50 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
 
   mi_page_t* page = pq->first;
   if (pq->first == NULL) page = _mi_page_empty_get();
+  #if MI_PPROF
+  bool prof_poisoning = false;
+  // #267: while the profiler is forcing this theap onto the slow path, substitute the
+  // empty page for the real one here -- same effect as poisoning (every malloc misses the
+  // fast list-pop and lands in `_mi_malloc_generic`, where the sampling countdown lives),
+  // but derived fresh from the CURRENT queue state on every call instead of freezing
+  // `pages_free_direct` at whatever `_mi_theap_pages_free_direct_poison` last wrote.
+  //
+  // This is a correctness fix, not just a cost one: an earlier version of this code
+  // early-returned here instead, skipping the write entirely while `prof_force_slow` was
+  // set. That is unsafe -- when a page is later retired (`_mi_page_free` ->
+  // `mi_page_queue_remove` -> this same function, one of its other callers below) while
+  // poisoned, an early return would leave that page's now-stale pointer sitting in
+  // `pages_free_direct` even after the arena reclaims its memory, a use-after-free on the
+  // next fast-path allocation of that size class. Substituting the empty sentinel instead
+  // keeps every write self-consistent with "currently valid queue page, or empty",
+  // regardless of any race with `_mi_subproc_prof_sync_force_slow`'s cross-thread flag/
+  // poison writes (subproc.c) -- this thread always derives the value from its own,
+  // definitely-current `pq->first`, never from a value written by another thread.
+  if mi_unlikely(theap->prof_force_slow) { page = _mi_page_empty_get(); prof_poisoning = true; }
+  #endif
 
   // find index in the right direct page array
   const size_t idx = _mi_wsize_from_size(size);
   mi_page_t** const pages_free = theap->pages_free_direct;
+  #if MI_PPROF
+  // #267: the "already set" short-circuit below assumes the whole [start..idx] range was
+  // last written as one unit by THIS function -- true when only the owning thread ever
+  // writes `pages_free_direct` (Bun's design: its poison/unpoison runs same-thread, at
+  // theap init). Not true here: `_mi_theap_pages_free_direct_poison` (below) writes the
+  // FULL [0..MI_PAGES_DIRECT) range cross-thread, one entry at a time, with no ordering
+  // guarantee against this function's own concurrent [start..idx] write. A page can start
+  // that race sampled at both ends (`pages_free[idx] == empty`, matching `page` here) while
+  // an interior slot j in [start,idx) still holds a stale real page from this function's
+  // own not-yet-fully-applied write -- the short-circuit would then return without ever
+  // repairing slot j, and it stays wrong for the rest of this profiling run (see the
+  // multi-entry range built below: a size class can span several `pages_free_direct`
+  // slots). Disabling the short-circuit while poisoned costs at most a few extra stores
+  // per update (already on the slow, profiling-only path) and lets every call re-cover the
+  // whole range, self-healing slot j the next time this queue is touched.
+  if (pages_free[idx] == page && !prof_poisoning) return;  // already set
+  #else
   if (pages_free[idx] == page) return;  // already set
+  #endif
 
   // find start slot
   size_t start;
@@ -242,6 +281,23 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
     pages_free[sz] = page;
   }
 }
+
+#if MI_PPROF
+// #267: force every entry to the empty page so the small-object fast path
+// (`alloc.c:mi_page_malloc_zero`, reached via `internal.h:_mi_theap_get_free_small_page`)
+// always misses and falls through to `_mi_malloc_generic`. Called only from
+// `_mi_subproc_prof_sync_force_slow()` (subproc.c), which already holds
+// `heap->theaps_lock` for this theap -- a cross-thread plain-pointer write into memory the
+// owning thread may concurrently read lock-free; see that function's comment for why this
+// is safe (every possible value is either a valid live page or the static empty page,
+// never a dangling one). Strategy ported from oven-sh/mimalloc @ 942b8342, MIT.
+void _mi_theap_pages_free_direct_poison(mi_theap_t* theap) {
+  mi_page_t* const empty = _mi_page_empty_get();
+  for (size_t i = 0; i < MI_PAGES_DIRECT; i++) {
+    theap->pages_free_direct[i] = empty;
+  }
+}
+#endif
 
 /*
 static bool mi_page_queue_is_empty(mi_page_queue_t* queue) {

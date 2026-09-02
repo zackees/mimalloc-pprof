@@ -300,6 +300,18 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
     theap->hnext = head;
     if (head!=NULL) { head->hprev = theap; }
     heap->theaps = theap;
+    #if MI_PPROF
+    // #267: read the profiler's current run state and push under the SAME lock that
+    // `_mi_subproc_prof_sync_force_slow` (subproc.c) holds while poisoning every theap in
+    // this heap's list -- this serializes "am I in the list yet" against "is profiling
+    // enabled yet" so a theap created concurrently with `mi_prof_start`/`mi_prof_stop` is
+    // never missed: either this push is ordered before that walk (which then sees and
+    // sets this theap itself) or after it (in which case `mi_prof_is_enabled()` already
+    // reflects the new state). `pages_free_direct` starts out fully poisoned regardless
+    // (copied from the empty-theap template above, before any real page is queued), so no
+    // separate poison call is needed here when force_slow comes back true.
+    theap->prof_force_slow = mi_prof_is_enabled();
+    #endif
   }
 }
 

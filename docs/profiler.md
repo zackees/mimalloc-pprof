@@ -4,29 +4,36 @@
 
 ## What it costs when it is not running
 
-Measured, so you can decide whether to ship `MI_PPROF=ON`. Windows/MinGW, Release,
-4M alloc/free pairs single-threaded, both arms built from the same commit and run
-interleaved, minimum of four runs of three reps each:
+**Fixed in #267 (Bun parity P2).** `mi_malloc`/`mi_heap_malloc_small`'s fast path
+(the small-object free-list pop) now contains **zero** profiler instructions —
+verified by disassembling the Release static lib: no call to any `_mi_prof_*`
+function and no load of profiler state, byte-identical between `MI_PPROF=ON` and
+`MI_PPROF=OFF`. The sampling countdown moved to `_mi_malloc_generic` (the slow
+path), which every allocation is routed through *only* while the profiler is
+actually running: `mi_prof_start` poisons every theap's `pages_free_direct` (Bun's
+strategy, ported from `oven-sh/mimalloc@942b8342`, MIT) so the fast path always
+misses for as long as profiling is on, and stops poisoning it — same-thread,
+lock-free — the moment `mi_prof_stop` runs.
 
-| build | ns per allocation | within-arm spread |
-|---|---|---|
-| `MI_PPROF=OFF` | **11.75** | 4% |
-| `MI_PPROF=ON`, profiler stopped | **20.00** | 14% |
+Historical context: #154 originally measured **+70% per allocation** (11.75 ns
+`MI_PPROF=OFF` vs. 20.00 ns `MI_PPROF=ON`-stopped, Windows/MinGW Release, 4M
+alloc/free pairs single-threaded) from the old unconditional `_mi_prof_on_alloc`
+call on the fast path. A quick re-measurement on Linux (shared dev container, not
+a dedicated benchmark host — noisier than #154's numbers, but the direction is
+unambiguous and corroborated by the disassembly proof above) puts `MI_PPROF=OFF`
+and `MI_PPROF=ON`-stopped within a few percent of each other, both far below the
+actively-running cost:
 
-**About +70% per allocation with the profiler switched off.** That is the cost of the
-unconditional `_mi_prof_on_alloc` call on the allocation fast path, which then checks an
-atomic flag and returns. Single-threaded on purpose — this is per-allocation instruction
-count, not lock contention (contention was a separate defect, fixed in #152).
+| build | ns per alloc+free pair (best of 5, N=4M) |
+|---|---|
+| `MI_PPROF=OFF` | ~24–31 |
+| `MI_PPROF=ON`, profiler stopped | ~28 |
+| `MI_PPROF=ON`, profiler running (rate default) | ~33–34 |
 
-This is larger than it should be and is a known gap rather than a design choice. Bun's
-fork takes a different approach: it leaves the fast path completely untouched and, when
-profiling is switched on, poisons `pages_free_direct` so allocations divert into the
-already-cold `_mi_malloc_generic`, where the sampling check lives. That is strictly
-better when disabled, which is the common case for a shipping build. Tracked in #50.
-
-Until then: if allocation throughput matters more to you than being able to turn
-profiling on at runtime, build with `MI_PPROF=OFF`. Enabling the profiler at runtime
-costs more again, but the sampling decision itself is now lock-free (#152).
+Enabling the profiler at runtime still costs more, as expected — every allocation
+now takes the generic path while it runs — but that cost is paid only while you
+are actively profiling, not for the lifetime of a process built with `MI_PPROF=ON`
+and never told to start.
 
 ## Environment variables
 

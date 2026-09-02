@@ -8,6 +8,15 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MI_TYPES_H
 #define MI_TYPES_H
 
+// #267: default the allocation sampling profiler ON so a consumer that compiles
+// `src/static.c` directly (no CMake, e.g. Bun's build) gets it, matching this fork's
+// CMake default (`option(MI_PPROF ... ON)`, CMakeLists.txt). CMake keeps passing
+// -DMI_PPROF=0/1 explicitly, which wins over this default since that's a command-line
+// define, not a re-definition. See README's C build section.
+#ifndef MI_PPROF
+#define MI_PPROF 1
+#endif
+
 // --------------------------------------------------------------------------
 // This file contains the main type definitions for mimalloc:
 // mi_heap_t      : all data for a heap; usually there is just one main default heap.
@@ -555,6 +564,18 @@ struct mi_theap_s {
   size_t                guarded_size_max;                    // maximal size for guarded objects
   size_t                guarded_sample_rate;                 // sample rate (set to 0 to disable guarded pages)
   size_t                guarded_sample_count;                // current sample count (counting down to 0)
+  #endif
+  #if MI_PPROF
+  bool                  prof_force_slow;                     // #267: poison `pages_free_direct` so every malloc misses
+                                                               // the fast path and lands in `_mi_malloc_generic` (where the
+                                                               // sampling countdown lives) while the profiler is running.
+                                                               // Set/cleared cross-thread by `_mi_subproc_prof_sync_force_slow`
+                                                               // (subproc.c) under `heap->theaps_lock`; a new theap reads the
+                                                               // current profiler state under that same lock in
+                                                               // `_mi_theap_init` (theap.c) so it is never missed by a
+                                                               // concurrent start. Ported strategy (not code) from
+                                                               // oven-sh/mimalloc @ 942b8342, MIT (`prof_force_slow` /
+                                                               // `MI_PAGE_HAS_PROF_SAMPLES`).
   #endif
   mi_page_t*            pages_free_direct[MI_PAGES_DIRECT];  // optimize: array where every entry points a page with possibly free blocks in the corresponding queue for that size.
   mi_page_queue_t       pages[MI_BIN_COUNT];                 // queue of pages for each size class (or "bin")

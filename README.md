@@ -118,9 +118,12 @@ cmake -S . -B build -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build --config RelWithDebInfo
 ```
 
-Builds that compile `src/static.c` directly instead of using CMake must pass
-`-DMI_PPROF=1` and, on non-Windows, `-fno-omit-frame-pointer` — without them the
-profiler is silently compiled out.
+`MI_PPROF` now defaults to `1` in the header (`include/mimalloc/types.h`), so a
+build that compiles `src/static.c` directly instead of using CMake gets the
+profiler by default too — CMake keeps passing `-DMI_PPROF=0/1` explicitly, which
+still wins over the header default. On non-Windows you still need to pass
+`-fno-omit-frame-pointer` yourself in that case — without it the profiler's stack
+capture is unreliable.
 
 ```c
 #include <mimalloc.h>

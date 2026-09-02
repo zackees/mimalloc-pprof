@@ -31,7 +31,12 @@ static inline void mi_free_block_local(mi_page_t* page, mi_block_t* block, bool 
   // checks
   if mi_unlikely(mi_check_is_double_free(page, block)) return;
   #if MI_PPROF
-  _mi_prof_on_free(page, block);
+  // #267: check `has_metadata` here, before the call, not inside `_mi_prof_on_free` --
+  // that call is out-of-line, so a stopped/never-sampled page (the common case) would
+  // still pay a full function call on every free just to load one bool and return. `page`
+  // is already in a register/cache line at this point (used just above), so this is a
+  // single extra branch, not a new cache miss.
+  if mi_unlikely(page->has_metadata) { _mi_prof_on_free(page, block); }
   #endif
   _mi_memevt_on_free(page, block);
   if (!was_guarded) { mi_check_padding(page, block); }

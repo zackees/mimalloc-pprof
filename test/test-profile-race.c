@@ -20,6 +20,12 @@
         slices -- while mi_prof_visit / mi_prof_snapshot_new walk the profiler
         tables, and while other threads hand their theaps to that same scavenger
         with mi_on_thread_idle_start/_end.
+     5. (issue #272, Phase 7b) the *hole* sweep -- discarding the memory of free
+        blocks INSIDE still-used pages -- running on both the owner thread and the
+        scavenger, while a third thread walks those same pages with mi_prof_visit
+        and mi_heap_visit_blocks. Where scenario 4 is about whole slices going away
+        under a table walk, this one is about individual blocks losing their memory
+        under a *block* walk.
 
    Each scenario is a pass/fail assert; the test is deliberately allocation-heavy
    so that sampling actually triggers rather than being skipped. */
@@ -35,6 +41,7 @@
 #include <stdbool.h>
 #include "mimalloc.h"
 #include "mimalloc/profile.h"
+#include "mimalloc/internal.h"   /* scenario 5: _mi_ptr_page, mi_page_block_is_purged */
 
 #define RACE_THREADS   8
 #define RACE_ROUNDS    3
@@ -312,11 +319,183 @@ static void test_visit_vs_scavenger(void) {
   mi_prof_stop();
 }
 
+/* ---- scenario 5: hole sweep vs. block/record walks (issue #272, Phase 7b) ----
+
+   Hole purging discards the memory of the FREE blocks inside a page that is still in
+   use. Two profiler-interaction claims follow from that, and this scenario is their
+   empirical half (the design argument is in `src/page-holes.c`'s header):
+
+     (1) a discard never covers a sampled block. A record is attached to a LIVE block and
+         an OS page is discarded only when every block overlapping it is free -- so the
+         two can never intersect. `_mi_prof_debug_assert_no_records_in` (src/profile.c)
+         asserts this from the other side, per discard, in an MI_DEBUG build, including
+         when the discard runs on the scavenger for a parked thread. This scenario is what
+         makes that assert fire at all: without records on swept pages it is vacuous.
+     (2) no inspection path may hand out a discarded block. `_mi_theap_area_visit_blocks`
+         marks purged blocks in its free map, so `mi_heap_visit_blocks` skips them, and
+         `mi_prof_visit`'s records only ever name live blocks. Every pointer either walk
+         produces is therefore checked here for purged-ness AND dereferenced -- a
+         discarded page reads back zero (and is poisoned under ASan), so a leak of one
+         into a visitor shows up as a failed check or a fault rather than silently.
+
+   Three roles run concurrently: an owner that sweeps its own heaps with
+   `mi_on_thread_idle()`, a parker whose heaps the scavenger sweeps instead, and a walker
+   doing both walks. The churn shape is the one hole punching exists for: a page full of
+   small blocks with scattered survivors, so a sweep finds whole free OS pages. */
+
+static volatile int hole_stop;
+
+#define HOLE_BSZ    (512)
+#define HOLE_LIVE   (4096)
+
+/* keep one block per 2 OS pages so a run of frees always covers a whole OS page */
+static size_t hole_keep_every(void) {
+  return (((2 * _mi_os_page_size()) + HOLE_BSZ - 1) / HOLE_BSZ) + 2;
+}
+
+/* allocate HOLE_LIVE blocks, then free all but every Nth: the survivors pin their own OS
+   page and everything between them becomes discardable. */
+static void hole_churn(void** p) {
+  const size_t keep = hole_keep_every();
+  for (size_t i = 0; i < HOLE_LIVE; i++) {
+    if (p[i] == NULL) { p[i] = mi_malloc(HOLE_BSZ); assert(p[i] != NULL); }
+    memset(p[i], (int)(i & 0x7f) + 1, HOLE_BSZ);
+  }
+  for (size_t i = 0; i < HOLE_LIVE; i++) {
+    if ((i % keep) != 0) { mi_free(p[i]); p[i] = NULL; }
+  }
+}
+
+static void hole_release(void** p) {
+  for (size_t i = 0; i < HOLE_LIVE; i++) { if (p[i] != NULL) { mi_free(p[i]); p[i] = NULL; } }
+}
+
+/* the owner sweep: this thread discards the holes in its own pages */
+static THREAD_RET hole_owner_worker(void* arg) {
+  (void)arg;
+  void** p = (void**)calloc(HOLE_LIVE, sizeof(void*));
+  assert(p != NULL);
+  gate_wait();
+  while (hole_stop == 0) {
+    hole_churn(p);
+    mi_on_thread_idle();
+    /* survivors must be byte-for-byte intact across the discard */
+    for (size_t i = 0; i < HOLE_LIVE; i++) {
+      if (p[i] == NULL) continue;
+      assert(((unsigned char*)p[i])[0] == (unsigned char)((i & 0x7f) + 1));
+      assert(!mi_page_block_is_purged(_mi_ptr_page(p[i]), p[i]));
+    }
+  }
+  hole_release(p);
+  free(p);
+  return THREAD_OK;
+}
+
+/* the scavenger sweep: this thread parks, and another thread discards its holes */
+static THREAD_RET hole_parker_worker(void* arg) {
+  (void)arg;
+  void** p = (void**)calloc(HOLE_LIVE, sizeof(void*));
+  assert(p != NULL);
+  gate_wait();
+  while (hole_stop == 0) {
+    hole_churn(p);
+    if (mi_on_thread_idle_start()) {
+      thread_yield_now();
+      mi_on_thread_idle_end();
+    }
+    for (size_t i = 0; i < HOLE_LIVE; i++) {
+      if (p[i] == NULL) continue;
+      assert(((unsigned char*)p[i])[0] == (unsigned char)((i & 0x7f) + 1));
+      assert(!mi_page_block_is_purged(_mi_ptr_page(p[i]), p[i]));
+    }
+  }
+  hole_release(p);
+  free(p);
+  return THREAD_OK;
+}
+
+/* every record the profiler reports names a live block: it must not be purged, and
+   reading it must not fault. */
+static bool hole_prof_visitor(const mi_prof_sample_info_t* info, void* arg) {
+  size_t* n = (size_t*)arg;
+  (*n) += info->depth;
+  for (size_t i = 0; i < info->depth; i++) { (void)info->stack[i]; }
+  return true;
+}
+
+/* every block `mi_heap_visit_blocks` reports is a LIVE block of this thread's heap: a
+   purged block is free and must have been filtered out by the free-map marking in
+   `_mi_theap_area_visit_blocks`. */
+static bool hole_block_visitor(const mi_heap_t* heap, const mi_heap_area_t* area,
+                               void* block, size_t block_size, void* arg) {
+  (void)heap; (void)area;
+  size_t* n = (size_t*)arg;
+  if (block == NULL) return true;   /* the per-area callback */
+  mi_page_t* const page = _mi_ptr_page(block);
+  assert(page != NULL);
+  assert(!mi_page_block_is_purged(page, block));
+  /* touch it: a discarded OS page reads back zero and is poisoned under ASan */
+  (void)*(volatile unsigned char*)block;
+  (void)block_size;
+  (*n)++;
+  return true;
+}
+
+static void test_hole_sweep_vs_visit(void) {
+  thread_t threads[4];
+  void** own = (void**)calloc(HOLE_LIVE, sizeof(void*));
+  assert(own != NULL);
+  gate_open = 0; hole_stop = 0;
+  /* Sample rate 1024 over 512-byte blocks: high enough that ~100 records survive on the
+     swept pages at the end (verified by the assert below -- with zero records invariant (1)
+     would never be exercised), low enough that the 60 walk rounds stay under ~15s.
+     A one-off negative control (`mi_assert_internal(false)` inside
+     `_mi_prof_debug_assert_no_records_in`) confirmed that assert does fire on this workload,
+     i.e. hole discards really do happen on pages that carry profiler records. */
+  assert(mi_prof_start_seeded(1024, 23));
+  thread_start(&threads[0], (thread_fun_t)hole_owner_worker, NULL);
+  thread_start(&threads[1], (thread_fun_t)hole_owner_worker, NULL);
+  thread_start(&threads[2], (thread_fun_t)hole_parker_worker, NULL);
+  thread_start(&threads[3], (thread_fun_t)hole_parker_worker, NULL);
+  gate_open = 1;
+  /* the walker: its own pages get swept too (it idles), and it walks while the four
+     workers above are being swept by themselves and by the scavenger. */
+  for (size_t round = 0; round < 60; round++) {
+    hole_churn(own);
+    size_t n = 0;
+    assert(mi_prof_visit(&hole_prof_visitor, &n));
+    mi_prof_snapshot_t* snap = mi_prof_snapshot_new();
+    assert(snap != NULL);
+    size_t m = 0;
+    assert(mi_prof_snapshot_visit(snap, &hole_prof_visitor, &m));
+    mi_prof_snapshot_free(snap);
+    size_t blocks = 0;
+    assert(mi_theap_visit_blocks(mi_theap_get_default(), true /* visit blocks */, &hole_block_visitor, &blocks));
+    mi_on_thread_idle();
+  }
+  hole_stop = 1;
+  for (size_t i = 0; i < 4; i++) { thread_join(threads[i]); }
+  /* BEFORE releasing `own`: the survivors are what carry the live sampled records that make
+     invariant (1) non-vacuous, and they must still be alive when we count them. */
+  mi_purge_holes_stats_t hs;
+  mi_purge_holes_stats_get(&hs);
+  size_t records = 0, bytes = 0, stacks = 0;
+  mi_prof_debug_stats(&records, &bytes, &stacks);
+  hole_release(own);
+  free(own);
+  printf("  scenario 5: %zu hole discards, %zu bytes discarded, %zu live profiler records\n",
+         hs.discard_calls, hs.purged_bytes_total, records);
+  assert(!mi_option_is_enabled(mi_option_purge_holes) || hs.discard_calls > 0);
+  assert(records > 0);   /* otherwise invariant (1) is never actually tested */
+  mi_prof_stop();
+}
+
 int main(void) {
   test_bootstrap_race();
   test_cross_thread_free();
   test_snapshot_under_mutation();
-  test_visit_vs_scavenger();   /* issue #272 */
+  test_visit_vs_scavenger();     /* issue #272 */
+  test_hole_sweep_vs_visit();    /* issue #272, Phase 7b */
   printf("test-profile-race: ok\n");
   return 0;
 }

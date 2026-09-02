@@ -7,8 +7,10 @@ terms of the MIT license. A copy of the license can be found in the file
 
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
 //
-// ONE DELIBERATE ADAPTATION for this tree (marked inline where it is used):
-//   Bun's "did a sweep run?" observable is `mi_purge_holes_stats_get().discard_calls`. Here it is
+// ADAPTATIONS for this tree (both marked inline where they appear):
+//   (a) the 7a-added `forced_collect_loop` stress case, which has no counterpart in Bun --
+//       see its comment; it guards this fork's blocking `mi_collect(true)` change.
+//   (b) Bun's "did a sweep run?" observable is `mi_purge_holes_stats_get().discard_calls`. Here it is
 //   `_mi_test_idle_work_count()` (src/scavenger.c): the number of completed idle-work passes.
 //   That is the same signal and a strictly stronger one -- it counts passes rather than
 //   madvise syscalls, so a pass that legitimately finds nothing discardable (a page whose free

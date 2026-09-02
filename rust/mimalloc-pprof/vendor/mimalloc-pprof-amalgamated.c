@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2fcac37b of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f95d7e76 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -5119,6 +5119,27 @@ static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
   return (mi_atomic_load_acquire(&theap->tld->park_state) == MI_PARK_SWEEPING);
 }
 
+// #272: the park contract is "the owner does not allocate or free between
+// `mi_on_thread_idle_start` and `mi_on_thread_idle_end`". A thread that EXITS while parked
+// breaks it through no fault of the caller: pthread-key destructors and C++ `thread_local`
+// destructors run in an unspecified order and can free ON THE OWNER THREAD before mimalloc's
+// own thread-done hook (`_mi_thread_done`, which does call `_mi_park_leave`) is reached --
+// `epoll_wait` being a cancellation point is exactly the shape Bun parks around. The scavenger
+// may be mid-sweep of those very theaps, and the owner then mutates page queues underneath the
+// walk: `test-park-handoff` trips `mi_theap_visit_pages`'s `count == total` (and
+// `mi_page_is_valid_init`'s block-conservation check) that way, ~2/120 runs pinned to 4 CPUs.
+//
+// So take the park back in the allocator's own slow paths as well, which makes the guarantee
+// hold for ANY owner-side allocation or free however it got there. Costs one relaxed load of an
+// already-hot cache line, and only on the generic/slow paths -- never on the fast path.
+static inline void _mi_park_leave_if_parked(mi_theap_t* theap) {
+  if (theap == NULL) return;
+  mi_tld_t* const tld = theap->tld;
+  if mi_likely(tld == NULL || mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_RUNNING) return;
+  if (tld->thread_id != _mi_thread_id()) return;   // only the owner may leave its own park
+  _mi_park_leave(tld);
+}
+
 /* -----------------------------------------------------------
   The page map maps addresses to `mi_page_t` pointers
 ----------------------------------------------------------- */
@@ -6958,6 +6979,7 @@ static inline bool mi_block_check_unguard(mi_page_t* page, mi_block_t* block, vo
 
 // free a local pointer  (page parameter comes first for better codegen)
 static void mi_decl_noinline mi_free_generic_local(mi_page_t* page, void* p) mi_attr_noexcept {
+  _mi_park_leave_if_parked(mi_page_theap(page));   // #272: an owner-side free while parked (e.g. from a TLS destructor)
   mi_assert_internal(p!=NULL && page != NULL);
   mi_block_t* const block = (mi_page_has_interior_pointers(page) ? _mi_page_ptr_unalign(page, p) : mi_validate_block_from_ptr(page,p));
   const bool was_guarded = mi_block_check_unguard(page, block, p);
@@ -22292,6 +22314,7 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   #if !MI_THEAP_INITASNULL
   mi_assert_internal(theap != NULL);
   #endif
+  _mi_park_leave_if_parked(theap);   // #272: an owner-side alloc while parked (e.g. from a TLS destructor)
   const bool zero = ((zero_huge_alignment & 1) != 0);
   const size_t huge_alignment = (zero_huge_alignment & ~1);
   mi_page_t* page = NULL;

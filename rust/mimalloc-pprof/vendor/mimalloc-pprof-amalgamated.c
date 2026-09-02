@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit cc6cc2a3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ff6653a4 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -662,7 +662,14 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_heap_alloc_new_n(mi_h
    Same policy as Go/tcmalloc. Every drop cause (record-alloc failure, stack-intern failure,
    including the MI_PROF_STACK_CAP cap) is counted in mi_prof_stats_t.dropped_samples (v2);
    cap overflows are additionally broken out in stack_table_overflows, so
-   dropped_samples >= stack_table_overflows always. */
+   dropped_samples >= stack_table_overflows always.
+
+   ## MI_NO_PROCESS_DETACH interaction
+
+   MIMALLOC_PROF_DUMP_AT_EXIT (and MIMALLOC_DHAT_DUMP_AT_EXIT, see dhat.h) fire from the
+   automatic process-exit path (_mi_auto_process_done), which a build configured with
+   MI_NO_PROCESS_DETACH skips entirely. An embedder using MI_NO_PROCESS_DETACH must call
+   mi_prof_dump / mi_dhat_dump themselves before exit, or no dump is written. */
 #pragma once
 #ifndef MIMALLOC_PROFILE_H
 #define MIMALLOC_PROFILE_H
@@ -15269,6 +15276,10 @@ void mi_cdecl mi_process_done(void) mi_attr_noexcept {
 
 // Called automatically when the process is done (cdecl as it is used with `at_exit` on some platforms)
 void mi_cdecl _mi_auto_process_done(void) mi_attr_noexcept {
+  // imported from oven-sh/mimalloc @ 942b8342, MIT -- see #268.
+  #ifdef MI_NO_PROCESS_DETACH
+  return;   // fork: the embedder tears down explicitly or not at all; touching allocator state this late is unsafe under other static destructors
+  #endif
   if (_mi_option_get_fast(mi_option_destroy_on_exit)>=2) return;  // allow disabling auto process done
   mi_process_done();
 }
@@ -29122,9 +29133,14 @@ void _mi_prim_thread_yield(void) {
   static void mi_attr_constructor mi_process_attach(void) {
     _mi_auto_process_init();
   }
+  // imported from oven-sh/mimalloc @ 942b8342, MIT -- see #268. _mi_auto_process_done
+  // already early-returns under MI_NO_PROCESS_DETACH (src/init.c); this additionally
+  // skips registering the destructor at all, matching Bun's exact diff.
+  #ifndef MI_NO_PROCESS_DETACH
   static void mi_attr_destructor mi_process_detach(void) {
     _mi_auto_process_done();
   }
+  #endif
 #elif defined(__cplusplus)
   // C++: use static initialization to detect process start/end
   // This is not guaranteed to be first/last but the best we can generally do?

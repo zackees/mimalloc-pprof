@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit cc6cc2a3 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ff6653a4 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -646,7 +646,14 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_heap_alloc_new_n(mi_h
    Same policy as Go/tcmalloc. Every drop cause (record-alloc failure, stack-intern failure,
    including the MI_PROF_STACK_CAP cap) is counted in mi_prof_stats_t.dropped_samples (v2);
    cap overflows are additionally broken out in stack_table_overflows, so
-   dropped_samples >= stack_table_overflows always. */
+   dropped_samples >= stack_table_overflows always.
+
+   ## MI_NO_PROCESS_DETACH interaction
+
+   MIMALLOC_PROF_DUMP_AT_EXIT (and MIMALLOC_DHAT_DUMP_AT_EXIT, see dhat.h) fire from the
+   automatic process-exit path (_mi_auto_process_done), which a build configured with
+   MI_NO_PROCESS_DETACH skips entirely. An embedder using MI_NO_PROCESS_DETACH must call
+   mi_prof_dump / mi_dhat_dump themselves before exit, or no dump is written. */
 #pragma once
 #ifndef MIMALLOC_PROFILE_H
 #define MIMALLOC_PROFILE_H

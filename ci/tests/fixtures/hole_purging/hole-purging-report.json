@@ -1,5 +1,7 @@
 {
   "commit": "fixture01",
+  "cpu": "Fixture CPU",
+  "kernel": "0.0.0-fixture",
   "off": {
     "peak_rss_mb": 280.3,
     "tail_mean_rss_mb": 230.7,

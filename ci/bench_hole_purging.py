@@ -461,9 +461,29 @@ def fmt_int(v: int) -> str:
     return f"{v:,}"
 
 
-def render_table_svg(off_stats: dict, on_stats: dict, theme: Theme, source_line: str) -> str:
-    rows = [(field, label) for field, label in TABLE_ROWS if field in off_stats and field in on_stats]
-    height = TITLE_H + HEADER_H + ROW_H * len(rows) + 20
+# (label, off value string, on value string) -- rendered above the counter rows,
+# same two value columns, no delta (a delta of two percentages reads as noise).
+def memory_summary_rows(off_summary: dict, on_summary: dict) -> list[tuple[str, str, str]]:
+    off_peak, on_peak = off_summary["peak_rss_mb"], on_summary["peak_rss_mb"]
+    off_after, on_after = off_summary["tail_mean_rss_mb"], on_summary["tail_mean_rss_mb"]
+    off_pct = (off_peak - off_after) / off_peak * 100 if off_peak else 0.0
+    on_pct = (on_peak - on_after) / on_peak * 100 if on_peak else 0.0
+    return [
+        ("peak RSS, before idle", f"{off_peak:.1f} MB", f"{on_peak:.1f} MB"),
+        ("RSS after idle (median of 3)", f"{off_after:.1f} MB", f"{on_after:.1f} MB"),
+        ("% returned (peak to after-idle)", f"{off_pct:.0f}%", f"{on_pct:.0f}%"),
+    ]
+
+
+def render_table_svg(
+    off_stats: dict, on_stats: dict, off_summary: dict, on_summary: dict,
+    theme: Theme, source_line: str,
+) -> str:
+    counter_rows = [(field, label) for field, label in TABLE_ROWS if field in off_stats and field in on_stats]
+    mem_rows = memory_summary_rows(off_summary, on_summary)
+    n_rows = len(mem_rows) + len(counter_rows)
+    sep_gap = ROW_H // 2
+    height = TITLE_H + HEADER_H + ROW_H * n_rows + sep_gap + 20
 
     parts: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {TABLE_WIDTH} {height}" '
@@ -479,7 +499,7 @@ def render_table_svg(off_stats: dict, on_stats: dict, theme: Theme, source_line:
 
     header_y = TITLE_H + 14
     parts.append(f'<text x="{COL_LABEL_X}" y="{header_y}" font-size="12" font-weight="600" '
-                 f'fill="{theme.muted}">counter (mi_purge_holes_stats_t)</text>')
+                 f'fill="{theme.muted}">measurement</text>')
     parts.append(f'<text x="{COL_OFF_X}" y="{header_y}" font-size="12" font-weight="600" '
                  f'text-anchor="end" fill="{theme.muted}">off</text>')
     parts.append(f'<text x="{COL_ON_X}" y="{header_y}" font-size="12" font-weight="600" '
@@ -490,26 +510,44 @@ def render_table_svg(off_stats: dict, on_stats: dict, theme: Theme, source_line:
     parts.append(f'<line x1="{COL_LABEL_X}" y1="{rule_y}" x2="{TABLE_WIDTH - COL_LABEL_X}" y2="{rule_y}" '
                  f'stroke="{theme.grid}" stroke-width="1"/>')
 
-    y = rule_y
-    for i, (field, label) in enumerate(rows):
-        y = rule_y + ROW_H * (i + 1)
-        text_y = y - 8
-        off_v = off_stats[field]
-        on_v = on_stats[field]
-        delta = on_v - off_v
-        delta_str = f"{delta:+,}" if delta != 0 else "0"
-        if i % 2 == 1:
-            parts.append(f'<rect x="{COL_LABEL_X - 8}" y="{y - ROW_H}" '
+    # `top`: the y-coordinate of this row's top edge, growing downward. A single
+    # cursor threaded through both blocks so the separator's gap is the only place
+    # row height changes.
+    top = rule_y
+    zebra_index = 0
+
+    def draw_row(label: str, off_str: str, on_str: str, delta_str: str) -> None:
+        nonlocal top, zebra_index
+        bottom = top + ROW_H
+        text_y = bottom - 8
+        if zebra_index % 2 == 1:
+            parts.append(f'<rect x="{COL_LABEL_X - 8}" y="{top}" '
                          f'width="{TABLE_WIDTH - 2 * (COL_LABEL_X - 8)}" height="{ROW_H}" '
                          f'fill="{theme.grid}" opacity="0.25"/>')
         parts.append(f'<text x="{COL_LABEL_X}" y="{text_y}" font-size="12" fill="{theme.text}">'
                      f'{escape(label)}</text>')
         parts.append(f'<text x="{COL_OFF_X}" y="{text_y}" font-size="12" text-anchor="end" '
-                     f'fill="{theme.text}">{fmt_int(off_v)}</text>')
+                     f'fill="{theme.text}">{off_str}</text>')
         parts.append(f'<text x="{COL_ON_X}" y="{text_y}" font-size="12" text-anchor="end" '
-                     f'fill="{theme.text}">{fmt_int(on_v)}</text>')
+                     f'fill="{theme.text}">{on_str}</text>')
         parts.append(f'<text x="{COL_DELTA_X}" y="{text_y}" font-size="12" text-anchor="end" '
                      f'fill="{theme.muted}">{delta_str}</text>')
+        top = bottom
+        zebra_index += 1
+
+    for label, off_str, on_str in mem_rows:
+        draw_row(label, off_str, on_str, "—")  # em dash: no delta for a percentage row
+
+    top += sep_gap
+    sep_y = top - sep_gap // 2
+    parts.append(f'<line x1="{COL_LABEL_X}" y1="{sep_y}" x2="{TABLE_WIDTH - COL_LABEL_X}" y2="{sep_y}" '
+                 f'stroke="{theme.grid}" stroke-width="1" stroke-dasharray="2,3"/>')
+    zebra_index = 0
+
+    for field, label in counter_rows:
+        off_v, on_v = off_stats[field], on_stats[field]
+        delta = on_v - off_v
+        draw_row(label, fmt_int(off_v), fmt_int(on_v), f"{delta:+,}" if delta != 0 else "0")
 
     parts.append("</g></svg>")
     return "\n".join(parts) + "\n"
@@ -519,7 +557,8 @@ def render_table_svg(off_stats: dict, on_stats: dict, theme: Theme, source_line:
 # CLI
 # ---------------------------------------------------------------------------
 
-def build_source_line(commit: str) -> str:
+def probe_machine() -> tuple[str, str]:
+    """Return (cpu model, kernel release) of the machine actually running the benchmark."""
     import platform
     cpu = ""
     try:
@@ -530,8 +569,22 @@ def build_source_line(commit: str) -> str:
                     break
     except OSError:
         pass
-    kernel = platform.release()
-    return f"measured at {commit}, {cpu or platform.machine()}, {kernel}, taskset -c 0-3, median of 3"
+    return cpu or platform.machine(), platform.release()
+
+
+def format_source_line(commit: str, cpu: str, kernel: str) -> str:
+    return f"measured at {commit}, {cpu}, {kernel}, taskset -c 0-3, median of 3"
+
+
+def build_source_line(commit: str) -> str:
+    """Source line for a FRESH measurement -- probes this machine live.
+
+    Do not use this for --check/--from-data: the committed JSON's own `cpu`/`kernel`
+    fields must be read back instead (format_source_line), or the caption drifts
+    from the SVG every time this runs on a different machine or after a rebase.
+    """
+    cpu, kernel = probe_machine()
+    return format_source_line(commit, cpu, kernel)
 
 
 def write_csv(path: Path, off: RunResult, on: RunResult) -> None:
@@ -551,9 +604,11 @@ def load_csv(path: Path) -> dict[str, list[Sample]]:
     return out
 
 
-def write_report_json(path: Path, off: RunResult, on: RunResult, commit: str) -> None:
+def write_report_json(path: Path, off: RunResult, on: RunResult, commit: str, cpu: str, kernel: str) -> None:
     payload = {
         "commit": commit,
+        "cpu": cpu,
+        "kernel": kernel,
         "off": {
             "stats": off.stats,
             "peak_rss_mb": max(s.rss_kb for s in off.samples) / 1024.0,
@@ -601,8 +656,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "hole-purging-rss.csv"
     json_path = out_dir / "hole-purging-report.json"
-    commit = git_commit(REPO_ROOT)
-    source_line = build_source_line(commit)
 
     if args.check or args.from_data:
         if not csv_path.exists() or not json_path.exists():
@@ -610,8 +663,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 1
         series = load_csv(csv_path)
         report = load_report_json(json_path)
+        # Read the committed machine/commit fields back rather than re-probing this
+        # machine -- otherwise the caption drifts from the SVG on every rebase or on
+        # a different box, and --check could never pass anywhere but where it was made.
+        source_line = format_source_line(report["commit"], report["cpu"], report["kernel"])
         off_samples, on_samples = series["off"], series["on"]
         off_stats, on_stats = report["off"]["stats"], report["on"]["stats"]
+        off_summary, on_summary = report["off"], report["on"]
     else:
         if args.build_dir is None:
             print("error: --build-dir is required unless --check/--from-data", file=sys.stderr)
@@ -620,27 +678,38 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not lib_path.exists():
             print(f"error: {lib_path} not found", file=sys.stderr)
             return 1
+        commit = git_commit(REPO_ROOT)
+        cpu, kernel = probe_machine()
+        source_line = format_source_line(commit, cpu, kernel)
         with tempfile.TemporaryDirectory(prefix="hole-purging-bench-") as tmp:
             exe = compile_workload(args.include_dir, lib_path, Path(tmp))
             results = measure(exe, args.seconds, args.runs)
         off, on = results["off"], results["on"]
         write_csv(csv_path, off, on)
-        write_report_json(json_path, off, on, commit)
+        write_report_json(json_path, off, on, commit, cpu, kernel)
         off_samples, on_samples = off.samples, on.samples
         off_stats, on_stats = off.stats, on.stats
+        off_summary = {
+            "peak_rss_mb": max(s.rss_kb for s in off_samples) / 1024.0,
+            "tail_mean_rss_mb": off.mean_rss_kb_tail / 1024.0,
+        }
+        on_summary = {
+            "peak_rss_mb": max(s.rss_kb for s in on_samples) / 1024.0,
+            "tail_mean_rss_mb": on.mean_rss_kb_tail / 1024.0,
+        }
         print(
-            f"off: peak {max(s.rss_kb for s in off_samples)/1024:.1f} MB, "
-            f"tail-mean {off.mean_rss_kb_tail/1024:.1f} MB; "
-            f"on: peak {max(s.rss_kb for s in on_samples)/1024:.1f} MB, "
-            f"tail-mean {on.mean_rss_kb_tail/1024:.1f} MB "
+            f"off: peak {off_summary['peak_rss_mb']:.1f} MB, "
+            f"tail-mean {off_summary['tail_mean_rss_mb']:.1f} MB; "
+            f"on: peak {on_summary['peak_rss_mb']:.1f} MB, "
+            f"tail-mean {on_summary['tail_mean_rss_mb']:.1f} MB "
             f"(purged {on_stats.get('purged_bytes_total', 0)/1e6:.1f} MB)"
         )
 
     if args.table:
         light_path = out_dir / "hole-purging-table-light.svg"
         dark_path = out_dir / "hole-purging-table-dark.svg"
-        light_svg = render_table_svg(off_stats, on_stats, LIGHT, source_line)
-        dark_svg = render_table_svg(off_stats, on_stats, DARK, source_line)
+        light_svg = render_table_svg(off_stats, on_stats, off_summary, on_summary, LIGHT, source_line)
+        dark_svg = render_table_svg(off_stats, on_stats, off_summary, on_summary, DARK, source_line)
     else:
         light_path = out_dir / "hole-purging-rss-light.svg"
         dark_path = out_dir / "hole-purging-rss-dark.svg"

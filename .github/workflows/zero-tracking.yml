@@ -8,6 +8,25 @@ name: zero-tracking
 # measurement order on a loaded machine -- the interleaved rerun reversed the sign. So
 # the arms here are interleaved and paired, from a single binary, and the raw numbers
 # are printed rather than a verdict.
+#
+# LINUX ONLY, since #277 phase E. The `windows-latest` row this workflow used to carry
+# built the tree natively with MSVC and then ran the A/B on it; that was one more Windows
+# VM per matching PR, which is exactly what #277 exists to stop. Both of its halves moved
+# into `windows-bundles.yml`'s single `run-windows` job:
+#
+#   * correctness (`ctest -R zero-tracking`) was ALREADY there and is not conditional:
+#     `test-zero-tracking` and `test-zero-tracking-enabled` are ordinary registered ctest
+#     tests, so ci/bundle_tests.py puts them in every bundle manifest and run-windows's
+#     full replay of `windows-{gnu,msvc}-x64-release` runs both on every push. That is
+#     strictly MORE coverage than this workflow's path-filtered trigger gave.
+#   * the interleaved A/B became a gated step on the same `run-windows` job, keyed to the
+#     same paths as this workflow's trigger, so it costs zero extra Windows queue slots.
+#
+# The quiet-runner property survives the move: run-windows is entirely serial, so nothing
+# else is executing on that VM while the A/B runs, and the arms are still interleaved and
+# paired from a single binary. What does NOT survive: the Windows arm is now built by
+# soldr's clang-cl rather than by `cl`, and a PR that touches only THIS file exercises the
+# Linux arm alone (windows-bundles.yml is not triggered by it). See docs/ci-gates.md.
 
 on:
   workflow_dispatch:
@@ -24,11 +43,7 @@ concurrency:
 
 jobs:
   ab:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: cmake -B build -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=Release
@@ -54,5 +69,5 @@ jobs:
           python3 ci/zero_tracking_report.py ab.jsonl
       - uses: actions/upload-artifact@v4
         with:
-          name: zero-tracking-${{ matrix.os }}
+          name: zero-tracking-ubuntu-latest
           path: ab.jsonl

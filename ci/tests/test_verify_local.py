@@ -205,5 +205,135 @@ class SelftestTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
 
+# --------------------------------------------------------------------------------------
+# #277 phase F: the --bundle name table vs. the bundle workflows' build matrices.
+# --------------------------------------------------------------------------------------
+
+BUNDLE_WORKFLOW_JOBS: list[tuple[str, str]] = [
+    ("macos-bundles.yml", "build-macos"),
+    ("windows-bundles.yml", "build-windows-gnu"),
+    ("windows-bundles.yml", "build-windows-msvc"),
+]
+
+TOOLCHAIN_RE = re.compile(r"cmake/toolchains/soldr-([A-Za-z0-9_.-]+)\.cmake")
+
+
+def matrix_bundles(workflow_name: str, job_name: str) -> list[dict[str, Any]]:
+    """The `include:` rows of one bundle-building job's matrix, plus the triple.
+
+    The macOS matrix carries `triple:` per row; the two Windows jobs do not (they are
+    single-target jobs, so the triple is spelled once, in the toolchain path their steps
+    pass to cmake). Reading it out of the run text rather than hardcoding it here means a
+    job that is repointed at a different toolchain fails this test.
+    """
+    doc = load_workflow(workflow_name)
+    job = cast(dict[str, Any], doc["jobs"][job_name])
+    rows = cast(list[dict[str, Any]], job["strategy"]["matrix"]["include"])
+    text = job_run_text(job)
+    job_triples = {t for t in TOOLCHAIN_RE.findall(text) if "${{" not in t}
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        triple = row.get("triple")
+        if triple is None:
+            assert len(job_triples) == 1, (
+                f"{workflow_name}:{job_name} has no matrix `triple:` and its steps name "
+                f"{sorted(job_triples)} toolchains -- cannot infer one target"
+            )
+            triple = next(iter(job_triples))
+        out.append(
+            {
+                "bundle": row["bundle"],
+                "triple": triple,
+                "cmake": row["cmake"],
+                "workflow": workflow_name,
+                "job": job_name,
+                "run_text": text,
+            }
+        )
+    return out
+
+
+def all_matrix_bundles() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for workflow_name, job_name in BUNDLE_WORKFLOW_JOBS:
+        rows.extend(matrix_bundles(workflow_name, job_name))
+    return rows
+
+
+class BundleTableDriftTests(unittest.TestCase):
+    """`verify_local.py --bundle NAME` must offer exactly the CI matrices' bundles.
+
+    Same contract as the config table above and for the same reason: the flags are copied
+    by hand so that a workflow edit fails loudly here instead of silently changing what
+    `--bundle` builds. A name that exists in CI but not here is a lane a developer cannot
+    reproduce locally; a name that exists here but not in CI builds something CI does not.
+    """
+
+    def test_names_match_the_workflow_matrices_exactly(self) -> None:
+        expected = [row["bundle"] for row in all_matrix_bundles()]
+        self.assertEqual(sorted(verify_local.BUNDLE_NAMES), sorted(expected))
+        self.assertEqual(len(expected), len(set(expected)))
+
+    def test_triple_and_cmake_flags_match_verbatim(self) -> None:
+        by_name = {b.name: b for b in verify_local.BUNDLES}
+        for row in all_matrix_bundles():
+            spec = by_name[row["bundle"]]
+            self.assertEqual(
+                spec.triple,
+                row["triple"],
+                f"{row['workflow']}:{row['job']} builds {row['bundle']} for "
+                f"{row['triple']}, verify_local.py says {spec.triple}",
+            )
+            self.assertEqual(
+                spec.cmake,
+                row["cmake"],
+                f"{row['workflow']}:{row['job']}'s {row['bundle']} cmake flags drifted "
+                "from ci/verify_local.py",
+            )
+            self.assertEqual(spec.workflow, row["workflow"])
+            self.assertEqual(spec.job, row["job"])
+
+    def test_bundle_tests_arguments_match_the_workflow_step(self) -> None:
+        # The lane-specific ci/bundle_tests.py flags matter as much as the cmake ones:
+        # without --dll-search-dir the win-gnu bundle silently omits libgcc_s_seh-1.dll.
+        for row in all_matrix_bundles():
+            spec = next(b for b in verify_local.BUNDLES if b.name == row["bundle"])
+            for arg in spec.bundle_args:
+                self.assertIn(
+                    arg,
+                    row["run_text"],
+                    f"ci/verify_local.py passes {arg!r} to bundle_tests.py for "
+                    f"{row['bundle']}, but {row['workflow']}:{row['job']} does not",
+                )
+
+    def test_every_bundle_names_a_toolchain_file_that_exists(self) -> None:
+        for spec in verify_local.BUNDLES:
+            toolchain = ROOT / "cmake" / "toolchains" / f"soldr-{spec.triple}.cmake"
+            self.assertTrue(toolchain.is_file(), f"{spec.name} names a missing {toolchain}")
+
+    def test_list_prints_the_bundle_table(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "ci" / "verify_local.py"), "--list"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name in verify_local.BUNDLE_NAMES:
+            self.assertIn(name, result.stdout)
+
+    def test_unknown_bundle_is_rejected(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "ci" / "verify_local.py"), "--bundle", "not-a-bundle"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown bundle", result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

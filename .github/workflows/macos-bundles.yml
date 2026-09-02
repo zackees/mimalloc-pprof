@@ -81,7 +81,12 @@ jobs:
           - bundle: macos-arm64-debug-full
             arch: arm64
             triple: aarch64-apple-darwin
-            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
+            # -DMI_TLS_MODEL_FIXED=ON rides on this bundle only (compile-only, arm64):
+            # #273 8c's fixed pthread TSD slots 96/97 (prim-tls.h) otherwise have zero
+            # compile coverage on macOS -- no other lane passes this flag. It exercises
+            # test-tls-slots-heap and test-threadlocal-growth under the fixed model; the
+            # TSD-slot guard above is the runtime-drift check for the same feature.
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_TLS_MODEL_FIXED=ON
           # The memory gate's positive control. It is a separate *build*
           # (MI_BENCH_INJECT_LEAK), not a separate run, so it cannot be an entry in
           # another bundle's manifest; it gets its own bundle rather than being dropped
@@ -144,26 +149,34 @@ jobs:
         #
         # There is no public Apple SDK -- not even soldr's -- that ships
         # pthread/tsd_private.h: it is a *private* darwin-libpthread header, confirmed absent
-        # from $SDKROOT/usr/include here (soldr's Apple SDK 14.5) by direct search. The
-        # authoritative source both this fork and Bun's own comment cite is Apple's
-        # opensource release mirrored at apple/darwin-libpthread; pinned to the commit that
-        # last touched the file (libpthread-454.40.3, unchanged since 2021) rather than
-        # `main`, so a later unrelated push to that repo cannot silently change what this
-        # step checks.
+        # from $SDKROOT/usr/include here (soldr's Apple SDK 14.5) by direct search. This step
+        # also greps soldr's $SDKROOT copy below, in case a future SDK bundles it -- belt and
+        # suspenders, not the primary source. The authoritative source both this fork and
+        # Bun's own comment cite is Apple's opensource release, now published at
+        # apple-oss-distributions/libpthread (the apple/darwin-libpthread mirror this step
+        # used to pin predates that rename). This fetches `main`, not a pinned commit: a
+        # pinned commit can never observe a slot Apple assigns *after* that commit, which
+        # defeats the point of a drift check -- confirmed by a review of the first version of
+        # this step (#273 8c). `main` was verified byte-identical to the old pin's content at
+        # the time this step was written; if Apple's own history ever diverges, that is
+        # exactly the drift this step exists to catch.
         #
-        # A pinned-content fetch that merely greps for 96/97 and passes on curl failure would
-        # be a tautology (nothing to grep -> nothing found -> false green), so this also
-        # asserts the fetched file has the shape the 96/97 choice depends on: key 95
+        # A fetch that merely greps for 96/97 and passes on curl failure would be a
+        # tautology (nothing to grep -> nothing found -> false green), so this also asserts
+        # the fetched file has the shape the 96/97 choice depends on: key 95
         # (__PTK_FRAMEWORK_CORETEXT_KEY0) and key 100 (__PTK_FRAMEWORK_SWIFT_KEY0) must both
         # be present, proving the real header was fetched and the gap is still exactly where
-        # this fork's comment says it is. Runs once (this matrix entry only), not once per
-        # bundle -- the header does not vary by architecture or build config.
+        # this fork's comment says it is. The slot assertion itself is anchored to a
+        # `#define NAME 96|97` line so a bare "96" or "97" in a comment or rdar:// reference
+        # elsewhere in the file cannot false-positive it. Runs once (this matrix entry
+        # only), not once per bundle -- the header does not vary by architecture or build
+        # config.
         if: matrix.bundle == 'macos-arm64-release'
         run: |
           set -euo pipefail
-          url="https://raw.githubusercontent.com/apple/darwin-libpthread/fe48dac35eb1232b0aa67260e79911387364568d/private/pthread/tsd_private.h"
+          url="https://raw.githubusercontent.com/apple-oss-distributions/libpthread/main/private/pthread/tsd_private.h"
           if ! curl -fsSL "$url" -o tsd_private.h; then
-            echo "::error::could not fetch apple/darwin-libpthread's tsd_private.h; cannot verify slots 96/97 are still unassigned"
+            echo "::error::could not fetch apple-oss-distributions/libpthread's tsd_private.h; cannot verify slots 96/97 are still unassigned"
             exit 1
           fi
           if ! grep -qE '__PTK_FRAMEWORK_CORETEXT_KEY0[[:space:]]+95' tsd_private.h || \
@@ -171,12 +184,21 @@ jobs:
             echo "::error::tsd_private.h does not have the expected shape (CORETEXT_KEY0=95, SWIFT_KEY0=100) -- fetch likely broken, not a real assertion"
             exit 1
           fi
-          if grep -qE '\b9[67]\b' tsd_private.h; then
-            echo "::error::Apple appears to have assigned TSD slot 96 or 97 -- this fork's MI_TLS_MODEL_FIXED_DEFAULT/_CACHED (prim-tls.h) collide with an in-use slot, silent memory corruption on macOS. Update the fixed slots before this build is trusted."
-            grep -nE '\b9[67]\b' tsd_private.h
-            exit 1
+          assert_slots_free() {
+            local file="$1" source="$2"
+            if grep -qE '^#define[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+9[67]\b' "$file"; then
+              echo "::error::Apple appears to have assigned TSD slot 96 or 97 ($source) -- this fork's MI_TLS_MODEL_FIXED_DEFAULT/_CACHED (prim-tls.h) collide with an in-use slot, silent memory corruption on macOS. Update the fixed slots before this build is trusted."
+              grep -nE '^#define[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+9[67]\b' "$file"
+              exit 1
+            fi
+          }
+          assert_slots_free tsd_private.h "apple-oss-distributions/libpthread@main"
+          sdk_copy="${SDKROOT:-}/usr/include/pthread/tsd_private.h"
+          if [ -n "${SDKROOT:-}" ] && [ -f "$sdk_copy" ]; then
+            assert_slots_free "$sdk_copy" "soldr's \$SDKROOT copy"
+            echo "OK: also checked soldr's \$SDKROOT copy at $sdk_copy"
           fi
-          echo "OK: slots 96 and 97 remain unassigned in apple/darwin-libpthread's tsd_private.h"
+          echo "OK: slots 96 and 97 remain unassigned in apple-oss-distributions/libpthread's tsd_private.h"
       - name: Configure for ${{ matrix.triple }}
         run: |
           set -euo pipefail

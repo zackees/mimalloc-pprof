@@ -135,6 +135,48 @@ jobs:
             args=(--restore "$archive" "${args[@]}")
           fi
           soldr prepare "${args[@]}"
+      - name: macOS fixed TLS slots 96/97 must still be unassigned (#273 8c)
+        # This fork uses fixed pthread TSD slots 96/97 for the theap pointer on Apple
+        # platforms when MI_TLS_MODEL_FIXED is opted into (see include/mimalloc/prim-tls.h)
+        # -- 96/97 sit in the never-assigned gap between __PTK_FRAMEWORK_CORETEXT_KEY0 (95)
+        # and __PTK_FRAMEWORK_SWIFT_KEY0 (100). A slot Apple later assigns is silent memory
+        # corruption, not a build failure, so this is checked in CI rather than trusted.
+        #
+        # There is no public Apple SDK -- not even soldr's -- that ships
+        # pthread/tsd_private.h: it is a *private* darwin-libpthread header, confirmed absent
+        # from $SDKROOT/usr/include here (soldr's Apple SDK 14.5) by direct search. The
+        # authoritative source both this fork and Bun's own comment cite is Apple's
+        # opensource release mirrored at apple/darwin-libpthread; pinned to the commit that
+        # last touched the file (libpthread-454.40.3, unchanged since 2021) rather than
+        # `main`, so a later unrelated push to that repo cannot silently change what this
+        # step checks.
+        #
+        # A pinned-content fetch that merely greps for 96/97 and passes on curl failure would
+        # be a tautology (nothing to grep -> nothing found -> false green), so this also
+        # asserts the fetched file has the shape the 96/97 choice depends on: key 95
+        # (__PTK_FRAMEWORK_CORETEXT_KEY0) and key 100 (__PTK_FRAMEWORK_SWIFT_KEY0) must both
+        # be present, proving the real header was fetched and the gap is still exactly where
+        # this fork's comment says it is. Runs once (this matrix entry only), not once per
+        # bundle -- the header does not vary by architecture or build config.
+        if: matrix.bundle == 'macos-arm64-release'
+        run: |
+          set -euo pipefail
+          url="https://raw.githubusercontent.com/apple/darwin-libpthread/fe48dac35eb1232b0aa67260e79911387364568d/private/pthread/tsd_private.h"
+          if ! curl -fsSL "$url" -o tsd_private.h; then
+            echo "::error::could not fetch apple/darwin-libpthread's tsd_private.h; cannot verify slots 96/97 are still unassigned"
+            exit 1
+          fi
+          if ! grep -qE '__PTK_FRAMEWORK_CORETEXT_KEY0[[:space:]]+95' tsd_private.h || \
+             ! grep -qE '__PTK_FRAMEWORK_SWIFT_KEY0[[:space:]]+100' tsd_private.h; then
+            echo "::error::tsd_private.h does not have the expected shape (CORETEXT_KEY0=95, SWIFT_KEY0=100) -- fetch likely broken, not a real assertion"
+            exit 1
+          fi
+          if grep -qE '\b9[67]\b' tsd_private.h; then
+            echo "::error::Apple appears to have assigned TSD slot 96 or 97 -- this fork's MI_TLS_MODEL_FIXED_DEFAULT/_CACHED (prim-tls.h) collide with an in-use slot, silent memory corruption on macOS. Update the fixed slots before this build is trusted."
+            grep -nE '\b9[67]\b' tsd_private.h
+            exit 1
+          fi
+          echo "OK: slots 96 and 97 remain unassigned in apple/darwin-libpthread's tsd_private.h"
       - name: Configure for ${{ matrix.triple }}
         run: |
           set -euo pipefail

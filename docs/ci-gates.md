@@ -271,53 +271,70 @@ contributes nothing — using `$<TARGET_LINKER_FILE_NAME:mimalloc>` so the Debug
 `mimalloc-debug.dll` is handled too. Verified cross-built for all three configs, and
 gated on every run.
 
-That fixes the import order. **It does not, on its own, make the override take effect**,
-and the same trick applied one level down makes things worse — see below.
+That fixes the import order in the *executable*. It is necessary but not sufficient: the
+same defect one level down, inside `mimalloc.dll`'s own table, is what actually decided
+the outcome. See below.
 
 ### The override is gated on the bundle's own binaries
 
-`run-windows-gnu` asserts both halves, as hard failures, on the artifacts it ships:
+`run-windows-gnu` asserts all of this, as hard failures, on the artifacts it ships:
 
-- **gated:** `mimalloc*.dll` is import #0 of `mimalloc-test-stress-dynamic.exe` in the
-  release, debug-full and shared bundles. Read with `ci/pe_imports.py`, a PE import-table
-  reader — `dumpbin` is MSVC-only and MSYS2 is not installed at that point in the job (and
-  depending on it would be wrong anyway: the bundle is meant to run with no toolchain).
-- **measured, not yet gated:** whether `malloc is redirected.` appears under
-  `MIMALLOC_VERBOSE=1` (`src/init.c:530`, printed only when `_mi_is_redirected()`).
-  `test-stress-dynamic` asserts nothing about redirection itself, so this probe is the
-  only thing anywhere in CI that looks at it.
+- **the exe's table:** `mimalloc*.dll` is import #0 of `mimalloc-test-stress-dynamic.exe`
+  in the release, debug-full and shared bundles. Read with `ci/pe_imports.py`, a PE
+  import-table reader — `dumpbin` is MSVC-only and MSYS2 is not installed at that point in
+  the job (and depending on it would be wrong anyway: the bundle is meant to run with no
+  toolchain).
+- **the DLL's table**, in the Linux build job that produces each bundle:
+  `mimalloc-redirect.dll` is import #0 of `mimalloc.dll`, and `mimalloc.dll` does **not**
+  import `__emutls_get_address`.
+- **the behaviour**, on all three bundles: `mimalloc-test-redirect-probe` must print
+  `REDIRECT_BEHAVIOURAL=1`.
 
-### What was tried, and what is still open
+That last one is deliberately *not* `mi_is_redirected()`. That flag only reports what the
+redirection module believed it did, and on the MSYS2 msvcrt binary it reports success
+while the binary's own `msvcrt.dll!malloc` was never touched — `mimalloc-redirect.dll`
+v1.3.3 names only `ucrtbase`/`ucrtbased` and contains no reference to `msvcrt`; what it
+patched there was a `ucrtbase.dll` some system DLL had loaded. So the gate takes a pointer
+from the CRT's own `malloc` and asks `mi_is_in_heap_region`. Only a real override makes
+that true. The flag is still printed, and the native row is still gated on it, because
+while that MSYS2 build exists a regression in it is a regression — but it is a witness,
+not a control.
 
-The cross-built binary does **not** redirect, and five measured attempts did not change
-that. In order:
+### Why it did not redirect, and what fixed it
 
-| attempt | result |
-|---|---|
-| as originally linked (`mimalloc.dll` last) | NOT-REDIRECTED |
-| `minject`, both postfixes, with and without `--inplace` | image will not start (rc 127) |
-| `MI_MINGW_UCRT64=OFF`, same toolchain | NOT-REDIRECTED |
-| `mimalloc.dll` first in the exe (the fix above) | NOT-REDIRECTED; everything else green |
-| `mimalloc-redirect.dll` also first inside `mimalloc.dll` | **SEGFAULT** before any output; reverted |
+Two bugs in series, both now fixed:
 
-The last row retires the "minject writes a corrupt PE" theory: minject produces exactly
-that layout, and so does the linker when asked to, and both crash the same way. Loading
-the redirection module before `ucrtbase` has initialised is what this binary cannot
-survive — and upstream's supported MSVC layout has the api-sets first too, so being
-*early* was never the requirement.
+1. **`mimalloc-redirect.dll` refuses to patch a CRT that has already initialised.** It
+   imports only `ntdll` and has no output API at all: its entire diagnostic channel is the
+   `const char**` returned by `mi_allocator_init`, which `src/init.c` prints *after* the
+   option dump. Printed, it says `mimalloc-redirect.dll seems to be initialized after
+   ucrtbase.dll`. The check (disassembled at `0x180003720` in the v1.3.3 module) is
+   `LdrGetDllHandle` followed by `LDR_DATA_TABLE_ENTRY.Flags & 0x00080000`
+   (`LDRP_PROCESS_ATTACH_CALLED`). The loader initialises a module's dependencies in *that
+   module's* import-descriptor order, so `mimalloc.dll` has to import the redirect module
+   before its own `api-ms-win-crt-*`. MSVC gets that for free (explicit libraries precede
+   `/DEFAULTLIB` ones); with `ld` it was decided by where the checkout happened to live.
+   `MI_MINGW_REDIRECT_FIRST` (default ON) spells it `./…`.
 
-So the probe reports and warns rather than failing, with a dated TODO, because a
-permanently-red gate is worse than an absent one. The MSYS2-built msvcrt binary in the
-same job **does** redirect and **is** gated — not as a substitute for the bundle, but
-because while that row exists a regression in it is still a regression. Escalated on #277:
-closing this needs a Windows debugger, not another CI round.
+2. **That layout then died at load — GCC emulated TLS.** soldr's conda-forge
+   `x86_64-w64-mingw32-gcc 15.3.0` has no native TLS: `__thread int x;` compiles to
+   `__emutls_v.x` plus a call to `__emutls_get_address`, and `__declspec(thread)` only
+   warns and emits a plain global. `__emutls_get_address` allocates its per-thread table
+   with `malloc` — which, once the override is live, is `mi_malloc`. cdb on the runner
+   showed the cycle, one `libgcc_s_seh_1!__emutls_get_address` frame per turn, until the
+   stack was gone. That is the "rc 139 / rc 127" recorded on earlier runs: a stack
+   overflow before `main`, **not** a corrupt PE. Fixed by moving the two thread-locals on
+   the allocation path — `src/threadlocal.c`'s `mi_thread_locals`/`mi_slot_fast` and
+   `src/options.c`'s output-recursion guard — onto dynamic Win32 TLS keys
+   (`_mi_prim_tls_key_*`, `MI_WIN_TLS_SLOTS`), which never allocate.
 
-`minject` is **not** used on the cross lane. It is a Windows PE utility, so it cannot run
-on the Linux builder at all; and when it was run on the Windows runner instead it produced
-an image that will not start (exit 127 — the loader refused it), for both an empty and a
-non-empty `--postfix`, with and without `--inplace`. That is a separate upstream bug,
-recorded with the facts in `docs/upstreaming.md` and deliberately not root-caused here,
-because the link-order fix removes the need for it.
+`minject` is **not** used on the cross lane, and is not needed on any lane. It is a
+Windows PE utility, so it cannot run on the Linux builder at all; and when it was run on
+the Windows runner instead it produced an image that would not start (exit 127). That is
+now understood: minject builds exactly the redirect-first layout, which was correct all
+along — the image died of the emulated-TLS recursion above, not of anything wrong with the
+PE minject wrote. Superseded by `MI_MINGW_REDIRECT_FIRST`, which does the same thing at
+link time and works on a cross build.
 
 ### The runtime DLL
 

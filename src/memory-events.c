@@ -249,7 +249,7 @@ void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
   // (memevt_live_bytes/memevt_live_count are running deltas, so an unmatched free would
   // under/overflow them) -- DHAT's own free path needs no matching check since it looks
   // up the pointer in its own record table and no-ops when the alloc was never recorded.
-  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
+  if (_mi_meta_is_meta_page_safe(page)) return;  // adapted for issue #271: was _mi_meta_is_meta_page(mi_page_subproc(page), page)
   _mi_dhat_begin_alloc(page, p, request_size);
   size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
@@ -277,8 +277,16 @@ void _mi_memevt_on_free(mi_page_t* page, void* p) {
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
   if (hooks->memevt_suppress_depth > 0) return;
+  // issue #271 (Bun parity P6, "keep our profiler hooks consistent -- a page unpublished
+  // from its heap must not be visited with a dangling heap pointer"): this can run for a
+  // cross-thread free (mi_free_block_mt) concurrently with a mi_heap_delete/mi_heap_destroy
+  // of `page`'s heap on another thread. The block being freed keeps `page` itself alive
+  // (see free.c's _mi_page_ptr_unalign comment), but NOT `page->heap` -- reproduced as a
+  // SIGSEGV (and, in MI_DEBUG builds, a read of MI_DEBUG_FREED-poisoned memory) reading
+  // page->heap->subproc here. _mi_meta_is_meta_page_safe (internal.h) answers the same
+  // question from page->memid's arena instead, which never touches page->heap.
   // #266: symmetric with the _mi_memevt_on_alloc check above -- see its comment.
-  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
+  if (_mi_meta_is_meta_page_safe(page)) return;
   _mi_dhat_begin_free(p);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {

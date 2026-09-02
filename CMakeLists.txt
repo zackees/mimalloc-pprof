@@ -1049,6 +1049,90 @@ if (MI_BUILD_TESTS)
   add_test(NAME test-subproc-lifecycle COMMAND mimalloc-test-subproc-lifecycle)
   set_tests_properties(test-subproc-lifecycle PROPERTIES TIMEOUT 600)
 
+  # Commit-fail fault injection (issue #271, Bun parity P6): imported from
+  # oven-sh/mimalloc @ 942b8342, MIT. Needs the MI_DEBUG-only mi_debug_fail_os_commit_after
+  # hook (src/os.c), so it only builds in a debug configuration -- mirrors Bun's own
+  # CMakeLists gating ("MI_DEBUG_FULL OR CMAKE_BUILD_TYPE MATCHES Debug"), simplified to
+  # the MI_DEBUG cmake variable this tree already resolves that from (see MI_DEBUG=0/1/2/3
+  # above). Exercises the arena_pages->pages-bit / page-map cleanup on a commit failure
+  # during mi_arenas_page_alloc_fresh; this tree's fresh-page-alloc path at the 6def7be9
+  # pin already sets the bit only after a successful commit (see the port's provenance
+  # note in MIMALLOC_FORKS.md), so a pass here is expected -- kept as regression coverage
+  # per the issue's "if everything passes, still import the test" instruction.
+  if(MI_DEBUG)
+    add_executable(mimalloc-test-commit-fail test/test-commit-fail.c)
+    target_compile_definitions(mimalloc-test-commit-fail PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-commit-fail PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-commit-fail PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-commit-fail PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-commit-fail PRIVATE mimalloc ${mi_libraries})
+    endif()
+    add_test(NAME test-commit-fail COMMAND mimalloc-test-commit-fail)
+    set_tests_properties(test-commit-fail PROPERTIES TIMEOUT 120)
+  endif()
+
+  # Bun's heap delete/destroy teardown regression corpus (issue #271, Bun parity P6):
+  # imported from oven-sh/mimalloc @ 942b8342, MIT, verbatim except for provenance headers
+  # and `#if 0 // Phase 7` around test-heap-teardown.c's `parked` case (needs the background
+  # scavenger / mi_on_thread_idle_*, neither of which exists in this tree, see issue #272).
+  # test-theap-sentinel.c is deliberately NOT imported: it white-box-reproduces a
+  # `(mi_theap_t*)1` sentinel-reservation bug in Bun's `mi_heap_init_theap` (heap.c) that
+  # only exists because Bun reserves the thread-local slot with a sentinel before creating
+  # the theap; this tree's `mi_heap_init_theap` (src/heap.c) never writes a sentinel -- it
+  # sets the slot to the real theap pointer exactly once, after `_mi_theap_create` succeeds
+  # -- so there is no equivalent bug to regress-test, and the test needs internal symbols
+  # (`_mi_theap_default_safe`) this fork's differently-shaped internals do not have. See the
+  # PR description's hunk-classification table.
+  # Bun's own CMakeLists (942b8342) registers this corpus with no explicit ctest TIMEOUT;
+  # bounded here instead so a still-open race (or the intentionally-unwired
+  # mi_debug_stall_in_heap_delete_claim hook, pre-protocol-port) fails the run rather than
+  # hanging it forever.
+  #
+  # test-heap-teardown itself is registered separately below, gated on MI_DEBUG: its `pin`
+  # case needs the MI_DEBUG-only mi_debug_stall_in_heap_delete_claim hook (arena.c), and the
+  # source now `#error`s (like test-commit-fail.c) if built with MI_DEBUG==0 rather than
+  # silently diverging between an undefined-symbol link failure (Debug + MI_NO_DEBUG=ON,
+  # where MI_DEBUG=0 but the old `!defined(NDEBUG)` guard still referenced the symbol) and a
+  # silently-skipped pin case (Release + MI_DEBUG_FULL=ON, where MI_DEBUG>0 but NDEBUG is
+  # still defined by the Release build type) -- both reproduced by CI review of this PR.
+  foreach(TEST_NAME heap-mt heap-churn heap-aba heap-delete-race)
+    add_executable(mimalloc-test-${TEST_NAME} test/test-${TEST_NAME}.c)
+    target_compile_definitions(mimalloc-test-${TEST_NAME} PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-${TEST_NAME} PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-${TEST_NAME} PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-${TEST_NAME} PRIVATE mimalloc ${mi_libraries})
+    endif()
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-${TEST_NAME} PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-${TEST_NAME} COMMAND mimalloc-test-${TEST_NAME})
+    set_tests_properties(test-${TEST_NAME} PROPERTIES TIMEOUT 300)
+  endforeach()
+
+  if(MI_DEBUG)
+    add_executable(mimalloc-test-heap-teardown test/test-heap-teardown.c)
+    target_compile_definitions(mimalloc-test-heap-teardown PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-heap-teardown PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-heap-teardown PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-heap-teardown PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-heap-teardown PRIVATE mimalloc ${mi_libraries})
+    endif()
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-heap-teardown PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-heap-teardown COMMAND mimalloc-test-heap-teardown)
+    set_tests_properties(test-heap-teardown PROPERTIES TIMEOUT 300)
+  endif()
+
   # pthread_atfork fork-safety handlers (issue #270, Bun parity P5). POSIX-only --
   # both sources compile to a Windows-skip stub via #ifdef _WIN32, but there is no
   # pthread/fork() to link against on MSVC/MinGW, so only build+register them off

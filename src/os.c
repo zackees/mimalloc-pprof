@@ -553,6 +553,11 @@ static void* mi_os_page_align_area_conservative(void* addr, size_t size, size_t*
   return mi_os_page_align_areax(true, addr, size, newsize);
 }
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT
+#if MI_DEBUG > 0
+mi_decl_export volatile long mi_debug_fail_os_commit_after = 0;
+#endif
+
 bool _mi_os_commit_ex(mi_subproc_t* subproc, void* addr, size_t size, bool* is_zero, size_t stat_size) {
   if (is_zero != NULL) { *is_zero = false; }
   mi_subproc_stat_counter_increase(subproc, commit_calls, 1);
@@ -564,6 +569,15 @@ bool _mi_os_commit_ex(mi_subproc_t* subproc, void* addr, size_t size, bool* is_z
 
   // commit
   bool os_is_zero = false;
+  // imported from oven-sh/mimalloc @ 942b8342, MIT: MI_DEBUG fault injection hook (issue #271)
+  #if MI_DEBUG > 0
+  const long fail_after = mi_debug_fail_os_commit_after;
+  if (fail_after > 0) { mi_debug_fail_os_commit_after = fail_after - 1; }
+  if (fail_after == 1) {
+    _mi_warning_message("mi_debug_fail_os_commit_after: injecting commit failure at %p, size 0x%zx\n", start, csize);
+    return false;
+  }
+  #endif
   int err = _mi_prim_commit(start, csize, &os_is_zero);
   if (err != 0) {
     _mi_warning_message("cannot commit OS memory (error: %d (0x%x), address: %p, size: 0x%zx bytes)\n", err, err, start, csize);

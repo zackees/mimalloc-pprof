@@ -17,7 +17,14 @@ terms of the MIT license.
    On ELF the call is made from `.preinit_array`, which the loader runs before every
    `.init_array` entry of the executable and its libraries -- the same point in process startup
    as the glibc call. Elsewhere a plain constructor is the closest available approximation (its
-   order relative to mimalloc's own constructor is not guaranteed). */
+   order relative to mimalloc's own constructor is not guaranteed).
+
+   musl's dynamic linker does not invoke DT_PREINIT_ARRAY for the main executable at all (verified
+   empirically on alpine:3.20/musl 1.2.5: a `.preinit_array` entry with `used` never runs, though
+   the section and dynamic-table entry are emitted correctly by the linker -- this is a musl
+   limitation, not a linker or mimalloc bug, and the original glibc 2.44 race this test targets is
+   glibc-specific to begin with). Fall back to the constructor approximation under MI_LIBC_MUSL,
+   per #273 (8a). */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +38,7 @@ static void free_null_before_init(void) {
   calls_before_init++;
 }
 
-#if defined(__ELF__)
+#if defined(__ELF__) && !defined(MI_LIBC_MUSL)
 __attribute__((section(".preinit_array"), used))
 static void (*mi_test_preinit)(void) = &free_null_before_init;
 #elif defined(__GNUC__) || defined(__clang__)

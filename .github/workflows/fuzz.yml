@@ -20,6 +20,13 @@ on:
   schedule:
     - cron: '0 4 * * *'   # nightly, longer budget
 
+concurrency:
+  # event_name is in the group on purpose: a scheduled run carries ref=refs/heads/main,
+  # so without it the nightly 2,000,000-iteration run and a main push would cancel each
+  # other. Same-event runs on the same ref still supersede.
+  group: fuzz-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest

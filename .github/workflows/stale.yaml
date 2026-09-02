@@ -4,6 +4,13 @@ on:
     - cron: "15 21 * * *"  # minute, hour, day (1-31), month (1-12), day of the week (0 - 6 or SUN-SAT)
 
 name: Close inactive issues
+
+concurrency:
+  # Never cancel: it closes/labels issues and PRs, so a half-run leaves the repo in a
+  # partially-swept state.
+  group: stale-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   close-issues:
     runs-on: ubuntu-latest

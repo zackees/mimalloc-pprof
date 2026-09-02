@@ -17,6 +17,11 @@ on:
       - 'test/bench-zero-tracking.c'
       - '.github/workflows/zero-tracking.yml'
 
+concurrency:
+  # A/B timing report on a path-filtered PR; produces no artifact anyone waits on.
+  group: zero-tracking-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ab:
     strategy:

@@ -16,6 +16,11 @@ on:
       - '.github/workflows/python-lint.yml'
       - '.github/workflows/benchmark-*.yml'
 
+concurrency:
+  # Pure verification: a superseded push's answer is worthless.
+  group: python-lint-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     runs-on: ubuntu-latest

@@ -12,6 +12,11 @@ on:
       - 'ci/**'
       - '.github/workflows/c-unit.yml'
 
+concurrency:
+  # The macOS/Windows queue hog (#277). A superseded push's ctest result is worthless.
+  group: c-unit-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ctest:
     strategy:

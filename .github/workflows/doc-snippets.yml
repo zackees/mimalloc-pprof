@@ -23,6 +23,11 @@ on:
       - 'ci/check_doc_snippets.py'
       - '.github/workflows/doc-snippets.yml'
 
+concurrency:
+  # Pure verification: a superseded push's answer is worthless.
+  group: doc-snippets-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: ubuntu-latest

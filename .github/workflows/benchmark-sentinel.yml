@@ -17,6 +17,11 @@ on:
 env:
   SOLDR_GITHUB_TOKEN: ${{ github.token }}
 
+concurrency:
+  # PR-tier sentinel; artifact-only, publishes nothing (see #171).
+  group: benchmark-sentinel-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   sentinel:
     name: benchmark-sentinel (${{ matrix.os }})

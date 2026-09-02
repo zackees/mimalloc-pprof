@@ -9,6 +9,11 @@ on:
       - 'ci/check_crate_package.py'
       - '.github/workflows/rust-native.yml'
 
+concurrency:
+  # Its only publish-shaped step is `cargo publish --dry-run`, which uploads nothing.
+  group: rust-native-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:

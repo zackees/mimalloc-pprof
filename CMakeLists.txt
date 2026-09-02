@@ -712,7 +712,13 @@ endif()
 # set language for source files now
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c PROPERTIES LANGUAGE CXX )
+  # #272 (P7b): test-purge-holes.c and test-profile-race.c reach `mimalloc/internal.h`
+  # (`_mi_ptr_page`, `mi_page_block_is_purged`, `_mi_os_page_size`, ...), which is NOT wrapped
+  # in `extern "C"`. With MI_USE_CXX the library's symbols are C++-mangled, so a C test cannot
+  # link them -- the `windows-msvc` bundles failed with `lld-link: undefined symbol:
+  # _mi_os_page_size`. Compiling these two as C++ alongside the library is what test-api.c
+  # already does for the same reason.
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c PROPERTIES LANGUAGE CXX )
 endif()
 
 

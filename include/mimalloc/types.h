@@ -569,7 +569,7 @@ struct mi_theap_s {
   bool                  prof_force_slow;                     // #267: poison `pages_free_direct` so every malloc misses
                                                                // the fast path and lands in `_mi_malloc_generic` (where the
                                                                // sampling countdown lives) while the profiler is running.
-                                                               // Set/cleared cross-thread by `_mi_subproc_prof_set_force_slow`
+                                                               // Set/cleared cross-thread by `_mi_subproc_prof_sync_force_slow`
                                                                // (subproc.c) under `heap->theaps_lock`; a new theap reads the
                                                                // current profiler state under that same lock in
                                                                // `_mi_theap_init` (theap.c) so it is never missed by a

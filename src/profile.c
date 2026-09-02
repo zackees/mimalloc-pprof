@@ -293,14 +293,14 @@ bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept {
   // subproc/heap/theap locks that nothing else nests under prof_lock, and coupling them
   // here would just add a new lock-ordering constraint for no benefit (prof_enabled is
   // already visible process-wide by the time the walk starts). See
-  // `_mi_subproc_prof_set_force_slow`'s comment (subproc.c) for the poisoning strategy
+  // `_mi_subproc_prof_sync_force_slow`'s comment (subproc.c) for the poisoning strategy
   // and the accepted start-time coverage gap this creates: a theap whose queue update
   // races the walk and reads `prof_force_slow` as not-yet-set keeps its fast path live
   // for one more allocation. The strategy (poison-on-start) is ported from
   // oven-sh/mimalloc @ 942b8342; this specific window is a consequence of our own
   // implementation choice to walk outside prof_lock, not a claim about Bun's own
   // start-time behavior, which was not inspected in this detail.
-  if (started) { _mi_subproc_prof_set_force_slow(); }
+  if (started) { _mi_subproc_prof_sync_force_slow(); }
   return started;
 }
 bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { return mi_prof_start_seeded(sample_rate, (uint64_t)mi_option_get(mi_option_prof_seed)); }
@@ -459,7 +459,7 @@ void mi_prof_stop(void) mi_attr_noexcept {
   // a page that gets freed moments later -- a use-after-free on that theap's next fast-path
   // malloc. Each theap re-syncs its own `pages_free_direct` itself, same-thread, the next
   // time it takes the generic path (see `mi_find_page`/`_mi_malloc_generic` in page.c).
-  _mi_subproc_prof_set_force_slow();
+  _mi_subproc_prof_sync_force_slow();
 }
 bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
   if (write == NULL) return false;
@@ -875,7 +875,7 @@ static void prof_auto_start(void) {
   /* Some statically linked MinGW programs do not retain the CRT/TLS startup
      callback. Fall back to the first allocation so MIMALLOC_PROF still works. */
   // #267 follow-up (latent, not fixed here): mi_prof_start (via this function) now
-  // reaches _mi_subproc_prof_set_force_slow (subproc.c), which takes
+  // reaches _mi_subproc_prof_sync_force_slow (subproc.c), which takes
   // subproc->heaps_lock and each heap's theaps_lock. This function is reachable from
   // the alloc path (any mi_malloc can be the first-ever allocation with
   // MIMALLOC_PROF=1), so a caller's own mi_heap_visit_fun/visitor passed to
@@ -918,7 +918,7 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   // theap_meta) can be in flight while this same thread holds `subproc->theap_meta_lock`
   // or, during subproc/heap creation, `subproc->heaps_lock`. prof_auto_start()'s
   // first-ever call can reach mi_prof_start(), whose cross-theap poison walker
-  // (_mi_subproc_prof_set_force_slow, subproc.c) takes `subproc->heaps_lock` and each
+  // (_mi_subproc_prof_sync_force_slow, subproc.c) takes `subproc->heaps_lock` and each
   // heap's `theaps_lock` -- a non-reentrant self-deadlock if a meta allocation could still
   // reach prof_auto_start() here. Meta pages are never sampled anyway, so skipping
   // auto-start for them too costs nothing: it still fires on the first genuine user

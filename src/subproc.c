@@ -354,7 +354,7 @@ bool mi_subproc_visit_heaps(mi_subproc_id_t subproc_id, mi_heap_visit_fun* visit
 // safe to leave stale for a while rather than a use-after-free waiting to happen. Clearing
 // the flag (fresh read says disabled) never touches `pages_free_direct` itself -- see
 // `mi_prof_stop`'s comment (profile.c) for why.
-void _mi_subproc_prof_set_force_slow(void) {
+void _mi_subproc_prof_sync_force_slow(void) {
   mi_lock(&mi_subprocs_lock) {
     for (mi_subproc_t* subproc = mi_subprocs; subproc != NULL; subproc = subproc->next) {
       mi_lock(&subproc->heaps_lock) {

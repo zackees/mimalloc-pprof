@@ -964,7 +964,7 @@ static void test_meta_pages_never_sampled(void) {
 
 /* ---- #267 adversarial cases: start/stop/reset racing concurrent allocation ----------
    Exercises the zero-cost-when-off fast path's cross-thread poison/unpoison machinery
-   (mi_theap_t::prof_force_slow, `_mi_subproc_prof_set_force_slow` in subproc.c) under
+   (mi_theap_t::prof_force_slow, `_mi_subproc_prof_sync_force_slow` in subproc.c) under
    the exact conditions it is built for: worker threads hammering the small-object fast
    path while this thread starts, stops, and restarts the profiler with a different rate
    underneath them, plus a reset while a page still carries a live sampled block. None of
@@ -1045,7 +1045,7 @@ static void test_start_while_allocating_stop_mid_sample_restart_reset(void) {
   cfg1.sample_interval = 128;
 
   /* 1) start while several threads are already mid-allocation loop -- races the
-        cross-theap poison walk (_mi_subproc_prof_set_force_slow) against each worker's
+        cross-theap poison walk (_mi_subproc_prof_sync_force_slow) against each worker's
         own theap-creation/queue-update activity, AND races the page-retirement path
         against `prof_force_slow` (see the worker-body comment above). */
   p267_stop_workers = false;

@@ -972,12 +972,15 @@ static mi_page_t* mi_find_page(mi_theap_t* theap, size_t size, size_t huge_align
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   #if MI_PPROF
-  // #267: same-thread, lock-free opportunistic re-sync of `pages_free_direct` for this
-  // queue. A no-op while `theap->prof_force_slow` is still set (see
-  // `mi_theap_queue_first_update`'s early-return in page-queue.c) and a no-op for `pq`
-  // outside the small-object range; once the profiler has stopped, this is what actually
-  // restores the fast path for a theap that is not otherwise mutating its page queues --
-  // `mi_prof_stop` (profile.c) deliberately does not touch `pages_free_direct` cross-thread.
+  // #267: same-thread, lock-free re-sync of `pages_free_direct` for this queue. A no-op
+  // for `pq` outside the small-object range. While `theap->prof_force_slow` is still set
+  // it is NOT a no-op -- it re-poisons the whole range to the empty page (see
+  // `mi_theap_queue_first_update`'s "already set" short-circuit comment in page-queue.c
+  // for why that short-circuit is disabled while poisoned: a cross-thread poison write can
+  // otherwise leave an interior slot of a multi-slot range stuck on a real, soon-to-be-
+  // freed page). Once the profiler has stopped, this is what actually restores the fast
+  // path for a theap that is not otherwise mutating its page queues -- `mi_prof_stop`
+  // (profile.c) deliberately does not touch `pages_free_direct` cross-thread.
   mi_theap_queue_first_update(theap, pq);
   #endif
   return page;
@@ -1123,9 +1126,9 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
         if (ppage!=NULL) { *ppage = page; }
         mi_assert_internal(mi_page_immediate_available(page));
         #if MI_PPROF
-        // #267: opportunistic re-sync (see `mi_find_page`'s matching comment above; a
-        // no-op unless the profiler has stopped and this theap's fast path for `pq` is
-        // still poisoned from a run that ended without this queue being touched again).
+        // #267: re-sync (see `mi_find_page`'s matching comment above) -- restores the
+        // fast path once stopped, or re-poisons a multi-slot range's interior slots while
+        // still running (see `mi_theap_queue_first_update`'s comment, page-queue.c).
         mi_theap_queue_first_update(theap, pq);
         #endif
         void* const p = _mi_page_malloc_zero(theap,page,size,zero);

@@ -302,7 +302,7 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
     heap->theaps = theap;
     #if MI_PPROF
     // #267: read the profiler's current run state and push under the SAME lock that
-    // `_mi_subproc_prof_set_force_slow` (subproc.c) holds while poisoning every theap in
+    // `_mi_subproc_prof_sync_force_slow` (subproc.c) holds while poisoning every theap in
     // this heap's list -- this serializes "am I in the list yet" against "is profiling
     // enabled yet" so a theap created concurrently with `mi_prof_start`/`mi_prof_stop` is
     // never missed: either this push is ordered before that walk (which then sees and

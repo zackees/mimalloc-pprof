@@ -357,7 +357,7 @@ mi_prof_stack_t* _mi_prof_stack_intern(void);
 // #267: zero-cost-when-off fast path. "page-queue.c": poisons/refreshes one theap's
 // `pages_free_direct`. "subproc.c": walks every live theap process-wide.
 void        _mi_theap_pages_free_direct_poison(mi_theap_t* theap);
-void        _mi_subproc_prof_set_force_slow(void);
+void        _mi_subproc_prof_sync_force_slow(void);
 void        _mi_prof_stack_release(mi_prof_stack_t* stack);
 void        _mi_prof_stack_alloc(mi_prof_stack_t* stack, size_t size);
 void        _mi_prof_stack_free(mi_prof_stack_t* stack, size_t size);

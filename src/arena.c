@@ -1197,6 +1197,18 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(unabandon || (page->next==NULL && page->prev==NULL));
   mi_assert_internal(_mi_theap_can_touch(current_theapx));
+  #if MI_PPROF
+  // #272 profiler-interaction invariant (1): no profiler record may be attached to a page that
+  // is going back to the arena, because the slices it occupies can be decommitted by the
+  // background scavenger at any point after `mi_arena_schedule_purge` below. The invariant holds
+  // by construction -- a page only reaches here once `mi_page_all_free`, and every block free
+  // ran `_mi_prof_on_free` / `_mi_prof_on_free_collect`, which unlink that block's record under
+  // `prof_lock` and clear `has_metadata` when the list empties -- but it is exactly the kind of
+  // thing a future fast path could break silently, so assert it where the page is handed over.
+  // (The records themselves live in the profiler's raw-OS arena, CLAUDE.md rule 4, so they are
+  // never inside a discarded range either way; this asserts nothing DANGLES INTO the range.)
+  mi_assert_internal(!page->has_metadata && page->metadata == NULL);
+  #endif
 
   // all we need from the heap, before the page is unpublished from it (see
   // mi_arenas_page_free_prim's provenance comment, above)

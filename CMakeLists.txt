@@ -1016,6 +1016,12 @@ if (MI_BUILD_TESTS)
     endif()
     add_test(NAME test-profile-race COMMAND mimalloc-test-profile-race)
     set_tests_properties(test-profile-race PROPERTIES TIMEOUT 300)
+    # issue #272: the same source with the purge delay forced to its minimum, so the
+    # background scavenger is continuously decommitting arena slices underneath scenario 4's
+    # mi_prof_visit / mi_prof_snapshot_new walks (and sweeping the parked worker threads).
+    add_test(NAME test-profile-race-scavenger COMMAND mimalloc-test-profile-race)
+    set_tests_properties(test-profile-race-scavenger PROPERTIES TIMEOUT 300
+                         ENVIRONMENT "MIMALLOC_PURGE_DELAY=1;MIMALLOC_SCAVENGER=1")
   endif()
 
   # Memory + counter regression gate (issue #63). Emits JSON for CI baseline
@@ -1583,6 +1589,31 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-process-rss PRIVATE mimalloc ${mi_libraries})
   endif()
   add_test(NAME test-process-rss COMMAND mimalloc-test-process-rss)
+
+  # issue #272 (Bun parity P7a) acceptance test. A C++ TU that declares
+  # `extern "C" void mi_on_thread_idle(void) noexcept;` by hand, exactly as Bun's consumer
+  # code does (no mimalloc header), so a mangling or noexcept mismatch in the public header
+  # is a link error here. It then asserts the behaviour: RSS drops by at least half of a
+  # freed 256 MiB within one second of a worker thread going idle, with neither thread
+  # allocating in the meantime (so it measures the scavenger, not an inline purge).
+  # A C++ compiler is not required by this project (`project(libmimalloc C)`), so only add
+  # the target when one is actually available.
+  include(CheckLanguage)
+  check_language(CXX)
+  if(CMAKE_CXX_COMPILER AND MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    enable_language(CXX)
+    add_executable(mimalloc-test-thread-idle-rss test/test-thread-idle-rss.cpp)
+    target_compile_definitions(mimalloc-test-thread-idle-rss PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-thread-idle-rss PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-thread-idle-rss PRIVATE include)
+    target_link_libraries(mimalloc-test-thread-idle-rss PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-thread-idle-rss PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-thread-idle-rss COMMAND mimalloc-test-thread-idle-rss)
+    set_tests_properties(test-thread-idle-rss PROPERTIES TIMEOUT 120)
+  endif()
 
   # macOS VM tag must be application-specific (issue #78).
   add_executable(mimalloc-test-os-tag test/test-os-tag.c)

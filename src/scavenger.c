@@ -121,7 +121,20 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
       }
     }
     if (claimed == NULL) return due_in;   // nothing parked (any more) that is due yet
+    #if MI_DEBUG
+    // #272 profiler-interaction invariant (3): the parked thread's own sampling countdown is
+    // its own. Nothing in the sweep may advance or reset it -- the profiler decides when to
+    // sample from the OWNER's allocation stream, and a sweep that touched these would make a
+    // parked thread's next sample depend on how often the scavenger happened to visit it.
+    const mi_profiler_tld_t prof_before = claimed->profiler;
+    #endif
     _mi_thread_idle_work(claimed, theap0);
+    #if MI_DEBUG
+    mi_assert_internal(claimed->profiler.bytes_since_sample == prof_before.bytes_since_sample &&
+                       claimed->profiler.next_threshold    == prof_before.next_threshold &&
+                       claimed->profiler.random            == prof_before.random &&
+                       claimed->profiler.generation        == prof_before.generation);
+    #endif
     // #272 profiler-interaction invariant (3): the sweep must leave this thread without a theap
     // of its own. If any hook or stat on the sweep path forced `_mi_theap_default()` into
     // existence here, the scavenger would (a) acquire this fork's per-thread profiler/hook

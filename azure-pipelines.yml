@@ -150,35 +150,11 @@ jobs:
 #  - upload: $(Build.SourcesDirectory)/$(BuildType)
 #    artifact: mimalloc-ubuntu-$(BuildType)
 
-- job:
-  displayName: macOS 14 (Sonoma)
-  pool:
-    vmImage:
-      macOS-14
-  strategy:
-    matrix:
-      Debug:
-        BuildType: debug
-        cmakeExtraArgs: -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG_FULL=ON
-      Release:
-        BuildType: release
-        cmakeExtraArgs: -DCMAKE_BUILD_TYPE=Release
-      Secure:
-        BuildType: secure
-        cmakeExtraArgs: -DCMAKE_BUILD_TYPE=Release -DMI_SECURE=ON
-  steps:
-  - task: CMake@1
-    inputs:
-      workingDirectory: $(BuildType)
-      cmakeArgs: .. $(cmakeExtraArgs)
-  - script: make -j$(sysctl -n hw.ncpu) -C $(BuildType)
-    displayName: Make
-  - script: ctest --verbose --timeout 240
-    workingDirectory: $(BuildType)
-    displayName: CTest
-    
-#  - upload: $(Build.SourcesDirectory)/$(BuildType)
-#    artifact: mimalloc-macos-$(BuildType)
+# The macOS 14 and macOS 15 jobs were removed in issue #277 phase B2: no macOS
+# runner is used anywhere in this fork. Both Apple architectures are cross-built on
+# Linux through soldr and the x86_64 bundle is executed under dockurr/macos on a
+# Linux runner -- see docs/ci-gates.md. (This pipeline is inherited from upstream and
+# is dormant in the fork; ci/lint_no_macos_runners.py scans it anyway.)
 
 # ----------------------------------------------------------
 # Other OS versions (just debug mode)
@@ -222,30 +198,6 @@ jobs:
       workingDirectory: $(BuildType)
       cmakeArgs: .. $(cmakeExtraArgs)
   - script: make -j$(nproc) -C $(BuildType)
-    displayName: Make
-  - script: ctest --verbose --timeout 240
-    workingDirectory: $(BuildType)
-    displayName: CTest
-
-- job:
-  displayName: macOS 15 (Sequoia)
-  pool:
-    vmImage:
-      macOS-15
-  strategy:
-    matrix:
-      Debug:
-        BuildType: debug
-        cmakeExtraArgs: -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG_FULL=ON
-      # Release:
-      #   BuildType: release
-      #   cmakeExtraArgs: -DCMAKE_BUILD_TYPE=Release
-  steps:
-  - task: CMake@1
-    inputs:
-      workingDirectory: $(BuildType)
-      cmakeArgs: .. $(cmakeExtraArgs)
-  - script: make -j$(sysctl -n hw.ncpu) -C $(BuildType)
     displayName: Make
   - script: ctest --verbose --timeout 240
     workingDirectory: $(BuildType)

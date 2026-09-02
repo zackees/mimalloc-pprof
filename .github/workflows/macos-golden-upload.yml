@@ -1,0 +1,124 @@
+name: macos-golden-upload
+
+# Issue #277 phase B2. Publish an already-built golden macOS disk into the Actions cache
+# that `macos-bundles.yml`'s `run-macos-x64-dockur` restores.
+#
+# This job does NOT install macOS, and deliberately cannot. macOS has no unattended
+# installer, so a human must drive Apple's Recovery GUI once. Doing that on a runner would
+# mean exposing dockur's web viewer -- an unauthenticated noVNC console with keyboard and
+# mouse control of the VM -- to the public internet for the several hours an emulated
+# install takes, from a PUBLIC repository. An earlier draft of this workflow did exactly
+# that behind a cloudflared quick tunnel and printed the URL into the run log; that is why
+# it no longer exists. The install happens on a maintainer's own machine, on loopback:
+#
+#   ci/macos_golden_local.sh boot     # start the guest, print the click-by-click list
+#   ci/macos_golden_local.sh check    # poll until ssh answers
+#   ci/macos_golden_local.sh pack     # shut down, tar -cSf | zstd, checksum, size-gate
+#
+# Then upload the resulting macstore.tar.zst somewhere private that a runner can fetch by
+# URL, and run this workflow with that URL and its sha256.
+#
+# Both inputs are masked before use, so neither appears in the log even if a later step
+# echoes a command containing them. The URL is expected to be a short-lived signed link;
+# treat it as a credential.
+#
+# The image must NOT be published as a public release asset: that would be redistributing
+# Apple software. Apple's macOS Software Licence Agreement permits running macOS in a VM
+# only on Apple-branded hardware, and dockur/macos states the same caveat in its README.
+# Recorded here as a fact for whoever owns that decision.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Private URL to fetch macstore.tar.zst from (treated as a secret)"
+        required: true
+      sha256:
+        description: "Expected sha256 of macstore.tar.zst (from `macos_golden_local.sh pack`)"
+        required: true
+      golden_key:
+        description: "Cache key to publish under"
+        default: "macos-x64-golden-ventura-v1"
+
+concurrency:
+  # Two of these racing would fight over one cache key.
+  group: macos-golden-upload
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Mask the inputs before anything can echo them
+        # First step, before any `set -x` or curl invocation exists to leak them.
+        env:
+          URL: ${{ inputs.url }}
+          SHA: ${{ inputs.sha256 }}
+        run: |
+          echo "::add-mask::$URL"
+          echo "::add-mask::$SHA"
+
+      - name: Refuse to overwrite an existing entry silently
+        id: existing
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/golden
+          key: ${{ inputs.golden_key }}
+          lookup-only: true
+
+      - name: Fetch and verify
+        env:
+          URL: ${{ inputs.url }}
+          SHA: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$URL"
+          echo "::add-mask::$SHA"
+          sudo mkdir -p /mnt/golden && sudo chown "$USER" /mnt/golden
+          # --fail so an HTML error page is not silently checksummed and rejected with a
+          # confusing message; -sS so the progress meter does not spam the log but errors
+          # still surface.
+          curl --fail -sS -L -o /mnt/golden/macstore.tar.zst "$URL"
+          size=$(stat -c%s /mnt/golden/macstore.tar.zst)
+          echo "downloaded $(numfmt --to=iec "$size")"
+          actual=$(sha256sum /mnt/golden/macstore.tar.zst | cut -d' ' -f1)
+          if [ "$actual" != "$SHA" ]; then
+            # Neither value is printed: the expected one is a masked input and the actual
+            # one would let the masked value be recovered by comparison.
+            echo "::error::sha256 mismatch -- the downloaded image is not the one you packed"
+            exit 1
+          fi
+          echo "sha256 verified"
+          # GitHub gives a repository 10 GB of Actions cache IN TOTAL, shared with the
+          # soldr caches. Refuse rather than silently evicting them on every run.
+          if [ "$size" -gt 9000000000 ]; then
+            echo "::error::image is $(numfmt --to=iec "$size"), over the 9 GB budget; see docs/ci-gates.md"
+            exit 1
+          fi
+
+      - name: It must actually be a readable archive
+        # A cache entry that only fails when run-macos-x64-dockur unpacks it would waste a
+        # full CI run to discover. `-t` streams it without writing 64 GB to disk.
+        run: |
+          set -euo pipefail
+          zstd -dc /mnt/golden/macstore.tar.zst | tar -tf - | head -20
+          echo "archive is readable"
+
+      - uses: actions/cache/save@v4
+        with:
+          path: /mnt/golden
+          key: ${{ inputs.golden_key }}
+
+      - name: Say what happened
+        run: |
+          {
+            echo "### golden macOS image published"
+            echo
+            echo "- cache key: \`${{ inputs.golden_key }}\`"
+            echo "- previously present: \`${{ steps.existing.outputs.cache-hit == 'true' }}\`"
+            echo "- \`run-macos-x64-dockur\` should now go green on the next run."
+            echo
+            echo "Actions caches are evicted after **7 days without a read**."
+            echo "\`macos-golden-touch.yml\` reads this entry weekly to keep it alive."
+          } >> "$GITHUB_STEP_SUMMARY"

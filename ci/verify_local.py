@@ -645,13 +645,11 @@ def run_lint(ctx: RunCtx) -> bool:
         )
         ok = ok and rc == 0
 
-    # Issue #277 phase B2: no workflow may schedule onto a native macOS runner. Also
-    # yaml-dependent, so it gets the same ephemeral environment as the four above.
-    rc, _ = run_logged(
-        ["uv", "run", "--with", "pyyaml==6.0.2", "ci/lint_no_macos_runners.py"],
-        cwd=ROOT,
-        log=ctx.log,
-    )
+    # Issue #277 phase B2: no workflow -- nor azure-pipelines.yml -- may schedule onto a
+    # native macOS runner. Run bare, unlike the four above: this script carries a PEP-723
+    # header declaring its own PyYAML, so the command in its docstring works on a fresh
+    # checkout. Injecting --with here would hide a regression in that header.
+    rc, _ = run_logged(["uv", "run", "ci/lint_no_macos_runners.py"], cwd=ROOT, log=ctx.log)
     ok = ok and rc == 0
 
     rc, _ = run_logged(

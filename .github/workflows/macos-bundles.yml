@@ -325,16 +325,23 @@ jobs:
   # a GUI that must be driven by a human through dockur's web viewer on :8006 (verified
   # against the image: /run/install.sh has no automation hook, and the image exposes no
   # unattended/answer-file variable the way dockur/windows does). Installing on every run
-  # is therefore not an option at any price. `macos-golden-bootstrap.yml` is the one-time,
-  # human-driven job that produces the disk this job restores; a cache miss here is a hard
-  # error that names it, rather than a silent skip.
+  # is therefore not an option at any price. The disk is built ONCE, on a maintainer's own
+  # machine, by `ci/macos_golden_local.sh`, and published into the Actions cache by
+  # `macos-golden-upload.yml`. A cache miss here is a hard error naming both, never a
+  # silent skip.
   #
-  # CONSEQUENCE, stated plainly rather than left for a reviewer to discover: until
-  # `macos-golden-bootstrap` has been run once, THIS JOB IS RED -- on the PR that
-  # introduces it and on every push to main after it merges. That is deliberate. A gate
-  # that reports "I have no disk to run on" is worth more than one that skips itself into
-  # a green tick, which is the exact failure mode docs/ci-gates.md exists to prevent. It
-  # fails in about two minutes and costs one Linux runner.
+  # The install is deliberately NOT done on a runner. Driving Apple's Recovery GUI in CI
+  # would mean exposing dockur's web viewer -- an unauthenticated noVNC console with
+  # keyboard and mouse control of the VM -- to the public internet for the hours an
+  # emulated install takes, from a public repository. Loopback on a maintainer's machine
+  # costs nothing and risks nothing.
+  #
+  # CONSEQUENCE, stated plainly rather than left for a reviewer to discover: until that
+  # image has been built and uploaded once, THIS JOB IS RED -- on the PR that introduces
+  # it and on every push to main after it merges. That is deliberate. A gate that reports
+  # "I have no disk to run on" is worth more than one that skips itself into a green tick,
+  # which is the exact failure mode docs/ci-gates.md exists to prevent. It fails in about
+  # two minutes and costs one Linux runner.
   # ---------------------------------------------------------------------------------
   run-macos-x64-dockur:
     name: run-macos-x64 (dockurr/macos on Linux)
@@ -417,10 +424,10 @@ jobs:
         if: steps.golden.outputs.cache-hit != 'true'
         run: |
           echo "::error::No golden macOS disk under cache key '$GOLDEN_KEY'." \
-               "macOS cannot be installed unattended, so this job cannot bootstrap itself." \
-               "Run the 'macos-golden-bootstrap' workflow (manual, one-time, ~2-4 h:" \
-               "it opens dockur's web viewer over a tunnel so a human can drive Apple's" \
-               "installer once), then re-run this job."
+               "macOS has no unattended installer, so this job cannot bootstrap itself." \
+               "Build the image once on your own machine with ci/macos_golden_local.sh" \
+               "(boot -> click through Apple's installer -> pack), then publish it with" \
+               "the 'macos-golden-upload' workflow and re-run this job."
           exit 1
 
       - name: Give containers access to /dev/kvm
@@ -445,7 +452,13 @@ jobs:
         id: boot
         run: |
           set -euo pipefail
-          zstd -d --sparse -T0 /mnt/golden/macstore.tar.zst -c | tar -C /mnt/macstore -xf -
+          # NOT `zstd -d --sparse ... -c`: sparse mode cannot apply to a pipe, and zstd
+          # does not ignore the flag, it fails -- `zstd: error 92 : Sparse skip error`,
+          # reproduced on zstd 1.5.7, which then feeds tar a truncated stream and reports
+          # "This does not look like a tar archive". The holes are preserved anyway,
+          # because `macos_golden_local.sh pack` recorded them with `tar -cSf`; GNU tar
+          # restores a sparse member's holes on extraction from that format on its own.
+          zstd -dc /mnt/golden/macstore.tar.zst | tar -C /mnt/macstore -xSf -
           du -sh /mnt/macstore
 
           # dockur pins AMD hosts to one core (dockur/macos#268: the guest panics with
@@ -464,9 +477,13 @@ jobs:
           # `Skylake-Client-v4` boots macOS Recovery in about 5 minutes. dockur#268
           # describes the AMD symptom and the single-core mitigation; the CPU model is the
           # other half and it is not defaulted for macOS 13.
+          # 127.0.0.1 explicitly: Docker's default publish address is 0.0.0.0, and the
+          # guest's sshd accepts a fixed password. Nothing outside this runner has any
+          # business reaching it. (Port 8006, dockur's VNC console, is not published at
+          # all -- nothing here drives the GUI.)
           docker run -d --name macguest \
             --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
-            -p 2222:22 \
+            -p 127.0.0.1:2222:22 \
             -e VERSION=13 -e RAM_SIZE=6G -e CPU_CORES="$cores" -e DISK_SIZE=64G \
             -e CPU_MODEL="Skylake-Client-v4" \
             -v /mnt/macstore:/storage \

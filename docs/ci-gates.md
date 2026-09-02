@@ -126,9 +126,13 @@ not catch an arm64 runtime bug.
 
 Two further things are stated rather than gated, because nothing here can gate them:
 
-- **Nothing compiles this code with Apple's clang or against Xcode's SDK any more.** The
-  native compile-compat build went with the runners. An Apple-clang-specific rejection or
-  an Xcode header change now surfaces downstream, not here.
+- **Nothing compiles this code with Apple's clang any more.** Header compatibility with
+  Apple's SDK *is* retained — soldr provisions a real Apple SDK (15.5 as of soldr 0.9.11)
+  and both toolchain files build against it, so a header-level incompatibility still
+  fails here. What is lost is narrower and worth naming precisely: **Apple-clang codegen**
+  (soldr's clang 21 and Apple's fork can differ in what they emit), and **Xcode drift** —
+  a change in a newer Xcode's SDK than the one soldr pins surfaces downstream, not here.
+  The native compile-compat build that would have caught the second went with the runners.
 - The **8 doctests** in `rust/mimalloc-pprof/src/lib.rs` run under `cargo test` and cannot
   run from a `--tests` binary; they are Linux-only (#277 §4).
 
@@ -197,14 +201,47 @@ Three things about it are not obvious:
 **There is no unattended macOS install.** dockur/windows takes an answer file; the macOS
 image has no equivalent — `/run/install.sh` exposes no automation hook and no
 unattended/answer-file variable exists. Apple's Recovery installer is a GUI that has to be
-clicked through in dockur's web viewer. So the disk is built **once, by a human**, by
-`macos-golden-bootstrap.yml` (`workflow_dispatch`, `timeout-minutes: 350`, tunnels the
-viewer out with cloudflared and prints the click-by-click procedure), compressed, and
-stored under an `actions/cache` key. A cache miss in `run-macos-x64-dockur` is a hard
-error naming that workflow, never a silent skip — so **until that bootstrap has been run
-once, `run-macos-x64-dockur` is red**, on the PR that introduced it and on every push to
-`main` afterwards. That is deliberate: a gate that says "I have no disk to run on" is
-worth more than one that skips itself into a green tick. It fails in about two minutes.
+clicked through in dockur's web viewer.
+
+That viewer is an **unauthenticated noVNC console with keyboard and mouse control of the
+VM**, so driving it from a runner would mean publishing it to the internet for the hours
+an emulated install takes, from a public repository. An earlier draft did exactly that
+behind a cloudflared quick tunnel and printed the URL into the run log. It does not exist
+any more. Instead:
+
+1. A maintainer runs **`ci/macos_golden_local.sh`** on their own Linux box — `boot` (guest
+   on `127.0.0.1:8006` only, with the click-by-click list), `check` (poll for ssh), `pack`
+   (shut down, `tar -cSf | zstd -19`, sha256, 9 GB gate).
+2. They upload the result somewhere private and run **`macos-golden-upload.yml`** with the
+   URL and sha256. Both inputs are `::add-mask::`ed before any step can echo them; the job
+   verifies the checksum, re-checks the size, proves the archive is readable, and saves it
+   to the cache. Neither the expected nor the actual digest is printed on mismatch — that
+   would let the masked value be recovered by comparison.
+3. **`macos-golden-touch.yml`** restores it weekly with `lookup-only: true`. Actions caches
+   are evicted after **7 days without a read**, and this is the one entry in the repository
+   CI cannot rebuild by itself.
+
+A cache miss in `run-macos-x64-dockur` is a hard error naming both, never a silent skip —
+so **until that image has been built and uploaded once, `run-macos-x64-dockur` is red**, on
+the PR that introduced it and on every push to `main` afterwards. That is deliberate: a
+gate that says "I have no disk to run on" is worth more than one that skips itself into a
+green tick. It fails in about two minutes.
+
+**Two archive flags are load-bearing, and both were wrong first time.** Packing uses
+`tar -cSf`: the guest disk is a raw image that is mostly holes, and without `-S` GNU tar
+stores every hole as literal zeros. zstd still compresses those to almost nothing, so the
+archive looks fine — but *extraction* then writes them as real blocks, and passing `-S` at
+extraction time does not help, because sparseness has to be recorded at creation.
+Measured on a 2 GB/21 MB sparse file: 21 MB extracted with `-S` at pack time, **2.1 GB
+without**. Scaled to a 64 GB disk that exhausts the runner, which has ~87 GB free in total.
+Unpacking uses `zstd -dc`, **not** `zstd -d --sparse … -c`: sparse mode cannot apply to a
+pipe and zstd does not ignore the flag, it fails with `zstd: error 92 : Sparse skip error`
+(reproduced on zstd 1.5.7) and hands `tar` a truncated stream.
+
+**The cache budget is the open risk.** GitHub gives a repository **10 GB of Actions cache
+in total**, shared with the soldr toolchain caches. The golden image is gated at 9 GB, and
+an image near that ceiling will LRU-evict those caches continuously — slower runs that
+never actually fail. If that happens the fix is a smaller image or a self-hosted runner.
 
 **`CPU_MODEL` is not dockur's default, and it is the difference between working and not.**
 Measured on an AMD Zen 2 host (Ryzen 7 3700X): with dockur's default profile for macOS 13

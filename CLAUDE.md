@@ -24,8 +24,11 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    both Apple arches are cross-built on Linux through soldr, `x86_64` is *executed* inside a
    `dockurr/macos` guest on a Linux runner (`run-macos-x64-dockur`), and `aarch64` is
    **compile-only** — a build plus Mach-O header assertions, with its test-name set checked
-   against the executed x86_64 bundle. Never add a `macos-*` runner label to a workflow;
-   `ci/lint_no_macos_runners.py` fails `python-lint` if you do.
+   against the executed x86_64 bundle. Never add a `macos-*` runner label to a workflow or
+   to `azure-pipelines.yml`; `ci/lint_no_macos_runners.py` fails `python-lint` if you do.
+   The dockur guest needs a golden disk built once by hand (`ci/macos_golden_local.sh`,
+   published by `macos-golden-upload.yml`), so `run-macos-x64-dockur` is red until that
+   exists — deliberately, and documented in docs/ci-gates.md.
    (macOS gates run from Linux-built bundles on one runner; see #277.)
 4. **Profiler memory-safety invariant:** profiler-internal memory (sample records, intern table,
    dump buffers) comes ONLY from the raw-OS-layer arena (`_mi_os_alloc`), never from hooked

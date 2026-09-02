@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4aee6bc5 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fe76d060 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4356,6 +4356,8 @@ bool          _mi_page_is_valid(mi_page_t* page);
 
 // "profile.c" / "profile-stack.c" / "profile-maps.c": allocation sampling profiler (MI_PPROF).
 void        _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size);
+void        _mi_prof_suppress_begin(void);  // like _mi_memevt_suppress_begin/end (#266): pair around
+void        _mi_prof_suppress_end(void);    // an inner allocation whose size the caller will correct
 void        _mi_prof_on_free(mi_page_t* page, void* p);
 void        _mi_prof_on_free_collect(mi_page_t* page, mi_block_t* head);
 void        _mi_prof_on_realloc_in_place(mi_page_t* page, void* p, size_t size);
@@ -7318,7 +7320,35 @@ static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_non
   #endif
   #if MI_GUARDED
   if mi_unlikely(mi_theap_malloc_use_guarded(theap,size)) {
-    return _mi_theap_malloc_guarded(theap, size, zero, ppage);
+    // The guarded allocator internally over-allocates (block + trailing guard page) and
+    // its own inner allocation hooks would otherwise report that inflated size to
+    // observers (memevt) and account it against the sampling budget (the profiler)
+    // instead of the caller's actual request. Suppress both and publish one corrected
+    // event/sample keyed by the real page/block, matching
+    // alloc-aligned.c:mi_theap_malloc_guarded_aligned's existing memevt pattern for the
+    // same underlying call.
+    _mi_memevt_suppress_begin();
+    #if MI_PPROF
+    _mi_prof_suppress_begin();
+    #endif
+    void* const gp = _mi_theap_malloc_guarded(theap, size, zero, ppage);
+    #if MI_PPROF
+    _mi_prof_suppress_end();
+    #endif
+    _mi_memevt_suppress_end();
+    if (gp != NULL) {
+      mi_page_t* const gpage = _mi_ptr_page(gp);
+      #if MI_PPROF
+      // The profiler's own free path (free.c) looks a sample up by the block start it
+      // computes via _mi_page_ptr_unalign, not by the caller-visible (possibly interior,
+      // for a guarded allocation) pointer -- see profile.c:prof_free_record's `ptr != p`
+      // match. Record under that same identity or the free-side lookup never finds it
+      // and the sample leaks until the page itself is reclaimed.
+      _mi_prof_on_alloc(theap, gpage, _mi_page_ptr_unalign(gpage, gp), size);
+      #endif
+      _mi_memevt_on_alloc(gpage, gp, size);
+    }
+    return gp;
   }
   #endif
 
@@ -7343,7 +7373,29 @@ static mi_decl_forceinline void* mi_theap_malloc_generic(mi_theap_t* theap, size
   if (theap!=NULL)
   #endif
   if (huge_alignment==0 && mi_theap_malloc_use_guarded(theap, size)) {
-    return _mi_theap_malloc_guarded(theap, size, zero, ppage);
+    // See the matching comment in mi_theap_malloc_small_zero_nonnull above.
+    _mi_memevt_suppress_begin();
+    #if MI_PPROF
+    _mi_prof_suppress_begin();
+    #endif
+    void* const gp = _mi_theap_malloc_guarded(theap, size, zero, ppage);
+    #if MI_PPROF
+    _mi_prof_suppress_end();
+    #endif
+    _mi_memevt_suppress_end();
+    if (gp != NULL) {
+      mi_page_t* const gpage = _mi_ptr_page(gp);
+      #if MI_PPROF
+      // The profiler's own free path (free.c) looks a sample up by the block start it
+      // computes via _mi_page_ptr_unalign, not by the caller-visible (possibly interior,
+      // for a guarded allocation) pointer -- see profile.c:prof_free_record's `ptr != p`
+      // match. Record under that same identity or the free-side lookup never finds it
+      // and the sample leaks until the page itself is reclaimed.
+      _mi_prof_on_alloc(theap, gpage, _mi_page_ptr_unalign(gpage, gp), size);
+      #endif
+      _mi_memevt_on_alloc(gpage, gp, size);
+    }
+    return gp;
   }
   #endif
   #if !MI_THEAP_INITASNULL
@@ -14596,6 +14648,15 @@ static void mi_heap_main_init_once(void) {
   _mi_theap_init(&mi_process_theap_meta,&mi_process_heap_main,&mi_tld_detached);
   mi_process_theap_meta.allow_page_abandon = false;  // for security, don't share with other threads
   mi_process_theap_meta.page_full_retain = 2;
+  #if MI_GUARDED
+  // Internal allocator bookkeeping (tld/theap/subproc structs, TLS slot arrays -- see
+  // #266) is not a user-visible object: guarding it serves no purpose (there is no
+  // application buffer-overrun to catch here) and corrupts memevt/profiler hook
+  // accounting, since the guarded allocator's own inner request reports a different
+  // (guard-page-inflated) size than the logical allocation. Never guard theap_meta,
+  // regardless of the global MIMALLOC_GUARDED_SAMPLE_RATE setting.
+  mi_process_theap_meta.guarded_sample_rate = 0;
+  #endif
   subproc_main->theap_meta = &mi_process_theap_meta;
 
   // mi_heap_theap_set(&mi_process_heap_main,&mi_process_theap_main); // set in `mi_thread_init(_theap_default)`
@@ -17089,7 +17150,18 @@ void mi_register_output(mi_output_fun* out, void* arg) mi_attr_noexcept {
 
 // add stderr to the delayed output after the module is loaded
 static void mi_add_stderr_output(void) {
-  mi_assert_internal(mi_out_default == NULL);
+  // #266: `_mi_options_post_init` (init.c) is not itself do-once guarded, unlike
+  // `mi_process_init`, so it is only as single-invocation-safe as whatever constructor
+  // mechanism calls `_mi_auto_process_init`. Observed hit twice on win-gnu debug-full CI
+  // under this pin (upstream `1cf88691` switched MinGW from MI_WIN_INIT_USE_FLS to the
+  // "default" win init path) -- not reproducible locally (no MinGW cross-compiler
+  // available here) to pin down which of the two constructor entry points fires twice.
+  // Whatever the exact double-invocation path, a second call here is meant to be a
+  // harmless re-affirmation of "stderr is now safe to use", not a distinct state
+  // transition, so make it idempotent instead of asserting -- the original assert dates
+  // to when this was believed reachable exactly once; that invariant no longer holds on
+  // every configuration.
+  if (mi_out_default != NULL) return;
   mi_out_buf_flush(&mi_out_stderr, false, NULL); // flush current contents to stderr
   mi_atomic_store_ptr_release(void,&mi_out_default,(void*)&mi_out_buf_stderr);  // and add stderr to the delayed output
   mi_atomic_store_ptr_release(void,&mi_out_arg,NULL);
@@ -21426,10 +21498,25 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   else { mi_atomic_increment_relaxed(&prof_dropped_samples); }  /* dropped sample: record-alloc itself failed (budget/arena exhausted). */
   mi_lock_release(&prof_lock);
 }
+
+// #266: pair around an inner allocation whose reported size is not the caller's actual
+// request (e.g. the guarded allocator's own over-allocated inner call in alloc.c) so its
+// _mi_prof_on_alloc doesn't touch the per-theap sampling counters with the wrong size;
+// the caller fires one corrected _mi_prof_on_alloc afterward. Reuses prof_callback_depth,
+// the same re-entrancy guard _mi_prof_on_alloc already checks, rather than adding new
+// per-theap state.
+void _mi_prof_suppress_begin(void) { prof_callback_depth++; }
+void _mi_prof_suppress_end(void)   { prof_callback_depth--; }
+
 static void prof_free_collect(mi_page_t* page, mi_block_t* head) { for (mi_block_t* b=head; b != NULL && page->has_metadata; b=mi_block_next(page,b)) prof_free_record(page,b); }
 static void prof_realloc_in_place(mi_page_t* page, void* p, size_t size) {
+  // #266: callers pass the caller-visible pointer, which for a guarded (interior)
+  // allocation is not the block start records are keyed by (see prof_free_record /
+  // _mi_prof_on_alloc's callers in alloc.c). Unalias first so both identities match;
+  // this is a no-op for an already block-aligned p (the common, non-guarded case).
+  void* const block = _mi_page_ptr_unalign(page, p);
   for (mi_prof_record_t* rec = (mi_prof_record_t*)page->metadata; rec != NULL; rec = rec->next) {
-    if (rec->ptr == p) { mi_atomic_store_relaxed(&prof_bytes, mi_atomic_load_relaxed(&prof_bytes) - rec->size + size); _mi_prof_stack_resize(rec->stack, rec->size, size); rec->size = size; break; }
+    if (rec->ptr == block) { mi_atomic_store_relaxed(&prof_bytes, mi_atomic_load_relaxed(&prof_bytes) - rec->size + size); _mi_prof_stack_resize(rec->stack, rec->size, size); rec->size = size; break; }
   }
 }
 void _mi_prof_on_free(mi_page_t* page, void* p) {
@@ -23133,6 +23220,11 @@ mi_subproc_id_t mi_subproc_new(void) {
   mi_assert_internal(parent->theap_meta->tld!=NULL);
   mi_assert_internal(parent->theap_meta->tld->thread_id == MI_THREADID_DETACHED);
   _mi_theap_init(theap_meta,heap_main,parent->theap_meta->tld /* detached tld */);
+  #if MI_GUARDED
+  // See the matching comment in init.c's process-main theap_meta bootstrap (#266):
+  // internal allocator bookkeeping must never be guarded.
+  theap_meta->guarded_sample_rate = 0;
+  #endif
   subproc->theap_meta = theap_meta;
 
   return _mi_subproc_to_id(subproc);

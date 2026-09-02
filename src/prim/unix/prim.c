@@ -676,7 +676,17 @@ size_t _mi_prim_numa_node(void) {
 
 size_t _mi_prim_numa_node_count(void) {
   char buf[128];
-  unsigned last_found = 1;
+  // imported from microsoft/mimalloc upstream/dev3 @ 66383f06 (PR #1365, David Carlier), MIT -- see
+  // #273. Lands after our overlay pin (6def7be9, 2026-08-09 vs 66383f06's 2026-08-14): not yet in
+  // this tree by the normal pin-bump path, so taken directly. Bun cherry-picked the same commit
+  // (their 16cd3684); this is classified upstream-post-pin, not fork-only -- flag it at the next
+  // pin bump so it isn't double-applied.
+  //
+  // The scan starts at node1, so on a machine with nodes 0..N-1 `last_found` used to end at N-1 and
+  // be returned as the count: 2 nodes reported as 1, 4 as 3. Callers use it as a bound on node ids
+  // (`numa_node % numa_count`), so the highest node got folded onto node 0. Return `last_found + 1`,
+  // as the Windows primitive does with `GetNumaHighestNodeNumber() + 1`.
+  unsigned last_found = 0;
   for(unsigned node = 1; node < 256; node++) {
     // enumerate node entries -- todo: it there a more efficient way to do this? (but ensure there is no allocation)
     _mi_snprintf(buf, 127, "/sys/devices/system/node/node%u", node);
@@ -685,7 +695,7 @@ size_t _mi_prim_numa_node_count(void) {
     }
     else { last_found = node; }         // highest found node
   }
-  return last_found;
+  return last_found + 1;
 }
 
 #elif defined(__FreeBSD__) && __FreeBSD_version >= 1200000

@@ -116,6 +116,46 @@ jobs:
       - uses: actions/checkout@v4
       - run: cmake -B build -DMI_PPROF=OFF && cmake --build build && ctest --test-dir build --output-on-failure
 
+  # musl/Alpine C-engine job (#273 8a). Bun ships musl builds (`MI_LIBC_MUSL=1`,
+  # `-ftls-model=local-dynamic`); our CMake option compiled but nothing ran it, so
+  # "compiles" was not evidence. The profiler's Unix stack walker already avoids
+  # `<execinfo.h>` on non-glibc/non-Apple platforms (see src/prof.c), which is the right
+  # call for musl -- this job proves it, and the rest of the suite, actually pass.
+  #
+  # Runs inside the alpine:3.20 container directly (no cross toolchain): GitHub Actions
+  # defaults a containerized job's `run:` shell to `sh`, not `bash` -- Alpine ships no
+  # bash by default. `set -e` alone (no `-o pipefail`, a bash-only flag) is portable to
+  # ash/dash and used below; a bare matrix-expression `${{ matrix.pprof }}` interpolated
+  # straight into a `-D...` flag is avoided in favor of the `for pprof in ON OFF` shell
+  # loop the `diagnostic-gates` job above already uses, both because it is one job
+  # instead of two and because ci/tests/test_verify_local.py's drift guard specifically
+  # recognizes the literal `$pprof` shell-variable spelling.
+  #
+  # Verified locally before landing (docker run alpine:3.20): 34/34 tests pass with
+  # MI_PPROF=ON, 29/29 with MI_PPROF=OFF. The only failure found was
+  # test-free-before-init, fixed in the same PR -- musl's dynamic linker does not invoke
+  # `.preinit_array` for the main executable at all (a musl limitation, not a mimalloc
+  # bug; the test now falls back to its constructor approximation under MI_LIBC_MUSL).
+  ctest-musl:
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      # Before checkout: actions/checkout needs `git` on PATH, which alpine's base
+      # image does not carry.
+      - name: Install build dependencies
+        run: apk add --no-cache build-base cmake python3 ninja git
+      - uses: actions/checkout@v4
+      - name: Configure, build and test (musl, local-dynamic TLS) for MI_PPROF=ON and OFF
+        run: |
+          set -e
+          for pprof in ON OFF; do
+            echo "::group::MI_PPROF=$pprof"
+            cmake -B "build-$pprof" -G Ninja -DMI_LIBC_MUSL=ON -DMI_PPROF="$pprof" -DCMAKE_C_FLAGS=-ftls-model=local-dynamic
+            cmake --build "build-$pprof"
+            ctest --test-dir "build-$pprof" --output-on-failure
+            echo "::endgroup::"
+          done
+
   ctest-debug-full:
     strategy:
       fail-fast: false

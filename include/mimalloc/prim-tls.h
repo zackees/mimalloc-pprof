@@ -351,11 +351,19 @@ static inline mi_theap_t* _mi_theap_cached(void) {
 
 #if !defined(MI_TLS_MODEL_FIXED_DEFAULT)
   #if defined(__APPLE__) && !defined(__POWERPC__)  // macOS on arm64 or x64
-    // we use the last two swift framework slots which seem unused.
-    // we may want to use slot 6 and 11 instead which are only used by Windows emulation.
+    // imported from oven-sh/mimalloc @ 942b8342 (include/mimalloc/prim-tls.h:356-361), MIT -- see #273.
+    //
+    // 96-97 sit in the never-assigned gap between __PTK_FRAMEWORK_CORETEXT_KEY0 (95) and
+    // __PTK_FRAMEWORK_SWIFT_KEY0 (100). Slots 125-209 are NOT free: dyld uses them for shared-cache
+    // dylib __thread storage with `&free` as the destructor (issue #1333). Alt: 241-242.
+    //
+    // This fork's previous default, 108/109, is a CONFIRMED collision, not a hypothetical one: per
+    // apple/darwin-libpthread's private/pthread/tsd_private.h (libpthread-454.40.3,
+    // fe48dac35eb1232b0aa67260e79911387364568d), 108 and 109 are __PTK_FRAMEWORK_SWIFT_KEY8 and
+    // __PTK_FRAMEWORK_SWIFT_KEY9 -- assigned, in-use slots. Bun has production evidence for 96/97.
     // see <https://github.com/apple/darwin-libpthread/blob/main/private/pthread/tsd_private.h#L99> for assigned slots
-    #define MI_TLS_MODEL_FIXED_DEFAULT   108
-    #define MI_TLS_MODEL_FIXED_CACHED    109
+    #define MI_TLS_MODEL_FIXED_DEFAULT   96
+    #define MI_TLS_MODEL_FIXED_CACHED    97
   #elif defined(_WIN32)
     // we use two seemingly unused fields in the Windows TEB.
     // see <https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/pebteb/teb/index.htm>

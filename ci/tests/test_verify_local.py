@@ -80,8 +80,21 @@ def expected_tokens(text: str) -> set[str]:
 # cargo test --workspace`, skipping the soldr cache wrapper, `cargo publish --dry-run`,
 # and the package-contents check for speed. Listed explicitly, rather than loosened in
 # the regex, so a *different* future gap still fails this test.
+#
+# c-unit.yml's ctest-musl job (#273 8a) runs inside `container: alpine:3.20` -- a
+# different execution model than every other config here, which builds directly on
+# this host's own toolchain. verify_local.py has no container runner, so this job is
+# out of scope for the same reason the "rust" gap above is: listed explicitly rather
+# than making the regex or `is_linux_job` blind to `container:` in general, so an
+# actually-in-scope job that starts using `-DCMAKE_C_FLAGS=...` still fails this test.
+# Covered instead by ci/dev_linux.py-style manual `docker run alpine:3.20 ...`
+# verification (see #273's PR description) and by CI itself.
 KNOWN_GAPS: dict[tuple[str, str], set[str]] = {
     ("rust-native.yml", "test"): {"ci/check_crate_package.py"},
+    ("c-unit.yml", "ctest-musl"): {
+        "-DMI_LIBC_MUSL=ON",
+        "-DCMAKE_C_FLAGS=-ftls-model=local-dynamic",
+    },
 }
 
 

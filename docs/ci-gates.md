@@ -702,10 +702,31 @@ The Rust side is where the accounting needed care. `cross.yml`'s
 `test (x86_64-pc-windows-msvc)` runs the 19 `mimalloc-pprof` test binaries;
 `rust-native.yml`'s `test (windows-latest)` runs `cargo test` across the **whole
 workspace**, which is 110 further tests in `bench-harness`, `benchmark-suite`, `dashboard`
-and `stress-harness`. `build-rust (x86_64-pc-windows-msvc)` therefore builds
-`--workspace`, not `-p mimalloc-pprof`: 53 test binaries are built and **49 are executed**
-on the runner. Building only the narrow set would have cut Windows Rust coverage by more
-than half while the table claimed parity.
+and `stress-harness`. They also differ in **profile**, and collapsing that would quietly change what is tested.
+So `build-rust (x86_64-pc-windows-msvc)` runs cargo **twice**, staging into
+`dist/msvc-tests/{debug,release}/`:
+
+| build | stands in for | staged / built |
+|---|---|---:|
+| `cargo test --workspace --no-run` (**debug**) | `rust-native.yml` `test (windows-latest)` | 49 / 53 |
+| `cargo test -p mimalloc-pprof --no-run --release` | `cross.yml` `test (x86_64-pc-windows-msvc)` | 19 / 19 |
+
+**68 test binaries execute on the runner.** Building only the narrow set would have cut
+Windows Rust coverage by more than half while the table claimed parity; building the
+*workspace* in release instead — which this job did first — is not a free "stricter" choice
+either. `stress-harness`'s `timing_contract` tests assert
+`outer_started.elapsed().as_millis() >= 100` around a 100 ms test-hook sleep, and with the
+surrounding work optimised away that lands on 99. Measured, and **not** a Windows or
+clang-cl property: the same test binary built natively for **Linux** fails 3/3 in release
+at `--test-threads=1` and passes 3/3 in debug, on unmodified `main`. `cargo test` is a
+debug build, which is why no native job has ever run it. Reported on #277 rather than
+fixed here — "changing what any test asserts" is out of scope for that issue, and a test
+fix is a `rust/` commit (rule 2).
+
+The two profiles stage into separate directories rather than one flat one because
+`t3_stats` and `t12_proto` exist in both, and the pprof dump checks stand in for a
+*release* row — a flat directory would leave `ls … | head -1` picking a profile by hash
+ordering.
 
 **Four cannot be executed anywhere but the machine that built them, and this is
 structural.** `env!("CARGO_BIN_EXE_<name>")` is expanded by cargo *at compile time* into
@@ -740,9 +761,6 @@ change and out of scope for a CI phase (rule 2, rule 7).
 
 Stated rather than gated:
 
-- **Profile.** The cross-built Rust binaries are `--release` (matching `cross.yml`);
-  `rust-native.yml` ran the workspace in **debug**, so `debug_assertions` is no longer
-  exercised on Windows. It still is on `ubuntu-latest`, which keeps the debug row.
 - **Doctests.** `cargo test` includes the 8 doctests in `rust/mimalloc-pprof/src/lib.rs`;
   cross-built `--tests` binaries cannot. Linux-only since phase B, and now on Windows too.
 - **`xtask check` / `cargo publish --dry-run` / `check_crate_package.py`** are platform-

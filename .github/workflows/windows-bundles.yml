@@ -594,12 +594,30 @@ jobs:
     # it is, feeding its now-informational `test (x86_64-pc-windows-msvc)`, until the
     # comparison window closes.
     #
-    # `--workspace`, not `-p mimalloc-pprof`. This job replaces TWO native jobs with
-    # different scopes: cross.yml's row runs the 19 `mimalloc-pprof` test binaries, and
-    # rust-native.yml's `test (windows-latest)` runs `cargo test` across the whole
-    # workspace (110 further tests in bench-harness, benchmark-suite, dashboard and
-    # stress-harness). Building only the narrow set would have cut Windows Rust coverage
-    # by more than half while the coverage table claimed parity.
+    # TWO builds, because this job replaces TWO native jobs with different scopes AND
+    # different profiles, and collapsing them would silently change what is tested:
+    #
+    #   cross.yml `test (x86_64-pc-windows-msvc)`  ->  `-p mimalloc-pprof`, RELEASE
+    #   rust-native.yml `test (windows-latest)`    ->  `--workspace`, DEBUG
+    #
+    # They stage into `dist/msvc-tests/{debug,release}/` rather than one flat directory,
+    # because `t3_stats` and `t12_proto` exist in both and the pprof dump checks stand in
+    # for a release row.
+    #
+    # Building only the narrow set would have cut Windows Rust coverage by more than half
+    # (110 of the workspace's tests live in bench-harness, benchmark-suite, dashboard and
+    # stress-harness) while the coverage table claimed parity.
+    #
+    # Building the workspace in RELEASE instead -- which this job did first -- is not a
+    # free "stricter" choice either. `stress-harness`'s `timing_contract` tests assert
+    # `outer_started.elapsed().as_millis() >= 100` around a 100 ms test-hook sleep; with
+    # the surrounding work optimised away that lands on 99 and the assertion fails. It is
+    # a pre-existing, profile-dependent bug and NOT a Windows or clang-cl one: the same
+    # test binary, built natively for Linux, fails 3/3 in release at --test-threads=1 and
+    # passes 3/3 in debug. `cargo test` is a debug build, which is why no native job has
+    # ever run it. Reported on #277 rather than fixed here -- "changing what any test
+    # asserts" is out of scope for this issue (rule 7), and a test fix is a rust/ commit
+    # (rule 2).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -628,15 +646,31 @@ jobs:
           # frame-pointer flags either: the profiler does not walk frame pointers on
           # Windows (it uses RtlCaptureStackBackTrace), which is why cross.yml's
           # frame-pointer steps are gated on `apple-darwin`.
-          cargo test --workspace --no-run --target x86_64-pc-windows-msvc --release \
-            --message-format=json > cargo.json || rc=$?
-          jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' cargo.json > bins.txt
-          if [ "$rc" -ne 0 ]; then
-            jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' cargo.json >&2
-            exit "$rc"
-          fi
-          test -s bins.txt
-          mkdir -p dist/x86_64-pc-windows-msvc
+          build() {
+            local label="$1"; shift
+            rc=0
+            cargo test --no-run --target x86_64-pc-windows-msvc "$@" \
+              --message-format=json > "cargo-$label.json" || rc=$?
+            jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' \
+              "cargo-$label.json" > "bins-$label.txt"
+            if [ "$rc" -ne 0 ]; then
+              jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' "cargo-$label.json" >&2
+              exit "$rc"
+            fi
+            test -s "bins-$label.txt"
+          }
+          # rust-native.yml's `test (windows-latest)`: the whole workspace, DEBUG.
+          build workspace-debug --workspace
+          # cross.yml's `test (x86_64-pc-windows-msvc)`: the profiler crate, RELEASE.
+          build pprof-release -p mimalloc-pprof --release
+          # Staged into separate directories, not one flat one. `t3_stats` and `t12_proto`
+          # exist in BOTH sets, and the pprof dump checks stand in for cross.yml's row,
+          # which is a RELEASE row -- a flat directory would leave `ls … | head -1`
+          # picking a profile by hash ordering.
+          mkdir -p dist/msvc-tests/debug dist/msvc-tests/release
+          excluded=""
+          stage() {
+          local label="$1" profile="$2"
           # NOT every workspace test binary can be moved to another machine, and the ones
           # that cannot say so in their own bytes.
           #
@@ -644,7 +678,7 @@ jobs:
           # absolute path of the companion binary in the builder's target directory. Four
           # tests here spawn `stress-child` that way (bench-harness's planted_control,
           # rejections and throughput; dashboard's stress_child), so their binaries carry
-          # a literal `/home/runner/work/.../target/.../release/stress-child.exe`. There
+          # a literal `/home/runner/work/.../target/.../<profile>/stress-child.exe`. There
           # is no env override -- the string is frozen into the image -- and a Linux path
           # cannot be reconstructed on a Windows runner, so shipping `stress-child.exe`
           # alongside them would not help either. Cross-built, they can only run on the
@@ -655,7 +689,9 @@ jobs:
           # of names that would rot the moment a test is added or renamed. This is the
           # same "a portable artifact contains no build-tree absolute path" rule
           # ci/bundle_tests.py enforces on the C bundles.
-          target_root="$PWD/target/x86_64-pc-windows-msvc/release"
+          # Both profiles' output directories: a binary is unrelocatable if it names
+          # either, and the workspace set is built under debug/.
+          target_root="$PWD/target/x86_64-pc-windows-msvc"
           # SELF-TEST FIRST. `grep -F` without `-a` treats these images as binary and can
           # report no match for a string that is demonstrably present -- which would make
           # this scan silently stage an unrelocatable binary and fail much later on the
@@ -663,20 +699,22 @@ jobs:
           # a known-positive before trusting its negatives.
           # The control must contain a NUL, or it is not binary and `grep -F` would match
           # it even WITHOUT `-a` -- a self-test that cannot fail is decoration.
-          printf 'prefix%s/stress-child.exe\000\001tail' "$target_root" > scanner-control.bin
+          printf 'prefix%s/debug/stress-child.exe\000\001tail' "$target_root" > scanner-control.bin
           if ! grep -aqF "$target_root/" scanner-control.bin; then
             echo "::error::the unrelocatable-binary scanner cannot match a path it was just handed; its negatives are worthless"
             exit 1
           fi
           rm -f scanner-control.bin
-          excluded=""
           while read -r bin; do
             if grep -aqF "$target_root/" "$bin" 2>/dev/null; then
               excluded="$excluded $(basename "$bin")"
             else
-              cp "$bin" dist/x86_64-pc-windows-msvc/
+              cp "$bin" "dist/msvc-tests/$profile/"
             fi
-          done < bins.txt
+          done < "bins-$label.txt"
+          }
+          stage workspace-debug debug
+          stage pprof-release release
           if [ -n "$excluded" ]; then
             echo "::warning::not staged (they embed the builder's absolute path via CARGO_BIN_EXE_*, so they cannot run on another machine):$excluded"
             {
@@ -698,14 +736,20 @@ jobs:
           # cross.yml's `test (x86_64-pc-windows-msvc)` has `pprof: true`, so run-windows
           # needs these two specifically. Assert it here, next to the compiler output,
           # instead of letting the consumer fail without saying why.
+          # cross.yml's `test (x86_64-pc-windows-msvc)` has `pprof: true`, and it is a
+          # RELEASE row, so the dump checks must find these in the release set. Assert it
+          # here, next to the compiler output, instead of letting the consumer fail
+          # without saying why.
           for required in t3_stats t12_proto; do
-            if ! ls "dist/x86_64-pc-windows-msvc/$required"-* >/dev/null 2>&1; then
-              echo "::error::$required was not built. Staged binaries:"
-              ls -1 dist/x86_64-pc-windows-msvc || echo "  (none)"
+            if ! ls "dist/msvc-tests/release/$required"-* >/dev/null 2>&1; then
+              echo "::error::$required was not built into the release set. Staged:"
+              ls -1 dist/msvc-tests/release || echo "  (none)"
               exit 1
             fi
           done
-          echo "staged $(ls -1 dist/x86_64-pc-windows-msvc | wc -l) of $(wc -l < bins.txt) test binaries"
+          built=$(cat bins-workspace-debug.txt bins-pprof-release.txt | wc -l)
+          staged=$(( $(ls -1 dist/msvc-tests/debug | wc -l) + $(ls -1 dist/msvc-tests/release | wc -l) ))
+          echo "staged $staged of $built test binaries ($(ls -1 dist/msvc-tests/debug | wc -l) debug + $(ls -1 dist/msvc-tests/release | wc -l) release)"
       - name: Build the PR benchmark sentinel
         # benchmark-sentinel.yml's `benchmark-sentinel (windows-latest)` row runs
         # `soldr cargo run -p dashboard --release`, which is a self-contained binary: it
@@ -726,7 +770,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: rust-test-bins-x86_64-pc-windows-msvc
-          path: rust/dist/x86_64-pc-windows-msvc
+          path: rust/dist/msvc-tests
           if-no-files-found: error
           retention-days: 7
       - uses: actions/upload-artifact@v4
@@ -1157,11 +1201,15 @@ jobs:
         run: |
           set -euo pipefail
           count=0
-          for test_binary in rust-bins-msvc/*.exe; do
-            echo "::group::$(basename "$test_binary")"
-            "$test_binary" --test-threads=4
-            echo "::endgroup::"
-            count=$((count + 1))
+          for profile in debug release; do
+            echo "== $profile =="
+            for test_binary in "rust-bins-msvc/$profile"/*.exe; do
+              [ -e "$test_binary" ] || continue
+              echo "::group::$profile/$(basename "$test_binary")"
+              "$test_binary" --test-threads=4
+              echo "::endgroup::"
+              count=$((count + 1))
+            done
           done
           echo "ran $count MSVC test binaries"
           # A silently-empty artifact would make this step pass having run nothing.
@@ -1181,14 +1229,14 @@ jobs:
             echo "::error::PPROF is unset -- the 'Install pprof' step (win-gnu half) must run before this one"
             exit 1
           }
-          generator=$(ls rust-bins-msvc/t3_stats-*.exe | head -1)
+          generator=$(ls rust-bins-msvc/release/t3_stats-*.exe | head -1)
           MIMALLOC_PPROF_CI_DUMP="$GITHUB_WORKSPACE/heap-msvc.prof" "$generator"
           "$PPROF" -raw "$GITHUB_WORKSPACE/heap-msvc.prof" > raw-msvc.txt
           grep -Eq 'PeriodType: space|heap_v2|inuse_space' raw-msvc.txt
       - name: Prove pprof parses a proto dump (MSVC)
         run: |
           set -euo pipefail
-          generator=$(ls rust-bins-msvc/t12_proto-*.exe | head -1)
+          generator=$(ls rust-bins-msvc/release/t12_proto-*.exe | head -1)
           MIMALLOC_PROF_PROTO_PATH="$GITHUB_WORKSPACE/heap-msvc.pb" "$generator"
           "$PPROF" -raw "$GITHUB_WORKSPACE/heap-msvc.pb" > raw-msvc-pb.txt
           grep -Eq 'inuse_space|alloc_space' raw-msvc-pb.txt

@@ -26,66 +26,23 @@ static mi_lock_t     mi_subprocs_lock = MI_LOCK_INITIALIZER;
   detached `theap_meta`.
 ----------------------------------------------------------- */
 
-// #266 (macOS ctest-debug-full test-stress-dynamic, ASan/DYLD_INSERT_LIBRARIES-style
-// early process bootstrap under MI_DEBUG_FULL's reentrancy checker): a thread's very
-// first touch of `heap_main` while THIS thread is already inside one of the three
-// functions below -- e.g. theap_meta's own allocation growing into a fresh arena page,
-// which needs arena bookkeeping allocated from `heap_main` (src/arena.c's
-// "arena-pages-metadata" site), which bootstraps that thread's `heap_main` theap
-// (src/theap.c:_mi_theap_init's caller, theap.c ~317), which calls `_mi_meta_zalloc`
-// again for the SAME subproc -- reaches this file recursively on the same thread while
-// `subproc->theap_meta_lock` (a plain, non-recursive pthread_mutex/SRWLock via
-// mi_lock_t) is still held by the outer call. That is a genuine reentrant-acquire
-// deadlock, not just a diagnostic false positive: MI_DEBUG_FULL's checker
-// (include/mimalloc/atomic.h's mi_lock_acquire, diagnostic.c) caught it before the
-// underlying primitive actually wedged.
-//
-// Track, per thread, the subproc currently being meta-allocated-into; if a nested call
-// targets the SAME subproc, the outer lock already protects it, so skip re-acquiring
-// (recursive-mutex semantics, implemented without changing mi_lock_t's type, which
-// backs every other lock in the codebase too). A nested call for a genuinely different
-// subproc is unaffected and still locks normally -- multi-subprocess reentrancy across
-// two different subprocs' meta locks is a separate, far rarer hazard this does not
-// claim to address.
-static mi_decl_thread mi_subproc_t* mi_meta_lock_thread_owner;
-
-static void* mi_meta_zalloc_locked(mi_subproc_t* subproc, size_t size) {
-  if (mi_meta_lock_thread_owner == subproc) {
-    // already holding this subproc's theap_meta_lock on this thread -- don't re-acquire
-    return mi_theap_zalloc(subproc->theap_meta, size);
-  }
-  void* p = NULL;
-  mi_lock(&subproc->theap_meta_lock) {
-    mi_subproc_t* const prev_owner = mi_meta_lock_thread_owner;
-    mi_meta_lock_thread_owner = subproc;
-    p = mi_theap_zalloc(subproc->theap_meta, size);
-    mi_meta_lock_thread_owner = prev_owner;
-  }
-  return p;
-}
-
 void* _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid ) {
   mi_assert_internal(subproc->theap_meta != NULL);
-  void* p = mi_meta_zalloc_locked(subproc, size);
-  if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
+  void* p = NULL;
+  mi_lock(&subproc->theap_meta_lock) {
+    p = mi_theap_zalloc(subproc->theap_meta, size);
+    if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
+  }
   return p;
 }
 
 void* _mi_meta_zalloc_aligned( mi_subproc_t* subproc, size_t size, size_t aligned, mi_memid_t* memid ) {
   mi_assert_internal(subproc->theap_meta != NULL);
   void* p = NULL;
-  if (mi_meta_lock_thread_owner == subproc) {
+  mi_lock(&subproc->theap_meta_lock) {
     p = mi_theap_zalloc_aligned(subproc->theap_meta, size, aligned);
+    if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
   }
-  else {
-    mi_lock(&subproc->theap_meta_lock) {
-      mi_subproc_t* const prev_owner = mi_meta_lock_thread_owner;
-      mi_meta_lock_thread_owner = subproc;
-      p = mi_theap_zalloc_aligned(subproc->theap_meta, size, aligned);
-      mi_meta_lock_thread_owner = prev_owner;
-    }
-  }
-  if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,true) ); }
   return p;
 }
 
@@ -93,7 +50,10 @@ void* _mi_meta_rezalloc( mi_subproc_t* subproc, void* oldp, size_t newsize, mi_m
   mi_assert_internal(subproc->theap_meta != NULL);
   // note: since we take a meta lock we cannot use `mi_theap_rezalloc` as that could call `mi_free` which
   // can call `mi_stat_free` which would try to take the meta lock again. See issue #1358.
-  void* p = mi_meta_zalloc_locked(subproc, newsize);
+  void* p = NULL;  
+  mi_lock(&subproc->theap_meta_lock) {
+    p = mi_theap_zalloc(subproc->theap_meta, newsize);
+  }
   if (p!=NULL) {
     if (oldp!=NULL) {
       const size_t oldsize  = mi_usable_size(oldp);
@@ -230,8 +190,7 @@ mi_subproc_id_t mi_subproc_new(void) {
   _mi_theap_init(theap_meta,heap_main,parent->theap_meta->tld /* detached tld */);
   #if MI_GUARDED
   // See the matching comment in init.c's process-main theap_meta bootstrap (#266):
-  // internal allocator bookkeeping must never be guarded. Diverges from upstream (see
-  // docs/fork-divergence.md).
+  // internal allocator bookkeeping must never be guarded.
   theap_meta->guarded_sample_rate = 0;
   #endif
   subproc->theap_meta = theap_meta;

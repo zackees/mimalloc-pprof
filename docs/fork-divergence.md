@@ -77,7 +77,6 @@ or someone else's?" should not require reading git history.
 | `MI_PROF_CONFIG_OVERRIDE` tested on every env-backed field | this fork | `MIMALLOC_*` is process-global and other libraries embed mimalloc. This is the documented way to be immune to the ambient environment. |
 | `ruff` + `pyright --strict` over `ci/` | this fork | The gating layer was itself unchecked; two silent gate failures were Python bugs. |
 | `-Wmaybe-uninitialized` fix in `src/profile.c` | this fork | Noise in every build log is where a real warning hides. |
-| Meta theap (`subproc->theap_meta`) never guarded, even when `MIMALLOC_GUARDED_SAMPLE_RATE` is set | this fork (#266) | Internal allocator bookkeeping (tld/theap/subproc structs, the TLS slot array) is not a user-visible object -- guarding it catches no application buffer overrun, and the guarded allocator's inner over-allocated request reports the wrong size to memevt/profiler hooks for it. `src/init.c` and `src/subproc.c` zero `guarded_sample_rate` right after each of theap_meta's two `_mi_theap_init` call sites. |
 
 ## How v3 was validated
 

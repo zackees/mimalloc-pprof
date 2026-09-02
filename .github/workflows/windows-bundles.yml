@@ -409,6 +409,35 @@ jobs:
           probe "UCRT release bundle" bundle/windows-gnu-x64-release ucrt-release.txt
           probe "UCRT shared bundle " bundle/windows-gnu-x64-shared ucrt-shared.txt
 
+      - name: DIAG (temporary, #277) -- what does the redirection module actually say?
+        # TEMPORARY diagnostic for the ci/277-ucrt-redirect-investigation branch.
+        # `mimalloc-redirect.dll` imports only ntdll (LdrFindEntryForAddress,
+        # LdrGetDllHandle, NtProtectVirtualMemory, RtlQueryEnvironmentVariable,
+        # RtlGetCurrentPeb, RtlGetProcessHeaps) -- it has NO output API at all, so the
+        # ONLY channel it can report on is the `const char** message` that
+        # `mi_allocator_init` hands back, which src/init.c prints after the option dump.
+        # The previous round's `head -30` cut that off before it appeared. Print
+        # everything, under each env knob whose name is in the module's string table.
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          bundle=bundle/windows-gnu-x64-release
+          exe="$bundle/mimalloc-test-stress-dynamic.exe"
+          run_one() {
+            local label="$1"; shift
+            echo "::group::DIAG $label"
+            ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1 "$@"; "$exe" 2 5 1 ) > diag.raw 2>&1
+            echo "rc=$?"
+            grep -v "^option '" diag.raw
+            echo "::endgroup::"
+          }
+          run_one "baseline"                MIMALLOC_SHOW_STATS=1
+          run_one "FORCE_REDIRECT"          MIMALLOC_FORCE_REDIRECT=1
+          run_one "PATCH_IMPORTS"           MIMALLOC_PATCH_IMPORTS=1
+          run_one "PATCH_NTHEAP"            MIMALLOC_PATCH_NTHEAP=1
+          run_one "PRIORITIZE_LOAD_ORDER"   MIMALLOC_PRIORITIZE_LOAD_ORDER=1
+          run_one "ENABLE_REDIRECT"         MIMALLOC_ENABLE_REDIRECT=1
+
       - name: ctest-win-gnu equivalent -- windows-gnu-x64-release
         run: |
           uv run ci/run_test_bundle.py bundle/windows-gnu-x64-release \
@@ -597,9 +626,20 @@ jobs:
             | sed 's/^[[:space:]]*//' > native-imports.txt
           cat native-imports.txt
           set +e
-          MIMALLOC_VERBOSE=1 ./native-release/mimalloc-test-stress-dynamic.exe 4 10 1 > msvcrt.raw 2>&1
+          MIMALLOC_VERBOSE=1 MIMALLOC_SHOW_STATS=1 ./native-release/mimalloc-test-stress-dynamic.exe 4 10 1 > msvcrt.raw 2>&1
           rc=$?
           set -e
+          # DIAG (temporary, #277): the msvcrt lane is the control this PR gates against,
+          # so print what it actually reports -- including the stats, which say whether
+          # the process's mallocs really reached mimalloc or whether `ucrtbase.dll`
+          # merely happened to be loaded (by a system DLL) and got patched while
+          # `msvcrt.dll!malloc`, which is what this binary calls, stayed untouched.
+          echo "::group::DIAG msvcrt native"
+          grep -v "^option '" msvcrt.raw || true
+          echo "::endgroup::"
+          echo "::group::DIAG msvcrt native imports of the exe and the dll"
+          objdump -p native-release/mimalloc.dll | grep -i 'DLL Name' || true
+          echo "::endgroup::"
           if [ "$rc" -ne 0 ]; then
             echo "FAILED(rc=$rc)" > msvcrt.txt
           elif grep -q 'malloc is redirected' msvcrt.raw; then

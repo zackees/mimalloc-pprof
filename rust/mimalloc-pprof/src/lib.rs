@@ -199,6 +199,35 @@ pub unsafe fn usable_size(p: *const u8) -> usize {
     unsafe { sys::mi_usable_size(p.cast()) }
 }
 
+/// Live per-heap -> per-page -> (optional) per-block JSON snapshot of the current
+/// subprocess (issue #269, Bun parity P4). Backs Bun's shipped `bun:jsc`
+/// `heapStats({dump:true|"blocks"}).mimallocDump`; see `src/heap-dump.c` for the JSON
+/// shape (`{"heaps":[{"seq":N,"pages":[{"id","block_size","used","reserved","thread_id"}],
+/// "blocks":[[id,size],...]}]}`, `blocks` present only when `include_blocks`).
+///
+/// Set `hash_addresses` to mix every reported address through a per-process key so a
+/// dump can be shared or diffed without exposing raw ASLR-derived pointers.
+///
+/// Best-effort under concurrent frees on the heaps being walked (mimalloc's
+/// `mi_heap_visit_blocks`/`mi_subproc_visit_heaps` contract; see the caveat on
+/// `src/heap-dump.c` and issue #78) -- never `unsafe` to call, but a heap another
+/// thread is actively freeing into may be under- or over-reported in the returned JSON.
+///
+/// Returns `None` only on allocation failure (out of memory building the JSON buffer),
+/// not for an empty subprocess.
+pub fn heap_dump_json(include_blocks: bool, hash_addresses: bool) -> Option<String> {
+    use std::ffi::CStr;
+    let ptr = unsafe { sys::mi_heap_dump_json(include_blocks, hash_addresses) };
+    if ptr.is_null() {
+        return None;
+    }
+    let json = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { sys::mi_free(ptr.cast()) };
+    Some(json)
+}
+
 /// Exact DHAT v2 heap/lifetime profiling controls.
 ///
 /// DHAT records every non-internal allocation from the moment [`start`] succeeds.
@@ -894,5 +923,20 @@ mod tests {
         dhat::stop();
         assert!(!dhat::is_enabled());
         assert!(!dhat::stats().enabled);
+    }
+    #[test]
+    fn heap_dump_json_reports_well_formed_json_with_current_heap() {
+        // The default/main heap always has at least one live allocation by the time any
+        // Rust test runs (the runtime itself allocates), so a pages-only dump of the
+        // current subprocess must come back non-empty and syntactically balanced.
+        let json = heap_dump_json(false, false).expect("heap_dump_json should not fail");
+        assert!(json.contains("\"heaps\""));
+        assert!(!json.contains("\"blocks\""));
+        let opens = json.matches('{').count();
+        let closes = json.matches('}').count();
+        assert_eq!(opens, closes);
+
+        let with_blocks = heap_dump_json(true, true).expect("heap_dump_json should not fail");
+        assert!(with_blocks.contains("\"blocks\""));
     }
 }

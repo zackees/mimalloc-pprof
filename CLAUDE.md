@@ -20,7 +20,11 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    `MI_PPROF=ON`, the `OFF` job green (profiler hooks disabled; upstream allocator behavior
    with independent memory-events tracking left runtime-disabled), `rust-native` green.
    MSVC **and** win-gnu are priority platforms — both, always.
-   (macOS gates run from Linux-built bundles on one runner; see #277.)
+   (macOS and win-gnu gates run from Linux-built bundles on one runner each; see #277.
+   Phase C changed *how* win-gnu is built, not whether it is tested: the bundles are
+   built by soldr's mingw-w64, which is **UCRT**, while the native MSYS2 MINGW64 jobs it
+   replaces were msvcrt — those stay informational for a ≥10-push window. Keep win-gnu
+   gated; do not drop it to "MSVC covers Windows".)
 4. **Profiler memory-safety invariant:** profiler-internal memory (sample records, intern table,
    dump buffers) comes ONLY from the raw-OS-layer arena (`_mi_os_alloc`), never from hooked
    allocation paths (`mi_malloc`/`operator new`/`GlobalAlloc`). Debug builds assert this.

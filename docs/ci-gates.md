@@ -24,7 +24,7 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 |---|---|---|
 | **memory-gate** (`ci/memory_gate.py`) | peak memory or thread-count regressions vs a committed per-platform baseline | builds a copy with an injected leak; the gate must fail — verified at +212% / +98% / +27% on linux/windows/macos |
 | **isa-baseline** (`ci/check_isa_baseline.py`) | binaries containing instructions above the CPU baseline, which SIGILL on older hardware | builds with `MI_OPT_ARCH=ON`; the scanner must fire. The parser also self-tests against x86 and arm64 fixtures on every run |
-| **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW. **macOS is gated from Linux-built bundles run on one runner** (`macos-bundles.yml`, #277 phase B); the native macOS jobs are informational during the comparison window | `ci/bundle_coverage.py` fails if any test the native macOS `ctest` would run is missing from a bundle |
+| **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW. **macOS and windows-MinGW are gated from Linux-built bundles run on one runner each** (`macos-bundles.yml`, #277 phase B; `windows-bundles.yml`, phase C — which also moves that lane from msvcrt to UCRT); the native macOS and MinGW jobs are informational during the comparison window | `ci/bundle_coverage.py` fails if any test the native `ctest` would run is missing from a bundle |
 | **ctest-guarded** | the `MI_GUARDED` guard-page path, run twice: at the default sample rate and again with `MIMALLOC_GUARDED_SAMPLE_RATE=1` so every eligible allocation is guarded | configure step greps the resolved compiler defines for `MI_GUARDED=1`, since the original bug was the flag never reaching the compiler |
 | **asan** | use-after-free, overflow and leaks under AddressSanitizer | — |
 | **fuzz** (`test/fuzz/`) | crashes from structured random allocator-API sequences, with ASan as the oracle | builds with a planted use-after-free and requires an anchored `(ERROR\|SUMMARY): AddressSanitizer:` report naming it |
@@ -190,6 +190,131 @@ The native jobs stay as a control arm, `continue-on-error: true`, for at least t
 Apple `test` rows, and `rust-native.yml`'s macOS row. Each carries a dated TODO naming
 what deletes it. A permanently-yellow job is worse than an absent one, so the comparison
 window is meant to end.
+
+## windows-gnu via cross-built bundles
+
+Issue #277 phase C. The MinGW gates no longer build on Windows. `windows-bundles.yml`
+builds the x86-64 test binaries on **ubuntu-latest** through soldr's mingw-w64 toolchain,
+packs them with `ci/bundle_tests.py`, and one `windows-latest` job runs everything
+serially — including the Rust `x86_64-pc-windows-gnu` test binaries, whose *build* also
+moves to Linux (`cross.yml`'s `build-win-gnu` ran on `windows-latest`).
+
+| Linux job | produces | replaces |
+|---|---|---|
+| `build-windows-gnu (windows-gnu-x64-release)` | `bundle-windows-gnu-x64-release` | `ctest-win-gnu` |
+| `build-windows-gnu (windows-gnu-x64-debug-full)` | `bundle-windows-gnu-x64-debug-full` | `ctest-debug-full-win-gnu` |
+| `build-windows-gnu (windows-gnu-x64-shared)` | `bundle-windows-gnu-x64-shared` | `ctest-shared-win-gnu` |
+| `build-windows-gnu (windows-gnu-x64-leak)` | `bundle-windows-gnu-x64-leak` | *(new)* the memory gate's positive control |
+| `build-rust (x86_64-pc-windows-gnu)` | `rust-test-bins-…` | `cross.yml` `build-win-gnu` + `test (x86_64-pc-windows-gnu)`, and `rust-native.yml` `test-win-gnu` |
+
+### The CRT changes: msvcrt → UCRT
+
+This is the one place where the bundle lane is **not** a like-for-like replacement, so it
+is stated rather than buried.
+
+The three native jobs use `msys2/setup-msys2` with `msystem: MINGW64`, which is a
+**msvcrt** environment. soldr provisions mingw-w64-gcc 15.3.0 built
+`--with-default-msvcrt=ucrt`, which is **UCRT**: `libmsvcrt.a` in its sysroot is an archive
+of `lib64_libucrt_*.o`, `_mingw.h` defines `_UCRT`, and a hello-world imports
+`api-ms-win-crt-*-l1-1-0.dll` rather than `msvcrt.dll`. soldr offers no msvcrt variant of
+the lane — `libmsvcrt-os.a` exists in the sysroot, but the headers are UCRT unconditionally,
+so `-mcrtdll=msvcrt-os` would pair UCRT declarations with a legacy runtime. **The decision
+is to accept UCRT**, which is also the environment MSYS2 itself now defaults to (`UCRT64`)
+and the one Microsoft ships on every supported Windows.
+
+Accepting it has two consequences, because upstream detects UCRT from `$ENV{MSYSTEM}` and
+that can only ever be set by an MSYS2 shell:
+
+1. `cmake/toolchains/soldr-x86_64-pc-windows-gnu.cmake` sets `MI_MINGW_UCRT64 ON`, and
+   `CMakeLists.txt` now honours a caller-set value alongside the `MSYSTEM` probe. Without
+   it, a UCRT build would be compiled *as if* it were msvcrt:
+   `src/prim/windows/prim.c:794` would register initialisation through a constructor
+   attribute instead of the `.CRT$XLB` TLS-callback table. `build-windows-gnu` greps the
+   configure log for `MI_MINGW_UCRT64=1` in the resolved compiler defines — a flag that
+   never reaches the compiler is this repository's most-repeated CI bug.
+2. `mimalloc-test-stress-dynamic.exe` imports `mimalloc.dll` **after** the UCRT api-sets,
+   which is exactly the case `bin/minject.exe` exists for. Upstream runs it as a CMake
+   `POST_BUILD` command; minject is a PE binary, so that command is now guarded with
+   `AND CMAKE_HOST_WIN32` and `run-windows-gnu` runs minject itself, deriving
+   `--postfix` from the bundle's own library name (the Debug config renames it
+   `mimalloc-debug.dll`).
+
+The override is then **proven, not assumed**: the job runs
+`mimalloc-test-stress-dynamic.exe` with `MIMALLOC_VERBOSE=1` and requires
+`malloc is redirected.` — `src/init.c:530`, printed only when `_mi_is_redirected()` is
+true. The test itself asserts nothing about redirection, so without this step the bundle
+could pass while overriding nothing. The same probe runs *before* minject as an
+informational `::notice::`, so the log answers "does the UCRT override need minject?" with
+a measurement instead of an argument.
+
+### The runtime DLL
+
+soldr's mingw links `mimalloc.dll` against `libgcc_s_seh-1.dll`, which no plain
+`windows-latest` runner has, and a missing DLL is a dialog-free `0xC0000135` exit rather
+than a test failure that says what happened. `bundle_tests.py --dll-search-dir` turns on a
+transitive PE import scan (`objdump -p`) that copies every non-system DLL the bundle's
+executables import — and **refuses to write a bundle** whose executables import something
+neither carried nor in its Windows system-DLL allowlist.
+
+Shipping the DLL was preferred over building `-static-libgcc`: the DLL is a property of
+the *bundle*, so the binary under test stays byte-for-byte the one an ordinary mingw link
+produces. Only `libgcc_s_seh-1.dll` is actually needed — this gcc's thread model is
+`win32`, so nothing pulls in `libwinpthread-1.dll`, and the C build never links
+`libstdc++-6.dll`.
+
+### What the build job proves before shipping a bundle
+
+- `file format pei-x86-64`
+- `.CRT$XLB`, `.CRT$XLY` and `.CRT$XIB` present in `prim.c.obj`, **and** a non-empty
+  Thread Storage Directory (data-directory entry 9) in the linked DLL — the section being
+  compiled is not the same as the callback surviving the link
+- `mimalloc-redirect.dll` in the DLL's import table: the Windows override goes through the
+  redirection module, so a DLL that lost that import overrides nothing
+- resolved `Link libraries : psapi;shell32;user32;advapi32;bcrypt`, exactly
+- `tests.json` contains no absolute path; `libgcc_s_seh-1.dll` and `mimalloc-redirect.dll`
+  are in the bundle
+
+`CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY` is set on this lane too, but unlike Darwin it is
+**belt-and-braces rather than load-bearing**: CMake's Windows-GNU
+`CMAKE_FIND_LIBRARY_SUFFIXES` are `.dll.a;.a;.lib`, so the host's `librt.so` is not a
+candidate for `find_link_library()` even with the search unconfined (verified both ways).
+#277's claim that all three lanes need it is true only for Darwin.
+
+### Coverage accounting
+
+`ci/bundle_coverage.py` runs on every `run-windows-gnu`. The runner installs MSYS2
+MINGW64, configures the same three CMake trees with **msvcrt gcc**, and the script fails if
+any test name the native `ctest` would run is absent from the bundles. That same MSYS2 step
+is the native compile-compat check: it *builds* the Release tree (no tests — the bundles do
+that), so an msvcrt-only or MSYS2-header-only compile break is still caught.
+
+Stated rather than gated:
+
+- the `windows-gnu-x64-leak` bundle and the memory gate on this lane are **new** coverage:
+  no native win-gnu job runs the memory gate today (only `memory-gate (windows-latest)`
+  does, on MSVC). It bootstraps yellow — see below.
+- `rust-native.yml`'s `test-win-gnu` runs `cargo test`, which includes doctests; the
+  cross-built `--tests` binaries do not. Those 8 doctests were already Linux-only after
+  phase B.
+
+### Memory-gate baseline
+
+The win-gnu lane asks for `ci/memory-baselines/windows-x64-soldr-mingw-gcc-15-pprof1.json`
+via `--arch x64 --compiler soldr-mingw-gcc-15`, so it cannot borrow
+`windows-pprof1.json`, which MSVC recorded on the same runner. That file does not exist
+yet, so the first runs take the "no baseline → bootstrap it" path (`memory_gate.py where`
+exits 3) and upload their JSON; the positive control is skipped with a warning until the
+baseline is committed, because `control` requires `check` to *fail* and a missing baseline
+is not a failure.
+
+### Rollout
+
+The native jobs stay as a control arm, `continue-on-error: true`, for at least ten pushes:
+`c-unit.yml`'s `ctest-win-gnu`, `ctest-debug-full-win-gnu` and `ctest-shared-win-gnu`,
+`rust-native.yml`'s `test-win-gnu`, and `cross.yml`'s `build-win-gnu` +
+`test (x86_64-pc-windows-gnu)`. Each carries a dated TODO naming what deletes it. Because
+this phase changes the CRT, that window is the only place the two runtimes are exercised
+side by side — do not delete the msvcrt arm before the comparison has actually happened.
 
 ## Concurrency: superseded runs are cancelled
 

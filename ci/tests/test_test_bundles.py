@@ -266,6 +266,38 @@ class LeakedAbsolutePathTest(unittest.TestCase):
         )
         self.assertEqual(bundle_tests.leaked_paths(test), [])
 
+    def test_a_flag_prefixed_absolute_path_is_refused(self) -> None:
+        # Deferred phase B review finding: the scan matched a *bare* absolute path, so
+        # `--out=/abs` and `-I/abs` -- the shapes a CMake test command most plausibly
+        # carries -- read as relative and shipped verbatim.
+        for argument in ("--out=/opt/toolchain/x", "-I/opt/toolchain/include", "-L/abs/lib"):
+            test = bundle_tests.BundledTest(name="t", argv=[f"{BUNDLE}/exe", argument])
+            self.assertEqual(bundle_tests.leaked_paths(test), [f"argv[1]: {argument}"], argument)
+
+    def test_a_flag_without_a_path_is_not_a_leak(self) -> None:
+        test = bundle_tests.BundledTest(
+            name="t", argv=[f"{BUNDLE}/exe", "--threads=4", "-O2", "--out=relative/x"]
+        )
+        self.assertEqual(bundle_tests.leaked_paths(test), [])
+
+    def test_a_windows_path_inside_a_separated_list_is_refused(self) -> None:
+        # The phase B splitter split on os.pathsep, which is ":" on the Linux host every
+        # Windows bundle is built on -- so `C:\\build\\x` became "C" and "\\build\\x",
+        # neither of which looks absolute, and the leak scanned clean.
+        test = bundle_tests.BundledTest(
+            name="t",
+            argv=[f"{BUNDLE}/exe"],
+            env={"MY_PATH": f"{BUNDLE};C:\\build\\x"},
+        )
+        self.assertEqual(bundle_tests.leaked_paths(test), ["env[MY_PATH]: C:\\build\\x"])
+
+    def test_splitting_never_cuts_a_drive_letter_in_half(self) -> None:
+        self.assertEqual(bundle_tests.split_path_list("C:\\build\\x"), ["C:\\build\\x"])
+        self.assertEqual(bundle_tests.split_path_list("C:/a;D:/b"), ["C:/a", "D:/b"])
+        self.assertEqual(bundle_tests.split_path_list("/tmp/x:C:\\y"), ["/tmp/x", "C:\\y"])
+        self.assertEqual(bundle_tests.split_path_list("/a:/b"), ["/a", "/b"])
+        self.assertEqual(bundle_tests.split_path_list("1"), ["1"])
+
     def test_the_manifest_records_no_absolute_build_directory(self) -> None:
         # `generated_from.build_dir` used to be the one host path left in tests.json,
         # which made "the manifest contains zero absolute paths" untrue as stated.
@@ -618,3 +650,108 @@ class EndToEndBundleTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuntimeDllScanTest(unittest.TestCase):
+    """`--dll-search-dir`: the Windows half of "a bundle runs where nothing is installed".
+
+    soldr's mingw-w64 links mimalloc.dll against libgcc_s_seh-1.dll, which no
+    `windows-latest` runner has. A missing DLL is a silent 0xC0000135 exit, not a test
+    failure that explains itself -- so the scan is a hard gate, not a convenience.
+
+    A fake objdump keeps these tests runnable on any host: the parser, the system-DLL
+    allowlist and the transitive closure are the logic worth pinning, not binutils.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _fake_objdump(self, imports: dict[str, list[str]]) -> str:
+        """An `objdump -p` stand-in that reports `imports[basename]` for its argument."""
+        script = self.root / ("objdump.py" if os.name != "nt" else "objdump.bat")
+        table = json.dumps(imports)
+        script.write_text(
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            f"table = json.loads({table!r})\n"
+            "name = Path(sys.argv[-1]).name\n"
+            "print('  DLL name: ' + name)\n"
+            "for dll in table.get(name, []):\n"
+            "    print('\\tDLL Name: ' + dll)\n",
+            encoding="utf-8",
+        )
+        return f"{sys.executable} {script}"
+
+    def _launcher(self, imports: dict[str, list[str]]) -> str:
+        """`resolve_runtime_dlls` takes one program, so wrap interpreter + script."""
+        command = self._fake_objdump(imports).split()
+        launcher = self.root / "objdump.sh"
+        launcher.write_text("#!/bin/sh\nexec " + " ".join(command) + ' "$@"\n', encoding="utf-8")
+        launcher.chmod(launcher.stat().st_mode | stat.S_IEXEC)
+        return str(launcher)
+
+    def _run(
+        self, imports: dict[str, list[str]], staged: list[str], available: list[str]
+    ) -> list[Path]:
+        build = self.root / "build"
+        build.mkdir(exist_ok=True)
+        lib = self.root / "toolchain"
+        lib.mkdir(exist_ok=True)
+        for name in staged:
+            (build / name).write_bytes(b"MZ")
+        for name in available:
+            (lib / name).write_bytes(b"MZ")
+        return bundle_tests.resolve_runtime_dlls(
+            [build / name for name in staged], [lib], self._launcher(imports)
+        )
+
+    def test_system_dlls_are_never_carried(self) -> None:
+        found = self._run(
+            {"t.exe": ["KERNEL32.dll", "api-ms-win-crt-heap-l1-1-0.dll", "ntdll.dll"]},
+            ["t.exe"],
+            [],
+        )
+        self.assertEqual(found, [])
+
+    def test_a_toolchain_dll_is_found_transitively(self) -> None:
+        # t.exe -> mimalloc.dll (already in the bundle) -> libgcc_s_seh-1.dll (not).
+        # Scanning only the executables would miss the one DLL the runner lacks.
+        found = self._run(
+            {
+                "t.exe": ["mimalloc.dll", "KERNEL32.dll"],
+                "mimalloc.dll": ["libgcc_s_seh-1.dll"],
+                "libgcc_s_seh-1.dll": ["KERNEL32.dll"],
+            },
+            ["t.exe", "mimalloc.dll"],
+            ["libgcc_s_seh-1.dll"],
+        )
+        self.assertEqual([path.name for path in found], ["libgcc_s_seh-1.dll"])
+
+    def test_an_unresolvable_import_is_an_error_naming_the_importer(self) -> None:
+        with self.assertRaises(bundle_tests.BundleError) as caught:
+            self._run({"t.exe": ["libwinpthread-1.dll"]}, ["t.exe"], [])
+        message = str(caught.exception)
+        self.assertIn("t.exe imports libwinpthread-1.dll", message)
+
+    def test_import_names_match_case_insensitively(self) -> None:
+        found = self._run({"t.exe": ["LIBGCC_S_SEH-1.DLL"]}, ["t.exe"], ["libgcc_s_seh-1.dll"])
+        self.assertEqual([path.name for path in found], ["libgcc_s_seh-1.dll"])
+
+    def test_the_export_directory_line_is_not_read_as_an_import(self) -> None:
+        # objdump prints the module's own name as `DLL name:` (lower-case n) and each
+        # import as `DLL Name:`. Reading the first as an import would make every DLL
+        # appear to import itself, and the scan would then never terminate on a bundle
+        # that carries it. The fake objdump emits both shapes for mimalloc.dll.
+        build = self.root / "build"
+        build.mkdir(exist_ok=True)
+        (build / "mimalloc.dll").write_bytes(b"MZ")
+        launcher = self._launcher({"mimalloc.dll": ["KERNEL32.dll"]})
+        self.assertEqual(
+            bundle_tests.read_pe_imports(build / "mimalloc.dll", launcher), ["KERNEL32.dll"]
+        )
+
+    def test_import_libraries_are_not_scanned(self) -> None:
+        found = self._run({"libmimalloc.dll.a": ["nope.dll"]}, ["libmimalloc.dll.a"], [])
+        self.assertEqual(found, [])

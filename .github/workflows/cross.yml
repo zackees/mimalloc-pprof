@@ -237,6 +237,13 @@ jobs:
   build-win-gnu:
     name: build (x86_64-pc-windows-gnu)
     runs-on: windows-latest
+    # TODO(#277 phase C, added 2026-09-02): DELETE this job -- and the
+    # x86_64-pc-windows-gnu row of test-binaries below -- after ten pushes have compared
+    # them against windows-bundles.yml's `build-rust (x86_64-pc-windows-gnu)` +
+    # `run-windows-gnu`, which build the same test binaries on ubuntu-latest through
+    # soldr's Linux-hosted mingw-w64 and run them on the shared Windows VM. Informational
+    # until then. A permanently-yellow job is worse than an absent one.
+    continue-on-error: true
     defaults:
       run:
         working-directory: rust
@@ -282,7 +289,10 @@ jobs:
     # macos-bundles.yml's `run-macos`, which runs the same binaries on one runner instead
     # of two. These are the rows that measured 8-14 s of execution behind up to 5h26m /
     # 6h13m of queue wait. Informational until then.
-    continue-on-error: ${{ contains(matrix.target, 'apple-darwin') }}
+    # TODO(#277 phase C, added 2026-09-02): likewise DELETE the x86_64-pc-windows-gnu row
+    # together with build-win-gnu above, after ten pushes against windows-bundles.yml's
+    # `run-windows-gnu`.
+    continue-on-error: ${{ contains(matrix.target, 'apple-darwin') || matrix.target == 'x86_64-pc-windows-gnu' }}
     strategy:
       fail-fast: false
       matrix:

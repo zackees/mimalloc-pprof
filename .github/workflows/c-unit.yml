@@ -167,6 +167,13 @@ jobs:
 
   ctest-debug-full-win-gnu:
     runs-on: windows-latest
+    # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
+    # it against `run-windows-gnu` in windows-bundles.yml, which runs the same test set
+    # from a Linux-built bundle on a shared Windows VM. Informational until then -- it is
+    # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
+    # mingw-w64 is UCRT), so do not delete it before that comparison has actually
+    # happened. A permanently-yellow job is worse than an absent one.
+    continue-on-error: true
     defaults:
       run:
         shell: msys2 {0}
@@ -240,6 +247,13 @@ jobs:
 
   ctest-shared-win-gnu:
     runs-on: windows-latest
+    # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
+    # it against `run-windows-gnu` in windows-bundles.yml, which runs the same test set
+    # from a Linux-built bundle on a shared Windows VM. Informational until then -- it is
+    # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
+    # mingw-w64 is UCRT), so do not delete it before that comparison has actually
+    # happened. A permanently-yellow job is worse than an absent one.
+    continue-on-error: true
     defaults:
       run:
         shell: msys2 {0}
@@ -341,6 +355,13 @@ jobs:
 
   ctest-win-gnu:
     runs-on: windows-latest
+    # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
+    # it against `run-windows-gnu` in windows-bundles.yml, which runs the same test set
+    # from a Linux-built bundle on a shared Windows VM. Informational until then -- it is
+    # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
+    # mingw-w64 is UCRT), so do not delete it before that comparison has actually
+    # happened. A permanently-yellow job is worse than an absent one.
+    continue-on-error: true
     defaults:
       run:
         shell: msys2 {0}

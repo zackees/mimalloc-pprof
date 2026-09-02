@@ -855,3 +855,52 @@ class RuntimeDllScanTest(unittest.TestCase):
     def test_import_libraries_are_not_scanned(self) -> None:
         found = self._run({"libmimalloc.dll.a": ["nope.dll"]}, ["libmimalloc.dll.a"], [])
         self.assertEqual(found, [])
+
+    # -- the clang-cl lane (#277 phase D) ------------------------------------------------
+
+    def test_the_scan_runs_with_no_search_dir_and_still_rejects(self) -> None:
+        # The MSVC bundles have no toolchain DLL to ship, so there is no directory to
+        # point at -- but "this bundle can load" is still worth asserting, which is what
+        # --check-dll-closure buys. An empty search list must not turn the scan into a
+        # no-op that reports success on a bundle that cannot start.
+        with self.assertRaises(bundle_tests.BundleError) as caught:
+            self._run_no_dirs({"t.exe": ["something-else.dll"]}, ["t.exe"])
+        self.assertIn("t.exe imports something-else.dll", str(caught.exception))
+
+    def test_msvc_runtime_dlls_are_rejected_by_default(self) -> None:
+        # VCRUNTIME140.dll is not part of Windows. Defaulting to "assume it is there"
+        # would let the win-gnu lane silently acquire a dependency it cannot satisfy.
+        with self.assertRaises(bundle_tests.BundleError) as caught:
+            self._run_no_dirs({"t.exe": ["VCRUNTIME140.dll"]}, ["t.exe"])
+        self.assertIn("t.exe imports VCRUNTIME140.dll", str(caught.exception))
+
+    def test_msvc_runtime_dlls_are_accepted_when_the_lane_says_so(self) -> None:
+        found = self._run_no_dirs(
+            {"t.exe": ["VCRUNTIME140.dll", "MSVCP140.dll", "KERNEL32.dll"]},
+            ["t.exe"],
+            allow_msvc_runtime=True,
+        )
+        # Accepted means "not carried", not "copied in": there is nothing to copy.
+        self.assertEqual(found, [])
+
+    def test_allowing_the_msvc_runtime_does_not_widen_anything_else(self) -> None:
+        with self.assertRaises(bundle_tests.BundleError) as caught:
+            self._run_no_dirs({"t.exe": ["libgcc_s_seh-1.dll"]}, ["t.exe"], allow_msvc_runtime=True)
+        self.assertIn("t.exe imports libgcc_s_seh-1.dll", str(caught.exception))
+
+    def _run_no_dirs(
+        self,
+        imports: dict[str, list[str]],
+        staged: list[str],
+        allow_msvc_runtime: bool = False,
+    ) -> list[Path]:
+        build = self.root / "build"
+        build.mkdir(exist_ok=True)
+        for name in staged:
+            (build / name).write_bytes(b"MZ")
+        return bundle_tests.resolve_runtime_dlls(
+            [build / name for name in staged],
+            [],
+            self._launcher(imports),
+            allow_msvc_runtime,
+        )

@@ -33,11 +33,22 @@ tree does not contain: soldr's mingw-w64 links `mimalloc.dll` against `libgcc_s_
 which does not exist on a plain `windows-latest` runner. `--dll-search-dir` turns on an
 import scan (`--objdump`, transitive) that copies exactly those and refuses to write a
 bundle whose executables import something neither carried nor supplied by Windows itself.
+`--check-dll-closure` runs that same scan with nothing to copy from, which is what the
+clang-cl lane wants: it has no toolchain DLL to ship, but it still must not produce a
+bundle that cannot load.
+
+`--allow-msvc-runtime` additionally accepts the Visual C++ redistributable DLLs
+(`VCRUNTIME140.dll`, `MSVCP140.dll`, ...) as present. They are NOT part of Windows -- they
+come with Visual Studio, which the `windows-latest` image has and a bare Windows install
+does not -- so this is an explicit, per-lane assumption rather than a default, and the job
+that consumes such a bundle is expected to assert they are really there (`where
+VCRUNTIME140.dll`).
 
 Usage:
 
     uv run ci/bundle_tests.py <build-dir> <out-dir> [--config Debug]
                               [--objdump PROG] [--dll-search-dir DIR ...]
+                              [--check-dll-closure] [--allow-msvc-runtime]
 """
 
 from __future__ import annotations
@@ -628,13 +639,42 @@ SYSTEM_DLLS = frozenset(
     )
 )
 
+#: The Visual C++ redistributable. NOT part of Windows -- these ship with Visual Studio,
+#: and a bare Windows install does not have them -- which is why they are a separate set
+#: behind `--allow-msvc-runtime` rather than entries in SYSTEM_DLLS. Every MSVC-ABI build
+#: of this tree imports `VCRUNTIME140.dll`, and `MSVCP140.dll` too once MI_USE_CXX is on
+#: (CMakeLists.txt turns that on by itself for `cl` and clang-cl alike). soldr's xwin splat
+#: carries import libraries only and no redistributable DLLs, so a cross build could not
+#: ship them even if it wanted to; the `windows-latest` image has them in System32.
+MSVC_RUNTIME_DLLS = frozenset(
+    name.lower()
+    for name in (
+        "concrt140.dll",
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "msvcp140_2.dll",
+        "msvcp140_atomic_wait.dll",
+        "msvcp140_codecvt_ids.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+    )
+)
+
 #: Files whose imports are worth reading. `.a`/`.lib` import libraries are not loaded at
 #: run time, so they are not scanned even when they sit in the bundle.
 PE_SUFFIXES = (".exe", ".dll")
 
 
-def is_system_dll(name: str) -> bool:
+def is_system_dll(name: str, allow_msvc_runtime: bool = False) -> bool:
+    """True for a DLL the target machine supplies, so the bundle need not carry it.
+
+    `allow_msvc_runtime` widens "the target machine" from "any Windows" to "a machine with
+    the Visual C++ redistributable installed" -- true of `windows-latest`, and an explicit
+    per-lane choice rather than a default.
+    """
     lowered = name.lower()
+    if allow_msvc_runtime and lowered in MSVC_RUNTIME_DLLS:
+        return True
     return lowered in SYSTEM_DLLS or lowered.startswith(SYSTEM_DLL_PREFIXES)
 
 
@@ -656,7 +696,10 @@ def read_pe_imports(path: Path, objdump: str) -> list[str]:
 
 
 def resolve_runtime_dlls(
-    staged: Sequence[Path], search_dirs: Sequence[Path], objdump: str
+    staged: Sequence[Path],
+    search_dirs: Sequence[Path],
+    objdump: str,
+    allow_msvc_runtime: bool = False,
 ) -> list[Path]:
     """Every non-system DLL the staged files import, transitively, found in `search_dirs`.
 
@@ -667,6 +710,10 @@ def resolve_runtime_dlls(
     An import that is neither a system DLL nor findable is a hard error naming both the
     importer and the directories that were searched -- shipping the bundle anyway would
     trade a legible failure here for an unexplained exit code on the Windows runner.
+
+    `search_dirs` may be empty: the scan then copies nothing and is purely the "this bundle
+    can load" assertion, which is what the clang-cl lane needs (it imports no toolchain DLL
+    at all, so there is no directory to point at, but the assertion is still worth making).
     """
     # Case-insensitive, because PE import names are (`KERNEL32.dll` vs `kernel32.dll`) and
     # the search directories live on a case-sensitive filesystem during a cross build.
@@ -685,7 +732,7 @@ def resolve_runtime_dlls(
         current = pending.pop(0)
         for imported in read_pe_imports(current, objdump):
             key = imported.lower()
-            if key in carried or is_system_dll(imported):
+            if key in carried or is_system_dll(imported, allow_msvc_runtime):
                 continue
             resolved = available.get(key)
             if resolved is None:
@@ -794,10 +841,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--check-dll-closure",
+        action="store_true",
+        help=(
+            "run the PE import scan even with no --dll-search-dir. Nothing is copied; the "
+            "bundle is only checked for an import it neither carries nor can expect to "
+            "find. Implied by --dll-search-dir."
+        ),
+    )
+    parser.add_argument(
+        "--allow-msvc-runtime",
+        action="store_true",
+        help=(
+            "treat the Visual C++ redistributable DLLs (VCRUNTIME140.dll, MSVCP140.dll, "
+            "...) as supplied by the machine that will run the bundle. They are not part "
+            "of Windows; the consuming job should assert they are present."
+        ),
+    )
+    parser.add_argument(
         "--objdump",
         default="llvm-objdump",
         metavar="PROG",
-        help="objdump used by --dll-search-dir (llvm-objdump or x86_64-w64-mingw32-objdump)",
+        help="objdump used by the PE import scan (llvm-objdump or x86_64-w64-mingw32-objdump)",
     )
     args = parser.parse_args(argv)
 
@@ -818,8 +883,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seen[source.name] = source
                 unique.append(source)
         runtime_dlls: list[Path] = []
-        if search_dirs:
-            runtime_dlls = resolve_runtime_dlls(unique, search_dirs, objdump)
+        if search_dirs or bool(args.check_dll_closure):
+            runtime_dlls = resolve_runtime_dlls(
+                unique, search_dirs, objdump, bool(args.allow_msvc_runtime)
+            )
             for dll in runtime_dlls:
                 if dll.name not in seen:
                     seen[dll.name] = dll

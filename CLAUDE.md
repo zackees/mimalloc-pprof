@@ -34,6 +34,18 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    win-gnu is built, not whether it is tested — soldr's mingw-w64 is **UCRT**, while the
    native MSYS2 MINGW64 jobs it replaces were msvcrt, so those stay informational for a
    ≥10-push window. Keep win-gnu gated; do not drop it to "MSVC covers Windows".
+   The **MSVC** gate is split in two (#277 phase D), and the split is the rule, not an
+   implementation detail. `windows-bundles.yml` cross-builds the MSVC-ABI bundles on Linux
+   with soldr's **clang-cl** and runs them on the same single Windows runner as win-gnu —
+   but **`c-unit.yml`'s `ctest (windows-latest)` (Release) stays native, stays built by
+   Microsoft's `cl`, and stays a hard gate.** A clang-cl binary is not a `cl` binary:
+   clang-cl accepts `__attribute__`s cl rejects, and cl's codegen, TLS lowering and DLL
+   runtime are its own. Do NOT make that job `continue-on-error` and do not delete it
+   without amending this rule explicitly. Every *other* `windows-latest` row is
+   informational for a ≥10-push window and carries a dated TODO. One further consequence:
+   soldr's CRT splat has no `msvcrtd.lib`, so the cross lane is `/MD` only and cannot
+   reproduce the native debug-full job's `/MDd` compile — it reproduces its defines
+   (`MI_DEBUG=3`), which is what `MI_DEBUG_FULL` is for. See docs/ci-gates.md.
 4. **Profiler memory-safety invariant:** profiler-internal memory (sample records, intern table,
    dump buffers) comes ONLY from the raw-OS-layer arena (`_mi_os_alloc`), never from hooked
    allocation paths (`mi_malloc`/`operator new`/`GlobalAlloc`). Debug builds assert this.

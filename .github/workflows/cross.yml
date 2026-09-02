@@ -293,10 +293,18 @@ jobs:
     #
     # TODO(#277 phase C, added 2026-09-02): DELETE the x86_64-pc-windows-gnu row -- and
     # `build-win-gnu` above -- after ten pushes have compared them against
-    # windows-bundles.yml's `build-rust (x86_64-pc-windows-gnu)` + `run-windows-gnu`,
-    # which build the same binaries on ubuntu-latest through soldr's Linux-hosted
-    # mingw-w64 and run them on the shared Windows VM. Informational until then.
-    continue-on-error: ${{ matrix.target == 'x86_64-pc-windows-gnu' }}
+    # windows-bundles.yml's `build-rust (x86_64-pc-windows-gnu)` + `run-windows`, which
+    # build the same binaries on ubuntu-latest through soldr's Linux-hosted mingw-w64 and
+    # run them on the shared Windows VM. Informational until then.
+    #
+    # TODO(#277 phase D, added 2026-09-02): DELETE the x86_64-pc-windows-msvc row on the
+    # same terms, against windows-bundles.yml's `build-rust (x86_64-pc-windows-msvc)` +
+    # `run-windows`. That job builds the WHOLE workspace (not just `-p mimalloc-pprof`),
+    # because it also stands in for rust-native.yml's `test (windows-latest)`. NOTE:
+    # `build-cross`'s x86_64-pc-windows-msvc row above must go with it, but
+    # aarch64-pc-windows-msvc must NOT -- that one is build-only and has no runner.
+    # A permanently-yellow job is worse than an absent one.
+    continue-on-error: ${{ matrix.target == 'x86_64-pc-windows-gnu' || matrix.target == 'x86_64-pc-windows-msvc' }}
     strategy:
       fail-fast: false
       matrix:

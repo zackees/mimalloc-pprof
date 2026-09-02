@@ -68,6 +68,25 @@ terms of the MIT license. A copy of the license can be found in the file
       heap never faults a hole back in.
    3. the sweep of a parked thread never touches `mi_tld_t::profiler`: nothing
       in this file reads or writes it (asserted in `_mi_theap_sweep_parked`).
+
+  TEARDOWN AND HEAP DELETION (7a's exit-path hardening, PR #299). Neither needs a
+  check in this file, for reasons worth writing down:
+   - after `_mi_scavenger_stop` sets `_mi_scavenger_shutdown`, no sweep can start on
+     the scavenger: its run loop exits on `_mi_scavenger_running == 0` and the stop
+     joins it, and `_mi_scavenger_start_lazy` refuses to restart, so
+     `mi_on_thread_idle_start` returns false and hands nothing off. A direct
+     `mi_on_thread_idle()` after that still sweeps -- on the CALLING thread, over its
+     own theaps, which is safe at any point in the process's life.
+   - `mi_heap_delete`/`_destroy` calls `_mi_park_leave` on every parked owner of the
+     heap BEFORE `_mi_heap_detach_theaps`, and `_mi_park_leave` does not return until
+     MI_PARK_SWEEPING has cleared. So a sweep is never in progress while a theap is
+     being detached. `_mi_park_leave` terminates against this sweep because every
+     phase of it re-reads `tld->park_reclaim`: between heaps in `_mi_purge_holes_of`,
+     between pages in `mi_theap_page_purge_holes`, and between abandoned pages in
+     `mi_arena_page_purge_holes_at` -- so the wait is bounded by one page's walk, and
+     `tld->theaps_lock` (which the sweep holds across its passes, and which
+     `_mi_heap_detach_theaps` try-acquires) is always released before the deleter
+     needs it.
 ----------------------------------------------------------- */
 
 #include "mimalloc.h"

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 649b3a67 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit feb1d6da of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -6100,11 +6100,19 @@ static inline mi_theap_t* _mi_theap_cached(void) {
 
 #if !defined(MI_TLS_MODEL_FIXED_DEFAULT)
   #if defined(__APPLE__) && !defined(__POWERPC__)  // macOS on arm64 or x64
-    // we use the last two swift framework slots which seem unused.
-    // we may want to use slot 6 and 11 instead which are only used by Windows emulation.
+    // imported from oven-sh/mimalloc @ 942b8342 (include/mimalloc/prim-tls.h:356-361), MIT -- see #273.
+    //
+    // 96-97 sit in the never-assigned gap between __PTK_FRAMEWORK_CORETEXT_KEY0 (95) and
+    // __PTK_FRAMEWORK_SWIFT_KEY0 (100). Slots 125-209 are NOT free: dyld uses them for shared-cache
+    // dylib __thread storage with `&free` as the destructor (issue #1333). Alt: 241-242.
+    //
+    // This fork's previous default, 108/109, is a CONFIRMED collision, not a hypothetical one: per
+    // apple/darwin-libpthread's private/pthread/tsd_private.h (libpthread-454.40.3,
+    // fe48dac35eb1232b0aa67260e79911387364568d), 108 and 109 are __PTK_FRAMEWORK_SWIFT_KEY8 and
+    // __PTK_FRAMEWORK_SWIFT_KEY9 -- assigned, in-use slots. Bun has production evidence for 96/97.
     // see <https://github.com/apple/darwin-libpthread/blob/main/private/pthread/tsd_private.h#L99> for assigned slots
-    #define MI_TLS_MODEL_FIXED_DEFAULT   108
-    #define MI_TLS_MODEL_FIXED_CACHED    109
+    #define MI_TLS_MODEL_FIXED_DEFAULT   96
+    #define MI_TLS_MODEL_FIXED_CACHED    97
   #elif defined(_WIN32)
     // we use two seemingly unused fields in the Windows TEB.
     // see <https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/pebteb/teb/index.htm>
@@ -26452,24 +26460,29 @@ typedef SIZE_T(__stdcall* PGetLargePageMinimum)(VOID);
 static PGetLargePageMinimum pGetLargePageMinimum = NULL;
 
 // Available after Windows XP
-typedef BOOL (__stdcall *PGetPhysicallyInstalledSystemMemory)( PULONGLONG TotalMemoryInKilobytes );
 typedef BOOL (__stdcall* PGetVersionExW)(LPOSVERSIONINFOW lpVersionInformation);
 
 
-// Load a library
-static HMODULE mi_win_loadlibrary(const TCHAR* library) {
+// imported from oven-sh/mimalloc @ 942b8342 (commit 75a1edf8), MIT -- see #273.
+//
+// Load a system library. Wide names so no ANSI conversion happens (this runs at process
+// initialization: mimalloc is not built with UNICODE defined here, so a TEXT()/TCHAR* call would
+// have resolved to the ANSI entry point, which converts its argument to UTF-16 before calling the
+// wide one anyway), and LOAD_LIBRARY_SEARCH_SYSTEM32 so the loader goes straight to system32
+// instead of probing the application directory first.
+static HMODULE mi_win_loadlibrary(const wchar_t* library) {
   #if MI_WIN_DESKTOP
-    return LoadLibrary(library);
+    return LoadLibraryExW(library, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
   #else
     return LoadPackagedLibrary(library, 0);
   #endif
 }
 
 // Get a library handle (and possibly load it)
-static HMODULE mi_win_getlibrary(const TCHAR* library, bool* should_free) {
+static HMODULE mi_win_getlibrary(const wchar_t* library, bool* should_free) {
   #if MI_WIN_DESKTOP
   // avoid calling LoadLibrary for "kernel32", "ntdll", and "kernelbase" (also to avoid hitting the loader lock)
-  HMODULE mod = GetModuleHandle(library);
+  HMODULE mod = GetModuleHandleW(library);
   if (mod!=NULL) {
     *should_free = false;
     return mod;
@@ -26503,7 +26516,7 @@ static bool win_enable_large_os_pages_once(size_t* large_page_size)
   err = GetLastError();
   if (ok) {
     TOKEN_PRIVILEGES tp;
-    ok = LookupPrivilegeValue(NULL, TEXT("SeLockMemoryPrivilege"), &tp.Privileges[0].Luid);
+    ok = LookupPrivilegeValueW(NULL, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid);
     err = GetLastError();
     if (ok) {
       tp.PrivilegeCount = 1;
@@ -26564,7 +26577,7 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
 
   // get the VirtualAlloc2 function
   bool hDllFree;
-  HINSTANCE hDll = mi_win_getlibrary(TEXT("kernelbase.dll"), &hDllFree);
+  HINSTANCE hDll = mi_win_getlibrary(L"kernelbase.dll", &hDllFree);
   if (hDll != NULL) {
     // use VirtualAlloc2FromApp if possible as it is available to Windows store apps
     pVirtualAlloc2 = (PVirtualAlloc2)(void (*)(void))GetProcAddress(hDll, "VirtualAlloc2FromApp");
@@ -26572,13 +26585,13 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
     mi_win_freelibrary(hDll, hDllFree);
   }
   // NtAllocateVirtualMemoryEx is used for huge page allocation
-  hDll = mi_win_getlibrary(TEXT("ntdll.dll"), &hDllFree);
+  hDll = mi_win_getlibrary(L"ntdll.dll", &hDllFree);
   if (hDll != NULL) {
     pNtAllocateVirtualMemoryEx = (PNtAllocateVirtualMemoryEx)(void (*)(void))GetProcAddress(hDll, "NtAllocateVirtualMemoryEx");
     mi_win_freelibrary(hDll, hDllFree);
   }
   // Try to use Win7+ numa API
-  hDll = mi_win_getlibrary(TEXT("kernel32.dll"), &hDllFree);
+  hDll = mi_win_getlibrary(L"kernel32.dll", &hDllFree);
   if (hDll != NULL) {
     pGetCurrentProcessorNumberEx = (PGetCurrentProcessorNumberEx)(void (*)(void))GetProcAddress(hDll, "GetCurrentProcessorNumberEx");
     pGetNumaProcessorNodeEx = (PGetNumaProcessorNodeEx)(void (*)(void))GetProcAddress(hDll, "GetNumaProcessorNodeEx");
@@ -26587,11 +26600,14 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
     pGetNumaNodeProcessorMask = (PGetNumaNodeProcessorMask)(void (*)(void))GetProcAddress(hDll, "GetNumaNodeProcessorMask");
     pGetNumaHighestNodeNumber = (PGetNumaHighestNodeNumber)(void (*)(void))GetProcAddress(hDll, "GetNumaHighestNodeNumber");
     pGetLargePageMinimum = (PGetLargePageMinimum)(void (*)(void))GetProcAddress(hDll, "GetLargePageMinimum");
-    // Get physical memory (not available on XP, so check dynamically)
-    PGetPhysicallyInstalledSystemMemory pGetPhysicallyInstalledSystemMemory = (PGetPhysicallyInstalledSystemMemory)(void (*)(void))GetProcAddress(hDll,"GetPhysicallyInstalledSystemMemory");
-    if (pGetPhysicallyInstalledSystemMemory != NULL) {
-      ULONGLONG memInKiB = 0;
-      if ((*pGetPhysicallyInstalledSystemMemory)(&memInKiB)) {
+    // imported from oven-sh/mimalloc @ 942b8342 (commit 6ccccec2), MIT -- see #273.
+    // Get physical memory. GlobalMemoryStatusEx is a plain system-information query;
+    // GetPhysicallyInstalledSystemMemory parses the SMBIOS firmware table to produce it.
+    {
+      MEMORYSTATUSEX mem; _mi_memzero_var(mem);
+      mem.dwLength = sizeof(mem);
+      if (GlobalMemoryStatusEx(&mem)) {
+        ULONGLONG memInKiB = mem.ullTotalPhys / MI_KiB;
         if (memInKiB > 0 && memInKiB <= SIZE_MAX) {
           config->physical_memory_in_kib = (size_t)memInKiB;
         }
@@ -26977,7 +26993,7 @@ void _mi_prim_process_info(mi_process_info_t* pinfo)
 
   // load psapi on demand
   mi_atomic_do_once{
-    HINSTANCE hDll = mi_win_loadlibrary(TEXT("psapi.dll"));
+    HINSTANCE hDll = mi_win_loadlibrary(L"psapi.dll");
     if (hDll != NULL) {
       pGetProcessMemoryInfo = (PGetProcessMemoryInfo)(void (*)(void))GetProcAddress(hDll, "GetProcessMemoryInfo");
       // mi_win_freelibrary(hDll, true);  // don't free
@@ -27082,18 +27098,38 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
 #endif
 
 typedef LONG (NTAPI *PBCryptGenRandom)(HANDLE, PUCHAR, ULONG, ULONG);
+typedef BOOL (WINAPI *PProcessPrng)(PBYTE, SIZE_T);
 static  PBCryptGenRandom pBCryptGenRandom = NULL;
+static  PProcessPrng pProcessPrng = NULL;
 
+// imported from oven-sh/mimalloc @ 942b8342 (commits 6ccccec2, c3c36aa8, d676cced), MIT -- see #273.
+//
+// Prefer ProcessPrng (bcryptprimitives.dll, Windows 8+): it is the primitive
+// BCryptGenRandom(BCRYPT_USE_SYSTEM_PREFERRED_RNG) ends up calling, without loading bcrypt.dll
+// and resolving the CNG provider (about a millisecond at process start). Fall back to
+// BCryptGenRandom on older systems.
+// This runs from the TLS process-attach callback, i.e. under the loader lock, so use an already
+// loaded bcryptprimitives.dll when there is one (anything that seeds from ProcessPrng imports it)
+// and only LoadLibrary it otherwise.
 bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   mi_assert(buf_len <= ULONG_MAX);
   if (buf_len > ULONG_MAX) return false;
   mi_atomic_do_once {
-    HINSTANCE hDll = mi_win_loadlibrary(TEXT("bcrypt.dll"));
+    bool hDllFree;
+    HINSTANCE hDll = mi_win_getlibrary(L"bcryptprimitives.dll", &hDllFree);
     if (hDll != NULL) {
-      pBCryptGenRandom = (PBCryptGenRandom)(void (*)(void))GetProcAddress(hDll, "BCryptGenRandom");
-      // mi_win_freelibrary(hDll);  // don't free
+      pProcessPrng = (PProcessPrng)(void (*)(void))GetProcAddress(hDll, "ProcessPrng");
+      // never freed: pProcessPrng points into it
+    }
+    if (pProcessPrng == NULL) {
+      hDll = mi_win_loadlibrary(L"bcrypt.dll");
+      if (hDll != NULL) {
+        pBCryptGenRandom = (PBCryptGenRandom)(void (*)(void))GetProcAddress(hDll, "BCryptGenRandom");
+        // mi_win_freelibrary(hDll);  // don't free
+      }
     }
   }
+  if (pProcessPrng != NULL) return (pProcessPrng((PBYTE)buf, (SIZE_T)buf_len) != FALSE);
   if (pBCryptGenRandom == NULL) return false;
   return (pBCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)buf_len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0);
 }
@@ -28307,7 +28343,17 @@ size_t _mi_prim_numa_node(void) {
 
 size_t _mi_prim_numa_node_count(void) {
   char buf[128];
-  unsigned last_found = 1;
+  // imported from microsoft/mimalloc upstream/dev3 @ 66383f06 (PR #1365, David Carlier), MIT -- see
+  // #273. Lands after our overlay pin (6def7be9, 2026-08-09 vs 66383f06's 2026-08-14): not yet in
+  // this tree by the normal pin-bump path, so taken directly. Bun cherry-picked the same commit
+  // (their 16cd3684); this is classified upstream-post-pin, not fork-only -- flag it at the next
+  // pin bump so it isn't double-applied.
+  //
+  // The scan starts at node1, so on a machine with nodes 0..N-1 `last_found` used to end at N-1 and
+  // be returned as the count: 2 nodes reported as 1, 4 as 3. Callers use it as a bound on node ids
+  // (`numa_node % numa_count`), so the highest node got folded onto node 0. Return `last_found + 1`,
+  // as the Windows primitive does with `GetNumaHighestNodeNumber() + 1`.
+  unsigned last_found = 0;
   for(unsigned node = 1; node < 256; node++) {
     // enumerate node entries -- todo: it there a more efficient way to do this? (but ensure there is no allocation)
     _mi_snprintf(buf, 127, "/sys/devices/system/node/node%u", node);
@@ -28316,7 +28362,7 @@ size_t _mi_prim_numa_node_count(void) {
     }
     else { last_found = node; }         // highest found node
   }
-  return last_found;
+  return last_found + 1;
 }
 
 #elif defined(__FreeBSD__) && __FreeBSD_version >= 1200000
@@ -29977,7 +30023,17 @@ size_t _mi_prim_numa_node(void) {
 
 size_t _mi_prim_numa_node_count(void) {
   char buf[128];
-  unsigned last_found = 1;
+  // imported from microsoft/mimalloc upstream/dev3 @ 66383f06 (PR #1365, David Carlier), MIT -- see
+  // #273. Lands after our overlay pin (6def7be9, 2026-08-09 vs 66383f06's 2026-08-14): not yet in
+  // this tree by the normal pin-bump path, so taken directly. Bun cherry-picked the same commit
+  // (their 16cd3684); this is classified upstream-post-pin, not fork-only -- flag it at the next
+  // pin bump so it isn't double-applied.
+  //
+  // The scan starts at node1, so on a machine with nodes 0..N-1 `last_found` used to end at N-1 and
+  // be returned as the count: 2 nodes reported as 1, 4 as 3. Callers use it as a bound on node ids
+  // (`numa_node % numa_count`), so the highest node got folded onto node 0. Return `last_found + 1`,
+  // as the Windows primitive does with `GetNumaHighestNodeNumber() + 1`.
+  unsigned last_found = 0;
   for(unsigned node = 1; node < 256; node++) {
     // enumerate node entries -- todo: it there a more efficient way to do this? (but ensure there is no allocation)
     _mi_snprintf(buf, 127, "/sys/devices/system/node/node%u", node);
@@ -29986,7 +30042,7 @@ size_t _mi_prim_numa_node_count(void) {
     }
     else { last_found = node; }         // highest found node
   }
-  return last_found;
+  return last_found + 1;
 }
 
 #elif defined(__FreeBSD__) && __FreeBSD_version >= 1200000

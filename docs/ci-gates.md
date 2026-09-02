@@ -265,45 +265,52 @@ the CRT arrives as `libmsvcrt.a` and `mimalloc.dll` happens to sort ahead of `ms
 under UCRT it arrives as `api-ms-win-crt-*`, which sorts earlier, and mimalloc loses. The
 CRT only changes what mimalloc is being sorted against.
 
-It bites at **two levels**, and only fixing both makes the override work:
+`CMakeLists.txt` therefore spells the same file `./…` for `mimalloc-test-stress-dynamic`
+on MinGW — in the *libraries* position, since an archive named before anything needs it
+contributes nothing — using `$<TARGET_LINKER_FILE_NAME:mimalloc>` so the Debug build's
+`mimalloc-debug.dll` is handled too. Verified cross-built for all three configs, and
+gated on every run.
 
-1. `mimalloc-test-stress-dynamic.exe` must import `mimalloc.dll` before the CRT.
-2. `mimalloc.dll` must import `mimalloc-redirect.dll` before the CRT — the loader
-   initialises a module's dependencies in *its* import-table order, so a redirect module
-   listed after the `api-ms-win-crt-*` set is initialised after the runtime it patches.
-
-Level 2 is the one that looks like luck: CMake links the redirect import library by its
-absolute source-directory path, so whether it beats the absolute sysroot path the CRT
-arrives on depends on **where the checkout lives**. `/home/user/src/…` wins against
-`/home/user/.mingw/…` and loses against `/opt/…` — measured going both ways on the same
-commit, working in a local tree and failing on CI.
-
-`CMakeLists.txt` therefore spells both files `./…` on MinGW, in the *libraries* position
-(an archive named before anything needs it contributes nothing): the DLL's import library
-via `$<TARGET_LINKER_FILE_NAME:mimalloc>` so the Debug build's `mimalloc-debug.dll` is
-handled too, and a build-directory copy of `bin/mimalloc-redirect*.lib`. Verified
-cross-built for all three configs, and verified load-bearing by relinking the same objects
-against a deliberately late-sorting absolute path (redirect module not first) and the
-`./` copy (first).
+That fixes the import order. **It does not, on its own, make the override take effect**,
+and the same trick applied one level down makes things worse — see below.
 
 ### The override is gated on the bundle's own binaries
 
 `run-windows-gnu` asserts both halves, as hard failures, on the artifacts it ships:
 
-- **`mimalloc*.dll` is import #0** of `mimalloc-test-stress-dynamic.exe`, and
-  **`mimalloc-redirect.dll` is import #0** of `mimalloc*.dll`, in the release, debug-full
-  and shared bundles. Read with `ci/pe_imports.py`, a PE import-table reader — `dumpbin`
-  is MSVC-only and MSYS2 is not installed at that point in the job (and depending on it
-  would be wrong anyway: the bundle is meant to run with no toolchain). The build job
-  asserts the DLL half a second time, on Linux, before the bundle ships.
-- **`malloc is redirected.`** appears under `MIMALLOC_VERBOSE=1` (`src/init.c:530`,
-  printed only when `_mi_is_redirected()`). `test-stress-dynamic` asserts nothing about
-  redirection itself, so without this the bundle could pass while overriding nothing.
+- **gated:** `mimalloc*.dll` is import #0 of `mimalloc-test-stress-dynamic.exe` in the
+  release, debug-full and shared bundles. Read with `ci/pe_imports.py`, a PE import-table
+  reader — `dumpbin` is MSVC-only and MSYS2 is not installed at that point in the job (and
+  depending on it would be wrong anyway: the bundle is meant to run with no toolchain).
+- **measured, not yet gated:** whether `malloc is redirected.` appears under
+  `MIMALLOC_VERBOSE=1` (`src/init.c:530`, printed only when `_mi_is_redirected()`).
+  `test-stress-dynamic` asserts nothing about redirection itself, so this probe is the
+  only thing anywhere in CI that looks at it.
 
-Cross-compilation is the product requirement, so a natively built control passing is not
-evidence about the artifact this workflow ships. The MSYS2 lane's own result and import
-order are recorded next to it — measured on both sides rather than asserted on one — and
-that row is gated too while it exists.
+### What was tried, and what is still open
+
+The cross-built binary does **not** redirect, and five measured attempts did not change
+that. In order:
+
+| attempt | result |
+|---|---|
+| as originally linked (`mimalloc.dll` last) | NOT-REDIRECTED |
+| `minject`, both postfixes, with and without `--inplace` | image will not start (rc 127) |
+| `MI_MINGW_UCRT64=OFF`, same toolchain | NOT-REDIRECTED |
+| `mimalloc.dll` first in the exe (the fix above) | NOT-REDIRECTED; everything else green |
+| `mimalloc-redirect.dll` also first inside `mimalloc.dll` | **SEGFAULT** before any output; reverted |
+
+The last row retires the "minject writes a corrupt PE" theory: minject produces exactly
+that layout, and so does the linker when asked to, and both crash the same way. Loading
+the redirection module before `ucrtbase` has initialised is what this binary cannot
+survive — and upstream's supported MSVC layout has the api-sets first too, so being
+*early* was never the requirement.
+
+So the probe reports and warns rather than failing, with a dated TODO, because a
+permanently-red gate is worse than an absent one. The MSYS2-built msvcrt binary in the
+same job **does** redirect and **is** gated — not as a substitute for the bundle, but
+because while that row exists a regression in it is still a regression. Escalated on #277:
+closing this needs a Windows debugger, not another CI round.
 
 `minject` is **not** used on the cross lane. It is a Windows PE utility, so it cannot run
 on the Linux builder at all; and when it was run on the Windows runner instead it produced

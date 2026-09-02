@@ -312,29 +312,28 @@ This is also the real explanation for the msvcrt/UCRT split: under msvcrt the CR
 `api-ms-win-crt-*`, which sorts earlier. The CRT only changes what mimalloc is sorted
 against.
 
-**It bites at two levels.** The loader initialises a module's dependencies in *its* own
-import-table order, so it is not enough for the exe to import `mimalloc.dll` first —
-`mimalloc.dll` must also import `mimalloc-redirect.dll` before its own
-`api-ms-win-crt-*` imports, or the redirect module is initialised after the runtime it
-patches. That second one is linked from an absolute *source directory* path, so whether it
-beats the sysroot depends on where the checkout lives: it passed in a local tree
-(`/home/u/.clud/...` < `/home/u/.soldr/...`) and failed on CI
-(`/home/runner/work/...` > `/home/runner/.soldr/...`) at the same commit. Proven
-load-bearing by relinking the same objects twice: against a deliberately late-sorting
-absolute path the first import is `libgcc_s_seh-1.dll`; against `./mimalloc-redirect.lib`
-it is `mimalloc-redirect.dll`.
-
-**Fix we carry** (`CMakeLists.txt`, two `if(MINGW)` blocks): spell both files `./…`, in
-the libraries position — the DLL's import library via `$<TARGET_LINKER_FILE_NAME:mimalloc>`
-on the `mimalloc-test-stress-dynamic` target, and a build-directory copy of
-`bin/mimalloc-redirect*.lib` on the `mimalloc` target. Verified cross-built (soldr
+**Fix we carry** (`CMakeLists.txt`, one `if(MINGW)` block on the
+`mimalloc-test-stress-dynamic` target): spell the same file `./…`, in the libraries
+position, via `$<TARGET_LINKER_FILE_NAME:mimalloc>`. Verified cross-built (soldr
 mingw-w64-gcc 15.3.0) for Release, Debug + `MI_DEBUG_FULL` and the shared-only config:
-`mimalloc.dll` / `mimalloc-debug.dll` is import #0 of the exe and `mimalloc-redirect.dll`
-is import #0 of the DLL, in all three, exactly one descriptor each. It removes the
-dependency on `minject` and applies to the native MSYS2 lane too. Upstreamable as-is; it
-touches two guarded blocks and no C.
+`mimalloc.dll` / `mimalloc-debug.dll` is import #0 in all three, exactly one descriptor.
+It is what upstream's own "try to link with the mimalloc library earlier on the command
+line" hint asks for, it applies to the native MSYS2 lane too, and it needs no `minject`.
+Upstreamable as-is; it touches one guarded block and no C.
 
-**Separate bug, not root-caused: `minject` produces an unloadable image on a
+**It is necessary but not sufficient, and the remaining half is unsolved.** With the exe
+importing `mimalloc.dll` first, a cross-built UCRT binary still reports
+`_mi_is_redirected() == false`. Going one level further -- forcing `mimalloc-redirect.dll`
+ahead of the `api-ms-win-crt-*` imports inside `mimalloc.dll`, by the same path-spelling
+trick -- makes the process **segfault before it prints anything**, which is also exactly
+what `minject` produces (minject builds the same layout). So the redirection module cannot
+be initialised before `ucrtbase` here, and upstream's supported MSVC layout does not do
+that either: the MSVC linker sorts descriptors alphabetically, so `api-ms-win-crt-*`
+precedes `mimalloc-redirect.dll` there as well. Whatever makes redirection work on
+MSVC/UCRT and on mingw/msvcrt, but not on mingw/UCRT, is still unidentified; it needs a
+Windows debugger.
+
+**Related, and probably the same defect: `minject` produces a non-starting image on a
 mingw-linked exe.** Facts from CI run 33609497360: `minject --verbose --postfix=<p>` reads
 the exe, reports `inject 'mimalloc-redirect.dll'`, prints a correct reordering
 (`mimalloc-redirect.dll` #0, `mimalloc*.dll` #1, then `KERNEL32.dll` and the

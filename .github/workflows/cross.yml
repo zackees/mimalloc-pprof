@@ -117,6 +117,7 @@ jobs:
           - aarch64-pc-windows-msvc
           - x86_64-apple-darwin
           - aarch64-apple-darwin
+          - x86_64-unknown-linux-musl
     defaults:
       run:
         working-directory: rust
@@ -133,20 +134,34 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: soldr prepare --target "$TARGET" --github-env "$GITHUB_ENV"
-      - name: Keep the Apple builds unwindable (frame pointers)
+      - name: Add the musl target to the pinned toolchain (#273 8a)
+        # rust-toolchain.toml's `targets` list does not carry x86_64-unknown-linux-musl
+        # (it would then be fetched for every contributor, not just this CI job), and
+        # `soldr prepare --target x86_64-unknown-linux-musl` provisions the musl-gcc
+        # cross toolchain and its env vars but does NOT itself add the target to the
+        # pinned rustc's sysroot -- confirmed locally: without this step, `cargo build
+        # --target x86_64-unknown-linux-musl` fails E0463 "can't find crate for `core`"
+        # even right after a successful `soldr prepare`.
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: soldr rustup target add x86_64-unknown-linux-musl
+      - name: Keep the Apple + musl builds unwindable (frame pointers)
         # #277 §4: build-linux sets RUSTFLAGS/CFLAGS at job level and this job set
         # neither, so the Apple test binaries were built without frame pointers while the
         # profiler walks frame pointers on every non-Windows platform. Copying
         # build-linux's job-level `env:` here would be dead -- `soldr prepare` has already
         # exported CARGO_ENCODED_RUSTFLAGS (which cargo lets shadow RUSTFLAGS entirely)
         # and CFLAGS_<triple> (which cc-rs prefers over plain CFLAGS) -- so both are
-        # appended to. Apple targets only: the profiler does not walk frame pointers on
-        # Windows, and whether clang-cl accepts the flag is a #277 phase D question.
+        # appended to. Apple and musl targets only: the profiler does not walk frame
+        # pointers on Windows, and whether clang-cl accepts the flag is a #277 phase D
+        # question. musl needs the same treatment as Apple here (#273 8a): `soldr
+        # prepare` exports CARGO_ENCODED_RUSTFLAGS and a musl-triple CFLAGS_* of its own
+        # (the `--sysroot=...` needed to find musl's headers), both of which would
+        # otherwise silently drop frame pointers the same way the Apple rows did.
         #
         # Kept in step with macos-bundles.yml's build-rust-apple: while the Apple rows
         # below are the informational control arm for #277 phase B, both arms must build
         # the same way or a divergence has two possible causes instead of one.
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'linux-musl')
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -164,7 +179,7 @@ jobs:
         # A flag that never reaches the compiler is this repository's most-repeated CI bug
         # (MI_GUARDED, docs/ci-gates.md). Assert on the environment the next step runs
         # with, not on what the previous step intended to write.
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'linux-musl')
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -307,6 +322,12 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             pprof: false
+          # #273 8a: the musl test binaries are statically linked (verified locally),
+          # so they run directly on the glibc ubuntu-latest runner with no musl runtime
+          # installed -- no separate execution environment needed.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            pprof: true
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             pprof: true

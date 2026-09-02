@@ -1597,11 +1597,31 @@ if (MI_BUILD_TESTS)
   # freed 256 MiB within one second of a worker thread going idle, with neither thread
   # allocating in the meantime (so it measures the scavenger, not an inline purge).
   # A C++ compiler is not required by this project (`project(libmimalloc C)`), so only add
-  # the target when one is actually available.
-  include(CheckLanguage)
-  check_language(CXX)
-  if(CMAKE_CXX_COMPILER AND MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
-    enable_language(CXX)
+  # the target where one can actually be enabled.
+  #
+  # The Apple CROSS toolchain is the exception that has to be spelled out:
+  # `enable_language(CXX)` there dies with "Could not find install_name_tool, please check
+  # your installation" (CMakeFindBinUtils via CMakeDetermineCXXCompiler) -- CMake's Apple
+  # C++ path insists on that tool and soldr's Linux-hosted Apple SDK toolchain does not
+  # provide it under that name, while the C language never asks for it. Nothing is lost:
+  # macos-bundles is compile-only for arm64 and its x64 run is gated on #283's golden
+  # image, so this test would not be RUN there in any case, and its actual claim -- that
+  # `extern "C" void mi_on_thread_idle(void) noexcept;` written by hand, as Bun writes it,
+  # links against our library -- is covered by the native Linux jobs, the native `cl` job,
+  # the MinGW bundle lane, and the clang-cl bundle lane (where CMakeLists turns MI_USE_CXX
+  # on by itself, so CXX is already loaded by the time we get here).
+  set(mi_have_cxx_for_tests FALSE)
+  if(CMAKE_CXX_COMPILER_LOADED)
+    set(mi_have_cxx_for_tests TRUE)
+  elseif(NOT (APPLE AND CMAKE_CROSSCOMPILING))
+    include(CheckLanguage)
+    check_language(CXX)
+    if(CMAKE_CXX_COMPILER)
+      enable_language(CXX)
+      set(mi_have_cxx_for_tests TRUE)
+    endif()
+  endif()
+  if(mi_have_cxx_for_tests AND MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
     add_executable(mimalloc-test-thread-idle-rss test/test-thread-idle-rss.cpp)
     target_compile_definitions(mimalloc-test-thread-idle-rss PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-thread-idle-rss PRIVATE ${mi_cflags})

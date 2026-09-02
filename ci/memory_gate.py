@@ -23,7 +23,7 @@ Usage:
     memory_gate.py control <result.json> [more.json ...]   # positive control: must FAIL
     memory_gate.py where   <result.json>                   # print the baseline it matches
 
-`--arch <name>` and `--compiler <name>` (accepted by all three commands) declare the
+`--arch <name>` and `--compiler <name>` (accepted by every command) declare the
 toolchain identity the binary cannot know about itself, and become part of the baseline
 file's name. #277 phase B needs them: an arm64 macOS run from a soldr-cross-built bundle
 and an arm64 macOS run from an Xcode-built tree are the same `platform` on the same

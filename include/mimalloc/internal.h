@@ -963,9 +963,15 @@ static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
 // walk: `test-park-handoff` trips `mi_theap_visit_pages`'s `count == total` (and
 // `mi_page_is_valid_init`'s block-conservation check) that way, ~2/120 runs pinned to 4 CPUs.
 //
-// So take the park back in the allocator's own slow paths as well, which makes the guarantee
-// hold for ANY owner-side allocation or free however it got there. Costs one relaxed load of an
-// already-hot cache line, and only on the generic/slow paths -- never on the fast path.
+// So take the park back in the allocator's own generic/slow paths as well (`mi_page_malloc`'s
+// slow path and `mi_free_generic_local`), which closes the gap for those paths. Costs one
+// relaxed load of an already-hot cache line, and only there -- never on the fast path.
+//
+// Residual: `mi_free_ex`'s thread-local fast path (`src/free.c`, `xtid==0`) calls
+// `mi_free_block_local` directly, and `mi_page_malloc`'s free-list pop, without going through
+// this function -- a parked thread's fast-path free that ends up retiring a page (via
+// `_mi_page_retire`) still races the scavenger's walk on that path. `mi_free_block_local` carries
+// a permanent debug-only assert as a detector for that residual instead (see its definition).
 static inline void _mi_park_leave_if_parked(mi_theap_t* theap) {
   if (theap == NULL) return;
   mi_tld_t* const tld = theap->tld;

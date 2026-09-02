@@ -216,4 +216,14 @@ unsafe extern "C" {
     /// Mirrors `mi_heap_get_seq` (include/mimalloc-stats.h): the monotonic sequence
     /// number assigned to `heap` at creation, or 0 for a NULL heap.
     pub fn mi_heap_get_seq(heap: *mut mi_heap_t) -> usize;
+
+    /// Mirrors `mi_on_thread_idle` (issue #272, Bun parity P7a).
+    pub fn mi_on_thread_idle();
+    /// Mirrors `mi_on_thread_idle_start`; `false` means nothing was handed off and
+    /// `mi_on_thread_idle_end` must NOT be called.
+    pub fn mi_on_thread_idle_start() -> bool;
+    /// Mirrors `mi_on_thread_idle_end`.
+    pub fn mi_on_thread_idle_end();
+    /// Mirrors `mi_scavenger_stop` (issue #272).
+    pub fn mi_scavenger_stop();
 }

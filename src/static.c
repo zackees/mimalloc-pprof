@@ -48,6 +48,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "profile-maps.c"
 #endif
 #include "random.c"
+#include "scavenger.c"    // #272: background scavenger + idle handoff
 #include "stats.c"
 #include "subproc.c"
 #include "theap.c"

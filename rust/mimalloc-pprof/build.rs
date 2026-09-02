@@ -34,7 +34,10 @@ fn main() {
     build.compile("mimalloc");
 
     if env::var("TARGET").is_ok_and(|target| target.contains("windows")) {
-        for library in ["psapi", "shell32", "user32", "advapi32", "bcrypt"] {
+        // `synchronization` is WaitOnAddress/WakeByAddressSingle, used by the background
+        // scavenger (src/scavenger.c, issue #272). The `#pragma comment(lib, ...)` in that
+        // file only reaches MSVC/clang-cl, so the *-pc-windows-gnu targets need this.
+        for library in ["psapi", "shell32", "user32", "advapi32", "bcrypt", "synchronization"] {
             println!("cargo:rustc-link-lib={library}");
         }
     }

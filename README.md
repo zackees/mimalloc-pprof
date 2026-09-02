@@ -264,6 +264,38 @@ continuously running production workload. Memory budgeting
 (`MIMALLOC_DHAT_MAX_BYTES`), partial-report semantics, and the stats API:
 **[docs/dhat-and-memory-events.md](docs/dhat-and-memory-events.md)**.
 
+### Returning memory when a thread goes idle
+
+A background **scavenger** thread returns freed arena memory to the OS on a timer
+instead of waiting for the next allocation to run a purge — so an idle process
+stops sitting on memory it no longer uses. It starts on demand (the first time a
+second thread appears, or the first park) and is controlled by
+`MIMALLOC_SCAVENGER` (`mi_option_scavenger`, default `1`) together with
+`MIMALLOC_PURGE_DELAY`; `mi_scavenger_stop()` stops it for good.
+
+An event loop that knows it is about to block can say so and get the work done for
+free, on the scavenger, while it sits in the kernel:
+
+```c
+#include <mimalloc.h>
+
+mi_on_thread_idle();               /* do the idle work here, on this thread */
+
+if (mi_on_thread_idle_start()) {   /* ... or hand it to the scavenger instead */
+  /* block in the kernel here (epoll_wait, WaitForMultipleObjects, ...);
+     this thread must not allocate or free until `_end` */
+  mi_on_thread_idle_end();
+}
+```
+
+`mi_on_thread_idle_start` returns `false` when there was nothing to hand off, and
+then `mi_on_thread_idle_end` is not required. Between the two calls the thread must
+not allocate or free — that is the whole precondition the sweep relies on.
+
+The scavenger is stopped and joined at process exit. On Windows that happens from an
+`atexit` handler, so it holds even in an `MI_NO_PROCESS_DETACH` build; on POSIX such a
+build leaves it running through `exit()` unless you call `mi_scavenger_stop()` yourself.
+
 ### Going deeper
 
 Everything deeper — CMake install and linking, the zeroing-realloc family,

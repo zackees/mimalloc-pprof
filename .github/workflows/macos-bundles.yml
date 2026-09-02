@@ -433,7 +433,7 @@ jobs:
           docker run -d --name macguest \
             --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
             -p 2222:22 \
-            -e VERSION=13 -e RAM_SIZE=8G -e CPU_CORES="$cores" -e DISK_SIZE=64G \
+            -e VERSION=13 -e RAM_SIZE=6G -e CPU_CORES="$cores" -e DISK_SIZE=64G \
             -e CPU_MODEL="Skylake-Client-v4" \
             -v /mnt/macstore:/storage \
             dockurr/macos
@@ -447,7 +447,7 @@ jobs:
           deadline=$(( $(date +%s) + 1800 ))
           until sshpass -p "$GUEST_PASS" ssh -p 2222 \
                   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                  -o ConnectTimeout=5 "$GUEST_USER@127.0.0.1" true 2>/dev/null; do
+                  -o ConnectTimeout=5 -o ConnectionAttempts=1 "$GUEST_USER@127.0.0.1" true 2>/dev/null; do
             if [ "$(date +%s)" -ge "$deadline" ]; then
               echo "::error::the macOS guest never accepted ssh within 30 minutes"
               docker logs macguest 2>&1 | grep -viE 'BdsDxe|EXITBS|EB\.BST|B:BOOT|HANDOFF|End of efiboot' | tail -40

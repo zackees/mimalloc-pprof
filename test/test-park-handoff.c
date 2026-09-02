@@ -275,15 +275,40 @@ static void* park_stress(void* arg) {
   return NULL;
 }
 
+// #272 (this fork): `mi_collect(true)` now WAITS for `_mi_arenas_try_purge`'s
+// one-purger-at-a-time guard instead of skipping when it is held, because the scavenger sits
+// in that same function on a timer and a forced purge that silently does nothing broke
+// `test-degenerate`'s thread-churn bound. Turning a non-blocking guard into a blocking one
+// deserves a test that hammers it: a thread doing nothing but forced collects, against the
+// park/wake stress below.
+static volatile int collect_stop;
+
+static void* forced_collect_loop(void* arg) {
+  (void)arg;
+  while (collect_stop == 0) { mi_collect(true); usleep(200); }
+  return NULL;
+}
+
 static void test_park_stress(void) {
   enum { THREADS = 4 };
   pthread_t t[THREADS];
+  pthread_t collector;
+  bool have_collector = false;
   stress_corrupt = 0;
+  collect_stop = 0;
+  if (pthread_create(&collector, NULL, &forced_collect_loop, NULL) == 0) { have_collector = true; }
   for (long i = 0; i < THREADS; i++) {
-    if (pthread_create(&t[i], NULL, &park_stress, (void*)i) != 0) return;
+    if (pthread_create(&t[i], NULL, &park_stress, (void*)i) != 0) {
+      collect_stop = 1;
+      if (have_collector) pthread_join(collector, NULL);
+      return;
+    }
   }
   for (int i = 0; i < THREADS; i++) { pthread_join(t[i], NULL); }
+  collect_stop = 1;
+  if (have_collector) pthread_join(collector, NULL);   // a hang here IS the deadlock this guards
   check("concurrent park/wake keeps every survivor intact", stress_corrupt == 0);
+  check("forced mi_collect against a live scavenger neither hangs nor corrupts", true);
 }
 
 // ---------------------------------------------------------------------------

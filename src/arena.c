@@ -2388,8 +2388,19 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
   // enough to matter (`test-degenerate`'s thread-churn RSS backstop failed 4 runs in 40:
   // "memory grew with thread churn -- 5.1 MB -> 54.1 MB", i.e. `mi_collect(true)` returning
   // having purged nothing at all). So a forced purge WAITS for the guard instead of
-  // skipping. The holder never blocks on anything the waiter owns, so the wait is bounded
-  // by one purge pass.
+  // skipping.
+  //
+  // Why that wait cannot deadlock, spelled out because it turns a non-blocking guard into a
+  // blocking one: the ONLY caller that passes `force` is `_mi_arenas_collect(force_purge=true)`
+  // from `mi_theap_collect_ex(MI_FORCE)`, i.e. an ordinary thread inside `mi_collect(true)`.
+  // The scavenger never does -- it reaches here through `mi_theap_collect(theap0, false)`
+  // (MI_NORMAL) and through `_mi_arenas_purge_now`, both `force == false`, and
+  // `mi_theap_collect_ex` skips `_mi_arenas_collect` outright while `park_state ==
+  // MI_PARK_SWEEPING`. So a waiter is always a user thread and a holder is always someone
+  // running a bounded pass over the arenas that acquires no mimalloc lock the waiter could
+  // be holding (the guarded body takes only arena bitmaps and the OS). The wait is therefore
+  // bounded by one purge pass, and in particular a holder is never itself blocked on
+  // `_mi_park_leave` waiting for a SWEEPING state the waiter would have to clear.
   bool ran = false;
   do {
   mi_atomic_guard(&mi_arenas_purge_guard)

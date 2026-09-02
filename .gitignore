@@ -15,3 +15,6 @@ docs/
 .DS_STore
 __pycache__/
 *.pyc
+
+# uv run writes an (empty) lock file here; pyproject.toml has no [project] table, so it carries nothing
+uv.lock

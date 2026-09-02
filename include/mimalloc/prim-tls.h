@@ -413,7 +413,14 @@ static inline mi_theap_t* _mi_heap_theap_peek(const mi_heap_t* heap) {
   if mi_likely(_mi_theap_heap_peek(theap)==heap) return theap;
   #endif
   theap = (mi_theap_t*)_mi_thread_local_get(heap->theap);  // don't update the cache on a query
-  mi_assert_internal(theap==NULL || (!_mi_is_empty_theap(theap) && theap->heap==heap));
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): a theap
+  // detached from `heap` by a concurrent `mi_heap_delete`/`mi_heap_destroy`
+  // (`_mi_heap_detach_theaps`) has `theap->heap == NULL` here, not `heap` -- return NULL
+  // instead of asserting, so callers stop reclaiming into / abandoning through it.
+  if (theap==NULL) return NULL;
+  mi_assert_internal(!_mi_is_empty_theap(theap));
+  mi_assert_internal(_mi_theap_heap_peek(theap)==heap || _mi_theap_heap_peek(theap)==NULL);
+  if (_mi_theap_heap_peek(theap) != heap) return NULL;
   return theap;
 }
 
@@ -423,7 +430,12 @@ static inline mi_theap_t* _mi_page_associated_theap_peek(mi_page_t* page) {
   mi_heap_t* const heap = mi_page_heap(page);
   mi_theap_t* const theap = (mi_theap_t*)_mi_thread_local_get(heap->theap);
   if (theap==NULL) return NULL;
-  if (theap->heap != heap) return NULL; // should never happen, but can happen for a free across subprocesses, which can happen during pthread tls storage deallocation
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): the theap no
+  // longer belongs to the heap when it was detached by a concurrent `mi_heap_delete`
+  // (`_mi_heap_detach_theaps`; the theap struct itself is freed only after the page has left
+  // the heap, so it is still safe to read here). It also does not belong to it for a free
+  // across subprocesses, which can happen during pthread tls storage deallocation.
+  if (_mi_theap_heap_peek(theap) != heap) return NULL;
   mi_assert_internal(!_mi_is_empty_theap(theap) && mi_theap_matches_thread(theap));
   // note: for pages allocated by a detached theap, the returned theap may not be detached
   return theap;

@@ -25,6 +25,14 @@ static mi_lock_t     mi_subprocs_lock = MI_LOCK_INITIALIZER;
 mi_subproc_t* _mi_subprocs_head(void) { return mi_subprocs; }
 mi_lock_t*    _mi_subprocs_lock(void) { return &mi_subprocs_lock; }
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): defined here
+// (not in src/fork.c, which is compiled only under `#if !defined(_WIN32) && !defined(__wasi__)`)
+// because `mi_heap_visit_page_claim` (arena.c) and `mi_heap_detach_theaps` (heap.c) read it
+// unconditionally on every platform -- a Windows/wasi build that never sets it still needs
+// the symbol to link. Only the setter (`_mi_process_fork_child`) lives in fork.c's
+// POSIX-only block; see its definition there for the sticky-flag limitation.
+mi_decl_hidden bool _mi_process_is_forked_child = false;
+
 
 /* -----------------------------------------------------------
   Meta-data allocation

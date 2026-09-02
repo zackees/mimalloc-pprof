@@ -213,6 +213,14 @@ void          _mi_process_fork_prepare(void);
 void          _mi_process_fork_parent(void);
 void          _mi_process_fork_child(void);
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): defined
+// unconditionally in src/subproc.c (not src/fork.c, which compiles only on POSIX) so the
+// symbol links on every platform; set once by `_mi_process_fork_child` (src/fork.c, in its
+// POSIX-only block -- see there for the sticky-flag limitation), never cleared. Consulted by
+// `mi_heap_visit_page_claim` (arena.c) and `mi_heap_detach_theaps` (heap.c) to avoid waiting
+// on / walking pages of a theap whose owning thread did not survive a multi-threaded fork().
+extern mi_decl_hidden bool _mi_process_is_forked_child;
+
 // #270: runtime lock-order detector. Every internal lock acquire already goes through
 // diagnostic.c's reentrancy checker (MI_DEBUG>2), which records the owning thread in
 // `mi_lock_t::debug_owner`; fork.c uses that to record the nesting edges actually
@@ -241,6 +249,24 @@ void*         _mi_meta_rezalloc( mi_subproc_t* subproc, void* p, size_t newsize,
 void*         _mi_meta_zalloc_aligned( mi_subproc_t* subproc, size_t size, size_t alignment, mi_memid_t* memid );
 void          _mi_meta_free(mi_subproc_t* subproc, void* p, mi_memid_t memid);
 bool          _mi_meta_is_meta_page(const mi_subproc_t* subproc, const mi_page_t* p);
+
+// issue #271 (Bun parity P6, "keep our profiler hooks consistent -- a page unpublished
+// from its heap must not be visited with a dangling heap pointer"): a hook that runs for a
+// cross-thread free (free.c:mi_free_block_mt) can race a concurrent mi_heap_delete /
+// mi_heap_destroy of the page's heap on another thread. The block being freed keeps the
+// *page* struct alive (see free.c's _mi_page_ptr_unalign comment), but NOT the heap or
+// theap it points to -- `mi_heap_free`/`_mi_theap_decref` can free and (in MI_DEBUG builds)
+// poison that memory out from under a concurrent reader with no synchronization of its own
+// (reproduced: `mi_page_subproc(page)` / `page->heap->subproc` reading freed, poisoned
+// mi_heap_t memory from `_mi_memevt_on_free`, SIGSEGV inside `_mi_meta_is_meta_page`).
+// `page->memid` is immutable after page creation and safe to read; for an arena-backed page
+// (the only kind a meta-allocator page ever is -- mi_heap_t/mi_theap_t are always small,
+// arena-sized allocations, never OS/oversized) its arena's `subproc` field is set once at
+// arena creation and outlives every heap in it, so this never touches page->heap/page->theap.
+static inline bool _mi_meta_is_meta_page_safe(const mi_page_t* page) {
+  mi_arena_t* const arena = mi_memid_arena(page->memid);
+  return (arena != NULL && _mi_meta_is_meta_page(arena->subproc, page));
+}
 
 
 // init.c
@@ -282,6 +308,26 @@ bool          _mi_os_decommit(mi_subproc_t* subproc, void* addr, size_t size);
 void          _mi_os_reuse(mi_subproc_t* subproc, void* p, size_t size);
 mi_decl_nodiscard bool _mi_os_commit(mi_subproc_t* subproc, void* p, size_t size, bool* is_zero);
 mi_decl_nodiscard bool _mi_os_commit_ex(mi_subproc_t* subproc, void* addr, size_t size, bool* is_zero, size_t stat_size);
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT: MI_DEBUG-only test hooks (issue #271 /
+// Bun parity P6). Declared with C linkage so a C test links against a library that may be
+// compiled as C++ (mirrors the other `mi_debug_*` test hooks).
+#if MI_DEBUG > 0
+#ifdef __cplusplus
+extern "C" {
+#endif
+// After `fail_after` successful commits, the next `_mi_os_commit_ex` call fails instead of
+// calling into the OS (test-commit-fail.c).
+extern mi_decl_export volatile long mi_debug_fail_os_commit_after;
+// test-heap-teardown.c's `pin` case: set to 1 before a `mi_heap_delete`; the claim loop in
+// `arena.c` (`mi_heap_visit_page_claim`) sets it to 2 once it has a page pinned but not yet
+// claimed, and stalls there until the test sets it back to 0.
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+#ifdef __cplusplus
+}
+#endif
+#endif
+
 mi_decl_nodiscard bool _mi_os_protect(void* addr, size_t size);
 bool          _mi_os_unprotect(void* addr, size_t size);
 bool          _mi_os_purge(mi_subproc_t* subproc, void* p, size_t size);
@@ -334,6 +380,7 @@ void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 
 mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t page_alignment);
 void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
+void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271)
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
@@ -373,6 +420,7 @@ bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t*
 void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 
 void          _mi_heap_detach_theaps( mi_heap_t* heap );
+void          _mi_theap_abandon(mi_theap_t* theap);  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271)
 void          _mi_tld_detach_theaps( mi_tld_t* tld );
 void          _mi_theap_incref(mi_theap_t* theap);
 void          _mi_theap_decref(mi_theap_t* theap);
@@ -830,6 +878,21 @@ static inline bool mi_theap_is_detached(mi_theap_t* theap) {
 static inline bool mi_theap_matches_thread(mi_theap_t* theap) {
   const mi_threadid_t tid = _mi_thread_id();
   return (theap==NULL || theap->tld->thread_id == tid || mi_theap_is_detached(theap));
+}
+
+// adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// 8286bfb6): like mi_theap_matches_thread, but additionally allows a theap that
+// mi_heap_delete/mi_heap_destroy detached from its heap (`_mi_heap_detach_theaps` clears
+// `theap->heap`, see theap.c) -- `_mi_theap_abandon` (theap.c) calls
+// `_mi_arenas_page_abandon` on behalf of such a theap from the *deleting* thread, which
+// is not the theap's own owning thread. Bun's version also allows the park state the
+// background scavenger sets while sweeping a parked thread's theaps; that state does not
+// exist in this tree (#272), so that clause is omitted here.
+static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
+  if (theap == NULL || theap->tld == NULL) return true;
+  if (mi_atomic_load_ptr_relaxed(mi_heap_t, &theap->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`
+  if (theap->tld->thread_id == _mi_thread_id()) return true;
+  return mi_theap_is_detached(theap);   // upstream's permanently-detached theaps (meta-data) belong to no thread
 }
 
 /* -----------------------------------------------------------

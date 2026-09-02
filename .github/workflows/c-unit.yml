@@ -18,6 +18,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # THE RETAINED NATIVE MSVC GATE (#277 phase D). Every other windows-latest row in this
+  # repository is now informational, replaced by Linux-cross-built bundles that
+  # windows-bundles.yml's `run-windows` executes on one shared VM. This one is not, and
+  # must not become so without the owner amending CLAUDE.md rule 3 ("MSVC and win-gnu are
+  # priority platforms -- both, always"): the bundles are built by clang-cl, and a
+  # clang-cl binary is not a `cl` binary. clang-cl accepts `__attribute__`s that cl
+  # rejects, and cl's codegen, TLS lowering and DLL runtime are its own. This job is the
+  # only thing in CI that compiles this tree with Microsoft's compiler and runs the
+  # result. Do NOT add continue-on-error here.
   ctest:
     strategy:
       fail-fast: false
@@ -153,6 +162,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # TODO(#277 phase D, added 2026-09-02): DELETE the windows-latest row after ten pushes
+    # have compared it against `run-windows` in windows-bundles.yml, which runs the same
+    # test set from a Linux-built bundle on the shared Windows VM. Informational until
+    # then -- it is the control arm for a deliberate toolchain change (native `cl` /MDd
+    # vs cross clang-cl /MD), so do not delete it before that comparison has actually
+    # happened. A permanently-yellow job is worse than an absent one. The ubuntu-latest
+    # row of this matrix is NOT affected and stays a hard gate.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
       - run: cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON && cmake --build build --config Debug && ctest --test-dir build -C Debug --output-on-failure
@@ -198,7 +215,7 @@ jobs:
   ctest-debug-full-win-gnu:
     runs-on: windows-latest
     # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
-    # it against `run-windows-gnu` in windows-bundles.yml, which runs the same test set
+    # it against `run-windows` in windows-bundles.yml, which runs the same test set
     # from a Linux-built bundle on a shared Windows VM. Informational until then -- it is
     # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
     # mingw-w64 is UCRT), so do not delete it before that comparison has actually
@@ -269,6 +286,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # TODO(#277 phase D, added 2026-09-02): DELETE the windows-latest row after ten pushes
+    # have compared it against `run-windows` in windows-bundles.yml, which runs the same
+    # test set from a Linux-built bundle on the shared Windows VM. Informational until
+    # then -- it is the control arm for a deliberate toolchain change (native `cl` /MDd
+    # vs cross clang-cl /MD), so do not delete it before that comparison has actually
+    # happened. A permanently-yellow job is worse than an absent one. The ubuntu-latest
+    # row of this matrix is NOT affected and stays a hard gate.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
       - run: cmake -B build -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
@@ -278,7 +303,7 @@ jobs:
   ctest-shared-win-gnu:
     runs-on: windows-latest
     # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
-    # it against `run-windows-gnu` in windows-bundles.yml, which runs the same test set
+    # it against `run-windows` in windows-bundles.yml, which runs the same test set
     # from a Linux-built bundle on a shared Windows VM. Informational until then -- it is
     # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
     # mingw-w64 is UCRT), so do not delete it before that comparison has actually
@@ -311,6 +336,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # TODO(#277 phase D, added 2026-09-02): DELETE the windows-latest row after ten pushes
+    # have compared it against `run-windows` in windows-bundles.yml, which runs the same
+    # test set from a Linux-built bundle on the shared Windows VM. Informational until
+    # then -- it is the control arm for a deliberate toolchain change (native `cl` /MDd
+    # vs cross clang-cl /MD), so do not delete it before that comparison has actually
+    # happened. A permanently-yellow job is worse than an absent one. The ubuntu-latest
+    # row of this matrix is NOT affected and stays a hard gate.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
       - run: cmake -B build -DMI_PPROF=ON
@@ -377,7 +410,7 @@ jobs:
   ctest-win-gnu:
     runs-on: windows-latest
     # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
-    # it against `run-windows-gnu` in windows-bundles.yml, which runs the same test set
+    # it against `run-windows` in windows-bundles.yml, which runs the same test set
     # from a Linux-built bundle on a shared Windows VM. Informational until then -- it is
     # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
     # mingw-w64 is UCRT), so do not delete it before that comparison has actually

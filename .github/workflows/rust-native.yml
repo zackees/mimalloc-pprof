@@ -21,6 +21,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # TODO(#277 phase D, added 2026-09-02): DELETE the windows-latest row after ten pushes
+    # have compared it against `run-windows` in windows-bundles.yml, which runs the whole
+    # workspace's test binaries -- cross-built on Linux for x86_64-pc-windows-msvc -- on
+    # the shared Windows VM. Informational until then. A permanently-yellow job is worse
+    # than an absent one. The ubuntu-latest row is NOT affected and stays a hard gate.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     defaults:
       run:
         working-directory: rust
@@ -32,19 +38,29 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
+      # `xtask check`, `cargo publish --dry-run` and the package check are
+      # platform-INDEPENDENT: they compare the vendored C amalgamation against src/ and
+      # inspect a .crate archive. Running them on a second OS proves nothing, and #277's
+      # review addendum (item 5) asked for them to be dropped from the non-Linux runners
+      # rather than carried into a test bundle. `cargo test` is the only row-specific
+      # step, and windows-bundles.yml's `run-windows` now runs the same tests from
+      # Linux-cross-built binaries.
       - name: xtask check (vendored C amalgamation must match src/include/)
+        if: runner.os != 'Windows'
         run: soldr cargo run -p xtask -- check
       - run: soldr cargo test --locked
       - name: cargo publish --dry-run (mimalloc-pprof)
+        if: runner.os != 'Windows'
         run: soldr cargo publish --dry-run -p mimalloc-pprof --locked
       - name: Verify publish archive contains feature gate and DHAT
+        if: runner.os != 'Windows'
         shell: bash
         run: python ../ci/check_crate_package.py target/package
 
   test-win-gnu:
     runs-on: windows-latest
     # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
-    # it against `run-windows-gnu` in windows-bundles.yml, which runs the same Rust test
+    # it against `run-windows` in windows-bundles.yml, which runs the same Rust test
     # binaries, cross-built on Linux, on a shared Windows VM. Informational until then -- it is
     # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
     # mingw-w64 is UCRT), so do not delete it before that comparison has actually

@@ -231,16 +231,6 @@ This incurs an extra check in the fast path (but can often be combined in an exi
 #if !defined(MI_TLS_RECURSE_GUARD) && MI_TLS_MODEL_LOCAL && defined(__APPLE__)
 #define MI_TLS_RECURSE_GUARD 1     // macOS can allocate on thread-local initialization
 #endif
-#if !defined(MI_TLS_RECURSE_GUARD) && defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
-// Same hazard as macOS's `_tlv_bootstrap`, for the same reason: many mingw-w64 GCCs (the
-// conda-forge cross compilers among them) are built without native TLS, so `__thread`
-// becomes GCC's *emulated* TLS and `__emutls_get_address` allocates its per-thread table
-// with `malloc` -- which, with `mimalloc-redirect.dll` active, is mimalloc. The remaining
-// `mi_decl_thread` on an allocation-reachable path is `recurse` in `src/options.c`, and
-// this is exactly the guard that keeps it from being touched while preloading.
-// (mimalloc-pprof #277; `src/threadlocal.c` avoids `__thread` here altogether.)
-#define MI_TLS_RECURSE_GUARD 1
-#endif
 
 // Declared this way to optimize register spills and branches
 mi_decl_cold mi_decl_noinline mi_theap_t* _mi_theap_empty_get(void);

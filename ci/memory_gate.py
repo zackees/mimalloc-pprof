@@ -18,9 +18,13 @@ more stable than any single run. The spread across runs is printed every time --
 ever approaches the tolerance, the tolerance is wrong and the printout says so.
 
 Usage:
-    memory_gate.py check   <result.json> [more.json ...]
+    memory_gate.py check   [<result.json> ...]   # no paths: build/run the binary itself
     memory_gate.py update  <result.json> [more.json ...]   # deliberate, reviewed act
     memory_gate.py control <result.json> [more.json ...]   # positive control: must FAIL
+
+With no JSON paths, `check` locates the built `mimalloc-test-memory-gate` binary,
+runs it RUNS_EXPECTED times (see run_gate_binary), and checks those results -- this
+is what makes `python ci/memory_gate.py check` alone reproduce the CI job locally.
 
 Exit codes: 0 pass, 1 regression, 2 usage/IO error.
 """
@@ -28,7 +32,10 @@ Exit codes: 0 pass, 1 regression, 2 usage/IO error.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -80,6 +87,15 @@ class Result(TypedDict):
 # This number is set from the observed spread reported by the runs below, not guessed.
 # Raise it only with the measurement that justifies it; a gate that flakes gets ignored,
 # and an ignored gate is worse than none.
+#
+# Known margin, not yet acted on (#266): main's docs-only PR #275 (no allocator-path
+# changes at all) still failed ubuntu's memory-gate at +15.7%, just over this threshold.
+# That is evidence the 15% tolerance is closer to the noise floor on ubuntu than this
+# comment's derivation assumed -- not evidence of a real regression from a docs PR.
+# Deliberately NOT widening PEAK_TOLERANCE or touching ci/memory-baselines/*.json here:
+# that decision needs its own measurement-backed change, called out in its own PR, per
+# the "raise it only with the measurement that justifies it" rule above -- not folded
+# into an unrelated change as a side effect.
 PEAK_TOLERANCE = 0.15
 
 # Number of runs the CI job is expected to supply. Fewer is allowed (with a warning) so
@@ -90,6 +106,90 @@ RUNS_EXPECTED = 4
 # still be live; anything above this is cleanup that did not run. Matches the inline
 # assertion in test-memory-gate.c.
 MAX_LIVE_THREADS = 32
+
+
+# CI's runners are 4-core (ubuntu-latest/windows-latest/macos-latest as of the baselines
+# this gate compares against). A wider local box measurably inflates the peak this test
+# exercises: it drives MI_BENCH_THREADS()-many concurrently-running threads doing an
+# allocation churn, and peak RSS/commit scales with how many of those threads the OS
+# actually schedules onto distinct CPUs at once, not just with the allocator's true
+# high-water mark. Observed on this repo: 58 MB on an unrestricted 16-core host vs ~23 MB
+# under `taskset -c 0-3` on the same host, for the identical binary and commit -- an
+# apples-to-oranges comparison against the 4-core baselines that nothing about the JSON
+# schema flags as such. Pinning the child to <= 4 CPUs here is what makes a local
+# `python ci/memory_gate.py check` (no path arguments) comparable to the CI numbers
+# instead of just plausible-looking.
+MAX_GATE_CPUS = 4
+
+
+def _cpu_affinity_preexec(cpus: list[int]):
+    def _set():
+        os.sched_setaffinity(0, cpus)
+
+    return _set
+
+
+def find_gate_binary() -> Path:
+    """Locate a built mimalloc-test-memory-gate executable under common build dirs.
+
+    Multiple build directories (Release, Debug, ASan, ...) commonly coexist locally.
+    Comparing against a 4-core *Release* baseline against, say, an ASan build's peak
+    (which is inflated by shadow memory and redzones, not allocator growth) is exactly
+    the kind of apples-to-oranges mismatch MAX_GATE_CPUS above exists to avoid for CPU
+    count -- so among all candidates, prefer the most recently built one (mtime), which
+    in practice is whichever config the caller configured/built right before running
+    this, matching what `python ci/memory_gate.py check` right after a build expects.
+    """
+    root = Path(__file__).resolve().parents[1]
+    names = ("mimalloc-test-memory-gate", "mimalloc-test-memory-gate.exe")
+    search_dirs = sorted(root.glob("build*")) + sorted(root.glob("out/*"))
+    candidates: list[Path] = []
+    for d in search_dirs:
+        for name in names:
+            for candidate in d.rglob(name):
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    candidates.append(candidate)
+    if not candidates:
+        raise FileNotFoundError(
+            "no built mimalloc-test-memory-gate found under build*/ or out/*/ -- "
+            "configure and build first, e.g.:\n"
+            "  cmake -B build -DMI_PPROF=ON && cmake --build build --config Release"
+        )
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def run_gate_binary(binary: Path, runs: int = RUNS_EXPECTED) -> list[str]:
+    """Run the gate binary `runs` times, pinned to <= MAX_GATE_CPUS CPUs where the
+    platform supports it, and return the resulting JSON file paths.
+
+    CPU pinning uses os.sched_setaffinity via preexec_fn on platforms that have it
+    (Linux); elsewhere (macOS, Windows) there is no equivalent standard-library call, so
+    this runs unpinned there -- those platforms' baselines were not observed to need it,
+    and CI itself does not pin on them either.
+    """
+    cpu_count = os.cpu_count() or MAX_GATE_CPUS
+    pin_cpus = list(range(min(MAX_GATE_CPUS, cpu_count)))
+    can_pin = hasattr(os, "sched_setaffinity")
+    print(
+        f"running {binary} x{runs}"
+        + (
+            f", pinned to CPUs {pin_cpus}"
+            if can_pin
+            else " (no CPU pinning available on this platform)"
+        )
+    )
+    result_paths: list[str] = []
+    tmpdir = Path(tempfile.mkdtemp(prefix="mimalloc-memory-gate-"))
+    for i in range(1, runs + 1):
+        out_path = tmpdir / f"result-{i}.json"
+        env = dict(os.environ)
+        env["MI_BENCH_JSON"] = str(out_path)
+        kwargs = {}
+        if can_pin:
+            kwargs["preexec_fn"] = _cpu_affinity_preexec(pin_cpus)
+        subprocess.run([str(binary)], env=env, stdout=subprocess.DEVNULL, check=True, **kwargs)
+        result_paths.append(str(out_path))
+    return result_paths
 
 
 def baseline_path(result: Result) -> Path:
@@ -279,12 +379,23 @@ def update(result_paths: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 3 or argv[1] not in ("check", "update", "control"):
+    if len(argv) < 2 or argv[1] not in ("check", "update", "control"):
+        print(__doc__)
+        return 2
+    result_paths = argv[2:]
+    if argv[1] == "check" and not result_paths:
+        try:
+            binary = find_gate_binary()
+            result_paths = run_gate_binary(binary)
+        except (OSError, ValueError, FileNotFoundError, subprocess.SubprocessError) as e:
+            print(f"error: {e}")
+            return 2
+    elif not result_paths:
         print(__doc__)
         return 2
     try:
         cmd = {"check": check, "update": update, "control": control}[argv[1]]
-        return cmd(argv[2:])
+        return cmd(result_paths)
     except (OSError, ValueError, KeyError) as e:
         print(f"error: {e}")
         return 2

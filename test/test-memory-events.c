@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include "mimalloc.h"
 #include "mimalloc/memory-events.h"
+#include "mimalloc/profile.h"  /* mi_prof_start/mi_prof_stop -- see test_new_thread_first_alloc_all_observers_active (#266) */
+#include "mimalloc/dhat.h"     /* mi_dhat_start/mi_dhat_stop -- ditto */
 
 /* ---------------------------------------------------------------------------------------------
    Shared callback-counting harness: one handler function for all three kinds, dispatching on
@@ -242,6 +244,35 @@ static void test_event_correctness(void) {
      crash/corruption. Build with -DCMAKE_BUILD_TYPE=Debug (or -DMI_DEBUG=ON) to exercise it. */
 #if defined(MI_DEBUG) && (MI_DEBUG > 0)
   {
+    /* MI_GUARDED (issue #266): under MIMALLOC_GUARDED_SAMPLE_RATE forcing every
+       allocation to be guarded, this 64-byte block gets its own single-block page, and
+       freeing it immediately retires/returns that page to the arena (src/page.c's
+       _mi_page_free clears has_interior_pointers and hands the page back). The
+       double-free detector assumes a freed block's page sticks around for the
+       free-list scan that spots it -- an assumption a reclaimed page violates, so the
+       deliberate second mi_free below would fault in mi_validate_block_from_ptr before
+       mi_check_is_double_free ever runs, rather than testing the thing this sub-case
+       exists to test. Re-verified this is still needed after the #266 round-2 pointer-
+       identity fix (alloc.c/alloc-aligned.c): reverting just this disable and re-running
+       under MIMALLOC_GUARDED_SAMPLE_RATE=1 still faults identically here, so the
+       remaining cause is page reclaim-on-free, not a pointer-identity bug like
+       test-dhat.c's (removed) exemption was.
+       Deliberately NOT restoring the sample rate afterwards, despite every later test
+       function in this file running on this same thread/theap: tried it, and restoring
+       does not just re-enable guarding cleanly -- it exposes at least two more,
+       unrelated, pre-existing gaps further down this same file that guarding was never
+       actually exercised against before (test_concurrency/T7: a deterministic loss of
+       exactly T7_THREADS FREE events out of 16000, reproducible every run, not a race;
+       test_visit_live_allocations/T11: a tracked-allocation visibility assertion also
+       fails). Chasing those is out of scope for this fix -- they are pre-existing gaps
+       in this test's guarding coverage, not consequences of the pointer-identity bug
+       just fixed. Leaving guarding disabled for the rest of this file's run is the
+       narrower, honest choice until those get their own investigation, rather than
+       silently forcing a restore that would make T7/T11 flaky/red for reasons unrelated
+       to what this comment can explain. */
+#if MI_GUARDED
+    mi_theap_guarded_set_sample_rate(mi_theap_get_default(), 0, 0);
+#endif
     void* a = mi_malloc(64); assert(a != NULL);
     mi_free(a);
     evt_ctx_reset(&ctx);
@@ -686,6 +717,68 @@ static void test_free_from_foreign_thread(void) {
   assert(after.live_count == before.live_count);
 }
 
+/* ---- T12: brand-new thread whose first-ever mimalloc call happens with memory-events,
+   the profiler, and DHAT all active simultaneously (issue #266) ---------------------------
+
+   Regression coverage for the macOS-only crash this issue diagnosed: a worker thread's
+   very first allocation goes through _mi_thread_init_with_heap -> _mi_meta_zalloc, which
+   allocates that thread's own tld/theap while holding subproc->theap_meta_lock, and the
+   allocation hooks (_mi_memevt_on_alloc, _mi_prof_on_alloc, _mi_dhat_begin_alloc) fire for
+   that very allocation. The bug was those hooks touching per-thread `mi_decl_thread`
+   (`__thread`) state: on a macOS dylib, first-touching a `__thread` variable can lazily
+   allocate its TLS block via a dyld-interposed calloc, which reenters mimalloc and
+   re-acquires that same non-recursive lock on the same thread -- a deadlock (and, under
+   MI_DEBUG_FULL's reentrant-lock diagnostic, an assertion instead).
+
+   The fix (moving that state onto mi_tld_t; see include/mimalloc/hooks-tld.h) is
+   platform-independent, so this passes on Linux both before and after the fix -- the
+   point here is coverage of the exact three-observers-active shape, not reproducing the
+   macOS-specific trigger itself. */
+#ifdef _WIN32
+static DWORD WINAPI t12_thread(LPVOID arg) {
+  (void)arg;
+  void* p = mi_malloc(64);   /* this thread's very first mimalloc call */
+  assert(p != NULL);
+  memset(p, 0xEE, 64);
+  mi_free(p);
+  return 0;
+}
+static void t12_run(void) {
+  HANDLE th = CreateThread(NULL, 0, t12_thread, NULL, 0, NULL);
+  assert(th != NULL);
+  WaitForSingleObject(th, INFINITE);
+  CloseHandle(th);
+}
+#else
+static void* t12_thread(void* arg) {
+  (void)arg;
+  void* p = mi_malloc(64);   /* this thread's very first mimalloc call */
+  assert(p != NULL);
+  memset(p, 0xEE, 64);
+  mi_free(p);
+  return NULL;
+}
+static void t12_run(void) {
+  pthread_t th;
+  assert(pthread_create(&th, NULL, t12_thread, NULL) == 0);
+  assert(pthread_join(th, NULL) == 0);
+}
+#endif
+
+static void test_new_thread_first_alloc_all_observers_active(void) {
+  assert(mi_memory_tracking_is_enabled());
+  /* mi_prof_start is a harmless no-op returning false when built with MI_PPROF=OFF; the
+     allocation hooks below are always compiled in regardless, so this test still covers
+     the memevt+dhat pair on an MI_PPROF=OFF build. */
+  const bool prof_started = mi_prof_start(0);
+  const bool dhat_started = mi_dhat_start();
+
+  t12_run();   /* the whole point: must not deadlock or assert */
+
+  if (prof_started) mi_prof_stop();
+  if (dhat_started) mi_dhat_stop();
+}
+
 static void test_unwrapped_family(void) {
   assert(mi_memory_tracking_is_enabled());
   evt_ctx_t ctx; evt_ctx_reset(&ctx);
@@ -804,6 +897,7 @@ int main(int argc, char** argv) {
   test_disable_reenable_partial();
   test_visit_live_allocations();
   test_free_from_foreign_thread();
+  test_new_thread_first_alloc_all_observers_active();
   test_unwrapped_family();
 
   puts("memory-events tests passed");

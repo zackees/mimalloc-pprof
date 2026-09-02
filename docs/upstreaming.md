@@ -187,6 +187,43 @@ should land after the fixes.
 
 **MinGW CI job: still unfiled**, and now correctly sequenced behind #1351.
 
+**Update (2026-09-01, #266 pin bump):** the `__GCC__`/`__GNUC__` detection typo described above is fixed upstream as of our new pin (`6def7be9`). It was still present at `1f06f694` (the tip snapshot measured above) but upstream landed
+`4cca633e`/`b5fdee4a` ("fix mingw detection: __GCC__ -> __GNUC__") and then
+`1cf88691` ("use __MINGW32__ to detect mingw ... instead of __GNUC__") somewhere
+in `1f06f694..6def7be9`. `src/prim/windows/prim.c` at `6def7be9` already reads
+`#elif defined(__MINGW32__)` in all three `MI_WIN_INIT_USE_*` blocks -- a real,
+correct macro (defined by MinGW-w64 GCC and by clang targeting `*-w64-mingw32`),
+not the old typo. We do not carry a patch for this anymore; our overlay took
+upstream's file verbatim at the bump (#266). The historical measurements above
+(against `1f06f694`) remain accurate for their time and are left as-is for the
+record; they no longer describe our current pin.
+
+**New upstream bug found by the same `1cf88691` narrowing (2026-09-02, #266 round 2):
+`_mi_auto_process_init` (src/init.c) runs twice on win-gnu, not zero times.** Its own
+comment says "Called once by the process loader ... before main is called", and
+`mi_process_init()` inside it is do-once guarded -- but nothing else in the function
+was. Root cause: `MI_PRIM_HAS_PROCESS_ATTACH` (src/prim/windows/prim.c) is defined only
+for the `MI_WIN_INIT_USE_TLS_DLLMAIN`/`MI_SHARED_LIB` paths; the plain `__MINGW32__`
+TLS-callback path `1cf88691` switched MinGW onto does not define it. Without that
+macro, `src/prim/prim.c`'s `MI_PRIM_HAS_PROCESS_ATTACH`-gated code (~line 40) still
+falls through to a GCC `__attribute__((constructor))` that ALSO calls
+`_mi_auto_process_init` -- so on win-gnu the function runs once via the registered
+`mi_tls_attach` TLS callback's `DLL_PROCESS_ATTACH` and once via the constructor.
+Observed as `mi_add_stderr_output`'s `mi_out_default == NULL` assertion firing on every
+win-gnu `MI_DEBUG_FULL` test (C ctest-debug-full-win-gnu) and on rust-native's
+win-gnu Rust test (bench-harness's `planted_control`) -- same assertion, same file, two
+unrelated consumers, confirming it's a real double-invocation and not test-specific.
+At `bcee5a88` (our previous pin) MinGW used `MI_WIN_INIT_USE_FLS`, which DOES define
+`MI_PRIM_HAS_PROCESS_ATTACH`, so this was unreachable before the bump.
+Fixed on our side by wrapping `_mi_auto_process_init`'s body in `mi_atomic_do_once`
+(defense in depth: `mi_add_stderr_output` was also made idempotent). Not reproducible
+locally (no MinGW cross-compiler in this environment) to directly confirm the two-call
+path; reasoned from source and the two independent consumers hitting the identical
+assertion. **`pr/*` candidate**: either define `MI_PRIM_HAS_PROCESS_ATTACH` for the
+plain-`__MINGW32__` TLS-callback path too (matching what `MI_WIN_INIT_USE_FLS` did), or
+wrap `_mi_auto_process_init`'s body in a do-once guard upstream, the way ours now is.
+Needs a MinGW box to verify before filing.
+
 ## Posture on upstream PR #1266 (competing profiler)
 
 Resolves #128 F2. Re-check the dates below before cutting a `pr/*` branch that touches

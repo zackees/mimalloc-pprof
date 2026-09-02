@@ -22,6 +22,7 @@ ALLOCATORS = (
     "_mi_meta_realloc",
     "_mi_meta_rezalloc",
     "_mi_meta_zalloc",
+    "_mi_meta_zalloc_aligned",
     "_mi_os_alloc",
     "_mi_os_alloc_aligned",
     "_mi_os_alloc_aligned_at_offset",
@@ -48,7 +49,6 @@ EXCLUDED = {
     "src/alloc-override.c",
     "src/alloc-posix.c",
     "src/alloc.c",
-    "src/arena-meta.c",
     "src/os.c",
 }
 REQUIRED_FIELDS = {
@@ -249,7 +249,7 @@ def selftest(entries: list[dict[str, object]], observed: list[Site]) -> None:
         for i, site in enumerate(observed)
         if site.path == "src/threadlocal.c"
         and site.callee == "mi_heap_rezalloc"
-        and site.args.startswith("mi_heap_main()")
+        and site.args.startswith("_mi_theap_heap(mi_theap_get_default())")
     )
     changed = list(observed)
     old = changed[tls_index]

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fb424675 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 9d8ca042 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -11,7 +11,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MIMALLOC_H
 #define MIMALLOC_H
 
-#define MI_MALLOC_VERSION 30403   // major + 2 digits minor + 2 digits patch
+#define MI_MALLOC_VERSION 30500   // major + 2 digits minor + 2 digits patch
 
 // ------------------------------------------------------
 // Compiler specific attributes
@@ -136,6 +136,9 @@ mi_decl_nodiscard mi_decl_export void* mi_reallocf(void* p, size_t newsize)     
 mi_decl_nodiscard mi_decl_export size_t mi_usable_size(const void* p) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export size_t mi_good_size(size_t size)     mi_attr_noexcept;
 
+// `mi_free_size` can be more efficient (as at calls mi_free_small internally).
+mi_decl_export void mi_free_size(void* p, size_t size) mi_attr_noexcept;
+
 // `mi_free_small` is for special applications like language runtimes.
 // it should only be used to free objects from `mi_(heap_)(m|z)alloc_small` and is potentially a tiny bit faster than `mi_free`
 mi_decl_export void mi_free_small(void* p) mi_attr_noexcept;  
@@ -160,12 +163,13 @@ mi_decl_nodiscard mi_decl_export void* mi_realloc_aligned_at(void* p, size_t new
 // Typed allocation, the type is always the first parameter
 // ------------------------------------------------------
 
-#define mi_malloc_tp(tp)                 ((tp*)mi_malloc(sizeof(tp)))
-#define mi_zalloc_tp(tp)                 ((tp*)mi_zalloc(sizeof(tp)))
+#define mi_malloc_tp(tp)                 ((tp*)mi_malloc_csize(sizeof(tp)))
+#define mi_zalloc_tp(tp)                 ((tp*)mi_zalloc_csize(sizeof(tp)))
 #define mi_calloc_tp(tp,n)               ((tp*)mi_calloc(n,sizeof(tp)))
 #define mi_mallocn_tp(tp,n)              ((tp*)mi_mallocn(n,sizeof(tp)))
 #define mi_reallocn_tp(tp,p,n)           ((tp*)mi_reallocn(p,n,sizeof(tp)))
 #define mi_recalloc_tp(tp,p,n)           ((tp*)mi_recalloc(p,n,sizeof(tp)))
+#define mi_free_tp(tp,p)                 (mi_free_csize(p,sizeof(tp)))
 
 #define mi_heap_malloc_tp(tp,hp)         ((tp*)mi_heap_malloc(hp,sizeof(tp)))
 #define mi_heap_zalloc_tp(tp,hp)         ((tp*)mi_heap_zalloc(hp,sizeof(tp)))
@@ -419,8 +423,29 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_calloc(mi_theap
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_malloc_small(mi_theap_t* theap, size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2);
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_zalloc_small(mi_theap_t* theap, size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2);
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_malloc_aligned(mi_theap_t* theap, size_t size, size_t alignment) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2) mi_attr_alloc_align(3);
+mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_zalloc_aligned(mi_theap_t* theap, size_t size, size_t alignment) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2) mi_attr_alloc_align(3);
 mi_decl_nodiscard mi_decl_export                  void* mi_theap_realloc(mi_theap_t* theap, void* p, size_t newsize)              mi_attr_noexcept mi_attr_alloc_size(3);
+mi_decl_nodiscard mi_decl_export                  void* mi_theap_rezalloc(mi_theap_t* theap, void* p, size_t newsize)             mi_attr_noexcept mi_attr_alloc_size(3);
 
+// ------------------------------------------------------
+// Fast constant size allocations.
+// ------------------------------------------------------
+
+static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexcept {
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_malloc_small(size); } else { return mi_malloc(size); }
+}
+static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_zalloc_small(size); } else { return mi_zalloc(size); }
+}
+static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_malloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
+}
+static inline mi_decl_restrict void* mi_theap_zalloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_zalloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
+}
+static inline void mi_free_csize(void* p, size_t size) mi_attr_noexcept {
+  if (size <= MI_SMALL_SIZE_MAX) { mi_free_small(p); } else { mi_free(p); }
+}
 
 // ------------------------------------------------------
 // Experimental
@@ -575,7 +600,6 @@ mi_decl_nodiscard mi_decl_export int   mi_reallocarr(void* ptrp, size_t count, s
 mi_decl_nodiscard mi_decl_export void* mi_aligned_recalloc(void* p, size_t newcount, size_t size, size_t alignment) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export void* mi_aligned_offset_recalloc(void* p, size_t newcount, size_t size, size_t alignment, size_t offset) mi_attr_noexcept;
 
-mi_decl_export void mi_free_size(void* p, size_t size)                           mi_attr_noexcept;
 mi_decl_export void mi_free_size_aligned(void* p, size_t size, size_t alignment) mi_attr_noexcept;
 mi_decl_export void mi_free_aligned(void* p, size_t alignment)                   mi_attr_noexcept;
 mi_decl_export int  mi_dupenv_s(char** buf, size_t* size, const char* name)      mi_attr_noexcept;

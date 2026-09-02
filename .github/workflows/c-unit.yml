@@ -160,19 +160,19 @@ jobs:
   # `_mi_theap_malloc_zero` extern inline for exactly this reason on v3.4.1.
   # Runs on both Windows toolchains because that is where the reported failure was.
   #
-  # MSVC-shared (windows-latest) is deliberately NOT in this matrix yet: it found a real
-  # bug -- MIMALLOC_MEMORY_EVENTS env activation fails in an MSVC DLL build, tracked in
-  # issue #69 -- and adding it red, or with continue-on-error, is how a gate becomes
-  # decoration. It goes in with the fix. win-gnu shared runs below and is green.
-  # windows-latest (MSVC) is in this matrix as a DIAGNOSTIC for #69 -- it is expected to
-  # fail on test-memory-events-env-enabled until that issue is fixed. It is here rather
-  # than deferred because #69's hypothesis (env resolution racing DLL init) was never
-  # confirmed: "I do not have MSVC locally and could not reproduce it outside CI ... Do
-  # not fix it on my say-so -- confirm first." CI *is* the MSVC machine. This job plus
-  # the [env-check] lines in test-memory-events.c are the confirmation step.
-  # It must not stay red: either it goes green with the fix, or windows-latest comes back
-  # out of this matrix. Do NOT add continue-on-error -- see the note below on why a
-  # permanently-yellow job is worse than an absent one.
+  # #69 (MIMALLOC_MEMORY_EVENTS env activation failing in an MSVC DLL build) is
+  # RESOLVED: windows-latest was confirmed green here on main (runs 33565889274,
+  # 33546799862) well before #266, so the stale note this comment used to carry --
+  # claiming windows-latest was a deliberate known-red diagnostic for #69 -- no longer
+  # describes reality and was corrected during #266's review (it was misleading anyone
+  # who saw this job red and assumed it was the old, expected #69 failure rather than a
+  # new regression).
+  #
+  # Do NOT add continue-on-error if this job goes red again -- see the note below on why
+  # a permanently-yellow job is worse than an absent one. Confirm any new failure is a
+  # real regression (as #266 round 2 did for test-profile/-accum/-auto's cross-thread
+  # sampled-free reclamation, fixed on this branch) before landing, per the same
+  # "confirm on CI, don't guess" discipline #69 was fixed under.
   ctest-shared:
     strategy:
       fail-fast: false
@@ -232,9 +232,13 @@ jobs:
           set +e
           set -uo pipefail
           exe=$(find build -name 'mimalloc-test-memory-gate*' -type f -perm -u+x | head -1)
-          # Peak memory is noisy; the gate compares the minimum of several runs. Four
-          # is what the committed baselines are built from.
-          for i in 1 2 3 4; do
+          # Peak memory is noisy; the gate compares the minimum of several runs. The
+          # committed baselines are min-of-4, but ci/memory_gate.py's RUNS_EXPECTED is
+          # min-of-8 (#266, 2026-09-02): min-of-8 of the same distribution can only be
+          # <= min-of-4, so this is strictly conservative against those baselines while
+          # cutting the shared-runner noise that was flipping PASS/FAIL between pushes
+          # of identical Release object code.
+          for i in 1 2 3 4 5 6 7 8; do
             MI_BENCH_JSON="result-$i.json" "$exe" > /dev/null
           done
           cat result-1.json
@@ -256,11 +260,18 @@ jobs:
           cmake -B build-leak -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
           cmake --build build-leak --config Release --target mimalloc-test-memory-gate
           exe=$(find build-leak -name 'mimalloc-test-memory-gate*' -type f -perm -u+x | head -1)
-          for i in 1 2 3 4; do
+          # Matches the run count above: `control` calls the same report_runs() path,
+          # which warns if fewer than RUNS_EXPECTED runs are supplied.
+          for i in 1 2 3 4 5 6 7 8; do
             MI_BENCH_JSON="leak-$i.json" "$exe" > /dev/null || true
           done
           python3 ci/memory_gate.py control leak-*.json
-      - uses: actions/upload-artifact@v4
+      # Upload even when the gate fails: a red gate is exactly when the raw
+      # per-run JSON is needed (to attribute the growth, or to re-baseline
+      # deliberately with `memory_gate.py update`). Skipping it on failure left
+      # every red run -- including main's own -- with no data to reason from.
+      - if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: memory-gate-${{ matrix.os }}
           path: result-*.json

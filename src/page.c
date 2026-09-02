@@ -88,7 +88,7 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   
   mi_assert_internal(page->heap!=NULL);
   mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
-  mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap);
+  mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED);
 
   // const size_t bsize = mi_page_block_size(page);
   // uint8_t* start = mi_page_start(page);
@@ -130,7 +130,7 @@ bool _mi_page_is_valid(mi_page_t* page) {
     //mi_assert_internal(!_mi_process_is_initialized);
     mi_assert_internal(page->heap!=NULL);
     mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
-    mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap);
+    mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED);
     {
       mi_page_queue_t* pq = mi_page_queue_of(page);
       mi_assert_internal(mi_page_queue_contains(pq, page));
@@ -209,8 +209,8 @@ static void mi_page_thread_free_collect(mi_page_t* page)
 }
 
 // returns `true` if after collection `mi_page_immediate_available` is true.
-static bool mi_page_free_quick_collect(mi_page_t* page) {
-  if (page->free != NULL) return true;
+static inline bool mi_page_free_quick_collect(mi_page_t* page) {
+  if mi_likely(page->free != NULL) return true;
   if (page->local_free == NULL) return false;
   // move local_free to free
   page->free = page->local_free;
@@ -307,7 +307,7 @@ void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
     mi_page_set_theap(page, NULL);
     page->theap = theap; // don't actually set theap to NULL so we can reclaim_on_free within the same theap
     _mi_arenas_page_abandon(page, theap);
-    _mi_arenas_collect(false, false, theap->tld); // allow purging
+    // _mi_arenas_collect(false, false, theap->tld); // allow purging
   }
 }
 
@@ -416,7 +416,7 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
   mi_theap_t* theap = mi_page_theap(page); mi_assert_internal(theap!=NULL);
   mi_page_set_theap(page,NULL);
   _mi_arenas_page_free(page, theap);
-  _mi_arenas_collect(false, false, theap->tld);  // allow purging
+  // _mi_arenas_collect(false, false, theap->tld);  // allow purging
 }
 
 #define MI_RETIRE_CYCLES      (16)
@@ -465,6 +465,28 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   _mi_page_free(page, pq);
 }
 
+
+static void mi_theap_collect_full_pages(mi_theap_t* theap) {
+  // note: normally full pages get immediately abandoned and the full queue is always empty
+  // this path is only used if abandoning is disabled due to a destroy-able theap or options
+  // set by the user.
+  mi_page_queue_t* pq = &theap->pages[MI_BIN_FULL];
+  for (mi_page_t* page = pq->first; page != NULL; ) {
+    mi_page_t* next = page->next;         // get next in case we free the page
+    _mi_page_free_collect(page, false);   // register concurrent free's
+    // no longer full?
+    if (!mi_page_is_full(page)) {
+      if (mi_page_all_free(page)) {
+        _mi_page_free(page, pq);
+      }
+      else {
+        _mi_page_unfull(page);
+      }
+    }
+    page = next;
+  }
+}
+
 // free retired pages: we don't need to look at the entire queues
 // since we only retire pages that are at the head position in a queue.
 void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
@@ -492,58 +514,12 @@ void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
   }
   theap->page_retired_min = min;
   theap->page_retired_max = max;
-}
-
-/* Stays commented out deliberately -- see issue #128 B2 and C1.
-
-   Upstream `bf054991` un-comments this, on the reasoning that with
-   MIMALLOC_PAGE_FULL_RETAIN=-1 (allow_page_abandon false) a page sitting in
-   MI_BIN_FULL whose blocks are all cross-thread freed can neither be abandoned nor
-   collected: `_mi_page_unfull` runs only from a thread-LOCAL free, and a remote free
-   just pushes onto `xthread_free` without waking anyone. The mechanism is really
-   there in our pin -- but the memory growth it predicts is not.
-
-   Measured, Windows/MinGW, Release, MIMALLOC_PAGE_FULL_RETAIN=-1: 60 rounds of
-   "fill pages from thread A, free every block from thread B", at both 256 and 4096
-   live 16 KiB blocks (the latter reaching 64 MiB committed). Committed bytes and RSS
-   were flat to the kilobyte from round 10 through round 60 -- 0.0% growth in each
-   configuration. A page retained per round would have shown linear growth.
-
-   So the predicted leak is not reachable this way, and repo rule #66 C.2 is to import
-   only with a test that fails without the import. There is no such test, so this stays
-   as upstream left it. The negative result does not prove the bug's absence -- it
-   bounds it: whatever reaches this path is not the simple cross-thread-free-a-full-page
-   workload. Anyone re-opening this should produce a growing repro FIRST.
-
-   Same evidence retires C1 (`mi_page_is_full()` ignoring uncollected `xthread_free`).
-   C1 asked to "confirm a reachable call site before changing a predicate that's
-   asserted in three places": every site that could RETAIN memory already collects
-   first -- `mi_free_try_collect_mt` opens with `_mi_page_free_collect{,_partly}`, and
-   `mi_abandoned_page_unown_from_free` re-collects and re-tries free/reabandon on every
-   CAS that observes a non-empty `xthread_free`. The window is closed by construction.
-*/
-/*
-static void mi_theap_collect_full_pages(mi_theap_t* theap) {
-  // note: normally full pages get immediately abandoned and the full queue is always empty
-  // this path is only used if abandoning is disabled due to a destroy-able theap or options
-  // set by the user.
-  mi_page_queue_t* pq = &theap->pages[MI_BIN_FULL];
-  for (mi_page_t* page = pq->first; page != NULL; ) {
-    mi_page_t* next = page->next;         // get next in case we free the page
-    _mi_page_free_collect(page, false);   // register concurrent free's
-    // no longer full?
-    if (!mi_page_is_full(page)) {
-      if (mi_page_all_free(page)) {
-        _mi_page_free(page, pq);
-      }
-      else {
-        _mi_page_unfull(page);
-      }
-    }
-    page = next;
+  if (!theap->allow_page_abandon) {
+    mi_theap_collect_full_pages(theap);
   }
 }
-*/
+
+
 
 
 /* -----------------------------------------------------------
@@ -688,7 +664,8 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   mi_assert_internal(extend < (1UL<<16));
 
   // commit on demand?
-  if (page->slice_committed > 0) {
+  const size_t slice_committed = mi_page_slice_committed(page);
+  if (slice_committed > 0) {
     // reduce extend if it commits more than an arena slice
     if ((extend * bsize) > MI_ARENA_SLICE_SIZE) {
       extend = _mi_divide_up(MI_ARENA_SLICE_SIZE, bsize);
@@ -696,7 +673,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
     // commit required size
     const size_t needed_size = (page->capacity + extend)*bsize;
     mi_assert_internal(needed_size <= page_size);
-    size_t needed_commit = _mi_align_up( mi_page_slice_offset_of(page, needed_size), MI_PAGE_MIN_COMMIT_SIZE );
+    size_t needed_commit = _mi_align_up( mi_page_slice_offset_of(page, needed_size), mi_page_min_commit_size());
     #if MI_SECURE>=5
     // the previous alignup could extend the commit into the guard page; re-adjust if needed
     const size_t page_size_commit = _mi_align_up( mi_page_slice_offset_of(page, page_size), _mi_os_page_size() );    
@@ -704,13 +681,13 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
       needed_commit = page_size_commit;
     }
     #endif
-    if (needed_commit > page->slice_committed) {
-      mi_assert_internal(((needed_commit - page->slice_committed) % _mi_os_page_size()) == 0);
-      if (!_mi_os_commit(_mi_theap_subproc(theap), mi_page_slice_start(page) + page->slice_committed, needed_commit - page->slice_committed, NULL)) {
+    if (needed_commit > slice_committed) {
+      mi_assert_internal(((needed_commit - slice_committed) % _mi_os_page_size()) == 0);
+      if (!_mi_os_commit(_mi_theap_subproc(theap), mi_page_slice_start(page) + slice_committed, needed_commit - slice_committed, NULL)) {
         return false;
       }
-      mi_assert_internal(needed_commit < UINT32_MAX);
-      page->slice_committed = (uint32_t)needed_commit;
+      mi_assert_internal(needed_commit <= UINT16_MAX * _mi_os_page_size());
+      page->slice_pcommitted = (uint16_t)(needed_commit / _mi_os_page_size());
     }
   }
 
@@ -875,7 +852,7 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
 
   if (page == NULL) {
     _mi_theap_collect_retired(theap, false); // perhaps make a page available
-    page = mi_page_fresh(theap, pq);
+    page = mi_page_fresh(theap, pq);         
     mi_assert_internal(page == NULL || mi_page_immediate_available(page));
     if (page == NULL && first_try) {
       // out-of-memory _or_ an abandoned page with free blocks was reclaimed, try once again
@@ -896,29 +873,105 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   return page;
 }
 
-
-
-// Find a page with free blocks of `size`.
-static mi_page_t* mi_find_free_page(mi_theap_t* theap, mi_page_queue_t* pq) {
-  // mi_page_queue_t* pq = mi_page_queue(theap, size);
+// Look for a page with free blocks of `size` but don't try to search or allocate
+static inline mi_page_t* mi_page_queue_lookup_free_first(mi_theap_t* theap, mi_page_queue_t* pq) {
   mi_assert_internal(!mi_page_queue_is_huge(pq));
-
-  // check the first page: we even do this with candidate search or otherwise we re-search every time
   mi_page_t* page = pq->first;
-  if mi_likely(page != NULL && mi_page_free_quick_collect(page)) {
+  if mi_likely(page!=NULL && mi_page_free_quick_collect(page)) {
+    // fast path
     #if (MI_SECURE>=2) // in secure mode, we extend half the time to increase randomness
     if (page->capacity < page->reserved && ((_mi_theap_random_next(theap) & 1) == 1)) {
       (void)mi_page_extend_free(theap, page);  // ok if this fails
       mi_assert_internal(mi_page_immediate_available(page));
     }
+    #else
+    MI_UNUSED(theap);
     #endif
     page->retire_expire = 0;
-    return page; // fast path
+    mi_assert_internal(mi_page_immediate_available(page));
+    mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+    mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
+    return page;
   }
   else {
-    return mi_page_queue_find_free_ex(theap, pq, true);
+    return NULL;
   }
 }
+
+// Find a page with free blocks of `size`.
+static inline mi_page_t* mi_page_queue_find_free(mi_theap_t* theap, mi_page_queue_t* pq) {
+  // mi_page_queue_t* pq = mi_page_queue(theap, size);
+  mi_assert_internal(!mi_page_queue_is_huge(pq));
+
+  // check the first page: we even do this with candidate search or otherwise we re-search every time
+  mi_page_t* page = mi_page_queue_lookup_free_first(theap,pq);
+  if (page==NULL) {
+    page = mi_page_queue_find_free_ex(theap, pq, true);
+    if (page==NULL) return NULL;
+  }  
+  mi_assert_internal(mi_page_immediate_available(page));
+  mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
+  return page;
+}
+
+// Huge pages contain just one block, and the segment contains just that page.
+// Huge pages are also use if the requested alignment is very large (> MI_BLOCK_ALIGNMENT_MAX)
+// so their size is not always `> MI_LARGE_OBJ_SIZE_MAX`.
+static mi_page_t* mi_huge_page_alloc(mi_theap_t* theap, size_t size, size_t page_alignment, mi_page_queue_t* pq) {
+  const size_t block_size = _mi_os_good_alloc_size(size);
+  // mi_assert_internal(mi_bin(block_size) == MI_BIN_HUGE || page_alignment > 0);
+  #if MI_HUGE_PAGE_ABANDON
+  #error todo.
+  #else
+  // mi_page_queue_t* pq = mi_page_queue(theap, MI_LARGE_MAX_OBJ_SIZE+1);  // always in the huge queue regardless of the block size
+  mi_assert_internal(mi_page_queue_is_huge(pq));
+  #endif
+  mi_page_t* page = mi_page_fresh_alloc(theap, pq, block_size, page_alignment);
+  if (page != NULL) {
+    mi_assert_internal(mi_page_block_size(page) >= size);
+    mi_assert_internal(mi_page_immediate_available(page));
+    mi_assert_internal(mi_page_is_huge(page));
+    mi_assert_internal(mi_page_is_singleton(page));
+    #if MI_HUGE_PAGE_ABANDON
+    mi_assert_internal(mi_page_is_abandoned(page));
+    mi_page_set_theap(page, NULL);
+    #endif
+    mi_theap_stat_increase(theap, malloc_huge, mi_page_block_size(page));
+    mi_theap_stat_counter_increase(theap, malloc_huge_count, 1);
+  }
+  return page;
+}
+
+// Allocate a page
+// Note: in debug mode the size includes MI_PADDING_SIZE and might have overflowed.
+static mi_page_t* mi_find_page(mi_theap_t* theap, size_t size, size_t huge_alignment) mi_attr_noexcept {
+  const size_t req_size = size - MI_PADDING_SIZE;  // correct for padding_size in case of an overflow on `size`
+  if mi_unlikely(req_size > MI_MAX_ALLOC_SIZE) {
+    _mi_error_message(EOVERFLOW, "allocation request is too large (%zu bytes)\n", req_size);
+    return NULL;
+  }
+  mi_page_queue_t* pq = mi_page_queue(theap, (huge_alignment > 0 ? MI_LARGE_MAX_OBJ_SIZE+1 : size));
+  mi_page_t* page;
+  // huge allocation?
+  if mi_unlikely(mi_page_queue_is_huge(pq) || req_size > MI_MAX_ALLOC_SIZE) {
+    page = mi_huge_page_alloc(theap,size,huge_alignment,pq);
+  }
+  else {
+    // otherwise find a page with free blocks in our size segregated queues
+    #if MI_PADDING
+    mi_assert_internal(size >= MI_PADDING_SIZE);
+    #endif
+    page = mi_page_queue_find_free(theap,pq);
+  }
+  if (page==NULL) return NULL;
+  mi_assert_internal(mi_page_block_size(page) >= size);
+  mi_assert_internal(mi_page_immediate_available(page));
+  mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
+  return page;
+}
+
 
 
 /* -----------------------------------------------------------
@@ -950,77 +1003,11 @@ void mi_register_deferred_free(mi_deferred_free_fun* fn, void* arg) mi_attr_noex
 
 
 /* -----------------------------------------------------------
-  General allocation
+  Admin
 ----------------------------------------------------------- */
 
-// Huge pages contain just one block, and the segment contains just that page.
-// Huge pages are also use if the requested alignment is very large (> MI_BLOCK_ALIGNMENT_MAX)
-// so their size is not always `> MI_LARGE_OBJ_SIZE_MAX`.
-static mi_page_t* mi_huge_page_alloc(mi_theap_t* theap, size_t size, size_t page_alignment, mi_page_queue_t* pq) {
-  const size_t block_size = _mi_os_good_alloc_size(size);
-  // mi_assert_internal(mi_bin(block_size) == MI_BIN_HUGE || page_alignment > 0);
-  #if MI_HUGE_PAGE_ABANDON
-  #error todo.
-  #else
-  // mi_page_queue_t* pq = mi_page_queue(theap, MI_LARGE_MAX_OBJ_SIZE+1);  // always in the huge queue regardless of the block size
-  mi_assert_internal(mi_page_queue_is_huge(pq));
-  #endif
-  mi_page_t* page = mi_page_fresh_alloc(theap, pq, block_size, page_alignment);
-  if (page != NULL) {
-    mi_assert_internal(mi_page_block_size(page) >= size);
-    mi_assert_internal(mi_page_immediate_available(page));
-    mi_assert_internal(mi_page_is_huge(page));
-    mi_assert_internal(mi_page_is_singleton(page));
-    #if MI_HUGE_PAGE_ABANDON
-    mi_assert_internal(mi_page_is_abandoned(page));
-    mi_page_set_theap(page, NULL);
-    #endif
-    mi_theap_stat_increase(theap, malloc_huge, mi_page_block_size(page));
-    mi_theap_stat_counter_increase(theap, malloc_huge_count, 1);
-  }
-  return page;
-}
-
-
-// Allocate a page
-// Note: in debug mode the size includes MI_PADDING_SIZE and might have overflowed.
-static mi_page_t* mi_find_page(mi_theap_t* theap, size_t size, size_t huge_alignment) mi_attr_noexcept {
-  const size_t req_size = size - MI_PADDING_SIZE;  // correct for padding_size in case of an overflow on `size`
-  if mi_unlikely(req_size > MI_MAX_ALLOC_SIZE) {
-    _mi_error_message(EOVERFLOW, "allocation request is too large (%zu bytes)\n", req_size);
-    return NULL;
-  }
-  mi_page_queue_t* pq = mi_page_queue(theap, (huge_alignment > 0 ? MI_LARGE_MAX_OBJ_SIZE+1 : size));
-  // huge allocation?
-  if mi_unlikely(mi_page_queue_is_huge(pq) || req_size > MI_MAX_ALLOC_SIZE) {
-    return mi_huge_page_alloc(theap,size,huge_alignment,pq);
-  }
-  else {
-    // otherwise find a page with free blocks in our size segregated queues
-    #if MI_PADDING
-    mi_assert_internal(size >= MI_PADDING_SIZE);
-    #endif
-    return mi_find_free_page(theap, pq);
-  }
-}
-
-
-// Generic allocation routine if the fast path (`alloc.c:mi_page_malloc`) does not succeed.
-// Note: in debug mode the size includes MI_PADDING_SIZE and might have overflowed.
-// The `huge_alignment` is normally 0 but is set to a multiple of MI_SLICE_SIZE for
-// very large requested alignments in which case we use a huge singleton page.
-// Note: we put `bool zero, size_t huge_alignment` into one parameter (with zero in the low bit)
-// to use 4 parameters which compiles better on msvc for the malloc fast path.
-void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignment, size_t* usable) mi_attr_noexcept
+static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap) 
 {
-  const bool zero = ((zero_huge_alignment & 1) != 0);
-  const size_t huge_alignment = (zero_huge_alignment & ~1);
-
-  #if !MI_THEAP_INITASNULL
-  mi_assert_internal(theap != NULL);
-  #endif
-
-  // initialize if necessary
   if mi_unlikely(!mi_theap_is_initialized(theap)) {
     if (theap==&_mi_theap_empty_wrong) {
       // we were unable to allocate a theap for a first-class heap
@@ -1033,22 +1020,35 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   mi_assert_internal(mi_theap_is_initialized(theap));
 
   // do administrative tasks every N generic mallocs
-  if mi_unlikely(++theap->generic_count >= 1000) {
+  if mi_unlikely(theap->generic_count >= 1000) {
     theap->generic_collect_count += theap->generic_count;
     theap->generic_count = 0;
-    // call potential deferred free routines
-    _mi_deferred_free(theap, false);
-    // free retired pages
-    _mi_theap_collect_retired(theap, false);
-
-    // collect every once in a while (10000 by default)
+    
+    // do a full theap collect every once in a while (10000 by default)
     const long generic_collect = mi_option_get_clamp(mi_option_generic_collect, 1, 1000000L);
     if (theap->generic_collect_count >= generic_collect) {
       theap->generic_collect_count = 0;
       mi_theap_collect(theap, false /* force? */);
     }
+    else {
+      // otherwise we do a mini-collect
+      _mi_deferred_free(theap, false);         // call potential deferred free routines      
+      _mi_theap_collect_retired(theap, false); // free retired pages      
+    }
   }
+  return theap;
+}
 
+/* -----------------------------------------------------------
+  Generic allocation
+----------------------------------------------------------- */
+
+static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) 
+{  
+  // initialize if necessary
+  theap = mi_malloc_generic_admin(theap);
+  if (theap==NULL) return NULL;
+  
   // find (or allocate) a page of the right size
   mi_page_t* page = mi_find_page(theap, size, huge_alignment);
   if mi_unlikely(page == NULL) { // first time out of memory, try to collect and retry the allocation once more
@@ -1068,7 +1068,7 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
 
   // and try again, this time succeeding! (i.e. this should never recurse through _mi_page_malloc)
-  if (usable!=NULL) { *usable = mi_page_usable_block_size(page); }
+  if (ppage!=NULL) { *ppage = page; }
   void* const p = _mi_page_malloc_zero(theap,page,size,zero);
   mi_assert_internal(p != NULL);
 
@@ -1077,4 +1077,39 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
     mi_page_to_full(page, mi_page_queue_of(page));
   }
   return p;
+}
+
+
+// Generic allocation routine if the fast path (`alloc.c:mi_page_malloc`) does not succeed.
+// Note: in debug mode the size includes MI_PADDING_SIZE and might have overflowed.
+// The `huge_alignment` is normally 0 but is set to a multiple of MI_SLICE_SIZE for
+// very large requested alignments in which case we use a huge singleton page.
+// Note: we put `bool zero, size_t huge_alignment` into one parameter (with zero in the low bit)
+// to use 4 parameters which compiles better on msvc for the malloc fast path.
+void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignment, mi_page_t** ppage) mi_attr_noexcept
+{
+  #if !MI_THEAP_INITASNULL
+  mi_assert_internal(theap != NULL);
+  #endif
+  const bool zero = ((zero_huge_alignment & 1) != 0);
+  const size_t huge_alignment = (zero_huge_alignment & ~1);
+  mi_page_t* page = NULL;
+
+  // fast path objects that fit in a small page
+  if mi_likely(mi_theap_is_initialized(theap) && ++theap->generic_count < 1000 && huge_alignment==0) {
+    const size_t req_size = size - MI_PADDING_SIZE;  // correct for padding_size in case of an overflow on `size`
+    if (req_size < MI_SMALL_MAX_OBJ_SIZE) {
+      mi_page_queue_t* pq = mi_page_queue(theap, size);
+      mi_assert_internal(pq!=NULL && !mi_page_queue_is_huge(pq));
+      page = mi_page_queue_find_free(theap,pq);
+      // mi_assert_internal(mi_page_block_size(page) <= MI_SMALL_MAX_OBJ_SIZE);
+      if (page!=NULL) {        
+        if (ppage!=NULL) { *ppage = page; }
+        mi_assert_internal(mi_page_immediate_available(page));
+        return _mi_page_malloc_zero(theap,page,size,zero);
+      }
+    }
+  }
+  // otherwise fallback
+  return mi_malloc_generic_fallback(theap,size,zero, huge_alignment,ppage);
 }

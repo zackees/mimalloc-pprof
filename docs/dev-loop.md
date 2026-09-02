@@ -1,6 +1,40 @@
+# Native local verification (Linux)
+
+`ci/verify_local.py` is a fast, parallel local mirror of the Linux-runnable subset of
+CI: `.github/workflows/c-unit.yml`, `rust-native.yml`, `python-lint.yml`, and
+`asan.yml`. It exists because the alternative -- running Release `MI_PPROF=ON` ctest,
+`MI_PPROF=OFF` ctest, Debug `MI_DEBUG_FULL=ON` ctest, the guarded job, the shared-lib
+job, the memory-gate, the diagnostic gates, the Rust workspace, and python-lint one at
+a time by hand -- takes a long time and is easy to shortcut under time pressure. Each
+config's cmake flags and env are copied verbatim from the workflow file it mirrors
+(not re-derived), and `ci/tests/test_verify_local.py` parses the workflow files itself
+and fails if a job's flags drift out of sync with the script.
+
+```bash
+uv run ci/verify_local.py                     # everything fast (slow ctest tier excluded)
+uv run ci/verify_local.py --only release,lint  # just these configs
+uv run ci/verify_local.py --slow               # also run the long-tail ctest tier
+uv run ci/verify_local.py --list                # print the config table and exit
+uv run ci/verify_local.py --jobs 8              # override the total build/ctest job budget
+uv run ci/verify_local.py --keep-going          # run every config even after one fails
+uv run ci/verify_local.py --selftest            # trivially fast dry-run, no real builds
+```
+
+Ten configs run concurrently (`release`, `off`, `debug-full`, `guarded`, `shared`,
+`memory-gate`, `diag`, `rust`, `lint`, `asan`), each building into its own directory
+under `out/verify/<config>/` (gitignored, incremental across invocations) with Ninja
+and ccache when available. `asan` needs `clang`/`clang++` on `PATH` and reports
+SKIPPED with a reason otherwise. The long tests (`test-profile-race`,
+`test-subproc-lifecycle`, `test-zero-tracking*`) are excluded from ctest by default
+via `-E`; pass `--slow` to include them. On a 16-core machine with a warm cache,
+expect on the order of a few minutes wall-clock for the fast tier -- well under the
+sum of the per-config times, which the final table reports alongside the wall clock so
+the parallel speedup is visible. A failed config prints the last ~40 lines of its full
+log (`out/verify/<config>/verify.log`) inline.
+
 # Fast local Linux build loop
 
-On Windows, run the C and Rust test loops through `python ci/dev_linux.py`.
+On Windows, run the C and Rust test loops through `uv run ci/dev_linux.py`.
 The source tree is a live, read-only Docker bind mount: its NTFS mtimes are
 shared with the container and remain stable across container restarts. Build
 trees and caches are Docker named volumes. Do not build into a host bind mount:
@@ -8,11 +42,11 @@ writing build output through that layer is what causes the costly mtime and
 filesystem translation problems.
 
 ```powershell
-python ci/dev_linux.py doctor
-python ci/dev_linux.py c-test
-python ci/dev_linux.py rust-test
-python ci/dev_linux.py bench
-python ci/dev_linux.py bench --reuse  # verify volumes after docker stop/start
+uv run ci/dev_linux.py doctor
+uv run ci/dev_linux.py c-test
+uv run ci/dev_linux.py rust-test
+uv run ci/dev_linux.py bench
+uv run ci/dev_linux.py bench --reuse  # verify volumes after docker stop/start
 ```
 
 `bench` is the acceptance check. It measures a cold run, three warm no-op C
@@ -31,8 +65,8 @@ switch also rewrites source mtimes; run `git restore-mtime` if the cache
 matters. zccache hashes contents, so an mtime-driven rebuild should remain a
 cache-hit path rather than a full recompilation.
 
-For a cold-start recovery, run `python ci/dev_linux.py clean`, then
-`python ci/dev_linux.py c-test`. `clean` deliberately removes the Docker
+For a cold-start recovery, run `uv run ci/dev_linux.py clean`, then
+`uv run ci/dev_linux.py c-test`. `clean` deliberately removes the Docker
 container and named volumes, so it should not be part of normal iteration.
 Use `bench --reuse` after restarting the named container to verify that volumes
 survive without deliberately wiping them first.

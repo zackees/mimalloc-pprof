@@ -87,7 +87,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #endif
 
 // Enable guard pages behind objects of a certain size (set by the MIMALLOC_GUARDED_MIN/MAX/SAMPLE_RATE options)
-#if !defined(MI_GUARDED) && MI_DEBUG && !defined(NDEBUG) && !MI_PAGE_META_ALIGNED_FREE_SMALL
+#if !defined(MI_GUARDED) && MI_DEBUG && !defined(NDEBUG) && !MI_OPT_FREE_SMALL
 #define MI_GUARDED  1
 #endif
 
@@ -135,7 +135,9 @@ terms of the MIT license. A copy of the license can be found in the file
 // We can choose to only put page info of small pages at the start of the page area.
 // This can be used to have a slightly faster `mi_free_small` function for specialized
 // cases (like language runtime systems).
-#if !defined(MI_PAGE_META_ALIGNED_FREE_SMALL)
+#if MI_OPT_FREE_SMALL && !defined(MI_PAGE_META_ALIGNED_FREE_SMALL)
+#define MI_PAGE_META_ALIGNED_FREE_SMALL   1
+#elif !defined(MI_PAGE_META_ALIGNED_FREE_SMALL)
 #define MI_PAGE_META_ALIGNED_FREE_SMALL   0
 #endif
 
@@ -144,7 +146,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #error "secure mode should use separated page infos"
 #endif
 #if MI_PAGE_META_ALIGNED_FREE_SMALL && MI_SECURE
-#error "secure mode cannot use MI_PAGE_META_ALIGNED_FREE_SMALL"
+#error "secure mode cannot use MI_OPT_FREE_SMALL (MI_PAGE_META_ALIGNED_FREE_SMALL)"
 #endif
 #if MI_PAGE_META_IS_SEPARATED && MI_PAGE_MAP_FLAT
 #error "cannot have a flat page map with separated page infos"
@@ -212,8 +214,8 @@ terms of the MIT license. A copy of the license can be found in the file
 // We never allocate more than PTRDIFF_MAX (see also <https://sourceware.org/ml/libc-announce/2019/msg00001.html>)
 #define MI_MAX_ALLOC_SIZE        PTRDIFF_MAX
 
-// Minimal commit for a page on-demand commit (should be >= OS page size)
-#define MI_PAGE_MIN_COMMIT_SIZE  MI_ARENA_SLICE_SIZE
+// Minimal commit for a page on-demand commit 
+#define MI_PAGE_MIN_COMMIT_SIZE  (16*MI_KiB) /* MI_ARENA_SLICE_SIZE */
 
 
 // ------------------------------------------------------
@@ -252,15 +254,14 @@ typedef struct mi_subproc_s mi_subproc_t;
 // Memory can reside in arena's, direct OS allocated, meta-data pages, or statically allocated.
 // The memid keeps track of this.
 typedef enum mi_memkind_e {
-  MI_MEM_NONE,      // not allocated
+  MI_MEM_NONE,      // not allocated (or static)
   MI_MEM_EXTERNAL,  // not owned by mimalloc but provided externally (via `mi_manage_os_memory` for example)
   MI_MEM_STATIC,    // allocated in a static area and should not be freed (the initial main theap data for example (`init.c`))
-  MI_MEM_META,      // allocated with the meta data allocator (`arena-meta.c`)
   MI_MEM_OS,        // allocated from the OS
   MI_MEM_OS_HUGE,   // allocated as huge OS pages (usually 1GiB, pinned to physical memory)
   MI_MEM_OS_REMAP,  // allocated in a remapable area (i.e. using `mremap`)
   MI_MEM_ARENA,     // allocated from an arena (the usual case) (`arena.c`)
-  MI_MEM_HEAP_MAIN  // allocated in the main heap (for theaps)
+  MI_MEM_MALLOC     // allocated with mi_malloc
 } mi_memkind_t;
 
 static inline bool mi_memkind_is_os(mi_memkind_t memkind) {
@@ -285,17 +286,16 @@ typedef struct mi_memid_arena_info {
   uint32_t      slice_count;        // allocated slices
 } mi_memid_arena_info_t;
 
-typedef struct mi_memid_meta_info {
-  mi_meta_page_t* meta_page;        // meta-page that contains the block
-  uint32_t        block_index;      // block index in the meta-data page
-  uint32_t        block_count;      // allocated blocks
-} mi_memid_meta_info_t;
+typedef struct mi_memid_malloc_info {
+  void*         base;               // returned pointer
+  size_t        size;               // allocated size
+} mi_memid_malloc_info_t;
 
 typedef struct mi_memid_s {
   union {
-    mi_memid_os_info_t    os;       // only used for MI_MEM_OS
-    mi_memid_arena_info_t arena;    // only used for MI_MEM_ARENA
-    mi_memid_meta_info_t  meta;     // only used for MI_MEM_META
+    mi_memid_os_info_t     os;       // only used for MI_MEM_OS(_HUGE/_REMAP)
+    mi_memid_arena_info_t  arena;    // only used for MI_MEM_ARENA
+    mi_memid_malloc_info_t malloc;   // only used for MI_MEM_MALLOC
   } mem;
   mi_memkind_t  memkind;
   bool          is_pinned;          // `true` if we cannot decommit/reset/protect in this memory (e.g. when allocated using large (2Mib) or huge (1GiB) OS pages)
@@ -303,6 +303,8 @@ typedef struct mi_memid_s {
   bool          initially_zero;     // `true` if the memory was originally zero initialized
 } mi_memid_t;
 
+#define MI_MEMID_INIT(kind)   {{{NULL,0}}, kind, true /* pinned */, true /* committed */, false /* zero */ }
+#define MI_MEMID_STATIC       MI_MEMID_INIT(MI_MEM_STATIC)
 
 static inline bool mi_memid_is_os(mi_memid_t memid) {
   return mi_memkind_is_os(memid.memkind);
@@ -340,6 +342,7 @@ typedef struct mi_block_s {
 #define MI_PAGE_IN_FULL_QUEUE           MI_ZU(0x01)
 #define MI_PAGE_HAS_INTERIOR_POINTERS   MI_ZU(0x02)
 #define MI_PAGE_FLAG_MASK               MI_ZU(0x03)
+#define MI_PAGE_FLAG_BITS               (2)
 typedef size_t mi_page_flags_t;
 
 // There are two special threadid's: 0 for pages that are abandoned (and not in a theap queue),
@@ -347,7 +350,8 @@ typedef size_t mi_page_flags_t;
 // in an arena (in `mi_heap_t.arena_pages.pages_abandoned`) so these can be quickly found for reuse.
 // Abandoning partially used pages allows for sharing of this memory between threads (in particular if threads are blocked)
 #define MI_THREADID_ABANDONED           MI_ZU(0)
-#define MI_THREADID_ABANDONED_MAPPED    (MI_PAGE_FLAG_MASK + 1)
+#define MI_THREADID_ABANDONED_MAPPED    (MI_ZU(1) << MI_PAGE_FLAG_BITS)
+#define MI_THREADID_DETACHED            (MI_ZU(2) << MI_PAGE_FLAG_BITS)
 
 // Thread free list.
 // Points to a list of blocks that are freed by other threads.
@@ -390,29 +394,29 @@ typedef struct mi_page_s {
   _Atomic(mi_threadid_t)    xthread_id;        // thread this page belongs to. (= `theap->thread_id (or 0 or 4 if abandoned) | page_flags`)
 
   mi_block_t*               free;              // list of available free blocks (`malloc` allocates from this list)
-  uint16_t                  used;              // number of blocks in use (including blocks in `thread_free`)
+  uint32_t                  used;              // number of blocks in use (including blocks in `thread_free`)
   uint16_t                  capacity;          // number of blocks committed
-  uint16_t                  reserved;          // number of blocks reserved in memory
   uint8_t                   retire_expire;     // expiration count for retired blocks
   bool                      free_is_zero;      // `true` if the blocks in the free list are zero initialized
-
+  
   mi_block_t*               local_free;        // list of deferred free blocks by this thread (migrates to `free`)
   _Atomic(mi_thread_free_t) xthread_free;      // list of deferred free blocks freed by other threads (= `mi_block_t* | (1 if owned)`)
 
   size_t                    block_size;        // const: size available in each block (always `>0`)
   uint32_t                  page_ma_offset;    // const: offset relative to the page (in MI_MAX_ALIGN_SIZE parts) to the start of the blocks
-  uint32_t                  slice_committed;   // committed size relative to the first arena slice of the page data (or 0 if the page is fully committed already)
-
-  #if (MI_ENCODE_FREELIST || MI_PADDING)
-  uintptr_t                 keys[2];           // const: two random keys to encode the free lists (see `_mi_block_next`) or padding canary
-  #endif
-
+  uint16_t                  slice_pcommitted;  // committed size in OS page sizes relative to the first arena slice of the page data (or 0 if the page is fully committed already)
+  uint16_t                  reserved;          // number of blocks reserved in memory
+  
   mi_theap_t*               theap;             // the theap owning this page (may not be valid or NULL for abandoned pages)
   mi_heap_t*                heap;              // const: the heap owning this page
 
   struct mi_page_s*         next;              // next page owned by the theap with the same `block_size`
   struct mi_page_s*         prev;              // previous page owned by the theap with the same `block_size`
   mi_memid_t                memid;             // const: provenance of the page memory
+
+  #if (MI_ENCODE_FREELIST || MI_PADDING)
+  uintptr_t                 keys[2];           // const: two random keys to encode the free lists (see `_mi_block_next`) or padding canary
+  #endif
 
   struct mi_prof_record_s*  metadata;          // sampled live allocation records, or NULL (MI_PPROF)
   bool                      has_metadata;      // `true` if profiler records are attached to this page
@@ -508,7 +512,7 @@ typedef struct mi_random_cxt_s {
 #if MI_PADDING
 typedef struct mi_padding_s {
   uint32_t canary; // encoded block value to check validity of the padding (in case of overflow)
-  uint32_t delta;  // padding bytes before the block. (mi_usable_size(p) - delta == exact allocated bytes)
+  uint32_t delta;  // padding bytes before the block. (mi_full_usable_size(p) - delta == exact allocated bytes)
 } mi_padding_t;
 #define MI_PADDING_SIZE   (sizeof(mi_padding_t))
 #define MI_PADDING_WSIZE  ((MI_PADDING_SIZE + MI_INTPTR_SIZE - 1) / MI_INTPTR_SIZE)
@@ -526,7 +530,7 @@ struct mi_theap_s {
   _Atomic(mi_heap_t*)   heap;                                // the heap this theap belongs to.
   _Atomic(mi_subproc_t*)subproc;                             // subproc this belongs too (always `subproc == heap->subproc` but needed for safe destruction)
   _Atomic(size_t)       refcount;                            // reference count
-  _Atomic(size_t)       freed;                               // ensure atomic free-ing
+  
   unsigned long long    heartbeat;                           // monotonic heartbeat count
   uintptr_t             cookie;                              // random cookie to verify pointers (see `_mi_ptr_cookie`)
   mi_random_ctx_t       random;                              // random number context used for secure allocation
@@ -545,6 +549,7 @@ struct mi_theap_s {
   long                  page_full_retain;                    // how many full pages can be retained per queue (before abandoning them)
   bool                  allow_page_reclaim;                  // `true` if this theap can reclaim abandoned pages
   bool                  allow_page_abandon;                  // `true` if this theap can abandon pages to reduce memory footprint
+  bool                  is_detached;                         // `true` if `tld->thread_id == MI_THREADID_DETACHED`
   #if MI_GUARDED
   size_t                guarded_size_min;                    // minimal size for guarded objects
   size_t                guarded_size_max;                    // maximal size for guarded objects
@@ -594,7 +599,7 @@ typedef struct mi_heap_s {
 
   _Atomic(mi_arena_pages_t*) arena_pages[MI_MAX_ARENAS]; // track owned and abandoned pages in the arenas (entries can be NULL)
   mi_lock_t             arena_pages_lock;                // lock to update the arena_pages array
-
+  mi_memid_t            memid;                           // provenance of the heap memory
   mi_stats_t            stats;                           // statistics for this heap; periodically updated by merging from each theap
 } mi_heap_t;
 
@@ -624,6 +629,9 @@ struct mi_subproc_s {
   mi_heap_t*            heaps;                          // heaps belonging to this sub-process
   mi_lock_t             heaps_lock;
 
+  mi_theap_t*           theap_meta;                     // detached theap for allocating meta-data
+  mi_lock_t             theap_meta_lock;                // all allocations in theap_meta need a lock
+
   _Atomic(size_t)       thread_count;                   // current threads associated with this sub-process
   _Atomic(size_t)       thread_total_count;             // total created threads associated with this sub-process
   _Atomic(size_t)       heap_count;                     // current heaps in this sub-process (== |heaps|)
@@ -652,6 +660,35 @@ typedef struct mi_profiler_tld_s {
   uint64_t generation;
 } mi_profiler_tld_t;
 
+// Reentrancy-guard / in-flight-event scratch for the fork's hook implementations
+// (src/memory-events.c, src/dhat.c, src/profile.c). These used to be file-local
+// `mi_decl_thread` (`__thread`) variables, but on a macOS dylib the loader can lazily
+// instantiate a thread's `__thread` block via a dyld-interposed `calloc` the very first
+// time it is touched on that thread -- including from inside `_mi_thread_init_with_heap`
+// -> `_mi_meta_zalloc`, which already holds `subproc->theap_meta_lock` for that same
+// thread's own tld/theap allocation. Touching a `__thread` var from our hook there
+// reenters mimalloc and re-acquires that lock on the same thread (see issue #266).
+// Living inline in `mi_tld_t` avoids that: obtaining a thread's `mi_tld_t*` (see
+// `_mi_hooks_tld_peek` in mimalloc/hooks-tld.h) never touches a `mi_decl_thread`
+// variable and never allocates.
+typedef struct mi_hooks_tld_s {
+  int      memevt_suppress_depth;     // memory-events.c: reentrancy / internal-op suppression
+  int      dhat_observer_depth;       // dhat.c: reentrancy guard for the in-flight event below
+  struct {                            // dhat.c: in-flight event scratch; fields are opaque here
+    int        kind;                  // dhat_event_kind_t
+    void*      oldp;
+    void*      newp;
+    size_t     size;
+    uint64_t   at;
+    uint64_t   generation;
+    mi_page_t* page;
+    void*      pp;                    // dhat_pp_t*
+    bool       armed;
+  }        dhat_event;
+  int      prof_callback_depth;       // profile.c (MI_PPROF): reentrancy / suppression depth
+  bool     prof_lock_owner;           // profile.c (MI_PPROF): this thread already holds prof_lock
+} mi_hooks_tld_t;
+
 // Thread local data
 struct mi_tld_s {
   mi_threadid_t         thread_id;            // thread id of this thread
@@ -664,6 +701,7 @@ struct mi_tld_s {
   bool                  is_in_threadpool;     // true if this thread is part of a threadpool (and can run arbitrary tasks)
   mi_memid_t            memid;                // provenance of the tld memory itself (meta or OS)
   mi_profiler_tld_t     profiler;             // allocation sampling profiler state
+  mi_hooks_tld_t        hooks;                // memory-events/dhat/profiler hook reentrancy state (#266)
 };
 
 

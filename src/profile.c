@@ -3,6 +3,7 @@
    recursively enter the allocator. */
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
+#include "mimalloc/hooks-tld.h"  // _mi_hooks_tld_peek/_peek_or_local (#266)
 #include "mimalloc-stats.h"
 #include <stdio.h>
 #include <string.h>
@@ -64,8 +65,22 @@ static size_t prof_max_bytes;
    dump_format field or, for pure-env users, prof_auto_start reading
    MIMALLOC_PROF_DUMP_FORMAT; consumed by _mi_prof_process_done. */
 static int prof_dump_at_exit_format;
-static mi_decl_thread int prof_callback_depth;
-static mi_decl_thread bool prof_lock_owner;
+// #266: `prof_callback_depth`/`prof_lock_owner` used to be file-local `mi_decl_thread`
+// (`__thread`) variables; they now live on `mi_tld_t::hooks` (mi_hooks_tld_t, types.h) --
+// see hooks-tld.h's file comment for why.
+//
+// This is a plain, read-only entry check (never a persisted write across a callback) --
+// peek only, NEVER force: forcing (mi_theap_get_default() -> mi_thread_init()) is unsafe
+// not only mid-init (the #266 crash: reachable via prof_auto_start() -> mi_prof_start()
+// from deep inside _mi_meta_zalloc's locked region) but equally mid *teardown*
+// (mi_thread_theaps_done resets the default theap to the empty sentinel before freeing
+// this thread's theaps precisely so nothing re-initializes it in that window). A NULL
+// peek is treated the same as a never-touched thread's depth reading 0 under the old
+// `mi_decl_thread` counter -- i.e. "not currently inside a profiler callback".
+static bool prof_callback_depth_active(void) {
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  return (hooks != NULL && hooks->prof_callback_depth > 0);
+}
 static inline size_t prof_min(size_t x, size_t y) { return (x < y ? x : y); }
 static inline size_t prof_max(size_t x, size_t y) { return (x > y ? x : y); }
 
@@ -245,8 +260,18 @@ static void prof_free_record(mi_page_t* page, void* p) {
   rec->next = prof_free; prof_free = rec;
 }
 
+// #266: unlike the rest of the top-level profiler API below, this (and mi_prof_start_ex)
+// can be reached from `_mi_prof_on_alloc`'s own `prof_auto_start()` -- i.e. from deep
+// inside `_mi_meta_zalloc`'s locked region, on a thread that is still mid-init allocating
+// its own tld/theap (MIMALLOC_PROF=1's first-ever sample decision triggers it). Forcing
+// thread init here (like the other control functions do) would recursively re-enter
+// `_mi_thread_init_with_heap` and re-acquire `subproc->theap_meta_lock` on that same
+// thread. So this peeks instead: a NULL result means "definitely not already inside a
+// profiler callback on this thread" (no callback can run without a theap), which is
+// exactly the same outcome the old `mi_decl_thread` counter's initial 0 gave on any
+// never-touched thread. See hooks-tld.h's file comment.
 bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return false;
+  if (prof_callback_depth_active()) return false;
   if (sample_rate == 0) {
     /* MIMALLOC_PROF_SAMPLE_INTERVAL is the honest name for this env var (it is an average
        byte interval, not a rate); MIMALLOC_PROF_SAMPLE_RATE (-> mi_option_prof_sample_rate)
@@ -281,7 +306,8 @@ bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { return mi_prof_start_s
 bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept {
   if (config == NULL) return mi_prof_start(0);
   if (config->size != sizeof(mi_prof_config_t) || config->version != MI_PROF_CONFIG_VERSION) return false;
-  if (prof_callback_depth > 0) return false;
+  // #266: see mi_prof_start_seeded above -- must peek, never force.
+  if (prof_callback_depth_active()) return false;
   const bool is_override = (config->mode == MI_PROF_CONFIG_OVERRIDE);
 
   if (config->accum) {
@@ -400,7 +426,8 @@ bool mi_prof_stats_get(mi_prof_stats_t* stats) mi_attr_noexcept {
    would make every call walk the subproc's heap list for stats it then discards. */
 void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks) mi_attr_noexcept { mi_prof_stats_t stats; _mi_memzero(&stats, sizeof(stats)); stats.size = offsetof(mi_prof_stats_t, dropped_samples); stats.version = 1; const bool ok = mi_prof_stats_get(&stats); MI_UNUSED(ok); if (records) *records=stats.live_samples; if (bytes) *bytes=stats.live_bytes; if (unique_stacks) *unique_stacks=stats.unique_stacks; }
 void mi_prof_stop(void) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return;
   mi_lock_acquire(&prof_lock);
   mi_atomic_store_release(&prof_enabled, false);
   for (mi_prof_record_t* rec = prof_all; rec != NULL; rec = rec->all_next) { rec->page->metadata = NULL; rec->page->has_metadata = false; }
@@ -416,7 +443,8 @@ void mi_prof_stop(void) mi_attr_noexcept {
 }
 bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
   if (write == NULL) return false;
-  if (prof_callback_depth > 0) return false;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return false;
   prof_dump_buffer_t out = { NULL, NULL, true };
 #if MI_DEBUG
   bool lock_held = true;
@@ -474,22 +502,38 @@ bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
   return ok;
 }
 static void prof_file_write(void* arg, const char* buf, size_t len) { (void)fwrite(buf,1,len,(FILE*)arg); }
-bool mi_prof_dump(const char* path) mi_attr_noexcept { if (prof_callback_depth > 0) return false; if (path==NULL) return false; FILE* f=fopen(path,"wb"); if(f==NULL)return false; bool ok=mi_prof_dump_writer(prof_file_write,f); fclose(f); return ok; }
+// #266: see prof_callback_depth_active's comment above (mi_prof_dump_writer below
+// re-checks on its own; this early check just avoids opening the file needlessly).
+bool mi_prof_dump(const char* path) mi_attr_noexcept { if (prof_callback_depth_active()) return false; if (path==NULL) return false; FILE* f=fopen(path,"wb"); if(f==NULL)return false; bool ok=mi_prof_dump_writer(prof_file_write,f); fclose(f); return ok; }
 void mi_prof_reset(void) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return;
   mi_lock_acquire(&prof_lock);
   _mi_prof_stack_reset();
   mi_atomic_store_relaxed(&prof_accum_records, (size_t)0); mi_atomic_store_relaxed(&prof_accum_bytes, (size_t)0);
   mi_lock_release(&prof_lock);
 }
 bool mi_prof_visit(mi_prof_visit_fun* visitor, void* arg) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return false;
   if (visitor == NULL) return false;
+  // #266: this is the one place in this file that deliberately forces thread init
+  // (mi_theap_get_default(), NOT the peek-only pattern the rest of this file uses --
+  // see hooks-tld.h's file comment on why forcing is normally unsafe). It is required
+  // here specifically because prof_lock is held across the `visitor` callback below: if
+  // that callback frees a sampled block on this SAME thread, the nested _mi_prof_on_free
+  // MUST see prof_lock_owner==true via a REAL, shared `mi_tld_t::hooks` -- a peek-or-local
+  // fallback would give _mi_prof_on_free its own independent (and NULL, hence
+  // not-lock-owner) view, which would then try to re-acquire prof_lock and deadlock.
+  // Forcing is safe here (unlike in the hot alloc/free hooks) because mi_prof_visit is a
+  // deliberate, top-level, user-initiated call -- never reachable from inside
+  // `_mi_meta_zalloc`'s locked region (mid-init) or from mimalloc's own thread-teardown
+  // machinery (mid-teardown).
+  mi_hooks_tld_t* const hooks = &mi_theap_get_default()->tld->hooks;
+  if (hooks->prof_callback_depth > 0) return false;
   mi_lock_acquire(&prof_lock);
   _mi_prof_stack_pin_all();
-  prof_lock_owner = true; prof_callback_depth++;
+  hooks->prof_lock_owner = true; hooks->prof_callback_depth++;
   _mi_prof_stack_visit_info(visitor, arg);
-  prof_callback_depth--; prof_lock_owner = false;
+  hooks->prof_callback_depth--; hooks->prof_lock_owner = false;
   _mi_prof_stack_unpin_all_and_sweep();
   mi_lock_release(&prof_lock);
   return true;
@@ -524,7 +568,8 @@ static bool prof_snapshot_copy(const mi_prof_sample_info_t* info, void* arg) {
   return true;
 }
 mi_prof_snapshot_t* mi_prof_snapshot_new(void) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return NULL;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return NULL;
   mi_lock_acquire(&prof_lock);
   prof_snap_count_t counted = { 0, 0 };
   _mi_prof_stack_visit_info(prof_snapshot_count, &counted);
@@ -557,7 +602,8 @@ void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { if (snap
 
 bool mi_prof_modules_visit(mi_prof_module_visit_fun* visitor, void* arg) mi_attr_noexcept {
   if (visitor == NULL) return false;
-  if (prof_callback_depth > 0) return false;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return false;
   return _mi_prof_maps_visit(visitor, arg);  // OS-owned module list: no profiler lock needed.
 }
 
@@ -698,7 +744,8 @@ static const char* const prof_proto_fixed_strings[PB_STR_FIXED_COUNT] = { "", "a
 
 bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
   if (write == NULL) return false;
-  if (prof_callback_depth > 0) return false;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return false;
   mi_prof_snapshot_t* snap = mi_prof_snapshot_new();  // deep-copies stacks+counts under prof_lock, then releases it.
   if (snap == NULL) return false;
 
@@ -795,7 +842,8 @@ bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg) mi_attr_noex
   return ok;
 }
 bool mi_prof_dump_proto(const char* path) mi_attr_noexcept {
-  if (prof_callback_depth > 0) return false;
+  // #266: see prof_callback_depth_active's comment above.
+  if (prof_callback_depth_active()) return false;
   if (path == NULL) return false;
   FILE* f = fopen(path, "wb"); if (f == NULL) return false;
   const bool ok = mi_prof_dump_proto_writer(prof_file_write, f);
@@ -826,7 +874,25 @@ void _mi_prof_process_done(void) {
 void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size) {
   prof_auto_start();
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;
-  if (prof_callback_depth > 0) return;
+  // #266: peek the CURRENT thread's hooks tld here, not `theap` (the theap performing
+  // the allocation, which during a meta allocation is the shared, always-initialized
+  // `subproc->theap_meta`, not necessarily this thread's own theap) -- see
+  // hooks-tld.h's file comment. This thread can be mid-init (inside
+  // `_mi_thread_init_with_heap` -> `_mi_meta_zalloc`, allocating its OWN tld/theap) when
+  // this hook fires, in which case bail out immediately, before touching anything else.
+  mi_hooks_tld_t* const prof_hooks = _mi_hooks_tld_peek();
+  if (prof_hooks == NULL) return;
+  if (prof_hooks->prof_callback_depth > 0) return;
+
+  // #266: never sample allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
+  // _mi_meta_zalloc onto subproc->theap_meta). These are large (sizeof(mi_theap_t) is
+  // several KB) relative to typical sample rates, so they sample almost every time, and
+  // on an MSVC DLL build they can be freed from DLL_THREAD_DETACH after the owning
+  // thread's tld has already been torn down -- a path mi_collect(true) never revisits --
+  // leaving the sample "live" forever. page->has_metadata is never set for a meta page as
+  // a result, so _mi_prof_on_free/_mi_prof_on_free_collect need no matching change: there
+  // is nothing on the page for them to find.
+  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
 
   // The sampling DECISION is thread-local and is made without taking prof_lock.
   //
@@ -870,25 +936,54 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   else { mi_atomic_increment_relaxed(&prof_dropped_samples); }  /* dropped sample: record-alloc itself failed (budget/arena exhausted). */
   mi_lock_release(&prof_lock);
 }
+
+// #266: pair around an inner allocation whose reported size is not the caller's actual
+// request (e.g. the guarded allocator's own over-allocated inner call in alloc.c) so its
+// _mi_prof_on_alloc doesn't touch the per-theap sampling counters with the wrong size;
+// the caller fires one corrected _mi_prof_on_alloc afterward. Reuses prof_callback_depth,
+// the same re-entrancy guard _mi_prof_on_alloc already checks, rather than adding new
+// per-theap state.
+// #266: called only from already-initialized-thread call sites (guarded/aligned alloc
+// paths, never from inside `_mi_meta_zalloc`'s own call chain), but peek defensively
+// rather than force -- see hooks-tld.h's file comment.
+void _mi_prof_suppress_begin(void) { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->prof_callback_depth++; }
+void _mi_prof_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->prof_callback_depth--; }
+
 static void prof_free_collect(mi_page_t* page, mi_block_t* head) { for (mi_block_t* b=head; b != NULL && page->has_metadata; b=mi_block_next(page,b)) prof_free_record(page,b); }
 static void prof_realloc_in_place(mi_page_t* page, void* p, size_t size) {
+  // #266: callers pass the caller-visible pointer, which for a guarded (interior)
+  // allocation is not the block start records are keyed by (see prof_free_record /
+  // _mi_prof_on_alloc's callers in alloc.c). Unalias first so both identities match;
+  // this is a no-op for an already block-aligned p (the common, non-guarded case).
+  void* const block = _mi_page_ptr_unalign(page, p);
   for (mi_prof_record_t* rec = (mi_prof_record_t*)page->metadata; rec != NULL; rec = rec->next) {
-    if (rec->ptr == p) { mi_atomic_store_relaxed(&prof_bytes, mi_atomic_load_relaxed(&prof_bytes) - rec->size + size); _mi_prof_stack_resize(rec->stack, rec->size, size); rec->size = size; break; }
+    if (rec->ptr == block) { mi_atomic_store_relaxed(&prof_bytes, mi_atomic_load_relaxed(&prof_bytes) - rec->size + size); _mi_prof_stack_resize(rec->stack, rec->size, size); rec->size = size; break; }
   }
 }
+// #266: these run on the FREEING thread (which for a cross-thread free is not the
+// allocating thread), so each peeks its own current-thread hooks -- see hooks-tld.h's
+// file comment. `page->has_metadata` (checked first, not TLS) already means this page
+// was sampled, i.e. profiling is/was active, but the freeing thread itself may still be
+// mid-init (or simply never allocated anything through mimalloc); a NULL peek there
+// just means "definitely not the thread currently inside mi_prof_visit's callback"
+// (that path forces init -- see mi_prof_visit above), so fall through to the normal
+// locked path exactly like a peek that found prof_lock_owner == false.
 void _mi_prof_on_free(mi_page_t* page, void* p) {
   if mi_likely(!page->has_metadata) return;
-  if (prof_lock_owner) { prof_free_record(page,p); return; }
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks != NULL && hooks->prof_lock_owner) { prof_free_record(page,p); return; }
   mi_lock_acquire(&prof_lock); prof_free_record(page,p); mi_lock_release(&prof_lock);
 }
 void _mi_prof_on_free_collect(mi_page_t* page, mi_block_t* head) {
   if mi_likely(!page->has_metadata) return;
-  if (prof_lock_owner) { prof_free_collect(page,head); return; }
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks != NULL && hooks->prof_lock_owner) { prof_free_collect(page,head); return; }
   mi_lock_acquire(&prof_lock); prof_free_collect(page,head); mi_lock_release(&prof_lock);
 }
 void _mi_prof_on_realloc_in_place(mi_page_t* page, void* p, size_t size) {
   if mi_likely(!page->has_metadata) return;
-  if (prof_lock_owner) { prof_realloc_in_place(page,p,size); return; }
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks != NULL && hooks->prof_lock_owner) { prof_realloc_in_place(page,p,size); return; }
   mi_lock_acquire(&prof_lock); prof_realloc_in_place(page,p,size); mi_lock_release(&prof_lock);
 }
 

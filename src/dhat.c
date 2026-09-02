@@ -5,6 +5,7 @@
 #include "mimalloc/internal.h"
 #include "mimalloc/prim.h"
 #include "mimalloc/dhat.h"
+#include "mimalloc/hooks-tld.h"  // _mi_hooks_tld_peek/_peek_or_local (#266)
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -82,8 +83,26 @@ static uint64_t dhat_generation;
 static uint64_t dhat_total_bytes, dhat_total_blocks;
 static uint64_t dhat_live_bytes, dhat_live_blocks, dhat_peak_bytes, dhat_peak_blocks, dhat_peak_at;
 static char dhat_dump_at_exit[1024];
-static mi_decl_thread int dhat_observer_depth;
-static mi_decl_thread dhat_event_t dhat_event;
+
+// #266: `dhat_observer_depth` and `dhat_event` used to be file-local `mi_decl_thread`
+// (`__thread`) variables; they now live on `mi_tld_t::hooks` (see hooks-tld.h's file
+// comment for why: touching a `__thread` var from inside `_mi_meta_zalloc`'s call chain
+// can deadlock on macOS). `hooks->dhat_event` stores the same fields as `dhat_event_t`
+// above but with `kind` as a plain `int` and `pp` as `void*` (mi_tld_t/types.h cannot see
+// this file's private `dhat_event_kind_t`/`dhat_pp_t` types); this converts back.
+static dhat_event_t dhat_event_load(const mi_hooks_tld_t* hooks) {
+  dhat_event_t ev;
+  ev.kind = (dhat_event_kind_t)hooks->dhat_event.kind;
+  ev.oldp = hooks->dhat_event.oldp;
+  ev.newp = hooks->dhat_event.newp;
+  ev.size = hooks->dhat_event.size;
+  ev.at = hooks->dhat_event.at;
+  ev.generation = hooks->dhat_event.generation;
+  ev.page = hooks->dhat_event.page;
+  ev.pp = (dhat_pp_t*)hooks->dhat_event.pp;
+  ev.armed = hooks->dhat_event.armed;
+  return ev;
+}
 
 size_t _mi_dhat_stack_capture(void** pcs, size_t capacity);
 
@@ -316,41 +335,77 @@ static void dhat_resolve_env(void) {
 }
 
 bool _mi_dhat_is_active(void) { return mi_atomic_load_relaxed(&dhat_state) == DHAT_ENABLED; }
-static void dhat_prepare(dhat_event_kind_t kind, mi_page_t* page, void* oldp, void* newp, size_t size) {
-  dhat_event.armed = false;
-  if (dhat_observer_depth != 0) return;
+// `hooks` is the caller's already-obtained, known-non-NULL `mi_hooks_tld_t*` -- see the
+// three wrappers below for why each uses a different (peek vs. force) strategy to get it.
+static void dhat_prepare(mi_hooks_tld_t* hooks, dhat_event_kind_t kind, mi_page_t* page, void* oldp, void* newp, size_t size) {
+  hooks->dhat_event.armed = false;
+  if (hooks->dhat_observer_depth != 0) return;
   /* Register before reading activation so stop can wait for any thread that
      might have observed the old enabled state. */
   mi_atomic_increment_acq_rel(&dhat_inflight);
   size_t state = mi_atomic_load_relaxed(&dhat_state);
   if (state == DHAT_UNINIT) { dhat_resolve_env(); state = mi_atomic_load_relaxed(&dhat_state); }
   if (state != DHAT_ENABLED) { mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
-  dhat_observer_depth++;
-  dhat_event.kind = kind; dhat_event.page = page; dhat_event.oldp = oldp; dhat_event.newp = newp;
-  dhat_event.size = size; dhat_event.at = _mi_clock_now();
-  dhat_event.generation = 0; dhat_event.pp = NULL;
+  hooks->dhat_observer_depth++;
+  hooks->dhat_event.kind = (int)kind; hooks->dhat_event.page = page; hooks->dhat_event.oldp = oldp; hooks->dhat_event.newp = newp;
+  hooks->dhat_event.size = size; hooks->dhat_event.at = _mi_clock_now();
+  hooks->dhat_event.generation = 0; hooks->dhat_event.pp = NULL;
   if (kind == DHAT_EVENT_ALLOC) {
     void* pcs[DHAT_STACK_MAX]; const size_t depth = _mi_dhat_stack_capture(pcs, DHAT_STACK_MAX);
-    if (depth == 0) { dhat_mark_dropped(); dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
+    if (depth == 0) { dhat_mark_dropped(); hooks->dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
     mi_lock_acquire(&dhat_lock);
-    dhat_event.pp = dhat_pp_intern_locked(pcs, depth);
-    dhat_event.generation = dhat_generation;
+    dhat_pp_t* const pp = dhat_pp_intern_locked(pcs, depth);
+    hooks->dhat_event.pp = pp;
+    hooks->dhat_event.generation = dhat_generation;
     mi_lock_release(&dhat_lock);
-    if (dhat_event.pp == NULL) { dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
+    if (pp == NULL) { hooks->dhat_observer_depth--; mi_atomic_decrement_acq_rel(&dhat_inflight); return; }
   }
   else {
     mi_lock_acquire(&dhat_lock);
-    dhat_event.generation = dhat_generation;
+    hooks->dhat_event.generation = dhat_generation;
     mi_lock_release(&dhat_lock);
   }
-  dhat_event.armed = true;
+  hooks->dhat_event.armed = true;
 }
-void _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size) { dhat_prepare(DHAT_EVENT_ALLOC, page, NULL, p, request_size); }
-void _mi_dhat_begin_free(void* p) { dhat_prepare(DHAT_EVENT_FREE, NULL, p, NULL, 0); }
-void _mi_dhat_begin_resize(void* oldp, void* newp, size_t request_size) { dhat_prepare(DHAT_EVENT_RESIZE, NULL, oldp, newp, request_size); }
+// #266: this is reached from _mi_memevt_on_alloc, which is itself reachable from inside
+// `_mi_meta_zalloc`'s own call chain (a thread's own tld/theap allocation) -- so, like
+// that caller, this must peek (never force) and bail out immediately on NULL, before
+// touching anything else. Such a call is always for a meta allocation anyway (the
+// calling _mi_memevt_on_alloc's own `_mi_meta_is_meta_page` check already excludes it).
+void _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size) {
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks == NULL) return;
+  dhat_prepare(hooks, DHAT_EVENT_ALLOC, page, NULL, p, request_size);
+}
+// #266: these could in principle use a peek-or-local fallback (like
+// _mi_memevt_on_free's own family) to still track a thread with no tld of its own --
+// EXCEPT that dhat_prepare's armed event has to survive from here until the *separate*
+// _mi_dhat_finish_event() call below, which a stack-local fallback cannot do (its
+// storage would already be gone the moment this function returns). So: like begin_alloc
+// above, peek and bail -- a thread with no tld of its own simply isn't tracked by DHAT
+// (no #266 test exercises DHAT across a foreign/torn-down thread; memevt's own
+// always-on counters, which do not have this begin/finish split, remain accurate
+// either way -- see _mi_memevt_on_free).
+void _mi_dhat_begin_free(void* p) {
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks == NULL) return;
+  dhat_prepare(hooks, DHAT_EVENT_FREE, NULL, p, NULL, 0);
+}
+void _mi_dhat_begin_resize(void* oldp, void* newp, size_t request_size) {
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks == NULL) return;
+  dhat_prepare(hooks, DHAT_EVENT_RESIZE, NULL, oldp, newp, request_size);
+}
 void _mi_dhat_finish_event(void) {
-  if (!dhat_event.armed) return;
-  dhat_event_t ev = dhat_event; dhat_event.armed = false; dhat_observer_depth--;
+  // #266: always safe to peek here regardless of which begin_* (if any) armed the
+  // event -- every begin_* above peeked too, so a non-NULL result here reaches the
+  // exact same real `hooks` (no allocation or thread-state change happens between
+  // begin and finish on the same thread), and a NULL result here means begin_*
+  // (whichever ran) found NULL too and left nothing armed.
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks == NULL) return;
+  if (!hooks->dhat_event.armed) return;
+  dhat_event_t ev = dhat_event_load(hooks); hooks->dhat_event.armed = false; hooks->dhat_observer_depth--;
   /* The observer guard is deliberately popped before mutating the ledger: a user memory
      callback runs between begin and finish, and any allocations it makes are excluded. */
   mi_lock_acquire(&dhat_lock);
@@ -364,7 +419,13 @@ void _mi_dhat_finish_event(void) {
 }
 
 bool mi_dhat_start(void) mi_attr_noexcept {
-  if (dhat_observer_depth != 0) return false;
+  // #266: a plain entry check, not a persisted write -- peek (never force: see
+  // hooks-tld.h's file comment) and treat NULL the same as a never-touched thread's
+  // depth reading 0 under the old `mi_decl_thread` counter.
+  {
+    mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+    if (hooks != NULL && hooks->dhat_observer_depth != 0) return false;
+  }
   if (_mi_atomic_once_enter(&dhat_once)) {
     /* Explicit start wins over MIMALLOC_DHAT, but it must still honor the
        independently useful exit-dump configuration before sealing the once. */
@@ -382,7 +443,11 @@ bool mi_dhat_start(void) mi_attr_noexcept {
   mi_lock_release(&dhat_lock); return true;
 }
 void mi_dhat_stop(void) mi_attr_noexcept {
-  if (dhat_observer_depth != 0) return;
+  // #266: see mi_dhat_start above.
+  {
+    mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+    if (hooks != NULL && hooks->dhat_observer_depth != 0) return;
+  }
   mi_lock_acquire(&dhat_lock);
   if (!_mi_dhat_is_active()) { mi_lock_release(&dhat_lock); return; }
   /* Block a new start while we drain events that already observed this session. */
@@ -477,19 +542,28 @@ static void dhat_write_json_locked(FILE* f) {
   fprintf(f, "\n  ]\n}\n");
 }
 bool mi_dhat_dump(const char* path) mi_attr_noexcept {
-  if (path == NULL || dhat_observer_depth != 0) return false;
+  if (path == NULL) return false;
+  // #266: the depth bump below has to persist across this whole call (fopen/fprintf/
+  // fclose can recursively reach _mi_dhat_begin_alloc etc. via an overridden stdio
+  // allocation), but never forces thread init -- see hooks-tld.h's file comment. A
+  // local fallback is safe here specifically because everything that reads/writes it
+  // stays within this one function call (unlike dhat_prepare/_mi_dhat_finish_event's
+  // begin/finish split, which cannot use this pattern -- see _mi_dhat_begin_free above).
+  mi_hooks_tld_t local_hooks;
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
+  if (hooks->dhat_observer_depth != 0) return false;
   /* stdio can allocate (and applications can override those calls with mimalloc).
      Suppress this thread's dump-time traffic before fopen/fprintf while leaving the
      report's actual live records untouched; otherwise a reentrant hook could attempt
      to take dhat_lock while serialization already owns it. */
-  dhat_observer_depth++;
+  hooks->dhat_observer_depth++;
   /* Suppress the public dispatcher too: a callback invoked by a lazy stdio
      allocation could otherwise call a DHAT API while dhat_lock is held. */
   _mi_memevt_suppress_begin();
   FILE* f = fopen(path, "wb");
   if (f == NULL) {
     _mi_memevt_suppress_end();
-    dhat_observer_depth--;
+    hooks->dhat_observer_depth--;
     return false;
   }
   mi_lock_acquire(&dhat_lock);
@@ -497,7 +571,7 @@ bool mi_dhat_dump(const char* path) mi_attr_noexcept {
   mi_lock_release(&dhat_lock);
   const bool ok = (fclose(f) == 0);
   _mi_memevt_suppress_end();
-  dhat_observer_depth--;
+  hooks->dhat_observer_depth--;
   return ok;
 }
 void _mi_dhat_process_init(void) { dhat_resolve_env(); }

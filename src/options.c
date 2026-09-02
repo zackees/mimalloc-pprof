@@ -85,7 +85,7 @@ int mi_version(void) {
 #endif
 
 #ifndef MI_DEFAULT_PAGEMAP_COMMIT
-#if defined(__APPLE__)  // when overloading malloc, we still get mixed pointers sometimes on macOS; this avoids a bad access
+#if defined(__APPLE__) && MI_PAGE_MAP_FLAT  // when overloading malloc, we still get mixed pointers sometimes on macOS; this avoids a bad access
 #define MI_DEFAULT_PAGEMAP_COMMIT 1
 #else
 #define MI_DEFAULT_PAGEMAP_COMMIT 0
@@ -225,7 +225,7 @@ mi_decl_export void mi_options_print_out(mi_output_fun* out, void* arg) mi_attr_
   const int vermajor = MI_MALLOC_VERSION/10000;
   const int verminor = (MI_MALLOC_VERSION%10000)/100;
   const int verpatch = (MI_MALLOC_VERSION%100);
-  _mi_fprintf(out, arg, "v%i.%i.%i%s%s (built on %s, %s)\n", vermajor, verminor, verpatch,
+  _mi_fprintf(out, arg, "v%i.%i.%i%s%s\n", vermajor, verminor, verpatch,
       #if defined(MI_CMAKE_BUILD_TYPE)
       ", " mi_stringify(MI_CMAKE_BUILD_TYPE)
       #else
@@ -237,7 +237,7 @@ mi_decl_export void mi_options_print_out(mi_output_fun* out, void* arg) mi_attr_
       #else
       ""
       #endif
-      , __DATE__, __TIME__);
+      );
 
   // show options
   for (int i = 0; i < _mi_option_last; i++) {
@@ -445,7 +445,18 @@ void mi_register_output(mi_output_fun* out, void* arg) mi_attr_noexcept {
 
 // add stderr to the delayed output after the module is loaded
 static void mi_add_stderr_output(void) {
-  mi_assert_internal(mi_out_default == NULL);
+  // #266: `_mi_options_post_init` (init.c) is not itself do-once guarded, unlike
+  // `mi_process_init`, so it is only as single-invocation-safe as whatever constructor
+  // mechanism calls `_mi_auto_process_init`. Observed hit twice on win-gnu debug-full CI
+  // under this pin (upstream `1cf88691` switched MinGW from MI_WIN_INIT_USE_FLS to the
+  // "default" win init path) -- not reproducible locally (no MinGW cross-compiler
+  // available here) to pin down which of the two constructor entry points fires twice.
+  // Whatever the exact double-invocation path, a second call here is meant to be a
+  // harmless re-affirmation of "stderr is now safe to use", not a distinct state
+  // transition, so make it idempotent instead of asserting -- the original assert dates
+  // to when this was believed reachable exactly once; that invariant no longer holds on
+  // every configuration.
+  if (mi_out_default != NULL) return;
   mi_out_buf_flush(&mi_out_stderr, false, NULL); // flush current contents to stderr
   mi_atomic_store_ptr_release(void,&mi_out_default,(void*)&mi_out_buf_stderr);  // and add stderr to the delayed output
   mi_atomic_store_ptr_release(void,&mi_out_arg,NULL);
@@ -525,7 +536,7 @@ void _mi_fprintf( mi_output_fun* out, void* arg, const char* fmt, ... ) {
 }
 
 static void mi_vfprintf_thread(mi_output_fun* out, void* arg, const char* prefix, const char* fmt, va_list args) {
-  if (prefix != NULL && _mi_strnlen(prefix,33) <= 32 && !_mi_is_main_thread()) {
+  if (prefix != NULL && _mi_strnlen(prefix,33) <= 32) { // && !_mi_is_main_thread()) {
     char tprefix[64];
     _mi_snprintf(tprefix, sizeof(tprefix), "%sthread 0x%tx: ", prefix, (uintptr_t)_mi_thread_id());
     mi_vfprintf(out, arg, tprefix, fmt, args);
@@ -608,7 +619,7 @@ static void mi_error_default(int err) {
     }
   #endif
   #if defined(MI_XMALLOC)
-    if (err==ENOMEM || err==EOVERFLOW || err=EINVAL) { // abort on memory allocation fails in xmalloc mode
+    if (err==ENOMEM || err==EOVERFLOW || err==EINVAL) { // abort on memory allocation fails in xmalloc mode
       abort();
     }
   #endif

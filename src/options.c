@@ -445,7 +445,18 @@ void mi_register_output(mi_output_fun* out, void* arg) mi_attr_noexcept {
 
 // add stderr to the delayed output after the module is loaded
 static void mi_add_stderr_output(void) {
-  mi_assert_internal(mi_out_default == NULL);
+  // #266: `_mi_options_post_init` (init.c) is not itself do-once guarded, unlike
+  // `mi_process_init`, so it is only as single-invocation-safe as whatever constructor
+  // mechanism calls `_mi_auto_process_init`. Observed hit twice on win-gnu debug-full CI
+  // under this pin (upstream `1cf88691` switched MinGW from MI_WIN_INIT_USE_FLS to the
+  // "default" win init path) -- not reproducible locally (no MinGW cross-compiler
+  // available here) to pin down which of the two constructor entry points fires twice.
+  // Whatever the exact double-invocation path, a second call here is meant to be a
+  // harmless re-affirmation of "stderr is now safe to use", not a distinct state
+  // transition, so make it idempotent instead of asserting -- the original assert dates
+  // to when this was believed reachable exactly once; that invariant no longer holds on
+  // every configuration.
+  if (mi_out_default != NULL) return;
   mi_out_buf_flush(&mi_out_stderr, false, NULL); // flush current contents to stderr
   mi_atomic_store_ptr_release(void,&mi_out_default,(void*)&mi_out_buf_stderr);  // and add stderr to the delayed output
   mi_atomic_store_ptr_release(void,&mi_out_arg,NULL);

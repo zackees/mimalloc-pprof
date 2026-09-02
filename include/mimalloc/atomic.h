@@ -702,6 +702,19 @@ typedef struct mi_atomic_once_s {
 // Other threads (than the initial thread that entered) will block until `_mi_atomic_once_release` has been called.
 bool _mi_atomic_once_enter(mi_atomic_once_t* once);        // defined in `libc.c`
 void _mi_atomic_once_release(mi_atomic_once_t* once);      // defined in `libc.c`
+// #270: fork-safety. If some thread was mid-`_mi_atomic_once_enter`..
+// `_mi_atomic_once_release` (holding `once->lock`, `once->tid` set to that thread's
+// id) at the moment of fork(), and that thread does not survive the fork, the child
+// would inherit `once->lock` permanently held and `once->tid` pointing at a vanished
+// thread -- wedging every future `_mi_atomic_once_enter` on this `once` (the CAS
+// against `tid==0` never succeeds, and the lock never releases). Never touch an
+// ALREADY-RESOLVED once (`tid==1`): that state is valid, ordinary process memory
+// that should carry over unchanged, matching this codebase's profiler/DHAT/memevt
+// "continue across fork" policy -- resetting a resolved once would make the child
+// redo (and potentially re-diverge on) an env-var resolution the parent already
+// committed to. Call from a `_mi_*_fork_child` handler for any named (non-anonymous)
+// `mi_atomic_once_t`; defined in `libc.c`.
+void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 
 #define mi_atomic_do_once  \
   static mi_atomic_once_t _mi_once = { MI_ATOMIC_VAR_INIT(0), MI_LOCK_INITIALIZER }; \

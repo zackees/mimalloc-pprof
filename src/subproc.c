@@ -9,10 +9,21 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/internal.h"
 #include "mimalloc/prim-tls.h"
 
+/* -----------------------------------------------------------
+  #270 (Bun parity P5): the `pthread_atfork` fork-safety handlers, the lock order they
+  implement, and their MI_DEBUG-only self-checks and test hooks all live in `src/fork.c`
+  (rule 6: new logic in new files). This file keeps only the two accessors below, which
+  give fork.c access to the sub-process registry it has to walk.
+----------------------------------------------------------- */
 // pre-allocate the main subprocess structure.
 static mi_decl_cache_align mi_subproc_t mi_process_subproc_main = mi_init_struct_zero;
 static mi_subproc_t* mi_subprocs = NULL;
 static mi_lock_t     mi_subprocs_lock = MI_LOCK_INITIALIZER;
+
+// #270: the fork handlers (src/fork.c) walk the sub-process registry and quiesce its
+// lock; both are file-static here. Callers must hold `mi_subprocs_lock` while walking.
+mi_subproc_t* _mi_subprocs_head(void) { return mi_subprocs; }
+mi_lock_t*    _mi_subprocs_lock(void) { return &mi_subprocs_lock; }
 
 
 /* -----------------------------------------------------------

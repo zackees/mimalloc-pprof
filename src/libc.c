@@ -140,6 +140,16 @@ void _mi_atomic_once_release(mi_atomic_once_t* once) {
   }
 }
 
+// #270: fork-safety. See the declaration in atomic.h for the full rationale. Leaves an
+// already-resolved once (`tid==1`) untouched; resets everything else to a fresh,
+// never-entered state.
+void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once) {
+  if (mi_atomic_load_relaxed(&once->tid) != 1) {
+    mi_atomic_store_relaxed(&once->tid, 0);
+    mi_lock_init(&once->lock);
+  }
+}
+
 #if MI_USE_PTHREADS
 mi_decl_noinline bool _mi_pthread_key_create(pthread_key_t* pkey, void (*destruct)(void*), void* init) {
   int err = pthread_key_create(pkey,destruct);

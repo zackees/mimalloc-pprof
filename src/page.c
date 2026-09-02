@@ -1117,6 +1117,7 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   #if !MI_THEAP_INITASNULL
   mi_assert_internal(theap != NULL);
   #endif
+  _mi_park_leave_if_parked(theap);   // #272: an owner-side alloc while parked (e.g. from a TLS destructor)
   const bool zero = ((zero_huge_alignment & 1) != 0);
   const size_t huge_alignment = (zero_huge_alignment & ~1);
   mi_page_t* page = NULL;

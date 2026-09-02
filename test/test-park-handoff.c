@@ -526,11 +526,12 @@ static void test_fork_while_parked(void) {
 // race the scavenger's rewrite of the same pages -- the park has to be left before any teardown
 // free. Also registers a pthread key destructor that frees, as an application would.
 // ---------------------------------------------------------------------------
+#define DTOR_BLOCKS  (500)
 static pthread_key_t dtor_key;
 static void dtor_frees(void* blocks_v) {
   void** blocks = (void**)blocks_v;
   if (blocks == NULL) return;
-  for (int i = 0; i < 500; i++) { if (blocks[i] != NULL) mi_free(blocks[i]); }
+  for (int i = 0; i < DTOR_BLOCKS; i++) { if (blocks[i] != NULL) mi_free(blocks[i]); }
   free(blocks);
 }
 
@@ -572,6 +573,67 @@ static void test_exit_while_swept_with_dyn_tls(void) {
 }
 
 // ---------------------------------------------------------------------------
+// #272 regression for the parked-thread sweep race. The park contract is "the owner does not
+// allocate or free between `_start` and `_end`" -- but a thread that EXITS while parked breaks
+// it through no fault of the caller: pthread-key destructors (and C++ `thread_local`
+// destructors) run in an unspecified order and free ON THE OWNER THREAD before mimalloc's own
+// thread-done hook gets to leave the park. The scavenger is mid-sweep of exactly those theaps,
+// so the owner mutates page queues under the walk and `mi_theap_visit_pages`'s `count == total`
+// (or `mi_page_is_valid_init`'s block-conservation check) fires. Long queues make the walk long
+// and the jittered sleep lands the exit inside it. Asserts only under MI_DEBUG_FULL.
+// ---------------------------------------------------------------------------
+// Spread over every small size class and keep survivors in each, so this thread's theap has a
+// page in (almost) every bin: `mi_theap_visit_pages(include_full)` then walks a long list and
+// the destructor's frees have a wide window to land inside it.
+#define RACE_CLASSES  (48)
+#define RACE_PER_CLASS (24)
+
+static void* park_then_exit_racing_dtor(void* arg) {
+  const unsigned id = (unsigned)(uintptr_t)arg;
+  void** dblocks = (void**)calloc(DTOR_BLOCKS, sizeof(void*));
+  if (dblocks != NULL) {
+    for (int i = 0; i < DTOR_BLOCKS; i++) {
+      dblocks[i] = mi_malloc(16 + (size_t)(i % RACE_CLASSES) * 40);   // hits many bins on free
+      if (dblocks[i] == NULL) break;
+    }
+    pthread_setspecific(dtor_key, dblocks);
+  }
+  // populate every bin and keep one survivor per class so the page stays in its queue
+  for (int c = 0; c < RACE_CLASSES; c++) {
+    const size_t sz = 16 + (size_t)c * 40;
+    void* keep = NULL;
+    for (int k = 0; k < RACE_PER_CLASS; k++) {
+      void* q = mi_malloc(sz);
+      if (q == NULL) break;
+      if (k == 0) { keep = q; } else { mi_free(q); }
+    }
+    (void)keep;   // deliberately leaked into this thread's teardown
+  }
+  void** p = (void**)calloc(LIVE, sizeof(void*));
+  if (p != NULL) { churn_pattern(p); free(p); }   // more holes, more pages, a longer sweep
+  (void)mi_on_thread_idle_start();
+  usleep(20 + (id * 13) % 250);   // land the exit INSIDE the scavenger's walk
+  pthread_exit(NULL);
+}
+
+static void test_exit_while_swept_stress(void) {
+  enum { THREADS = 12, ROUNDS = 60 };
+  if (pthread_key_create(&dtor_key, &dtor_frees) != 0) return;
+  for (int r = 0; r < ROUNDS; r++) {
+    pthread_t t[THREADS];
+    int made = 0;
+    for (int i = 0; i < THREADS; i++) {
+      if (pthread_create(&t[i], NULL, &park_then_exit_racing_dtor,
+                         (void*)(uintptr_t)(unsigned)(r * THREADS + i)) != 0) break;
+      made++;
+    }
+    for (int i = 0; i < made; i++) { pthread_join(t[i], NULL); }
+  }
+  pthread_key_delete(dtor_key);
+  check("exit while swept, racing an app destructor's frees, is race-free", true);
+}
+
+// ---------------------------------------------------------------------------
 // Stopping the scavenger joins the thread: a park after it has nobody to hand off to and reports
 // false, and the process stays fully usable. Runs last, since it takes the scavenger away.
 // ---------------------------------------------------------------------------
@@ -596,6 +658,7 @@ int main(void) {
   test_fork_while_parked();
   test_park_then_exit();
   test_exit_while_swept_with_dyn_tls();
+  test_exit_while_swept_stress();
   test_park_stress();
   test_scavenger_stop();
   fprintf(stderr, "\n%s\n", failures == 0 ? "all tests passed." : "SOME TESTS FAILED.");

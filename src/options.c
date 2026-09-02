@@ -478,47 +478,33 @@ static _Atomic(size_t) warning_count; // = 0;  // when >= max_warning_count stop
 // platforms. However, C code generator may move the initial thread local address
 // load before the `if` and we therefore split it out in a separate function.
 //
-// mimalloc-pprof #277: on Windows with a GCC-family compiler this guard must not be a
-// `mi_decl_thread` either, and for a sharper version of the same reason. Many mingw-w64
-// GCCs have no native TLS, so `__thread` becomes GCC's emulated TLS and
-// `__emutls_get_address` allocates with `malloc` -- which, with `mimalloc-redirect.dll`
-// active, is `mi_malloc`. This guard sits directly on `mi_malloc`'s own verbose-output
-// path (`_mi_verbose_message` -> `_mi_fputs` -> here), so touching it there recurses
-// until the stack is gone. A Win32 TLS slot never allocates. See `src/threadlocal.c`.
-#if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
-#include <windows.h>
-static _Atomic(size_t) mi_recurse_key;   // 0 == not allocated yet, else TLS index + 1
+// mimalloc-pprof #277: on Windows with a non-MSVC compiler this guard must not be a
+// `mi_decl_thread` either, and for a sharper version of the same reason. `__thread` may
+// be GCC's emulated TLS there, and `__emutls_get_address` allocates with `malloc` --
+// which, with `mimalloc-redirect.dll` active, is `mi_malloc`. This guard sits directly on
+// `mi_malloc`'s own verbose-output path (`_mi_verbose_message` -> `_mi_fputs` -> here),
+// so touching it there recurses until the stack is gone. Win32 TLS keys never allocate.
+#if MI_WIN_TLS_SLOTS
+static mi_prim_tls_key_t mi_recurse_key;   // 0 == not allocated yet
 
-static size_t mi_recurse_key_get(void) {
-  size_t key = mi_atomic_load_acquire(&mi_recurse_key);
-  if mi_unlikely(key == 0) {
-    const DWORD index = TlsAlloc();      // does not allocate from the C heap
-    if (index == TLS_OUT_OF_INDEXES) return mi_atomic_load_acquire(&mi_recurse_key);  // another thread may have won
-    size_t expected = 0;
-    if (mi_atomic_cas_strong_acq_rel(&mi_recurse_key, &expected, (size_t)index + 1)) {
-      key = (size_t)index + 1;
-    }
-    else { TlsFree(index); key = expected; }   // lost the race
-  }
-  return key;
-}
-
+// Note this FAILS CLOSED: if the process has exhausted its TLS indices,
+// `_mi_prim_tls_key_alloc` returns 0 and we report "already inside", so the message is
+// dropped rather than risking unbounded recursion. Silence is the safe answer here.
 static mi_decl_noinline bool mi_recurse_enter_prim(void) {
-  const size_t key = mi_recurse_key_get();
+  const size_t key = _mi_prim_tls_key_alloc(&mi_recurse_key);
   if (key == 0) return false;
-  const DWORD err = GetLastError();     // an allocator must not clobber the caller's last error
-  const bool inside = (TlsGetValue((DWORD)(key - 1)) != NULL);
-  if (!inside) { TlsSetValue((DWORD)(key - 1), (void*)1); }
-  SetLastError(err);
-  return !inside;
+  if (_mi_prim_tls_key_get(key) != NULL) return false;   // already inside on this thread
+  _mi_prim_tls_key_set(key, (void*)1);
+  return true;
 }
 
 static mi_decl_noinline void mi_recurse_exit_prim(void) {
-  const size_t key = mi_atomic_load_relaxed(&mi_recurse_key);
-  if (key == 0) return;
-  const DWORD err = GetLastError();
-  TlsSetValue((DWORD)(key - 1), NULL);
-  SetLastError(err);
+  _mi_prim_tls_key_set(mi_atomic_load_relaxed(&mi_recurse_key), NULL);
+}
+
+// Called once from `mi_process_done_once` (init.c).
+void _mi_options_done(void) {
+  _mi_prim_tls_key_free(&mi_recurse_key);
 }
 
 #else
@@ -532,6 +518,10 @@ static mi_decl_noinline bool mi_recurse_enter_prim(void) {
 
 static mi_decl_noinline void mi_recurse_exit_prim(void) {
   recurse = false;
+}
+
+void _mi_options_done(void) {
+  // nothing to release
 }
 #endif
 

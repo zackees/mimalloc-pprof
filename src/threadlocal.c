@@ -50,53 +50,19 @@ static mi_thread_locals_t mi_thread_locals_empty = mi_init_struct_zero;
   static inline bool name##_set(tp val)   { return mi_pthread_key_set(&__##name##_key,val); } \
   static inline void name##_delete(void)  { mi_pthread_key_delete(&__##name##_key); }
 
-#elif defined(_WIN32) && !defined(_MSC_VER)
-// Windows with a GCC-family compiler: use Win32 TLS slots, not `__thread`.
-//
-// Many mingw-w64 GCCs -- notably the conda-forge cross compilers a Linux host builds
-// Windows binaries with -- are configured without native TLS, so `__thread` compiles to
-// GCC's *emulated* TLS (`__emutls_v.<name>` + a call to `__emutls_get_address`) and
-// `__declspec(thread)` is silently ignored. `__emutls_get_address` allocates its
-// per-thread table with `malloc`; once `mimalloc-redirect.dll` has patched the C runtime
-// that `malloc` IS `mi_malloc`, so every thread-local read on an allocation path
-// re-enters the allocator and the process dies of a stack overflow before `main`
-// (mimalloc-pprof #277). Win32 TLS slots never allocate, so this is immune, and it is
-// correct on native-TLS MinGW too.
-//
-// `TlsGetValue`/`TlsSetValue` reset the thread's last error, which an allocator must not
-// do to its caller, so it is saved and restored. (A direct TEB read as in
-// `src/prim/prim-tls.c` would avoid both the call and the save; that is a possible
-// optimisation, not a correctness matter.)
-#include <windows.h>
-
+#elif MI_WIN_TLS_SLOTS
+// Windows, non-MSVC: dynamic Win32 TLS keys instead of `__thread`. This toolchain may
+// lower `__thread` to GCC's *emulated* TLS, whose `__emutls_get_address` allocates with
+// `malloc` -- which is `mi_malloc` once `mimalloc-redirect.dll` is live, so a
+// thread-local read from the allocator would re-enter the allocator forever
+// (mimalloc-pprof #277). See `MI_WIN_TLS_SLOTS` in `mimalloc/internal.h` and
+// `_mi_prim_tls_key_*` in `mimalloc/prim.h`; none of them allocate.
 #define mi_define_thread_local(tp,name,initval) \
-  static _Atomic(size_t) __##name##_key;  /* 0 == not allocated yet, else TLS index + 1 */ \
-  static size_t name##_key_get(void) { \
-    size_t key = mi_atomic_load_acquire(&__##name##_key); \
-    if mi_unlikely(key == 0) { \
-      const DWORD index = TlsAlloc(); \
-      if (index == TLS_OUT_OF_INDEXES) return mi_atomic_load_acquire(&__##name##_key); /* another thread may have won */ \
-      size_t expected = 0; \
-      if (mi_atomic_cas_strong_acq_rel(&__##name##_key, &expected, (size_t)index + 1)) { \
-        key = (size_t)index + 1; \
-      } \
-      else { TlsFree(index); key = expected; }  /* lost the race */ \
-    } \
-    return key; \
-  } \
-  static inline tp   name##_peek(void)    { const size_t key = mi_atomic_load_relaxed(&__##name##_key); \
-                                            if (key == 0) return (tp)NULL; \
-                                            const DWORD err = GetLastError(); \
-                                            const tp val = (tp)TlsGetValue((DWORD)(key - 1)); \
-                                            SetLastError(err); return val; } \
+  static mi_prim_tls_key_t __##name##_key;  /* 0 == not allocated yet */ \
+  static inline tp   name##_peek(void)    { return (tp)_mi_prim_tls_key_get(mi_atomic_load_relaxed(&__##name##_key)); } \
   static inline tp   name##_get(void)     { tp result = name##_peek(); return (result!=NULL ? result : initval); } \
-  static inline bool name##_set(tp val)   { const size_t key = name##_key_get(); \
-                                            if (key == 0) return false; \
-                                            const DWORD err = GetLastError(); \
-                                            const BOOL ok = TlsSetValue((DWORD)(key - 1), (void*)val); \
-                                            SetLastError(err); return (ok != 0); } \
-  static inline void name##_delete(void)  { const size_t key = mi_atomic_exchange_acq_rel(&__##name##_key, (size_t)0); \
-                                            if (key != 0) { TlsFree((DWORD)(key - 1)); } }
+  static inline bool name##_set(tp val)   { return _mi_prim_tls_key_set(_mi_prim_tls_key_alloc(&__##name##_key), (void*)val); } \
+  static inline void name##_delete(void)  { _mi_prim_tls_key_free(&__##name##_key); }
 
 #else
 // Direct thread locals

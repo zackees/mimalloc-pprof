@@ -162,15 +162,40 @@ mi_heap_t* mi_heap_new(void) {
   return mi_heap_new_in_arena(0);
 }
 
-// free all theaps belonging to this heap (without deleting their pages as we do this arena wise for efficiency)
-static void mi_heap_free_theaps(mi_heap_t* heap) {
-  // This can run concurrently with a thread that terminates (see `init.c:mi_thread_theaps_done`),
-  // and we need to ensure we free theaps atomically.
-
-  // We first detach our theaps list from any thread local lists
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// ec238987 "mi_heap_delete: detach the theaps before the pages are moved, free them
+// after"): `mi_heap_delete`/`mi_heap_destroy` used to free the theaps of the heap before
+// it walked the pages, and the detach marked a theap by clearing `theap->tld`. A thread
+// that used the heap before still reaches its theap for the heap through the heap's
+// thread local while it frees blocks of the heap during the delete
+// (`_mi_page_associated_theap_peek` on the reclaim/re-abandon paths of
+// `mi_free_try_collect_mt`); that theap was then detached-and-freed under it, or already
+// gone. It is also the root cause of the `mi_theap_is_valid` ABA hazard reproduced from
+// PR #289's evidence (issue #271): `_mi_heap_detach_theaps` (theap.c) only cleared
+// `theap->tld`, not `theap->heap`, so a theap referenced by `_mi_theap_cached()` on some
+// thread kept pointing at a `mi_heap_t` address that could be reused by a later
+// `mi_heap_new()` (test-heap-aba.c covers this directly).
+//
+// Detach is now split from free: `mi_heap_detach_theaps` clears `theap->heap` (not
+// `theap->tld`) via `_mi_heap_detach_theaps` (theap.c) and merges each theap's stats into
+// the heap, so no thread finds a theap for this heap anymore, but the theap structs (and
+// their `tld`) stay valid until `mi_heap_free_theaps` runs -- after the pages have moved
+// or been destroyed -- for a free that obtained the theap just before the detach.
+static void mi_heap_detach_theaps(mi_heap_t* heap) {
   _mi_heap_detach_theaps(heap);
+  mi_lock(&heap->theaps_lock) { // paranoia
+    for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
+      mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // detached
+      _mi_stats_merge_into(&heap->stats, &theap->stats);
+    }
+  }
+}
 
-  // Now we can safely free the theaps
+// Free the detached theaps of this heap (without deleting their pages as we do this arena wise for efficiency).
+// This must run after the pages have left the heap: a concurrent `mi_free` of a block in a page that was
+// still in the heap may have found its theap through `heap->theap` just before the detach
+// (`_mi_page_associated_theap_peek`), and uses the theap (and its `tld`) while it owns the page.
+static void mi_heap_free_theaps(mi_heap_t* heap) {
   mi_lock(&heap->theaps_lock) { // paranoia
     mi_theap_t* theap = heap->theaps;
     heap->theaps = NULL;
@@ -178,14 +203,12 @@ static void mi_heap_free_theaps(mi_heap_t* heap) {
       mi_theap_t* next = theap->hnext;
       theap->hnext = NULL;
       theap->hprev = NULL;
-      mi_assert_internal(theap->tld==NULL);
-      // merge stats into the owning heap stats
-      _mi_stats_merge_into(&heap->stats, &theap->stats);
-      // and free
+      mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // detached
+      theap->tld = NULL;
       _mi_theap_decref(theap);  // a cached entry can still point to the theap
       theap = next;
     }
-  }  
+  }
 }
 
 // free the heap resources (assuming the pages are already moved/destroyed, and all theaps have been freed)
@@ -242,16 +265,18 @@ void mi_heap_delete(mi_heap_t* heap) {
     _mi_warning_message("cannot delete the main heap\n");
     return;
   }
-  mi_heap_free_theaps(heap);
+  mi_heap_detach_theaps(heap);
   _mi_heap_move_pages(heap, heap_main);
+  mi_heap_free_theaps(heap);
   mi_heap_free(heap,true /* acquire subproc->heaps_lock */);
 }
 
 void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   if (heap==NULL) return;
-  mi_heap_free_theaps(heap);
+  mi_heap_detach_theaps(heap);
   _mi_dhat_forget_heap(heap);
   _mi_heap_destroy_pages(heap);
+  mi_heap_free_theaps(heap);
   // Free unless this is the PROCESS main heap (which is statically allocated and must
   // outlive everything). _mi_is_heap_main alone is not the right test: it resolves via
   // heap->subproc, so a *subproc's* heap_main is "main" by that definition too -- yet it

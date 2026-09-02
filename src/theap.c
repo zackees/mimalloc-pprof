@@ -58,7 +58,13 @@ static bool mi_theap_page_is_valid(mi_theap_t* theap, mi_page_queue_t* pq, mi_pa
   MI_UNUSED(pq);
   mi_assert_internal(mi_page_theap(page) == theap);
   mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
-  mi_assert_internal(page_theap == NULL || theap == page_theap);
+  // a detached theap (e.g. `subproc->theap_meta`, used under a lock from any thread for
+  // meta-data allocation) is not what `_mi_heap_theap_peek` returns for the calling
+  // thread's own theap of the same heap -- that mismatch is expected, not a bug. Same
+  // exception already used for this in page.c:91,133 (`_mi_page_is_valid`); it was
+  // missing here, which is what the multi-threaded mi_heap_new/mi_heap_delete churn
+  // repro in issue #271 / PR #289 tripped (mi_theap_collect on `theap_meta` itself).
+  mi_assert_internal(page_theap == NULL || theap == page_theap || mi_theap_is_detached(theap));
   mi_assert_expensive(_mi_page_is_valid(page));
   return true;
 }
@@ -68,7 +74,8 @@ static bool mi_theap_is_valid(mi_theap_t* theap) {
   mi_heap_t* const heap = _mi_theap_heap_peek(theap);
   mi_assert_internal(heap != NULL);
   mi_theap_t* const heap_theap = _mi_heap_theap_peek(heap);  // don't use mi_heap_theap as that may re-initialize the thread
-  mi_assert_internal(heap_theap==NULL || heap_theap == theap);
+  // see the comment in mi_theap_page_is_valid above
+  mi_assert_internal(heap_theap==NULL || heap_theap == theap || mi_theap_is_detached(theap));
   mi_theap_visit_pages(theap, &mi_theap_page_is_valid, true, NULL, NULL);
   for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
     mi_assert_internal(_mi_page_queue_is_valid(theap, &theap->pages[bin]));
@@ -399,6 +406,16 @@ void _mi_theap_decref(mi_theap_t* theap) {
 // via `git grep _mi_theap_free` across src/include at 6def7be9.
 
 // Remove the theaps in this heap from any thread local tld lists.
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
+// ec238987): a detached theap has `theap->heap == NULL`, so `_mi_heap_theap_peek` /
+// `_mi_page_associated_theap_peek` no longer return it and a concurrent `mi_free` of a
+// block in the heap no longer reclaims into it or re-abandons through it -- and, just as
+// importantly, no thread's `_mi_theap_cached()` fast path can mistake it for a theap of a
+// *different*, later heap allocated at the same (reused) address (the ABA reproduced by
+// test-heap-aba.c / the standalone repro in this PR). The theap struct itself (and its
+// `tld`) stays valid until `heap.c:mi_heap_free_theaps`, which runs after all the pages
+// have left the heap, for a free that found the theap just before it was detached here.
+// Previously this cleared `theap->tld` instead, which left `theap->heap` stale.
 void _mi_heap_detach_theaps( mi_heap_t* heap ) {
   bool all_detached;
   do {
@@ -407,15 +424,16 @@ void _mi_heap_detach_theaps( mi_heap_t* heap ) {
       mi_theap_t* theap = heap->theaps;
       while (theap != NULL) {
         mi_theap_t* next = theap->hnext;
-        mi_tld_t* tld = theap->tld;
-        if (tld != NULL) {
+        if (_mi_theap_heap_peek(theap) != NULL) {   // not detached yet in an earlier round?
+          mi_tld_t* const tld = theap->tld;
+          mi_assert_internal(tld != NULL);
           if (mi_lock_try_acquire(&tld->theaps_lock)) {
             // remove the theap from the tld theaps list
             if (theap->tnext != NULL) { theap->tnext->tprev = theap->tprev;  }
             if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
-                                else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
+                                else { mi_assert_internal(tld->theaps == theap); tld->theaps = theap->tnext; }
             theap->tnext = theap->tprev = NULL;
-            theap->tld = NULL;
+            mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
             mi_lock_release(&tld->theaps_lock);
           }
           else {

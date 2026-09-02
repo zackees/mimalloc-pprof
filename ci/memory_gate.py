@@ -21,6 +21,7 @@ Usage:
     memory_gate.py check   [<result.json> ...]   # no paths: build/run the binary itself
     memory_gate.py update  <result.json> [more.json ...]   # deliberate, reviewed act
     memory_gate.py control <result.json> [more.json ...]   # positive control: must FAIL
+    memory_gate.py where   <result.json>                   # print the baseline it matches
 
 `--arch <name>` and `--compiler <name>` (accepted by all three commands) declare the
 toolchain identity the binary cannot know about itself, and become part of the baseline
@@ -457,6 +458,21 @@ def _identity_flags(arch: str | None, compiler: str | None) -> str:
     return (f" --arch {arch}" if arch else "") + (f" --compiler {compiler}" if compiler else "")
 
 
+def where(result_paths: list[str], *, arch: str | None = None, compiler: str | None = None) -> int:
+    """Print the baseline file a run of this identity is compared against.
+
+    Exit 0 if it exists, 2 if it does not. This is what lets a workflow ask "does this
+    lane have a baseline yet?" without hardcoding a filename that this module computes --
+    #277 phase B needs it because the *positive control* cannot run before a baseline
+    exists (`control` requires `check` to fail, and a missing baseline is not a failure,
+    it is a bootstrap to be committed), and a hardcoded path in YAML would drift silently.
+    """
+    result, _, _ = load_runs(result_paths, arch, compiler)
+    path = baseline_path(result)
+    print(path)
+    return 0 if path.exists() else 2
+
+
 def update(result_paths: list[str], *, arch: str | None = None, compiler: str | None = None) -> int:
     result, peaks, spread = load_runs(result_paths, arch, compiler)
     if result.get("inject_leak", 0):
@@ -513,7 +529,7 @@ def main(argv: list[str]) -> int:
     except ValueError as e:
         print(f"error: {e}")
         return 2
-    if len(argv) < 2 or argv[1] not in ("check", "update", "control"):
+    if len(argv) < 2 or argv[1] not in ("check", "update", "control", "where"):
         print(__doc__)
         return 2
     result_paths = argv[2:]
@@ -528,7 +544,7 @@ def main(argv: list[str]) -> int:
         print(__doc__)
         return 2
     try:
-        cmd = {"check": check, "update": update, "control": control}[argv[1]]
+        cmd = {"check": check, "update": update, "control": control, "where": where}[argv[1]]
         return cmd(result_paths, arch=arch, compiler=compiler)
     except (OSError, ValueError, KeyError) as e:
         print(f"error: {e}")

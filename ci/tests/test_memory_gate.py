@@ -110,6 +110,26 @@ class LoadRunsTest(unittest.TestCase):
                 memory_gate.load_runs(paths)
 
 
+class WhereTest(unittest.TestCase):
+    """`where` is how a workflow asks "does this lane have a baseline yet?" without
+    hardcoding a filename that memory_gate.py computes."""
+
+    def _write(self, directory: Path, result: memory_gate.Result) -> str:
+        path = directory / "r.json"
+        path.write_text(json.dumps(result), encoding="utf-8")
+        return str(path)
+
+    def test_exit_zero_and_the_path_for_a_committed_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(Path(tmp), _result())
+            self.assertEqual(memory_gate.where([path]), 0)
+
+    def test_exit_two_for_a_lane_with_no_baseline_yet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(Path(tmp), _result())
+            self.assertEqual(memory_gate.where([path], arch="arm64", compiler="soldr-clang-21"), 2)
+
+
 class OptionParsingTest(unittest.TestCase):
     """`--arch`/`--compiler` are pulled out of argv wherever they appear, so the existing
     `memory_gate.py check result-*.json` shape (a glob of any length) is unchanged."""

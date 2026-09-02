@@ -133,6 +133,47 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: soldr prepare --target "$TARGET" --github-env "$GITHUB_ENV"
+      - name: Keep the Apple builds unwindable (frame pointers)
+        # #277 §4: build-linux sets RUSTFLAGS/CFLAGS at job level and this job set
+        # neither, so the Apple test binaries were built without frame pointers while the
+        # profiler walks frame pointers on every non-Windows platform. Copying
+        # build-linux's job-level `env:` here would be dead -- `soldr prepare` has already
+        # exported CARGO_ENCODED_RUSTFLAGS (which cargo lets shadow RUSTFLAGS entirely)
+        # and CFLAGS_<triple> (which cc-rs prefers over plain CFLAGS) -- so both are
+        # appended to. Apple targets only: the profiler does not walk frame pointers on
+        # Windows, and whether clang-cl accepts the flag is a #277 phase D question.
+        #
+        # Kept in step with macos-bundles.yml's build-rust-apple: while the Apple rows
+        # below are the informational control arm for #277 phase B, both arms must build
+        # the same way or a divergence has two possible causes instead of one.
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          under="${TARGET//-/_}"
+          eval "existing=\${CFLAGS_${under}:-}"
+          echo "CFLAGS_${under}=${existing} -fno-omit-frame-pointer" >> "$GITHUB_ENV"
+          if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+            printf 'CARGO_ENCODED_RUSTFLAGS=%s\037-Cforce-frame-pointers=yes\n' \
+              "$CARGO_ENCODED_RUSTFLAGS" >> "$GITHUB_ENV"
+          else
+            echo 'CARGO_ENCODED_RUSTFLAGS=-Cforce-frame-pointers=yes' >> "$GITHUB_ENV"
+          fi
+      - name: The frame-pointer flags must actually be in the build's environment
+        # A flag that never reaches the compiler is this repository's most-repeated CI bug
+        # (MI_GUARDED, docs/ci-gates.md). Assert on the environment the next step runs
+        # with, not on what the previous step intended to write.
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          eval "cflags=\${CFLAGS_${TARGET//-/_}:-}"
+          case "$cflags" in *-fno-omit-frame-pointer*) ;; *)
+            echo "::error::CFLAGS_${TARGET//-/_} lost -fno-omit-frame-pointer: '$cflags'"; exit 1;; esac
+          case "${CARGO_ENCODED_RUSTFLAGS:-}" in *force-frame-pointers*) ;; *)
+            echo "::error::CARGO_ENCODED_RUSTFLAGS lost -Cforce-frame-pointers"; exit 1;; esac
       - name: Build test binaries through Soldr
         env:
           TARGET: ${{ matrix.target }}
@@ -236,6 +277,12 @@ jobs:
     name: test (${{ matrix.target }})
     needs: [build-linux, build-cross, build-win-gnu]
     runs-on: ${{ matrix.runner }}
+    # TODO(#277 phase B, added 2026-09-02): DELETE the two apple-darwin rows -- and the
+    # matching targets from build-cross -- after ten pushes have compared them against
+    # macos-bundles.yml's `run-macos`, which runs the same binaries on one runner instead
+    # of two. These are the rows that measured 8-14 s of execution behind up to 5h26m /
+    # 6h13m of queue wait. Informational until then.
+    continue-on-error: ${{ contains(matrix.target, 'apple-darwin') }}
     strategy:
       fail-fast: false
       matrix:

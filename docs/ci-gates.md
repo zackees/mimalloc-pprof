@@ -24,7 +24,7 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 |---|---|---|
 | **memory-gate** (`ci/memory_gate.py`) | peak memory or thread-count regressions vs a committed per-platform baseline | builds a copy with an injected leak; the gate must fail — verified at +212% / +98% / +27% on linux/windows/macos |
 | **isa-baseline** (`ci/check_isa_baseline.py`) | binaries containing instructions above the CPU baseline, which SIGILL on older hardware | builds with `MI_OPT_ARCH=ON`; the scanner must fire. The parser also self-tests against x86 and arm64 fixtures on every run |
-| **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW | — |
+| **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW. **macOS is gated from Linux-built bundles run on one runner** (`macos-bundles.yml`, #277 phase B); the native macOS jobs are informational during the comparison window | `ci/bundle_coverage.py` fails if any test the native macOS `ctest` would run is missing from a bundle |
 | **ctest-guarded** | the `MI_GUARDED` guard-page path, run twice: at the default sample rate and again with `MIMALLOC_GUARDED_SAMPLE_RATE=1` so every eligible allocation is guarded | configure step greps the resolved compiler defines for `MI_GUARDED=1`, since the original bug was the flag never reaching the compiler |
 | **asan** | use-after-free, overflow and leaks under AddressSanitizer | — |
 | **fuzz** (`test/fuzz/`) | crashes from structured random allocator-API sequences, with ASan as the oracle | builds with a planted use-after-free and requires an anchored `(ERROR\|SUMMARY): AddressSanitizer:` report naming it |
@@ -71,6 +71,14 @@ the expected non-zero exit — the script's own words are "negative control time
 instead of failing fast" — and the expected substring is searched in the *combined*
 stdout+stderr, so a control that fails for the wrong reason stays red.
 
+Every lowered test is then scanned for absolute paths that the bundle does not carry --
+across `argv`, every `env` value (split on `os.pathsep`) and `cwd`, not just `argv[0]` --
+and any hit is a hard error naming the test and the field. `PathRewriter` only rewrites
+paths under the *build* directory, so a source-tree, toolchain or runner-home path would
+otherwise be replayed verbatim on a machine that does not have it. Windows drive-qualified
+and UNC paths count as absolute even though `os.path.isabs` says otherwise on Linux, which
+is where every cross bundle is built.
+
 Test properties are an **allowlist** (`ENVIRONMENT`, `TIMEOUT`, `WORKING_DIRECTORY`,
 `LABELS`, `WILL_FAIL`, `DISABLED`). Anything else — `PASS_REGULAR_EXPRESSION`,
 `SKIP_RETURN_CODE`, `RESOURCE_LOCK` — is a hard error naming the test, as is any `cmake`
@@ -86,6 +94,102 @@ dead gates above shared.
 requires the same test names with the same pass/fail (`--compare-junit`). Moving the build
 tree is the load-bearing step: the executables carry an RPATH into it, so without that
 `mv` a broken bundle would pass on the build machine by loading the original libraries.
+
+## macOS via cross-built bundles
+
+Issue #277 phase B. The macOS gates no longer build on macOS. `macos-bundles.yml` builds
+the arm64 test binaries on **ubuntu-latest** through soldr's Darwin toolchain, packs them
+with `ci/bundle_tests.py`, and one `macos-latest` job runs everything serially.
+
+The reason is queue wait, not build time. Over 20 runs per workflow, `cross.yml`'s Apple
+rows executed in 8–14 s and waited up to 5h26m (arm64) / 6h13m (Intel), p90 1h29m / 2h32m,
+while every ubuntu row waited 4–5 s. Six macOS jobs per push become one.
+
+| Linux job | produces | replaces |
+|---|---|---|
+| `build-macos (macos-arm64-release)` | `bundle-macos-arm64-release` | `ctest (macos-latest)` |
+| `build-macos (macos-arm64-debug-full)` | `bundle-macos-arm64-debug-full` | `ctest-debug-full (macos-latest)` |
+| `build-macos (macos-arm64-leak)` | `bundle-macos-arm64-leak` | the `memory-gate` positive control |
+| `build-rust (aarch64-apple-darwin)` | `rust-test-bins-…` | `cross.yml` `test (aarch64-apple-darwin)` |
+| `build-rust (x86_64-apple-darwin)` | `rust-test-bins-…` | `cross.yml` `test (x86_64-apple-darwin)`, run under Rosetta 2 |
+
+### The toolchain
+
+`cmake/toolchains/soldr-aarch64-apple-darwin.cmake` consumes only what `soldr prepare
+--target aarch64-apple-darwin` exports (`CC_`/`CXX_`/`CFLAGS_`/`CXXFLAGS_`/`AR_`/`RANLIB_`
+per triple, plus `SDKROOT`), so no path, SDK version or compiler version is written down
+in the repository. One line in it is load-bearing:
+
+```cmake
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+```
+
+`CMakeLists.txt`'s `find_link_library()` falls back to `find_library()` when
+`check_linker_flag()` rejects `-l<name>`, and a Darwin link rejects both `-lrt` and
+`-latomic` — so without confining the search to the SDK, the host's ELF `librt.so` and
+`libatomic.so` are found and handed to a Mach-O link. `build-macos` asserts on the
+resolved list (`Link libraries : pthread`, exactly), not on the flag that was passed in.
+
+### What the build job proves before shipping a bundle
+
+Cross-compilation can produce a plausible-looking file that does nothing on the target, so
+the artifact is inspected rather than trusted:
+
+- arm64 Mach-O with `LC_BUILD_VERSION` (platform, `minos`, `sdk` printed into the job
+  summary — soldr's SDK moves, so it is recorded, never asserted against a constant)
+- `__DATA,__interpose` and `__DATA,__thread_vars` present: `MI_OSX_INTERPOSE` puts the
+  malloc replacements in the first, and a dylib that quietly lost the section would load
+  on the runner and override nothing
+- `LC_CODE_SIGNATURE` present (ad-hoc, from `ld64.lld`) — arm64 macOS kills an unsigned
+  image before `main()` with no diagnostic
+- `tests.json` contains no absolute path, and the bundle carries a `.dylib`
+
+The bundle is shipped as a **tar**, not as a plain artifact upload: `upload-artifact@v4`
+drops the executable bit and does not preserve symlinks, and the bundle needs both (every
+test executable, and the `libmimalloc.dylib → libmimalloc.3.dylib` chain).
+
+### Coverage accounting
+
+`ci/bundle_coverage.py` runs on every `run-macos`. The runner configures the same two
+CMake trees with **Xcode's** clang (`--show-only=json-v1` needs a configured tree, not a
+built one) and the script fails if any test name the native `ctest` would run is absent
+from the bundles. A name only the bundle has is reported, not fatal.
+
+Two coverage facts are stated rather than gated, because nothing can gate them:
+
+- the **8 doctests** in `rust/mimalloc-pprof/src/lib.rs` run under `cargo test` and cannot
+  run from a `--tests` binary; after phase B they are Linux-only (#277 §4)
+- the native compile-compat build uses Xcode clang and runs **no tests**: it catches
+  compile-only breakage, not codegen or runtime differences between Apple clang and
+  soldr's clang
+
+### Memory-gate baselines are per toolchain now
+
+`macos-latest` now executes two differently-built arm64 binaries, and they report the same
+`platform` and the same `platform.machine()`. `ci/memory_gate.py` therefore accepts
+`--arch` and `--compiler`, which join the baseline file's name. Both are optional and
+absent by default, so `linux-pprof1.json`, `windows-pprof1.json` and `macos-pprof1.json`
+keep their names and keep matching the runs that produced them — the ubuntu baseline is
+untouched. The soldr lane asks for `macos-arm64-soldr-clang-21-pprof1.json`, which does
+not exist yet, so its first run takes the existing "no baseline → bootstrap it" path and
+uploads its JSON. Its positive control is skipped with a warning until that baseline is
+committed, because `control` requires `check` to *fail* and a missing baseline is not a
+failure.
+
+Which of those two states a run is in is decided by `memory_gate.py where`, not by
+`check`'s status. `check` exits 2 both for "no baseline" and for "this run's JSON could
+not be read", so a step that treated its 2 as "bootstrap me" would turn a **crashed gate
+binary** into a green run with a reassuring warning. `where` answers **3** for "no
+baseline" and keeps **2** for "cannot read this run", and `run-macos` additionally
+requires all eight result files to exist before it calls the gate at all.
+
+### Rollout
+
+The native jobs stay as a control arm, `continue-on-error: true`, for at least ten pushes:
+`c-unit.yml`'s `ctest`, `ctest-debug-full` and `memory-gate` macOS rows, `cross.yml`'s two
+Apple `test` rows, and `rust-native.yml`'s macOS row. Each carries a dated TODO naming
+what deletes it. A permanently-yellow job is worse than an absent one, so the comparison
+window is meant to end.
 
 ## Concurrency: superseded runs are cancelled
 

@@ -1,0 +1,477 @@
+name: macos-bundles
+
+# Issue #277 phase B: build the macOS test binaries on Linux, execute them on ONE macOS
+# runner.
+#
+# The motivation is not build time. Measured over 20 runs per workflow (#277 phase 0),
+# cross.yml's Apple rows EXECUTE in 8-14 seconds and WAIT up to 5h26m (arm64) / 6h13m
+# (Intel) for a runner, p90 1h29m / 2h32m, while every ubuntu row waits 4-5 s. Per push
+# there are 5-6 macOS jobs, each spinning up its own VM to check out, build and run a
+# slice of the suite. This workflow replaces all of that with two Linux build jobs and one
+# macOS job.
+#
+# The Linux side needs no Apple hardware and no Xcode: `soldr prepare --target
+# aarch64-apple-darwin` provisions clang 21 + ld64.lld + an Apple SDK, and
+# cmake/toolchains/soldr-aarch64-apple-darwin.cmake feeds CMake nothing but what soldr
+# exported. `ci/bundle_tests.py` then turns the build tree into a directory that runs with
+# no CMake and no checkout (see docs/ci-gates.md, "Test bundles").
+#
+# While this is being compared against the jobs it replaces, the native macOS entries of
+# c-unit.yml's `ctest`/`ctest-debug-full`/`memory-gate`, cross.yml's Apple `test (*)` rows
+# and rust-native.yml's macOS row are `continue-on-error: true`. They are the control arm,
+# not decoration -- see the dated TODO on each.
+
+env:
+  SOLDR_GITHUB_TOKEN: ${{ github.token }}
+
+on:
+  push:
+    branches: [main, v4]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'test/**'
+      - 'rust/**'
+      - 'CMakeLists.txt'
+      - 'cmake/toolchains/**'
+      - 'ci/**'
+      - '.github/workflows/macos-bundles.yml'
+
+concurrency:
+  # The macOS pool is the scarce one this whole workflow exists to stop wasting (#277).
+  group: macos-bundles-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-macos:
+    name: build-macos (${{ matrix.bundle }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Exactly today's macOS C coverage, no more: `ctest (macos-latest)` and
+          # `ctest-debug-full (macos-latest)`. #277's review found the first draft
+          # smuggling ~8 new configs in under the word "parity"; adding shared/guarded/
+          # pprof-off/Intel configs is a separate, deliberate decision.
+          #
+          # CMAKE_BUILD_TYPE is Release in both because that is what the native jobs
+          # actually compile: they pass no CMAKE_BUILD_TYPE and CMakeLists.txt (~137-145)
+          # then defaults it to Release unless the *binary directory name* ends in
+          # "debug"/"asan"/... . MI_DEBUG_FULL sets MI_DEBUG=3 independently of the build
+          # type, and the registered test set is identical either way (verified: 32 tests
+          # both ways) -- so this is parity with the job being replaced, not a downgrade.
+          - bundle: macos-arm64-release
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON
+          - bundle: macos-arm64-debug-full
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
+          # The memory gate's positive control. It is a separate *build*
+          # (MI_BENCH_INJECT_LEAK), not a separate run, so it cannot be an entry in
+          # another bundle's manifest; it gets its own bundle rather than being dropped
+          # on macOS, because a gate whose control never runs is a gate nobody has seen
+          # fire (docs/ci-gates.md).
+          - bundle: macos-arm64-leak
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: zackees/setup-soldr@v0
+        with:
+          # zccache wraps `soldr cargo`; this job drives CMake directly, so there is
+          # nothing for it to wrap. Only the toolchain provisioning is wanted here.
+          cache: false
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+      - name: Cache the prepared Darwin toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/soldr-aarch64-apple-darwin.tar.zst
+          key: soldr-prepare-aarch64-apple-darwin-${{ hashFiles('rust/rust-toolchain.toml') }}
+      - name: Prepare the soldr Darwin toolchain
+        # `soldr prepare` resolves rustc from a rust-toolchain.toml at or above the
+        # working directory, which is why this runs in rust/ like cross.yml does.
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          archive="$HOME/soldr-aarch64-apple-darwin.tar.zst"
+          args=(--target aarch64-apple-darwin --github-env "$GITHUB_ENV" --save "$archive")
+          # --restore on a nonexistent archive is not a documented no-op, so only pass it
+          # on a cache hit.
+          if [ -f "$archive" ]; then
+            args=(--restore "$archive" "${args[@]}")
+          fi
+          soldr prepare "${args[@]}"
+      - name: Configure for aarch64-apple-darwin
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja ${{ matrix.cmake }} \
+            --toolchain cmake/toolchains/soldr-aarch64-apple-darwin.cmake \
+            --log-level=VERBOSE 2>&1 | tee configure.log
+          # The find-root fix in the toolchain file is the difference between linking
+          # `pthread` and silently handing the host's ELF librt.so to a Mach-O link.
+          # Assert on the resolved list, not on the option that was passed in -- the
+          # MI_GUARDED lesson from docs/ci-gates.md.
+          if ! grep -qE '^-- Link libraries *: *pthread$' configure.log; then
+            echo "::error::the Darwin link picked up host libraries; expected exactly 'pthread'"
+            grep -E 'Link libraries' configure.log || true
+            exit 1
+          fi
+      - run: cmake --build build --parallel
+      - name: Prove the output is arm64 Mach-O with the profiler's Darwin sections
+        run: |
+          set -euo pipefail
+          lib=$(ls build/libmimalloc*.dylib | head -1)
+          echo "## ${{ matrix.bundle }}" >> "$GITHUB_STEP_SUMMARY"
+          llvm-objdump --macho --private-headers "$lib" > headers.txt
+          grep -E 'MH_MAGIC_64 +ARM64' headers.txt
+          grep -A3 'cmd LC_BUILD_VERSION' headers.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          # MI_OSX_INTERPOSE puts the malloc replacements in __DATA,__interpose. If a
+          # cross build silently dropped that section the dylib would load on the runner
+          # and override nothing, which no test failure would obviously explain.
+          llvm-objdump --macho --section-headers "$lib" | grep -q '__interpose'
+          llvm-objdump --macho --section-headers "$lib" | grep -q '__thread_vars'
+          # ld64.lld ad-hoc signs arm64 images. Without a signature every process is
+          # killed by the kernel on arm64 macOS before main(), with no diagnostic.
+          grep -q 'cmd LC_CODE_SIGNATURE' headers.txt
+      - name: Bundle the tests
+        run: python3 ci/bundle_tests.py build bundle
+      - name: The manifest must carry no absolute path
+        # bundle_tests.py already refuses these; this is the independent check, because
+        # the whole portability claim rests on it and this is the first phase where the
+        # bundle leaves the machine that built it.
+        run: |
+          set -euo pipefail
+          if grep -nE '"(/|[A-Za-z]:[\\/])' bundle/tests.json; then
+            echo "::error::the bundle manifest contains an absolute path"
+            exit 1
+          fi
+          python3 -c "import json,sys; d=json.load(open('bundle/tests.json')); print(len(d['tests']), 'tests')"
+          ls bundle | grep -q '\.dylib$'
+      - name: Pack the bundle
+        # tar, not a plain artifact upload: upload-artifact@v4 drops the executable bit
+        # and does not preserve symlinks, and this bundle needs both (every test exe, and
+        # the libmimalloc.dylib -> libmimalloc.3.dylib SONAME chain).
+        run: tar -C bundle -czf "${{ matrix.bundle }}.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.bundle }}
+          path: ${{ matrix.bundle }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build-rust-apple:
+    name: build-rust (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: zackees/setup-soldr@v0
+        with:
+          cache: true
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+          build-cache-mode: full
+      - name: Prepare blessed cross toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: soldr prepare --target "$TARGET" --github-env "$GITHUB_ENV"
+      - name: Keep the cross-built code unwindable (frame pointers)
+        # Pre-existing gap #277 §4 asks phase B to close: build-linux sets RUSTFLAGS and
+        # CFLAGS at job level, build-cross sets neither, so the Apple test binaries are
+        # built without frame pointers while the profiler walks frame pointers on every
+        # non-Windows platform.
+        #
+        # Copying build-linux's job-level `env:` here would be dead: `soldr prepare` has
+        # already exported CARGO_ENCODED_RUSTFLAGS (which cargo lets shadow RUSTFLAGS
+        # entirely) and CFLAGS_<triple> (which cc-rs prefers over plain CFLAGS). So both
+        # have to be *appended to*, not set. CARGO_ENCODED_RUSTFLAGS is 0x1f-separated.
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          under="${TARGET//-/_}"
+          eval "existing=\${CFLAGS_${under}:-}"
+          echo "CFLAGS_${under}=${existing} -fno-omit-frame-pointer" >> "$GITHUB_ENV"
+          if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+            printf 'CARGO_ENCODED_RUSTFLAGS=%s\037-Cforce-frame-pointers=yes\n' \
+              "$CARGO_ENCODED_RUSTFLAGS" >> "$GITHUB_ENV"
+          else
+            echo 'CARGO_ENCODED_RUSTFLAGS=-Cforce-frame-pointers=yes' >> "$GITHUB_ENV"
+          fi
+      - name: The frame-pointer flags must actually be in the build's environment
+        # A flag that never reaches the compiler is this repository's most-repeated CI
+        # bug (MI_GUARDED, docs/ci-gates.md). Assert on the environment the next step
+        # runs with, not on what the previous step intended to write.
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          eval "cflags=\${CFLAGS_${TARGET//-/_}:-}"
+          case "$cflags" in *-fno-omit-frame-pointer*) ;; *)
+            echo "::error::CFLAGS_${TARGET//-/_} lost -fno-omit-frame-pointer: '$cflags'"; exit 1;; esac
+          case "${CARGO_ENCODED_RUSTFLAGS:-}" in *force-frame-pointers*) ;; *)
+            echo "::error::CARGO_ENCODED_RUSTFLAGS lost -Cforce-frame-pointers"; exit 1;; esac
+      - name: Build test binaries through Soldr
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          # Same shape as cross.yml's build-cross, and for the same measured reasons:
+          # pipefail is NOT on in GitHub's `bash -e`, so without it a failed cargo build
+          # reports jq's exit status and looks green; and the raw JSON is kept because
+          # piping cargo straight into jq discards every `compiler-message`, which is
+          # where the error text lives.
+          set -euo pipefail
+          run_build() {
+            local rc=0
+            eval "$1 --target $TARGET --release --message-format=json" > cargo.json || rc=$?
+            jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' cargo.json > bins.txt
+            if [ "$rc" -ne 0 ]; then
+              jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' cargo.json >&2
+            fi
+            return "$rc"
+          }
+          # Plain `cargo`, NOT `soldr cargo` -- see the long note in cross.yml's
+          # build-cross: the wrapper drops mi_prof_* symbols at link time on these targets.
+          #
+          # No soldr#1969 cache-bypass retry here, deliberately: that retry re-runs
+          # `${cmd/soldr/soldr --no-cache}`, and with `soldr` absent from cmd the
+          # substitution is a no-op, so the "retry" would just run the identical command
+          # a second time and report the same failure twice. (cross.yml carries the same
+          # dead retry; it is left alone here so this PR does not change the control arm
+          # of #277 phase B's comparison.)
+          run_build "cargo test -p mimalloc-pprof --no-run"
+          test -s bins.txt
+          mkdir -p "dist/$TARGET"
+          xargs -r -a bins.txt -I{} cp {} "dist/$TARGET/"
+          if ! ls "dist/$TARGET"/t3_stats-* >/dev/null 2>&1; then
+            echo "::error::t3_stats was not built for $TARGET. Staged binaries:"
+            ls -1 "dist/$TARGET" || echo "  (none)"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-test-bins-${{ matrix.target }}
+          path: rust/dist/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  run-macos:
+    # The point of the whole workflow: one macOS VM, one queue slot, everything serial.
+    needs: [build-macos, build-rust-apple]
+    runs-on: macos-latest
+    # Everything this job does is serial, so a hung test would otherwise hold the very
+    # macOS slot this workflow exists to stop wasting. Observed end-to-end: ~1m40s.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-macos-*
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rust-test-bins-*
+          path: rust-bins
+      - name: Unpack the bundles
+        run: |
+          set -euo pipefail
+          for archive in artifacts/*/*.tar.gz; do
+            name=$(basename "$archive" .tar.gz)
+            mkdir -p "bundle/$name"
+            tar -C "bundle/$name" -xzf "$archive"
+          done
+          # A cross-built binary that will not even load is the failure this whole phase
+          # risks, so say what these files are before running anything.
+          file bundle/macos-arm64-release/mimalloc-test-api
+          ls -l bundle/macos-arm64-release | head -40
+
+      - name: ctest (macos-latest) equivalent -- macos-arm64-release
+        run: |
+          python3 ci/run_test_bundle.py bundle/macos-arm64-release \
+            --junit "$GITHUB_WORKSPACE/bundle-release.xml"
+      - name: ctest-debug-full (macos-latest) equivalent -- macos-arm64-debug-full
+        # Carries the six run-negative.cmake controls and the DYLD_INSERT_LIBRARIES
+        # interposition test; run serially after the release bundle, never alongside it.
+        run: |
+          python3 ci/run_test_bundle.py bundle/macos-arm64-debug-full \
+            --junit "$GITHUB_WORKSPACE/bundle-debug-full.xml"
+
+      - name: Install Rosetta if x86_64 binaries cannot run
+        run: |
+          if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+      - name: Run the cross-built Rust test binaries
+        # Replaces cross.yml's `test (aarch64-apple-darwin)` and
+        # `test (x86_64-apple-darwin)`. Those rows have `pprof: false`, so there is no
+        # pprof-parses-a-dump step here either -- parity, not a silent reduction.
+        # These link MI_STATIC_LIB, so Rosetta is translating an ordinary static binary;
+        # no dylib interposition is involved.
+        run: |
+          set -euo pipefail
+          for target_dir in rust-bins/rust-test-bins-*; do
+            target=${target_dir#rust-bins/rust-test-bins-}
+            echo "::group::$target"
+            chmod +x "$target_dir"/*
+            for test_binary in "$target_dir"/*; do
+              case "$target" in
+                x86_64-*) arch -x86_64 "$test_binary" --test-threads=4 ;;
+                *) "$test_binary" --test-threads=4 ;;
+              esac
+            done
+            echo "::endgroup::"
+          done
+
+      - name: Memory gate -- 8 runs from the release bundle
+        run: |
+          set -euo pipefail
+          exe="$PWD/bundle/macos-arm64-release/mimalloc-test-memory-gate"
+          for i in 1 2 3 4 5 6 7 8; do
+            MI_BENCH_JSON="$PWD/result-$i.json" "$exe" > /dev/null
+          done
+          # A gate binary that crashed writes no JSON, the glob stays unexpanded, and
+          # every downstream error would then be indistinguishable from "this lane has no
+          # baseline yet" -- i.e. a green step. Count first.
+          # Counted with a glob, not `ls | wc -l`: under `set -o pipefail` a pipeline
+          # whose `ls` finds nothing fails, and the failing assignment would then kill the
+          # step before it could say why.
+          count=0
+          for produced in result-*.json; do
+            if [ -e "$produced" ]; then count=$((count + 1)); fi
+          done
+          if [ "$count" -ne 8 ]; then
+            echo "::error::only $count of 8 memory-gate runs produced JSON"
+            exit 1
+          fi
+          cat result-1.json
+          # --arch/--compiler give this lane its own baseline. Without them it would be
+          # compared against ci/memory-baselines/macos-pprof1.json, which Apple clang
+          # recorded on this same runner -- a cross-toolchain comparison dressed as a
+          # regression check (#277 phase B).
+          #
+          # "Is this lane new?" is decided by `where`, which answers 3 for "no baseline"
+          # and 2 for "cannot read this run". `check` collapses both into 2, so gating the
+          # yellow bootstrap path on check's own status would report an unreadable or
+          # missing result as a bootstrap and exit green.
+          rc=0
+          python3 ci/memory_gate.py where --arch arm64 --compiler soldr-clang-21 result-1.json || rc=$?
+          case "$rc" in
+            0)
+              python3 ci/memory_gate.py check --arch arm64 --compiler soldr-clang-21 result-*.json
+              ;;
+            3)
+              echo "::warning::No committed baseline for the soldr arm64 lane yet -- bootstrap it from this run's memory-gate artifact."
+              # `check` exits 2 here by construction: the probe just proved the baseline is
+              # absent, so its status carries no information -- but its report does.
+              python3 ci/memory_gate.py check --arch arm64 --compiler soldr-clang-21 result-*.json || true
+              ;;
+            *)
+              echo "::error::memory_gate could not read this run's JSON (rc=$rc)"
+              exit 1
+              ;;
+          esac
+      - name: Positive control -- the gate must catch an injected leak
+        run: |
+          set -euo pipefail
+          exe="$PWD/bundle/macos-arm64-leak/mimalloc-test-memory-gate"
+          for i in 1 2 3 4 5 6 7 8; do
+            MI_BENCH_JSON="$PWD/leak-$i.json" "$exe" > /dev/null || true
+          done
+          # The leak build is *expected* to exit non-zero (hence `|| true` above), which
+          # makes the file count the only evidence that it ran at all.
+          count=0
+          for produced in leak-*.json; do
+            if [ -e "$produced" ]; then count=$((count + 1)); fi
+          done
+          if [ "$count" -ne 8 ]; then
+            echo "::error::only $count of 8 leak-control runs produced JSON"
+            exit 1
+          fi
+          # `control` requires `check` to FAIL. A missing baseline is not a failure, it is
+          # a bootstrap, so before this lane's baseline is committed the control would go
+          # red for the wrong reason. Ask memory_gate.py where the baseline lives rather
+          # than hardcoding a name it computes -- and distinguish "no baseline" (3) from
+          # "cannot read this run" (2), which must stay a hard failure.
+          rc=0
+          python3 ci/memory_gate.py where --arch arm64 --compiler soldr-clang-21 leak-1.json || rc=$?
+          case "$rc" in
+            0)
+              python3 ci/memory_gate.py control --arch arm64 --compiler soldr-clang-21 leak-*.json
+              ;;
+            3)
+              echo "::warning::the soldr arm64 lane has no committed baseline yet, so its positive control cannot run. Commit the baseline, then this becomes a hard gate."
+              ;;
+            *)
+              echo "::error::memory_gate could not read the leak control's JSON (rc=$rc)"
+              exit 1
+              ;;
+          esac
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-gate-macos-arm64-soldr
+          # The leak runs too: they are what a reader needs to see why the control did or
+          # did not fire, and the gate runs are what the baseline is bootstrapped from.
+          path: |
+            result-*.json
+            leak-*.json
+          if-no-files-found: error
+
+      - name: Native compile-compat check (Xcode clang, no tests)
+        # The bundles are built by soldr's clang against soldr's SDK. This is the only
+        # thing on this runner that still uses Xcode's compiler and headers, and it
+        # catches compile-only breakage (an Apple-clang-specific rejection, an SDK
+        # header change) that a cross build would not. It deliberately runs NO tests --
+        # the bundles do that -- so it costs a configure and a build, not a VM.
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # Must stay in step with c-unit.yml's `ctest` job (`cmake -B build -DMI_PPROF=ON`,
+          # built `--config Release`): this tree is the native half of the coverage
+          # comparison below, so if that job's flags change and these do not, the
+          # comparison silently stops describing the job being replaced. CMAKE_BUILD_TYPE
+          # is spelled out because there it is implied -- CMakeLists.txt (~137-145)
+          # defaults it to Release from the binary directory's name.
+          cmake -B native-release -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build native-release --config Release --parallel
+          cc --version
+      - name: Enumerate what the native runner's own ctest would run
+        # `--show-only` needs a configured tree, not a built one, so the debug-full side
+        # of the coverage comparison costs a configure and nothing more.
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # Same pairing as above, against c-unit.yml's `ctest-debug-full` job
+          # (`cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON`, built `--config Debug`).
+          # Release is not a typo: that job passes no CMAKE_BUILD_TYPE, its binary
+          # directory is `build`, and MI_DEBUG_FULL sets MI_DEBUG=3 independently of the
+          # build type -- so Release+MI_DEBUG_FULL is what it actually compiles.
+          cmake -B native-debug-full -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DCMAKE_BUILD_TYPE=Release
+          ctest --test-dir native-release --show-only=json-v1 > native-release.json
+          ctest --test-dir native-debug-full --show-only=json-v1 > native-debug-full.json
+      - name: Coverage -- the bundles must run every test the native runner would
+        if: ${{ !cancelled() }}
+        run: |
+          python3 ci/bundle_coverage.py \
+            --compare "ctest (macos-latest)" native-release.json bundle/macos-arm64-release/tests.json \
+            --compare "ctest-debug-full (macos-latest)" native-debug-full.json bundle/macos-arm64-debug-full/tests.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-bundle-results
+          path: |
+            bundle-release.xml
+            bundle-debug-full.xml
+            native-release.json
+            native-debug-full.json
+          if-no-files-found: warn
+          retention-days: 7

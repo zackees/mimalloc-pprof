@@ -31,6 +31,7 @@ BUNDLE_TESTS = Path(__file__).resolve().parents[1] / "bundle_tests.py"
 RUN_BUNDLE = Path(__file__).resolve().parents[1] / "run_test_bundle.py"
 
 BUILD = Path("/build") if os.name != "nt" else Path("C:/build")
+BUNDLE = bundle_tests.BUNDLE_PLACEHOLDER
 
 
 def _payload() -> object:
@@ -197,6 +198,83 @@ class PathRewritingTest(unittest.TestCase):
         with self.assertRaises(bundle_tests.BundleError) as caught:
             bundle_tests.convert(payload, BUILD)
         self.assertIn("t-outside", str(caught.exception))
+
+
+class LeakedAbsolutePathTest(unittest.TestCase):
+    """Phase A only validated argv[0]; phase B ships bundles to another machine.
+
+    A path outside the build tree is not rewritten (PathRewriter only knows the build
+    prefix), so before this scan it was copied into the manifest verbatim and pointed at a
+    directory the macOS/Windows runner does not have. Review follow-up on PR #279.
+    """
+
+    def test_an_absolute_path_in_a_later_argv_element_is_refused(self) -> None:
+        payload = _wrap(
+            _test_entry(
+                "t-argv", [f"{BUILD.as_posix()}/mimalloc-test-api", "/home/runner/work/src/x.txt"]
+            )
+        )
+        with self.assertRaises(bundle_tests.BundleError) as caught:
+            bundle_tests.convert(payload, BUILD)
+        self.assertIn("t-argv", str(caught.exception))
+        self.assertIn("argv[1]", str(caught.exception))
+
+    def test_an_absolute_path_in_an_env_value_is_refused(self) -> None:
+        payload = _wrap(
+            _test_entry(
+                "t-env",
+                [f"{BUILD.as_posix()}/mimalloc-test-api"],
+                [{"name": "ENVIRONMENT", "value": ["SOME_DIR=/opt/toolchain/lib"]}],
+            )
+        )
+        with self.assertRaises(bundle_tests.BundleError) as caught:
+            bundle_tests.convert(payload, BUILD)
+        self.assertIn("env[SOME_DIR]", str(caught.exception))
+
+    def test_an_absolute_working_directory_is_refused(self) -> None:
+        payload = _wrap(
+            _test_entry(
+                "t-cwd",
+                [f"{BUILD.as_posix()}/mimalloc-test-api"],
+                [{"name": "WORKING_DIRECTORY", "value": "/some/source/tree"}],
+            )
+        )
+        with self.assertRaises(bundle_tests.BundleError) as caught:
+            bundle_tests.convert(payload, BUILD)
+        self.assertIn("cwd", str(caught.exception))
+
+    def test_a_pathsep_joined_value_reports_the_leaking_element(self) -> None:
+        joined = os.pathsep.join([f"{BUNDLE}/lib", "/opt/toolchain/lib"])
+        test = bundle_tests.BundledTest(name="t", argv=[f"{BUNDLE}/exe"], env={"MY_PATH": joined})
+        self.assertEqual(bundle_tests.leaked_paths(test), ["env[MY_PATH]: /opt/toolchain/lib"])
+
+    def test_a_windows_drive_path_is_absolute_even_on_linux(self) -> None:
+        # Every cross bundle is produced on Linux, where os.path.isabs("C:/build/x") is
+        # False -- so a Windows bundle's leak would pass unnoticed without this.
+        self.assertTrue(bundle_tests.looks_absolute("C:/build/x"))
+        self.assertTrue(bundle_tests.looks_absolute("C:\\build\\x"))
+        self.assertTrue(bundle_tests.looks_absolute("\\\\server\\share"))
+        self.assertFalse(bundle_tests.looks_absolute("relative/path"))
+        self.assertFalse(bundle_tests.looks_absolute("MIMALLOC_VERBOSE=1"))
+
+    def test_relative_and_placeholder_values_are_accepted(self) -> None:
+        test = bundle_tests.BundledTest(
+            name="t",
+            argv=[f"{BUNDLE}/exe", "reentrant"],
+            env={"A": "1", "B": f"{BUNDLE}/libmimalloc.dylib"},
+            cwd=BUNDLE,
+        )
+        self.assertEqual(bundle_tests.leaked_paths(test), [])
+
+    def test_the_manifest_records_no_absolute_build_directory(self) -> None:
+        # `generated_from.build_dir` used to be the one host path left in tests.json,
+        # which made "the manifest contains zero absolute paths" untrue as stated.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "bundle"
+            out.mkdir()
+            bundle_tests.write_manifest(out, [], Path(tmp) / "build-debug-full", "Debug")
+            manifest = json.loads((out / "tests.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["generated_from"]["build_dir"], "build-debug-full")
 
 
 class PropertyHandlingTest(unittest.TestCase):

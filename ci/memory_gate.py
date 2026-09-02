@@ -21,12 +21,21 @@ Usage:
     memory_gate.py check   [<result.json> ...]   # no paths: build/run the binary itself
     memory_gate.py update  <result.json> [more.json ...]   # deliberate, reviewed act
     memory_gate.py control <result.json> [more.json ...]   # positive control: must FAIL
+    memory_gate.py where   <result.json>                   # 0 = baseline exists, 3 = none
+
+`--arch <name>` and `--compiler <name>` (accepted by every command) declare the
+toolchain identity the binary cannot know about itself, and become part of the baseline
+file's name. #277 phase B needs them: an arm64 macOS run from a soldr-cross-built bundle
+and an arm64 macOS run from an Xcode-built tree are the same `platform` on the same
+`macos-latest` runner, and comparing one against the other's committed peak would be a
+cross-toolchain comparison dressed as a regression check. Omitting both keeps the legacy
+`<platform>-pprof<N>.json` name, so no existing baseline moves.
 
 With no JSON paths, `check` locates the built `mimalloc-test-memory-gate` binary,
 runs it RUNS_EXPECTED times (see run_gate_binary), and checks those results -- this
 is what makes `python ci/memory_gate.py check` alone reproduce the CI job locally.
 
-Exit codes: 0 pass, 1 regression, 2 usage/IO error.
+Exit codes: 0 pass, 1 regression, 2 usage/IO error, 3 (`where` only) no baseline yet.
 """
 
 from __future__ import annotations
@@ -55,6 +64,14 @@ class Counters(TypedDict):
 
 class Result(TypedDict):
     """One run of test-memory-gate. Mirrors the JSON that MI_BENCH_JSON writes.
+
+    Two optional keys are written by the *caller* rather than by test-memory-gate.c and
+    so are read through `identity()` instead of being declared here (this project pins
+    pyright to pythonVersion 3.9, where `NotRequired` does not exist): `arch` and
+    `compiler`. What they distinguish is invisible to the binary: an arm64 macOS run from
+    a soldr-cross-built bundle and an arm64 macOS run from an Xcode-built tree report the
+    same `platform` on the same runner while being different toolchains with legitimately
+    different peaks (#277 phase B).
 
     Declared rather than left as dict[str, Any] because every field here is indexed by
     string literal below. A typo in one of those keys would previously have been a
@@ -206,10 +223,29 @@ def run_gate_binary(binary: Path, runs: int = RUNS_EXPECTED) -> list[str]:
     return result_paths
 
 
+def baseline_key(result: Result) -> tuple[str, ...]:
+    """The identity a baseline file is matched on: platform, arch, compiler, MI_PPROF.
+
+    MI_PPROF changes the legitimate peak (rule 4 puts the profiler arena in process
+    memory), so ON and OFF get separate baselines rather than one padded threshold. Arch
+    and compiler joined in for #277 phase B: `macos` alone stopped being a sufficient key
+    the moment the same `macos-latest` runner started executing both an Xcode-built binary
+    and a soldr-cross-built one. They are optional, so every existing baseline
+    (`linux-pprof1.json`, `windows-pprof1.json`, `macos-pprof1.json`) keeps its name and
+    keeps matching the runs that produced it -- a new toolchain asks for its own file
+    rather than silently borrowing another compiler's number.
+    """
+    parts = [result["platform"]]
+    for field in IDENTITY_FIELDS:
+        value = identity(result, field)
+        if value:
+            parts.append(value)
+    parts.append("pprof{}".format(result["mi_pprof"]))
+    return tuple(parts)
+
+
 def baseline_path(result: Result) -> Path:
-    # MI_PPROF changes the legitimate peak (rule 4 puts the profiler arena in process
-    # memory), so ON and OFF get separate baselines rather than one padded threshold.
-    return BASELINE_DIR / "{}-pprof{}.json".format(result["platform"], result["mi_pprof"])
+    return BASELINE_DIR / ("-".join(baseline_key(result)) + ".json")
 
 
 def load(path: str | Path) -> Result:
@@ -219,14 +255,35 @@ def load(path: str | Path) -> Result:
         return cast(Result, json.load(f))
 
 
-def load_runs(paths: list[str]) -> tuple[Result, list[float], float]:
+#: Optional identity keys (see Result's docstring). Order fixes the baseline file name.
+IDENTITY_FIELDS = ("arch", "compiler")
+
+
+def identity(record: Result, field: str) -> str | None:
+    value = cast("dict[str, object]", record).get(field)
+    return value if isinstance(value, str) and value else None
+
+
+def stamp(result: Result, arch: str | None, compiler: str | None) -> Result:
+    """Record the toolchain identity the binary cannot know about itself."""
+    fields = cast("dict[str, object]", result)
+    if arch:
+        fields["arch"] = arch
+    if compiler:
+        fields["compiler"] = compiler
+    return result
+
+
+def load_runs(
+    paths: list[str], arch: str | None = None, compiler: str | None = None
+) -> tuple[Result, list[float], float]:
     """Load N runs of the same configuration and return (representative, peak_mb, spread%).
 
     The representative record is the run with the minimum gated peak; its counters are
     the ones checked, so the counter assertions and the peak refer to the same run.
     """
-    runs = [load(p) for p in paths]
-    keys = {(r["platform"], r["mi_pprof"], r["gated_metric"]) for r in runs}
+    runs = [stamp(load(p), arch, compiler) for p in paths]
+    keys = {(baseline_key(r), r["gated_metric"]) for r in runs}
     if len(keys) != 1:
         raise ValueError(f"runs are not from the same configuration: {sorted(keys)}")
     peaks = sorted(r["peak_mb"] for r in runs)
@@ -256,7 +313,9 @@ def report_runs(peaks: list[float], spread: float) -> None:
         )
 
 
-def control(result_paths: list[str]) -> int:
+def control(
+    result_paths: list[str], *, arch: str | None = None, compiler: str | None = None
+) -> int:
     """Positive control: require the gate to FAIL on a deliberately leaky build.
 
     A gate that has never been observed to fire proves nothing -- it can be silently
@@ -267,7 +326,7 @@ def control(result_paths: list[str]) -> int:
     Requiring inject_leak to be *set* is what keeps this from being usable as an escape
     hatch -- it cannot be pointed at a real regression to turn it green.
     """
-    result, _, _ = load_runs(result_paths)
+    result, _, _ = load_runs(result_paths, arch, compiler)
     if not result.get("inject_leak", 0):
         print(
             "REFUSING: positive control requires a build with MI_BENCH_INJECT_LEAK "
@@ -277,7 +336,7 @@ def control(result_paths: list[str]) -> int:
         return 2
 
     print("=== positive control: the gate is expected to FAIL below ===")
-    rc = check(result_paths, _control=True)
+    rc = check(result_paths, _control=True, arch=arch, compiler=compiler)
     if rc == 1:
         print("\nPASS (control): the gate detected the injected leak.")
         return 0
@@ -287,8 +346,14 @@ def control(result_paths: list[str]) -> int:
     return 1
 
 
-def check(result_paths: list[str], _control: bool = False) -> int:
-    result, peaks, spread = load_runs(result_paths)
+def check(
+    result_paths: list[str],
+    _control: bool = False,
+    *,
+    arch: str | None = None,
+    compiler: str | None = None,
+) -> int:
+    result, peaks, spread = load_runs(result_paths, arch, compiler)
 
     if result.get("inject_leak", 0) and not _control:
         # An injected-leak run is a positive control; it is expected to fail and must
@@ -303,8 +368,15 @@ def check(result_paths: list[str], _control: bool = False) -> int:
     if not bpath.exists():
         print(f"No baseline at {bpath}.")
         report_runs(peaks, spread)
-        print("This platform/config has never been recorded. Create it with:")
-        print("    python ci/memory_gate.py update {}".format(" ".join(result_paths)))
+        print(
+            "This platform/arch/compiler/config ({}) has never been recorded. "
+            "Create it with:".format("+".join(baseline_key(result)))
+        )
+        print(
+            "    python ci/memory_gate.py update{} {}".format(
+                _identity_flags(arch, compiler), " ".join(result_paths)
+            )
+        )
         return 2
     base = load(bpath)
 
@@ -313,9 +385,16 @@ def check(result_paths: list[str], _control: bool = False) -> int:
     peak, base_peak = peaks[0], base["peak_mb"]
     allowed = base_peak * (1.0 + PEAK_TOLERANCE)
 
-    print(
-        "platform={} metric={} mi_pprof={}".format(result["platform"], metric, result["mi_pprof"])
-    )
+    print("baseline={} metric={}  ({})".format("+".join(baseline_key(result)), metric, bpath.name))
+    base_compiler = identity(base, "compiler")
+    if base_compiler and not identity(result, "compiler"):
+        # Not fatal: the file still keys on `macos`, so this is the legacy match working
+        # as intended. Saying so keeps a reader from assuming the number was recorded
+        # with the toolchain that just produced it.
+        print(
+            f"  NOTE: this baseline was recorded with compiler={base_compiler!r}; this run "
+            f"declared none (pass --compiler to give a new toolchain its own baseline)."
+        )
     print(
         f"  {metric:<22} {peak:>9.1f} MB   baseline {base_peak:>9.1f} MB   allowed {allowed:>9.1f} MB"
     )
@@ -363,7 +442,11 @@ def check(result_paths: list[str], _control: bool = False) -> int:
         for f in failures:
             print(f"  - {f}")
         print("\nIf this growth is intentional, re-baseline deliberately:")
-        print("    python ci/memory_gate.py update {}".format(" ".join(result_paths)))
+        print(
+            "    python ci/memory_gate.py update{} {}".format(
+                _identity_flags(arch, compiler), " ".join(result_paths)
+            )
+        )
         print("and say why in the PR. Do not re-baseline to make a red gate green.")
         return 1
 
@@ -371,8 +454,34 @@ def check(result_paths: list[str], _control: bool = False) -> int:
     return 0
 
 
-def update(result_paths: list[str]) -> int:
-    result, peaks, spread = load_runs(result_paths)
+def _identity_flags(arch: str | None, compiler: str | None) -> str:
+    return (f" --arch {arch}" if arch else "") + (f" --compiler {compiler}" if compiler else "")
+
+
+def where(result_paths: list[str], *, arch: str | None = None, compiler: str | None = None) -> int:
+    """Print the baseline file a run of this identity is compared against.
+
+    Exit 0 if it exists, **3** if it does not, 2 if this run's JSON could not be read.
+
+    The three-way split is the point. `check` also exits 2 for "no baseline", but it exits
+    2 for an unreadable or absent result file as well -- so a workflow that treats `check`
+    rc=2 as "bootstrap me" turns a *crashed gate binary* into a green run with a
+    reassuring warning. Gating on this probe instead keeps those two apart: 3 means the
+    lane is genuinely new, 2 means something is wrong with the run itself.
+
+    #277 phase B needs the probe anyway, because the positive control cannot run before a
+    baseline exists (`control` requires `check` to fail, and a missing baseline is not a
+    failure), and hardcoding the filename in YAML would drift from what this module
+    computes from platform/arch/compiler/MI_PPROF.
+    """
+    result, _, _ = load_runs(result_paths, arch, compiler)
+    path = baseline_path(result)
+    print(path)
+    return 0 if path.exists() else 3
+
+
+def update(result_paths: list[str], *, arch: str | None = None, compiler: str | None = None) -> int:
+    result, peaks, spread = load_runs(result_paths, arch, compiler)
     if result.get("inject_leak", 0):
         print("REFUSING to baseline a run with MI_BENCH_INJECT_LEAK set.")
         return 2
@@ -392,8 +501,42 @@ def update(result_paths: list[str]) -> int:
     return 0
 
 
+def take_option(argv: list[str], name: str) -> tuple[list[str], str | None]:
+    """Pull `--name VALUE` (or `--name=VALUE`) out of argv, anywhere in it.
+
+    Hand-rolled rather than argparse so the positional shape this script has always had
+    (`memory_gate.py <command> <result.json>...`, with a glob expanding to any number of
+    paths) is untouched, and so the module-level `check`/`update`/`control` functions that
+    ci/verify_local.py calls directly keep the same signature.
+    """
+    rest: list[str] = []
+    value: str | None = None
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == f"--{name}":
+            if index + 1 >= len(argv):
+                raise ValueError(f"--{name} needs a value")
+            value = argv[index + 1]
+            index += 2
+            continue
+        if token.startswith(f"--{name}="):
+            value = token.split("=", 1)[1]
+            index += 1
+            continue
+        rest.append(token)
+        index += 1
+    return rest, value
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or argv[1] not in ("check", "update", "control"):
+    try:
+        argv, arch = take_option(list(argv), "arch")
+        argv, compiler = take_option(argv, "compiler")
+    except ValueError as e:
+        print(f"error: {e}")
+        return 2
+    if len(argv) < 2 or argv[1] not in ("check", "update", "control", "where"):
         print(__doc__)
         return 2
     result_paths = argv[2:]
@@ -408,8 +551,8 @@ def main(argv: list[str]) -> int:
         print(__doc__)
         return 2
     try:
-        cmd = {"check": check, "update": update, "control": control}[argv[1]]
-        return cmd(result_paths)
+        cmd = {"check": check, "update": update, "control": control, "where": where}[argv[1]]
+        return cmd(result_paths, arch=arch, compiler=compiler)
     except (OSError, ValueError, KeyError) as e:
         print(f"error: {e}")
         return 2

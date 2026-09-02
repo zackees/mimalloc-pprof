@@ -20,6 +20,7 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    `MI_PPROF=ON`, the `OFF` job green (profiler hooks disabled; upstream allocator behavior
    with independent memory-events tracking left runtime-disabled), `rust-native` green.
    MSVC **and** win-gnu are priority platforms — both, always.
+   (macOS gates run from Linux-built bundles on one runner; see #277.)
 4. **Profiler memory-safety invariant:** profiler-internal memory (sample records, intern table,
    dump buffers) comes ONLY from the raw-OS-layer arena (`_mi_os_alloc`), never from hooked
    allocation paths (`mi_malloc`/`operator new`/`GlobalAlloc`). Debug builds assert this.

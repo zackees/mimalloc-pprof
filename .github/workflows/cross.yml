@@ -236,6 +236,12 @@ jobs:
     name: test (${{ matrix.target }})
     needs: [build-linux, build-cross, build-win-gnu]
     runs-on: ${{ matrix.runner }}
+    # TODO(#277 phase B, added 2026-09-02): DELETE the two apple-darwin rows -- and the
+    # matching targets from build-cross -- after ten pushes have compared them against
+    # macos-bundles.yml's `run-macos`, which runs the same binaries on one runner instead
+    # of two. These are the rows that measured 8-14 s of execution behind up to 5h26m /
+    # 6h13m of queue wait. Informational until then.
+    continue-on-error: ${{ contains(matrix.target, 'apple-darwin') }}
     strategy:
       fail-fast: false
       matrix:

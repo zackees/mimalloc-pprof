@@ -31,7 +31,7 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 | **amalgamation-drift** | a C change that never reached the vendored copy the Rust crate compiles — which broke `main` twice before this gate existed | — |
 | **doc-snippets** (`ci/check_doc_snippets.py`) | fenced ```c examples in `README.md`/`docs/*.md` that don't compile against the real headers — caught one in PR #259 (a snippet using `mi_prof_config_t_decl`/`mi_prof_start_ex` with no `#include` at all) | `--self-test` plants a snippet calling an undeclared mimalloc function; the checker must reject it, on both gcc and clang |
 | **python-lint** | the gate scripts themselves — `ruff` + `pyright --strict` | — |
-| **zero-tracking** | correctness and footprint of `mi_option_purge_zeroes`, reported as paired interleaved A/B medians with the within-arm spread alongside | — |
+| **zero-tracking** | correctness and footprint of `mi_option_purge_zeroes`, reported as paired interleaved A/B medians with the within-arm spread alongside. Linux runs it in its own path-filtered workflow; Windows runs it as a gated step inside `run-windows` (#277 phase E), and the *correctness* half is unconditional there because `test-zero-tracking*` are ordinary ctest tests carried in every bundle | — |
 
 ## Test bundles
 
@@ -856,3 +856,140 @@ Three details worth stating, because each was an assumption that measurement ove
   was satisfied by libFuzzer's advice *to use* AddressSanitizer. Assertions about tool
   output should anchor on that tool's actual report format (`^(==[0-9]+==)?(ERROR|SUMMARY):`),
   never on a keyword that can appear in an explanatory sentence.
+
+## zero-tracking on Windows: a gated step, not a VM (#277 phase E)
+
+`zero-tracking.yml` used to be a two-row matrix, `ubuntu-latest` and `windows-latest`. The
+Windows row checked out, configured and built the tree with MSVC, ran
+`ctest -R zero-tracking`, then ran the interleaved A/B — a whole extra Windows VM per PR
+that touched `src/arena.c` or `test/bench-zero-tracking.c`. That is precisely the cost
+#277 exists to remove, so both halves moved into `windows-bundles.yml`'s single
+`run-windows` job and the matrix row is gone.
+
+The two halves did not move the same way, and the difference matters:
+
+| half | before | after |
+|---|---|---|
+| correctness (`ctest -R zero-tracking`) | Windows row, only on a matching PR | **unconditional, every push** — `test-zero-tracking` and `test-zero-tracking-enabled` are registered ctest tests, so `ci/bundle_tests.py` puts them in every bundle manifest and `run-windows` replays the whole manifest for `windows-gnu-x64-release` **and** `windows-msvc-x64-release` |
+| interleaved A/B timing | Windows row, only on a matching PR | a gated step on `run-windows`, keyed to the same paths |
+
+So the correctness gate got *stronger* (two lanes, every push, instead of one lane on a
+path-filtered PR) while the Windows job count went **down by one**.
+
+**The quiet-runner property survives.** `zero-tracking.yml`'s header explains why the A/B
+is its own workflow: a first local attempt measured a 13% regression that was really
+measurement order on a loaded machine. `run-windows` is entirely serial, so nothing else
+executes on that VM while the A/B runs, and the mitigation that actually did the work —
+interleaved, paired arms from a single binary, raw numbers rather than a verdict — is
+unchanged.
+
+**Two costs, stated:**
+
+- The Windows arm is now built by soldr's **clang-cl**, not by `cl`. It is the
+  `windows-msvc-x64-release` bundle's `mimalloc-test-zero-tracking.exe`.
+- The gate step asks the API for the PR's changed files rather than using a workflow
+  `paths:` filter (a step cannot have one). It keys on `src/arena.c`,
+  `test/bench-zero-tracking.c` and `.github/workflows/windows-bundles.yml` — deliberately
+  **not** on `zero-tracking.yml`, because editing that file does not trigger
+  `windows-bundles.yml` at all, so keying on it would promise a run the trigger cannot
+  deliver. A PR touching only `zero-tracking.yml` therefore exercises the Linux arm alone.
+  The API call **fails open**: if it errors, the A/B runs.
+
+## Release assets are cross-built, all of them (#277 phase E)
+
+`auto-release.yml` ships the shared library, the static library, the object file, the
+CMake package and pkg-config files, and the headers — including this fork's own
+`mimalloc/profile.h` and `mimalloc/memory-events.h` — for four targets, plus the
+architecture-independent vendored C amalgamation ZIP it always shipped:
+
+| asset | target | built by | consumer still needs |
+|---|---|---|---|
+| `mimalloc-pprof-macos-arm64-<tag>.tar.gz` | `aarch64-apple-darwin` | soldr clang 21 + ld64.lld, soldr's Apple SDK, on `ubuntu-latest` | — |
+| `mimalloc-pprof-macos-x86_64-<tag>.tar.gz` | `x86_64-apple-darwin` | same | — |
+| `mimalloc-pprof-windows-x64-gnu-<tag>.zip` | `x86_64-pc-windows-gnu` | soldr mingw-w64 gcc 15 (UCRT), on `ubuntu-latest` | nothing — `libgcc_s_seh-1.dll` is **shipped in the archive** |
+| `mimalloc-pprof-windows-x64-msvc-<tag>.zip` | `x86_64-pc-windows-msvc` | soldr clang-cl + lld-link, `/MD` pinned, on `ubuntu-latest` | the Visual C++ redistributable (`VCRUNTIME140.dll`, `MSVCP140.dll`) |
+| `mimalloc-pprof-c-<tag>.zip` | any | `ubuntu-latest` (source, not binaries) | a C compiler |
+
+### The decision, and the row it overrides
+
+#277's phase table said "shipped release assets stay built by the platform's own
+toolchain (state the decision)". **They are not.** Every binary asset is cross-built on
+Linux. Two owner decisions taken after that row was written force it:
+
+1. **No macOS build or test may run on a native Mac runner**, anywhere in this repository
+   (`ci/lint_no_macos_runners.py` fails the `python-lint` gate if a macOS label reappears).
+   There is no Apple toolchain available to build an Apple asset with.
+2. **Cross-compilation is a product requirement**, not a CI cost measure: mimalloc-pprof
+   ships inside cross-compiled code, so the Linux-cross-built artifact *is* the product.
+
+The second is the one that settles Windows, where a native runner does still exist.
+Building the shipped MSVC-ABI binary with `cl` on `windows-latest` while
+`windows-bundles.yml` executes the test suite from a clang-cl bundle would mean the thing
+tested and the thing shipped are different binaries. So the assets come off the same
+toolchains, the same `cmake/toolchains/soldr-<triple>.cmake` files and the same commit as
+the bundles that are actually executed — the bundles are the evidence for the assets.
+
+`c-unit.yml` keeps one native `cl` Release `ctest` job as the correctness gate for `cl`
+(CLAUDE.md rule 3). **That job ships nothing, and never did**: before this phase
+`auto-release.yml` had no binary assets at all, only the amalgamation ZIP, so there is no
+natively-built asset here to "retain".
+
+### What the release job proves before attaching anything
+
+Each lane, on the artifact rather than on the flags that produced it:
+
+- the resolved `-- Link libraries` list is exactly `pthread` (Darwin) or
+  `psapi;shell32;user32;advapi32;bcrypt` (Windows) — on Darwin this is load-bearing, since
+  without the toolchain file's find-root confinement `find_link_library()` hands the host's
+  ELF `librt.so` to a Mach-O link;
+- the Mach-O header says `ARM64` / `X86_64`, or the PE header says `pei-x86-64` /
+  `coff-x86-64`;
+- `mimalloc-redirect.dll` is installed on both Windows lanes;
+- the **whole PE import closure resolves**, via the same `ci/bundle_tests.py`
+  `resolve_runtime_dlls()` the test bundles use. This is what puts `libgcc_s_seh-1.dll` in
+  the win-gnu archive: `mimalloc.dll` imports it for `__popcountdi2`, and a missing DLL on
+  the consumer's machine is a dialog-free `0xC0000135`, not a legible error. Shipping it
+  rather than relinking `-static-libgcc` keeps the shipped binary byte-identical to the one
+  `windows-bundles.yml` tests.
+
+Every archive carries a `PROVENANCE.txt` naming the commit, the target, the compiler and
+the runtime the consumer still needs, because a user who downloads `windows-x64-msvc`
+should learn about the VC++ redistributable from the archive rather than from a loader
+error.
+
+`release` `needs:` both build jobs, `release-outcome` reports both, and the rename step
+hard-fails if fewer than five assets are present — a release that published to crates.io
+and then shipped three of its four platform archives would be a release nobody can tell is
+incomplete (issue #55 is that failure once already). `auto-release.yml` never runs on a
+pull request, so none of this wiring is exercised by CI before a tag:
+`ci/tests/test_auto_release_workflow.py` is the substitute, asserting the shape from the
+YAML itself.
+
+## Reproducing a macOS or Windows bundle from Linux (#277 phase F)
+
+```bash
+uv run ci/verify_local.py --list                            # config table + bundle table
+uv run ci/verify_local.py --bundle macos-arm64-release      # build one lane locally
+```
+
+`--bundle <name>` runs the same `soldr prepare --target <triple>` (from `rust/`, where the
+`rust-toolchain.toml` pin lives), the same `cmake/toolchains/soldr-<triple>.cmake`, the same
+matrix `cmake` flags, and the same `ci/bundle_tests.py` invocation — including the
+lane-specific `--objdump` / `--dll-search-dir` / `--check-dll-closure` /
+`--allow-msvc-runtime` arguments — that `macos-bundles.yml` and `windows-bundles.yml` use.
+It asserts the resolved `-- Link libraries` line the build jobs assert, prints the bundle
+path, the manifest's test count and every test's lowered argv, and ends with the exact
+`ci/run_test_bundle.py` command to replay it on the target OS.
+
+It stops **before** execution, which is the one step a Linux box cannot do. That is still
+most of the failure surface: a configure that picked up a host library, a link that lost
+`__interpose` or a TLS directory, an emulated-TLS import, a bundle missing a runtime DLL,
+a manifest with a leaked absolute path — all of those are build-side and all of them
+reproduce here in about a minute, instead of a push-and-wait cycle against a runner.
+
+The fourteen names are exactly the two workflows' matrices
+(`macos-{arm64,x64}-{release,debug-full,leak}`,
+`windows-{gnu,msvc}-x64-{release,debug-full,shared,leak}`), and
+`ci/tests/test_verify_local.py` parses those matrices and fails if a name, triple, cmake
+flag or `bundle_tests.py` argument drifts out of sync — the same contract the
+`--only` config table has had since phase A.

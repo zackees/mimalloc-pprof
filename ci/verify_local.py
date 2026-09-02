@@ -13,11 +13,18 @@ of each matrixed job is covered (no Windows/macOS/MSYS2), and every job's exact 
 flags/env are copied from the workflow files rather than re-derived, so drift is
 caught by `ci/tests/test_verify_local.py` rather than trusted to stay in sync by hand.
 
+`--bundle <name>` is the one thing here that is not about Linux: it reproduces a
+macOS/Windows lane of `macos-bundles.yml`/`windows-bundles.yml` on this box, through
+the same `soldr prepare`, the same `cmake/toolchains/soldr-<triple>.cmake` and the same
+`ci/bundle_tests.py` CI uses -- everything up to the execution step, which needs the
+target OS (#277 phase F).
+
 Usage:
     uv run ci/verify_local.py                        # everything fast (slow tests excluded)
     uv run ci/verify_local.py --only release,lint     # just these configs
     uv run ci/verify_local.py --slow                  # also run the long-tail ctest suite
-    uv run ci/verify_local.py --list                  # print the config table and exit
+    uv run ci/verify_local.py --list                  # print the config + bundle tables
+    uv run ci/verify_local.py --bundle macos-arm64-release   # cross-build one CI bundle
     uv run ci/verify_local.py --jobs 8                # override the worker/build budget
     uv run ci/verify_local.py --keep-going             # don't skip queued configs on a failure
     uv run ci/verify_local.py --selftest               # trivially fast dry-run, no real builds
@@ -32,6 +39,7 @@ import argparse
 import contextlib
 import dataclasses
 import io
+import json
 import os
 import re
 import shlex
@@ -43,6 +51,7 @@ import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from string import Template
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT_ROOT = ROOT / "out" / "verify"
@@ -801,6 +810,379 @@ CONFIGS: list[ConfigSpec] = [
 CONFIG_NAMES = [c.name for c in CONFIGS]
 
 
+# ---------------------------------------------------------------------------------
+# Cross bundles (#277 phase F)
+#
+# macOS and Windows are not executed here -- there is no Mac and no Windows on this box,
+# and by owner requirement there is no native Mac anywhere in this repository's CI either
+# (ci/lint_no_macos_runners.py). What IS reproducible locally is everything up to the
+# execution step: `soldr prepare` provisions the same cross toolchain the runner uses,
+# cmake/toolchains/soldr-<triple>.cmake feeds CMake nothing but what soldr exported, and
+# ci/bundle_tests.py turns the build tree into the same portable bundle the workflow
+# uploads. So a red `run-macos-x64-dockur` or `run-windows` that is really a *build* or
+# *bundling* failure can be reproduced in one command instead of a push-and-wait cycle.
+#
+# The flags below are copied verbatim out of macos-bundles.yml's and windows-bundles.yml's
+# matrices, exactly like the CONFIGS table above copies c-unit.yml's, and
+# ci/tests/test_verify_local.py parses those matrices and fails if the two drift.
+
+BUNDLE_OUT_ROOT = OUT_ROOT / "bundles"
+
+# The `-- Link libraries   : ...` line each lane's configure must resolve to. This is the
+# assertion the build jobs make, and on Darwin it is load-bearing rather than cosmetic:
+# without the toolchain file's CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY, CMakeLists.txt's
+# find_link_library() falls back to find_library() and hands the host's ELF librt.so to a
+# Mach-O link.
+DARWIN_LINK_LIBRARIES = "pthread"
+WINDOWS_LINK_LIBRARIES = "psapi;shell32;user32;advapi32;bcrypt"
+
+
+@dataclasses.dataclass(frozen=True)
+class BundleSpec:
+    """One row of a bundle workflow's build matrix, reproduced locally."""
+
+    name: str  # the matrix's `bundle:` value, and the artifact name CI uploads
+    workflow: str
+    job: str
+    triple: str
+    cmake: str  # the matrix's `cmake:` value, verbatim
+    link_libraries: str
+    # ci/bundle_tests.py arguments, verbatim from the workflow's "Bundle the tests" step.
+    # $VARS are expanded from the environment `soldr prepare` exported, not from this
+    # shell's -- MINGW_W64_CROSS_BIN only exists after a prepare.
+    bundle_args: tuple[str, ...] = ()
+
+
+BUNDLES: list[BundleSpec] = [
+    # --- macos-bundles.yml: build-macos -------------------------------------------
+    BundleSpec(
+        "macos-arm64-release",
+        "macos-bundles.yml",
+        "build-macos",
+        "aarch64-apple-darwin",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON",
+        DARWIN_LINK_LIBRARIES,
+    ),
+    BundleSpec(
+        "macos-arm64-debug-full",
+        "macos-bundles.yml",
+        "build-macos",
+        "aarch64-apple-darwin",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_TLS_MODEL_FIXED=ON",
+        DARWIN_LINK_LIBRARIES,
+    ),
+    BundleSpec(
+        "macos-arm64-leak",
+        "macos-bundles.yml",
+        "build-macos",
+        "aarch64-apple-darwin",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000",
+        DARWIN_LINK_LIBRARIES,
+    ),
+    BundleSpec(
+        "macos-x64-release",
+        "macos-bundles.yml",
+        "build-macos",
+        "x86_64-apple-darwin",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON",
+        DARWIN_LINK_LIBRARIES,
+    ),
+    BundleSpec(
+        "macos-x64-debug-full",
+        "macos-bundles.yml",
+        "build-macos",
+        "x86_64-apple-darwin",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON",
+        DARWIN_LINK_LIBRARIES,
+    ),
+    BundleSpec(
+        "macos-x64-leak",
+        "macos-bundles.yml",
+        "build-macos",
+        "x86_64-apple-darwin",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000",
+        DARWIN_LINK_LIBRARIES,
+    ),
+    # --- windows-bundles.yml: build-windows-gnu -----------------------------------
+    # --dll-search-dir turns on bundle_tests.py's transitive PE import scan: soldr's
+    # mingw-w64 links mimalloc.dll against libgcc_s_seh-1.dll, which no windows-latest
+    # runner has, and a missing DLL is a dialog-free 0xC0000135 rather than a test failure.
+    BundleSpec(
+        "windows-gnu-x64-release",
+        "windows-bundles.yml",
+        "build-windows-gnu",
+        "x86_64-pc-windows-gnu",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON",
+        WINDOWS_LINK_LIBRARIES,
+        (
+            "--objdump",
+            "$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump",
+            "--dll-search-dir",
+            "$MINGW_W64_CROSS_ROOT/x86_64-w64-mingw32/lib",
+        ),
+    ),
+    BundleSpec(
+        "windows-gnu-x64-debug-full",
+        "windows-bundles.yml",
+        "build-windows-gnu",
+        "x86_64-pc-windows-gnu",
+        "-DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_DEBUG_FULL=ON",
+        WINDOWS_LINK_LIBRARIES,
+        (
+            "--objdump",
+            "$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump",
+            "--dll-search-dir",
+            "$MINGW_W64_CROSS_ROOT/x86_64-w64-mingw32/lib",
+        ),
+    ),
+    BundleSpec(
+        "windows-gnu-x64-shared",
+        "windows-bundles.yml",
+        "build-windows-gnu",
+        "x86_64-pc-windows-gnu",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF",
+        WINDOWS_LINK_LIBRARIES,
+        (
+            "--objdump",
+            "$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump",
+            "--dll-search-dir",
+            "$MINGW_W64_CROSS_ROOT/x86_64-w64-mingw32/lib",
+        ),
+    ),
+    BundleSpec(
+        "windows-gnu-x64-leak",
+        "windows-bundles.yml",
+        "build-windows-gnu",
+        "x86_64-pc-windows-gnu",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000",
+        WINDOWS_LINK_LIBRARIES,
+        (
+            "--objdump",
+            "$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump",
+            "--dll-search-dir",
+            "$MINGW_W64_CROSS_ROOT/x86_64-w64-mingw32/lib",
+        ),
+    ),
+    # --- windows-bundles.yml: build-windows-msvc ----------------------------------
+    # No --dll-search-dir: soldr's xwin splat is import libraries only. --check-dll-closure
+    # runs the same scan anyway, and --allow-msvc-runtime is the one assumption this lane
+    # makes (VCRUNTIME140/MSVCP140 come from the Visual C++ redistributable on the runner).
+    BundleSpec(
+        "windows-msvc-x64-release",
+        "windows-bundles.yml",
+        "build-windows-msvc",
+        "x86_64-pc-windows-msvc",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON",
+        WINDOWS_LINK_LIBRARIES,
+        ("--objdump", "llvm-objdump", "--check-dll-closure", "--allow-msvc-runtime"),
+    ),
+    BundleSpec(
+        "windows-msvc-x64-debug-full",
+        "windows-bundles.yml",
+        "build-windows-msvc",
+        "x86_64-pc-windows-msvc",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON",
+        WINDOWS_LINK_LIBRARIES,
+        ("--objdump", "llvm-objdump", "--check-dll-closure", "--allow-msvc-runtime"),
+    ),
+    BundleSpec(
+        "windows-msvc-x64-shared",
+        "windows-bundles.yml",
+        "build-windows-msvc",
+        "x86_64-pc-windows-msvc",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF",
+        WINDOWS_LINK_LIBRARIES,
+        ("--objdump", "llvm-objdump", "--check-dll-closure", "--allow-msvc-runtime"),
+    ),
+    BundleSpec(
+        "windows-msvc-x64-leak",
+        "windows-bundles.yml",
+        "build-windows-msvc",
+        "x86_64-pc-windows-msvc",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000",
+        WINDOWS_LINK_LIBRARIES,
+        ("--objdump", "llvm-objdump", "--check-dll-closure", "--allow-msvc-runtime"),
+    ),
+]
+
+BUNDLE_NAMES = [b.name for b in BUNDLES]
+
+
+def soldr_prepare(triple: str, log: Path) -> dict[str, str] | None:
+    """Run `soldr prepare --target <triple>` and return the environment it exported.
+
+    Mirrors the workflows' "Prepare the soldr <X> toolchain" step, including its working
+    directory: `soldr prepare` resolves rustc from a rust-toolchain.toml at or above the
+    cwd, and this repository's lives in rust/.
+
+    Returns None (after logging) if soldr is missing or the prepare failed. The exported
+    environment is returned rather than applied to os.environ so a caller can hand it to
+    exactly the subprocesses that should see it.
+    """
+    if shutil.which("soldr") is None:
+        log_write(log, "\n[verify_local] soldr not found on PATH\n")
+        return None
+    env_file = BUNDLE_OUT_ROOT / f"soldr-{triple}.env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text("", encoding="utf-8")  # --github-env appends; start clean
+    rc, _ = run_logged(
+        ["soldr", "prepare", "--target", triple, "--github-env", str(env_file)],
+        cwd=ROOT / "rust",
+        log=log,
+    )
+    if rc:
+        return None
+    exported: dict[str, str] = {}
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        key, sep, value = line.partition("=")
+        # GitHub's env-file format also has a `KEY<<DELIM` heredoc shape. soldr does not
+        # emit it today; parse it wrong silently and the toolchain file would fail with a
+        # confusing "CC_<triple> is not set" much later, so refuse instead.
+        if not sep or "<<" in key:
+            log_write(log, f"\n[verify_local] unparseable soldr env line: {line!r}\n")
+            return None
+        exported[key] = value
+    return exported
+
+
+def build_one_bundle(spec: BundleSpec, jobs: int, log: Path) -> tuple[bool, Path | None]:
+    """Configure, build and bundle one cross lane. Returns (ok, bundle dir)."""
+    out = BUNDLE_OUT_ROOT / spec.name
+    build = out / "build"
+    bundle = out / "bundle"
+    out.mkdir(parents=True, exist_ok=True)
+
+    exported = soldr_prepare(spec.triple, log)
+    if exported is None:
+        return False, None
+    # soldr prepends its own LLVM/ninja/cmake bin directories to PATH; llvm-objdump on the
+    # MSVC lane comes from there, not from this host.
+    env = dict(exported)
+
+    ctx = RunCtx(name=spec.name, dir=out, log=log, jobs=jobs, slow=False)
+    rc, configure_out = run_logged(
+        [
+            cmake_bin(),
+            "-S",
+            str(ROOT),
+            "-B",
+            str(build),
+            "-G",
+            "Ninja",
+            *shlex.split(spec.cmake),
+            "--toolchain",
+            str(ROOT / "cmake" / "toolchains" / f"soldr-{spec.triple}.cmake"),
+            "--log-level=VERBOSE",
+        ],
+        cwd=ROOT,
+        log=log,
+        env=env,
+    )
+    if rc:
+        return False, None
+    # The same assertion the build job makes, on the RESOLVED list rather than on the
+    # option that was passed in.
+    if not re.search(
+        rf"^-- Link libraries *: *{re.escape(spec.link_libraries)}$", configure_out, re.MULTILINE
+    ):
+        log_write(
+            log,
+            f"\n[verify_local] the {spec.triple} link resolved unexpected libraries; "
+            f"expected exactly '{spec.link_libraries}'\n",
+        )
+        for line in configure_out.splitlines():
+            if "Link libraries" in line:
+                log_write(log, f"  {line}\n")
+        return False, None
+
+    if cmake_build(ctx, build, env=env):
+        return False, None
+
+    if bundle.exists():
+        shutil.rmtree(bundle)
+    expanded: list[str] = []
+    for arg in spec.bundle_args:
+        try:
+            expanded.append(Template(arg).substitute(env))
+        except KeyError as exc:
+            log_write(
+                log,
+                f"\n[verify_local] {arg!r} needs {exc} which `soldr prepare --target "
+                f"{spec.triple}` did not export\n",
+            )
+            return False, None
+    rc, _ = run_logged(
+        [
+            sys.executable,
+            str(ROOT / "ci" / "bundle_tests.py"),
+            str(build),
+            str(bundle),
+            *expanded,
+        ],
+        cwd=ROOT,
+        log=log,
+        env=env,
+    )
+    if rc:
+        return False, None
+    return True, bundle
+
+
+def summarize_bundle(spec: BundleSpec, bundle: Path) -> None:
+    """Print the bundle path and a manifest summary -- what CI would have uploaded."""
+    manifest = json.loads((bundle / "tests.json").read_text(encoding="utf-8"))
+    tests = manifest.get("tests", [])
+    files = sorted(p.name for p in bundle.iterdir() if p.name != "tests.json")
+    libs = [f for f in files if f.endswith((".dylib", ".dll", ".so"))]
+    print()
+    print(f"bundle    : {bundle}")
+    print(f"lane      : {spec.workflow} :: {spec.job} ({spec.triple})")
+    print(f"cmake     : {spec.cmake}")
+    print(f"tests     : {len(tests)}")
+    print(f"files     : {len(files)} ({len(libs)} shared libraries)")
+    for lib in libs:
+        print(f"    lib   : {lib}")
+    for test in tests:
+        argv = test.get("argv", [])
+        extra: list[str] = []
+        if test.get("expect_nonzero"):
+            extra.append("expect-nonzero")
+        if test.get("env"):
+            extra.append(f"env[{len(test['env'])}]")
+        suffix = f"  [{', '.join(extra)}]" if extra else ""
+        print(f"    test  : {test.get('name')}  <- {' '.join(argv)}{suffix}")
+    print()
+    print("This host cannot execute it -- that is the one step this tool cannot")
+    print("reproduce. Copy the directory to the target OS and replay it there with:")
+    print(f"    uv run ci/run_test_bundle.py {bundle}")
+    print("(CI does the same, from the artifact `bundle-" + spec.name + "`.)")
+
+
+def run_bundle_build(name: str, jobs: int) -> int:
+    """`--bundle <name>`: reproduce one cross lane's build+bundle stage locally."""
+    spec = next((b for b in BUNDLES if b.name == name), None)
+    if spec is None:
+        print(f"error: unknown bundle {name!r}; choose from {BUNDLE_NAMES}", file=sys.stderr)
+        return 2
+    out = BUNDLE_OUT_ROOT / spec.name
+    log = out / "verify.log"
+    out.mkdir(parents=True, exist_ok=True)
+    log_start(log, f"=== bundle {spec.name} starting {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    print(f"verify_local: building bundle {spec.name} for {spec.triple} (log: {log})")
+    start = time.monotonic()
+    ok, bundle = build_one_bundle(spec, jobs, log)
+    elapsed = time.monotonic() - start
+    if not ok or bundle is None:
+        print(f"[{elapsed:7.1f}s] {spec.name:<28} FAIL")
+        print_tail(log)
+        return 1
+    print(f"[{elapsed:7.1f}s] {spec.name:<28} PASS")
+    summarize_bundle(spec, bundle)
+    return 0
+
+
 def format_table(rows: Iterable[Outcome]) -> str:
     rows = list(rows)
     headers = ["config", "result", "seconds", "build dir", "log"]
@@ -881,7 +1263,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--only", help=f"comma-separated subset of: {','.join(CONFIG_NAMES)}")
     parser.add_argument("--slow", action="store_true", help="also run the long-tail ctest tier")
-    parser.add_argument("--list", action="store_true", help="print the config table and exit")
+    parser.add_argument(
+        "--list", action="store_true", help="print the config and bundle tables and exit"
+    )
+    parser.add_argument(
+        "--bundle",
+        metavar="NAME",
+        help=(
+            "cross-build one CI test bundle locally and stop before the execution step "
+            f"(#277 phase F); one of: {','.join(BUNDLE_NAMES)}"
+        ),
+    )
     parser.add_argument(
         "--jobs",
         type=int,
@@ -902,10 +1294,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{'config':<12} {'mirrors':<45} description")
         for c in CONFIGS:
             print(f"{c.name:<12} {c.job:<45} {c.description}")
+        print()
+        print("cross bundles (--bundle NAME): built here, executed on the target OS")
+        print(f"{'bundle':<28} {'triple':<24} {'workflow':<21} cmake")
+        for b in BUNDLES:
+            print(f"{b.name:<28} {b.triple:<24} {b.workflow:<21} {b.cmake}")
         return 0
 
     if args.selftest:
         return do_selftest()
+
+    if args.bundle:
+        return run_bundle_build(args.bundle, args.jobs or os.cpu_count() or 4)
 
     if args.only:
         requested = [x.strip() for x in args.only.split(",") if x.strip()]
@@ -987,7 +1387,17 @@ def do_selftest() -> int:
     if rc != 0:
         print("FAIL: cmake not runnable")
         ok = False
+    if len(BUNDLE_NAMES) != len(set(BUNDLE_NAMES)):
+        print("FAIL: duplicate bundle names")
+        ok = False
+    for bundle in BUNDLES:
+        toolchain = ROOT / "cmake" / "toolchains" / f"soldr-{bundle.triple}.cmake"
+        if not toolchain.is_file():
+            print(f"FAIL: bundle {bundle.name!r} names a missing toolchain file {toolchain}")
+            ok = False
     print(f"selftest: {len(CONFIGS)} configs registered: {', '.join(CONFIG_NAMES)}")
+    print(f"selftest: {len(BUNDLES)} cross bundles registered: {', '.join(BUNDLE_NAMES)}")
+    print(f"selftest: soldr={'yes' if shutil.which('soldr') else 'no'}")
     print(
         f"selftest: ninja={'yes' if have_ninja() else 'no'} ccache={'yes' if have_ccache() else 'no'} clang={'yes' if _need_clang() is None else 'no'}"
     )

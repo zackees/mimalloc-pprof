@@ -543,7 +543,7 @@ def run_lint(ctx: RunCtx) -> bool:
     )
     ok = ok and rc == 0
     rc, _ = run_logged(
-        ["uv", "run", "--with", "pyright==1.1.411", "pyright"], cwd=ROOT, log=ctx.log
+        ["uv", "run", "--with", "pyright[nodejs]==1.1.411", "pyright"], cwd=ROOT, log=ctx.log
     )
     ok = ok and rc == 0
 

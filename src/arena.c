@@ -2378,8 +2378,23 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
   if (max_arena == 0) return;
 
   // allow only one thread to purge at a time (todo: allow concurrent purging?)
+  //
+  // #272: `mi_atomic_guard` is NON-blocking -- when another thread holds it, the purge is
+  // simply skipped. That is the right behaviour for the opportunistic callers, and it was
+  // harmless before this phase because only allocating threads ever entered here and the
+  // window is tiny. It is NOT harmless for a FORCED purge: `mi_collect(true)` promises the
+  // caller that everything due has gone back to the OS, and with the background scavenger
+  // sitting in this same function on a timer, a forced purge now loses that race often
+  // enough to matter (`test-degenerate`'s thread-churn RSS backstop failed 4 runs in 40:
+  // "memory grew with thread churn -- 5.1 MB -> 54.1 MB", i.e. `mi_collect(true)` returning
+  // having purged nothing at all). So a forced purge WAITS for the guard instead of
+  // skipping. The holder never blocks on anything the waiter owns, so the wait is bounded
+  // by one purge pass.
+  bool ran = false;
+  do {
   mi_atomic_guard(&mi_arenas_purge_guard)
   {
+    ran = true;
     // increase global expire: at most one purge per delay cycle
     if (arenas_expire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now + (delay/10)); }
     const size_t arena_start = tseq % max_arena;
@@ -2418,6 +2433,8 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
     }
   }
+    if (!ran && force) { _mi_prim_thread_yield(); }   // #272, see above
+  } while (!ran && force);
 }
 
 

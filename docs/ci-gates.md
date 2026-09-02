@@ -259,11 +259,29 @@ that for three binaries and puts them in the job summary:
 | soldr mingw-w64 (**UCRT**) bundle, as linked | `mimalloc-test-stress-dynamic.exe` |
 | soldr mingw-w64 (**UCRT**) bundle, after `minject` | `mimalloc-test-stress-dynamic-mi.exe` |
 
-The gate is the **comparison**: if the msvcrt lane redirects and neither UCRT binary does,
-the job fails. Requiring the bundle to redirect where the job it replaces never did would
-be a new gate smuggled in under the word "parity"; if none of the three redirects, that is
-reported as a `::warning::` and recorded here, because it says the dynamic override is not
-exercised on win-gnu *at all* today — a pre-existing gap, not something this phase caused.
+**Measured on run 33606909837**, and this is the one real cost of the CRT decision:
+
+| lane | redirects? |
+|---|---|
+| MSYS2 MINGW64 (msvcrt), no minject | **yes** |
+| soldr mingw-w64 (UCRT), as linked | no |
+| soldr mingw-w64 (UCRT), after `minject` (`--postfix=` *and* `--postfix=debug`) | the injected image does not start (rc 127) |
+| soldr mingw-w64 (UCRT), `MI_MINGW_UCRT64=OFF` | no |
+
+The last row is what makes this attributable: holding the toolchain fixed and turning the
+define off does not restore redirection, so **it is the CRT, not the init mechanism**. And
+`minject` — upstream's designated fix for exactly this case — produces an image Windows
+refuses to load when applied to a mingw-linked executable, for both an empty and a
+non-empty postfix. Escalated on #277 rather than worked around.
+
+So the gate is on the **msvcrt** binary: `run-windows-gnu` fails if the MSYS2 build it
+compiles for the compile-compat check stops redirecting, and warns (with the numbers) that
+the UCRT bundle does not. That is deliberate. All 27/34/25 ctest names pass in both lanes,
+so nothing is *failing*; what the UCRT lane exercises less of is the redirection path
+inside `test-stress-dynamic`, and this probe is the only thing anywhere in CI that asserts
+that path at all — the test itself does not. Keeping the assertion on the lane where the
+property holds is what lets `ctest-win-gnu` be deleted after the comparison window without
+losing it.
 
 ### The runtime DLL
 

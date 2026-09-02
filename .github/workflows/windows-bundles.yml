@@ -93,16 +93,6 @@ jobs:
             # has seen fire (docs/ci-gates.md). New on win-gnu: no native win-gnu job runs
             # the memory gate today -- see the coverage table in docs/ci-gates.md.
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
-          # DIAGNOSTIC, not a gate. The first two runs measured that the msvcrt lane
-          # redirects malloc in test-stress-dynamic and the UCRT bundle does not. Two
-          # things differ between them -- the CRT, and MI_MINGW_UCRT64 (which the
-          # toolchain must set because $ENV{MSYSTEM} cannot fire in a cross build, and
-          # which changes which init mechanism src/prim/windows/prim.c uses). This bundle
-          # holds the CRT fixed and turns the define off, so the override probe can say
-          # which of the two is responsible. `-D` on the command line wins over the
-          # toolchain's non-FORCE `set(... CACHE ...)`.
-          - bundle: windows-gnu-x64-probe-noucrt64
-            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_MINGW_UCRT64=OFF
     steps:
       - uses: actions/checkout@v4
       - uses: zackees/setup-soldr@v0
@@ -152,21 +142,11 @@ jobs:
           # The CRT decision, asserted rather than assumed: the toolchain file sets
           # MI_MINGW_UCRT64 because $ENV{MSYSTEM} cannot fire in a cross build, and a flag
           # that never reaches the compiler is this repository's most-repeated CI bug.
-          case "${{ matrix.bundle }}" in
-            *probe-noucrt64)
-              if grep -qE '^-- Compiler defines .*MI_MINGW_UCRT64=1' configure.log; then
-                echo "::error::the diagnostic bundle was supposed to have MI_MINGW_UCRT64 OFF"
-                exit 1
-              fi
-              ;;
-            *)
-              if ! grep -qE '^-- Compiler defines .*MI_MINGW_UCRT64=1' configure.log; then
-                echo "::error::MI_MINGW_UCRT64=1 did not reach the compiler defines"
-                grep -E 'Compiler defines' configure.log || true
-                exit 1
-              fi
-              ;;
-          esac
+          if ! grep -qE '^-- Compiler defines .*MI_MINGW_UCRT64=1' configure.log; then
+            echo "::error::MI_MINGW_UCRT64=1 did not reach the compiler defines"
+            grep -E 'Compiler defines' configure.log || true
+            exit 1
+          fi
       - run: cmake --build build --parallel
       - name: Prove the output is x86-64 PE with the profiler's Windows sections
         run: |
@@ -185,7 +165,6 @@ jobs:
           test -n "$obj"
           "$objdump" -h "$obj" > prim-sections.txt
           for section in '.CRT$XLB' '.CRT$XLY' '.CRT$XIB'; do
-            if [ "${{ matrix.bundle }}" = "windows-gnu-x64-probe-noucrt64" ]; then continue; fi
             if ! grep -qF "$section" prim-sections.txt; then
               echo "::error::$section is missing from $obj"
               cat prim-sections.txt
@@ -196,8 +175,7 @@ jobs:
           # makes the .CRT$XLB callback fire. An empty entry 9 means the section was
           # dropped at link time.
           "$objdump" -p "$lib" > private.txt
-          if [ "${{ matrix.bundle }}" != "windows-gnu-x64-probe-noucrt64" ] \
-             && ! grep -qE '^Entry 9 +0*[1-9a-f][0-9a-f]* +0*[1-9a-f]' private.txt; then
+          if ! grep -qE '^Entry 9 +0*[1-9a-f][0-9a-f]* +0*[1-9a-f]' private.txt; then
             echo "::error::$lib has no Thread Storage Directory; the .CRT\$XLB callback cannot fire"
             grep -E '^Entry 9' private.txt || true
             exit 1
@@ -415,17 +393,6 @@ jobs:
           }
           probe "UCRT, as linked   " "$bundle/mimalloc-test-stress-dynamic.exe" ucrt-plain.txt
           probe "UCRT, minjected   " "$bundle/mimalloc-test-stress-dynamic-mi.exe" ucrt-minject.txt
-          # Second minject sample with a NON-empty --postfix. On the empty-postfix
-          # bundles minject printed "leave at position 0: 'mimalloc-redirect.dll'" twice
-          # and the injected image then died (rc=127 in-place, rc=139 out-of-place);
-          # the --postfix=debug bundle printed it once. If this one runs, the fault is in
-          # minject's empty-postfix path, not in minject-on-mingw generally.
-          bundle=bundle/windows-gnu-x64-debug-full
-          probe "UCRT dbg, minjected" "$bundle/mimalloc-test-stress-dynamic-mi.exe" ucrt-minject-debug.txt
-          # And the CRT-vs-define control: same UCRT toolchain, MI_MINGW_UCRT64 off, so
-          # prim.c uses the constructor-attribute init the msvcrt lane uses.
-          bundle=bundle/windows-gnu-x64-probe-noucrt64
-          probe "UCRT, define OFF  " "$bundle/mimalloc-test-stress-dynamic.exe" ucrt-noucrt64.txt
 
       - name: ctest-win-gnu equivalent -- windows-gnu-x64-release
         run: |
@@ -645,31 +612,31 @@ jobs:
           msvcrt=$(read_result msvcrt.txt)
           plain=$(read_result ucrt-plain.txt)
           minjected=$(read_result ucrt-minject.txt)
-          minjected_debug=$(read_result ucrt-minject-debug.txt)
-          no_define=$(read_result ucrt-noucrt64.txt)
           {
             echo "### test-stress-dynamic: does mimalloc override the CRT?"
             echo
             echo "| lane | result |"
             echo "|---|---|"
-            echo "| MSYS2 MINGW64 (msvcrt), as \`ctest-win-gnu\` runs it | $msvcrt |"
-            echo "| soldr mingw-w64 (UCRT) bundle, as linked | $plain |"
-            echo "| soldr mingw-w64 (UCRT) bundle, after \`minject --postfix=\` | $minjected |"
-            echo "| soldr mingw-w64 (UCRT) debug bundle, after \`minject --postfix=debug\` | $minjected_debug |"
-            echo "| soldr mingw-w64 (UCRT), \`MI_MINGW_UCRT64=OFF\` (diagnostic) | $no_define |"
+            echo "| MSYS2 MINGW64 (**msvcrt**), built by this job | $msvcrt |"
+            echo "| soldr mingw-w64 (**UCRT**) bundle, as linked | $plain |"
+            echo "| soldr mingw-w64 (**UCRT**) bundle, after \`minject\` | $minjected |"
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          # TODO(#277 phase C): while the diagnostic rows are being read, the comparison
-          # is reported and not enforced -- the point of this run is to find out which
-          # variable costs the override, and a red job that stops the run from finishing
-          # would hide the rows that answer it. Restore `exit 1` (or ship whichever
-          # configuration redirects) in the follow-up, and delete the probe-noucrt64
-          # bundle with it.
-          if [ "$msvcrt" = "REDIRECTED" ] \
-             && [ "$plain" != "REDIRECTED" ] \
-             && [ "$minjected" != "REDIRECTED" ] \
-             && [ "$minjected_debug" != "REDIRECTED" ] \
-             && [ "$no_define" != "REDIRECTED" ]; then
-            echo "::warning::the msvcrt lane redirects malloc and no UCRT variant does -- reported on #277, not yet enforced"
+          # The gate is on the msvcrt binary, because that is the lane where the dynamic
+          # override demonstrably works and therefore the only one where a regression is
+          # attributable. Measured on run 33606909837: msvcrt REDIRECTED; UCRT as linked
+          # NOT-REDIRECTED; UCRT after minject FAILED(rc=127) for both an empty and a
+          # non-empty --postfix; and a UCRT build with MI_MINGW_UCRT64=OFF also
+          # NOT-REDIRECTED -- i.e. it is the CRT, not the define. This step is what keeps
+          # that property gated once c-unit.yml's `ctest-win-gnu` is deleted: every test
+          # name it runs is covered by the bundle, but nothing else asserts that mimalloc
+          # actually intercepts the CRT on win-gnu.
+          if [ "$msvcrt" != "REDIRECTED" ]; then
+            echo "::error::the msvcrt win-gnu lane no longer redirects malloc in test-stress-dynamic (got: $msvcrt)"
+            cat msvcrt.raw || true
+            exit 1
+          fi
+          if [ "$plain" != "REDIRECTED" ] && [ "$minjected" != "REDIRECTED" ]; then
+            echo "::warning::the UCRT bundle does not redirect malloc (as linked: $plain, minjected: $minjected). Known and measured; tracked on #277 phase C. The msvcrt control above is what gates the property."
           fi
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
@@ -686,10 +653,6 @@ jobs:
             ucrt-plain.txt.raw
             ucrt-minject.txt
             ucrt-minject.txt.raw
-            ucrt-minject-debug.txt
-            ucrt-minject-debug.txt.raw
-            ucrt-noucrt64.txt
-            ucrt-noucrt64.txt.raw
             msvcrt.txt
             msvcrt.raw
           if-no-files-found: warn

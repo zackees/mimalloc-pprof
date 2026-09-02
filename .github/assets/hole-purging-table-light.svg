@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 396" width="1000" height="396" role="img" aria-label="Hole purging characteristics, churn workload">
+<rect width="1000" height="396" fill="#ffffff"/>
+<g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<text x="24" y="26" font-size="17" font-weight="600" fill="#1f2328">Hole purging characteristics: churn workload</text>
+<text x="24" y="44" font-size="12" fill="#59636e">measured at be13eadf, AMD Ryzen 7 3700X 8-Core Processor, 6.18.48, taskset -c 0-3, median of 3</text>
+<text x="24" y="70" font-size="12" font-weight="600" fill="#59636e">counter (mi_purge_holes_stats_t)</text>
+<text x="620" y="70" font-size="12" font-weight="600" text-anchor="end" fill="#59636e">off</text>
+<text x="780" y="70" font-size="12" font-weight="600" text-anchor="end" fill="#59636e">on</text>
+<text x="940" y="70" font-size="12" font-weight="600" text-anchor="end" fill="#59636e">delta</text>
+<line x1="24" y1="90" x2="976" y2="90" stroke="#d8dee4" stroke-width="1"/>
+<text x="24" y="108" font-size="12" fill="#1f2328">discard syscalls (madvise/MEM_RESET)</text>
+<text x="620" y="108" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="780" y="108" font-size="12" text-anchor="end" fill="#1f2328">12,672</text>
+<text x="940" y="108" font-size="12" text-anchor="end" fill="#59636e">+12,672</text>
+<rect x="16" y="116" width="968" height="26" fill="#d8dee4" opacity="0.25"/>
+<text x="24" y="134" font-size="12" fill="#1f2328">reuse syscalls (a hole handed back)</text>
+<text x="620" y="134" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="780" y="134" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="940" y="134" font-size="12" text-anchor="end" fill="#59636e">0</text>
+<text x="24" y="160" font-size="12" fill="#1f2328">bytes ever discarded</text>
+<text x="620" y="160" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="780" y="160" font-size="12" text-anchor="end" fill="#1f2328">165,052,416</text>
+<text x="940" y="160" font-size="12" text-anchor="end" fill="#59636e">+165,052,416</text>
+<rect x="16" y="168" width="968" height="26" fill="#d8dee4" opacity="0.25"/>
+<text x="24" y="186" font-size="12" fill="#1f2328">pages fully freed back to the arena</text>
+<text x="620" y="186" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="780" y="186" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="940" y="186" font-size="12" text-anchor="end" fill="#59636e">0</text>
+<text x="24" y="212" font-size="12" fill="#1f2328">pages ineligible for discard (last sweep)</text>
+<text x="620" y="212" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="780" y="212" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="940" y="212" font-size="12" text-anchor="end" fill="#59636e">0</text>
+<rect x="16" y="220" width="968" height="26" fill="#d8dee4" opacity="0.25"/>
+<text x="24" y="238" font-size="12" fill="#1f2328">bytes held by those pages (last sweep)</text>
+<text x="620" y="238" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="780" y="238" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="940" y="238" font-size="12" text-anchor="end" fill="#59636e">0</text>
+<text x="24" y="264" font-size="12" fill="#1f2328">unformed-tail bytes discarded</text>
+<text x="620" y="264" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="780" y="264" font-size="12" text-anchor="end" fill="#1f2328">94,208</text>
+<text x="940" y="264" font-size="12" text-anchor="end" fill="#59636e">+94,208</text>
+<rect x="16" y="272" width="968" height="26" fill="#d8dee4" opacity="0.25"/>
+<text x="24" y="290" font-size="12" fill="#1f2328">unformed-tail discard syscalls</text>
+<text x="620" y="290" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="780" y="290" font-size="12" text-anchor="end" fill="#1f2328">2</text>
+<text x="940" y="290" font-size="12" text-anchor="end" fill="#59636e">+2</text>
+<text x="24" y="316" font-size="12" fill="#1f2328">pages skipped (nothing changed since last sweep)</text>
+<text x="620" y="316" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="780" y="316" font-size="12" text-anchor="end" fill="#1f2328">350,361</text>
+<text x="940" y="316" font-size="12" text-anchor="end" fill="#59636e">+350,361</text>
+<rect x="16" y="324" width="968" height="26" fill="#d8dee4" opacity="0.25"/>
+<text x="24" y="342" font-size="12" fill="#1f2328">free-list blocks the sweep walked</text>
+<text x="620" y="342" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="780" y="342" font-size="12" text-anchor="end" fill="#1f2328">320,766</text>
+<text x="940" y="342" font-size="12" text-anchor="end" fill="#59636e">+320,766</text>
+<text x="24" y="368" font-size="12" fill="#1f2328">sweeps that walked every page</text>
+<text x="620" y="368" font-size="12" text-anchor="end" fill="#1f2328">0</text>
+<text x="780" y="368" font-size="12" text-anchor="end" fill="#1f2328">1</text>
+<text x="940" y="368" font-size="12" text-anchor="end" fill="#59636e">+1</text>
+</g></svg>

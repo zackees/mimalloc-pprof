@@ -1,0 +1,49 @@
+{
+  "commit": "be13eadf",
+  "off": {
+    "peak_rss_mb": 280.296875,
+    "report_text": "\n\nholes report: os page = 4096 bytes, 3539 pages (0 ineligible, 0 never madvise-able)\n  discardable bytes vs hypothetical OS page size (nothing is discarded to measure this):\n    @  4096 :     157.40 MB   <-- this machine's OS page size\n    @  8192 :     112.78 MB\n    @ 16384 :      66.06 MB\n    @ 32768 :      19.53 MB\n    @ 65536 :       0.00 MB\n  live 12.21 MB, free 207.53 MB\n  14330 pinned OS pages (>= 1 live block): 11.82 MB live + 44.15 MB free trapped in them\n  memory partition (walking the arena bitmaps):\n    in pages           :     219.83 MB  = live 12.21 + in-page free 207.53 + page overhead 0.08 (header/unformed)\n    arena slack        :      49.62 MB  (in NO page, touched at least once; 0.00 MB of it is queued for purge and so certainly still resident)\n    arena meta (ROUGH) :       2.93 MB  (arena bitmaps only; excludes the mi_meta heaps)\n    ---- ever-touched  :     272.39 MB  (in-pages + slack + meta; the ceiling on what we can be paying for)\n    reserved 1024.00 MB, slices_committed 1024.00 MB -- NOTE: on POSIX every slice is marked committed at reserve\n      time and a reset-purge never clears it, so slices_committed is address space, NOT residency.\n      'arena slack' is an UPPER bound: a slice purged earlier still reads as dirty here.\n      'in pages' misses pages owned by OTHER threads' theaps -- this walk cannot read them.\nsize_class    pages    live_MB    free_MB   undiscardable_MB  discarded_MB avg_live_blocks_per_pinned_ospage\n       512     1181       4.88      68.35              36.06          0.00          1.00\n      1024      794       2.44      46.40               9.18          0.00          1.00\n      2048     1563       4.88      92.77               4.88          0.00          1.00\n      4096        1       0.00       0.00               0.00          0.00          1.00\n     TOTAL     3539      12.21     207.53              50.12          0.00          1.00\n  of undiscardable: 5.97 MB lies in a partial OS page (page header / past capacity)\n  free and discardable but not discarded: 157.40 MB;  blocks not formed yet: 0.08 MB (of which discarded: 0.00 MB)\n  block_size 512: 36.06 MB undiscardable over 9448 pinned OS pages; live blocks per pinned OS page:  1: 9448  2: 0  3-4: 0  5-8: 0  9+: 0\n  block_size 1024: 9.18 MB undiscardable over 2381 pinned OS pages; live blocks per pinned OS page:  1: 2381  2: 0  3-4: 0  5-8: 0  9+: 0\n  block_size 2048: 4.88 MB undiscardable over 2500 pinned OS pages; live blocks per pinned OS page:  1: 2500  2: 0  3-4: 0  5-8: 0  9+: 0\n  (a live block straddling two pinned OS pages counts in both; abandoned pages are only reached when they are in the arena's abandoned map)\n",
+    "stats": {
+      "blocks_visited": 0,
+      "discard_calls": 0,
+      "full_sweeps": 0,
+      "ineligible_bytes": 0,
+      "ineligible_free_bytes": 0,
+      "ineligible_pages": 0,
+      "pages_freed": 0,
+      "pages_skipped": 0,
+      "purged_blocks": 0,
+      "purged_bytes": 0,
+      "purged_bytes_total": 0,
+      "reuse_calls": 0,
+      "unformed_bytes": 0,
+      "unformed_bytes_total": 0,
+      "unformed_discard_calls": 0,
+      "unformed_reuse_calls": 0
+    },
+    "tail_mean_rss_mb": 230.734375
+  },
+  "on": {
+    "peak_rss_mb": 280.29296875,
+    "report_text": "\n\nholes report: os page = 4096 bytes, 3539 pages (0 ineligible, 0 never madvise-able)\n  discardable bytes vs hypothetical OS page size (nothing is discarded to measure this):\n    @  4096 :     157.40 MB   <-- this machine's OS page size\n    @  8192 :     112.78 MB\n    @ 16384 :      66.06 MB\n    @ 32768 :      19.53 MB\n    @ 65536 :       0.00 MB\n  live 12.21 MB, free 207.53 MB\n  14330 pinned OS pages (>= 1 live block): 11.82 MB live + 44.15 MB free trapped in them\n  memory partition (walking the arena bitmaps):\n    in pages           :     219.83 MB  = live 12.21 + in-page free 207.53 + page overhead 0.08 (header/unformed)\n    arena slack        :      49.62 MB  (in NO page, touched at least once; 0.00 MB of it is queued for purge and so certainly still resident)\n    arena meta (ROUGH) :       2.93 MB  (arena bitmaps only; excludes the mi_meta heaps)\n    ---- ever-touched  :     272.39 MB  (in-pages + slack + meta; the ceiling on what we can be paying for)\n    reserved 1024.00 MB, slices_committed 1024.00 MB -- NOTE: on POSIX every slice is marked committed at reserve\n      time and a reset-purge never clears it, so slices_committed is address space, NOT residency.\n      'arena slack' is an UPPER bound: a slice purged earlier still reads as dirty here.\n      'in pages' misses pages owned by OTHER threads' theaps -- this walk cannot read them.\nsize_class    pages    live_MB    free_MB   undiscardable_MB  discarded_MB avg_live_blocks_per_pinned_ospage\n       512     1181       4.88      68.35              36.06         32.29          1.00\n      1024      794       2.44      46.40               9.18         37.22          1.00\n      2048     1563       4.88      92.77               4.88         87.89          1.00\n      4096        1       0.00       0.00               0.00          0.00          1.00\n     TOTAL     3539      12.21     207.53              50.12        157.40          1.00\n  of undiscardable: 5.97 MB lies in a partial OS page (page header / past capacity)\n  free and discardable but not discarded: 0.00 MB;  blocks not formed yet: 0.08 MB (of which discarded: 0.08 MB)\n  block_size 512: 36.06 MB undiscardable over 9448 pinned OS pages; live blocks per pinned OS page:  1: 9448  2: 0  3-4: 0  5-8: 0  9+: 0\n  block_size 1024: 9.18 MB undiscardable over 2381 pinned OS pages; live blocks per pinned OS page:  1: 2381  2: 0  3-4: 0  5-8: 0  9+: 0\n  block_size 2048: 4.88 MB undiscardable over 2500 pinned OS pages; live blocks per pinned OS page:  1: 2500  2: 0  3-4: 0  5-8: 0  9+: 0\n  (a live block straddling two pinned OS pages counts in both; abandoned pages are only reached when they are in the arena's abandoned map)\n",
+    "stats": {
+      "blocks_visited": 320766,
+      "discard_calls": 12672,
+      "full_sweeps": 1,
+      "ineligible_bytes": 0,
+      "ineligible_free_bytes": 0,
+      "ineligible_pages": 0,
+      "pages_freed": 0,
+      "pages_skipped": 350361,
+      "purged_blocks": 149252,
+      "purged_bytes": 165052416,
+      "purged_bytes_total": 165052416,
+      "reuse_calls": 0,
+      "unformed_bytes": 94208,
+      "unformed_bytes_total": 94208,
+      "unformed_discard_calls": 2,
+      "unformed_reuse_calls": 0
+    },
+    "tail_mean_rss_mb": 73.234375
+  }
+}

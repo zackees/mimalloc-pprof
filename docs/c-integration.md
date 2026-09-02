@@ -47,6 +47,32 @@ capture `mi_usable_size` before the call.
 All of these are available from Rust as `mimalloc_pprof::{rezalloc, recalloc, expand,
 usable_size}`.
 
+## Scavenger and hole purging
+
+Two independent, default-on mechanisms return memory to the OS without waiting for
+the next allocation:
+
+| Option | Env var | Default | What it does |
+|---|---|---|---|
+| `mi_option_scavenger` | `MIMALLOC_SCAVENGER` | `1` | Runs a background thread that purges arena memory on a timer (`mi_option_purge_delay`, `MIMALLOC_PURGE_DELAY`, 100 ms in this fork) instead of only on allocation. `mi_scavenger_stop()` stops it for good; it restarts on demand unless stopped. |
+| `mi_option_purge_holes` | `MIMALLOC_PURGE_HOLES` | `1` | At each idle point, discards the free blocks **inside** a still-used page (in OS-page units), so one long-lived object no longer pins the whole page resident. |
+| `mi_option_purge_holes_min_interval` | `MIMALLOC_PURGE_HOLES_MIN_INTERVAL` | `100` (ms) | Minimum time between two hole sweeps of the same thread's heaps. |
+| `mi_option_purge_holes_eager_zero` | `MIMALLOC_PURGE_HOLES_EAGER_ZERO` | `0` | Debug/test knob: zero a range before discarding it, so a mis-scoped discard corrupts visibly rather than silently on an OS that reclaims lazily. Always on when `MI_DEBUG>1`. Makes discarding more expensive, not cheaper. |
+| `mi_option_purge_holes_full_every` | `MIMALLOC_PURGE_HOLES_FULL_EVERY` | `64` | Every Nth hole sweep walks every page instead of skipping ones unchanged since the last sweep; `0` disables the periodic full walk. |
+
+Both mechanisms run at the same idle point: `mi_on_thread_idle()`, called directly
+or handed to the scavenger via `mi_on_thread_idle_start()` /
+`mi_on_thread_idle_end()` around a blocking kernel call. Query what hole purging
+has reclaimed with `mi_purge_holes_stats_get()` (a `mi_purge_holes_stats_t` of
+running counters — bytes/blocks purged, discard and reuse syscalls, pages
+skipped) or print a per-size-class breakdown of what could **not** be discarded,
+and why, with `mi_purge_holes_report()`. See the
+[README's measured chart](../README.md#returning-memory-faster-scavenger-and-hole-purging)
+for numbers, and `include/mimalloc.h` / `doc/mimalloc-doc.h` for the full API
+and option reference. Neither mechanism costs the `mi_malloc`/`mi_free` fast
+path anything — both are ported from
+[oven-sh/mimalloc @ `942b8342`](https://github.com/oven-sh/mimalloc), MIT.
+
 ## Build flags for usable stacks
 
 The profiler walks **your application's** frames, so the flags that matter are the ones

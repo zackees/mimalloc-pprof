@@ -64,6 +64,7 @@ not sample until you call a start API or set `MIMALLOC_PROF=1`.
 - [Quick start](#quick-start)
 - [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, TCMalloc, and jemalloc
 - [Why use this fork](#why-use-this-fork) — the most tested mimalloc fork in existence
+- [Returning memory faster: scavenger and hole purging](#returning-memory-faster-scavenger-and-hole-purging) — a measured chart of peak RSS, off vs on
 - [Choosing a version: v2 or v3](#choosing-a-version-v2-or-v3)
 - [Profiling and observability](#profiling-and-observability) — sampled pprof, exact stats, DHAT, memory events
 - [Upstream bugs found and fixed](#upstream-bugs-found-and-fixed) — including two unbounded memory leaks
@@ -312,6 +313,9 @@ mi_purge_holes_stats_get(&h);   /* discarded bytes/blocks now, totals, syscalls,
 mi_purge_holes_report();        /* per size class: what could NOT be discarded, and why */
 ```
 
+For a measured chart of what this buys on a churn workload, see
+[Returning memory faster: scavenger and hole purging](#returning-memory-faster-scavenger-and-hole-purging).
+
 ### Going deeper
 
 Everything deeper — CMake install and linking, the zeroing-realloc family,
@@ -424,6 +428,61 @@ lands, so quality is maintained by machinery, not just intent.
 
 ---
 
+## Returning memory faster: scavenger and hole purging
+
+A background **scavenger** thread returns freed arena memory to the OS on a timer
+instead of waiting for the next allocation to trigger a purge, so an idle process
+stops sitting on memory it no longer needs (`MIMALLOC_SCAVENGER`, default on;
+`MIMALLOC_PURGE_DELAY` is 100 ms in this fork, upstream is 10). Embedders with an
+event loop can call `mi_on_thread_idle()` right before blocking in the kernel to get
+that work done for free on the calling thread.
+
+The same idle point also punches **holes**: upstream mimalloc returns a page to the
+OS only once *every* block in it is free, so one long-lived object keeps a whole
+64 KiB/512 KiB page resident. Hole purging discards the free blocks *inside* a
+still-used page instead, one OS page at a time, via `MADV_DONTNEED` /
+`MADV_FREE_REUSABLE` / `MEM_RESET` — commit state is never touched, and the free
+list is rebuilt before anything is discarded. It costs the malloc/free fast path
+nothing (default on, `MIMALLOC_PURGE_HOLES`; pacing via
+`MIMALLOC_PURGE_HOLES_MIN_INTERVAL`, default 100 ms; `MIMALLOC_PURGE_HOLES_EAGER_ZERO`
+is a debug-only test knob). Query it live with `mi_purge_holes_stats_get` /
+`mi_purge_holes_report`.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-rss-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-rss-light.svg" />
+  <img alt="Resident memory of a churn workload, hole purging off vs on" src=".github/assets/hole-purging-rss-light.svg" width="100%" />
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-table-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-table-light.svg" />
+  <img alt="Hole purging characteristics of the churn workload" src=".github/assets/hole-purging-table-light.svg" width="100%" />
+</picture>
+
+Both were measured with [`ci/bench_hole_purging.py`](ci/bench_hole_purging.py): 150k
+512 B + 100k 1 KiB + 50k 2 KiB blocks, a scattered 1-in-20 kept alive, then idled for
+10 s calling `mi_on_thread_idle()` every 100 ms — median of 3 runs, pinned to 4 CPUs.
+
+| | hole purging off | hole purging on |
+|---|---:|---:|
+| resident memory before idle (peak) | 280.3 MB | 280.3 MB |
+| resident memory after idle (median of 3) | 230.7 MB | 73.2 MB |
+
+For comparison, the PR #302 description measured Bun's own workload shape
+(400k blocks, min of 5 runs): peak RSS went **210.0 MB → 105.0 MB**, and
+single-threaded alloc/free latency was unchanged within noise across three
+independent rounds (the free path gains no new code in a release build — the only
+addition sits inside the debug-only `MI_CHECK_DOUBLE_FREE` path). The one real cost
+is `sizeof(mi_page_t)` growing 144 → 192 bytes, all of it appended at the tail.
+
+Ported from [oven-sh/mimalloc @ `942b8342`](https://github.com/oven-sh/mimalloc),
+MIT; the engine lives in `src/page-holes.c`, with the sweep drivers in
+`src/scavenger.c` / `src/theap.c`. More detail, including the options reference,
+is in [docs/c-integration.md](docs/c-integration.md#scavenger-and-hole-purging).
+
+---
+
 ## Choosing a version: v2 or v3
 
 **When in doubt choose v3, the current default.**
@@ -502,7 +561,7 @@ are in **[docs/ci-gates.md](docs/ci-gates.md)**.
 
 | Document | Contents |
 |---|---|
-| [docs/c-integration.md](docs/c-integration.md) | CMake build/install, linking, zeroing-realloc variants, frame-pointer flags |
+| [docs/c-integration.md](docs/c-integration.md) | CMake build/install, linking, zeroing-realloc variants, frame-pointer flags, scavenger and hole-purging options |
 | [docs/rust-integration.md](docs/rust-integration.md) | Crate setup, stats API, cargo config, cross-compilation |
 | [docs/profiler.md](docs/profiler.md) | Profiler reference: cost, env vars, seeding, embedded-mimalloc concerns, exact stats |
 | [docs/dhat-and-memory-events.md](docs/dhat-and-memory-events.md) | Exact DHAT profiling and the memory-events API |

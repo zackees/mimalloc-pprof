@@ -97,6 +97,7 @@ set(mi_sources
     src/page-map.c
     src/profile.c
     src/random.c
+    src/scavenger.c
     src/stats.c
     src/subproc.c
     src/theap.c
@@ -688,7 +689,10 @@ function(find_link_library libname outlibname)
 endfunction()
 
 if(WIN32)
-  list(APPEND mi_libraries psapi shell32 user32 advapi32 bcrypt)
+  # `synchronization` is `WaitOnAddress`/`WakeByAddressSingle` (src/scavenger.c, #272). Needed for
+  # EVERY Windows toolchain: src/scavenger.c's `#pragma comment(lib, "synchronization")` reaches
+  # only MSVC/clang-cl, so MinGW (ld/lld) needs the explicit `-lsynchronization` this adds.
+  list(APPEND mi_libraries psapi shell32 user32 advapi32 bcrypt synchronization)
 else()
   find_link_library("pthread" MI_LIB_PTHREAD)
   if(MI_LIB_PTHREAD)

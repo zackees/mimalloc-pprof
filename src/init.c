@@ -104,7 +104,12 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   false,                  // is_in_threadpool
   MI_MEMID_STATIC,        // memid
   { 0, 0, 0, 0 },         // profiler (MI_PPROF)
-  { 0 }                   // hooks (#266)
+  { 0 },                  // hooks (#266)
+  MI_ATOMIC_VAR_INIT(0),  // park_state = MI_PARK_RUNNING (#272)
+  MI_ATOMIC_VAR_INIT(0),  // park_reclaim
+  NULL,                   // park_theap0
+  MI_ATOMIC_VAR_INIT(0),  // park_swept
+  NULL                    // subproc_next (unregistered)
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -172,6 +177,7 @@ bool _mi_is_empty_theap(const mi_theap_t* theap) {
 ----------------------------------------------------------- */
 
 static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc);
+static void mi_tld_register(mi_tld_t* tld);   // #272: tld registry for the scavenger (defined with mi_tld_free)
 
 // Initialize main heap
 static void mi_heap_main_init_once(void) {
@@ -249,6 +255,7 @@ static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc) 
     tld->is_in_threadpool = _mi_prim_thread_is_in_threadpool();
     tld->thread_seq = tseq;
     mi_atomic_increment_relaxed(&tld->subproc->thread_count);
+    mi_tld_register(tld);   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272)
   }
   return tld;
 }
@@ -275,8 +282,47 @@ static mi_tld_t* mi_tld_create(mi_subproc_t* subproc) {
   return mi_tld_init(tld,tseq,subproc);
 }
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+// Register a tld with its subproc so the scavenger can find it when it parks
+// (`mi_on_thread_idle_start`), and so `_mi_process_fork_child` can reach every thread's park
+// state and `theaps_lock`. Idempotent: a tld can come through allocation more than once if the
+// thread is re-initialized after `_mi_thread_done`.
+static void mi_tld_register(mi_tld_t* tld) {
+  if (tld == NULL) return;
+  mi_subproc_t* const subproc = tld->subproc;
+  mi_lock(&subproc->tlds_lock) {
+    bool found = false;
+    for (mi_tld_t* t = subproc->tlds; t != NULL; t = t->subproc_next) {
+      if (t == tld) { found = true; break; }   // already registered
+    }
+    if (!found) {
+      tld->subproc_next = subproc->tlds;
+      subproc->tlds = tld;
+    }
+  }
+}
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+// Unlink before the tld memory goes away. The tld cannot be mid-sweep here: only a PARKED tld is
+// ever claimed, and a thread running its own teardown is RUNNING by definition (`_mi_thread_done`
+// calls `_mi_park_leave` first).
+static void mi_tld_unregister(mi_tld_t* tld) {
+  if (tld == NULL) return;
+  mi_assert_internal(mi_atomic_load_acquire(&tld->park_state) != MI_PARK_SWEEPING);
+  mi_subproc_t* const subproc = tld->subproc;
+  mi_lock(&subproc->tlds_lock) {
+    mi_tld_t** prev = &subproc->tlds;
+    while (*prev != NULL) {
+      if (*prev == tld) { *prev = tld->subproc_next; break; }
+      prev = &(*prev)->subproc_next;
+    }
+    tld->subproc_next = NULL;
+  }
+}
+
 mi_decl_noinline static void mi_tld_free(mi_tld_t* tld) {
   if (tld==NULL) return;
+  mi_tld_unregister(tld);   // #272
   mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
   tld->thread_id = (mi_threadid_t)(~0);          // it is best to set an invalid tid for tld_main as sometimes the same thread-id
                                                  // is reused by the OS after a thread has terminated. (see issue #1287)
@@ -360,6 +406,24 @@ mi_theap_t* _mi_thread_init_with_heap(mi_heap_t* heap_main)
 
   mi_subproc_stat_increase(_mi_theap_subproc(theap), threads, 1);  // or theap stats and wait for merge?
   // _mi_verbose_message("thread init: 0x%zx\n", _mi_thread_id());
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+  if (theap->tld != &mi_process_tld_main && theap->tld->subproc == _mi_subproc_main()) {
+    // a second thread: a good moment to start the scavenger thread (not from the process
+    // initializer, see `_mi_scavenger_start_lazy`, and not from deep inside a free where a
+    // purge finds it missing)
+    //
+    // DEVIATION from Bun (`src/init.c:395`, which has no subproc condition): start it only
+    // from a thread of the MAIN subprocess. `pthread_create` allocates the new thread's stack
+    // and TLS block through the CALLING thread's malloc, i.e. out of that thread's subproc's
+    // arenas -- and a non-main subproc can be destroyed (`mi_subproc_destroy` ->
+    // `_mi_arenas_unsafe_destroy_all`) long before `mi_process_done` gets to
+    // `_mi_scavenger_stop`, so the `pthread_join` there would touch unmapped memory
+    // (reproduced as a SIGSEGV in `_dl_deallocate_tls` from `test-stress-subprocs`, which
+    // creates its threads inside subprocs it later destroys). The scavenger only ever sweeps
+    // the main subproc anyway -- `mi_on_thread_idle_start` already refuses to park a thread
+    // of another one -- so nothing is lost.
+    _mi_scavenger_start_lazy();
+  }
   return theap;
 }
 
@@ -466,6 +530,13 @@ void _mi_thread_done(mi_theap_t* _theap_main)
 
   // get the current tld
   mi_tld_t* const tld = _theap_main->tld;
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a):
+  // a thread can reach teardown still parked (a park is left by `mi_on_thread_idle_end`, which
+  // an `epoll_wait` cancellation never reaches). Leave the park -- waiting out any in-flight
+  // sweep of our theaps -- before ANY owner-side free below, since everything after this frees
+  // or rewrites what the scavenger would otherwise still be walking.
+  _mi_park_leave(tld);
 
   // release dynamic thread_local's
   _mi_thread_locals_thread_done();
@@ -623,6 +694,7 @@ void mi_process_init(void) mi_attr_noexcept {
 
 // Called when the process is done
 static void mi_process_done_once(void) {
+  _mi_scavenger_stop();   // #272: stop the background scavenger before any teardown
   // only shutdown if we were initialized
   if (!_mi_process_is_initialized) return;
   // ensure we are called once

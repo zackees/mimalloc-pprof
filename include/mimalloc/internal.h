@@ -377,6 +377,20 @@ void*         _mi_arenas_alloc_aligned(mi_heap_t* heap, size_t size, size_t alig
 void          _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid);
 void          _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld);
 void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+void          _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
+void          _mi_arenas_purge_now(mi_subproc_t* subproc);
+
+// scavenger.c -- imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+void          _mi_scavenger_start(void);
+void          _mi_scavenger_start_lazy(void);
+void          _mi_scavenger_stop(void);
+void          _mi_scavenger_wake(mi_subproc_t* subproc);
+bool          _mi_scavenger_is_running(void);
+void          _mi_scavenger_forked_child(void);
+void          _mi_park_leave(mi_tld_t* tld);
+void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0);
+mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);
 
 mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t page_alignment);
 void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);

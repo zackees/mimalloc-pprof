@@ -645,6 +645,8 @@ struct mi_subproc_s {
   mi_lock_t             arena_reserve_lock;             // lock to ensure arena's get reserved one at a time
   mi_decl_align(8)                                      // needed on some 32-bit platforms
   _Atomic(int64_t)      purge_expire;                   // expiration is set if any arenas can be purged
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+  _Atomic(uint32_t)     scavenger_wake;                 // futex word signalled when a purge is scheduled (the scavenger thread waits on this)
 
   _Atomic(mi_heap_t*)   heap_main;                      // main heap for this sub process
   mi_heap_t*            heaps;                          // heaps belonging to this sub-process
@@ -652,6 +654,11 @@ struct mi_subproc_s {
 
   mi_theap_t*           theap_meta;                     // detached theap for allocating meta-data
   mi_lock_t             theap_meta_lock;                // all allocations in theap_meta need a lock
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+  mi_tld_t*             tlds;                           // list of tlds of this sub-process (walked by the scavenger for parked threads)
+  mi_lock_t             tlds_lock;                      // guards the `tlds` list structure only -- never held across a sweep
+  _Atomic(size_t)       parked_count;                   // threads currently parked; lets the scavenger skip the walk entirely
 
   _Atomic(size_t)       thread_count;                   // current threads associated with this sub-process
   _Atomic(size_t)       thread_total_count;             // total created threads associated with this sub-process
@@ -710,6 +717,12 @@ typedef struct mi_hooks_tld_s {
   bool     prof_lock_owner;           // profile.c (MI_PPROF): this thread already holds prof_lock
 } mi_hooks_tld_t;
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a):
+// idle handoff states for `mi_tld_t::park_state`.
+#define MI_PARK_RUNNING   (0)   // the owner is running: only the owner may touch its theaps
+#define MI_PARK_PARKED    (1)   // the owner blocked in `mi_on_thread_idle_start`: the scavenger may claim it
+#define MI_PARK_SWEEPING  (2)   // the scavenger claimed it and is doing the idle work right now
+
 // Thread local data
 struct mi_tld_s {
   mi_threadid_t         thread_id;            // thread id of this thread
@@ -723,6 +736,17 @@ struct mi_tld_s {
   mi_memid_t            memid;                // provenance of the tld memory itself (meta or OS)
   mi_profiler_tld_t     profiler;             // allocation sampling profiler state
   mi_hooks_tld_t        hooks;                // memory-events/dhat/profiler hook reentrancy state (#266)
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+  // Idle handoff (`mi_on_thread_idle_start`). Kept at the tail: `mi_process_tld_main` /
+  // `mi_tld_detached` are initialized positionally in `src/init.c`, so a field inserted
+  // above silently shifts them. Zero is the correct initial value for every one of these
+  // (MI_PARK_RUNNING / NULL / unregistered).
+  _Atomic(uint32_t)     park_state;           // MI_PARK_*: whether another thread may sweep our theaps right now
+  _Atomic(uint32_t)     park_reclaim;         // set by the owner to get its theaps back; the sweep stops at the next page
+  mi_theap_t*           park_theap0;          // default theap, captured at the park (the scavenger has no TLS to find it)
+  _Atomic(uint32_t)     park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
+  mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
 };
 
 

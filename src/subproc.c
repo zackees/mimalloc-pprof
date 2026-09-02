@@ -165,6 +165,7 @@ static mi_subproc_t* mi_subproc_init(mi_subproc_t* subproc, mi_subproc_t* parent
   mi_lock_init(&subproc->arena_reserve_lock);
   mi_lock_init(&subproc->heaps_lock);
   mi_lock_init(&subproc->theap_meta_lock);
+  mi_lock_init(&subproc->tlds_lock);      // #272: tld registry (imported from oven-sh/mimalloc @ 942b8342, MIT)
   mi_lock(&mi_subprocs_lock) {
     // push on subproc list
     subproc->next = mi_subprocs;
@@ -273,6 +274,7 @@ static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subpro
   mi_lock_done(&subproc->arena_reserve_lock);
   mi_lock_done(&subproc->heaps_lock);
   mi_lock_done(&subproc->theap_meta_lock);  
+  mi_lock_done(&subproc->tlds_lock);      // #272
   _mi_meta_free( subproc->parent, subproc, subproc->memid);  
   if (_mi_subproc_is_main(subproc)) {
     // for the main subproc, also release the global page map

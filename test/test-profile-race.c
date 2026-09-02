@@ -53,6 +53,7 @@
 #else
 #define hole_check_not_purged(p)  ((void)(p))
 #ifdef _WIN32
+#include <windows.h>   /* the threading shim below includes it too, but that is AFTER this point */
 static size_t hole_os_page_size(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (size_t)si.dwPageSize; }
 #else
 #include <unistd.h>

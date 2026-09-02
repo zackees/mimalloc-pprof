@@ -306,6 +306,9 @@ size_t        _mi_os_minimal_purge_size(void);
 bool          _mi_os_reset(mi_subproc_t* subproc, void* addr, size_t size);
 bool          _mi_os_decommit(mi_subproc_t* subproc, void* addr, size_t size);
 void          _mi_os_reuse(mi_subproc_t* subproc, void* p, size_t size);
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b): release the
+// physical pages of a range NOW without touching its commit state (see src/page-holes.c).
+bool          _mi_os_discard(mi_subproc_t* subproc, void* addr, size_t size);
 mi_decl_nodiscard bool _mi_os_commit(mi_subproc_t* subproc, void* p, size_t size, bool* is_zero);
 mi_decl_nodiscard bool _mi_os_commit_ex(mi_subproc_t* subproc, void* addr, size_t size, bool* is_zero, size_t stat_size);
 
@@ -1123,6 +1126,145 @@ static inline size_t mi_page_committed(const mi_page_t* page) {
 static inline bool mi_page_all_free(const mi_page_t* page) {
   mi_assert_internal(page != NULL);
   return (page->used == 0);
+}
+
+/* ------------------------------------------------------
+   Page hole purging (issue #272 / Bun parity P7b)
+   imported from oven-sh/mimalloc @ 942b8342, MIT.
+   The engine lives in `src/page-holes.c`; `src/page.c` carries only the hook calls
+   (CLAUDE.md rule 6). Bun keeps these helpers as `page.c` statics; here they are shared
+   between the engine and those hooks, so they live with the other page inlines.
+   ------------------------------------------------------ */
+
+void          _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld);   // `tld`: the thread whose sweep this is
+void          _mi_page_purged_reset(mi_page_t* page);
+bool          _mi_page_unpurge_run(mi_page_t* page);
+void          _mi_page_unpurge_all(mi_page_t* page);
+size_t        _mi_page_purged_count(const mi_page_t* page);
+void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   // hand the discarded unformed tail back below `end` (an absolute address)
+size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            // the bytes of this page's unformed tail that are discarded right now
+bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
+                                            size_t capacity, size_t k, size_t* first, size_t* last);
+bool          _mi_page_purge_holes_in_progress(void);            // is the calling thread inside a sweep of its own heaps?
+void          _mi_page_holes_count_page_freed(void);
+void          _mi_page_holes_count_ineligible(const mi_page_t* page);
+void          _mi_page_holes_reset_ineligible(void);
+void          _mi_page_purge_holes_begin(mi_tld_t* tld);         // around each pass of a sweep; `tld` is the thread being swept
+void          _mi_page_purge_holes_end(mi_tld_t* tld);
+void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
+void          _mi_purge_holes_of(mi_tld_t* tld);                 // the sweep itself (src/page-holes.c)
+
+// The base of the OS-page bitmap: the start of the first OS page that the block area of
+// this page overlaps. It is OS-page aligned by construction, so bit `k` always names the
+// OS-page-aligned range `[base + k*os_page_size, base + (k+1)*os_page_size)`.
+static inline uintptr_t mi_page_purge_base(const mi_page_t* page) {
+  return _mi_align_down((uintptr_t)mi_page_start(page), _mi_os_page_size());
+}
+
+// the number of OS pages the block area spans = the number of bits this page needs
+static inline size_t mi_page_purge_bits(const mi_page_t* page) {
+  const uintptr_t base = mi_page_purge_base(page);
+  const uintptr_t end = (uintptr_t)mi_page_start(page) + mi_page_size(page);
+  return _mi_divide_up((size_t)(end - base), _mi_os_page_size());
+}
+
+// Eligible when the page's OS pages fit the bitmap. This does not depend on the block size
+// at all: a discard covers a whole OS page, so any number of small free blocks can together
+// cover one (and a page whose free runs never cover a whole OS page simply discards nothing).
+// Small and medium pages always fit; a large (4 MiB) page only fits when the OS page is
+// 16 KiB, and a huge page is a singleton (one block) so there is nothing to purge in it.
+// Pinned memory (large/huge OS pages) cannot be madvise'd away, and an arena with a custom
+// commit function owns its own commit/decommit -- like every other purge site
+// (`mi_arena_schedule_purge`, `_mi_os_purge_ex`), we stay away from both.
+static inline bool mi_page_can_purge_holes(const mi_page_t* page) {
+  if (page->reserved <= 1) return false;             // a singleton page has no free block while it is in use
+  if (page->memid.is_pinned) return false;
+  const mi_arena_t* const arena = mi_memid_arena(page->memid);
+  if (arena != NULL && arena->commit_fun != NULL) return false;
+  return (mi_page_purge_bits(page) <= MI_PAGE_PURGE_BITS);
+}
+
+static inline bool mi_page_has_purged(const mi_page_t* page) {
+  for (size_t i = 0; i < MI_PAGE_PURGE_WORDS; i++) {
+    if (page->purged[i] != 0) return true;
+  }
+  return false;
+}
+
+// is the memory of OS page `k` (counted from `mi_page_purge_base`) discarded?
+static inline bool mi_page_os_page_purged(const mi_page_t* page, size_t k) {
+  if (k >= MI_PAGE_PURGE_BITS) return false;
+  return ((page->purged[k / 64] >> (k % 64)) & 1) != 0;
+}
+
+// Is the block at index `idx` free-but-discarded (and thus not on any free list)?
+// This is the derived purge predicate: an OS page is discarded only when *every* block
+// overlapping it is free, so a block lost memory exactly when it overlaps a discarded OS page.
+static inline bool mi_page_block_index_is_purged(const mi_page_t* page, size_t idx) {
+  if (!mi_page_has_purged(page)) return false;
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t base = mi_page_purge_base(page);
+  const uintptr_t lo = (uintptr_t)mi_page_start(page) + (idx * page->block_size);
+  const size_t kfirst = (size_t)(lo - base) / os_size;
+  const size_t klast = (size_t)((lo + page->block_size - 1) - base) / os_size;
+  for (size_t k = kfirst; k <= klast && k < MI_PAGE_PURGE_BITS; k++) {
+    if (mi_page_os_page_purged(page, k)) return true;
+  }
+  return false;
+}
+
+// is `block` free-but-discarded? A purged block is on no free list, so a free-list walk
+// (as `free.c`'s double-free check does) cannot see that it is already free.
+static inline bool mi_page_block_is_purged(const mi_page_t* page, const void* block) {
+  if (!mi_page_has_purged(page)) return false;
+  mi_assert_internal((const uint8_t*)block >= mi_page_start(page));
+  const size_t idx = ((size_t)((const uint8_t*)block - mi_page_start(page))) / page->block_size;
+  if (idx >= page->capacity) return false;
+  return mi_page_block_index_is_purged(page, idx);
+}
+
+// The block state of the page, as the sweep sees it: `(capacity << 32) | used`.
+static inline uint64_t mi_page_sweep_state(const mi_page_t* page) {
+  mi_assert_internal(page->used <= page->capacity);
+  return (((uint64_t)page->capacity) << 32) | (uint64_t)page->used;
+}
+
+// Anything that changes which blocks are free *without* changing `(capacity,used)` must say so,
+// or the next sweep would wrongly skip the page. That is exactly `mi_page_unpurge_range`: it puts
+// discarded blocks back on the free list, and a purged block was already free.
+static inline void mi_page_sweep_state_invalidate(mi_page_t* page) {
+  page->swept_state = MI_PAGE_SWEPT_NONE;
+}
+
+static inline size_t mi_page_block_index(const mi_page_t* page, const mi_block_t* block) {
+  mi_assert_internal((uint8_t*)block >= mi_page_start(page));
+  return ((size_t)((uint8_t*)block - mi_page_start(page))) / page->block_size;
+}
+
+static inline mi_block_t* mi_page_block_index_at(const mi_page_t* page, size_t idx) {
+  mi_assert_internal(idx < page->capacity);
+  return (mi_block_t*)(mi_page_start(page) + (idx * page->block_size));
+}
+
+static inline void mi_page_purged_clear(mi_page_t* page, size_t k) {
+  mi_assert_internal(k < MI_PAGE_PURGE_BITS);
+  page->purged[k / 64] &= ~((uint64_t)1 << (k % 64));
+}
+
+// the OS pages that the block at index `idx` overlaps (relative to `mi_page_purge_base`)
+static inline void mi_page_block_os_pages(const mi_page_t* page, size_t idx, size_t* kfirst, size_t* klast) {
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t base = mi_page_purge_base(page);
+  const uintptr_t lo = (uintptr_t)mi_page_start(page) + (idx * page->block_size);
+  *kfirst = (size_t)(lo - base) / os_size;
+  *klast = (size_t)((lo + page->block_size - 1) - base) / os_size;
+}
+
+// the blocks that overlap OS page `k`, or `false` if that OS page is not entirely inside
+// the block area (see `_mi_page_purge_os_page_blocks`)
+static inline bool mi_page_os_page_blocks(const mi_page_t* page, size_t k, size_t* first, size_t* last) {
+  return _mi_page_purge_os_page_blocks(_mi_os_page_size(), page->block_size, (uintptr_t)mi_page_start(page),
+                                       page->capacity, k, first, last);
 }
 
 // are there immediately available blocks, i.e. blocks available on the free list.

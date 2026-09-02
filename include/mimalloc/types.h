@@ -226,6 +226,18 @@ terms of the MIT license. A copy of the license can be found in the file
 // Minimal commit for a page on-demand commit 
 #define MI_PAGE_MIN_COMMIT_SIZE  (16*MI_KiB) /* MI_ARENA_SLICE_SIZE */
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+// Hole purging: a bitmap of the OS pages inside a mimalloc page whose memory has been
+// discarded. It is indexed by OS page (not by block), so its size does not depend on the
+// size class: a page needs `page_size/os_page_size` bits (plus one for the partial OS page
+// that holds the page header). 256 bits covers every small (64 KiB) and medium (512 KiB)
+// page on every OS page size, and a large (4 MiB) page when the OS page is 16 KiB. A large
+// page on a 4 KiB OS page needs 1025 bits and stays ineligible -- the capacity check is at
+// runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in
+// `src/page-holes.c`).
+#define MI_PAGE_PURGE_BITS                (256)
+#define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from
@@ -429,7 +441,35 @@ typedef struct mi_page_s {
 
   struct mi_prof_record_s*  metadata;          // sampled live allocation records, or NULL (MI_PPROF)
   bool                      has_metadata;      // `true` if profiler records are attached to this page
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+  // The OS pages inside this page whose memory was discarded to the OS. A block is
+  // "purged" exactly when it overlaps one of them (we discard an OS page only when every
+  // block overlapping it is free), and a purged block is held OFF every free list: mimalloc
+  // threads its free list through the free blocks themselves, so a discarded block cannot
+  // hold a `next` pointer. COLD: touched only by the idle hole-purge sweep, so it stays at
+  // the very tail of the struct, after this fork's own `metadata`/`has_metadata` (which the
+  // free path reads) and after every upstream field.
+  uint64_t                  purged[MI_PAGE_PURGE_WORDS];
+
+  // The discarded part of the *unformed tail*: the blocks in `[capacity,reserved)` are not
+  // formatted yet, but when the page is carved from a recycled arena slice their memory is
+  // already resident. Byte offsets from `page_start`, OS-page aligned, `lo == hi` when
+  // nothing is discarded. Deliberately NOT part of `purged` above: a bit there means "this
+  // block is free and off every free list" (`_mi_page_is_valid`), and these blocks do not
+  // exist yet. The region only ever shrinks from the left, as `capacity` grows.
+  uint32_t                  unformed_purged_lo;
+  uint32_t                  unformed_purged_hi;
+
+  // The `(capacity,used)` the last hole sweep left this page in, packed as `(capacity<<32)|used`.
+  // A sweep that finds it unchanged skips the page without walking its free list at all: nothing
+  // was allocated or freed in it since, so the sweep has nothing new to discard (see
+  // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". Cold, like `purged` above.
+  uint64_t                  swept_state;
 } mi_page_t;
+
+// An impossible `(capacity,used)` (`used > capacity` never holds): "this page has no sweep state".
+#define MI_PAGE_SWEPT_NONE                (~(uint64_t)0)   // capacity is 16-bit, so a state with all upper bits set cannot occur
 
 
 // ------------------------------------------------------

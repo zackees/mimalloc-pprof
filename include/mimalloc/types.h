@@ -634,6 +634,27 @@ typedef struct mi_heap_s {
 // (and needs to call `mi_subproc_add_current_thread` before any allocations).
 // ------------------------------------------------------
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+// Width of the scavenger's wait word (`mi_subproc_t::scavenger_wake`). The OS wait
+// primitive fixes it: Linux `futex` and Darwin `__ulock_wait(UL_COMPARE_AND_WAIT)` compare
+// exactly 32 bits, while Windows `WaitOnAddress` takes 1/2/4/8 bytes.
+//
+// It is pointer-width on Windows on purpose. The MSVC **C** atomics wrapper
+// (`mimalloc/atomic.h`, taken whenever `__STDC_NO_ATOMICS__` is defined -- i.e. `cl` without
+// `/std:c11 /experimental:c11atomics`, which is exactly how `rust/mimalloc-pprof/build.rs`
+// compiles the amalgamation for `x86_64-pc-windows-msvc`) implements `mi_atomic_load` /
+// `store` / `exchange` / `cas` ONLY at `uintptr_t` width, via `__iso_volatile_load`/`_store`.
+// A 32-bit field there would be read and written 8 bytes at a time, silently clobbering
+// whatever follows it. Every field this tree touches with the generic `mi_atomic_*` macros
+// must therefore be exactly pointer-width; `src/scavenger.c` static-asserts it.
+#if defined(_WIN32)
+typedef size_t   mi_scav_word_t;
+#define MI_SCAV_WORD_ALIGN  MI_SIZE_SIZE
+#else
+typedef uint32_t mi_scav_word_t;
+#define MI_SCAV_WORD_ALIGN  8
+#endif
+
 struct mi_subproc_s {
   size_t                subproc_seq;                    // unique id for sub-processes
   mi_subproc_t*         next;                           // list of all sub-processes
@@ -674,8 +695,8 @@ struct mi_subproc_s {
   mi_tld_t*             tlds;                           // list of tlds of this sub-process (walked by the scavenger for parked threads)
   mi_lock_t             tlds_lock;                      // guards the `tlds` list structure only -- never held across a sweep
   _Atomic(size_t)       parked_count;                   // threads currently parked; lets the scavenger skip the walk entirely
-  mi_decl_align(8)
-  _Atomic(uint32_t)     scavenger_wake;                 // futex word signalled when a purge is scheduled (the scavenger thread waits on this)
+  mi_decl_align(MI_SCAV_WORD_ALIGN)
+  _Atomic(mi_scav_word_t) scavenger_wake;               // wait word signalled when a purge is scheduled (the scavenger thread waits on this)
 };
 
 
@@ -725,6 +746,8 @@ typedef struct mi_hooks_tld_s {
 
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a):
 // idle handoff states for `mi_tld_t::park_state`.
+// `size_t`-typed, not `uint32_t`: see `mi_scav_word_t` above -- the MSVC C atomics wrapper
+// only has pointer-width accessors, so every field reached through `mi_atomic_*` is one word.
 #define MI_PARK_RUNNING   (0)   // the owner is running: only the owner may touch its theaps
 #define MI_PARK_PARKED    (1)   // the owner blocked in `mi_on_thread_idle_start`: the scavenger may claim it
 #define MI_PARK_SWEEPING  (2)   // the scavenger claimed it and is doing the idle work right now
@@ -748,10 +771,10 @@ struct mi_tld_s {
   // `mi_tld_detached` are initialized positionally in `src/init.c`, so a field inserted
   // above silently shifts them. Zero is the correct initial value for every one of these
   // (MI_PARK_RUNNING / NULL / unregistered).
-  _Atomic(uint32_t)     park_state;           // MI_PARK_*: whether another thread may sweep our theaps right now
-  _Atomic(uint32_t)     park_reclaim;         // set by the owner to get its theaps back; the sweep stops at the next page
+  _Atomic(size_t)       park_state;           // MI_PARK_*: whether another thread may sweep our theaps right now
+  _Atomic(size_t)       park_reclaim;         // set by the owner to get its theaps back; the sweep stops at the next page
   mi_theap_t*           park_theap0;          // default theap, captured at the park (the scavenger has no TLS to find it)
-  _Atomic(uint32_t)     park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
+  _Atomic(size_t)       park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
   mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
 };
 

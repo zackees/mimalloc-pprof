@@ -27,6 +27,22 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/prim.h"      // _mi_prim_thread_yield
 #include "mimalloc/prim-tls.h"  // _mi_theap_default
 
+// #272 (blocker, MSVC-C): the MSVC **C** atomics wrapper in `mimalloc/atomic.h` -- taken by `cl`
+// without `/std:c11 /experimental:c11atomics`, which is how `rust/mimalloc-pprof/build.rs`
+// compiles the amalgamation for `x86_64-pc-windows-msvc` -- implements the generic
+// `mi_atomic_load/store/exchange/cas` ONLY at `uintptr_t` width. A narrower field reached
+// through them is read and written a full word at a time, past its end. These four are the
+// fields this phase added; a build that narrows one again fails here rather than at runtime.
+typedef char mi_scav_atomic_widths_assert_t[
+  (sizeof(((mi_tld_t*)0)->park_state)      == sizeof(uintptr_t) &&
+   sizeof(((mi_tld_t*)0)->park_reclaim)    == sizeof(uintptr_t) &&
+   sizeof(((mi_tld_t*)0)->park_swept)      == sizeof(uintptr_t) &&
+   sizeof(((mi_subproc_t*)0)->parked_count)== sizeof(uintptr_t)
+   #if defined(_WIN32)
+   && sizeof(((mi_subproc_t*)0)->scavenger_wake) == sizeof(uintptr_t)
+   #endif
+  ) ? 1 : -1];
+
 /* -----------------------------------------------------------
   The idle handoff protocol.
 
@@ -80,7 +96,7 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) {
 void _mi_park_leave(mi_tld_t* tld) {
   if (tld == NULL) return;
   for (;;) {
-    uint32_t expected = MI_PARK_PARKED;
+    size_t expected = MI_PARK_PARKED;
     if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_RUNNING)) break;
     if (expected == MI_PARK_RUNNING) return;   // not parked: nothing to take back
     // it may re-claim the moment it releases, so re-race rather than store: only a CAS from
@@ -114,7 +130,7 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     mi_lock(&subproc->tlds_lock) {
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
         if (mi_atomic_load_acquire(&tld->park_swept) != 0) continue;   // already done for this park
-        uint32_t expected = MI_PARK_PARKED;
+        size_t expected = MI_PARK_PARKED;
         if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_SWEEPING)) {
           claimed = tld; theap0 = tld->park_theap0; break;
         }
@@ -176,7 +192,7 @@ static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = runnin
 static _Atomic(uintptr_t) _mi_scavenger_shutdown;
 
 // -----------------------------------------------------------------------------
-// Wait/wake on subproc->scavenger_wake (a uint32_t futex word).
+// Wait/wake on subproc->scavenger_wake (a `mi_scav_word_t` futex/wait word).
 //
 //   mi_scav_wait(addr, timeout_ms) : block while *addr == 0, up to timeout_ms.
 //   mi_scav_wake_one(addr)         : wake one waiter on addr.
@@ -201,13 +217,13 @@ static _Atomic(uintptr_t) _mi_scavenger_shutdown;
 #define MI_FUTEX_WAIT_PRIVATE  (0 | 128)
 #define MI_FUTEX_WAKE_PRIVATE  (1 | 128)
 
-static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+static void mi_scav_wait(_Atomic(mi_scav_word_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;
   struct timespec ts;
   ts.tv_sec  = (time_t)(timeout_ms / 1000);
   ts.tv_nsec = (long)((timeout_ms % 1000) * 1000000L);
   while (mi_atomic_load_acquire(addr) == 0) {
-    const long rc = syscall(SYS_futex, (uint32_t*)addr, MI_FUTEX_WAIT_PRIVATE, (uint32_t)0, &ts, NULL, 0);
+    const long rc = syscall(SYS_futex, (uint32_t*)addr,   /* mi_scav_word_t is uint32_t here: futex is 32-bit only */ MI_FUTEX_WAIT_PRIVATE, (uint32_t)0, &ts, NULL, 0);
     if (rc == 0) return;                 // woken by FUTEX_WAKE
     if (errno == ETIMEDOUT) return;
     if (errno == EAGAIN) return;         // *addr != 0 at kernel check; caller re-reads
@@ -215,7 +231,7 @@ static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
   }
 }
 
-static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+static void mi_scav_wake_one(_Atomic(mi_scav_word_t)* addr) {
   syscall(SYS_futex, (uint32_t*)addr, MI_FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
 }
 
@@ -235,7 +251,7 @@ extern int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);
 #define MI_UL_COMPARE_AND_WAIT  1
 #define MI_ULF_NO_ERRNO         0x01000000
 
-static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+static void mi_scav_wait(_Atomic(mi_scav_word_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;
   const uint32_t timeout_us = (uint32_t)timeout_ms * 1000u;
   while (mi_atomic_load_acquire(addr) == 0) {
@@ -246,7 +262,7 @@ static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
   }
 }
 
-static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+static void mi_scav_wake_one(_Atomic(mi_scav_word_t)* addr) {
   __ulock_wake(MI_UL_COMPARE_AND_WAIT | MI_ULF_NO_ERRNO, (void*)addr, 0);
 }
 
@@ -269,18 +285,20 @@ VOID WINAPI WakeByAddressSingle(PVOID Address);
 #pragma comment(lib, "synchronization")
 #endif
 
-static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+static void mi_scav_wait(_Atomic(mi_scav_word_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;
-  uint32_t expected = 0;
+  mi_scav_word_t expected = 0;
   while (mi_atomic_load_acquire(addr) == 0) {
-    if (!WaitOnAddress((volatile VOID*)addr, &expected, sizeof(uint32_t), (DWORD)timeout_ms)) {
+    // the size argument must follow `scavenger_wake`'s ACTUAL width (`mi_scav_word_t`), which is
+    // pointer-width on Windows so the MSVC C atomics wrapper's word-width accessors fit it.
+    if (!WaitOnAddress((volatile VOID*)addr, &expected, sizeof(mi_scav_word_t), (DWORD)timeout_ms)) {
       return;  // timeout (GetLastError() == ERROR_TIMEOUT)
     }
     // woken (possibly spuriously): loop re-checks *addr
   }
 }
 
-static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+static void mi_scav_wake_one(_Atomic(mi_scav_word_t)* addr) {
   WakeByAddressSingle((PVOID)addr);
 }
 
@@ -304,7 +322,7 @@ static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
 static pthread_mutex_t _mi_scav_mutex;   // initialized in `mi_scav_init` (from `_mi_scavenger_start`, before any wait or wake)
 static pthread_cond_t  _mi_scav_cond;
 
-static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+static void mi_scav_wait(_Atomic(mi_scav_word_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;
   struct timespec ts;
   #if defined(CLOCK_REALTIME)
@@ -323,7 +341,7 @@ static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
   pthread_mutex_unlock(&_mi_scav_mutex);
 }
 
-static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+static void mi_scav_wake_one(_Atomic(mi_scav_word_t)* addr) {
   MI_UNUSED(addr);
   pthread_mutex_lock(&_mi_scav_mutex);
   pthread_cond_signal(&_mi_scav_cond);
@@ -370,7 +388,7 @@ static void mi_scavenger_run(void) {
     // `parked_count` read below can pass the parker's increment and its exchange in opposite
     // directions (store-buffering) -- we see no parked thread, it sees a stale wake==1 and issues
     // no syscall, and that park is silently deferred to the safety timeout.
-    mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)0);
+    mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (mi_scav_word_t)0);
     // Do the idle work of any thread that parked and handed us its theaps. This is the expensive
     // part and it is why the owner gets to skip it.
     const mi_msecs_t park_due = _mi_theap_sweep_parked(subproc);
@@ -422,7 +440,7 @@ void _mi_scavenger_wake(mi_subproc_t* subproc) {
   // Coalesce: only issue the wake syscall on the 0->1 edge. Callers sit on
   // the page-free path and would otherwise turn every arena page free into a
   // syscall on the freeing thread.
-  if (mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)1) == 0) {
+  if (mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (mi_scav_word_t)1) == 0) {
     mi_scav_wake_one(&subproc->scavenger_wake);
   }
 }
@@ -462,8 +480,18 @@ void _mi_scavenger_start(void) {
   if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) return;   // teardown has begun
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
-  mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  // Claim `running` FIRST, then re-check `shutdown`. Loading `shutdown` before publishing
+  // `running` leaves a window in which `_mi_scavenger_stop` sets `shutdown`, reads `running == 0`
+  // and returns having joined nothing, and we then create a thread nobody will ever stop.
+  // Ordering it this way, one of the two always sees the other: either stop reads `running == 1`
+  // (and joins us), or we read `shutdown != 0` (and never start).
   mi_atomic_store_release(&_mi_scavenger_exited, (uintptr_t)0);
+  if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)1) != 0) return;  // someone else got there
+  if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) {
+    mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
+    return;
+  }
+  // published under the same edge that owns `running`, so a stop that sees `running == 1` sees this
   _mi_scavenger_thread = CreateThread(NULL, 0, &mi_scavenger_thread_main, NULL, 0, NULL);
   if (_mi_scavenger_thread == NULL) {
     mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
@@ -474,7 +502,7 @@ void _mi_scavenger_stop(void) {
   mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)1);   // before the exchange: no restart past here
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
-  mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
+  mi_atomic_store_release(&subproc->scavenger_wake, (mi_scav_word_t)1);
   mi_scav_wake_one(&subproc->scavenger_wake);
   if (_mi_scavenger_thread != NULL) {
     // BOUNDED, never INFINITE. This runs first in `mi_process_done_once`, and on Windows that
@@ -540,7 +568,13 @@ void _mi_scavenger_start(void) {
   if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) return;   // teardown has begun
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
-  mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  // Claim `running` FIRST, then re-check `shutdown` -- see the Windows `_mi_scavenger_start`
+  // above for why the other order lets a start slip past the stop that should have joined it.
+  if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)1) != 0) return;
+  if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) {
+    mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
+    return;
+  }
   mi_scav_init();
   // Block all signals on the scavenger thread. It runs before the host has set
   // up its own signal masking, and a thread that leaves (e.g.) SIGCHLD
@@ -576,7 +610,7 @@ void _mi_scavenger_stop(void) {
   mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)1);   // before the exchange: no restart past here
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
-  mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
+  mi_atomic_store_release(&subproc->scavenger_wake, (mi_scav_word_t)1);
   mi_scav_wake_one(&subproc->scavenger_wake);
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_joinable, (uintptr_t)0) != 0) {
     pthread_join(_mi_scavenger_thread, NULL);
@@ -650,7 +684,7 @@ bool mi_on_thread_idle_start(void) mi_attr_noexcept {
   tld->park_theap0 = theap0;
   mi_atomic_store_release(&tld->park_reclaim, 0);
   mi_atomic_store_release(&tld->park_swept, 0);
-  uint32_t expected = MI_PARK_RUNNING;
+  size_t expected = MI_PARK_RUNNING;
   if (!mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_PARKED)) return false;
   mi_atomic_increment_relaxed(&tld->subproc->parked_count);
   _mi_scavenger_wake(tld->subproc);

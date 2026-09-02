@@ -729,13 +729,13 @@ void _mi_process_fork_child(void) {
     // cleared for the same reason: a stale 1 would make the coalescing edge in
     // `_mi_scavenger_wake` never fire again.
     mi_lock_init(&sp->tlds_lock);
-    mi_atomic_store_relaxed(&sp->scavenger_wake, (uint32_t)0);
+    mi_atomic_store_relaxed(&sp->scavenger_wake, (mi_scav_word_t)0);
     mi_atomic_store_relaxed(&sp->parked_count, (size_t)0);
     for (mi_tld_t* t = sp->tlds; t != NULL; t = t->subproc_next) {
       mi_lock_init(&t->theaps_lock);
-      mi_atomic_store_relaxed(&t->park_state, (uint32_t)MI_PARK_RUNNING);
-      mi_atomic_store_relaxed(&t->park_reclaim, (uint32_t)0);
-      mi_atomic_store_relaxed(&t->park_swept, (uint32_t)0);
+      mi_atomic_store_relaxed(&t->park_state, (size_t)MI_PARK_RUNNING);
+      mi_atomic_store_relaxed(&t->park_reclaim, (size_t)0);
+      mi_atomic_store_relaxed(&t->park_swept, (size_t)0);
     }
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       mi_lock_init(&h->theaps_lock);

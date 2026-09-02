@@ -1049,7 +1049,15 @@ if (MI_BUILD_TESTS)
   # bounded here instead so a still-open race (or the intentionally-unwired
   # mi_debug_stall_in_heap_delete_claim hook, pre-protocol-port) fails the run rather than
   # hanging it forever.
-  foreach(TEST_NAME heap-teardown heap-mt heap-churn heap-aba heap-delete-race)
+  #
+  # test-heap-teardown itself is registered separately below, gated on MI_DEBUG: its `pin`
+  # case needs the MI_DEBUG-only mi_debug_stall_in_heap_delete_claim hook (arena.c), and the
+  # source now `#error`s (like test-commit-fail.c) if built with MI_DEBUG==0 rather than
+  # silently diverging between an undefined-symbol link failure (Debug + MI_NO_DEBUG=ON,
+  # where MI_DEBUG=0 but the old `!defined(NDEBUG)` guard still referenced the symbol) and a
+  # silently-skipped pin case (Release + MI_DEBUG_FULL=ON, where MI_DEBUG>0 but NDEBUG is
+  # still defined by the Release build type) -- both reproduced by CI review of this PR.
+  foreach(TEST_NAME heap-mt heap-churn heap-aba heap-delete-race)
     add_executable(mimalloc-test-${TEST_NAME} test/test-${TEST_NAME}.c)
     target_compile_definitions(mimalloc-test-${TEST_NAME} PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE ${mi_cflags})
@@ -1066,6 +1074,24 @@ if (MI_BUILD_TESTS)
     add_test(NAME test-${TEST_NAME} COMMAND mimalloc-test-${TEST_NAME})
     set_tests_properties(test-${TEST_NAME} PROPERTIES TIMEOUT 300)
   endforeach()
+
+  if(MI_DEBUG)
+    add_executable(mimalloc-test-heap-teardown test/test-heap-teardown.c)
+    target_compile_definitions(mimalloc-test-heap-teardown PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-heap-teardown PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-heap-teardown PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-heap-teardown PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-heap-teardown PRIVATE mimalloc ${mi_libraries})
+    endif()
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-heap-teardown PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-heap-teardown COMMAND mimalloc-test-heap-teardown)
+    set_tests_properties(test-heap-teardown PROPERTIES TIMEOUT 300)
+  endif()
 
   # pthread_atfork fork-safety handlers (issue #270, Bun parity P5). POSIX-only --
   # both sources compile to a Windows-skip stub via #ifdef _WIN32, but there is no

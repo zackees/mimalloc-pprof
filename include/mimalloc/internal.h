@@ -193,11 +193,12 @@ void          _mi_process_fork_prepare(void);
 void          _mi_process_fork_parent(void);
 void          _mi_process_fork_child(void);
 
-// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): set once by
-// `_mi_process_fork_child`, never cleared. See src/fork.c's definition for the full
-// rationale; consulted by `mi_heap_visit_page_claim` (arena.c) and `mi_heap_detach_theaps`
-// (heap.c) to avoid waiting on / walking pages of a theap whose owning thread did not
-// survive a multi-threaded fork().
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): defined
+// unconditionally in src/subproc.c (not src/fork.c, which compiles only on POSIX) so the
+// symbol links on every platform; set once by `_mi_process_fork_child` (src/fork.c, in its
+// POSIX-only block -- see there for the sticky-flag limitation), never cleared. Consulted by
+// `mi_heap_visit_page_claim` (arena.c) and `mi_heap_detach_theaps` (heap.c) to avoid waiting
+// on / walking pages of a theap whose owning thread did not survive a multi-threaded fork().
 extern mi_decl_hidden bool _mi_process_is_forked_child;
 
 // #270: runtime lock-order detector. Every internal lock acquire already goes through
@@ -867,11 +868,11 @@ static inline bool mi_theap_matches_thread(mi_theap_t* theap) {
 // is not the theap's own owning thread. Bun's version also allows the park state the
 // background scavenger sets while sweeping a parked thread's theaps; that state does not
 // exist in this tree (#272), so that clause is omitted here.
-static inline bool _mi_theap_can_touch(const mi_theap_t* theap) {
+static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
   if (theap == NULL || theap->tld == NULL) return true;
-  if (mi_atomic_load_ptr_relaxed(mi_heap_t, &((mi_theap_t*)theap)->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`
+  if (mi_atomic_load_ptr_relaxed(mi_heap_t, &theap->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`
   if (theap->tld->thread_id == _mi_thread_id()) return true;
-  return mi_theap_is_detached((mi_theap_t*)theap);   // upstream's permanently-detached theaps (meta-data) belong to no thread
+  return mi_theap_is_detached(theap);   // upstream's permanently-detached theaps (meta-data) belong to no thread
 }
 
 /* -----------------------------------------------------------

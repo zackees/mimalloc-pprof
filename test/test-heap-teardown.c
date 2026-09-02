@@ -40,6 +40,19 @@ terms of the MIT license.
 
 #include "mimalloc.h"
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6). This whole
+// executable is CMake-gated on `if(MI_DEBUG)` (see CMakeLists.txt) because the `pin` case
+// below needs the MI_DEBUG-only `mi_debug_stall_in_heap_delete_claim` hook (arena.c); this
+// mirrors test-commit-fail.c's own `#if MI_DEBUG > 0` + `#error` pattern rather than the
+// `!defined(NDEBUG)` this file used before, which diverges from `MI_DEBUG` in this tree's
+// CMake (a Debug build with `-DMI_NO_DEBUG=ON` sets `MI_DEBUG=0` while `NDEBUG` stays
+// undefined; a Release build with `-DMI_DEBUG_FULL=ON` sets `MI_DEBUG=3` while `NDEBUG` is
+// still defined by the Release build type) -- so `!defined(NDEBUG)` could reference the
+// symbol when it is not linked in, or silently skip the pin case when it is.
+#if MI_DEBUG == 0
+#error "test-heap-teardown requires MI_DEBUG>0 (see CMakeLists.txt's if(MI_DEBUG) gate)"
+#endif
+
 #if defined(MI_TSAN)
 static int ITER = 20;
 #elif defined(MI_UBSAN) || defined(MI_GUARDED)
@@ -107,7 +120,7 @@ static void churn(intptr_t tid) {
 /* -----------------------------------------------------------
   pin: deterministic, needs the debug hook in `mi_heap_visit_page_claim`
 ----------------------------------------------------------- */
-#if !defined(NDEBUG)
+#if MI_DEBUG > 0
 #ifdef __cplusplus
 #include <atomic>
 extern "C" std::atomic<uintptr_t> mi_debug_stall_in_heap_delete_claim;
@@ -468,7 +481,7 @@ int main(int argc, char** argv) {
   }
   fprintf(stderr, "Using %d iterations\n", ITER);
 
-  #if !defined(NDEBUG)
+  #if MI_DEBUG > 0
   fprintf(stderr, "test: pin...  ");            test_pin();           fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");
   #endif
   fprintf(stderr, "test: os-pages...  ");       test_os_pages();      fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");

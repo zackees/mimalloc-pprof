@@ -125,6 +125,9 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   #if MI_GUARDED
   0, 0, 0, 1,             // rate is 0 and count is 1 so we never write to it (see `internal.h:mi_heap_malloc_use_guarded`)
   #endif
+  #if MI_PPROF
+  false,                  // prof_force_slow (#267): set correctly by `_mi_theap_init`, not by this template
+  #endif
   MI_SMALL_PAGES_EMPTY,
   MI_PAGE_QUEUES_EMPTY,
   MI_MEMID_STATIC,

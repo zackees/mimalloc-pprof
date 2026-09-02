@@ -156,7 +156,9 @@ static void mi_page_thread_collect_to_local(mi_page_t* page, mi_block_t* head)
   // _mi_page_free_collect_partly): deferred reclamation of already-freed blocks onto the
   // local free list, not a new free event, so memevt does not hook this function at all
   // (see free.c's mi_free_block_mt, where the one-time remote-free accounting happens).
-  _mi_prof_on_free_collect(page, head);
+  // #267: check `has_metadata` before the call for the same reason as free.c's
+  // mi_free_block_local -- avoid an out-of-line call on the (common) unsampled page.
+  if mi_unlikely(page->has_metadata) { _mi_prof_on_free_collect(page, head); }
   #endif
 
   // find the last block in the list -- also to get a proper use count (without data races)
@@ -969,6 +971,15 @@ static mi_page_t* mi_find_page(mi_theap_t* theap, size_t size, size_t huge_align
   mi_assert_internal(mi_page_immediate_available(page));
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
+  #if MI_PPROF
+  // #267: same-thread, lock-free opportunistic re-sync of `pages_free_direct` for this
+  // queue. A no-op while `theap->prof_force_slow` is still set (see
+  // `mi_theap_queue_first_update`'s early-return in page-queue.c) and a no-op for `pq`
+  // outside the small-object range; once the profiler has stopped, this is what actually
+  // restores the fast path for a theap that is not otherwise mutating its page queues --
+  // `mi_prof_stop` (profile.c) deliberately does not touch `pages_free_direct` cross-thread.
+  mi_theap_queue_first_update(theap, pq);
+  #endif
   return page;
 }
 
@@ -1071,6 +1082,11 @@ static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size
   if (ppage!=NULL) { *ppage = page; }
   void* const p = _mi_page_malloc_zero(theap,page,size,zero);
   mi_assert_internal(p != NULL);
+  #if MI_PPROF
+  // #267: the sampling countdown lives here now, not in `alloc.c`'s fast list-pop -- see
+  // that file's `mi_page_malloc_zero` for the full explanation.
+  _mi_prof_on_alloc(theap, page, p, size - MI_PADDING_SIZE);
+  #endif
 
   // move full pages to the full queue
   if (mi_page_block_size(page) > MI_SMALL_MAX_OBJ_SIZE && mi_page_is_full(page)) {
@@ -1103,10 +1119,21 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
       mi_assert_internal(pq!=NULL && !mi_page_queue_is_huge(pq));
       page = mi_page_queue_find_free(theap,pq);
       // mi_assert_internal(mi_page_block_size(page) <= MI_SMALL_MAX_OBJ_SIZE);
-      if (page!=NULL) {        
+      if (page!=NULL) {
         if (ppage!=NULL) { *ppage = page; }
         mi_assert_internal(mi_page_immediate_available(page));
-        return _mi_page_malloc_zero(theap,page,size,zero);
+        #if MI_PPROF
+        // #267: opportunistic re-sync (see `mi_find_page`'s matching comment above; a
+        // no-op unless the profiler has stopped and this theap's fast path for `pq` is
+        // still poisoned from a run that ended without this queue being touched again).
+        mi_theap_queue_first_update(theap, pq);
+        #endif
+        void* const p = _mi_page_malloc_zero(theap,page,size,zero);
+        #if MI_PPROF
+        // #267: the sampling countdown lives here now, not in `alloc.c`'s fast list-pop.
+        _mi_prof_on_alloc(theap, page, p, size - MI_PADDING_SIZE);
+        #endif
+        return p;
       }
     }
   }

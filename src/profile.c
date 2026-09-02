@@ -289,6 +289,15 @@ bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept {
     mi_atomic_store_release(&prof_enabled, true);
   }
   mi_lock_release(&prof_lock);
+  // #267: walk every live theap process-wide OUTSIDE prof_lock -- the walker takes
+  // subproc/heap/theap locks that nothing else nests under prof_lock, and coupling them
+  // here would just add a new lock-ordering constraint for no benefit (prof_enabled is
+  // already visible process-wide by the time the walk starts). See
+  // `_mi_subproc_prof_set_force_slow`'s comment (subproc.c) for the poisoning strategy and
+  // the accepted start-time coverage gap (a theap whose queue update races the walk and
+  // reads `prof_force_slow` as not-yet-set keeps its fast path live for one more
+  // allocation -- matches oven-sh/mimalloc @ 942b8342's own window).
+  if (started) { _mi_subproc_prof_set_force_slow(true); }
   return started;
 }
 bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { return mi_prof_start_seeded(sample_rate, (uint64_t)mi_option_get(mi_option_prof_seed)); }
@@ -440,6 +449,14 @@ void mi_prof_stop(void) mi_attr_noexcept {
   mi_atomic_store_relaxed(&prof_arena_committed, (size_t)0);
   mi_atomic_store_relaxed(&prof_dropped_samples, (size_t)0);
   mi_lock_release(&prof_lock);
+  // #267: only clear the flag here, cross-thread -- deliberately do NOT refresh any
+  // theap's `pages_free_direct` from this (the stopping) thread. That would read another
+  // theap's page-queue state (`pq->first`) concurrently with that theap's own thread
+  // mutating it (e.g. `_mi_page_free` removing the very page just read), which can publish
+  // a page that gets freed moments later -- a use-after-free on that theap's next fast-path
+  // malloc. Each theap re-syncs its own `pages_free_direct` itself, same-thread, the next
+  // time it takes the generic path (see `mi_find_page`/`_mi_malloc_generic` in page.c).
+  _mi_subproc_prof_set_force_slow(false);
 }
 bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg) mi_attr_noexcept {
   if (write == NULL) return false;
@@ -872,6 +889,27 @@ void _mi_prof_process_done(void) {
   }
 }
 void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size) {
+  // #266: never sample allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
+  // _mi_meta_zalloc onto subproc->theap_meta). These are large (sizeof(mi_theap_t) is
+  // several KB) relative to typical sample rates, so they sample almost every time, and
+  // on an MSVC DLL build they can be freed from DLL_THREAD_DETACH after the owning
+  // thread's tld has already been torn down -- a path mi_collect(true) never revisits --
+  // leaving the sample "live" forever. page->has_metadata is never set for a meta page as
+  // a result, so _mi_prof_on_free/_mi_prof_on_free_collect need no matching change: there
+  // is nothing on the page for them to find.
+  //
+  // #267: this check now runs BEFORE prof_auto_start(), not after -- meta allocations
+  // (`_mi_meta_zalloc`, used to bootstrap a thread's own tld/theap and every subproc's
+  // theap_meta) can be in flight while this same thread holds `subproc->theap_meta_lock`
+  // or, during subproc/heap creation, `subproc->heaps_lock`. prof_auto_start()'s
+  // first-ever call can reach mi_prof_start(), whose cross-theap poison walker
+  // (_mi_subproc_prof_set_force_slow, subproc.c) takes `subproc->heaps_lock` and each
+  // heap's `theaps_lock` -- a non-reentrant self-deadlock if a meta allocation could still
+  // reach prof_auto_start() here. Meta pages are never sampled anyway, so skipping
+  // auto-start for them too costs nothing: it still fires on the first genuine user
+  // allocation, which happens strictly after thread/process init releases those locks.
+  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
+
   prof_auto_start();
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;
   // #266: peek the CURRENT thread's hooks tld here, not `theap` (the theap performing
@@ -883,16 +921,6 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   mi_hooks_tld_t* const prof_hooks = _mi_hooks_tld_peek();
   if (prof_hooks == NULL) return;
   if (prof_hooks->prof_callback_depth > 0) return;
-
-  // #266: never sample allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
-  // _mi_meta_zalloc onto subproc->theap_meta). These are large (sizeof(mi_theap_t) is
-  // several KB) relative to typical sample rates, so they sample almost every time, and
-  // on an MSVC DLL build they can be freed from DLL_THREAD_DETACH after the owning
-  // thread's tld has already been torn down -- a path mi_collect(true) never revisits --
-  // leaving the sample "live" forever. page->has_metadata is never set for a meta page as
-  // a result, so _mi_prof_on_free/_mi_prof_on_free_collect need no matching change: there
-  // is nothing on the page for them to find.
-  if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
 
   // The sampling DECISION is thread-local and is made without taking prof_lock.
   //

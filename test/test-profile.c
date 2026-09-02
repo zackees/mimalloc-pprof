@@ -962,6 +962,112 @@ static void test_meta_pages_never_sampled(void) {
   mi_prof_stop();
 }
 
+/* ---- #267 adversarial cases: start/stop/reset racing concurrent allocation ----------
+   Exercises the zero-cost-when-off fast path's cross-thread poison/unpoison machinery
+   (mi_theap_t::prof_force_slow, `_mi_subproc_prof_set_force_slow` in subproc.c) under
+   the exact conditions it is built for: worker threads hammering the small-object fast
+   path (allocate + touch + free, repeatedly) while this thread starts, stops, and
+   restarts the profiler with a different rate underneath them, plus a reset while a
+   page still carries a live sampled block. None of this should crash, deadlock, or
+   leave the fast path (or the profiler) unable to run normally afterward. */
+static volatile bool p267_stop_workers;
+static void p267_worker_body(void) {
+  size_t i = 0;
+  while (!p267_stop_workers) {
+    void* p = mi_malloc(48 + (i % 5) * 16);
+    assert(p != NULL);
+    *(volatile char*)p = (char)i;
+    mi_free(p);
+    i++;
+  }
+}
+enum { P267_WORKERS = 6 };
+#ifdef _WIN32
+static DWORD WINAPI p267_worker(LPVOID arg) { (void)arg; p267_worker_body(); return 0; }
+static void p267_spawn(HANDLE* threads) {
+  for (size_t i = 0; i < P267_WORKERS; i++) { threads[i] = CreateThread(NULL, 0, p267_worker, NULL, 0, NULL); assert(threads[i] != NULL); }
+}
+static void p267_join(HANDLE* threads) {
+  WaitForMultipleObjects(P267_WORKERS, threads, TRUE, INFINITE);
+  for (size_t i = 0; i < P267_WORKERS; i++) CloseHandle(threads[i]);
+}
+#else
+static void* p267_worker(void* arg) { (void)arg; p267_worker_body(); return NULL; }
+static void p267_spawn(pthread_t* threads) {
+  for (size_t i = 0; i < P267_WORKERS; i++) assert(pthread_create(&threads[i], NULL, p267_worker, NULL) == 0);
+}
+static void p267_join(pthread_t* threads) {
+  for (size_t i = 0; i < P267_WORKERS; i++) assert(pthread_join(threads[i], NULL) == 0);
+}
+#endif
+
+static void test_start_while_allocating_stop_mid_sample_restart_reset(void) {
+#ifdef _WIN32
+  HANDLE threads[P267_WORKERS];
+#else
+  pthread_t threads[P267_WORKERS];
+#endif
+
+  /* 1) start while several threads are already mid-allocation loop -- races the
+        cross-theap poison walk (_mi_subproc_prof_set_force_slow) against each worker's
+        own theap-creation/queue-update activity. */
+  p267_stop_workers = false;
+  p267_spawn(threads);
+  for (int i = 0; i < 200; i++) { void* p = mi_malloc(64); assert(p != NULL); mi_free(p); }   /* let them get going */
+  assert(mi_prof_start_seeded(128, 267001));
+  for (int i = 0; i < 4000; i++) { void* p = mi_malloc(64); assert(p != NULL); mi_free(p); }   /* race the poison from both sides */
+
+  /* 2) stop mid-sample: workers are still allocating/freeing right now. */
+  mi_prof_stop();
+
+  p267_stop_workers = true;
+  p267_join(threads);
+
+  /* The fast path must work normally again, and be sample-free. */
+  mi_prof_stats_t_decl(after_stop);
+  assert(mi_prof_stats_get(&after_stop));
+  assert(!after_stop.enabled);
+  for (int i = 0; i < 4000; i++) { void* p = mi_malloc(64); assert(p != NULL); mi_free(p); }
+
+  /* 3) restart with a DIFFERENT rate while workers race the second start too --
+        exercises prof_generation invalidating each theap's stale sampling counters,
+        not just prof_force_slow re-poisoning pages_free_direct. */
+  p267_stop_workers = false;
+  p267_spawn(threads);
+  for (int i = 0; i < 200; i++) { void* p = mi_malloc(64); assert(p != NULL); mi_free(p); }
+  assert(mi_prof_start_seeded(8192, 267002));   /* much coarser than step 1's 128 */
+  mi_prof_stats_t_decl(started2);
+  assert(mi_prof_stats_get(&started2));
+  assert(started2.sample_rate == 8192);
+  for (int i = 0; i < 4000; i++) { void* p = mi_malloc(64); assert(p != NULL); mi_free(p); }
+  p267_stop_workers = true;
+  p267_join(threads);
+  mi_prof_stop();
+
+  /* 4) mi_prof_reset while a page still carries a live sampled block. mi_prof_reset
+        only clears the accum counters and interned-stack table -- it must not disturb
+        live records or their page->metadata linkage; the block stays ordinary, usable,
+        freeable memory throughout. */
+  assert(mi_prof_start_seeded(1, 267003));   /* rate 1: guarantee this allocation samples */
+  void* held = mi_malloc(256);
+  assert(held != NULL);
+  mi_prof_stats_t_decl(before_reset);
+  assert(mi_prof_stats_get(&before_reset));
+  assert(before_reset.live_samples > 0);   /* the block above is sampled (at rate 1, always) */
+
+  mi_prof_reset();
+
+  *(volatile char*)held = 0x5A;   /* still perfectly usable memory ... */
+  mi_free(held);                  /* ... and still frees cleanly through the profiler hook */
+  mi_prof_stop();
+
+  /* Everything still works after all of the above. */
+  assert(mi_prof_start_seeded(4096, 267004));
+  void* p = mi_malloc(64); assert(p != NULL); mi_free(p);
+  mi_prof_stop();
+  for (int i = 0; i < 4000; i++) { void* q = mi_malloc(64); assert(q != NULL); mi_free(q); }
+}
+
 int main(void) {
   enum { count = 1000, size = 512 };
   void* blocks[count];
@@ -1059,6 +1165,7 @@ int main(void) {
   test_sample_rate_one();
   test_cross_thread_free_of_sampled();
   test_meta_pages_never_sampled();
+  test_start_while_allocating_stop_mid_sample_restart_reset();
   if (getenv("MIMALLOC_PROF_DUMP_AT_EXIT") != NULL) {
     assert(mi_prof_start_seeded(1, 47));
     assert(mi_malloc(4096) != NULL);  /* Preserve one real sample for pprof validation. */

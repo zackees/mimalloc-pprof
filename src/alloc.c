@@ -112,9 +112,14 @@ static mi_decl_forceinline void* mi_page_malloc_zero(mi_theap_t* theap, mi_page_
     #endif
   #endif
 
-  #if MI_PPROF
-  _mi_prof_on_alloc(theap, page, block, size - MI_PADDING_SIZE);
-  #endif
+  // #267: no profiler hook here on purpose -- this function is the fast list-pop path
+  // (inlined into `mi_malloc`/`mi_heap_malloc_small`, and into `alloc-aligned.c`'s small
+  // aligned fast path) and must contain zero profiler instructions when the profiler is
+  // stopped or compiled out. The sampling countdown now lives only in `_mi_malloc_generic`
+  // (page.c), which every allocation reaches while profiling is running: `mi_prof_start`
+  // poisons `theap->pages_free_direct` so this same function's fast-list-pop above always
+  // misses (`block == NULL`) and falls through to `_mi_malloc_generic`. See
+  // `mi_theap_t::prof_force_slow` in mimalloc/types.h.
   _mi_memevt_on_alloc(page, block, size - MI_PADDING_SIZE);
   return block;
 }

@@ -210,6 +210,17 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
   mi_assert_internal(mi_theap_contains_queue(theap,pq));
   const size_t size = pq->block_size;
   if (size > MI_SMALL_SIZE_MAX) return;
+  #if MI_PPROF
+  // #267: while the profiler is forcing this theap onto the slow path, leave
+  // `pages_free_direct` poisoned (pointing at the empty page) instead of re-publishing a
+  // real free page here -- that is what makes every malloc miss the fast list-pop and land
+  // in `_mi_malloc_generic`, where the sampling countdown lives. Cleared by
+  // `_mi_subproc_prof_set_force_slow(false)` (subproc.c) on `mi_prof_stop`; this theap
+  // re-syncs itself the next time it goes through the generic path (see `mi_find_page`/
+  // `_mi_malloc_generic` in page.c) -- never eagerly from another thread, which would race
+  // this theap's own concurrent queue mutations.
+  if (theap->prof_force_slow) return;
+  #endif
 
   mi_page_t* page = pq->first;
   if (pq->first == NULL) page = _mi_page_empty_get();
@@ -242,6 +253,23 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
     pages_free[sz] = page;
   }
 }
+
+#if MI_PPROF
+// #267: force every entry to the empty page so the small-object fast path
+// (`alloc.c:mi_page_malloc_zero`, reached via `internal.h:_mi_theap_get_free_small_page`)
+// always misses and falls through to `_mi_malloc_generic`. Called only from
+// `_mi_subproc_prof_set_force_slow(true)` (subproc.c), which already holds
+// `heap->theaps_lock` for this theap -- a cross-thread plain-pointer write into memory the
+// owning thread may concurrently read lock-free; see that function's comment for why this
+// is safe (every possible value is either a valid live page or the static empty page,
+// never a dangling one). Strategy ported from oven-sh/mimalloc @ 942b8342, MIT.
+void _mi_theap_pages_free_direct_poison(mi_theap_t* theap) {
+  mi_page_t* const empty = _mi_page_empty_get();
+  for (size_t i = 0; i < MI_PAGES_DIRECT; i++) {
+    theap->pages_free_direct[i] = empty;
+  }
+}
+#endif
 
 /*
 static bool mi_page_queue_is_empty(mi_page_queue_t* queue) {

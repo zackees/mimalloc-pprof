@@ -317,6 +317,47 @@ bool mi_subproc_visit_heaps(mi_subproc_id_t subproc_id, mi_heap_visit_fun* visit
   return ok;
 }
 
+#if MI_PPROF
+// #267: called from mi_prof_start_seeded/mi_prof_stop (profile.c), deliberately OUTSIDE
+// prof_lock so this never adds a new lock-ordering constraint against it. Walks every live
+// theap of every subprocess (mi_subprocs -> heap->next -> theap->hnext) and flips
+// `prof_force_slow` -- Bun's zero-cost-when-off strategy: poisoning `pages_free_direct`
+// (via `_mi_theap_pages_free_direct_poison`, page-queue.c) forces every malloc on that
+// theap through `_mi_malloc_generic`, where the sampling countdown lives, for as long as
+// profiling is running.
+//
+// Lock order: mi_subprocs_lock -> subproc->heaps_lock -> heap->theaps_lock. Nothing else in
+// this file nests `heap->theaps_lock` under `subproc->heaps_lock` today (`_mi_theap_init`,
+// theap.c, takes them one after another, never nested), so this does not introduce a cycle;
+// see `_mi_theap_init`'s matching comment for how a theap created mid-walk is handled.
+//
+// `enable`d poisoning is a plain cross-thread pointer write into `pages_free_direct`/
+// `prof_force_slow` that the owning thread may concurrently read lock-free on its fast
+// path -- imported from oven-sh/mimalloc @ 942b8342's `prof_force_slow` design (MIT), which
+// accepts the same benign race: every possible value is either the theap's real (still
+// valid) page or the static, immutable empty page, so a stale or reordered read is never a
+// dangling pointer, only a delayed poison (one more fast-path allocation slips through
+// unsampled) or a delayed force-slow clear (one more allocation stays on the slow path
+// after `mi_prof_stop`). Disabling clears only the flag; see `mi_prof_stop`'s comment
+// (profile.c) for why `pages_free_direct` itself is never touched cross-thread here.
+void _mi_subproc_prof_set_force_slow(bool enable) {
+  mi_lock(&mi_subprocs_lock) {
+    for (mi_subproc_t* subproc = mi_subprocs; subproc != NULL; subproc = subproc->next) {
+      mi_lock(&subproc->heaps_lock) {
+        for (mi_heap_t* heap = subproc->heaps; heap != NULL; heap = heap->next) {
+          mi_lock(&heap->theaps_lock) {
+            for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
+              theap->prof_force_slow = enable;
+              if (enable) { _mi_theap_pages_free_direct_poison(theap); }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+#endif
+
 
 mi_subproc_t* _mi_subproc_main_init(void) {
   mi_lock_init(&mi_subprocs_lock);

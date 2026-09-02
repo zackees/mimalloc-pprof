@@ -567,6 +567,12 @@ typedef enum mi_option_e {
   mi_option_memory_events,              // enable opt-in allocation-change accounting/callbacks (MIMALLOC_MEMORY_EVENTS) (=0)
   mi_option_purge_zeroes,               // treat decommit-purged slices as zeroed, letting mi_zalloc skip its memset (=0, experimental)
   mi_option_scavenger,                  // run a background thread that purges scheduled arena memory (=1). imported from oven-sh/mimalloc @ 942b8342, MIT (#272)
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b). Appended
+  // after `scavenger`, NOT at Bun's slot numbers 50-53: slots 47+ diverged long ago (#264).
+  mi_option_purge_holes,                // discard the memory of free blocks inside still-used pages, on `mi_on_thread_idle` (=1)
+  mi_option_purge_holes_eager_zero,     // zero a range before discarding it, so a mis-scoped discard corrupts visibly (=0; forced on in debug builds). NOT zero-tracking -- see mi_option_purge_zeroes
+  mi_option_purge_holes_min_interval,   // do not sweep one thread's heaps more often than every N milli-seconds (=100)
+  mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=16); 0 disables
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

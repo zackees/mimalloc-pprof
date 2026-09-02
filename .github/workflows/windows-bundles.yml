@@ -452,8 +452,9 @@ jobs:
         # layout crashed at load in run 33614876511 with no output at all; this step gets
         # the faulting instruction and a stack instead of an exit code.
         if: ${{ !cancelled() }}
+        continue-on-error: true
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           bundle=bundle/windows-gnu-x64-redirect-first
           exe="$bundle/mimalloc-test-stress-dynamic.exe"
           echo "::group::DIAG redirect-first import tables"
@@ -466,6 +467,16 @@ jobs:
           ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1; timeout 60 "$exe" 2 5 1 ) > rf.raw 2>&1
           echo "rc=$?"
           grep -v "^option '" rf.raw
+          echo "::endgroup::"
+
+          echo "::group::DIAG redirect-first with MIMALLOC_DISABLE_REDIRECT=1"
+          # Separates the two candidate causes: if the image loads with redirection
+          # switched off, the import order itself is fine and the fault is in the window
+          # where a patched, still-uninitialised ucrtbase allocates through mimalloc.
+          ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1 MIMALLOC_DISABLE_REDIRECT=1
+            timeout 60 "$exe" 2 5 1 ) > rfd.raw 2>&1
+          echo "rc=$?"
+          grep -v "^option '" rfd.raw
           echo "::endgroup::"
 
           echo "::group::DIAG redirect-first NTSTATUS (cmd reports the real exit code)"

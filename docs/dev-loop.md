@@ -1,3 +1,37 @@
+# Native local verification (Linux)
+
+`ci/verify_local.py` is a fast, parallel local mirror of the Linux-runnable subset of
+CI: `.github/workflows/c-unit.yml`, `rust-native.yml`, `python-lint.yml`, and
+`asan.yml`. It exists because the alternative -- running Release `MI_PPROF=ON` ctest,
+`MI_PPROF=OFF` ctest, Debug `MI_DEBUG_FULL=ON` ctest, the guarded job, the shared-lib
+job, the memory-gate, the diagnostic gates, the Rust workspace, and python-lint one at
+a time by hand -- takes a long time and is easy to shortcut under time pressure. Each
+config's cmake flags and env are copied verbatim from the workflow file it mirrors
+(not re-derived), and `ci/tests/test_verify_local.py` parses the workflow files itself
+and fails if a job's flags drift out of sync with the script.
+
+```bash
+python ci/verify_local.py                     # everything fast (slow ctest tier excluded)
+python ci/verify_local.py --only release,lint  # just these configs
+python ci/verify_local.py --slow               # also run the long-tail ctest tier
+python ci/verify_local.py --list                # print the config table and exit
+python ci/verify_local.py --jobs 8              # override the total build/ctest job budget
+python ci/verify_local.py --keep-going          # run every config even after one fails
+python ci/verify_local.py --selftest            # trivially fast dry-run, no real builds
+```
+
+Ten configs run concurrently (`release`, `off`, `debug-full`, `guarded`, `shared`,
+`memory-gate`, `diag`, `rust`, `lint`, `asan`), each building into its own directory
+under `out/verify/<config>/` (gitignored, incremental across invocations) with Ninja
+and ccache when available. `asan` needs `clang`/`clang++` on `PATH` and reports
+SKIPPED with a reason otherwise. The long tests (`test-profile-race`,
+`test-subproc-lifecycle`, `test-zero-tracking*`) are excluded from ctest by default
+via `-E`; pass `--slow` to include them. On a 16-core machine with a warm cache,
+expect on the order of a few minutes wall-clock for the fast tier -- well under the
+sum of the per-config times, which the final table reports alongside the wall clock so
+the parallel speedup is visible. A failed config prints the last ~40 lines of its full
+log (`out/verify/<config>/verify.log`) inline.
+
 # Fast local Linux build loop
 
 On Windows, run the C and Rust test loops through `python ci/dev_linux.py`.

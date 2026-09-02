@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+"""Fast, parallel local mirror of the Linux-runnable subset of CI.
+
+Behavior-correctness verification for this repo (see `.github/workflows/c-unit.yml`,
+`rust-native.yml`, `python-lint.yml`, `asan.yml`) is normally done by hand, serially,
+running the same handful of cmake/ctest/cargo/ruff/pyright commands one after another.
+This script runs the same commands -- same flags, same env, same assertions -- as a
+pool of concurrent configs, each building into its own directory under
+`out/verify/<config>/` so repeated invocations are incremental.
+
+A pass here is a strong (not perfect) predictor of CI: only the ubuntu-latest portion
+of each matrixed job is covered (no Windows/macOS/MSYS2), and every job's exact cmake
+flags/env are copied from the workflow files rather than re-derived, so drift is
+caught by `ci/tests/test_verify_local.py` rather than trusted to stay in sync by hand.
+
+Usage:
+    python ci/verify_local.py                        # everything fast (slow tests excluded)
+    python ci/verify_local.py --only release,lint     # just these configs
+    python ci/verify_local.py --slow                  # also run the long-tail ctest suite
+    python ci/verify_local.py --list                  # print the config table and exit
+    python ci/verify_local.py --jobs 8                # override the worker/build budget
+    python ci/verify_local.py --keep-going             # don't skip queued configs on a failure
+    python ci/verify_local.py --selftest               # trivially fast dry-run, no real builds
+
+Exit code is non-zero if any selected config failed (a config SKIPPED because a tool
+it needs -- e.g. clang for `asan` -- is unavailable does not count as a failure).
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import io
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT_ROOT = ROOT / "out" / "verify"
+
+# ctest name substrings for the tests long enough that they get their own opt-in tier.
+# Matches test-zero-tracking AND test-zero-tracking-enabled (substring, per ctest -E).
+SLOW_TEST_REGEX = "test-profile-race|test-subproc-lifecycle|test-zero-tracking"
+
+# Seconds; only applies to tests without their own TIMEOUT property (test-profile-race,
+# test-subproc-lifecycle, test-zero-tracking* already have theirs from CMakeLists.txt).
+# CI itself sets no timeout at all here (ctest's own default is 1500s); this exists only
+# to bound a genuine hang, not to be tight -- ten configs sharing this machine's cores
+# (plus, right now, another agent's concurrent build) is real contention, not a hang.
+DEFAULT_CTEST_TIMEOUT = 600
+
+
+def cmake_bin() -> str:
+    return "cmake"
+
+
+def have_ninja() -> bool:
+    return shutil.which("ninja") is not None
+
+
+def have_ccache() -> bool:
+    return shutil.which("ccache") is not None
+
+
+def generator_args() -> list[str]:
+    return ["-G", "Ninja"] if have_ninja() else []
+
+
+def launcher_args() -> list[str]:
+    return ["-DCMAKE_C_COMPILER_LAUNCHER=ccache"] if have_ccache() else []
+
+
+@dataclasses.dataclass
+class RunCtx:
+    """Everything one config's runner function needs, nothing it should reach past."""
+
+    name: str
+    dir: Path
+    log: Path
+    jobs: int
+    slow: bool
+
+
+@dataclasses.dataclass
+class Outcome:
+    name: str
+    job: str
+    ok: bool | None  # True/False = ran; None = SKIPPED (tool unavailable)
+    seconds: float
+    build_dir: str
+    log_path: str
+    reason: str = ""
+
+
+def log_write(log: Path, text: str) -> None:
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as f:
+        f.write(text)
+
+
+def log_start(log: Path, text: str) -> None:
+    """Truncate `log` and write `text` as its first line. Every run of a config starts
+    here so a rerun's log never contains a stale PASS-looking line from a previous run
+    (log_write() itself always appends within one run).
+    """
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def run_logged(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    log: Path,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> tuple[int, str]:
+    """Run `cmd`, streaming output into `log` line-by-line (so a hang still leaves a
+    partial log) and also returning the captured text for callers that need to grep it.
+    """
+    full_env = os.environ.copy()
+    if env:
+        full_env.update(env)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    header = f"\n$ {' '.join(shlex.quote(c) for c in cmd)}  (cwd={cwd})\n"
+    with log.open("a", encoding="utf-8") as f:
+        f.write(header)
+        f.flush()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=full_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        lines: list[str] = []
+        assert proc.stdout is not None
+        start = time.monotonic()
+        timed_out = False
+        for line in proc.stdout:
+            lines.append(line)
+            f.write(line)
+            f.flush()
+            if timeout is not None and (time.monotonic() - start) > timeout:
+                proc.kill()
+                timed_out = True
+                break
+        rc = proc.wait()
+        if timed_out:
+            f.write(f"\n[verify_local] TIMEOUT after {timeout}s, process killed\n")
+            rc = rc or 124
+    return rc, "".join(lines)
+
+
+def run_captured(log: Path, func: Callable[[], int], *, label: str) -> tuple[int, str]:
+    """Call a Python function (e.g. a ci/*.py module entry point) capturing its stdout
+    into the log instead of shelling out to `python3 ci/<script>.py`.
+    """
+    log_write(log, f"\n$ <python> {label}\n")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = func()
+    text = buf.getvalue()
+    log_write(log, text)
+    return rc, text
+
+
+def cmake_configure(
+    ctx: RunCtx, build: Path, args: list[str], *, env: dict[str, str] | None = None
+) -> tuple[int, str]:
+    """Returns (rc, configure output) -- callers that need to assert on the resolved
+    configure output (e.g. `Compiler defines :`) use the text directly rather than
+    re-reading the (append-mode, cross-run) log file.
+    """
+    cmd = [
+        cmake_bin(),
+        "-S",
+        str(ROOT),
+        "-B",
+        str(build),
+        *generator_args(),
+        *launcher_args(),
+        *args,
+    ]
+    return run_logged(cmd, cwd=ROOT, log=ctx.log, env=env)
+
+
+def cmake_build(
+    ctx: RunCtx,
+    build: Path,
+    *,
+    config: str | None = None,
+    target: str | None = None,
+    env: dict[str, str] | None = None,
+) -> int:
+    cmd = [cmake_bin(), "--build", str(build), "--parallel", str(ctx.jobs)]
+    if config:
+        cmd += ["--config", config]
+    if target:
+        cmd += ["--target", target]
+    rc, _ = run_logged(cmd, cwd=ROOT, log=ctx.log, env=env)
+    return rc
+
+
+def ctest_run(
+    ctx: RunCtx,
+    build: Path,
+    *,
+    config: str | None = None,
+    filter_regex: str | None = None,
+    exclude_slow: bool = True,
+    timeout: int = DEFAULT_CTEST_TIMEOUT,
+    env: dict[str, str] | None = None,
+) -> int:
+    cmd = [
+        "ctest",
+        "--test-dir",
+        str(build),
+        "--output-on-failure",
+        "-j",
+        str(ctx.jobs),
+        "--timeout",
+        str(timeout),
+    ]
+    if config:
+        cmd += ["-C", config]
+    if filter_regex:
+        cmd += ["-R", filter_regex]
+    excluded_now = False
+    if exclude_slow and not ctx.slow:
+        cmd += ["-E", SLOW_TEST_REGEX]
+        excluded_now = True
+    if excluded_now:
+        log_write(
+            ctx.log,
+            f"\n[verify_local] excluding slow tier (-E '{SLOW_TEST_REGEX}'); pass --slow to include it\n",
+        )
+    rc, _ = run_logged(cmd, cwd=ROOT, log=ctx.log, env=env)
+    return rc
+
+
+# --------------------------------------------------------------------------------------
+# Per-config runners. Each mirrors one job (or the ubuntu-latest slice of a matrixed
+# job) from a workflow file 1:1 -- flags and env are copied verbatim from the yml, not
+# re-derived, so `ci/tests/test_verify_local.py` can catch drift by grepping this file.
+# --------------------------------------------------------------------------------------
+
+
+def run_release(ctx: RunCtx) -> bool:
+    """c-unit.yml job `ctest` (ubuntu-latest): cmake -B build -DMI_PPROF=ON; Release."""
+    build = ctx.dir / "build"
+    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON"])
+    if rc:
+        return False
+    if cmake_build(ctx, build, config="Release"):
+        return False
+    return ctest_run(ctx, build, config="Release") == 0
+
+
+def run_off(ctx: RunCtx) -> bool:
+    """c-unit.yml job `ctest-pprof-off`: cmake -B build -DMI_PPROF=OFF."""
+    build = ctx.dir / "build"
+    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=OFF"])
+    if rc:
+        return False
+    if cmake_build(ctx, build):
+        return False
+    return ctest_run(ctx, build) == 0
+
+
+def run_debug_full(ctx: RunCtx) -> bool:
+    """c-unit.yml job `ctest-debug-full` (ubuntu-latest): -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug."""
+    build = ctx.dir / "build"
+    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON"])
+    if rc:
+        return False
+    if cmake_build(ctx, build, config="Debug"):
+        return False
+    return ctest_run(ctx, build, config="Debug") == 0
+
+
+def run_guarded(ctx: RunCtx) -> bool:
+    """c-unit.yml job `ctest-guarded`: Debug + MI_GUARDED=ON, ctest twice (plain, then
+    with MIMALLOC_GUARDED_SAMPLE_RATE=1 forcing guarding on every allocation)."""
+    build = ctx.dir / "build-guarded"
+    rc, configure_out = cmake_configure(
+        ctx, build, ["-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_GUARDED=ON"]
+    )
+    if rc:
+        return False
+    # The whole point of #116 is that the flag silently did not reach the compiler --
+    # assert on THIS configure's resolved defines, not on the option passed in (and not
+    # on the append-mode log file, which would still show a stale PASS from a previous
+    # run of this same config after a real regression).
+    if not re.search(r"Compiler defines\s*:.*MI_GUARDED=1", configure_out):
+        log_write(ctx.log, "\n[verify_local] FAIL: MI_GUARDED=1 did not reach mi_defines\n")
+        return False
+    if cmake_build(ctx, build):
+        return False
+    if ctest_run(ctx, build, timeout=900) != 0:
+        return False
+    return ctest_run(ctx, build, timeout=900, env={"MIMALLOC_GUARDED_SAMPLE_RATE": "1"}) == 0
+
+
+def run_shared(ctx: RunCtx) -> bool:
+    """c-unit.yml job `ctest-shared` (ubuntu-latest): shared lib only, no static/object."""
+    build = ctx.dir / "build"
+    args = [
+        "-DMI_PPROF=ON",
+        "-DMI_BUILD_SHARED=ON",
+        "-DMI_BUILD_STATIC=OFF",
+        "-DMI_BUILD_OBJECT=OFF",
+    ]
+    rc, _ = cmake_configure(ctx, build, args)
+    if rc:
+        return False
+    if cmake_build(ctx, build, config="Release"):
+        return False
+    return ctest_run(ctx, build, config="Release") == 0
+
+
+def run_gate_binary_pinned(ctx: RunCtx, binary: Path, out_dir: Path, runs: int = 8) -> list[str]:
+    """Run `binary` `runs` times, each writing MI_BENCH_JSON to its own file under
+    `out_dir`, pinned via the external `taskset` command to <= memory_gate.MAX_GATE_CPUS
+    CPUs (matching the committed min-of-N baselines, which assume a 4-core run).
+
+    Deliberately NOT `memory_gate.run_gate_binary`: that function pins CPUs with
+    `subprocess.Popen(..., preexec_fn=...)`, and forking via `preexec_fn` from a worker
+    thread while nine other configs' threads are alive is documented by the `os` module
+    as deadlock-prone (the child only inherits the forking thread, so a lock held by
+    another thread at fork time is held forever in the child). `taskset` is an external
+    process, so pinning happens with no fork from this (multi-threaded) interpreter.
+    """
+    import memory_gate
+
+    cpu_count = os.cpu_count() or memory_gate.MAX_GATE_CPUS
+    pin = list(range(min(memory_gate.MAX_GATE_CPUS, cpu_count)))
+    have_taskset = shutil.which("taskset") is not None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    result_paths: list[str] = []
+    for i in range(1, runs + 1):
+        out_path = out_dir / f"result-{i}.json"
+        cmd = (
+            ["taskset", "-c", ",".join(str(c) for c in pin), str(binary)]
+            if have_taskset and pin
+            else [str(binary)]
+        )
+        run_logged(cmd, cwd=ROOT, log=ctx.log, env={"MI_BENCH_JSON": str(out_path)})
+        result_paths.append(str(out_path))
+    return result_paths
+
+
+def run_memory_gate(ctx: RunCtx) -> bool:
+    """c-unit.yml job `memory-gate` (ubuntu-latest). Calls ci/memory_gate.py's `check`/
+    `control` comparison functions directly (rather than shelling to `memory_gate.py
+    check` with no args) so binary discovery is pinned to THIS config's own build dir
+    -- with several configs building concurrently, the module's mtime-based
+    auto-discovery across build*/out/* would be a race.
+    """
+    import memory_gate
+
+    build = ctx.dir / "build"
+    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON"])
+    if rc:
+        return False
+    if cmake_build(ctx, build, config="Release"):
+        return False
+    if ctest_run(ctx, build, config="Release", filter_regex="test-memory-gate") != 0:
+        return False
+
+    def find_binary(under: Path) -> Path | None:
+        for name in ("mimalloc-test-memory-gate", "mimalloc-test-memory-gate.exe"):
+            for candidate in under.rglob(name):
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return candidate
+        return None
+
+    binary = find_binary(build)
+    if binary is None:
+        log_write(ctx.log, "\n[verify_local] FAIL: mimalloc-test-memory-gate binary not found\n")
+        return False
+
+    result_paths = run_gate_binary_pinned(ctx, binary, ctx.dir / "results")
+    rc, _ = run_captured(
+        ctx.log, lambda: memory_gate.check(result_paths), label="memory_gate.check"
+    )
+    if rc == 2:
+        log_write(
+            ctx.log, "\n[verify_local] WARNING: no committed baseline for this platform yet\n"
+        )
+    elif rc != 0:
+        return False
+
+    # Positive control: the gate must catch an injected leak, or it is decoration.
+    build_leak = ctx.dir / "build-leak"
+    rc, _ = cmake_configure(ctx, build_leak, ["-DMI_PPROF=ON", "-DMI_BENCH_INJECT_LEAK=200000"])
+    if rc:
+        return False
+    if cmake_build(ctx, build_leak, config="Release", target="mimalloc-test-memory-gate"):
+        return False
+    leak_binary = find_binary(build_leak)
+    if leak_binary is None:
+        log_write(
+            ctx.log, "\n[verify_local] FAIL: leaky mimalloc-test-memory-gate binary not found\n"
+        )
+        return False
+    leak_paths = run_gate_binary_pinned(ctx, leak_binary, ctx.dir / "results-leak")
+    control_rc, _ = run_captured(
+        ctx.log, lambda: memory_gate.control(leak_paths), label="memory_gate.control"
+    )
+    return control_rc == 0
+
+
+def run_diag(ctx: RunCtx) -> bool:
+    """c-unit.yml jobs `diagnostic-gates` AND the ubuntu-latest (x64) half of
+    `isa-baseline` -- both are cheap, ubuntu-only diagnostic checks over the same
+    kind of throwaway `mimalloc-static`-only build, so they share one config.
+
+    Shells out to `python3 ci/<script>.py` for each check (rather than importing the
+    module and calling its argparse-driven `main()` in-process) so there is no need to
+    juggle a process-global `sys.argv` from a worker thread that runs concurrently with
+    every other config.
+    """
+    ok = True
+
+    def py(*args: str) -> bool:
+        rc, _ = run_logged(["python3", f"ci/{args[0]}", *args[1:]], cwd=ROOT, log=ctx.log)
+        return rc == 0
+
+    ok = py("check_internal_state.py") and ok
+    ok = py("check_internal_state.py", "--selftest") and ok
+    ok = py("check_release_equivalence.py", "--selftest") and ok
+
+    for pprof in ("ON", "OFF"):
+        build = ctx.dir / f"release-{pprof.lower()}"
+        args = [
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DMI_DEBUG=OFF",
+            f"-DMI_PPROF={pprof}",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        ]
+        rc, _ = cmake_configure(ctx, build, args)
+        if rc:
+            return False
+        compile_commands = build / "compile_commands.json"
+        if compile_commands.is_file() and "diagnostic.c" in compile_commands.read_text(
+            encoding="utf-8"
+        ):
+            log_write(
+                ctx.log,
+                f"\n[verify_local] FAIL: diagnostic.c entered the MI_DEBUG=0 {pprof} build\n",
+            )
+            return False
+        if cmake_build(ctx, build, target="mimalloc-static"):
+            return False
+        libs = list(build.glob("libmimalloc*.a"))
+        if not libs:
+            log_write(ctx.log, f"\n[verify_local] FAIL: no libmimalloc*.a produced for {pprof}\n")
+            return False
+        _, nm_out = run_logged(["nm", "-a", str(libs[0])], cwd=ROOT, log=ctx.log)
+        if re.search(r"_mi_.*diagnostic|_mi_lock_debug", nm_out):
+            log_write(
+                ctx.log,
+                f"\n[verify_local] FAIL: diagnostic symbols in the MI_DEBUG=0 {pprof} library\n",
+            )
+            return False
+
+    ok = py("check_isa_baseline.py", "--selftest") and ok
+
+    build_portable = ctx.dir / "build-portable"
+    rc, _ = cmake_configure(ctx, build_portable, ["-DMI_PPROF=ON", "-DMI_NO_OPT_ARCH=ON"])
+    if rc:
+        return False
+    if cmake_build(ctx, build_portable, target="mimalloc-static"):
+        return False
+    portable_libs = list(build_portable.glob("libmimalloc*.a"))
+    if not portable_libs:
+        return False
+    ok = py("check_isa_baseline.py", str(portable_libs[0])) and ok
+
+    build_arch = ctx.dir / "build-arch"
+    rc, _ = cmake_configure(ctx, build_arch, ["-DMI_PPROF=ON", "-DMI_OPT_ARCH=ON"])
+    if rc:
+        return False
+    if cmake_build(ctx, build_arch, target="mimalloc-static"):
+        return False
+    arch_libs = list(build_arch.glob("libmimalloc*.a"))
+    if not arch_libs:
+        return False
+    return py("check_isa_baseline.py", str(arch_libs[0]), "--expect-dirty") and ok
+
+
+def run_rust(ctx: RunCtx) -> bool:
+    """rust-native.yml job `test` (ubuntu-latest slice), simplified to a plain,
+    un-cached `cargo` invocation (no soldr wrapper) with its own CARGO_TARGET_DIR so
+    it never contends with another cargo process building the same workspace.
+    """
+    rust_dir = ROOT / "rust"
+    env = {
+        "CARGO_TARGET_DIR": str(ctx.dir / "target"),
+        "CARGO_BUILD_JOBS": str(ctx.jobs),
+    }
+    rc, _ = run_logged(
+        ["cargo", "run", "-p", "xtask", "--", "check"], cwd=rust_dir, log=ctx.log, env=env
+    )
+    if rc:
+        return False
+    rc, _ = run_logged(["cargo", "test", "--workspace"], cwd=rust_dir, log=ctx.log, env=env)
+    return rc == 0
+
+
+def run_lint(ctx: RunCtx) -> bool:
+    """python-lint.yml job `lint` (its only job, already ubuntu-latest)."""
+    ok = True
+    rc, _ = run_logged(["ruff", "check", "ci/"], cwd=ROOT, log=ctx.log)
+    ok = ok and rc == 0
+    rc, _ = run_logged(["ruff", "format", "--check", "ci/"], cwd=ROOT, log=ctx.log)
+    ok = ok and rc == 0
+    rc, _ = run_logged(["pyright"], cwd=ROOT, log=ctx.log)
+    ok = ok and rc == 0
+
+    for cmd in (
+        ["python3", "ci/check_isa_baseline.py", "--selftest"],
+        ["python3", "ci/check_internal_state.py", "--selftest"],
+        ["python3", "ci/check_isa_baseline.py", "--help"],
+        ["python3", "ci/check_release_equivalence.py", "--help"],
+    ):
+        rc, _ = run_logged(cmd, cwd=ROOT, log=ctx.log)
+        ok = ok and rc == 0
+    rc, out = run_logged(["python3", "ci/memory_gate.py"], cwd=ROOT, log=ctx.log)
+    ok = ok and "Exit codes" in out
+
+    # These four import `yaml`, which python-lint.yml's job-level `pip install`
+    # provides for every subsequent bare `python3` call in that job. Nothing here
+    # guarantees the ambient `python3` has PyYAML, so run them the same way
+    # ci/tests gets it below: an ephemeral uvx environment with it installed.
+    for script in (
+        "ci/check_benchmark_workflow.py",
+        "ci/check_benchmark_memory_workflow.py",
+        "ci/check_benchmark_latency_workflow.py",
+        "ci/check_benchmark_scaling_workflow.py",
+    ):
+        rc, _ = run_logged(
+            ["uvx", "--with", "pyyaml==6.0.2", "python3", script, "--selftest"],
+            cwd=ROOT,
+            log=ctx.log,
+        )
+        ok = ok and rc == 0
+
+    rc, _ = run_logged(
+        [
+            "uvx",
+            "--with",
+            "pyyaml==6.0.2",
+            "--with",
+            "pytest==8.3.4",
+            "python",
+            "-m",
+            "pytest",
+            "ci/tests",
+            "-q",
+        ],
+        cwd=ROOT,
+        log=ctx.log,
+    )
+    return ok and rc == 0
+
+
+def run_asan(ctx: RunCtx) -> bool:
+    """asan.yml job `asan` (already ubuntu-latest only): CC=clang CXX=clang++,
+    -DMI_TRACK_ASAN=ON, plus its two positive/negative controls."""
+    build = ctx.dir / "build-asan"
+    env = {"CC": "clang", "CXX": "clang++"}
+    rc, configure_out = cmake_configure(
+        ctx,
+        build,
+        ["-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON", "-DMI_TRACK_ASAN=ON"],
+        env=env,
+    )
+    if rc:
+        return False
+    if "Compile with address sanitizer support (MI_TRACK_ASAN=ON)" not in configure_out:
+        log_write(ctx.log, "\n[verify_local] FAIL: MI_TRACK_ASAN did not survive configure\n")
+        return False
+    if cmake_build(ctx, build, env=env):
+        return False
+
+    api_candidates = list(build.rglob("mimalloc-test-api"))
+    if not api_candidates:
+        log_write(ctx.log, "\n[verify_local] FAIL: mimalloc-test-api not built\n")
+        return False
+    _, nm_out = run_logged(["nm", "-C", str(api_candidates[0])], cwd=ROOT, log=ctx.log)
+    if "__asan_init" not in nm_out:
+        log_write(
+            ctx.log, "\n[verify_local] FAIL: mimalloc-test-api does not reference __asan_init\n"
+        )
+        return False
+
+    if ctest_run(ctx, build, timeout=600) != 0:
+        return False
+
+    control_candidates = [
+        p
+        for p in build.rglob("mimalloc-test-asan-control")
+        if p.is_file() and os.access(p, os.X_OK)
+    ]
+    if not control_candidates:
+        log_write(ctx.log, "\n[verify_local] FAIL: mimalloc-test-asan-control not built\n")
+        return False
+    control_rc, control_out = run_logged([str(control_candidates[0])], cwd=ROOT, log=ctx.log)
+    if control_rc == 0:
+        log_write(
+            ctx.log,
+            "\n[verify_local] FAIL: asan control exited 0 -- did not catch a use-after-free\n",
+        )
+        return False
+    if not re.search(
+        r"AddressSanitizer|use-after-poison|heap-use-after-free", control_out, re.IGNORECASE
+    ):
+        log_write(
+            ctx.log,
+            "\n[verify_local] FAIL: control failed but produced no AddressSanitizer report\n",
+        )
+        return False
+    return True
+
+
+@dataclasses.dataclass(frozen=True)
+class ConfigSpec:
+    name: str
+    job: str
+    description: str
+    runner: Callable[[RunCtx], bool]
+    needs: Callable[[], str | None] = lambda: None  # returns a SKIP reason, or None to run
+
+
+def _need_clang() -> str | None:
+    if shutil.which("clang") is None or shutil.which("clang++") is None:
+        return "clang/clang++ not found on PATH"
+    return None
+
+
+CONFIGS: list[ConfigSpec] = [
+    ConfigSpec("release", "c-unit.yml: ctest", "Release, MI_PPROF=ON, full ctest", run_release),
+    ConfigSpec("off", "c-unit.yml: ctest-pprof-off", "MI_PPROF=OFF, full ctest", run_off),
+    ConfigSpec(
+        "debug-full", "c-unit.yml: ctest-debug-full", "Debug, MI_DEBUG_FULL=ON", run_debug_full
+    ),
+    ConfigSpec(
+        "guarded", "c-unit.yml: ctest-guarded", "Debug, MI_GUARDED=ON, ctest x2", run_guarded
+    ),
+    ConfigSpec(
+        "shared", "c-unit.yml: ctest-shared", "shared lib only, no static/object", run_shared
+    ),
+    ConfigSpec(
+        "memory-gate",
+        "c-unit.yml: memory-gate",
+        "min-of-8 peak-memory regression gate",
+        run_memory_gate,
+    ),
+    ConfigSpec(
+        "diag",
+        "c-unit.yml: diagnostic-gates + isa-baseline(x64)",
+        "internal-state/release/ISA gates",
+        run_diag,
+    ),
+    ConfigSpec("rust", "rust-native.yml: test", "xtask check + cargo test --workspace", run_rust),
+    ConfigSpec(
+        "lint", "python-lint.yml: lint", "ruff + pyright + gate selftests + pytest", run_lint
+    ),
+    ConfigSpec(
+        "asan",
+        "asan.yml: asan",
+        "clang ASan build, ctest, UAF positive control",
+        run_asan,
+        _need_clang,
+    ),
+]
+
+CONFIG_NAMES = [c.name for c in CONFIGS]
+
+
+def format_table(rows: Iterable[Outcome]) -> str:
+    rows = list(rows)
+    headers = ["config", "result", "seconds", "build dir", "log"]
+    widths = [len(h) for h in headers]
+    data: list[list[str]] = []
+    for r in rows:
+        status = "SKIPPED" if r.ok is None else ("PASS" if r.ok else "FAIL")
+        cells = [r.name, status, f"{r.seconds:.1f}", r.build_dir, r.log_path]
+        data.append(cells)
+        for i, c in enumerate(cells):
+            widths[i] = max(widths[i], len(c))
+    lines: list[str] = []
+    lines.append(" | ".join(h.ljust(widths[i]) for i, h in enumerate(headers)))
+    lines.append("-+-".join("-" * w for w in widths))
+    for cells in data:
+        lines.append(" | ".join(c.ljust(widths[i]) for i, c in enumerate(cells)))
+    return "\n".join(lines)
+
+
+def print_tail(log_path: Path, n: int = 40) -> None:
+    if not log_path.is_file():
+        return
+    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    tail = lines[-n:]
+    print(f"----- last {len(tail)} line(s) of {log_path} -----")
+    for line in tail:
+        print(line)
+    print("-" * 40)
+
+
+def run_one(
+    spec: ConfigSpec, jobs: int, slow: bool, abort: threading.Event, keep_going: bool
+) -> Outcome:
+    config_dir = OUT_ROOT / spec.name
+    log = config_dir / "verify.log"
+    # Configs lay out their build dir(s) differently (build/, build-guarded/,
+    # release-on/release-off/build-portable/build-arch for diag, ...); the config's
+    # own directory is the one path guaranteed to hold all of them.
+    build_dir_display = str(config_dir.relative_to(ROOT))
+
+    if not keep_going and abort.is_set():
+        return Outcome(
+            spec.name,
+            spec.job,
+            None,
+            0.0,
+            build_dir_display,
+            str(log.relative_to(ROOT)),
+            "skipped after an earlier failure",
+        )
+
+    reason = spec.needs()
+    if reason is not None:
+        return Outcome(
+            spec.name, spec.job, None, 0.0, build_dir_display, str(log.relative_to(ROOT)), reason
+        )
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+    log_start(
+        log, f"=== {spec.name} ({spec.job}) starting {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+    )
+    ctx = RunCtx(name=spec.name, dir=config_dir, log=log, jobs=jobs, slow=slow)
+    start = time.monotonic()
+    try:
+        ok = spec.runner(ctx)
+    except Exception as exc:  # a config crashing is a FAIL, not a script crash
+        log_write(log, f"\n[verify_local] EXCEPTION: {exc!r}\n")
+        ok = False
+    elapsed = time.monotonic() - start
+    if not ok and not keep_going:
+        abort.set()
+    return Outcome(spec.name, spec.job, ok, elapsed, build_dir_display, str(log.relative_to(ROOT)))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--only", help=f"comma-separated subset of: {','.join(CONFIG_NAMES)}")
+    parser.add_argument("--slow", action="store_true", help="also run the long-tail ctest tier")
+    parser.add_argument("--list", action="store_true", help="print the config table and exit")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help="total build/ctest parallelism budget (default: os.cpu_count())",
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="don't skip not-yet-started configs after a failure",
+    )
+    parser.add_argument(
+        "--selftest", action="store_true", help="trivially fast dry-run; no real builds"
+    )
+    args = parser.parse_args(argv)
+
+    if args.list:
+        print(f"{'config':<12} {'mirrors':<45} description")
+        for c in CONFIGS:
+            print(f"{c.name:<12} {c.job:<45} {c.description}")
+        return 0
+
+    if args.selftest:
+        return do_selftest()
+
+    if args.only:
+        requested = [x.strip() for x in args.only.split(",") if x.strip()]
+        unknown = [x for x in requested if x not in CONFIG_NAMES]
+        if unknown:
+            print(
+                f"error: unknown config(s) {unknown!r}; choose from {CONFIG_NAMES}", file=sys.stderr
+            )
+            return 2
+        selected = [c for c in CONFIGS if c.name in requested]
+    else:
+        selected = list(CONFIGS)
+
+    total_jobs = args.jobs or os.cpu_count() or 4
+    per_config_jobs = max(2, total_jobs // max(1, len(selected)))
+
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    print(
+        f"verify_local: {len(selected)} config(s), {total_jobs} total job budget "
+        f"({per_config_jobs} per config), ninja={'yes' if have_ninja() else 'no'}, "
+        f"ccache={'yes' if have_ccache() else 'no'}"
+    )
+    if not args.slow:
+        print(
+            f"verify_local: slow tier excluded by default (-E '{SLOW_TEST_REGEX}'); pass --slow to include it"
+        )
+
+    abort = threading.Event()
+    outcomes: dict[str, Outcome] = {}
+    start_all = time.monotonic()
+    max_workers = min(len(selected), max(1, total_jobs))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(run_one, spec, per_config_jobs, args.slow, abort, args.keep_going): spec
+            for spec in selected
+        }
+        for fut in as_completed(futures):
+            outcome = fut.result()
+            outcomes[outcome.name] = outcome
+            status = "SKIPPED" if outcome.ok is None else ("PASS" if outcome.ok else "FAIL")
+            suffix = f" ({outcome.reason})" if outcome.reason else ""
+            print(f"[{outcome.seconds:7.1f}s] {outcome.name:<12} {status}{suffix}")
+            if outcome.ok is False:
+                print_tail(ROOT / outcome.log_path)
+    wall_clock = time.monotonic() - start_all
+
+    ordered = [outcomes[c.name] for c in selected if c.name in outcomes]
+    print()
+    print(format_table(ordered))
+    total_seconds = sum(o.seconds for o in ordered)
+    print(
+        f"\nwall clock: {wall_clock:.1f}s   sum of per-config seconds: {total_seconds:.1f}s"
+        f"   (speedup: {(total_seconds / wall_clock) if wall_clock else 0:.2f}x)"
+    )
+
+    failed = [o.name for o in ordered if o.ok is False]
+    if failed:
+        print(f"\nFAILED: {', '.join(failed)}")
+        return 1
+    return 0
+
+
+def do_selftest() -> int:
+    """Trivially fast dry-run: validate the config table and tool detection without
+    running any real build. Used by ci/tests/test_verify_local.py and by hand as a
+    smoke test that the script itself still imports and argparses cleanly.
+    """
+    ok = True
+    if len(CONFIG_NAMES) != len(set(CONFIG_NAMES)):
+        print("FAIL: duplicate config names")
+        ok = False
+    for spec in CONFIGS:
+        if not spec.name or not spec.job or not spec.description:
+            print(f"FAIL: config {spec.name!r} missing metadata")
+            ok = False
+    rc = subprocess.run(
+        [cmake_bin(), "--version"], capture_output=True, text=True, check=False
+    ).returncode
+    if rc != 0:
+        print("FAIL: cmake not runnable")
+        ok = False
+    print(f"selftest: {len(CONFIGS)} configs registered: {', '.join(CONFIG_NAMES)}")
+    print(
+        f"selftest: ninja={'yes' if have_ninja() else 'no'} ccache={'yes' if have_ccache() else 'no'} clang={'yes' if _need_clang() is None else 'no'}"
+    )
+    print("selftest: PASS" if ok else "selftest: FAIL")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

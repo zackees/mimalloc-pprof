@@ -60,6 +60,8 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
   miss it.
 - Fast local iteration: `python ci/dev_linux.py c-test | rust-test | bench` (issue #10) once
   landed. `bench` is the speed acceptance test; paste its output on #10 when touched.
+  `python ci/verify_local.py` mirrors the Linux-runnable subset of CI (c-unit/rust-native/
+  python-lint/asan) as ten concurrent configs; see `docs/dev-loop.md`.
 - Upstreaming to microsoft/mimalloc: v3-targeted `pr/*` branches are cut from
   `upstream/dev3` (or its eventual renamed/default v3 branch), and receive only the
   fork-specific C diff; use `upstream/main` only for genuinely v2-compatible work until it

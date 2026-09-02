@@ -169,6 +169,11 @@ void _mi_scavenger_start_lazy(void) { _mi_scavenger_start(); }
 #include <errno.h>
 
 static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = running
+// Set by `_mi_scavenger_stop` and never cleared: teardown has begun, so no start may create a
+// thread any more. Without it `_mi_scavenger_start_lazy` -- reachable from a thread that parks
+// while the process is tearing down -- can spawn a scavenger AFTER the stop that was supposed
+// to join it, leaving a thread walking a subproc that is being dismantled.
+static _Atomic(uintptr_t) _mi_scavenger_shutdown;
 
 // -----------------------------------------------------------------------------
 // Wait/wake on subproc->scavenger_wake (a uint32_t futex word).
@@ -454,6 +459,7 @@ static DWORD WINAPI mi_scavenger_thread_main(LPVOID arg) {
 
 void _mi_scavenger_start(void) {
   if (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) return;
+  if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) return;   // teardown has begun
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
@@ -465,6 +471,7 @@ void _mi_scavenger_start(void) {
 }
 
 void _mi_scavenger_stop(void) {
+  mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)1);   // before the exchange: no restart past here
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
   mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
@@ -530,6 +537,7 @@ static void* mi_scavenger_thread_main(void* arg) {
 
 void _mi_scavenger_start(void) {
   if (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) return;
+  if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) return;   // teardown has begun
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
@@ -565,6 +573,7 @@ void _mi_scavenger_start(void) {
 }
 
 void _mi_scavenger_stop(void) {
+  mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)1);   // before the exchange: no restart past here
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
   mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
@@ -578,6 +587,7 @@ void _mi_scavenger_stop(void) {
 // child would: take the wake path in `_mi_arenas_purge_now` and signal nobody (so never purge at
 // all), and `pthread_join` a `pthread_t` that names no thread at exit.
 void _mi_scavenger_forked_child(void) {
+  mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)0);   // a fresh image, not a teardown
   mi_atomic_store_release(&_mi_scavenger_joinable, (uintptr_t)0);
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
   mi_scav_fork_child_reset();

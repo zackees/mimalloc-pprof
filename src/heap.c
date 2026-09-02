@@ -188,6 +188,33 @@ mi_heap_t* mi_heap_new(void) {
 // other party that can hold one is a concurrent mi_free collecting it -- the walk can then
 // safely claim and move/free each page without racing a still-live theap.
 static void mi_heap_detach_theaps(mi_heap_t* heap) {
+  // #272: a theap of this heap can be the `park_theap0` that a thread handed to the background
+  // scavenger -- `mi_on_thread_idle_start` captures `_mi_theap_default()`, and after
+  // `mi_heap_set_default(heap)` that is a theap of a DELETABLE heap. Nothing below consults the
+  // park protocol, so a cross-thread `mi_heap_delete` would abandon (and `mi_heap_free_theaps`
+  // later free) a theap the scavenger is walking right now; both assertions that would have
+  // caught it are suppressed (`theap->heap==NULL` here, the MI_PARK_SWEEPING clause of
+  // `mi_theap_page_is_valid` there). So take every parked owner back first.
+  //
+  // Outside `theaps_lock`, one at a time: `_mi_park_leave` waits out an in-progress sweep, and
+  // the sweep can take locks a holder of `theaps_lock` would deadlock against. It terminates
+  // because a parked thread is blocked -- it cannot re-park -- and `_mi_park_leave` leaves it
+  // RUNNING; the owner's own `mi_on_thread_idle_end` then finds RUNNING and no-ops.
+  if (!_mi_process_is_forked_child) {   // a forked child's park_state may name a thread that is gone
+    for (;;) {
+      mi_tld_t* parked = NULL;
+      mi_lock(&heap->theaps_lock) {
+        for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
+          mi_tld_t* const tld = theap->tld;
+          if (tld != NULL && mi_atomic_load_acquire(&tld->park_state) != MI_PARK_RUNNING) {
+            parked = tld; break;
+          }
+        }
+      }
+      if (parked == NULL) break;
+      _mi_park_leave(parked);
+    }
+  }
   _mi_heap_detach_theaps(heap);
   mi_lock(&heap->theaps_lock) { // paranoia
     for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {

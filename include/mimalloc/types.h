@@ -645,8 +645,6 @@ struct mi_subproc_s {
   mi_lock_t             arena_reserve_lock;             // lock to ensure arena's get reserved one at a time
   mi_decl_align(8)                                      // needed on some 32-bit platforms
   _Atomic(int64_t)      purge_expire;                   // expiration is set if any arenas can be purged
-  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
-  _Atomic(uint32_t)     scavenger_wake;                 // futex word signalled when a purge is scheduled (the scavenger thread waits on this)
 
   _Atomic(mi_heap_t*)   heap_main;                      // main heap for this sub process
   mi_heap_t*            heaps;                          // heaps belonging to this sub-process
@@ -654,11 +652,6 @@ struct mi_subproc_s {
 
   mi_theap_t*           theap_meta;                     // detached theap for allocating meta-data
   mi_lock_t             theap_meta_lock;                // all allocations in theap_meta need a lock
-
-  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
-  mi_tld_t*             tlds;                           // list of tlds of this sub-process (walked by the scavenger for parked threads)
-  mi_lock_t             tlds_lock;                      // guards the `tlds` list structure only -- never held across a sweep
-  _Atomic(size_t)       parked_count;                   // threads currently parked; lets the scavenger skip the walk entirely
 
   _Atomic(size_t)       thread_count;                   // current threads associated with this sub-process
   _Atomic(size_t)       thread_total_count;             // total created threads associated with this sub-process
@@ -670,6 +663,19 @@ struct mi_subproc_s {
   mi_decl_align(8)                                      // needed on some 32-bit platforms
   mi_stats_t            stats;                          // subprocess statistics; updated for arena/OS stats like committed,
                                                         // and otherwise merged with heap stats when those are deleted
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+  // DEVIATION from Bun, which puts `scavenger_wake` next to `purge_expire` and the tld
+  // registry before `thread_count`: appended at the TAIL here so that no existing field's
+  // offset moves. `mi_subproc_t::stats` is read and written from the free path
+  // (`mi_subproc_stat_*`), and shifting it re-lays it out across cache lines -- which
+  // measured as a consistent ~1.5-2 ns/alloc+free regression on the #154 microbenchmark
+  // before this was moved, for a struct nothing here needed to reorder.
+  mi_tld_t*             tlds;                           // list of tlds of this sub-process (walked by the scavenger for parked threads)
+  mi_lock_t             tlds_lock;                      // guards the `tlds` list structure only -- never held across a sweep
+  _Atomic(size_t)       parked_count;                   // threads currently parked; lets the scavenger skip the walk entirely
+  mi_decl_align(8)
+  _Atomic(uint32_t)     scavenger_wake;                 // futex word signalled when a purge is scheduled (the scavenger thread waits on this)
 };
 
 

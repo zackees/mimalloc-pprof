@@ -53,6 +53,13 @@ BUN_DEFINES = [
     "-DMI_MALLOC_OVERRIDE",
     "-DMI_DEFAULT_ALLOW_THP=0",
 ]
+# -fPIC is Bun's (DirectBuild sets `pic: true`). -fno-omit-frame-pointer is NOT in
+# mimalloc.ts today -- it is issue #274 9a step 3's own addition, matching the flag our
+# CMakeLists.txt appends whenever MI_PPROF is on (profiler stack unwinding needs it).
+# Bun doesn't build with MI_PPROF at all yet (see docs/bun-gap-analysis-*.md section
+# 2c, "MI_PPROF under DirectBuild" -- their build silently compiles the profiler out),
+# so this flag is here to keep the probe's own build shape consistent with what a real
+# MI_PPROF=1 Bun integration would need, not because Bun already passes it.
 BUN_CFLAGS = ["-fPIC", "-fno-omit-frame-pointer"]
 BUN_MUSL_DEFINES = ["-DMI_LIBC_MUSL=1"]
 BUN_MUSL_CFLAGS = ["-ftls-model=local-dynamic"]

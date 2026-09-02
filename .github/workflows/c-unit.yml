@@ -178,7 +178,7 @@ jobs:
         include:
           - name: glibc
             runs-on: ubuntu-latest
-            container: null
+            container: ""
             args: ""
           - name: musl
             runs-on: ubuntu-latest

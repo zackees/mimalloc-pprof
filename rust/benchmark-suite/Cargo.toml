@@ -46,6 +46,18 @@ path = "src/bin/benchmark-scaling-run.rs"
 name = "benchmark-scaling-validate"
 path = "src/bin/benchmark-scaling-validate.rs"
 
+[[test]]
+name = "timed_allocation_audit"
+path = "tests/timed_allocation_audit.rs"
+# Custom `fn main` (no libtest harness): libtest runs `#[test]` fns
+# concurrently on their own OS threads by default, and it initializes
+# per-thread output capture on each test's thread the moment that thread
+# starts -- an allocation with no ordering relative to this file's
+# `MEASURED` gate. That stray allocation from the *sibling* test's thread
+# landed inside this test's measured interval and was misattributed to
+# the code under audit. See #236 / #206.
+harness = false
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }

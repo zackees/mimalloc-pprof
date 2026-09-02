@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 60157904 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 93722a01 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -210,6 +210,21 @@ typedef void (mi_cdecl mi_error_fun)(int err, void* arg);
 mi_decl_export void mi_register_error(mi_error_fun* fun, void* arg);
 
 mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+// Tell mimalloc this thread is idle: it collects this thread's pending frees, discards the
+// free blocks inside its still-used pages (`purge_holes`), and hands the arena purge to the
+// background scavenger. Safe on any thread; a no-op on a thread that never allocated.
+mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
+// Declare that this thread will not allocate or free until `mi_on_thread_idle_end`, so the
+// scavenger can do the idle work above while this thread blocks. Returns `false` when nothing
+// was handed off, and then `mi_on_thread_idle_end` must NOT be called.
+mi_decl_export bool mi_on_thread_idle_start(void) mi_attr_noexcept;
+// The other half of `mi_on_thread_idle_start`: take the theaps back before allocating again.
+mi_decl_export void mi_on_thread_idle_end(void) mi_attr_noexcept;
+// Stop the background scavenger thread (it restarts on demand; see `mi_option_scavenger`).
+mi_decl_export void mi_scavenger_stop(void)     mi_attr_noexcept;
+
 mi_decl_export int  mi_version(void);
 mi_decl_export void mi_options_print(void)      mi_attr_noexcept;
 mi_decl_export void mi_process_info_print(void) mi_attr_noexcept;
@@ -570,6 +585,7 @@ typedef enum mi_option_e {
   mi_option_prof_max_bytes,             // budget (in bytes) for profiler-internal arena memory; 0 = unbudgeted (=0)
   mi_option_memory_events,              // enable opt-in allocation-change accounting/callbacks (MIMALLOC_MEMORY_EVENTS) (=0)
   mi_option_purge_zeroes,               // treat decommit-purged slices as zeroed, letting mi_zalloc skip its memset (=0, experimental)
+  mi_option_scavenger,                  // run a background thread that purges scheduled arena memory (=1). imported from oven-sh/mimalloc @ 942b8342, MIT (#272)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -1960,6 +1976,36 @@ static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub) {
 
 
 // ----------------------------------------------------------------------
+// CPU relax hint for a short spin (no syscall, no scheduler involvement).
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a):
+// used by `_mi_park_leave` (src/scavenger.c) to wait out an in-flight sweep, which is
+// bounded by one page's walk and so should not reach `_mi_prim_thread_yield`.
+// ----------------------------------------------------------------------
+
+#if defined(_WIN32)
+static inline void mi_atomic_pause(void) {
+  YieldProcessor();
+}
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+static inline void mi_atomic_pause(void) {
+  __asm__ volatile ("pause" ::: "memory");
+}
+#elif (defined(__GNUC__) || defined(__clang__)) && defined(__aarch64__)
+static inline void mi_atomic_pause(void) {
+  __asm__ volatile ("isb" ::: "memory");
+}
+#elif (defined(__GNUC__) || defined(__clang__)) && defined(__arm__) && (__ARM_ARCH >= 7)
+static inline void mi_atomic_pause(void) {
+  __asm__ volatile ("yield" ::: "memory");
+}
+#else
+static inline void mi_atomic_pause(void) {
+  mi_atomic_thread_fence(mi_memory_order_seq_cst);
+}
+#endif
+
+
+// ----------------------------------------------------------------------
 // Guard
 // ----------------------------------------------------------------------
 
@@ -2888,6 +2934,19 @@ struct mi_subproc_s {
   mi_decl_align(8)                                      // needed on some 32-bit platforms
   mi_stats_t            stats;                          // subprocess statistics; updated for arena/OS stats like committed,
                                                         // and otherwise merged with heap stats when those are deleted
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+  // DEVIATION from Bun, which puts `scavenger_wake` next to `purge_expire` and the tld
+  // registry before `thread_count`: appended at the TAIL here so that no existing field's
+  // offset moves. `mi_subproc_t::stats` is read and written from the free path
+  // (`mi_subproc_stat_*`), and shifting it re-lays it out across cache lines -- which
+  // measured as a consistent ~1.5-2 ns/alloc+free regression on the #154 microbenchmark
+  // before this was moved, for a struct nothing here needed to reorder.
+  mi_tld_t*             tlds;                           // list of tlds of this sub-process (walked by the scavenger for parked threads)
+  mi_lock_t             tlds_lock;                      // guards the `tlds` list structure only -- never held across a sweep
+  _Atomic(size_t)       parked_count;                   // threads currently parked; lets the scavenger skip the walk entirely
+  mi_decl_align(8)
+  _Atomic(uint32_t)     scavenger_wake;                 // futex word signalled when a purge is scheduled (the scavenger thread waits on this)
 };
 
 
@@ -2935,6 +2994,12 @@ typedef struct mi_hooks_tld_s {
   bool     prof_lock_owner;           // profile.c (MI_PPROF): this thread already holds prof_lock
 } mi_hooks_tld_t;
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a):
+// idle handoff states for `mi_tld_t::park_state`.
+#define MI_PARK_RUNNING   (0)   // the owner is running: only the owner may touch its theaps
+#define MI_PARK_PARKED    (1)   // the owner blocked in `mi_on_thread_idle_start`: the scavenger may claim it
+#define MI_PARK_SWEEPING  (2)   // the scavenger claimed it and is doing the idle work right now
+
 // Thread local data
 struct mi_tld_s {
   mi_threadid_t         thread_id;            // thread id of this thread
@@ -2948,6 +3013,17 @@ struct mi_tld_s {
   mi_memid_t            memid;                // provenance of the tld memory itself (meta or OS)
   mi_profiler_tld_t     profiler;             // allocation sampling profiler state
   mi_hooks_tld_t        hooks;                // memory-events/dhat/profiler hook reentrancy state (#266)
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+  // Idle handoff (`mi_on_thread_idle_start`). Kept at the tail: `mi_process_tld_main` /
+  // `mi_tld_detached` are initialized positionally in `src/init.c`, so a field inserted
+  // above silently shifts them. Zero is the correct initial value for every one of these
+  // (MI_PARK_RUNNING / NULL / unregistered).
+  _Atomic(uint32_t)     park_state;           // MI_PARK_*: whether another thread may sweep our theaps right now
+  _Atomic(uint32_t)     park_reclaim;         // set by the owner to get its theaps back; the sweep stops at the next page
+  mi_theap_t*           park_theap0;          // default theap, captured at the park (the scavenger has no TLS to find it)
+  _Atomic(uint32_t)     park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
+  mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
 };
 
 
@@ -4471,6 +4547,31 @@ void*         _mi_arenas_alloc_aligned(mi_heap_t* heap, size_t size, size_t alig
 void          _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid);
 void          _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld);
 void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+void          _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
+void          _mi_arenas_purge_now(mi_subproc_t* subproc);
+void          _mi_arenas_fork_child(void);   // #272: clear the inherited one-purger-at-a-time guard
+
+// scavenger.c -- imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+void          _mi_scavenger_start(void);
+void          _mi_scavenger_start_lazy(void);
+void          _mi_scavenger_stop(void);
+void          _mi_scavenger_wake(mi_subproc_t* subproc);
+bool          _mi_scavenger_is_running(void);
+void          _mi_scavenger_forked_child(void);
+void          _mi_park_leave(mi_tld_t* tld);
+void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0);
+mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);
+// #272 test observable (test/test-park-handoff.c). `mi_decl_export` because the
+// `ctest-shared` job links that test against the shared library, where the default
+// `-fvisibility=hidden` would otherwise hide it -- same reason as the `mi_debug_*` hooks
+// above, except this one is NOT `MI_DEBUG`-only: the test is meaningful in a Release
+// build too, and one relaxed increment per park is not worth a config split.
+mi_decl_export size_t _mi_test_idle_work_count(void);
+#if MI_DEBUG > 0
+// #272 fork test hook (test/test-fork-user-heap.c case_b); see src/init.c
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
+#endif
 
 mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t page_alignment);
 void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
@@ -4986,7 +5087,13 @@ static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
   if (theap == NULL || theap->tld == NULL) return true;
   if (mi_atomic_load_ptr_relaxed(mi_heap_t, &theap->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`
   if (theap->tld->thread_id == _mi_thread_id()) return true;
-  return mi_theap_is_detached(theap);   // upstream's permanently-detached theaps (meta-data) belong to no thread
+  if (mi_theap_is_detached(theap)) return true;   // upstream's permanently-detached theaps (meta-data) belong to no thread
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a,
+  // `internal.h:731`): the owner published MI_PARK_PARKED and the scavenger claimed it, so the
+  // owner is quiesced by contract and the sweeping thread may touch these pages -- the same
+  // "owner is not allocating" precondition `mi_theap_collect` already relies on for its
+  // non-owner callers (python/cpython#112532).
+  return (mi_atomic_load_acquire(&theap->tld->park_state) == MI_PARK_SWEEPING);
 }
 
 /* -----------------------------------------------------------
@@ -10901,6 +11008,18 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(unabandon || (page->next==NULL && page->prev==NULL));
   mi_assert_internal(_mi_theap_can_touch(current_theapx));
+  #if MI_PPROF
+  // #272 profiler-interaction invariant (1): no profiler record may be attached to a page that
+  // is going back to the arena, because the slices it occupies can be decommitted by the
+  // background scavenger at any point after `mi_arena_schedule_purge` below. The invariant holds
+  // by construction -- a page only reaches here once `mi_page_all_free`, and every block free
+  // ran `_mi_prof_on_free` / `_mi_prof_on_free_collect`, which unlink that block's record under
+  // `prof_lock` and clear `has_metadata` when the list empties -- but it is exactly the kind of
+  // thing a future fast path could break silently, so assert it where the page is handed over.
+  // (The records themselves live in the profiler's raw-OS arena, CLAUDE.md rule 4, so they are
+  // never inside a discarded range either way; this asserts nothing DANGLES INTO the range.)
+  mi_assert_internal(!page->has_metadata && page->metadata == NULL);
+  #endif
 
   // all we need from the heap, before the page is unpublished from it (see
   // mi_arenas_page_free_prim's provenance comment, above)
@@ -11074,7 +11193,6 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   Arena free
 ----------------------------------------------------------- */
 static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slices);
-static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
 
 void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid) {
   if (p==NULL) return;
@@ -11132,12 +11250,12 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
   }
 
   // try to purge expired decommits
-  // mi_arenas_try_purge(false, false, NULL);
+  // _mi_arenas_try_purge(false, false, NULL);
 }
 
 // Purge the arenas; if `force_purge` is true, amenable parts are purged even if not yet expired
 void _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld) {
-  mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq);
+  _mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq);
 }
 
 
@@ -11208,7 +11326,7 @@ static void mi_arenas_unsafe_destroy(mi_subproc_t* subproc) {
 // for dynamic libraries that are unloaded and need to release all their allocated memory.
 void _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc) {
   mi_arenas_unsafe_destroy(subproc);
-  // mi_arenas_try_purge(true /* force purge */, true /* visit all*/, subproc, 0 /* thread seq */);  // purge non-owned arenas
+  // _mi_arenas_try_purge(true /* force purge */, true /* visit all*/, subproc, 0 /* thread seq */);  // purge non-owned arenas
 }
 
 
@@ -11923,7 +12041,12 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
       // expiration was not yet set
       // maybe set the global arenas expire as well (if it wasn't set already)
       mi_assert_internal(expire0==0);
-      mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &expire0, expire);
+      // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+      if (mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &expire0, expire)) {
+        // subproc expire went 0 -> set: this is the only transition the scavenger actually
+        // needs to observe, so wake it here instead of on every free.
+        _mi_scavenger_wake(arena->subproc);
+      }
     }
     else {
       // already an expiration was set
@@ -12009,7 +12132,49 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
 }
 
 
-static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
+// Only one thread purges at a time. NOT a static inside `_mi_arenas_try_purge`: fork() can land
+// with it set by a thread that does not exist in the child (much more likely now that the
+// scavenger, #272, spends real time inside the guarded section), and the child would then never
+// purge again. `_mi_arenas_fork_child` clears it; see `src/fork.c`.
+static mi_atomic_guard_t mi_arenas_purge_guard;
+
+// #272: called from `_mi_process_fork_child`, on the single surviving thread.
+void _mi_arenas_fork_child(void) {
+  mi_atomic_store_release(&mi_arenas_purge_guard, (uintptr_t)0);
+}
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+// Bring every arena's scheduled purge forward to "now" and get it done: either by waking the
+// scavenger (which then runs `_mi_arenas_try_purge`), or inline when no scavenger is running.
+// This is the third phase of `mi_on_thread_idle`: the caller told us it is idle, so there is no
+// reason to sit on decommittable memory for the rest of `purge_delay`.
+void _mi_arenas_purge_now(mi_subproc_t* subproc) {
+  if (subproc == NULL) return;
+  const long delay = mi_arena_purge_delay();
+  if (delay <= 0) return;   // purging disabled, or already immediate at free time
+  const mi_msecs_t now = _mi_clock_now();
+  const size_t max_arena = mi_arenas_get_count(subproc);
+  bool any_scheduled = false;
+  for (size_t i = 0; i < max_arena; i++) {
+    mi_arena_t* const arena = mi_arena_from_index(subproc, i);
+    if (arena == NULL) continue;
+    const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+    if (expire == 0) continue;                 // nothing queued for this arena
+    any_scheduled = true;
+    if (expire > now) { mi_atomic_storei64_release(&arena->purge_expire, now); }
+  }
+  if (!any_scheduled) return;
+  const mi_msecs_t sexpire = mi_atomic_loadi64_relaxed(&subproc->purge_expire);
+  if (sexpire == 0 || sexpire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now); }
+  if (_mi_scavenger_is_running()) {
+    _mi_scavenger_wake(subproc);
+  }
+  else {
+    _mi_arenas_try_purge(false /* force */, true /* visit all */, subproc, 0 /* tseq */);  // no scavenger: purge here
+  }
+}
+
+void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
 {
   // try purge can be called often so try to only run when needed
   const long delay = mi_arena_purge_delay();
@@ -12024,15 +12189,41 @@ static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subpro
   if (max_arena == 0) return;
 
   // allow only one thread to purge at a time (todo: allow concurrent purging?)
-  static mi_atomic_guard_t purge_guard;
-  mi_atomic_guard(&purge_guard)
+  //
+  // #272: `mi_atomic_guard` is NON-blocking -- when another thread holds it, the purge is
+  // simply skipped. That is the right behaviour for the opportunistic callers, and it was
+  // harmless before this phase because only allocating threads ever entered here and the
+  // window is tiny. It is NOT harmless for a FORCED purge: `mi_collect(true)` promises the
+  // caller that everything due has gone back to the OS, and with the background scavenger
+  // sitting in this same function on a timer, a forced purge now loses that race often
+  // enough to matter (`test-degenerate`'s thread-churn RSS backstop failed 4 runs in 40:
+  // "memory grew with thread churn -- 5.1 MB -> 54.1 MB", i.e. `mi_collect(true)` returning
+  // having purged nothing at all). So a forced purge WAITS for the guard instead of
+  // skipping.
+  //
+  // Why that wait cannot deadlock, spelled out because it turns a non-blocking guard into a
+  // blocking one: the ONLY caller that passes `force` is `_mi_arenas_collect(force_purge=true)`
+  // from `mi_theap_collect_ex(MI_FORCE)`, i.e. an ordinary thread inside `mi_collect(true)`.
+  // The scavenger never does -- it reaches here through `mi_theap_collect(theap0, false)`
+  // (MI_NORMAL) and through `_mi_arenas_purge_now`, both `force == false`, and
+  // `mi_theap_collect_ex` skips `_mi_arenas_collect` outright while `park_state ==
+  // MI_PARK_SWEEPING`. So a waiter is always a user thread and a holder is always someone
+  // running a bounded pass over the arenas that acquires no mimalloc lock the waiter could
+  // be holding (the guarded body takes only arena bitmaps and the OS). The wait is therefore
+  // bounded by one purge pass, and in particular a holder is never itself blocked on
+  // `_mi_park_leave` waiting for a SWEEPING state the waiter would have to clear.
+  bool ran = false;
+  do {
+  mi_atomic_guard(&mi_arenas_purge_guard)
   {
+    ran = true;
     // increase global expire: at most one purge per delay cycle
     if (arenas_expire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now + (delay/10)); }
     const size_t arena_start = tseq % max_arena;
     size_t max_purge_count = (visit_all ? max_arena : (max_arena/4)+1);
     bool all_visited = true;
     bool any_purged = false;
+    mi_msecs_t next_expire = 0;   // earliest still-pending per-arena expire (#272)
     for (size_t _i = 0; _i < max_arena; _i++) {
       size_t i = _i + arena_start;
       if (i >= max_arena) { i -= max_arena; }
@@ -12049,12 +12240,23 @@ static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subpro
             max_purge_count--;
           }
         }
+        // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+        const mi_msecs_t aexpire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+        if (aexpire != 0 && (next_expire == 0 || aexpire < next_expire)) { next_expire = aexpire; }
       }
     }
-    if (all_visited && !any_purged) {
-      mi_atomic_storei64_release(&subproc->purge_expire, (mi_msecs_t)0);
+    MI_UNUSED(any_purged);
+    if (all_visited) {
+      // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a):
+      // we saw every arena, so `subproc->purge_expire` becomes the earliest still-pending
+      // per-arena expire (0 if none) and the scavenger's next wait is exact. A CAS, so a purge
+      // scheduled concurrently with this walk is never clobbered.
+      mi_msecs_t expected = arenas_expire;
+      mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
     }
   }
+    if (!ran && force) { _mi_prim_thread_yield(); }   // #272, see above
+  } while (!ran && force);
 }
 
 
@@ -15185,6 +15387,14 @@ terms of the MIT license. A copy of the license can be found in the file
       -> heap->arena_pages_lock     `mi_subproc_unsafe_destroy` -> `_mi_heap_force_destroy` -> `mi_heap_free` (heap.c:203)
       -> heap->os_abandoned_pages_lock, sp->theap_meta_lock   (same teardown path, via frees)
 
+    subproc->tlds_lock              init.c           #272: the subproc's registry of live tlds
+      -> (nothing)                  `mi_tld_register`/`mi_tld_unregister` (init.c) and the
+                                    scavenger's parked-thread walk (`_mi_theap_sweep_parked`,
+                                    scavenger.c) only touch list links and atomics under it,
+                                    and no caller holds another lock while acquiring it. A LEAF
+                                    in both directions; its step number below is therefore free,
+                                    and it sits where the child needs the list stable to walk it.
+
     heap->theaps_lock               heap.c/theap.c   the heap's list of theaps
       -> sp->theap_meta_lock        `mi_heap_free_theaps` (heap.c:174) -> `_mi_theap_decref`
                                     -> `mi_theap_free_mem` -> `_mi_meta_free` (theap.c:363)
@@ -15267,17 +15477,18 @@ terms of the MIT license. A copy of the license can be found in the file
      1. mi_subprocs_lock
      2. for each sp:                sp->heaps_lock
      3. for each sp, each heap h:   h->theaps_lock
-     4. for each sp, each NON-main h: h->arena_pages_lock
-     5. mi_thread_locals_lock
-     6. for each sp:                sp->theap_meta_lock
-     7. for each sp:                sp->heap_main->arena_pages_lock
-     8. for each sp:                sp->arena_reserve_lock
-     9. for each sp, each heap h:   h->os_abandoned_pages_lock
-    10. _mi_page_map()->lock
-    11. prof_lock                   (profile.c, MI_PPROF; no-op otherwise)
-    12. dhat_lock                   (dhat.c)
-    13. memevt_cb_lock              (memory-events.c)
-    14. out_buf_lock                (options.c)
+     4. for each sp:                sp->tlds_lock                (#272)
+     5. for each sp, each NON-main h: h->arena_pages_lock
+     6. mi_thread_locals_lock
+     7. for each sp:                sp->theap_meta_lock
+     8. for each sp:                sp->heap_main->arena_pages_lock
+     9. for each sp:                sp->arena_reserve_lock
+    10. for each sp, each heap h:   h->os_abandoned_pages_lock
+    11. _mi_page_map()->lock
+    12. prof_lock                   (profile.c, MI_PPROF; no-op otherwise)
+    13. dhat_lock                   (dhat.c)
+    14. memevt_cb_lock              (memory-events.c)
+    15. out_buf_lock                (options.c)
 
   Both list walks are stable from step 2 onwards: `mi_subprocs` is pinned by step 1 and
   every `sp->heaps` by step 2, so later passes see exactly the same sets.
@@ -15286,15 +15497,23 @@ terms of the MIT license. A copy of the license can be found in the file
   is irrelevant -- only ACQUIRE order can deadlock -- so each release pass walks its
   list forward rather than reconstructing a reverse walk.
 
-  // Phase 7: scavenger -- Bun also quiesces a per-subprocess `tlds` registry and its own
-  // `tlds_lock` here (walking every thread's `tld->theaps_lock` and park state). That
-  // registry does not exist yet in this tree; it lands with the scavenger (#264 item 7 /
-  // #272). `mi_tld_t::theaps_lock` (types.h, "sometimes accessed from another thread on
-  // mi_heap_free") is therefore a KNOWN GAP not covered by this phase -- see the P5 PR
-  // description and MIMALLOC_FORKS.md. It is deliberately not approximated by an ad hoc
-  // walk here: a heap's theaps list can reach the same `tld` through more than one theap
-  // (one thread, several heaps), and locking a non-recursive mutex twice would turn a
-  // currently-rare hang into a guaranteed one inside this very handler.
+  ---- `mi_tld_t::theaps_lock`: re-initialized in the child, never acquired here (#272) ----
+
+  P5 left this lock as a documented KNOWN GAP because there was no way to enumerate live
+  tlds. #272's `sp->tlds` registry removes that obstacle -- and shows the gap must be closed
+  the other way round. This lock is the one in the tree whose holder is REQUIRED to be able
+  to outlive a fork(): `mi_thread_theaps_done` (init.c) holds it across an entire theap
+  teardown (`_mi_theap_collect_abandon` per theap), and `test/test-fork-user-heap.c`'s case_b
+  forks deliberately while a sibling thread sits inside exactly that window. Acquiring it in
+  `prepare` turns that case's child-side deadlock into a PARENT-side one -- strictly worse,
+  since the parent is the process that is supposed to survive.
+
+  So `_mi_process_fork_child` re-initializes every registered tld's `theaps_lock` instead
+  (which is also what Bun does, `subproc.c:416-424`). That is correct rather than merely
+  pragmatic: the thread that held it does not exist in the child, so nothing will ever
+  release it, and every consumer of a pre-fork thread's theaps in the child is already gated
+  on `_mi_process_is_forked_child` (#271) into re-deriving ownership from the bitmaps.
+  Verified by case_b of `test-fork-user-heap`, re-enabled in #272.
 
   ---- Why Bun's stated rule does not transfer ----
 
@@ -15334,18 +15553,19 @@ typedef enum mi_fork_lock_level_e {
   MI_FORK_LOCK_SUBPROCS          = 1,
   MI_FORK_LOCK_HEAPS             = 2,
   MI_FORK_LOCK_THEAPS            = 3,
-  MI_FORK_LOCK_ARENA_PAGES       = 4,   // non-main heaps
-  MI_FORK_LOCK_THREAD_LOCALS     = 5,
-  MI_FORK_LOCK_THEAP_META        = 6,
-  MI_FORK_LOCK_ARENA_PAGES_MAIN  = 7,
-  MI_FORK_LOCK_ARENA_RESERVE     = 8,
-  MI_FORK_LOCK_OS_ABANDONED      = 9,
-  MI_FORK_LOCK_PAGE_MAP          = 10,
-  MI_FORK_LOCK_PROF              = 11,
-  MI_FORK_LOCK_DHAT              = 12,
-  MI_FORK_LOCK_MEMEVT            = 13,
-  MI_FORK_LOCK_OUT_BUF           = 14,
-  MI_FORK_LOCK_LEVEL_COUNT       = 15
+  MI_FORK_LOCK_TLDS              = 4,   // #272: subproc->tlds_lock
+  MI_FORK_LOCK_ARENA_PAGES       = 5,   // non-main heaps
+  MI_FORK_LOCK_THREAD_LOCALS     = 6,
+  MI_FORK_LOCK_THEAP_META        = 7,
+  MI_FORK_LOCK_ARENA_PAGES_MAIN  = 8,
+  MI_FORK_LOCK_ARENA_RESERVE     = 9,
+  MI_FORK_LOCK_OS_ABANDONED      = 10,
+  MI_FORK_LOCK_PAGE_MAP          = 11,
+  MI_FORK_LOCK_PROF              = 12,
+  MI_FORK_LOCK_DHAT              = 13,
+  MI_FORK_LOCK_MEMEVT            = 14,
+  MI_FORK_LOCK_OUT_BUF           = 15,
+  MI_FORK_LOCK_LEVEL_COUNT       = 16
 } mi_fork_lock_level_t;
 
 #if MI_FORK_LOCK_ORDER_CHECK
@@ -15354,6 +15574,7 @@ static const char* mi_fork_lock_level_name(int lvl) {
     case MI_FORK_LOCK_SUBPROCS:         return "mi_subprocs_lock";
     case MI_FORK_LOCK_HEAPS:            return "subproc->heaps_lock";
     case MI_FORK_LOCK_THEAPS:           return "heap->theaps_lock";
+    case MI_FORK_LOCK_TLDS:             return "subproc->tlds_lock";
     case MI_FORK_LOCK_ARENA_PAGES:      return "heap->arena_pages_lock";
     case MI_FORK_LOCK_THREAD_LOCALS:    return "mi_thread_locals_lock";
     case MI_FORK_LOCK_THEAP_META:       return "subproc->theap_meta_lock";
@@ -15574,6 +15795,16 @@ void _mi_process_fork_prepare(void) {
   #endif
   mi_fork_lock_order_check();   // before taking anything: it may print
 
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): this
+  // thread's own theaps may be mid-sweep on the scavenger right now (`mi_on_thread_idle_start`
+  // returns while the caller is still inside a park). Leave the park BEFORE any lock below, so
+  // nothing of ours is claimed across the fork() and the scavenger is not holding a page's free
+  // list half-rewritten when the child's single-threaded image is taken.
+  {
+    mi_theap_t* const theap = _mi_theap_default();
+    if (theap != NULL && mi_theap_is_initialized(theap) && theap->tld != NULL) { _mi_park_leave(theap->tld); }
+  }
+
   mi_lock_t* const subprocs_lock = _mi_subprocs_lock();
   mi_fork_acquire(MI_FORK_LOCK_SUBPROCS, subprocs_lock);                        // 1
   mi_subproc_t* const sp_main = _mi_subproc_main();
@@ -15589,42 +15820,58 @@ void _mi_process_fork_prepare(void) {
                                       else { mi_fork_acquire_local(MI_FORK_LOCK_THEAPS, &h->theaps_lock); }
     }
   }
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): the tld
+  // registry, which lets `_mi_process_fork_child` reach every live tld exactly once -- something
+  // an `sp->heaps` walk cannot do, since one thread can appear in several heaps' theap lists.
+  //
+  // NOTE: the per-tld `theaps_lock` is deliberately NOT acquired here, only re-initialized in
+  // the child. It is the one lock in the tree whose holder is REQUIRED to be able to outlive the
+  // fork: `mi_thread_theaps_done` (init.c) holds it across a whole theap teardown, and
+  // `test-fork-user-heap`'s case_b forks precisely while a sibling thread is parked inside that
+  // window. Blocking on it here would move that case's child-side deadlock into the parent,
+  // which is strictly worse. Re-initializing it in the child is correct instead: the thread that
+  // held it does not exist there, so nobody will ever release it, and every consumer of a
+  // pre-fork thread's theaps in the child is already gated on `_mi_process_is_forked_child`
+  // (#271). This supersedes the P5 file comment's KNOWN GAP: the gap was "we cannot even reach
+  // those locks"; with the registry we can, and re-init is the right thing to do to them.
   for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 4
+    if (sp == sp_main) { mi_fork_acquire(MI_FORK_LOCK_TLDS, &sp->tlds_lock); }
+                  else { mi_fork_acquire_local(MI_FORK_LOCK_TLDS, &sp->tlds_lock); }
+  }
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 5
     mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
-      if (h == heap_main) continue;   // main heap's arena_pages_lock is step 7
+      if (h == heap_main) continue;   // main heap's arena_pages_lock is step 8
       mi_fork_acquire_local(MI_FORK_LOCK_ARENA_PAGES, &h->arena_pages_lock);
     }
   }
-  mi_fork_enter(MI_FORK_LOCK_THREAD_LOCALS); _mi_thread_locals_fork_prepare(); mi_fork_leave();   // 5
-  // Phase 7: scavenger -- sp->tlds / sp->tlds_lock (per-thread tld->theaps_lock, park
-  // state) would be quiesced here once the tld registry lands. See the file comment.
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 6
+  mi_fork_enter(MI_FORK_LOCK_THREAD_LOCALS); _mi_thread_locals_fork_prepare(); mi_fork_leave();   // 6
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 7
     if (sp == sp_main) { mi_fork_acquire(MI_FORK_LOCK_THEAP_META, &sp->theap_meta_lock); }
                   else { mi_fork_acquire_local(MI_FORK_LOCK_THEAP_META, &sp->theap_meta_lock); }
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 7
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 8
     mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
     if (heap_main == NULL) continue;
     if (sp == sp_main) { mi_fork_acquire(MI_FORK_LOCK_ARENA_PAGES_MAIN, &heap_main->arena_pages_lock); }
                   else { mi_fork_acquire_local(MI_FORK_LOCK_ARENA_PAGES_MAIN, &heap_main->arena_pages_lock); }
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 8
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 9
     if (sp == sp_main) { mi_fork_acquire(MI_FORK_LOCK_ARENA_RESERVE, &sp->arena_reserve_lock); }
                   else { mi_fork_acquire_local(MI_FORK_LOCK_ARENA_RESERVE, &sp->arena_reserve_lock); }
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 9
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 10
     mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       if (h == heap_main && sp == sp_main) { mi_fork_acquire(MI_FORK_LOCK_OS_ABANDONED, &h->os_abandoned_pages_lock); }
                                       else { mi_fork_acquire_local(MI_FORK_LOCK_OS_ABANDONED, &h->os_abandoned_pages_lock); }
     }
   }
-  mi_fork_acquire(MI_FORK_LOCK_PAGE_MAP, &_mi_page_map()->lock);                                 // 10
-  mi_fork_enter(MI_FORK_LOCK_PROF);   _mi_prof_fork_prepare();    mi_fork_leave();               // 11 (no-op when MI_PPROF is off)
-  mi_fork_enter(MI_FORK_LOCK_DHAT);   _mi_dhat_fork_prepare();    mi_fork_leave();               // 12
-  mi_fork_enter(MI_FORK_LOCK_MEMEVT); _mi_memevt_fork_prepare();  mi_fork_leave();               // 13
-  mi_fork_enter(MI_FORK_LOCK_OUT_BUF);_mi_options_fork_prepare(); mi_fork_leave();               // 14: innermost
+  mi_fork_acquire(MI_FORK_LOCK_PAGE_MAP, &_mi_page_map()->lock);                                 // 11
+  mi_fork_enter(MI_FORK_LOCK_PROF);   _mi_prof_fork_prepare();    mi_fork_leave();               // 12 (no-op when MI_PPROF is off)
+  mi_fork_enter(MI_FORK_LOCK_DHAT);   _mi_dhat_fork_prepare();    mi_fork_leave();               // 13
+  mi_fork_enter(MI_FORK_LOCK_MEMEVT); _mi_memevt_fork_prepare();  mi_fork_leave();               // 14
+  mi_fork_enter(MI_FORK_LOCK_OUT_BUF);_mi_options_fork_prepare(); mi_fork_leave();               // 15: innermost
 }
 
 void _mi_process_fork_parent(void) {
@@ -15641,32 +15888,34 @@ void _mi_process_fork_parent(void) {
   if (mi_fork_depth != 0) return;  // still nested (same thread): outermost call handles the release
   // Release the levels in reverse. Within a level the order does not matter (only
   // acquire order can deadlock), so each pass walks its list forward.
-  _mi_options_fork_parent();                                                   // 14
-  _mi_memevt_fork_parent();                                                    // 13
-  _mi_dhat_fork_parent();                                                      // 12
-  _mi_prof_fork_parent();                                                      // 11
-  mi_lock_release(&_mi_page_map()->lock);                                      // 10
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 9
+  _mi_options_fork_parent();                                                   // 15
+  _mi_memevt_fork_parent();                                                    // 14
+  _mi_dhat_fork_parent();                                                      // 13
+  _mi_prof_fork_parent();                                                      // 12
+  mi_lock_release(&_mi_page_map()->lock);                                      // 11
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 10
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) { mi_lock_release(&h->os_abandoned_pages_lock); }
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 8
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 9
     mi_lock_release(&sp->arena_reserve_lock);
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 7
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 8
     mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
     if (heap_main != NULL) { mi_lock_release(&heap_main->arena_pages_lock); }
   }
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 6
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 7
     mi_lock_release(&sp->theap_meta_lock);
   }
-  _mi_thread_locals_fork_parent();                                             // 5
-  // Phase 7: scavenger -- release sp->tlds_lock / per-tld locks here (see prepare).
-  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 4
+  _mi_thread_locals_fork_parent();                                             // 6
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 5
     mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       if (h == heap_main) continue;
       mi_lock_release(&h->arena_pages_lock);
     }
+  }
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 4 (#272)
+    mi_lock_release(&sp->tlds_lock);
   }
   for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {    // 3
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) { mi_lock_release(&h->theaps_lock); }
@@ -15709,6 +15958,17 @@ void _mi_process_fork_child(void) {
   // with reality, which is exactly the child-side-thread-spawn-after-fork question #272
   // is scoped to answer; tracked as a follow-up in #293 once #272 lands.
   _mi_process_is_forked_child = true;
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): the
+  // scavenger thread did not survive the fork, but every flag saying it did was inherited.
+  // Clear them first -- before anything below can schedule a purge and try to wake a thread
+  // that does not exist. `_mi_scavenger_start_lazy` restarts one on this child's next park or
+  // second thread (not here: most children exec immediately).
+  _mi_scavenger_forked_child();
+  // #272: `_mi_arenas_try_purge`'s one-purger-at-a-time guard is a plain atomic flag, not a
+  // lock, so nothing above quiesces it -- and a fork() that landed while the scavenger was
+  // inside the guarded section leaves the child with a flag no thread will ever clear, i.e. a
+  // child that never purges again. Not a `mi_lock_t`, so it gets its own reset here.
+  _mi_arenas_fork_child();
   mi_fork_depth = 0;
   mi_atomic_store_relaxed(&mi_fork_owner, (mi_threadid_t)0);
   mi_lock_init(&mi_fork_serialize_lock);  // fresh for this child's own future forks
@@ -15725,8 +15985,23 @@ void _mi_process_fork_child(void) {
     mi_lock_init(&sp->arena_reserve_lock);
     mi_lock_init(&sp->heaps_lock);
     mi_lock_init(&sp->theap_meta_lock);
-    // Phase 7: scavenger -- re-init sp->tlds_lock and every live tld->theaps_lock here
-    // once the tld registry exists (see the file comment's KNOWN GAP note).
+    // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+    // Every tld -- the forking thread's included -- is registered here, so this is the one
+    // walk that reaches each exactly once. Besides the lock, reset the park protocol: in the
+    // child, every tld other than the caller's belongs to a thread that no longer exists, and
+    // an inherited PARKED/SWEEPING state (with a `parked_count` to match) would have the
+    // restarted scavenger claim and sweep dead threads' theaps forever. `scavenger_wake` is
+    // cleared for the same reason: a stale 1 would make the coalescing edge in
+    // `_mi_scavenger_wake` never fire again.
+    mi_lock_init(&sp->tlds_lock);
+    mi_atomic_store_relaxed(&sp->scavenger_wake, (uint32_t)0);
+    mi_atomic_store_relaxed(&sp->parked_count, (size_t)0);
+    for (mi_tld_t* t = sp->tlds; t != NULL; t = t->subproc_next) {
+      mi_lock_init(&t->theaps_lock);
+      mi_atomic_store_relaxed(&t->park_state, (uint32_t)MI_PARK_RUNNING);
+      mi_atomic_store_relaxed(&t->park_reclaim, (uint32_t)0);
+      mi_atomic_store_relaxed(&t->park_swept, (uint32_t)0);
+    }
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       mi_lock_init(&h->theaps_lock);
       mi_lock_init(&h->arena_pages_lock);
@@ -16087,7 +16362,12 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   false,                  // is_in_threadpool
   MI_MEMID_STATIC,        // memid
   { 0, 0, 0, 0 },         // profiler (MI_PPROF)
-  { 0 }                   // hooks (#266)
+  { 0 },                  // hooks (#266)
+  MI_ATOMIC_VAR_INIT(0),  // park_state = MI_PARK_RUNNING (#272)
+  MI_ATOMIC_VAR_INIT(0),  // park_reclaim
+  NULL,                   // park_theap0
+  MI_ATOMIC_VAR_INIT(0),  // park_swept
+  NULL                    // subproc_next (unregistered)
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -16155,6 +16435,7 @@ bool _mi_is_empty_theap(const mi_theap_t* theap) {
 ----------------------------------------------------------- */
 
 static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc);
+static void mi_tld_register(mi_tld_t* tld);   // #272: tld registry for the scavenger (defined with mi_tld_free)
 
 // Initialize main heap
 static void mi_heap_main_init_once(void) {
@@ -16232,6 +16513,7 @@ static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc) 
     tld->is_in_threadpool = _mi_prim_thread_is_in_threadpool();
     tld->thread_seq = tseq;
     mi_atomic_increment_relaxed(&tld->subproc->thread_count);
+    mi_tld_register(tld);   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272)
   }
   return tld;
 }
@@ -16258,8 +16540,47 @@ static mi_tld_t* mi_tld_create(mi_subproc_t* subproc) {
   return mi_tld_init(tld,tseq,subproc);
 }
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+// Register a tld with its subproc so the scavenger can find it when it parks
+// (`mi_on_thread_idle_start`), and so `_mi_process_fork_child` can reach every thread's park
+// state and `theaps_lock`. Idempotent: a tld can come through allocation more than once if the
+// thread is re-initialized after `_mi_thread_done`.
+static void mi_tld_register(mi_tld_t* tld) {
+  if (tld == NULL) return;
+  mi_subproc_t* const subproc = tld->subproc;
+  mi_lock(&subproc->tlds_lock) {
+    bool found = false;
+    for (mi_tld_t* t = subproc->tlds; t != NULL; t = t->subproc_next) {
+      if (t == tld) { found = true; break; }   // already registered
+    }
+    if (!found) {
+      tld->subproc_next = subproc->tlds;
+      subproc->tlds = tld;
+    }
+  }
+}
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+// Unlink before the tld memory goes away. The tld cannot be mid-sweep here: only a PARKED tld is
+// ever claimed, and a thread running its own teardown is RUNNING by definition (`_mi_thread_done`
+// calls `_mi_park_leave` first).
+static void mi_tld_unregister(mi_tld_t* tld) {
+  if (tld == NULL) return;
+  mi_assert_internal(mi_atomic_load_acquire(&tld->park_state) != MI_PARK_SWEEPING);
+  mi_subproc_t* const subproc = tld->subproc;
+  mi_lock(&subproc->tlds_lock) {
+    mi_tld_t** prev = &subproc->tlds;
+    while (*prev != NULL) {
+      if (*prev == tld) { *prev = tld->subproc_next; break; }
+      prev = &(*prev)->subproc_next;
+    }
+    tld->subproc_next = NULL;
+  }
+}
+
 mi_decl_noinline static void mi_tld_free(mi_tld_t* tld) {
   if (tld==NULL) return;
+  mi_tld_unregister(tld);   // #272
   mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
   tld->thread_id = (mi_threadid_t)(~0);          // it is best to set an invalid tid for tld_main as sometimes the same thread-id
                                                  // is reused by the OS after a thread has terminated. (see issue #1287)
@@ -16343,6 +16664,24 @@ mi_theap_t* _mi_thread_init_with_heap(mi_heap_t* heap_main)
 
   mi_subproc_stat_increase(_mi_theap_subproc(theap), threads, 1);  // or theap stats and wait for merge?
   // _mi_verbose_message("thread init: 0x%zx\n", _mi_thread_id());
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+  if (theap->tld != &mi_process_tld_main && theap->tld->subproc == _mi_subproc_main()) {
+    // a second thread: a good moment to start the scavenger thread (not from the process
+    // initializer, see `_mi_scavenger_start_lazy`, and not from deep inside a free where a
+    // purge finds it missing)
+    //
+    // DEVIATION from Bun (`src/init.c:395`, which has no subproc condition): start it only
+    // from a thread of the MAIN subprocess. `pthread_create` allocates the new thread's stack
+    // and TLS block through the CALLING thread's malloc, i.e. out of that thread's subproc's
+    // arenas -- and a non-main subproc can be destroyed (`mi_subproc_destroy` ->
+    // `_mi_arenas_unsafe_destroy_all`) long before `mi_process_done` gets to
+    // `_mi_scavenger_stop`, so the `pthread_join` there would touch unmapped memory
+    // (reproduced as a SIGSEGV in `_dl_deallocate_tls` from `test-stress-subprocs`, which
+    // creates its threads inside subprocs it later destroys). The scavenger only ever sweeps
+    // the main subproc anyway -- `mi_on_thread_idle_start` already refuses to park a thread
+    // of another one -- so nothing is lost.
+    _mi_scavenger_start_lazy();
+  }
   return theap;
 }
 
@@ -16360,11 +16699,26 @@ void mi_decl_noinline mi_thread_init(void) mi_attr_noexcept {
   Theaps done
 ----------------------------------------------------------- */
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a, `init.c:417`):
+// fork test hook. Set to 1 by `test/test-fork-user-heap.c`'s case_b to make a terminating thread
+// park inside the window where it holds `tld->theaps_lock` -- deterministically reproducing the
+// state `_mi_process_fork_child` must recover from (a lock held by a thread that will not exist
+// in the child). Debug builds only; nothing reads it otherwise.
+#if MI_DEBUG > 0
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
+#endif
+
 // Free the thread local theaps
 static void mi_thread_theaps_done(mi_tld_t* tld)
 {
   // abandon the pages of all theaps in this thread
   mi_lock(&tld->theaps_lock) {
+    #if MI_DEBUG > 0
+    if mi_unlikely(mi_atomic_load_acquire(&mi_debug_stall_in_thread_theaps_done) != 0) {
+      mi_atomic_store_release(&mi_debug_stall_in_thread_theaps_done, (uintptr_t)2); // signal: tld->theaps_lock held
+      while (mi_atomic_load_acquire(&mi_debug_stall_in_thread_theaps_done) != 0) { _mi_prim_thread_yield(); }
+    }
+    #endif
     mi_theap_t* theap = tld->theaps;
     while (theap != NULL) {
       mi_theap_t* next = theap->tnext;
@@ -16449,6 +16803,17 @@ void _mi_thread_done(mi_theap_t* _theap_main)
 
   // get the current tld
   mi_tld_t* const tld = _theap_main->tld;
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a, `init.c:531`):
+  // a thread can reach teardown still parked (a park is left by `mi_on_thread_idle_end`, which
+  // an `epoll_wait` cancellation never reaches). Leave the park -- waiting out any in-flight
+  // sweep of our theaps -- before ANY owner-side free below, since everything after this frees
+  // or rewrites what the scavenger would otherwise still be walking. Owner only: on Windows
+  // FLS shutdown the exiting main thread runs this for OTHER threads' theaps, and their park is
+  // not ours to leave (the thread-id check further down guards the rest of the teardown the
+  // same way, but the dynamic thread_local release below is the CALLING thread's own and must
+  // still happen).
+  if (tld->thread_id == _mi_prim_thread_id()) { _mi_park_leave(tld); }
 
   // release dynamic thread_local's
   _mi_thread_locals_thread_done();
@@ -16606,6 +16971,7 @@ void mi_process_init(void) mi_attr_noexcept {
 
 // Called when the process is done
 static void mi_process_done_once(void) {
+  _mi_scavenger_stop();   // #272: stop the background scavenger before any teardown
   // only shutdown if we were initialized
   if (!_mi_process_is_initialized) return;
   // ensure we are called once
@@ -18657,7 +19023,10 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { 0, MI_OPTION_UNINIT, MI_OPTION(deprecated_abandoned_page_purge) },
   { 0, MI_OPTION_UNINIT, MI_OPTION(deprecated_segment_reset) },   // reset segment memory on free (needs eager commit)
   { 1, MI_OPTION_UNINIT, MI_OPTION(deprecated_eager_commit_delay) },
-  { 1000,MI_OPTION_UNINIT, MI_OPTION_LEGACY(purge_delay,reset_delay) },  // purge delay in milli-seconds
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): 1000 -> 100 ms
+  // (oven-sh/bun#34217). The background scavenger (`mi_option_scavenger`) makes the shorter delay
+  // cheap: it purges on a wait instead of on the next allocation that happens to come along.
+  { 100, MI_OPTION_UNINIT, MI_OPTION_LEGACY(purge_delay,reset_delay) },  // purge delay in milli-seconds
   { 0,   MI_OPTION_UNINIT, MI_OPTION(use_numa_nodes) },           // 0 = use available numa nodes, otherwise use at most N nodes.
   { 0,   MI_OPTION_UNINIT, MI_OPTION_LEGACY(disallow_os_alloc,limit_os_alloc) },           // 1 = do not use OS memory for allocation (but only reserved arenas)
   { 240, MI_OPTION_UNINIT, MI_OPTION(os_tag) },                   // apple: VM_MEMORY_APPLICATION_SPECIFIC_1, so vmmap/Instruments attribute our arenas to us (#78)
@@ -18703,6 +19072,8 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(prof_max_bytes) }        // budget for profiler-internal arena memory; 0 = unbudgeted
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(memory_events) }         // opt-in allocation-change accounting/callbacks; read lazily by memory-events.c, not at startup
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_zeroes) }           // experimental (#67): treat decommit-purged slices as zeroed so mi_zalloc can skip its memset
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
+  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(scavenger) }              // background thread that purges scheduled arena memory (MIMALLOC_SCAVENGER)
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
@@ -24321,6 +24692,629 @@ static void chacha_test(void)
 }
 */
 /* ---- end inlined: src/random.c ---- */
+/* ---- begin inlined: src/scavenger.c ---- */
+/* ----------------------------------------------------------------------------
+Copyright (c) 2025, Microsoft Research, Daan Leijen
+This is free software; you can redistribute it and/or modify it under the
+terms of the MIT license. A copy of the license can be found in the file
+"LICENSE" at the root of this distribution.
+-----------------------------------------------------------------------------*/
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
+//
+// Demand-driven background scavenger. Waits on subproc->scavenger_wake (set by
+// mi_arena_schedule_purge) and runs _mi_arenas_try_purge when due, so freed
+// arena memory returns to the OS without waiting for the next allocation.
+//
+// This file also holds the idle-handoff protocol (`mi_on_thread_idle*`, `_mi_park_leave`,
+// `_mi_theap_sweep_parked`, `_mi_thread_idle_work`). Bun keeps those in `src/theap.c`;
+// this fork keeps `src/theap.c` an upstream file with only a few guarded lines in it
+// (CLAUDE.md rule 6), and none of them need theap file statics.
+//
+// DEVIATION from Bun: the second phase of `_mi_thread_idle_work` -- discarding the free
+// blocks inside still-used pages (`mi_option_purge_holes`) -- is Phase 7b (#272) and is
+// not in this file yet. Everything here works without it; `mi_on_thread_idle` currently
+// delivers clauses 1 and 3 of its documented contract (collect pending frees, hand the
+// arena purge to the scavenger) and gains clause 2 with 7b.
+
+
+/* -----------------------------------------------------------
+  The idle handoff protocol.
+
+  `park_state` on the tld is the whole protocol:
+
+    RUNNING  -- only the owner may touch its theaps (the normal state)
+    PARKED   -- the owner published "I will not allocate or free until I say otherwise"
+    SWEEPING -- the scavenger claimed a PARKED tld and is doing its idle work right now
+
+  Only the owner takes a tld out of RUNNING; only the scavenger takes it PARKED -> SWEEPING
+  and back. SWEEPING is what keeps the tld alive across a sweep without holding
+  `subproc->tlds_lock`: every path out of a park (`mi_on_thread_idle_end`, and thread
+  teardown / fork-prepare via `_mi_park_leave`) waits for SWEEPING to clear first.
+----------------------------------------------------------- */
+
+// #272 test hook: how many idle-work passes have completed in this process, on the owner
+// (`mi_on_thread_idle`) or on the scavenger for a parked thread. Not in `mimalloc.h` -- it is an
+// internal observable for `test/test-park-handoff.c`, which otherwise has no way to tell "the
+// handoff swept" from "the handoff silently did nothing". Unconditional (not `MI_DEBUG`-only, as
+// the fork test hooks in `src/fork.c` are) so the test is meaningful in a Release build too; one
+// relaxed increment per park costs nothing, and nothing on the alloc/free path reads it.
+// Phase 7b replaces the *content* of this observable with `mi_purge_holes_stats_get().discard_calls`
+// in the test; the counter stays as the "a pass ran at all" signal.
+static _Atomic(size_t) mi_idle_work_count;
+
+mi_decl_export size_t _mi_test_idle_work_count(void) {
+  return mi_atomic_load_relaxed(&mi_idle_work_count);
+}
+
+// Fold in pending frees and drain the arena purge queue. Runs on the owner
+// (`mi_on_thread_idle`) or on the scavenger for a parked thread; both require that the owner
+// of `tld` is not allocating while we rewrite its free lists.
+void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept {
+  if (tld == NULL) return;
+  // each phase is a full walk: an owner waiting in `_mi_park_leave` cannot allocate until we stop
+  if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
+  if (theap0 != NULL && mi_theap_is_initialized(theap0)) {
+    mi_theap_collect(theap0, false /* not forced */);
+  }
+  if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
+  // Phase 7b (#272): `mi_purge_holes_of(tld)` -- discard the free blocks inside still-used
+  // pages -- goes here, between the collect and the arena purge.
+  _mi_arenas_purge_now(tld->subproc);
+  mi_atomic_increment_relaxed(&mi_idle_work_count);   // #272 test observable, see above
+}
+
+// Take the theaps of `tld` back from the scavenger. Also called from teardown and from
+// `_mi_process_fork_prepare`: a thread can leave a park without reaching
+// `mi_on_thread_idle_end` (`epoll_wait` is a cancellation point), and freeing the tld while
+// the sweeper walks it is a use-after-free.
+void _mi_park_leave(mi_tld_t* tld) {
+  if (tld == NULL) return;
+  for (;;) {
+    uint32_t expected = MI_PARK_PARKED;
+    if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_RUNNING)) break;
+    if (expected == MI_PARK_RUNNING) return;   // not parked: nothing to take back
+    // it may re-claim the moment it releases, so re-race rather than store: only a CAS from
+    // PARKED may reach RUNNING
+    mi_assert_internal(expected == MI_PARK_SWEEPING);
+    mi_atomic_store_release(&tld->park_reclaim, 1);
+    // it stops at its next page or phase: spin briefly (no syscall), and only if it is still
+    // sweeping after that -- likely descheduled -- yield the CPU to it
+    size_t spin = 0;
+    while (mi_atomic_load_acquire(&tld->park_state) == MI_PARK_SWEEPING) {
+      if (spin < 256) { mi_atomic_pause(); spin++; }
+      else { _mi_prim_thread_yield(); }
+    }
+  }
+  mi_atomic_store_release(&tld->park_reclaim, 0);
+  mi_atomic_decrement_relaxed(&tld->subproc->parked_count);
+}
+
+// Sweep the theaps of every parked thread of `subproc`; scavenger only.
+//
+// Returns in how many msecs a park that was passed over becomes due (0: none was), so the
+// scavenger can wake for it instead of leaving it to its safety timeout. Always 0 until
+// Phase 7b adds `purge_holes_min_interval` pacing.
+mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
+  if (subproc == NULL) return 0;
+  if (mi_atomic_load_relaxed(&subproc->parked_count) == 0) return 0;
+  for (;;) {
+    mi_tld_t* claimed = NULL;
+    mi_theap_t* theap0 = NULL;
+    const mi_msecs_t due_in = 0;   // Phase 7b: `purge_holes_min_interval` pacing
+    mi_lock(&subproc->tlds_lock) {
+      for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
+        if (mi_atomic_load_acquire(&tld->park_swept) != 0) continue;   // already done for this park
+        uint32_t expected = MI_PARK_PARKED;
+        if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_SWEEPING)) {
+          claimed = tld; theap0 = tld->park_theap0; break;
+        }
+      }
+    }
+    if (claimed == NULL) return due_in;   // nothing parked (any more) that is due yet
+    #if MI_DEBUG
+    // #272 profiler-interaction invariant (3): the parked thread's own sampling countdown is
+    // its own. Nothing in the sweep may advance or reset it -- the profiler decides when to
+    // sample from the OWNER's allocation stream, and a sweep that touched these would make a
+    // parked thread's next sample depend on how often the scavenger happened to visit it.
+    const mi_profiler_tld_t prof_before = claimed->profiler;
+    #endif
+    _mi_thread_idle_work(claimed, theap0);
+    #if MI_DEBUG
+    mi_assert_internal(claimed->profiler.bytes_since_sample == prof_before.bytes_since_sample &&
+                       claimed->profiler.next_threshold    == prof_before.next_threshold &&
+                       claimed->profiler.random            == prof_before.random &&
+                       claimed->profiler.generation        == prof_before.generation);
+    #endif
+    // #272 profiler-interaction invariant (3): the sweep must leave this thread without a theap
+    // of its own. If any hook or stat on the sweep path forced `_mi_theap_default()` into
+    // existence here, the scavenger would (a) acquire this fork's per-thread profiler/hook
+    // state (`mi_tld_t.profiler` / `.hooks`) and mutate it from a thread the user never sees,
+    // and (b) register itself in `subproc->tlds` as a parkable thread. Everything it runs is
+    // either a pure atomic/OS operation or takes the swept `tld` explicitly, and every hook
+    // accessor peeks (`_mi_hooks_tld_peek` returns NULL, `_peek_or_local` falls back to the
+    // caller's stack) rather than forcing -- this asserts it stays that way.
+    mi_assert_internal(!mi_theap_is_initialized(_mi_theap_default()));
+    // Mark BEFORE releasing: a `park_swept` set after the store could land on the thread's *next*
+    // park and silently skip that sweep. Cleared by `mi_on_thread_idle_start`. If we bailed out
+    // early on `park_reclaim`, the owner is leaving the park anyway, so the rest is its next park's.
+    mi_atomic_store_release(&claimed->park_swept, 1);
+    // Back to PARKED, not RUNNING: the owner is still blocked and still owns the transition out.
+    mi_atomic_store_release(&claimed->park_state, MI_PARK_PARKED);
+  }
+}
+
+
+#if defined(__wasi__) || (defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__))
+
+// No scavenger thread on these platforms; purging stays allocation-driven.
+void _mi_scavenger_start(void) { }
+void _mi_scavenger_stop(void)  { }
+void _mi_scavenger_wake(mi_subproc_t* subproc) { MI_UNUSED(subproc); }
+bool _mi_scavenger_is_running(void) { return false; }
+void _mi_scavenger_forked_child(void) { }
+void _mi_scavenger_start_lazy(void) { _mi_scavenger_start(); }
+
+#else
+
+#include <errno.h>
+
+static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = running
+
+// -----------------------------------------------------------------------------
+// Wait/wake on subproc->scavenger_wake (a uint32_t futex word).
+//
+//   mi_scav_wait(addr, timeout_ms) : block while *addr == 0, up to timeout_ms.
+//   mi_scav_wake_one(addr)         : wake one waiter on addr.
+//
+// The thread loop re-reads scavenger_wake and purge_expire after every return,
+// so spurious wakeups are fine; EINTR is retried in-place so signals do not
+// turn the wait into a busy spin.
+// -----------------------------------------------------------------------------
+
+#if defined(__linux__)
+
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+  if (timeout_ms <= 0) timeout_ms = 1;
+  struct timespec ts;
+  ts.tv_sec  = (time_t)(timeout_ms / 1000);
+  ts.tv_nsec = (long)((timeout_ms % 1000) * 1000000L);
+  while (mi_atomic_load_acquire(addr) == 0) {
+    const long rc = syscall(SYS_futex, (uint32_t*)addr, FUTEX_WAIT_PRIVATE, (uint32_t)0, &ts, NULL, 0);
+    if (rc == 0) return;                 // woken by FUTEX_WAKE
+    if (errno == ETIMEDOUT) return;
+    if (errno == EAGAIN) return;         // *addr != 0 at kernel check; caller re-reads
+    // EINTR (or anything else unexpected): retry
+  }
+}
+
+static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+  syscall(SYS_futex, (uint32_t*)addr, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+}
+
+#elif defined(__APPLE__)
+
+// Darwin's private wait-on-address syscall. The public os_sync_wait_on_address
+// is macOS 14.4+; __ulock_* has been stable since 10.12 and is what libc++ and
+// Rust std park on.
+#if defined(__cplusplus)
+extern "C" {
+#endif
+extern int __ulock_wait(uint32_t operation, void* addr, uint64_t value, uint32_t timeout_us);
+extern int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);
+#if defined(__cplusplus)
+}
+#endif
+#define MI_UL_COMPARE_AND_WAIT  1
+#define MI_ULF_NO_ERRNO         0x01000000
+
+static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+  if (timeout_ms <= 0) timeout_ms = 1;
+  const uint32_t timeout_us = (uint32_t)timeout_ms * 1000u;
+  while (mi_atomic_load_acquire(addr) == 0) {
+    const int rc = __ulock_wait(MI_UL_COMPARE_AND_WAIT | MI_ULF_NO_ERRNO, (void*)addr, 0, timeout_us);
+    if (rc >= 0) return;                 // woken or value already changed
+    if (rc == -ETIMEDOUT) return;
+    // -EINTR / -EFAULT: retry
+  }
+}
+
+static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+  __ulock_wake(MI_UL_COMPARE_AND_WAIT | MI_ULF_NO_ERRNO, (void*)addr, 0);
+}
+
+#elif defined(_WIN32)
+
+// WaitOnAddress/WakeByAddressSingle require Windows 8+ and link against
+// `synchronization.lib` (added to `mi_libraries` in CMakeLists.txt for every Windows
+// toolchain, MinGW included -- the `#pragma comment` below only reaches MSVC/clang-cl).
+// windows.h is already included via mimalloc/atomic.h; declare here as well (matching the
+// SDK signature) so older/MinGW headers that gate on _WIN32_WINNT still resolve.
+#if defined(__cplusplus)
+extern "C" {
+#endif
+BOOL WINAPI WaitOnAddress(volatile VOID* Address, PVOID CompareAddress, SIZE_T AddressSize, DWORD dwMilliseconds);
+VOID WINAPI WakeByAddressSingle(PVOID Address);
+#if defined(__cplusplus)
+}
+#endif
+#if defined(_MSC_VER)
+#pragma comment(lib, "synchronization")
+#endif
+
+static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+  if (timeout_ms <= 0) timeout_ms = 1;
+  uint32_t expected = 0;
+  while (mi_atomic_load_acquire(addr) == 0) {
+    if (!WaitOnAddress((volatile VOID*)addr, &expected, sizeof(uint32_t), (DWORD)timeout_ms)) {
+      return;  // timeout (GetLastError() == ERROR_TIMEOUT)
+    }
+    // woken (possibly spuriously): loop re-checks *addr
+  }
+}
+
+static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+  WakeByAddressSingle((PVOID)addr);
+}
+
+#else  // generic POSIX (FreeBSD, OpenBSD, etc.)
+
+#include <pthread.h>
+#include <time.h>
+#if !defined(CLOCK_REALTIME)
+#include <sys/time.h>
+#endif
+
+// One scavenger per process, so a file-static mutex/cond is sufficient and
+// avoids bloating mi_subproc_s with platform-conditional fields.
+//
+// NOTE (fork, #270): these are raw pthread primitives, not `mi_lock_t`, so they are NOT
+// part of `src/fork.c`'s lock-order table and are not acquired by `_mi_process_fork_prepare`.
+// They cannot deadlock against it: nothing is ever acquired while holding them, and the
+// only allocator state their holders touch is `subproc->scavenger_wake` (an atomic). A
+// fork() that lands with the mutex held by a thread that does not exist in the child is
+// handled by `mi_scav_fork_child_reset` below, called from `_mi_scavenger_forked_child`.
+static pthread_mutex_t _mi_scav_mutex;   // initialized in `mi_scav_init` (from `_mi_scavenger_start`, before any wait or wake)
+static pthread_cond_t  _mi_scav_cond;
+
+static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
+  if (timeout_ms <= 0) timeout_ms = 1;
+  struct timespec ts;
+  #if defined(CLOCK_REALTIME)
+  clock_gettime(CLOCK_REALTIME, &ts);
+  #else
+  struct timeval tv; gettimeofday(&tv, NULL);
+  ts.tv_sec = tv.tv_sec; ts.tv_nsec = tv.tv_usec * 1000L;
+  #endif
+  ts.tv_sec  += (time_t)(timeout_ms / 1000);
+  ts.tv_nsec += (long)((timeout_ms % 1000) * 1000000L);
+  if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
+  pthread_mutex_lock(&_mi_scav_mutex);
+  while (mi_atomic_load_acquire(addr) == 0) {
+    if (pthread_cond_timedwait(&_mi_scav_cond, &_mi_scav_mutex, &ts) == ETIMEDOUT) break;
+  }
+  pthread_mutex_unlock(&_mi_scav_mutex);
+}
+
+static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+  MI_UNUSED(addr);
+  pthread_mutex_lock(&_mi_scav_mutex);
+  pthread_cond_signal(&_mi_scav_cond);
+  pthread_mutex_unlock(&_mi_scav_mutex);
+}
+
+// Some thread libraries (FreeBSD's) allocate a statically initialized mutex/condvar on its first use. With
+// malloc overridden that would be an allocation by a thread that just published itself as parked
+// (`mi_on_thread_idle_start` wakes us after that), racing the sweep of its theaps: initialize them here.
+#define MI_SCAV_HAS_INIT  1
+static void mi_scav_init(void) {
+  pthread_mutex_init(&_mi_scav_mutex, NULL);
+  pthread_cond_init(&_mi_scav_cond, NULL);
+}
+
+// fork() can land with `_mi_scav_mutex` held by a thread that no longer exists in the child.
+#define MI_SCAV_HAS_FORK_RESET  1
+static void mi_scav_fork_child_reset(void) {
+  mi_scav_init();
+}
+
+#endif
+
+#if !defined(MI_SCAV_HAS_FORK_RESET)
+// futex / __ulock / WaitOnAddress hold no state of ours across fork()
+static void mi_scav_fork_child_reset(void) { }
+#endif
+#if !defined(MI_SCAV_HAS_INIT)
+static void mi_scav_init(void) { }
+#endif
+
+
+// -----------------------------------------------------------------------------
+// Scavenger thread body (shared across platforms)
+// -----------------------------------------------------------------------------
+
+static void mi_scavenger_run(void) {
+  // Use the main subproc directly: this thread never allocates, so don't
+  // initialise a theap/tld via _mi_subproc()'s TLS path.
+  mi_subproc_t* const subproc = _mi_subproc_main();
+  while (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) {
+    // Clear with an RMW, not a plain store: it must be totally ordered against the parker's
+    // coalescing `exchange(wake, 1)` in `_mi_scavenger_wake`. With a store, our clear and the later
+    // `parked_count` read below can pass the parker's increment and its exchange in opposite
+    // directions (store-buffering) -- we see no parked thread, it sees a stale wake==1 and issues
+    // no syscall, and that park is silently deferred to the safety timeout.
+    mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)0);
+    // Do the idle work of any thread that parked and handed us its theaps. This is the expensive
+    // part and it is why the owner gets to skip it.
+    const mi_msecs_t park_due = _mi_theap_sweep_parked(subproc);
+    mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
+    mi_msecs_t timeout_ms;
+    if (expire == 0) {
+      // Nothing scheduled: park until woken. The 30s bound is a pure safety
+      // net so stop() is guaranteed to take effect and any per-arena expiry
+      // that did not propagate to subproc is still eventually purged.
+      timeout_ms = 30000;
+    }
+    else {
+      const mi_msecs_t now = _mi_clock_now();
+      if (expire > now) {
+        timeout_ms = expire - now;
+        if (timeout_ms > 30000) timeout_ms = 30000;
+      }
+      else {
+        _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
+        // _mi_arenas_try_purge sets subproc->purge_expire to the earliest still-pending
+        // per-arena expire once every arena is visited. If it left the stale past value
+        // (its CAS lost to a concurrent schedule), clear it so the next iteration parks on
+        // the 30s safety net instead of spinning. CAS so a concurrently scheduled future
+        // expire is never clobbered.
+        mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expire, (mi_msecs_t)0);
+        continue;
+      }
+    }
+    // a park passed over for its minimum interval is swept when its window ends, not at the safety timeout
+    if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
+    if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
+    mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
+  }
+  // #272 profiler-interaction invariant (3): the scavenger must never initialise a theap of
+  // its own -- it walks other threads' theaps and must not have this fork's per-thread
+  // profiler/hook state (`mi_tld_t.profiler`, `mi_tld_t.hooks`) attached to it, nor appear in
+  // `subproc->tlds` as a parkable thread. Everything it calls is either a pure atomic/OS
+  // operation or runs against an explicitly passed `tld`.
+  mi_assert_internal(!mi_theap_is_initialized(_mi_theap_default()));
+}
+
+bool _mi_scavenger_is_running(void) {
+  return (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0);
+}
+
+void _mi_scavenger_wake(mi_subproc_t* subproc) {
+  if (subproc == NULL) return;
+  if (mi_atomic_load_relaxed(&_mi_scavenger_running) == 0) return;
+  // Coalesce: only issue the wake syscall on the 0->1 edge. Callers sit on
+  // the page-free path and would otherwise turn every arena page free into a
+  // syscall on the freeing thread.
+  if (mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)1) == 0) {
+    mi_scav_wake_one(&subproc->scavenger_wake);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Thread lifecycle
+// -----------------------------------------------------------------------------
+
+#if defined(_WIN32)
+
+static HANDLE _mi_scavenger_thread;
+
+static DWORD WINAPI mi_scavenger_thread_main(LPVOID arg) {
+  MI_UNUSED(arg);
+  // SetThreadDescription is Windows 10 1607+ and absent from older SDK import
+  // libraries, so resolve it at runtime; naming the thread is best-effort.
+  typedef HRESULT (WINAPI *mi_set_thread_description_t)(HANDLE, PCWSTR);
+  const HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+  if (kernel32 != NULL) {
+    const mi_set_thread_description_t set_desc =
+      (mi_set_thread_description_t)(void*)GetProcAddress(kernel32, "SetThreadDescription");
+    if (set_desc != NULL) { set_desc(GetCurrentThread(), L"mi-scavenger"); }
+  }
+  mi_scavenger_run();
+  return 0;
+}
+
+void _mi_scavenger_start(void) {
+  if (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) return;
+  if (!mi_option_is_enabled(mi_option_scavenger)) return;
+  if (mi_option_get(mi_option_purge_delay) <= 0) return;
+  mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  _mi_scavenger_thread = CreateThread(NULL, 0, &mi_scavenger_thread_main, NULL, 0, NULL);
+  if (_mi_scavenger_thread == NULL) {
+    mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
+  }
+}
+
+void _mi_scavenger_stop(void) {
+  if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
+  mi_subproc_t* const subproc = _mi_subproc_main();
+  mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
+  mi_scav_wake_one(&subproc->scavenger_wake);
+  if (_mi_scavenger_thread != NULL) {
+    WaitForSingleObject(_mi_scavenger_thread, INFINITE);
+    CloseHandle(_mi_scavenger_thread);
+    _mi_scavenger_thread = NULL;
+  }
+}
+
+void _mi_scavenger_forked_child(void) { }    // no fork on Windows
+void _mi_scavenger_start_lazy(void) {        // see the POSIX one
+  if (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0) return;
+  static _Atomic(uintptr_t) started;
+  if (mi_atomic_exchange_acq_rel(&started, (uintptr_t)1) != 0) return;
+  _mi_scavenger_start();
+}
+
+#else  // POSIX
+
+#include <pthread.h>
+#include <signal.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
+static pthread_t          _mi_scavenger_thread;
+static _Atomic(uintptr_t) _mi_scavenger_joinable;
+static _Atomic(uintptr_t) _mi_scavenger_needs_restart;   // fork() took our thread; start one on next use
+
+static void* mi_scavenger_thread_main(void* arg) {
+  MI_UNUSED(arg);
+  #if defined(__APPLE__)
+  pthread_setname_np("mi-scavenger");
+  #elif defined(__linux__)
+  prctl(PR_SET_NAME, "mi-scavenger", 0, 0, 0);
+  #endif
+  mi_scavenger_run();
+  return NULL;
+}
+
+void _mi_scavenger_start(void) {
+  if (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) return;
+  if (!mi_option_is_enabled(mi_option_scavenger)) return;
+  if (mi_option_get(mi_option_purge_delay) <= 0) return;
+  mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  mi_scav_init();
+  // Block all signals on the scavenger thread. It runs before the host has set
+  // up its own signal masking, and a thread that leaves (e.g.) SIGCHLD
+  // unblocked will have process-directed signals dispatched to it and silently
+  // discarded, starving signalfd/kqueue consumers. sigfillset on glibc/musl
+  // already excludes the libc-internal realtime signals used for setxid/cancel.
+  //
+  // Except the signals a fault on this thread itself raises: a blocked SIGSEGV/SIGBUS
+  // is not queued, the kernel resets it to its default action and kills the process on
+  // the spot, so the host's crash handler never runs and a corrupted free list that the
+  // sweep trips over ends the process without a report. These are thread-directed by
+  // nature, so leaving them unblocked starves no one.
+  sigset_t all, old;
+  sigfillset(&all);
+  sigdelset(&all, SIGSEGV);
+  sigdelset(&all, SIGBUS);
+  sigdelset(&all, SIGILL);
+  sigdelset(&all, SIGFPE);
+  sigdelset(&all, SIGTRAP);
+  sigdelset(&all, SIGABRT);
+  sigdelset(&all, SIGSYS);
+  pthread_sigmask(SIG_SETMASK, &all, &old);
+  if (pthread_create(&_mi_scavenger_thread, NULL, &mi_scavenger_thread_main, NULL) != 0) {
+    mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
+  }
+  else {
+    mi_atomic_store_release(&_mi_scavenger_joinable, (uintptr_t)1);
+  }
+  pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
+void _mi_scavenger_stop(void) {
+  if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
+  mi_subproc_t* const subproc = _mi_subproc_main();
+  mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
+  mi_scav_wake_one(&subproc->scavenger_wake);
+  if (mi_atomic_exchange_acq_rel(&_mi_scavenger_joinable, (uintptr_t)0) != 0) {
+    pthread_join(_mi_scavenger_thread, NULL);
+  }
+}
+
+// The thread does not survive fork(), but every flag saying it does is inherited. Left alone the
+// child would: take the wake path in `_mi_arenas_purge_now` and signal nobody (so never purge at
+// all), and `pthread_join` a `pthread_t` that names no thread at exit.
+void _mi_scavenger_forked_child(void) {
+  mi_atomic_store_release(&_mi_scavenger_joinable, (uintptr_t)0);
+  mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
+  mi_scav_fork_child_reset();
+  mi_atomic_store_release(&_mi_scavenger_needs_restart, (uintptr_t)1);
+}
+
+// Start the scavenger when a second thread initializes or a thread first parks: not at process
+// initialization, which for an inserted/preloaded library runs before the other libraries' initializers
+// (on macOS the Objective-C runtime aborts if a thread exists before it initializes), and would give
+// every short-lived single-threaded process a thread it never uses (a purge that is due without a
+// scavenger runs inline, as upstream does). Also the restart after fork(): not in the fork handler, as
+// most children exec immediately.
+void _mi_scavenger_start_lazy(void) {
+  if (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0) return;
+  static _Atomic(uintptr_t) started;   // once per process image, plus once per fork
+  const bool forked = (mi_atomic_exchange_acq_rel(&_mi_scavenger_needs_restart, (uintptr_t)0) != 0);
+  if (mi_atomic_exchange_acq_rel(&started, (uintptr_t)1) != 0 && !forked) return;
+  _mi_scavenger_start();
+}
+
+#endif
+
+#endif
+
+
+/* -----------------------------------------------------------
+  Public entry points
+----------------------------------------------------------- */
+
+// The original entry point: do the work inline, on the calling thread. Kept for callers that
+// have no wake-up side to pair with (and as the fallback when no scavenger is running).
+void mi_on_thread_idle(void) mi_attr_noexcept {
+  mi_theap_t* const theap0 = _mi_theap_default();
+  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
+  if (theap0->tld->thread_id != _mi_thread_id()) return;
+  _mi_thread_idle_work(theap0->tld, theap0);
+}
+
+// Declare that this thread will not allocate or free until `mi_on_thread_idle_end` -- the sweep's
+// precondition -- so the scavenger can do it while we block.
+//
+// Returns false when nothing was handed off, and then `mi_on_thread_idle_end` is not required.
+// It deliberately does NOT sweep inline in that case: a caller parks far more often than it is
+// idle, and sweeping on every park is what it is trying to avoid. Only the caller knows whether
+// this park is idle enough to afford `mi_on_thread_idle()` instead.
+bool mi_on_thread_idle_start(void) mi_attr_noexcept {
+  mi_theap_t* const theap0 = _mi_theap_default();
+  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return false;
+  mi_tld_t* const tld = theap0->tld;
+  if (tld->thread_id != _mi_thread_id()) return false;
+  // the scavenger only sweeps the main subproc, so a thread elsewhere would never be swept
+  if (tld->subproc != _mi_subproc_main()) return false;
+  _mi_scavenger_start_lazy();
+  if (!_mi_scavenger_is_running()) return false;
+
+  // Already parked (a second `_start` without an `_end`): the scavenger may be reading the fields
+  // below right now. Only this thread takes the state out of RUNNING, so past this check they are ours.
+  if (mi_atomic_load_acquire(&tld->park_state) != MI_PARK_RUNNING) return false;
+  // The scavenger has no TLS of ours to find the default theap with, so leave it here.
+  tld->park_theap0 = theap0;
+  mi_atomic_store_release(&tld->park_reclaim, 0);
+  mi_atomic_store_release(&tld->park_swept, 0);
+  uint32_t expected = MI_PARK_RUNNING;
+  if (!mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_PARKED)) return false;
+  mi_atomic_increment_relaxed(&tld->subproc->parked_count);
+  _mi_scavenger_wake(tld->subproc);
+  return true;
+}
+
+// The other half: we are awake and about to allocate again, so take the theaps back. Usually an
+// uncontended CAS. If the scavenger is mid-sweep we ask it to stop (it checks between phases) and
+// spin until it does -- normally a syscall-free wait.
+void mi_on_thread_idle_end(void) mi_attr_noexcept {
+  mi_theap_t* const theap0 = _mi_theap_default();
+  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
+  mi_tld_t* const tld = theap0->tld;
+  if (tld->thread_id != _mi_thread_id()) return;
+  _mi_park_leave(tld);
+}
+
+void mi_scavenger_stop(void) mi_attr_noexcept {
+  _mi_scavenger_stop();
+}
+/* ---- end inlined: src/scavenger.c ---- */
 /* ---- begin inlined: src/stats.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
@@ -25336,6 +26330,7 @@ static mi_subproc_t* mi_subproc_init(mi_subproc_t* subproc, mi_subproc_t* parent
   mi_lock_init(&subproc->arena_reserve_lock);
   mi_lock_init(&subproc->heaps_lock);
   mi_lock_init(&subproc->theap_meta_lock);
+  mi_lock_init(&subproc->tlds_lock);      // #272: tld registry (imported from oven-sh/mimalloc @ 942b8342, MIT)
   mi_lock(&mi_subprocs_lock) {
     // push on subproc list
     subproc->next = mi_subprocs;
@@ -25444,6 +26439,7 @@ static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subpro
   mi_lock_done(&subproc->arena_reserve_lock);
   mi_lock_done(&subproc->heaps_lock);
   mi_lock_done(&subproc->theap_meta_lock);  
+  mi_lock_done(&subproc->tlds_lock);      // #272
   _mi_meta_free( subproc->parent, subproc, subproc->memid);  
   if (_mi_subproc_is_main(subproc)) {
     // for the main subproc, also release the global page map
@@ -25640,7 +26636,12 @@ static bool mi_theap_page_is_valid(mi_theap_t* theap, mi_page_queue_t* pq, mi_pa
   // exception already used for this in page.c:91,133 (`_mi_page_is_valid`); it was
   // missing here, which is what the multi-threaded mi_heap_new/mi_heap_delete churn
   // repro in issue #271 / PR #289 tripped (mi_theap_collect on `theap_meta` itself).
-  mi_assert_internal(page_theap == NULL || theap == page_theap || mi_theap_is_detached(theap));
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a, `theap.c:61`):
+  // ... and only the OWNING thread's lookup has to agree at all -- the scavenger sweeps a
+  // parked thread's theaps while having theaps of its own, so `_mi_heap_theap_peek` returns
+  // the scavenger's theap for that heap, not the one being walked.
+  mi_assert_internal(page_theap == NULL || theap == page_theap || mi_theap_is_detached(theap)
+                     || theap->tld == NULL || theap->tld->thread_id != _mi_thread_id());
   mi_assert_expensive(_mi_page_is_valid(page));
   return true;
 }
@@ -25651,7 +26652,9 @@ static bool mi_theap_is_valid(mi_theap_t* theap) {
   mi_assert_internal(heap != NULL);
   mi_theap_t* const heap_theap = _mi_heap_theap_peek(heap);  // don't use mi_heap_theap as that may re-initialize the thread
   // see the comment in mi_theap_page_is_valid above
-  mi_assert_internal(heap_theap==NULL || heap_theap == theap || mi_theap_is_detached(theap));
+  // ... plus the scavenger-sweeps-a-parked-thread case, see mi_theap_page_is_valid (#272)
+  mi_assert_internal(heap_theap==NULL || heap_theap == theap || mi_theap_is_detached(theap)
+                     || theap->tld == NULL || theap->tld->thread_id != _mi_thread_id());
   mi_theap_visit_pages(theap, &mi_theap_page_is_valid, true, NULL, NULL);
   for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
     mi_assert_internal(_mi_page_queue_is_valid(theap, &theap->pages[bin]));
@@ -25682,6 +26685,10 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
   MI_UNUSED(theap);
   mi_assert_expensive(mi_theap_page_is_valid(theap, pq, page, NULL, NULL));
   mi_collect_t collect = *((mi_collect_t*)arg_collect);
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): when the
+  // scavenger is doing this for a parked thread, the owner may wake at any moment and has to
+  // wait for us in `_mi_park_leave`. Stopping between pages bounds that wait to one page.
+  if (theap->tld != NULL && mi_atomic_load_relaxed(&theap->tld->park_reclaim) != 0) return false;
   _mi_page_free_collect(page, collect >= MI_FORCE);
   if (mi_page_all_free(page)) {
     // no more used blocks, possibly free the page.
@@ -25720,9 +26727,16 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   // collect all pages owned by this thread
   mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
 
-  // collect arenas (this is program wide so don't force purges on abandonment of threads)
+  // collect arenas (this is program wide so don't force purges on abandonment of threads).
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): not from a
+  // claimed parked sweep though -- a woken owner spins in `_mi_park_leave` for the whole of it
+  // and nothing in the arena purge reads `park_reclaim`, so the "bounded by one page" wait would
+  // become an unbounded subproc-wide madvise pass. `_mi_thread_idle_work` runs the arena purge
+  // itself, as its own reclaim-gated phase (`_mi_arenas_purge_now`).
   //mi_atomic_storei64_release(&theap->tld->subproc->purge_expire, 1);
-  _mi_arenas_collect(collect == MI_FORCE /* force purge? */, collect >= MI_FORCE /* visit all? */, theap->tld);
+  if (theap->tld == NULL || mi_atomic_load_relaxed(&theap->tld->park_state) != MI_PARK_SWEEPING) {
+    _mi_arenas_collect(collect == MI_FORCE /* force purge? */, collect >= MI_FORCE /* visit all? */, theap->tld);
+  }
 
   // merge statistics
   _mi_theap_merge_stats(theap);
@@ -28103,6 +29117,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <sys/mman.h>  // mmap
 #include <unistd.h>    // sysconf, sleep
+#include <sched.h>     // sched_yield (#272)
 #include <fcntl.h>     // open, close, read, access
 #include <stdlib.h>    // getenv, arc4random_buf
 
@@ -29189,7 +30204,13 @@ bool _mi_prim_thread_is_in_threadpool(void) {
 }
 
 void _mi_prim_thread_yield(void) {
-  sleep(0);
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a, commit
+  // 0b0153b2): `sleep(0)` is `nanosleep({0,0})` on glibc -- a syscall that returns without
+  // ever rescheduling, so every spin-then-yield back-off in the tree (`_mi_park_leave`,
+  // `_mi_tld_detach_theaps`/`_mi_heap_detach_theaps`'s try-acquire retry, which
+  // `_mi_process_fork_prepare` now depends on to acquire `tld->theaps_lock`) degenerated
+  // into a busy spin.
+  sched_yield();
 }
 /* ---- end inlined: src/prim/unix/prim.c ---- */
 /* ---- end inlined: src/prim/osx/prim.c ---- */
@@ -29783,6 +30804,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <sys/mman.h>  // mmap
 #include <unistd.h>    // sysconf, sleep
+#include <sched.h>     // sched_yield (#272)
 #include <fcntl.h>     // open, close, read, access
 #include <stdlib.h>    // getenv, arc4random_buf
 
@@ -30869,7 +31891,13 @@ bool _mi_prim_thread_is_in_threadpool(void) {
 }
 
 void _mi_prim_thread_yield(void) {
-  sleep(0);
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a, commit
+  // 0b0153b2): `sleep(0)` is `nanosleep({0,0})` on glibc -- a syscall that returns without
+  // ever rescheduling, so every spin-then-yield back-off in the tree (`_mi_park_leave`,
+  // `_mi_tld_detach_theaps`/`_mi_heap_detach_theaps`'s try-acquire retry, which
+  // `_mi_process_fork_prepare` now depends on to acquire `tld->theaps_lock`) degenerated
+  // into a busy spin.
+  sched_yield();
 }
 /* ---- end inlined: src/prim/unix/prim.c ---- */
 

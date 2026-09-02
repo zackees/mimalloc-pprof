@@ -1003,37 +1003,55 @@ if (MI_BUILD_TESTS)
 
   # MI_NO_PROCESS_DETACH (issue #268, Bun parity P3): imported from
   # oven-sh/mimalloc @ 942b8342, MIT. The same test source is built and run twice --
-  # once against the normal library (the automatic exit path runs and "process done"
-  # must appear under MIMALLOC_VERBOSE=1), once against a dedicated static library
-  # compiled with MI_NO_PROCESS_DETACH=1 (the automatic exit path is skipped and
-  # "process done" must NOT appear). The define has to be baked into the library build
-  # itself -- it guards src/init.c's _mi_auto_process_done and src/prim/prim.c's
-  # destructor registration, not anything in the test source -- so this needs its own
-  # static-lib target rather than just a per-test compile definition. Requires
-  # MI_BUILD_STATIC (skipped, e.g., under the MI_BUILD_STATIC=OFF shared-lib CI job;
-  # every other c-unit job builds static by default and covers this).
+  # once against a detach-*enabled* static library (the automatic exit path runs and
+  # "process done" must appear under MIMALLOC_VERBOSE=1), once against a dedicated
+  # static library compiled with MI_NO_PROCESS_DETACH=1 (the automatic exit path is
+  # skipped and "process done" must NOT appear). The define has to be baked into the
+  # library build itself -- it guards src/init.c's _mi_auto_process_done and
+  # src/prim/prim.c's destructor registration, not anything in the test source -- so
+  # this needs its own static-lib target rather than just a per-test compile
+  # definition. Requires MI_BUILD_STATIC (skipped, e.g., under the
+  # MI_BUILD_STATIC=OFF shared-lib CI job; every other c-unit job builds static by
+  # default and covers this).
   if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
-    add_executable(mimalloc-test-no-process-detach test/test-no-process-detach.c)
-    target_compile_definitions(mimalloc-test-no-process-detach PRIVATE ${mi_defines})
-    target_compile_options(mimalloc-test-no-process-detach PRIVATE ${mi_cflags})
-    target_include_directories(mimalloc-test-no-process-detach PRIVATE include)
-    target_link_libraries(mimalloc-test-no-process-detach PRIVATE mimalloc-static ${mi_libraries})
-    # ctest's PASS_REGULAR_EXPRESSION/FAIL_REGULAR_EXPRESSION have no bundle equivalent
-    # (ci/bundle_tests.py's SUPPORTED_PROPERTIES refuses them outright, issue #277) --
-    # use the run-negative.cmake-style `cmake -P` harness instead, which the bundler
-    # already knows how to lower. ENVIRONMENT is set via the ctest property, not a
-    # script variable: ctest sets it on the `cmake -P` process, execute_process()
-    # inherits it, and the bundler already lowers ENVIRONMENT for any command shape.
-    add_test(
-      NAME test-no-process-detach-runs
-      COMMAND ${CMAKE_COMMAND}
-        -DTEST_EXE=$<TARGET_FILE:mimalloc-test-no-process-detach>
-        "-DEXPECTED_TEXT=process done"
-        -DMODE=REQUIRE
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run-text-check.cmake)
-    set_tests_properties(test-no-process-detach-runs PROPERTIES ENVIRONMENT "MIMALLOC_VERBOSE=1")
+    # Positive control (REQUIRE): needs a detach-*enabled* mimalloc-static. If the
+    # top-level -DMI_NO_PROCESS_DETACH=ON option is set, mi_defines (see the
+    # MI_SKIP_COLLECT_ON_EXIT-adjacent block above) already carries
+    # MI_NO_PROCESS_DETACH=1 into mimalloc-static itself, and this test would fail by
+    # construction -- "process done" can never appear no matter what the test does.
+    # No c-unit job configures the top-level option today, but silently mispassing
+    # (or, here, silently misfailing) if that changes is exactly what issue #277's
+    # bundle format refuses to do for ctest properties; do the same for this.
+    if(NOT MI_NO_PROCESS_DETACH)
+      add_executable(mimalloc-test-no-process-detach test/test-no-process-detach.c)
+      target_compile_definitions(mimalloc-test-no-process-detach PRIVATE ${mi_defines})
+      target_compile_options(mimalloc-test-no-process-detach PRIVATE ${mi_cflags})
+      target_include_directories(mimalloc-test-no-process-detach PRIVATE include)
+      target_link_libraries(mimalloc-test-no-process-detach PRIVATE mimalloc-static ${mi_libraries})
+      # ctest's PASS_REGULAR_EXPRESSION/FAIL_REGULAR_EXPRESSION have no bundle
+      # equivalent (ci/bundle_tests.py's SUPPORTED_PROPERTIES refuses them outright,
+      # issue #277) -- use the run-negative.cmake-style `cmake -P` harness instead,
+      # which the bundler already knows how to lower. ENVIRONMENT is set via the
+      # ctest property, not a script variable: ctest sets it on the `cmake -P`
+      # process, execute_process() inherits it, and the bundler already lowers
+      # ENVIRONMENT for any command shape.
+      add_test(
+        NAME test-no-process-detach-runs
+        COMMAND ${CMAKE_COMMAND}
+          -DTEST_EXE=$<TARGET_FILE:mimalloc-test-no-process-detach>
+          "-DEXPECTED_TEXT=process done"
+          -DMODE=REQUIRE
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run-text-check.cmake)
+      set_tests_properties(test-no-process-detach-runs PROPERTIES ENVIRONMENT "MIMALLOC_VERBOSE=1")
+    endif()
 
-    add_library(mimalloc-static-no-detach STATIC EXCLUDE_FROM_ALL ${mi_sources})
+    # Negative control (FORBID): always built, independent of the top-level option,
+    # against a dedicated static library compiled from src/static.c -- the single-TU
+    # amalgamation, i.e. exactly the shape a Bun-style consumer compiles (see the
+    # `c++ -x c++ -c src/static.c ... -DMI_NO_PROCESS_DETACH=1` acceptance check in
+    # #268) -- with MI_NO_PROCESS_DETACH=1 explicit regardless of what mi_defines
+    # already carries.
+    add_library(mimalloc-static-no-detach STATIC EXCLUDE_FROM_ALL src/static.c)
     set_property(TARGET mimalloc-static-no-detach PROPERTY POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(mimalloc-static-no-detach PRIVATE ${mi_defines} MI_STATIC_LIB MI_NO_PROCESS_DETACH=1)
     target_compile_options(mimalloc-static-no-detach PRIVATE ${mi_cflags} ${mi_cflags_static})

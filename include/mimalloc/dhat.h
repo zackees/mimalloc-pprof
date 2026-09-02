@@ -9,7 +9,12 @@
    collector state (default 64 MiB); exhaustion is fail-soft and is exposed via
    incomplete/dropped in mi_dhat_stats_t and mi_dhat_incomplete in the JSON.
    Time fields use monotonic milliseconds (tu="ms"), not instruction counts.
-   Memory-access profiling is not available: emitted reports always use bkacc=false. */
+   Memory-access profiling is not available: emitted reports always use bkacc=false.
+
+   MI_NO_PROCESS_DETACH interaction: MIMALLOC_DHAT_DUMP_AT_EXIT fires from the
+   automatic process-exit path (_mi_auto_process_done), which a build configured with
+   MI_NO_PROCESS_DETACH skips entirely. An embedder using MI_NO_PROCESS_DETACH must
+   call mi_dhat_dump themselves before exit, or no report is written. */
 #pragma once
 #ifndef MIMALLOC_DHAT_H
 #define MIMALLOC_DHAT_H

@@ -156,6 +156,40 @@ jobs:
             echo "::endgroup::"
           done
 
+  # Bun consumer-surface parity check (#274, Bun parity P9a). Reproduces Bun's
+  # `scripts/build/deps/mimalloc.ts` DirectBuild outside CMake (that build never runs
+  # our CMake, so a green `ctest` job proves nothing about whether Bun could actually
+  # link against this tree): compiles `src/static.c` as C++ with Bun's exact defines,
+  # links `test/test-bun-surface.cpp` (the symbol/ABI probe) against it, and runs the
+  # result. See `ci/check_bun_surface.py` and `test/test-bun-surface.cpp` for what's
+  # checked.
+  #
+  # Hard gate as of 2026-09-02: `mi_on_thread_idle` (Bun parity P7a, issue #299) merged
+  # in `1dbbb8df`, and both glibc and musl (alpine:3.20) now report zero missing
+  # symbols -- a regression here blocks merge.
+  bun-surface:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: glibc
+            runs-on: ubuntu-latest
+            container: ""
+            args: ""
+          - name: musl
+            runs-on: ubuntu-latest
+            container: alpine:3.20
+            args: "--musl"
+    name: bun-surface (${{ matrix.name }})
+    runs-on: ${{ matrix.runs-on }}
+    container: ${{ matrix.container }}
+    steps:
+      - name: Install build dependencies (alpine only)
+        if: matrix.name == 'musl'
+        run: apk add --no-cache build-base git python3
+      - uses: actions/checkout@v4
+      - run: python3 ci/check_bun_surface.py ${{ matrix.args }}
+
   ctest-debug-full:
     strategy:
       fail-fast: false

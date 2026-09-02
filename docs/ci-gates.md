@@ -32,6 +32,18 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 | **doc-snippets** (`ci/check_doc_snippets.py`) | fenced ```c examples in `README.md`/`docs/*.md` that don't compile against the real headers — caught one in PR #259 (a snippet using `mi_prof_config_t_decl`/`mi_prof_start_ex` with no `#include` at all) | `--self-test` plants a snippet calling an undeclared mimalloc function; the checker must reject it, on both gcc and clang |
 | **python-lint** | the gate scripts themselves — `ruff` + `pyright --strict` | — |
 | **zero-tracking** | correctness and footprint of `mi_option_purge_zeroes`, reported as paired interleaved A/B medians with the within-arm spread alongside. Linux runs it in its own path-filtered workflow; Windows runs it as a gated step inside `run-windows` (#277 phase E), and the *correctness* half is unconditional there because `test-zero-tracking*` are ordinary ctest tests carried in every bundle | — |
+| **bun-surface** (`ci/check_bun_surface.py`) | whether `oven-sh/bun`'s exact `scripts/build/deps/mimalloc.ts` DirectBuild (`src/static.c` compiled as C++ with Bun's define set) can actually link against every `mi_*` symbol Bun's Rust FFI and C++ consumers reference, plus `MI_MAX_ALIGN_SIZE` / `mi_heap_area_t` / `mi_option_t` slot-0-42 ABI drift via `test/test-bun-surface.cpp`'s `static_assert`s | the script's own exit code already reflects reality (1 on any missing symbol or failed assert) |
+
+### `bun-surface` is a hard gate
+
+Issue #274 (Bun parity P9a). `mi_on_thread_idle` is part of Bun's linked surface
+(`mimalloc_sys.rs:30`) and merged to `main` with Bun parity P7a (issue #299, `1dbbb8df`).
+`ci/check_bun_surface.py` now reports zero missing symbols on both matrix rows
+(`bun-surface (glibc)` and `bun-surface (musl)`, the latter run inside `alpine:3.20`),
+so the job in `.github/workflows/c-unit.yml` runs with no `continue-on-error`: a
+regression here blocks merge, the same as every other row in the table above.
+`docs/bun-gap-analysis-2026-09-02.md` tracks the rest of what's still open (hole
+purging, #302) before the Bun issue itself (P9c) can be filed.
 
 ## Test bundles
 

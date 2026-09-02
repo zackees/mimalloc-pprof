@@ -751,6 +751,12 @@ jobs:
           staged=$(( $(ls -1 dist/msvc-tests/debug | wc -l) + $(ls -1 dist/msvc-tests/release | wc -l) ))
           echo "staged $staged of $built test binaries ($(ls -1 dist/msvc-tests/debug | wc -l) debug + $(ls -1 dist/msvc-tests/release | wc -l) release)"
       - name: Build the PR benchmark sentinel
+        # NOT gated on the `benchmark` label even though running it is (see run-windows):
+        # this is a cross-build on the Linux builder that already builds the whole Rust
+        # workspace, and its artifact is an unconditional `download-artifact` input over
+        # there. Gating the build would fail the download; gating the RUN is what saves the
+        # scarce thing, which is time on the single shared Windows VM.
+        #
         # benchmark-sentinel.yml's `benchmark-sentinel (windows-latest)` row runs
         # `soldr cargo run -p dashboard --release`, which is a self-contained binary: it
         # re-execs itself as its own stress child and writes benchmark-report.html into
@@ -1338,11 +1344,18 @@ jobs:
         # Guarded on the event so the fold does not turn a pull_request-only benchmark
         # into a per-push one -- windows-bundles.yml runs on push as well.
         #
+        # ... and guarded on the `benchmark` label for the same reason benchmark-sentinel.yml
+        # now is (see its header): these numbers are informational, no gate reads them, and
+        # measuring on every push spends minutes on a trend nobody plots. Label the PR
+        # `benchmark` to get them. Unlike that workflow this one cannot offer a daily
+        # schedule -- windows-bundles.yml exists to run correctness bundles per push -- so
+        # the daily point comes from benchmark-sentinel.yml's cron instead.
+        #
         # #171 already labels hosted-runner numbers informational and no gate reads them,
         # which is what makes it acceptable to take them on a VM that has just run four
         # ctest suites and a memory gate. `continue-on-error` for the same reason: a
         # benchmark that fails to produce a report must not fail the correctness runner.
-        if: ${{ github.event_name == 'pull_request' && !cancelled() }}
+        if: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'benchmark') && !cancelled() }}
         continue-on-error: true
         #
         # `dashboard` writes benchmark-report.html into the CURRENT directory and prints
@@ -1356,7 +1369,7 @@ jobs:
           cd sentinel
           "$GITHUB_WORKSPACE/rust-sentinel-msvc/dashboard.exe" > benchmark-report.json
           ls -l benchmark-report.html benchmark-report.json
-      - if: ${{ github.event_name == 'pull_request' && !cancelled() }}
+      - if: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'benchmark') && !cancelled() }}
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:

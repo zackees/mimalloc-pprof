@@ -993,11 +993,19 @@ jobs:
         # and while a failure can still say what happened -- a missing DLL is otherwise a
         # dialog-free 0xC0000135 exit, not a test failure.
         run: |
-          set -euo pipefail
+          set -uo pipefail
           missing=0
           for dll in VCRUNTIME140.dll MSVCP140.dll; do
-            if where "$dll" > /dev/null 2>&1; then
-              echo "  $dll: $(where "$dll" | head -1 | tr -d '\r')"
+            # `where` is the native lookup and searches the real PATH the loader will use.
+            # The System32 fallback is not redundant: this step runs in Git Bash, and if
+            # `where.exe` itself were unavailable the loop would otherwise report every
+            # DLL missing and fail the job for the wrong reason.
+            found=$(where "$dll" 2>/dev/null | head -1 | tr -d '\r')
+            if [ -z "$found" ] && [ -f "/c/Windows/System32/$dll" ]; then
+              found="C:\\Windows\\System32\\$dll"
+            fi
+            if [ -n "$found" ]; then
+              echo "  $dll: $found"
             else
               echo "::error::$dll is not on this runner; the MSVC bundles cannot load"
               missing=1
@@ -1224,12 +1232,18 @@ jobs:
         # benchmark that fails to produce a report must not fail the correctness runner.
         if: ${{ github.event_name == 'pull_request' && !cancelled() }}
         continue-on-error: true
+        #
+        # `dashboard` writes benchmark-report.html into the CURRENT directory and prints
+        # its JSON to STDOUT -- it writes no .json file at all, which is why
+        # benchmark-sentinel.yml's `rust/target/release/*.json` upload has always been an
+        # empty `if-no-files-found: warn`. Redirect it so the artifact actually carries
+        # the numbers.
         run: |
           set -euo pipefail
           mkdir -p sentinel
           cd sentinel
-          "$GITHUB_WORKSPACE/rust-sentinel-msvc/dashboard.exe"
-          ls -l benchmark-report.html
+          "$GITHUB_WORKSPACE/rust-sentinel-msvc/dashboard.exe" > benchmark-report.json
+          ls -l benchmark-report.html benchmark-report.json
       - if: ${{ github.event_name == 'pull_request' && !cancelled() }}
         continue-on-error: true
         uses: actions/upload-artifact@v4

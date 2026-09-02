@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ee890758 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit cf15bb2b of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -794,7 +794,7 @@ typedef bool (mi_prof_visit_fun)(const mi_prof_sample_info_t* info, void* arg);
    own contract) that mimalloc's own hot path can still be holding a *different*
    allocator lock while trying to acquire, and an allocating visitor inverts that
    same pair from the other side. This is a general property of the API, not
-   specific to fork() -- see subproc.c's lock-order comment (src/subproc.c) for the
+   specific to fork() -- see the lock-order comment in src/fork.c for the
    fork-specific instance of the same hazard. */
 mi_decl_nodiscard mi_decl_export bool mi_prof_visit(mi_prof_visit_fun* visitor, void* arg) mi_attr_noexcept;
 

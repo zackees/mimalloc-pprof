@@ -266,7 +266,12 @@ jobs:
             MI_BENCH_JSON="leak-$i.json" "$exe" > /dev/null || true
           done
           python3 ci/memory_gate.py control leak-*.json
-      - uses: actions/upload-artifact@v4
+      # Upload even when the gate fails: a red gate is exactly when the raw
+      # per-run JSON is needed (to attribute the growth, or to re-baseline
+      # deliberately with `memory_gate.py update`). Skipping it on failure left
+      # every red run -- including main's own -- with no data to reason from.
+      - if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: memory-gate-${{ matrix.os }}
           path: result-*.json

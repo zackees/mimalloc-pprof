@@ -28,6 +28,11 @@ static void   mi_stat_free(const mi_page_t* page, const mi_block_t* block);
 static inline void mi_free_block_local(mi_page_t* page, mi_block_t* block, bool was_guarded, bool track_stats, bool check_full)
 {
   MI_UNUSED(was_guarded);
+  // #272 permanent detector: this fast path is reached directly from `mi_free_ex`'s xtid==0
+  // branch, bypassing `_mi_park_leave_if_parked` (see the comment above that function). If the
+  // owner is here while its own theap is mid-sweep (MI_PARK_SWEEPING), this free races the
+  // scavenger's walk. Zero cost in release builds; keep even if it stays quiet for a long time.
+  mi_assert_internal(mi_atomic_load_relaxed(&mi_page_theap(page)->tld->park_state) != MI_PARK_SWEEPING);
   // checks
   if mi_unlikely(mi_check_is_double_free(page, block)) return;
   #if MI_PPROF

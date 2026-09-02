@@ -54,6 +54,53 @@ static void check(const char* name, bool ok) {
 #else
 #define LIVE   (20000)
 #endif
+
+// `test_park_then_exit`, `test_exit_while_swept_with_dyn_tls`, and `test_exit_while_swept_stress`
+// (below) each deliberately leave every churn/`RACE_CLASSES` survivor allocated for the life of
+// the process -- see the "on purpose" comments at their call sites; the pages/holes have to stay
+// live for the race they are hunting. Under MI_GUARDED every survivor is its own mapping, so
+// those permanent leaks are VMAs, not just bytes, and they stack across rounds and across all
+// three tests: at the FULL counts below and 1-in-1 guarding they leak ~134k mappings total --
+// well past ctest-guarded's CI `vm.max_map_count` of 65,530 (passes locally, where the default
+// is 1,048,576; measured pre-fix peak ~304,606, from these leaks plus transient churn/DTOR_BLOCKS
+// concurrency on top).
+//
+// MI_GUARDED alone does NOT mean every allocation is guarded, and it is compiled into every
+// MI_DEBUG build regardless of this test's needs (CMakeLists.txt: "Enable MI_GUARDED (since
+// MI_DEBUG=ON)") -- the default `guarded_sample_rate` only guards 1-in-4000, so `ctest-debug-full`
+// (the job whose MI_DEBUG_FULL assertions can actually catch the #272 race this corpus hunts,
+// per the comment on `_mi_park_leave_if_parked`) barely triggers it. Only `ctest-guarded`'s
+// second pass, which forces `MIMALLOC_GUARDED_SAMPLE_RATE=1`, guards everything and hits the VMA
+// cap. So gate on the actual runtime sample rate, not just the compile flag: `ctest-debug-full`
+// keeps the FULL counts (its discriminating power for #272 is unchanged), and only a forced
+// near-1-in-1 sample rate scales down to the BOUND counts. Measured: reverting
+// `_mi_park_leave_if_parked`'s two call sites (src/page.c, src/free.c) and running the FULL-count
+// build with the default sample rate 50 times still catches the regression -- see the PR body
+// for the count.
+#define PARK_THEN_EXIT_THREADS_FULL   (8)
+#define PARK_THEN_EXIT_ROUNDS_FULL    (10)
+#define DYN_TLS_THREADS_FULL          (8)
+#define DYN_TLS_ROUNDS_FULL           (12)
+#define SWEPT_STRESS_THREADS_FULL     (12)
+#define SWEPT_STRESS_ROUNDS_FULL      (60)
+
+#define PARK_THEN_EXIT_THREADS_BOUND  (4)
+#define PARK_THEN_EXIT_ROUNDS_BOUND   (4)
+#define DYN_TLS_THREADS_BOUND         (4)
+#define DYN_TLS_ROUNDS_BOUND          (4)
+#define SWEPT_STRESS_THREADS_BOUND    (4)
+#define SWEPT_STRESS_ROUNDS_BOUND     (8)
+
+// true only when (almost) every in-range allocation is actually being guarded right now, not
+// merely when MI_GUARDED was compiled in (see the comment above).
+static bool guard_every_alloc(void) {
+#if defined(MI_GUARDED)
+  const long rate = mi_option_get(mi_option_guarded_sample_rate);
+  return (rate > 0 && rate <= 8);   // ctest-guarded's forced pass uses 1; the default is ~4000
+#else
+  return false;
+#endif
+}
 #define BSZ    (512)
 // two OS pages of BSZ blocks between survivors (+2 for the margin), as in test-purge-holes.c
 static size_t keep_every(void) {
@@ -238,9 +285,12 @@ static void* park_then_cancel(void* arg) {
 }
 
 static void test_park_then_exit(void) {
-  enum { THREADS = 8, ROUNDS = 10 };
+  enum { THREADS_MAX = PARK_THEN_EXIT_THREADS_FULL };
+  const bool bound = guard_every_alloc();
+  const int THREADS = bound ? PARK_THEN_EXIT_THREADS_BOUND : PARK_THEN_EXIT_THREADS_FULL;
+  const int ROUNDS  = bound ? PARK_THEN_EXIT_ROUNDS_BOUND  : PARK_THEN_EXIT_ROUNDS_FULL;
   for (int r = 0; r < ROUNDS; r++) {
-    pthread_t t[THREADS];
+    pthread_t t[THREADS_MAX];
     for (int i = 0; i < THREADS; i++) {
       if (pthread_create(&t[i], NULL, ((i % 2) != 0 ? &park_then_exit : &park_then_cancel), NULL) != 0) return;
     }
@@ -558,10 +608,13 @@ static void* park_then_exit_with_dyn_tls(void* arg) {
 }
 
 static void test_exit_while_swept_with_dyn_tls(void) {
-  enum { THREADS = 8, ROUNDS = 12 };
+  enum { THREADS_MAX = DYN_TLS_THREADS_FULL };
+  const bool bound = guard_every_alloc();
+  const int THREADS = bound ? DYN_TLS_THREADS_BOUND : DYN_TLS_THREADS_FULL;
+  const int ROUNDS  = bound ? DYN_TLS_ROUNDS_BOUND  : DYN_TLS_ROUNDS_FULL;
   if (pthread_key_create(&dtor_key, &dtor_frees) != 0) return;
   for (int r = 0; r < ROUNDS; r++) {
-    pthread_t t[THREADS];
+    pthread_t t[THREADS_MAX];
     for (int i = 0; i < THREADS; i++) {
       if (pthread_create(&t[i], NULL, &park_then_exit_with_dyn_tls, NULL) != 0) return;
     }
@@ -617,10 +670,13 @@ static void* park_then_exit_racing_dtor(void* arg) {
 }
 
 static void test_exit_while_swept_stress(void) {
-  enum { THREADS = 12, ROUNDS = 60 };
+  enum { THREADS_MAX = SWEPT_STRESS_THREADS_FULL };
+  const bool bound = guard_every_alloc();
+  const int THREADS = bound ? SWEPT_STRESS_THREADS_BOUND : SWEPT_STRESS_THREADS_FULL;
+  const int ROUNDS  = bound ? SWEPT_STRESS_ROUNDS_BOUND  : SWEPT_STRESS_ROUNDS_FULL;
   if (pthread_key_create(&dtor_key, &dtor_frees) != 0) return;
   for (int r = 0; r < ROUNDS; r++) {
-    pthread_t t[THREADS];
+    pthread_t t[THREADS_MAX];
     int made = 0;
     for (int i = 0; i < THREADS; i++) {
       if (pthread_create(&t[i], NULL, &park_then_exit_racing_dtor,

@@ -2327,9 +2327,18 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
 // purge again. `_mi_arenas_fork_child` clears it; see `src/fork.c`.
 static mi_atomic_guard_t mi_arenas_purge_guard;
 
+// Release the guard unconditionally, and report whether it was actually held. ONLY for the
+// cases where the thread that held it provably no longer exists, so there is no owner left to
+// race with: the child of a `fork()`, and a Windows process exit that terminated the scavenger
+// where it stood (`_mi_scavenger_stop`). An orphaned guard is fatal now that a forced purge
+// waits for it rather than skipping.
+bool _mi_arenas_purge_guard_reset(void) {
+  return (mi_atomic_exchange_release(&mi_arenas_purge_guard, (uintptr_t)0) != 0);
+}
+
 // #272: called from `_mi_process_fork_child`, on the single surviving thread.
 void _mi_arenas_fork_child(void) {
-  mi_atomic_store_release(&mi_arenas_purge_guard, (uintptr_t)0);
+  _mi_arenas_purge_guard_reset();
 }
 
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
@@ -2401,7 +2410,17 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
   // be holding (the guarded body takes only arena bitmaps and the OS). The wait is therefore
   // bounded by one purge pass, and in particular a holder is never itself blocked on
   // `_mi_park_leave` waiting for a SWEEPING state the waiter would have to clear.
+  //
+  // And it is bounded in wall-clock time regardless, because "the holder no longer exists" is
+  // not hypothetical on Windows: `ExitProcess` terminates every other thread BEFORE the
+  // `.CRT$XLY` process-detach callback runs `mi_process_done`, so a thread killed inside the
+  // guarded section orphans the guard, and the forced purge in `mi_process_done_once`
+  // (`mi_theap_collect(theap, true)`) would then spin here for good. `_mi_scavenger_stop`
+  // clears the guard for the scavenger specifically; this deadline is the general backstop for
+  // any other thread the OS took. A forced purge that gave up is a missed optimization; a
+  // process that never exits is not.
   bool ran = false;
+  mi_msecs_t purge_guard_deadline = 0;   // set on the first attempt that found the guard held
   do {
   mi_atomic_guard(&mi_arenas_purge_guard)
   {
@@ -2444,7 +2463,15 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
     }
   }
-    if (!ran && force) { _mi_prim_thread_yield(); }   // #272, see above
+    if (!ran && force) {   // #272, see above
+      const mi_msecs_t waited_now = _mi_clock_now();
+      if (purge_guard_deadline == 0) { purge_guard_deadline = waited_now + 1000; }
+      else if (waited_now > purge_guard_deadline) {
+        _mi_verbose_message("forced arena purge gave up waiting for the purge guard\n");
+        break;
+      }
+      _mi_prim_thread_yield();
+    }
   } while (!ran && force);
 }
 

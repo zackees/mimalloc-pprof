@@ -69,24 +69,60 @@ terms of the MIT license. A copy of the license can be found in the file
    3. the sweep of a parked thread never touches `mi_tld_t::profiler`: nothing
       in this file reads or writes it (asserted in `_mi_theap_sweep_parked`).
 
-  TEARDOWN AND HEAP DELETION (7a's exit-path hardening, PR #299). Neither needs a
-  check in this file, for reasons worth writing down:
-   - after `_mi_scavenger_stop` sets `_mi_scavenger_shutdown`, no sweep can start on
-     the scavenger: its run loop exits on `_mi_scavenger_running == 0` and the stop
-     joins it, and `_mi_scavenger_start_lazy` refuses to restart, so
-     `mi_on_thread_idle_start` returns false and hands nothing off. A direct
-     `mi_on_thread_idle()` after that still sweeps -- on the CALLING thread, over its
-     own theaps, which is safe at any point in the process's life.
-   - `mi_heap_delete`/`_destroy` calls `_mi_park_leave` on every parked owner of the
-     heap BEFORE `_mi_heap_detach_theaps`, and `_mi_park_leave` does not return until
-     MI_PARK_SWEEPING has cleared. So a sweep is never in progress while a theap is
-     being detached. `_mi_park_leave` terminates against this sweep because every
-     phase of it re-reads `tld->park_reclaim`: between heaps in `_mi_purge_holes_of`,
-     between pages in `mi_theap_page_purge_holes`, and between abandoned pages in
-     `mi_arena_page_purge_holes_at` -- so the wait is bounded by one page's walk, and
-     `tld->theaps_lock` (which the sweep holds across its passes, and which
-     `_mi_heap_detach_theaps` try-acquires) is always released before the deleter
-     needs it.
+  TEARDOWN, HEAP DELETION AND THE PARK LEAVE (7a, PR #299). Re-audited against 7a's
+  final head; still no check needed in this file. Line numbers are as of that audit.
+
+  (a) SCAVENGER SHUTDOWN. After `_mi_scavenger_stop` sets `_mi_scavenger_shutdown`, no
+      sweep can start on the scavenger: its run loop exits on `_mi_scavenger_running == 0`
+      and the stop joins it, and `_mi_scavenger_start_lazy` refuses to restart, so
+      `mi_on_thread_idle_start` returns false and hands nothing off. A direct
+      `mi_on_thread_idle()` after that still sweeps -- on the CALLING thread, over its own
+      theaps, which is safe at any point in the process's life.
+
+  (b) LOCK ORDER. This sweep is a LEAF: `_mi_purge_holes_of` takes `tld->theaps_lock`
+      (page-holes.c:862) and, while holding it, takes no other lock of the tld/heap
+      family. In particular the abandoned pass (`_mi_arenas_purge_abandoned_holes`,
+      arena.c) reads `heap->arena_pages[]` with an atomic load, never
+      `heap->arena_pages_lock`, and reaches the pages through the arena bitmaps, so it
+      needs neither `heap->theaps_lock` nor `subproc->tlds_lock`. The two locks that
+      could close a cycle with `tld->theaps_lock` are held the other way round and both
+      back off rather than block: `_mi_heap_detach_theaps` (theap.c:473) holds
+      `heap->theaps_lock` and TRY-acquires `tld->theaps_lock` (theap.c:480), and
+      `_mi_tld_detach_theaps` (theap.c:508) holds `tld->theaps_lock` and TRY-acquires
+      `heap->theaps_lock` (theap.c:515). A leaf cannot be in a cycle, and neither
+      try-acquire can be in one either.
+
+  (c) HEAP DELETION. `mi_heap_delete`/`_destroy` -> `mi_heap_detach_theaps` (heap.c) calls
+      `_mi_park_leave` on every parked owner of the heap (heap.c:219) under
+      `subproc->tlds_lock` (heap.c:214), and only THEN `_mi_heap_detach_theaps`
+      (heap.c:224). `_mi_park_leave` does not return until MI_PARK_SWEEPING has cleared,
+      so no theap is ever detached under a running sweep.
+      That wait terminates, and holding `tlds_lock` across it is safe, because this sweep
+      needs nothing the deleter holds: it never takes `tlds_lock` (the scavenger takes it
+      only to CLAIM a park, scavenger.c:138, and releases it before `_mi_thread_idle_work`),
+      and the deleter does not hold either `theaps_lock` yet -- theap.c:473/480 run after
+      `_mi_park_leave` has returned. The wait is bounded by one page's walk because every
+      phase re-reads `tld->park_reclaim`: page-holes.c:767 between pages, page-holes.c:873
+      between heaps in the abandoned pass, arena.c:1410 between abandoned pages.
+      The one loop that does NOT check between iterations is the theap loop at
+      page-holes.c:863 -- it does not need to: with `park_reclaim` set, each theap's
+      per-page callback (page-holes.c:767) returns false on its FIRST page, so a theap
+      costs O(1) and the loop as a whole is bounded by the theap count.
+
+  (d) A PARK LEFT MID-SWEEP. 7a put `_mi_park_leave_if_parked` on the allocator slow paths
+      (page.c:1159, free.c:162), so a parked thread that allocates or frees from a
+      `thread_local` destructor un-parks itself while this sweep may be walking its pages.
+      Nothing extra is needed here, and the reason is (c)'s machinery seen from the other
+      end: that call reaches `_mi_park_leave`, which publishes `park_reclaim = 1`
+      (scavenger.c:114) and then SPINS until `park_state` leaves MI_PARK_SWEEPING. The
+      sweeper only stores MI_PARK_PARKED after `_mi_thread_idle_work` has fully returned
+      (scavenger.c:199), so by the time the leaver's CAS to MI_PARK_RUNNING can succeed the
+      sweep has stopped touching that theap's pages entirely -- the same guarantee 7a's
+      queue sweep gets, from the same protocol, because both run inside
+      `_mi_thread_idle_work`. `test-park-handoff.c`'s `test_exit_while_hole_swept_stress`
+      is the empirical half: a destructor that both frees and allocates (so it takes both
+      slow paths), on threads exiting inside a sweep, with `purge_holes_min_interval` at 0
+      so every park is a full hole sweep.
 ----------------------------------------------------------- */
 
 #include "mimalloc.h"

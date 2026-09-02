@@ -549,6 +549,12 @@ void        _mi_prof_fork_child(void);
 // `src/page-holes.c` just before every `_mi_os_discard` on a page that carries records; takes
 // `prof_lock` (unless this thread already holds it), so it is MI_DEBUG-only.
 void        _mi_prof_debug_assert_no_records_in(const mi_page_t* page, const void* addr, size_t size);
+// The predicate the assert is over, and how many records it has compared, both exported for
+// `test/test-profile-race.c`'s scenario 5 (review of PR #302): a REPEATABLE negative control --
+// aimed at a range that deliberately holds a live sampled block the first must return non-zero,
+// and the second must be non-zero after the run or the assert never saw a record-bearing page.
+size_t      _mi_prof_debug_records_in(const mi_page_t* page, const void* addr, size_t size);
+size_t      _mi_prof_debug_records_compared(void);
 #endif
 
 // "memory-events.c": opt-in allocation-change accounting/callbacks (issue #20). Independent of

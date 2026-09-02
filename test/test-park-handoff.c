@@ -642,6 +642,125 @@ static void test_exit_while_swept_stress(void) {
 }
 
 // ---------------------------------------------------------------------------
+// #302 review: the same race, with the HOLE sweep as the thing being raced.
+//
+// 7a made `_mi_park_leave_if_parked` fire from the allocator's own slow paths, so a parked
+// thread that allocates or frees from a `thread_local` destructor un-parks itself in the
+// MIDDLE of whatever the scavenger is doing to its theaps. 7a's own stress case covers that
+// against the queue sweep (`mi_theap_collect`); this one covers it against the hole sweep,
+// which is a strictly longer walk (every page of every theap INCLUDING the full queue, plus
+// every abandoned page of every heap behind them) and therefore a strictly wider window.
+//
+// Two things make it that rather than a copy of the case above:
+//   * `purge_holes_min_interval` is set to 0 for its duration, so EVERY park gets a full hole
+//     sweep. At the default 100ms most of these parks are skipped before any work starts and
+//     the variant would mostly be testing the pacing.
+//   * its destructor both frees AND allocates. Only the slow paths carry the park-leave
+//     (`mi_free_generic_local` in `src/free.c`, `_mi_malloc_generic` in `src/page.c`); a
+//     destructor that only frees can stay on the fast path and never reach one.
+//
+// What must hold: `_mi_park_leave` does not return until the sweep has left MI_PARK_SWEEPING,
+// and the sweep reaches that state check quickly because every phase re-reads `park_reclaim`
+// (see the TEARDOWN section of `src/page-holes.c`). So the thread never tears its tld down
+// under a running sweep, and the sweep never touches a theap of a thread that has left.
+// ---------------------------------------------------------------------------
+
+// Bounded under MI_GUARDED for the same reason `LIVE` is: every sampled allocation gets its own
+// guard-page mapping, and this case's destructor allocates DTOR_BLOCKS blocks a SECOND time on
+// each of THREADS threads. At the guarded lane's sizes that is enough VMAs to hit the runner's
+// `vm.max_map_count`; the race it is looking for does not need the volume.
+#if defined(MI_GUARDED)
+#define HOLE_EXIT_THREADS  (4)
+#define HOLE_EXIT_ROUNDS   (10)
+#define HOLE_EXIT_DTOR_N   (64)
+#else
+#define HOLE_EXIT_THREADS  (12)
+#define HOLE_EXIT_ROUNDS   (60)
+#define HOLE_EXIT_DTOR_N   DTOR_BLOCKS
+#endif
+
+static void dtor_frees_and_allocs(void* blocks_v) {
+  void** blocks = (void**)blocks_v;
+  if (blocks == NULL) return;
+  for (int i = 0; i < HOLE_EXIT_DTOR_N; i++) { if (blocks[i] != NULL) { mi_free(blocks[i]); blocks[i] = NULL; } }
+  // ... and allocate again, on a thread that is parked and may be mid-sweep: this is the
+  // `_mi_malloc_generic` half of the park-leave, and it needs fresh pages (the frees above
+  // just emptied this thread's), so it really does take the slow path.
+  for (int i = 0; i < HOLE_EXIT_DTOR_N; i++) {
+    blocks[i] = mi_malloc(24 + (size_t)(i % RACE_CLASSES) * 56);
+  }
+  for (int i = 0; i < HOLE_EXIT_DTOR_N; i++) { if (blocks[i] != NULL) mi_free(blocks[i]); }
+  free(blocks);
+}
+
+static void* park_then_exit_racing_alloc_dtor(void* arg) {
+  const unsigned id = (unsigned)(uintptr_t)arg;
+  void** dblocks = (void**)calloc(HOLE_EXIT_DTOR_N, sizeof(void*));
+  if (dblocks != NULL) {
+    for (int i = 0; i < HOLE_EXIT_DTOR_N; i++) {
+      dblocks[i] = mi_malloc(16 + (size_t)(i % RACE_CLASSES) * 40);
+      if (dblocks[i] == NULL) break;
+    }
+    pthread_setspecific(dtor_key, dblocks);
+  }
+  // scattered survivors in every bin: the shape the hole sweep has the most work on
+  for (int c = 0; c < RACE_CLASSES; c++) {
+    const size_t sz = 16 + (size_t)c * 40;
+    void* keep = NULL;
+    for (int k = 0; k < RACE_PER_CLASS; k++) {
+      void* q = mi_malloc(sz);
+      if (q == NULL) break;
+      if (k == 0) { keep = q; } else { mi_free(q); }
+    }
+    (void)keep;   // deliberately leaked into this thread's teardown
+  }
+  void** p = (void**)calloc(LIVE, sizeof(void*));
+  if (p != NULL) { churn_pattern(p); free(p); }
+  (void)mi_on_thread_idle_start();
+  // Three quarters exit 20-270us into the park, which lands the exit inside the scavenger's
+  // walk -- that is the race. But at that spacing the sweep bails on `park_reclaim` before it
+  // discards anything, so on its own this case can race a sweep that never does any work. Every
+  // fourth thread therefore stays parked long enough for a full hole sweep to complete, which
+  // is what the discard check below verifies actually happened.
+  if ((id % 4) == 3) { usleep(8000); } else { usleep(20 + (id * 13) % 250); }
+  pthread_exit(NULL);
+}
+
+static void test_exit_while_hole_swept_stress(void) {
+  enum { THREADS = HOLE_EXIT_THREADS, ROUNDS = HOLE_EXIT_ROUNDS };
+  const long saved = mi_option_get(mi_option_purge_holes_min_interval);
+  mi_option_set(mi_option_purge_holes_min_interval, 0);   // sweep on EVERY park: widest window
+  mi_purge_holes_stats_t before;
+  mi_purge_holes_stats_get(&before);
+
+  if (pthread_key_create(&dtor_key, &dtor_frees_and_allocs) != 0) {
+    mi_option_set(mi_option_purge_holes_min_interval, saved);
+    return;
+  }
+  for (int r = 0; r < ROUNDS; r++) {
+    pthread_t t[THREADS];
+    int made = 0;
+    for (int i = 0; i < THREADS; i++) {
+      if (pthread_create(&t[i], NULL, &park_then_exit_racing_alloc_dtor,
+                         (void*)(uintptr_t)(unsigned)(r * THREADS + i)) != 0) break;
+      made++;
+    }
+    for (int i = 0; i < made; i++) { pthread_join(t[i], NULL); }
+  }
+  pthread_key_delete(dtor_key);
+  mi_option_set(mi_option_purge_holes_min_interval, saved);
+
+  mi_purge_holes_stats_t after;
+  mi_purge_holes_stats_get(&after);
+  fprintf(stderr, "  hole-swept exit stress: %zu discards over the case\n",
+          after.discard_calls - before.discard_calls);
+  check("exit while HOLE-swept, racing a destructor that allocates, is race-free", true);
+  // otherwise the case ran but never actually raced a hole sweep
+  check("... and the parks it raced really did discard holes",
+        !mi_option_is_enabled(mi_option_purge_holes) || after.discard_calls > before.discard_calls);
+}
+
+// ---------------------------------------------------------------------------
 // Stopping the scavenger joins the thread: a park after it has nobody to hand off to and reports
 // false, and the process stays fully usable. Runs last, since it takes the scavenger away.
 // ---------------------------------------------------------------------------
@@ -667,6 +786,7 @@ int main(void) {
   test_park_then_exit();
   test_exit_while_swept_with_dyn_tls();
   test_exit_while_swept_stress();
+  test_exit_while_hole_swept_stress();   // #302 review: the same race against the HOLE sweep
   test_park_stress();
   test_scavenger_stop();
   // #272 Phase 7b: the second clause of `mi_on_thread_idle`'s contract. Every case above churned

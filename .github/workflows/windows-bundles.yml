@@ -96,12 +96,6 @@ jobs:
             # has seen fire (docs/ci-gates.md). New on win-gnu: no native win-gnu job runs
             # the memory gate today -- see the coverage table in docs/ci-gates.md.
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
-          - bundle: windows-gnu-x64-redirect-first
-            # TEMPORARY (#277 investigation). Identical to the release bundle except that
-            # `mimalloc.dll` imports `mimalloc-redirect.dll` before `api-ms-win-crt-*`,
-            # which is the only layout the redirection module accepts. It is not run as a
-            # test suite -- only the DIAG steps below touch it.
-            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_MINGW_REDIRECT_FIRST=ON
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -193,6 +187,24 @@ jobs:
           # The Windows override goes through the redirection DLL, not through symbol
           # interposition; a mimalloc.dll that lost this import overrides nothing.
           grep -qi 'DLL Name: mimalloc-redirect.dll' private.txt
+          # #277, both halves of the override, asserted on the artifact rather than on the
+          # flags that produced it:
+          #  * the redirection module must be the FIRST import descriptor, or the loader
+          #    initialises `ucrtbase` first and the module refuses to patch it;
+          #  * `mimalloc.dll` must not import `__emutls_get_address`. This toolchain's
+          #    GCC has no native TLS, so a `__thread` on the allocation path becomes
+          #    emulated TLS, and libgcc allocates it with `malloc` -- which, once the
+          #    override is live, is mi_malloc: unbounded recursion, dead before `main`.
+          first_dll=$(grep -i 'DLL Name:' private.txt | head -1 | sed 's/.*DLL Name: *//' | tr -d '\r')
+          if [ "$first_dll" != "mimalloc-redirect.dll" ]; then
+            echo "::error::$lib imports '$first_dll' first, expected mimalloc-redirect.dll"
+            exit 1
+          fi
+          if grep -q '__emutls_get_address' private.txt; then
+            echo "::error::$lib imports __emutls_get_address: a thread-local on the allocation path will recurse through the redirected malloc (#277)"
+            grep -n '__emutls' private.txt
+            exit 1
+          fi
           {
             echo '```'
             grep -E '^Entry 9' private.txt
@@ -376,20 +388,23 @@ jobs:
         # the runtime -- so without this step the bundle could pass while overriding
         # nothing.
         #
-        # TODO(#277 phase C, added 2026-09-02): make this a HARD failure. It is not one
-        # today because no cross-built configuration has been found that redirects, and a
-        # permanently-red gate is worse than an absent one (docs/ci-gates.md). What was
-        # measured, in order:
-        #   * mimalloc.dll last in the exe's import table -> NOT-REDIRECTED (run …889444)
-        #   * `minject` (both postfixes, with and without --inplace) -> image will not
-        #     start, rc 127 (run …497360)
-        #   * MI_MINGW_UCRT64=OFF, same toolchain -> NOT-REDIRECTED (run …909837)
-        #   * mimalloc.dll FIRST in the exe (the CMakeLists fix) -> still NOT-REDIRECTED,
-        #     everything else green (run …889444)
-        #   * mimalloc-redirect.dll also first inside mimalloc.dll -> SEGFAULT before any
-        #     output (run …876511); reverted
-        # The msvcrt binary MSYS2 builds in this same job redirects, and IS gated below.
-        # Escalated on #277: this needs a Windows debugger, not another CI round.
+        # This is a HARD failure (#277). What used to make it impossible, in order:
+        #   1. `mimalloc-redirect.dll` refuses to patch a CRT whose DllMain has already
+        #      run -- it reads `ucrtbase.dll`'s LDR_DATA_TABLE_ENTRY.Flags and checks
+        #      LDRP_PROCESS_ATTACH_CALLED (0x00080000), then reports
+        #      "seems to be initialized after ucrtbase.dll" and gives up. The loader
+        #      initialises a module's dependencies in that module's own import order, so
+        #      `mimalloc.dll` must import the redirect module before `api-ms-win-crt-*`
+        #      (CMakeLists.txt, MI_MINGW_REDIRECT_FIRST) -- the exe importing
+        #      `mimalloc.dll` first is necessary but not sufficient.
+        #   2. With that fixed, the process died before `main`: soldr's mingw-w64 GCC has
+        #      no native TLS, so mimalloc's `__thread` variables became GCC *emulated*
+        #      TLS, and `__emutls_get_address` allocates with `malloc` -- which is now
+        #      mi_malloc. Fixed in src/threadlocal.c and src/options.c; asserted in the
+        #      build job (mimalloc.dll must not import `__emutls_get_address`).
+        # The module's own explanation only ever reaches the log through the `const char**`
+        # that `mi_allocator_init` returns (it imports no output API at all), which
+        # src/init.c prints AFTER the option dump -- so print the whole thing on failure.
         run: |
           set -uo pipefail
           probe() {
@@ -408,109 +423,15 @@ jobs:
             fi
             echo "$label: $(cat "$out")"
             if [ "$(cat "$out")" != "REDIRECTED" ]; then
-              echo "::warning::$exe did not redirect malloc ($(cat "$out")) -- known, tracked on #277 phase C"
-              head -30 "$out.raw" || true
+              echo "::error::$exe did not redirect malloc ($(cat "$out"))"
+              grep -v "^option '" "$out.raw" || true
+              failed=1
             fi
           }
+          failed=0
           probe "UCRT release bundle" bundle/windows-gnu-x64-release ucrt-release.txt
           probe "UCRT shared bundle " bundle/windows-gnu-x64-shared ucrt-shared.txt
-
-      - name: DIAG (temporary, #277) -- what does the redirection module actually say?
-        # TEMPORARY diagnostic for the ci/277-ucrt-redirect-investigation branch.
-        # `mimalloc-redirect.dll` imports only ntdll (LdrFindEntryForAddress,
-        # LdrGetDllHandle, NtProtectVirtualMemory, RtlQueryEnvironmentVariable,
-        # RtlGetCurrentPeb, RtlGetProcessHeaps) -- it has NO output API at all, so the
-        # ONLY channel it can report on is the `const char** message` that
-        # `mi_allocator_init` hands back, which src/init.c prints after the option dump.
-        # The previous round's `head -30` cut that off before it appeared. Print
-        # everything, under each env knob whose name is in the module's string table.
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        run: |
-          set +e -u -o pipefail
-          bundle=bundle/windows-gnu-x64-release
-          exe="$bundle/mimalloc-test-stress-dynamic.exe"
-          run_one() {
-            local label="$1"; shift
-            echo "::group::DIAG $label"
-            ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1 "$@"; timeout 45 "$exe" 2 5 1 ) > diag.raw 2>&1
-            echo "rc=$?"
-            grep -v "^option '" diag.raw
-            echo "::endgroup::"
-          }
-          run_one "baseline"                MIMALLOC_SHOW_STATS=1
-          run_one "FORCE_REDIRECT"          MIMALLOC_FORCE_REDIRECT=1
-          run_one "PATCH_IMPORTS"           MIMALLOC_PATCH_IMPORTS=1
-          run_one "PATCH_NTHEAP"            MIMALLOC_PATCH_NTHEAP=1
-          run_one "PRIORITIZE_LOAD_ORDER"   MIMALLOC_PRIORITIZE_LOAD_ORDER=1
-          run_one "ENABLE_REDIRECT"         MIMALLOC_ENABLE_REDIRECT=1
-          run_one "VERBOSE=9"               MIMALLOC_VERBOSE=9
-
-      - name: DIAG (temporary, #277) -- the redirect-first bundle, under a debugger
-        # `mimalloc-redirect.dll` refuses to patch a CRT whose DllMain has already run
-        # (LDRP_PROCESS_ATTACH_CALLED), so it must be the first import descriptor of
-        # `mimalloc.dll` -- which is what `windows-gnu-x64-redirect-first` builds. That
-        # layout crashed at load in run 33614876511 with no output at all; this step gets
-        # the faulting instruction and a stack instead of an exit code.
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        run: |
-          set +e -u -o pipefail
-          bundle=bundle/windows-gnu-x64-redirect-first
-          exe="$bundle/mimalloc-test-stress-dynamic.exe"
-          echo "::group::DIAG redirect-first import tables"
-          uv run ci/pe_imports.py "$exe"
-          echo "--- mimalloc.dll ---"
-          uv run ci/pe_imports.py "$bundle/mimalloc.dll"
-          echo "::endgroup::"
-
-          echo "::group::DIAG redirect-first: does it redirect now?"
-          ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1; timeout 60 "$exe" 2 5 1 ) > rf0.raw 2>&1
-          rc=$?
-          if [ "$rc" -ne 0 ]; then echo "VERDICT=FAILED(rc=$rc)";
-          elif grep -q 'malloc is redirected' rf0.raw; then echo "VERDICT=REDIRECTED";
-          else echo "VERDICT=NOT-REDIRECTED"; fi
-          grep -v "^option '" rf0.raw
-          echo "::endgroup::"
-
-          echo "::group::DIAG redirect-first plain run"
-          ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1; timeout 60 "$exe" 2 5 1 ) > rf.raw 2>&1
-          echo "rc=$?"
-          grep -v "^option '" rf.raw
-          echo "::endgroup::"
-
-          echo "::group::DIAG redirect-first with MIMALLOC_DISABLE_REDIRECT=1"
-          # Separates the two candidate causes: if the image loads with redirection
-          # switched off, the import order itself is fine and the fault is in the window
-          # where a patched, still-uninitialised ucrtbase allocates through mimalloc.
-          ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1 MIMALLOC_DISABLE_REDIRECT=1
-            timeout 60 "$exe" 2 5 1 ) > rfd.raw 2>&1
-          echo "rc=$?"
-          grep -v "^option '" rfd.raw
-          echo "::endgroup::"
-
-          echo "::group::DIAG redirect-first NTSTATUS (cmd reports the real exit code)"
-          PATH="$PWD/$bundle:$PATH" cmd //c "$(cygpath -w "$exe") 2 5 1 & echo EXITCODE=%ERRORLEVEL%" 2>&1 | tail -5
-          echo "::endgroup::"
-
-          cdb=""
-          for c in "/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe" \
-                   "/c/Program Files/Windows Kits/10/Debuggers/x64/cdb.exe"; do
-            [ -x "$c" ] && cdb="$c" && break
-          done
-          echo "cdb: ${cdb:-<not found>}"
-          if [ -n "$cdb" ]; then
-            echo "::group::DIAG redirect-first under cdb"
-            ( export PATH="$PWD/$bundle:$PATH" MIMALLOC_VERBOSE=1
-              timeout 240 "$cdb" -g -G -c '.lines -e; g; .lastevent; r; kb; ub .; lm; q' \
-                "$(cygpath -w "$exe")" 2 5 1 ) 2>&1 | tail -120
-            echo "::endgroup::"
-          else
-            echo "::group::DIAG what debuggers exist"
-            ls "/c/Program Files (x86)/Windows Kits/10/Debuggers" 2>/dev/null || true
-            ls "/c/Program Files/Windows Kits/10/Debuggers" 2>/dev/null || true
-            echo "::endgroup::"
-          fi
+          exit $failed
 
       - name: ctest-win-gnu equivalent -- windows-gnu-x64-release
         run: |
@@ -700,18 +621,19 @@ jobs:
             | sed 's/^[[:space:]]*//' > native-imports.txt
           cat native-imports.txt
           set +e
-          MIMALLOC_VERBOSE=1 MIMALLOC_SHOW_STATS=1 ./native-release/mimalloc-test-stress-dynamic.exe 4 10 1 > msvcrt.raw 2>&1
+          MIMALLOC_VERBOSE=1 ./native-release/mimalloc-test-stress-dynamic.exe 4 10 1 > msvcrt.raw 2>&1
           rc=$?
           set -e
-          # DIAG (temporary, #277): the msvcrt lane is the control this PR gates against,
-          # so print what it actually reports -- including the stats, which say whether
-          # the process's mallocs really reached mimalloc or whether `ucrtbase.dll`
-          # merely happened to be loaded (by a system DLL) and got patched while
-          # `msvcrt.dll!malloc`, which is what this binary calls, stayed untouched.
-          echo "::group::DIAG msvcrt native"
+          # The msvcrt row is NOT a like-for-like control, and #277 records why: this
+          # binary's malloc comes from `msvcrt.dll`, and `mimalloc-redirect.dll` v1.3.3
+          # contains no reference to `msvcrt` at all -- its only CRT module names are
+          # `ucrtbase` and `ucrtbased`. It reports "redirected" because `ucrtbase.dll` is
+          # in the process (pulled in by system DLLs) and gets patched, not because this
+          # exe's allocations moved. Printed, not trusted.
+          echo "::group::msvcrt native, full output"
           grep -v "^option '" msvcrt.raw || true
           echo "::endgroup::"
-          echo "::group::DIAG msvcrt native imports of the exe and the dll"
+          echo "::group::msvcrt native: the DLL's own import table"
           objdump -p native-release/mimalloc.dll | grep -i 'DLL Name' || true
           echo "::endgroup::"
           if [ "$rc" -ne 0 ]; then

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 5ae7cbba of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit cbe7625d of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4551,6 +4551,7 @@ void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 void          _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
 void          _mi_arenas_purge_now(mi_subproc_t* subproc);
 void          _mi_arenas_fork_child(void);   // #272: clear the inherited one-purger-at-a-time guard
+bool          _mi_arenas_purge_guard_reset(void);  // #272: release the one-purger guard whose holder no longer exists; returns whether it was held
 
 // scavenger.c -- imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
 void          _mi_scavenger_start(void);
@@ -12138,9 +12139,18 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
 // purge again. `_mi_arenas_fork_child` clears it; see `src/fork.c`.
 static mi_atomic_guard_t mi_arenas_purge_guard;
 
+// Release the guard unconditionally, and report whether it was actually held. ONLY for the
+// cases where the thread that held it provably no longer exists, so there is no owner left to
+// race with: the child of a `fork()`, and a Windows process exit that terminated the scavenger
+// where it stood (`_mi_scavenger_stop`). An orphaned guard is fatal now that a forced purge
+// waits for it rather than skipping.
+bool _mi_arenas_purge_guard_reset(void) {
+  return (mi_atomic_exchange_release(&mi_arenas_purge_guard, (uintptr_t)0) != 0);
+}
+
 // #272: called from `_mi_process_fork_child`, on the single surviving thread.
 void _mi_arenas_fork_child(void) {
-  mi_atomic_store_release(&mi_arenas_purge_guard, (uintptr_t)0);
+  _mi_arenas_purge_guard_reset();
 }
 
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
@@ -12212,7 +12222,17 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
   // be holding (the guarded body takes only arena bitmaps and the OS). The wait is therefore
   // bounded by one purge pass, and in particular a holder is never itself blocked on
   // `_mi_park_leave` waiting for a SWEEPING state the waiter would have to clear.
+  //
+  // And it is bounded in wall-clock time regardless, because "the holder no longer exists" is
+  // not hypothetical on Windows: `ExitProcess` terminates every other thread BEFORE the
+  // `.CRT$XLY` process-detach callback runs `mi_process_done`, so a thread killed inside the
+  // guarded section orphans the guard, and the forced purge in `mi_process_done_once`
+  // (`mi_theap_collect(theap, true)`) would then spin here for good. `_mi_scavenger_stop`
+  // clears the guard for the scavenger specifically; this deadline is the general backstop for
+  // any other thread the OS took. A forced purge that gave up is a missed optimization; a
+  // process that never exits is not.
   bool ran = false;
+  mi_msecs_t purge_guard_deadline = 0;   // set on the first attempt that found the guard held
   do {
   mi_atomic_guard(&mi_arenas_purge_guard)
   {
@@ -12255,7 +12275,15 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
     }
   }
-    if (!ran && force) { _mi_prim_thread_yield(); }   // #272, see above
+    if (!ran && force) {   // #272, see above
+      const mi_msecs_t waited_now = _mi_clock_now();
+      if (purge_guard_deadline == 0) { purge_guard_deadline = waited_now + 1000; }
+      else if (waited_now > purge_guard_deadline) {
+        _mi_verbose_message("forced arena purge gave up waiting for the purge guard\n");
+        break;
+      }
+      _mi_prim_thread_yield();
+    }
   } while (!ran && force);
 }
 
@@ -25120,6 +25148,12 @@ void _mi_scavenger_wake(mi_subproc_t* subproc) {
 #if defined(_WIN32)
 
 static HANDLE _mi_scavenger_thread;
+// Set by the thread body as its very last act. It distinguishes "the thread ran to completion"
+// from "the handle is signalled because the OS killed the thread" -- which is not an edge case
+// on Windows but the NORMAL exit path for a statically linked exe: `mi_process_done` runs from
+// the `.CRT$XLY` TLS callback at DLL_PROCESS_DETACH, i.e. from inside `ExitProcess`, which
+// terminates every other thread first. See `_mi_scavenger_stop`.
+static _Atomic(uintptr_t) _mi_scavenger_exited;
 
 static DWORD WINAPI mi_scavenger_thread_main(LPVOID arg) {
   MI_UNUSED(arg);
@@ -25133,6 +25167,7 @@ static DWORD WINAPI mi_scavenger_thread_main(LPVOID arg) {
     if (set_desc != NULL) { set_desc(GetCurrentThread(), L"mi-scavenger"); }
   }
   mi_scavenger_run();
+  mi_atomic_store_release(&_mi_scavenger_exited, (uintptr_t)1);
   return 0;
 }
 
@@ -25141,6 +25176,7 @@ void _mi_scavenger_start(void) {
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  mi_atomic_store_release(&_mi_scavenger_exited, (uintptr_t)0);
   _mi_scavenger_thread = CreateThread(NULL, 0, &mi_scavenger_thread_main, NULL, 0, NULL);
   if (_mi_scavenger_thread == NULL) {
     mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
@@ -25153,7 +25189,28 @@ void _mi_scavenger_stop(void) {
   mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
   mi_scav_wake_one(&subproc->scavenger_wake);
   if (_mi_scavenger_thread != NULL) {
-    WaitForSingleObject(_mi_scavenger_thread, INFINITE);
+    // BOUNDED, never INFINITE. This runs first in `mi_process_done_once`, and on Windows that
+    // is reached from the `.CRT$XLY` TLS callback at DLL_PROCESS_DETACH -- inside `ExitProcess`,
+    // under the loader lock. A join that does not return there hangs the process for good, and
+    // the process is exiting anyway (`_mi_scavenger_running` is already 0).
+    const DWORD waited = WaitForSingleObject(_mi_scavenger_thread, 2000);
+    if (waited != WAIT_OBJECT_0) {
+      // Still running and not responding: leak the handle rather than close one the thread is
+      // still using, and leave the arena purge guard alone -- the thread may legitimately own it.
+      _mi_verbose_message("scavenger thread did not stop within 2s (wait result 0x%zx); detaching\n", (size_t)waited);
+      _mi_scavenger_thread = NULL;
+      return;
+    }
+    if (mi_atomic_load_acquire(&_mi_scavenger_exited) == 0) {
+      // Signalled, but the body never reached its epilogue: `ExitProcess` terminated it where it
+      // stood. If that was inside `mi_atomic_guard(&mi_arenas_purge_guard)` the guard is orphaned,
+      // and the forced purge that `mi_process_done_once` runs right after us
+      // (`mi_theap_collect(theap, true)` -> `_mi_arenas_try_purge(force)`) would spin on it
+      // forever. We are the only thread left, so releasing it races with nobody.
+      const bool was_held = _mi_arenas_purge_guard_reset();
+      _mi_verbose_message("scavenger thread was terminated by the process exit (arena purge guard was %s)\n",
+                          (was_held ? "held" : "free"));
+    }
     CloseHandle(_mi_scavenger_thread);
     _mi_scavenger_thread = NULL;
   }

@@ -637,7 +637,64 @@ jobs:
           fi
           test -s bins.txt
           mkdir -p dist/x86_64-pc-windows-msvc
-          xargs -r -a bins.txt -I{} cp {} dist/x86_64-pc-windows-msvc/
+          # NOT every workspace test binary can be moved to another machine, and the ones
+          # that cannot say so in their own bytes.
+          #
+          # `env!("CARGO_BIN_EXE_<name>")` is expanded by cargo AT COMPILE TIME into the
+          # absolute path of the companion binary in the builder's target directory. Four
+          # tests here spawn `stress-child` that way (bench-harness's planted_control,
+          # rejections and throughput; dashboard's stress_child), so their binaries carry
+          # a literal `/home/runner/work/.../target/.../release/stress-child.exe`. There
+          # is no env override -- the string is frozen into the image -- and a Linux path
+          # cannot be reconstructed on a Windows runner, so shipping `stress-child.exe`
+          # alongside them would not help either. Cross-built, they can only run on the
+          # machine that built them.
+          #
+          # So detect them by the thing that makes them unrelocatable -- the builder's own
+          # target path appearing inside the executable -- rather than by a hardcoded list
+          # of names that would rot the moment a test is added or renamed. This is the
+          # same "a portable artifact contains no build-tree absolute path" rule
+          # ci/bundle_tests.py enforces on the C bundles.
+          target_root="$PWD/target/x86_64-pc-windows-msvc/release"
+          # SELF-TEST FIRST. `grep -F` without `-a` treats these images as binary and can
+          # report no match for a string that is demonstrably present -- which would make
+          # this scan silently stage an unrelocatable binary and fail much later on the
+          # runner, with a panic that says nothing about paths. Prove the matcher works on
+          # a known-positive before trusting its negatives.
+          # The control must contain a NUL, or it is not binary and `grep -F` would match
+          # it even WITHOUT `-a` -- a self-test that cannot fail is decoration.
+          printf 'prefix%s/stress-child.exe\000\001tail' "$target_root" > scanner-control.bin
+          if ! grep -aqF "$target_root/" scanner-control.bin; then
+            echo "::error::the unrelocatable-binary scanner cannot match a path it was just handed; its negatives are worthless"
+            exit 1
+          fi
+          rm -f scanner-control.bin
+          excluded=""
+          while read -r bin; do
+            if grep -aqF "$target_root/" "$bin" 2>/dev/null; then
+              excluded="$excluded $(basename "$bin")"
+            else
+              cp "$bin" dist/x86_64-pc-windows-msvc/
+            fi
+          done < bins.txt
+          if [ -n "$excluded" ]; then
+            echo "::warning::not staged (they embed the builder's absolute path via CARGO_BIN_EXE_*, so they cannot run on another machine):$excluded"
+            {
+              echo "### Rust test binaries that cannot be relocated"
+              echo
+              echo "\`env!(\"CARGO_BIN_EXE_*\")\` freezes the builder's absolute path into the image."
+              echo
+              echo '```'
+              for name in $excluded; do echo "$name"; done
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # The profiler's own crate must NEVER land in that set -- it is the reason this
+          # lane exists, and losing it silently is exactly the failure this whole phase is
+          # supposed to make impossible.
+          case "$excluded" in *mimalloc_pprof*)
+            echo "::error::a mimalloc-pprof test binary embeds the builder's absolute path; the MSVC lane would silently stop testing the profiler"
+            exit 1;; esac
           # cross.yml's `test (x86_64-pc-windows-msvc)` has `pprof: true`, so run-windows
           # needs these two specifically. Assert it here, next to the compiler output,
           # instead of letting the consumer fail without saying why.
@@ -648,7 +705,7 @@ jobs:
               exit 1
             fi
           done
-          echo "staged $(wc -l < bins.txt) test binaries"
+          echo "staged $(ls -1 dist/x86_64-pc-windows-msvc | wc -l) of $(wc -l < bins.txt) test binaries"
       - name: Build the PR benchmark sentinel
         # benchmark-sentinel.yml's `benchmark-sentinel (windows-latest)` row runs
         # `soldr cargo run -p dashboard --release`, which is a self-contained binary: it

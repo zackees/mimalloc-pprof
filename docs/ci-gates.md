@@ -703,9 +703,40 @@ The Rust side is where the accounting needed care. `cross.yml`'s
 `rust-native.yml`'s `test (windows-latest)` runs `cargo test` across the **whole
 workspace**, which is 110 further tests in `bench-harness`, `benchmark-suite`, `dashboard`
 and `stress-harness`. `build-rust (x86_64-pc-windows-msvc)` therefore builds
-`--workspace`, not `-p mimalloc-pprof`: **53 test binaries**, all executed on the runner.
-Building only the narrow set would have cut Windows Rust coverage by more than half while
-the table claimed parity.
+`--workspace`, not `-p mimalloc-pprof`: 53 test binaries are built and **49 are executed**
+on the runner. Building only the narrow set would have cut Windows Rust coverage by more
+than half while the table claimed parity.
+
+**Four cannot be executed anywhere but the machine that built them, and this is
+structural.** `env!("CARGO_BIN_EXE_<name>")` is expanded by cargo *at compile time* into
+the absolute path of a companion binary in the builder's target directory. Four tests spawn
+`stress-child` that way — `bench-harness`'s `planted_control`, `rejections` and
+`throughput`, and `dashboard`'s `stress_child` — so their images carry a literal
+`/home/runner/work/…/target/x86_64-pc-windows-msvc/release/stress-child.exe`. There is no
+environment override (the string is frozen into the binary), and a Linux path cannot be
+reconstructed on a Windows runner, so shipping `stress-child.exe` beside them would not
+help either. They fail with `expect("valid normal benchmark")` — measured, on the first
+green-everywhere-else run of this lane.
+
+They are excluded by **detecting the property**, not by a hardcoded list of names that
+would rot the moment a test is added or renamed: the build job greps each staged image for
+the builder's own target path, which is the same "a portable artifact contains no
+build-tree absolute path" rule `ci/bundle_tests.py` enforces on the C bundles. Two guards
+around it:
+
+- the scanner **self-tests on a known-positive first** (a control file containing that path
+  *and a NUL byte*, so it is genuinely binary). `grep -F` without `-a` reports no match on
+  binary input, which would silently stage an unrelocatable binary and surface much later
+  as a panic that says nothing about paths — the scan's negatives are only worth having if
+  its positives are proven;
+- a `mimalloc-pprof` test binary landing in the excluded set is a **hard error**. That
+  crate is the reason the lane exists, and losing it silently is exactly the failure this
+  phase is meant to make impossible.
+
+Those four tests still run on `ubuntu-latest`, where builder and runner are the same
+machine. Restoring them on Windows needs an upstream change to the tests (resolve
+`stress-child` relative to `current_exe()` instead of `CARGO_BIN_EXE_*`), which is a Rust
+change and out of scope for a CI phase (rule 2, rule 7).
 
 Stated rather than gated:
 

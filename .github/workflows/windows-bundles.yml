@@ -1175,6 +1175,22 @@ jobs:
           gate "MSVC debug-full bundle" bundle/windows-msvc-x64-debug-full
           exit $failed
 
+      - name: TEMPORARY (#272) -- thread-idle-rss process exit under MIMALLOC_VERBOSE
+        # Diagnostic for the MSVC-bundle hang: run_test_bundle.py only echoes a test's output
+        # when it FAILS, so run the exe directly and always show it. Removed once the log has
+        # been read.
+        continue-on-error: true
+        run: |
+          set +e
+          for b in windows-msvc-x64-release windows-gnu-x64-release; do
+            echo "::group::$b -- thread-idle-rss (MIMALLOC_VERBOSE=1)"
+            PATH="$PWD/bundle/$b:$PATH" MIMALLOC_VERBOSE=1 \
+              timeout 30 "bundle/$b/mimalloc-test-thread-idle-rss.exe"
+            echo "exit=$?"
+            echo "::endgroup::"
+          done
+          exit 0
+
       - name: ctest (windows-latest) equivalent -- windows-msvc-x64-release
         # The one native MSVC job that is NOT replaced still runs this same set in
         # c-unit.yml (CLAUDE.md rule 3). Both arms run on every push; the coverage step

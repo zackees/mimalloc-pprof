@@ -1187,6 +1187,18 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
   mi_assert_internal(!mi_page_all_free(page));
   mi_assert_internal(page->next==NULL && page->prev == NULL);
   mi_assert_internal(mi_theap_matches_thread(current_theap));
+
+  // #266: every caller of this function reaches it while still owning `page` (asserted
+  // above), so this is safe, and narrows -- though for a lock-free deferred free list
+  // cannot fully close -- the window in which a cross-thread free's memevt/profiler
+  // record collection (_mi_prof_on_free_collect via mi_page_thread_collect_to_local,
+  // page.c) waits on some theap later walking this exact page again, which an abandoned
+  // page is not guaranteed to happen for (mi_collect only visits pages the calling
+  // theap currently owns; an abandoned page sits in the arena's own bookkeeping until
+  // some thread specifically reclaims it, which may be never). Investigated as the
+  // suspected cause of ctest-shared (windows-latest)'s test-profile/-accum/-auto
+  // failures at test/test-profile.c's cross-thread-free-of-sampled-blocks check.
+  _mi_page_free_collect(page, false);
   // mi_assert_internal(current_theap == _mi_page_associated_theap(page));
 
   // add to abandoned?

@@ -160,19 +160,19 @@ jobs:
   # `_mi_theap_malloc_zero` extern inline for exactly this reason on v3.4.1.
   # Runs on both Windows toolchains because that is where the reported failure was.
   #
-  # MSVC-shared (windows-latest) is deliberately NOT in this matrix yet: it found a real
-  # bug -- MIMALLOC_MEMORY_EVENTS env activation fails in an MSVC DLL build, tracked in
-  # issue #69 -- and adding it red, or with continue-on-error, is how a gate becomes
-  # decoration. It goes in with the fix. win-gnu shared runs below and is green.
-  # windows-latest (MSVC) is in this matrix as a DIAGNOSTIC for #69 -- it is expected to
-  # fail on test-memory-events-env-enabled until that issue is fixed. It is here rather
-  # than deferred because #69's hypothesis (env resolution racing DLL init) was never
-  # confirmed: "I do not have MSVC locally and could not reproduce it outside CI ... Do
-  # not fix it on my say-so -- confirm first." CI *is* the MSVC machine. This job plus
-  # the [env-check] lines in test-memory-events.c are the confirmation step.
-  # It must not stay red: either it goes green with the fix, or windows-latest comes back
-  # out of this matrix. Do NOT add continue-on-error -- see the note below on why a
-  # permanently-yellow job is worse than an absent one.
+  # #69 (MIMALLOC_MEMORY_EVENTS env activation failing in an MSVC DLL build) is
+  # RESOLVED: windows-latest was confirmed green here on main (runs 33565889274,
+  # 33546799862) well before #266, so the stale note this comment used to carry --
+  # claiming windows-latest was a deliberate known-red diagnostic for #69 -- no longer
+  # describes reality and was corrected during #266's review (it was misleading anyone
+  # who saw this job red and assumed it was the old, expected #69 failure rather than a
+  # new regression).
+  #
+  # Do NOT add continue-on-error if this job goes red again -- see the note below on why
+  # a permanently-yellow job is worse than an absent one. Confirm any new failure is a
+  # real regression (as #266 round 2 did for test-profile/-accum/-auto's cross-thread
+  # sampled-free reclamation, fixed on this branch) before landing, per the same
+  # "confirm on CI, don't guess" discipline #69 was fixed under.
   ctest-shared:
     strategy:
       fail-fast: false

@@ -16,6 +16,7 @@
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/prim-tls.h"   // _mi_theap_default
+#include "mimalloc/hooks-tld.h"  // _mi_hooks_tld_peek/_peek_or_local (#266)
 #include <string.h>
 #include <stdint.h>
 
@@ -71,10 +72,17 @@ static void*                 memevt_args[MI_MEMORY_CHANGE_COUNT];
 //       mi_heap_umalloc+mi_free pair, so those two calls don't leak an ALLOCATE/FREE
 //       pair to consumers; the caller then explicitly calls _mi_memevt_on_resize once,
 //       after suppression is lifted, to emit the single synthesized RESIZE.
-static mi_decl_thread int memevt_suppress_depth;
-
-void _mi_memevt_suppress_begin(void) { memevt_suppress_depth++; }
-void _mi_memevt_suppress_end(void)   { memevt_suppress_depth--; }
+// #266: this used to be `static mi_decl_thread int memevt_suppress_depth`; it now lives
+// on `mi_tld_t::hooks` (see hooks-tld.h's file comment for why). Both callers are always
+// on an already-initialized thread (paired around inner mi_realloc/mi_malloc_aligned/
+// mi_theap_malloc_guarded calls, never inside `_mi_meta_zalloc`'s own call chain), so a
+// NULL peek is not expected here in practice -- but this must still only ever PEEK, never
+// force: forcing (mi_theap_get_default() -> mi_thread_init()) is unsafe not only mid-init
+// but also mid *teardown* (mi_thread_theaps_done resets the default theap to the empty
+// sentinel before freeing this thread's theaps specifically so nothing re-initializes it
+// in that window; see its comment in init.c). No-op on NULL rather than crash either way.
+void _mi_memevt_suppress_begin(void) { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth++; }
+void _mi_memevt_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth--; }
 
 // ---------------------------------------------------------------------------------------
 // Lazy activation.
@@ -147,8 +155,10 @@ bool mi_memory_snapshot(mi_memory_snapshot_t* out) mi_attr_noexcept {
 // work / list push is already complete).
 // ---------------------------------------------------------------------------------------
 
-static void memevt_dispatch(mi_memory_change_kind_t kind, int64_t delta_bytes, uint64_t request_size) {
-  if (memevt_suppress_depth > 0) return;
+// `hooks` is the caller's already-peeked, known-non-NULL `mi_hooks_tld_t*` (every call
+// site below obtained it before calling here; see the hook entry points).
+static void memevt_dispatch(mi_hooks_tld_t* hooks, mi_memory_change_kind_t kind, int64_t delta_bytes, uint64_t request_size) {
+  if (hooks->memevt_suppress_depth > 0) return;
 
   size_t live_bytes_after;
   if (delta_bytes >= 0) {
@@ -187,9 +197,9 @@ static void memevt_dispatch(mi_memory_change_kind_t kind, int64_t delta_bytes, u
   change.delta_bytes = delta_bytes;
   change.request_size = request_size;
 
-  memevt_suppress_depth++;
+  hooks->memevt_suppress_depth++;
   handler(&change, handler_arg);
-  memevt_suppress_depth--;
+  hooks->memevt_suppress_depth--;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -206,7 +216,17 @@ static void memevt_dispatch(mi_memory_change_kind_t kind, int64_t delta_bytes, u
    The shared suppression depth excludes callback-internal and moving-realloc internals
    from both observers. */
 void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
-  if (memevt_suppress_depth > 0) return;
+  // #266: must be the very first thing touched -- see hooks-tld.h's file comment. A
+  // thread mid-init (inside `_mi_thread_init_with_heap` -> `_mi_meta_zalloc`, allocating
+  // its OWN tld/theap) reaches this hook too; peeking (rather than touching any TLS
+  // state directly) lets us bail out before doing anything else. Such a call is always
+  // for a meta allocation anyway -- the `_mi_meta_is_meta_page` check below would have
+  // excluded it regardless, but that check itself must not run first (it does not touch
+  // TLS, but ordering it before the peek would defeat the point: bail before ANY other
+  // per-thread work).
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks == NULL) return;
+  if (hooks->memevt_suppress_depth > 0) return;
   // #266: never report allocator-internal metadata (mi_tld_t / mi_theap_t, allocated via
   // _mi_meta_zalloc onto subproc->theap_meta) as a user allocation. This is the sole
   // entry point DHAT's begin_alloc is reached through, so this one check excludes both
@@ -220,43 +240,64 @@ void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
-    memevt_dispatch(MI_MEMORY_ALLOCATE, (int64_t)usable, (uint64_t)request_size);
+    memevt_dispatch(hooks, MI_MEMORY_ALLOCATE, (int64_t)usable, (uint64_t)request_size);
   }
   _mi_dhat_finish_event();
 }
 
+// #266: unlike _mi_memevt_on_alloc above, the free/resize hooks are never reachable
+// from inside `_mi_meta_zalloc`'s own call chain (meta allocations only ever allocate,
+// never free or resize), so a NULL peek here does NOT mean "meta allocation, drop it" --
+// it means a thread with no tld of its own is legitimately freeing (or resizing)
+// something, e.g. `test_free_from_foreign_thread` (test-memory-events.c): a thread whose
+// very first ever mimalloc call is a cross-thread mi_free must still be accounted for.
+// But forcing thread init here would be just as unsafe as in the alloc path -- unsafe
+// not for the mid-init reason (frees can't happen there) but because it is equally
+// reachable while THIS thread is mid *teardown* (mi_thread_theaps_done resets the
+// default theap to the empty sentinel before freeing this thread's own theaps precisely
+// so nothing re-initializes it in that window) or after teardown already completed (see
+// free.c's "free'd after thread_done" comment). So: peek, and fall back to a local,
+// per-call scratch `mi_hooks_tld_t` instead of forcing -- see hooks-tld.h.
 void _mi_memevt_on_free(mi_page_t* page, void* p) {
-  if (memevt_suppress_depth > 0) return;
+  mi_hooks_tld_t local_hooks;
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
+  if (hooks->memevt_suppress_depth > 0) return;
   // #266: symmetric with the _mi_memevt_on_alloc check above -- see its comment.
   if (_mi_meta_is_meta_page(mi_page_subproc(page), page)) return;
   _mi_dhat_begin_free(p);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
-    memevt_dispatch(MI_MEMORY_FREE, -(int64_t)usable, 0);
+    memevt_dispatch(hooks, MI_MEMORY_FREE, -(int64_t)usable, 0);
   }
   _mi_dhat_finish_event();
 }
 
 void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size) {
-  if (memevt_suppress_depth > 0) return;
+  // #266: see _mi_memevt_on_free above.
+  mi_hooks_tld_t local_hooks;
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
+  if (hooks->memevt_suppress_depth > 0) return;
   _mi_dhat_begin_resize(p, p, request_size);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     // Same page => same block-size class => usable size is identical before and after.
     MI_UNUSED(page);
-    memevt_dispatch(MI_MEMORY_RESIZE, 0, (uint64_t)request_size);
+    memevt_dispatch(hooks, MI_MEMORY_RESIZE, 0, (uint64_t)request_size);
   }
   _mi_dhat_finish_event();
 }
 
 void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
-  if (memevt_suppress_depth > 0) return;
+  // #266: see _mi_memevt_on_free above.
+  mi_hooks_tld_t local_hooks;
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
+  if (hooks->memevt_suppress_depth > 0) return;
   _mi_dhat_begin_resize(oldp, newp, request_size);
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const int64_t delta = (int64_t)usable_post - (int64_t)usable_pre;
-    memevt_dispatch(MI_MEMORY_RESIZE, delta, (uint64_t)request_size);
+    memevt_dispatch(hooks, MI_MEMORY_RESIZE, delta, (uint64_t)request_size);
   }
   _mi_dhat_finish_event();
 }
@@ -313,9 +354,9 @@ static bool mi_cdecl memevt_visit_adapter(const mi_heap_t* heap, const mi_heap_a
 
 bool mi_memory_visit_live_allocations(mi_memory_allocation_visit_fun* visitor, void* arg) mi_attr_noexcept {
   if (visitor == NULL) return false;
-  if (memevt_suppress_depth > 0) return false; // do not reenter while a callback/internal-op is in flight on this thread.
-  mi_theap_t* theap = _mi_theap_default();
-  if (theap == NULL || !mi_theap_is_initialized(theap)) return true; // nothing to visit yet on this thread.
+  mi_theap_t* const theap = _mi_theap_default();
+  if (!mi_theap_is_initialized(theap)) return true; // nothing to visit yet on this thread.
+  if (theap->tld->hooks.memevt_suppress_depth > 0) return false; // do not reenter while a callback/internal-op is in flight on this thread.
   memevt_visit_ctx_t ctx = { visitor, arg };
   // Walk every theap on this thread (tld->theaps, via tnext), and for each, walk its own
   // page queues directly -- see the comment block above for why mi_heap_visit_blocks is

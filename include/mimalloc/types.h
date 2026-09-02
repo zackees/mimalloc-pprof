@@ -660,6 +660,35 @@ typedef struct mi_profiler_tld_s {
   uint64_t generation;
 } mi_profiler_tld_t;
 
+// Reentrancy-guard / in-flight-event scratch for the fork's hook implementations
+// (src/memory-events.c, src/dhat.c, src/profile.c). These used to be file-local
+// `mi_decl_thread` (`__thread`) variables, but on a macOS dylib the loader can lazily
+// instantiate a thread's `__thread` block via a dyld-interposed `calloc` the very first
+// time it is touched on that thread -- including from inside `_mi_thread_init_with_heap`
+// -> `_mi_meta_zalloc`, which already holds `subproc->theap_meta_lock` for that same
+// thread's own tld/theap allocation. Touching a `__thread` var from our hook there
+// reenters mimalloc and re-acquires that lock on the same thread (see issue #266).
+// Living inline in `mi_tld_t` avoids that: obtaining a thread's `mi_tld_t*` (see
+// `_mi_hooks_tld_peek` in mimalloc/hooks-tld.h) never touches a `mi_decl_thread`
+// variable and never allocates.
+typedef struct mi_hooks_tld_s {
+  int      memevt_suppress_depth;     // memory-events.c: reentrancy / internal-op suppression
+  int      dhat_observer_depth;       // dhat.c: reentrancy guard for the in-flight event below
+  struct {                            // dhat.c: in-flight event scratch; fields are opaque here
+    int        kind;                  // dhat_event_kind_t
+    void*      oldp;
+    void*      newp;
+    size_t     size;
+    uint64_t   at;
+    uint64_t   generation;
+    mi_page_t* page;
+    void*      pp;                    // dhat_pp_t*
+    bool       armed;
+  }        dhat_event;
+  int      prof_callback_depth;       // profile.c (MI_PPROF): reentrancy / suppression depth
+  bool     prof_lock_owner;           // profile.c (MI_PPROF): this thread already holds prof_lock
+} mi_hooks_tld_t;
+
 // Thread local data
 struct mi_tld_s {
   mi_threadid_t         thread_id;            // thread id of this thread
@@ -672,6 +701,7 @@ struct mi_tld_s {
   bool                  is_in_threadpool;     // true if this thread is part of a threadpool (and can run arbitrary tasks)
   mi_memid_t            memid;                // provenance of the tld memory itself (meta or OS)
   mi_profiler_tld_t     profiler;             // allocation sampling profiler state
+  mi_hooks_tld_t        hooks;                // memory-events/dhat/profiler hook reentrancy state (#266)
 };
 
 

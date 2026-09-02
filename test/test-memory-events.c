@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include "mimalloc.h"
 #include "mimalloc/memory-events.h"
+#include "mimalloc/profile.h"  /* mi_prof_start/mi_prof_stop -- see test_new_thread_first_alloc_all_observers_active (#266) */
+#include "mimalloc/dhat.h"     /* mi_dhat_start/mi_dhat_stop -- ditto */
 
 /* ---------------------------------------------------------------------------------------------
    Shared callback-counting harness: one handler function for all three kinds, dispatching on
@@ -715,6 +717,68 @@ static void test_free_from_foreign_thread(void) {
   assert(after.live_count == before.live_count);
 }
 
+/* ---- T12: brand-new thread whose first-ever mimalloc call happens with memory-events,
+   the profiler, and DHAT all active simultaneously (issue #266) ---------------------------
+
+   Regression coverage for the macOS-only crash this issue diagnosed: a worker thread's
+   very first allocation goes through _mi_thread_init_with_heap -> _mi_meta_zalloc, which
+   allocates that thread's own tld/theap while holding subproc->theap_meta_lock, and the
+   allocation hooks (_mi_memevt_on_alloc, _mi_prof_on_alloc, _mi_dhat_begin_alloc) fire for
+   that very allocation. The bug was those hooks touching per-thread `mi_decl_thread`
+   (`__thread`) state: on a macOS dylib, first-touching a `__thread` variable can lazily
+   allocate its TLS block via a dyld-interposed calloc, which reenters mimalloc and
+   re-acquires that same non-recursive lock on the same thread -- a deadlock (and, under
+   MI_DEBUG_FULL's reentrant-lock diagnostic, an assertion instead).
+
+   The fix (moving that state onto mi_tld_t; see include/mimalloc/hooks-tld.h) is
+   platform-independent, so this passes on Linux both before and after the fix -- the
+   point here is coverage of the exact three-observers-active shape, not reproducing the
+   macOS-specific trigger itself. */
+#ifdef _WIN32
+static DWORD WINAPI t12_thread(LPVOID arg) {
+  (void)arg;
+  void* p = mi_malloc(64);   /* this thread's very first mimalloc call */
+  assert(p != NULL);
+  memset(p, 0xEE, 64);
+  mi_free(p);
+  return 0;
+}
+static void t12_run(void) {
+  HANDLE th = CreateThread(NULL, 0, t12_thread, NULL, 0, NULL);
+  assert(th != NULL);
+  WaitForSingleObject(th, INFINITE);
+  CloseHandle(th);
+}
+#else
+static void* t12_thread(void* arg) {
+  (void)arg;
+  void* p = mi_malloc(64);   /* this thread's very first mimalloc call */
+  assert(p != NULL);
+  memset(p, 0xEE, 64);
+  mi_free(p);
+  return NULL;
+}
+static void t12_run(void) {
+  pthread_t th;
+  assert(pthread_create(&th, NULL, t12_thread, NULL) == 0);
+  assert(pthread_join(th, NULL) == 0);
+}
+#endif
+
+static void test_new_thread_first_alloc_all_observers_active(void) {
+  assert(mi_memory_tracking_is_enabled());
+  /* mi_prof_start is a harmless no-op returning false when built with MI_PPROF=OFF; the
+     allocation hooks below are always compiled in regardless, so this test still covers
+     the memevt+dhat pair on an MI_PPROF=OFF build. */
+  const bool prof_started = mi_prof_start(0);
+  const bool dhat_started = mi_dhat_start();
+
+  t12_run();   /* the whole point: must not deadlock or assert */
+
+  if (prof_started) mi_prof_stop();
+  if (dhat_started) mi_dhat_stop();
+}
+
 static void test_unwrapped_family(void) {
   assert(mi_memory_tracking_is_enabled());
   evt_ctx_t ctx; evt_ctx_reset(&ctx);
@@ -833,6 +897,7 @@ int main(int argc, char** argv) {
   test_disable_reenable_partial();
   test_visit_live_allocations();
   test_free_from_foreign_thread();
+  test_new_thread_first_alloc_all_observers_active();
   test_unwrapped_family();
 
   puts("memory-events tests passed");

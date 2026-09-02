@@ -100,7 +100,8 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   false,                  // recurse
   false,                  // is_in_threadpool
   MI_MEMID_STATIC,        // memid
-  { 0, 0, 0, 0 }          // profiler (MI_PPROF)
+  { 0, 0, 0, 0 },         // profiler (MI_PPROF)
+  { 0 }                   // hooks (#266)
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {

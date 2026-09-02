@@ -318,7 +318,7 @@ jobs:
           test -s bins.txt
           mkdir -p dist/x86_64-pc-windows-gnu
           xargs -r -a bins.txt -I{} cp {} dist/x86_64-pc-windows-gnu/
-          # `test (x86_64-pc-windows-gnu)` has `pprof: true`, so run-windows-gnu needs
+          # `test (x86_64-pc-windows-gnu)` has `pprof: true`, so run-windows needs
           # these two specifically. Assert it here, next to the compiler output, instead
           # of letting the consumer fail without saying why.
           for required in t3_stats t12_proto; do

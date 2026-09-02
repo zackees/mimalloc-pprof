@@ -240,7 +240,7 @@ jobs:
     # TODO(#277 phase C, added 2026-09-02): DELETE this job -- and the
     # x86_64-pc-windows-gnu row of test-binaries below -- after ten pushes have compared
     # them against windows-bundles.yml's `build-rust (x86_64-pc-windows-gnu)` +
-    # `run-windows-gnu`, which build the same test binaries on ubuntu-latest through
+    # `run-windows`, which build the same test binaries on ubuntu-latest through
     # soldr's Linux-hosted mingw-w64 and run them on the shared Windows VM. Informational
     # until then. A permanently-yellow job is worse than an absent one.
     continue-on-error: true

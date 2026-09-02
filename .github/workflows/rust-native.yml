@@ -60,7 +60,7 @@ jobs:
   test-win-gnu:
     runs-on: windows-latest
     # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
-    # it against `run-windows-gnu` in windows-bundles.yml, which runs the same Rust test
+    # it against `run-windows` in windows-bundles.yml, which runs the same Rust test
     # binaries, cross-built on Linux, on a shared Windows VM. Informational until then -- it is
     # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
     # mingw-w64 is UCRT), so do not delete it before that comparison has actually

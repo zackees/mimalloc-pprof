@@ -954,11 +954,20 @@ that depended on purge timing — one measured batch had a control run land with
 the clean baseline, i.e. the control came within one sample of silently not firing.
 
 **Baselines.** `linux-pprof1.json` re-recorded at 58.0 MB (min-of-16, 0.9% spread) from
-run 33700518749. `windows-pprof1.json` re-recorded from this PR's own
-`memory-gate-windows-latest` artifact, because a workload change invalidates every
-baseline, not just the flaky one — the historical Windows lane was itself noisier than the
-new tolerance (min-of-8 51.2–57.0 MB across the same twelve `main` runs, within-run
-spreads 3.9–17.5%, baseline recorded at 9.9% spread). `macos-pprof1.json` is **left
+run 33700518749; independently confirmed on a fourth runner VM by run 33701098707, which
+read min-of-8 58.2 MB at 0.7% spread against it.
+
+`windows-pprof1.json` re-recorded at **74.4 MB (min-of-8, 0.1% spread)** from run
+33701098707, because a workload change invalidates every baseline, not just the flaky one.
+Windows was never the *failing* lane but it was the noisy one: across the same twelve
+`main` runs it read min-of-8 51.2–57.0 MB (11.3% across runs) with within-run spreads of
+3.9–17.5%, and its committed baseline had itself been recorded at 9.9% spread. The
+rendezvous fixed it too, and by more than it fixed ubuntu — 17.5% → 0.1%, which is the
+clearest evidence available that the scheduler-overlap diagnosis was the right one: the
+same source code change collapses the spread on two unrelated kernels and two different
+gated metrics (peak RSS and peak commit).
+
+`macos-pprof1.json` is **left
 untouched and is stale**: it records a native-Xcode arm64 lane that #277 phase B2 deleted,
 and no lane compares against it any more (the dockur x86_64 lane keys on
 `macos-x86_64-soldr-clang-21-pprof1.json` and bootstraps its own). Delete or regenerate it

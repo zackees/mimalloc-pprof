@@ -89,6 +89,8 @@ what that risk means and what was measured.
 Upstream mimalloc v3, plus everything below. Every item is on `main`, tested on every
 commit, and reachable from both C and Rust ([full API table](#api-surface)).
 
+### Malloc Stats
+
 - **pprof output.** A sampled heap profiler built into the allocator: `MIMALLOC_PROF=1`
   or `mi_prof_start()` / `prof::start()`, dump `heap_v2` text or `profile.proto`, open in
   `pprof` or any flame-graph tool. Sampling costs nothing on the fast path when it is
@@ -106,40 +108,47 @@ commit, and reachable from both C and Rust ([full API table](#api-surface)).
   snapshots (`mi_memory_set_callbacks`, `memory_events::snapshot()`) for your own
   counters — one relaxed flag check per operation while off, available even with the
   profiler compiled out. → [memory events](docs/dhat-and-memory-events.md#memory-events-api)
-- **All of Bun's mimalloc enhancements**, ported from
-  [oven-sh/mimalloc](https://github.com/oven-sh/mimalloc) through `b20b60d9` and
-  re-verified under this tree's stress suite. → [Bun features](#bun-features)
-  - **"Hole punch" memory return.** Free blocks *inside* a still-used page are
-    discarded to the OS one page at a time, so a single long-lived object no longer
-    pins a 64 KiB–512 KiB page resident. On the churn benchmark it returns **74 % of
-    peak RSS** after idle, versus 18 % for the scavenger alone
-    (`mi_on_thread_idle()`, `MIMALLOC_PURGE_HOLES`). → [measured](#hole-purging-measured)
-  - **Background scavenger.** A demand-driven thread purges scheduled arena memory on a
-    100 ms timer instead of waiting for the next allocation; threads with an event loop
-    can hand the work off with `mi_on_thread_idle_start()` / `park_while_idle()`.
-  - **`fork()` safety.** `pthread_atfork` handlers with a documented lock order and an
-    `MI_DEBUG>2` runtime lock-order checker, so a forked child never inherits a lock
-    another thread held.
-  - **Heap teardown protocol.** A four-step claim protocol closes an ABA race between
-    `mi_heap_destroy` and a concurrent allocation, plus Bun's heap-teardown test corpus
-    and fault-injection hook; two further use-after-free classes were found and fixed
-    here.
-  - **Lazy abandoned-page bitmaps and unmapped abandon on release.** Per-bin abandoned
-    bitmaps are allocated on first use instead of eagerly (~110 KB and ~50 page faults
-    saved per heap), and a heap being released abandons its pages without mapping them.
-  - **Collect on sub-process-safe free.** `mi_heap_destroy` no longer strands ~170 KB
-    per destroyed heap in burst patterns.
-  - **`mi_heap_dump_json` / `mi_heap_get_seq`**, `MI_NO_PROCESS_DETACH` for embedders
-    that own teardown, zero-cost-when-off profiler fast path, TLS-slot zeroing, the
-    glibc 2.44 `free(NULL)`-before-init fix, Windows PRNG/RAM-sizing/NUMA fixes, and
-    macOS TLS slots 96/97.
-- **Upstream bugs found and fixed here first**, including two unbounded memory leaks
-  and an ARM64 atomics incompatibility, several since upstreamed by Microsoft.
-  → [Upstream bugs](#upstream-bugs-found-and-fixed)
+
+### Bun's mimalloc improvements
+
+**All of Bun's mimalloc enhancements**, ported from
+[oven-sh/mimalloc](https://github.com/oven-sh/mimalloc) through `b20b60d9` and
+re-verified under this tree's stress suite. → [Bun features](#bun-features)
+
+- **"Hole punch" memory return.** Free blocks *inside* a still-used page are
+  discarded to the OS one page at a time, so a single long-lived object no longer
+  pins a 64 KiB–512 KiB page resident. On the churn benchmark it returns **74 % of
+  peak RSS** after idle, versus 18 % for the scavenger alone
+  (`mi_on_thread_idle()`, `MIMALLOC_PURGE_HOLES`). → [measured](#hole-purging-measured)
+- **Background scavenger.** A demand-driven thread purges scheduled arena memory on a
+  100 ms timer instead of waiting for the next allocation; threads with an event loop
+  can hand the work off with `mi_on_thread_idle_start()` / `park_while_idle()`.
+- **`fork()` safety.** `pthread_atfork` handlers with a documented lock order and an
+  `MI_DEBUG>2` runtime lock-order checker, so a forked child never inherits a lock
+  another thread held.
+- **Heap teardown protocol.** A four-step claim protocol closes an ABA race between
+  `mi_heap_destroy` and a concurrent allocation, plus Bun's heap-teardown test corpus
+  and fault-injection hook; two further use-after-free classes were found and fixed
+  here.
+- **Lazy abandoned-page bitmaps and unmapped abandon on release.** Per-bin abandoned
+  bitmaps are allocated on first use instead of eagerly (~110 KB and ~50 page faults
+  saved per heap), and a heap being released abandons its pages without mapping them.
+- **Collect on sub-process-safe free.** `mi_heap_destroy` no longer strands ~170 KB
+  per destroyed heap in burst patterns.
+- **`mi_heap_dump_json` / `mi_heap_get_seq`**, `MI_NO_PROCESS_DETACH` for embedders
+  that own teardown, zero-cost-when-off profiler fast path, TLS-slot zeroing, the
+  glibc 2.44 `free(NULL)`-before-init fix, Windows PRNG/RAM-sizing/NUMA fixes, and
+  macOS TLS slots 96/97.
+
+### Testing / Cross Compilation
+
 - **The most tested mimalloc fork.** Ubuntu, Windows MSVC, Windows MinGW and macOS
   (cross-built on Linux, executed in a macOS guest — no Apple hardware) in Debug and
   Release, profiler in and out, ASan, fuzzing, a memory-regression gate, and a positive
   control for every gate that can carry one. → [Why use this fork](#why-use-this-fork)
+- **Upstream bugs found and fixed here first**, including two unbounded memory leaks
+  and an ARM64 atomics incompatibility, several since upstreamed by Microsoft.
+  → [Upstream bugs](#upstream-bugs-found-and-fixed)
 - **A Rust crate with full parity.** `mimalloc-pprof` on crates.io binds every fork C
   export and every `mi_option_t` enumerator, with layout and enum-value checks against
   the C compiler on every build. → [API surface](#api-surface)

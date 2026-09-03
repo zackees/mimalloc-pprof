@@ -146,7 +146,9 @@ jobs:
             # baseline: 200000 -> 82.3 MB (+42%), 400000 -> 116.3 MB (+101%),
             # 600000 -> 166.1 MB (+186%). 600000 restores roughly the margin the control
             # was documented at before (+212%), so "the gate fired" stays unambiguous
-            # rather than sitting a few noisy samples above a 5% tolerance.
+            # rather than sitting a few noisy samples above a 5% tolerance. Confirmed on
+            # CI (run 33707744137): `peak_rss regressed: 156.5 MB vs baseline 58.0 MB
+            # (+169.8%, allowed +5%)` -- 34x the tolerance.
             cmake: -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=600000
             build_config: Release
             kind: control
@@ -447,10 +449,12 @@ jobs:
       - name: Memory gate -- 8 runs from the release bundle
         # Peak memory is noisy; the gate compares the minimum of several runs.
         # `ci/memory_gate.py`'s RUNS_EXPECTED is 8, which is what this step runs. The
-        # committed baselines are recorded min-of-16 (#298/#309) -- deliberately a
-        # *lower* number than a min-of-8 sample of the same distribution can be expected
-        # to reach, so comparing a min-of-8 run against them errs toward reporting a
-        # regression rather than hiding one. #298 also made the structural peak
+        # baseline this lane is compared against -- `linux-pprof1.json` -- is recorded
+        # min-of-16 (#298/#309): deliberately a *lower* number than a min-of-8 sample of
+        # the same distribution can be expected to reach, so comparing a min-of-8 run
+        # against it errs toward reporting a regression rather than hiding one. (The
+        # other committed baselines are not min-of-16 -- windows is min-of-8, macos
+        # min-of-4 -- and are compared by their own lanes in windows-/macos-bundles.yml.) #298 also made the structural peak
         # deterministic (a barrier in test/test-memory-gate.c) and set PEAK_TOLERANCE to
         # 0.05. The run count and the CLI here are unchanged from the job this replaces:
         # this PR moves the gate, it does not retune it.

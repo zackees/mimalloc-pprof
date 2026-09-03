@@ -143,7 +143,7 @@ runs no tests. `kind` says what it produces:
 | kind | rows | artifact |
 |---|---|---|
 | `bundle` | `release`, `pprof-off`, `debug-full`, `guarded`, `shared`, `musl`, `musl-pprof-off` | a `ci/bundle_tests.py` bundle, tarred, **plus** `show-only-<config>.json` straight from `ctest --show-only=json-v1` |
-| `control` | `memory-gate-leak` (`MI_BENCH_INJECT_LEAK=200000`) | a bundle that is never executed — only its `mimalloc-test-memory-gate` binary is, as the memory gate's positive control |
+| `control` | `memory-gate-leak` (`MI_BENCH_INJECT_LEAK=600000`) | a bundle that is never executed — only its `mimalloc-test-memory-gate` binary is, as the memory gate's positive control |
 | `lib` | `isa-portable`, `isa-arch`, `diag-pprof-on`, `diag-pprof-off` | `libmimalloc*.a` (+ `compile_commands.json`) for the run stage to scan |
 
 The bundles are **tarred**, not uploaded as loose files: `upload-artifact@v4` drops the
@@ -1056,7 +1056,7 @@ eight times, and compares the **minimum** peak of those runs against a committed
 per-platform/arch/compiler baseline in `ci/memory-baselines/`. On Windows the gated
 number is peak *commit* (the working set is trimmed under pressure and would hide
 committed-but-untouched growth); everywhere else it is peak RSS, from `ru_maxrss` via
-`mi_process_info`. A second build with `-DMI_BENCH_INJECT_LEAK=200000` runs the identical
+`mi_process_info`. A second build with `-DMI_BENCH_INJECT_LEAK=600000` runs the identical
 comparison through `memory_gate.py control`, which passes only if the gate *fails*.
 
 **What went wrong.** The gate was red on `main` for commits that changed no allocator
@@ -1125,16 +1125,17 @@ with those numbers written into `ci/memory_gate.py`. `RUNS_EXPECTED` stays 8: mi
 min-of-16 of this distribution are the same number, so more runs buy nothing and fewer
 would need a matching edit to `c-unit.yml`'s run loops.
 
-**Control margin.** The `MI_BENCH_INJECT_LEAK=200000` build reads min-of-8 82.6 / 82.4 /
-82.5 MB on those same three VMs — **+42.1%**, or 8.4× the tolerance, against a rule that
-the control must fire by at least 2×. CI confirms it on both gated metrics: run
-33701827771's controls report `peak_rss regressed: 82.5 MB vs baseline 58.0 MB (+42.2%)`
-and `peak_commit regressed: 113.7 MB vs baseline 74.4 MB (+52.8%)`. Note that the control
-no longer fires at ~3× the baseline as it did before this change — the injected leak is
-still the same ~32 MB, but the structural peak it has to clear went from ~22 MB to 58 MB.
-The rule that matters (≥2× the tolerance) is met with a factor of four to spare; if a
-larger absolute ratio is wanted, `MI_BENCH_INJECT_LEAK` is set in the workflow, so raising
-it belongs with #307's `c-unit.yml` rewrite rather than here. `ci/tests/test_memory_gate.py` asserts that ratio,
+**Control margin.** At the `MI_BENCH_INJECT_LEAK=200000` this control was built with when
+#298 landed, it read min-of-8 82.6 / 82.4 / 82.5 MB on those same three VMs — **+42.1%**,
+or 8.4× the tolerance, against a rule that the control must fire by at least 2×. That is
+comfortably over the rule but well below where this control used to sit: the injected leak
+is the same ~32 MB, while the structural peak it has to clear went from ~22 MB to 58 MB,
+so the *ratio* fell from ~3× the baseline to ~1.4×. #307 therefore raised the knob (it is
+set in `c-unit.yml`'s `memory-gate-leak` build row, not here) to **600000**, measured
+locally at min-of-4 166.1 MB and confirmed by CI: run 33707744137's control reports
+`peak_rss regressed: 156.5 MB vs baseline 58.0 MB (+169.8%, allowed +5%)` — **+169.8%, or
+34× the tolerance**. `ci/tests/test_memory_gate.py` asserts the 2× rule against the
+conservative 200000 figure,
 so raising the tolerance past half the measured control margin is a failing test rather
 than a judgement call. Leak injection now `memset`s the whole block: RSS counts *resident*
 pages, and a leak whose pages were committed-but-untouched moved the peak by an amount

@@ -948,7 +948,14 @@ would need a matching edit to `c-unit.yml`'s run loops.
 
 **Control margin.** The `MI_BENCH_INJECT_LEAK=200000` build reads min-of-8 82.6 / 82.4 /
 82.5 MB on those same three VMs — **+42.1%**, or 8.4× the tolerance, against a rule that
-the control must fire by at least 2×. `ci/tests/test_memory_gate.py` asserts that ratio,
+the control must fire by at least 2×. CI confirms it on both gated metrics: run
+33701827771's controls report `peak_rss regressed: 82.5 MB vs baseline 58.0 MB (+42.2%)`
+and `peak_commit regressed: 113.7 MB vs baseline 74.4 MB (+52.8%)`. Note that the control
+no longer fires at ~3× the baseline as it did before this change — the injected leak is
+still the same ~32 MB, but the structural peak it has to clear went from ~22 MB to 58 MB.
+The rule that matters (≥2× the tolerance) is met with a factor of four to spare; if a
+larger absolute ratio is wanted, `MI_BENCH_INJECT_LEAK` is set in the workflow, so raising
+it belongs with #307's `c-unit.yml` rewrite rather than here. `ci/tests/test_memory_gate.py` asserts that ratio,
 so raising the tolerance past half the measured control margin is a failing test rather
 than a judgement call. Leak injection now `memset`s the whole block: RSS counts *resident*
 pages, and a leak whose pages were committed-but-untouched moved the peak by an amount
@@ -956,11 +963,13 @@ that depended on purge timing — one measured batch had a control run land with
 the clean baseline, i.e. the control came within one sample of silently not firing.
 
 **Baselines.** `linux-pprof1.json` re-recorded at 58.0 MB (min-of-16, 0.9% spread) from
-run 33700518749; independently confirmed on a fourth runner VM by run 33701098707, which
-read min-of-8 58.2 MB at 0.7% spread against it.
+run 33700518749; independently confirmed on two further runner VMs by runs 33701098707
+(min-of-8 58.2 MB, 0.7% spread) and 33701827771 (58.1 MB, 0.7%), for five independent
+`ubuntu-latest` VMs in total, all reading 58.0-58.2 MB.
 
 `windows-pprof1.json` re-recorded at **74.4 MB (min-of-8, 0.1% spread)** from run
-33701098707, because a workload change invalidates every baseline, not just the flaky one.
+33701098707, and reproduced exactly by run 33701827771 (min-of-8 74.4 MB, 0.1% spread) on
+a second Windows runner — two runs, not one. Re-recorded because a workload change invalidates every baseline, not just the flaky one.
 Windows was never the *failing* lane but it was the noisy one: across the same twelve
 `main` runs it read min-of-8 51.2–57.0 MB (11.3% across runs) with within-run spreads of
 3.9–17.5%, and its committed baseline had itself been recorded at 9.9% spread. The

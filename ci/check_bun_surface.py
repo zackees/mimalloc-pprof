@@ -15,7 +15,8 @@ against the result. This script reproduces exactly that build outside CMake:
 
 `mi_on_thread_idle` (Bun parity P7a, issue #299) merged to `main` in `1dbbb8df`, so as of
 2026-09-02 step 3 reports zero missing symbols on both glibc and musl (alpine:3.20). The
-CI job calling this script (`.github/workflows/c-unit.yml`, job `bun-surface`) is a hard
+CI jobs calling this script (`.github/workflows/c-unit.yml`: `build-bun-objects`
+compiles, `run-linux` links and runs) are a hard
 gate: this script exits 1 whenever any symbol is missing, an ABI static_assert fails, or
 the resulting binary doesn't run clean, and that now blocks merge.
 

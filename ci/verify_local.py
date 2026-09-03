@@ -273,7 +273,7 @@ def ctest_run(
 
 
 def run_release(ctx: RunCtx) -> bool:
-    """c-unit.yml job `ctest` (ubuntu-latest): cmake -B build -DMI_PPROF=ON; Release."""
+    """c-unit.yml `build (release)` + its slice of `run-linux`: -DMI_PPROF=ON, Release."""
     build = ctx.dir / "build"
     rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON"])
     if rc:
@@ -284,7 +284,7 @@ def run_release(ctx: RunCtx) -> bool:
 
 
 def run_off(ctx: RunCtx) -> bool:
-    """c-unit.yml job `ctest-pprof-off`: cmake -B build -DMI_PPROF=OFF."""
+    """c-unit.yml `build (pprof-off)` + its slice of `run-linux`: -DMI_PPROF=OFF."""
     build = ctx.dir / "build"
     rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=OFF"])
     if rc:
@@ -295,7 +295,7 @@ def run_off(ctx: RunCtx) -> bool:
 
 
 def run_debug_full(ctx: RunCtx) -> bool:
-    """c-unit.yml job `ctest-debug-full` (ubuntu-latest): -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug."""
+    """c-unit.yml `build (debug-full)` + its slice of `run-linux`: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug."""
     build = ctx.dir / "build"
     rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON"])
     if rc:
@@ -306,7 +306,13 @@ def run_debug_full(ctx: RunCtx) -> bool:
 
 
 def run_bundle(ctx: RunCtx) -> bool:
-    """c-unit.yml job `bundle-roundtrip`: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug.
+    """Bundle/ctest pass-and-fail equivalence: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug.
+
+    This is the half of #277 phase A's `bundle-roundtrip` job that CI can no longer run:
+    since #307 the run stage has no build tree, so there is no native ctest result to
+    compare against there (it checks executed-vs-registered *names* instead, with
+    ci/bundle_coverage.py). A build tree exists here, so the stronger claim -- same names
+    AND same pass/fail -- is still worth making, and this is where it lives now.
 
     Builds, records a reference `ctest --output-junit`, bundles with
     `ci/bundle_tests.py`, moves the build tree away so the executables' RPATH cannot
@@ -372,8 +378,9 @@ def run_bundle(ctx: RunCtx) -> bool:
 
 
 def run_guarded(ctx: RunCtx) -> bool:
-    """c-unit.yml job `ctest-guarded`: Debug + MI_GUARDED=ON, ctest twice (plain, then
-    with MIMALLOC_GUARDED_SAMPLE_RATE=1 forcing guarding on every allocation)."""
+    """c-unit.yml `build (guarded)` + its slice of `run-linux`: Debug + MI_GUARDED=ON, run
+    twice -- plain, then with MIMALLOC_GUARDED_SAMPLE_RATE=1 forcing guarding on every
+    allocation (in CI that second pass is an `--env-variant` scoped to this bundle)."""
     build = ctx.dir / "build-guarded"
     rc, configure_out = cmake_configure(
         ctx, build, ["-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_GUARDED=ON"]
@@ -395,7 +402,7 @@ def run_guarded(ctx: RunCtx) -> bool:
 
 
 def run_shared(ctx: RunCtx) -> bool:
-    """c-unit.yml job `ctest-shared` (ubuntu-latest): shared lib only, no static/object."""
+    """c-unit.yml `build (shared)` + its slice of `run-linux`: shared lib only, no static/object."""
     build = ctx.dir / "build"
     args = [
         "-DMI_PPROF=ON",
@@ -443,7 +450,7 @@ def run_gate_binary_pinned(ctx: RunCtx, binary: Path, out_dir: Path, runs: int =
 
 
 def run_memory_gate(ctx: RunCtx) -> bool:
-    """c-unit.yml job `memory-gate` (ubuntu-latest). Calls ci/memory_gate.py's `check`/
+    """c-unit.yml `run-linux`'s memory gate. Calls ci/memory_gate.py's `check`/
     `control` comparison functions directly (rather than shelling to `memory_gate.py
     check` with no args) so binary discovery is pinned to THIS config's own build dir
     -- with several configs building concurrently, the module's mtime-based
@@ -504,9 +511,11 @@ def run_memory_gate(ctx: RunCtx) -> bool:
 
 
 def run_diag(ctx: RunCtx) -> bool:
-    """c-unit.yml jobs `diagnostic-gates` AND the ubuntu-latest (x64) half of
-    `isa-baseline` -- both are cheap, ubuntu-only diagnostic checks over the same
-    kind of throwaway `mimalloc-static`-only build, so they share one config.
+    """c-unit.yml `run-linux`'s diagnostic gates AND its x64 `isa-baseline` scans --
+    both are cheap, ubuntu-only diagnostic checks over the same kind of throwaway
+    `mimalloc-static`-only build, so they share one config. (In CI those builds are the
+    `diag-pprof-*` and `isa-*` rows of the `build` matrix and the scans happen in the run
+    stage; here there is one machine, so build and scan stay together.)
 
     Shells out to `uv run ci/<script>.py` for each check (rather than importing the
     module and calling its argparse-driven `main()` in-process) so there is no need to
@@ -761,32 +770,48 @@ def _need_uv() -> str | None:
 
 
 CONFIGS: list[ConfigSpec] = [
-    ConfigSpec("release", "c-unit.yml: ctest", "Release, MI_PPROF=ON, full ctest", run_release),
-    ConfigSpec("off", "c-unit.yml: ctest-pprof-off", "MI_PPROF=OFF, full ctest", run_off),
     ConfigSpec(
-        "debug-full", "c-unit.yml: ctest-debug-full", "Debug, MI_DEBUG_FULL=ON", run_debug_full
+        "release",
+        "c-unit.yml: build(release)+run-linux",
+        "Release, MI_PPROF=ON, full ctest",
+        run_release,
     ),
     ConfigSpec(
-        "guarded", "c-unit.yml: ctest-guarded", "Debug, MI_GUARDED=ON, ctest x2", run_guarded
+        "off", "c-unit.yml: build(pprof-off)+run-linux", "MI_PPROF=OFF, full ctest", run_off
     ),
     ConfigSpec(
-        "shared", "c-unit.yml: ctest-shared", "shared lib only, no static/object", run_shared
+        "debug-full",
+        "c-unit.yml: build(debug-full)+run-linux",
+        "Debug, MI_DEBUG_FULL=ON",
+        run_debug_full,
+    ),
+    ConfigSpec(
+        "guarded",
+        "c-unit.yml: build(guarded)+run-linux",
+        "Debug, MI_GUARDED=ON, run x2",
+        run_guarded,
+    ),
+    ConfigSpec(
+        "shared",
+        "c-unit.yml: build(shared)+run-linux",
+        "shared lib only, no static/object",
+        run_shared,
     ),
     ConfigSpec(
         "bundle",
-        "c-unit.yml: bundle-roundtrip",
+        "local only: bundle pass/fail equivalence",
         "ctest vs. portable test bundle, build tree removed",
         run_bundle,
     ),
     ConfigSpec(
         "memory-gate",
-        "c-unit.yml: memory-gate",
+        "c-unit.yml: run-linux memory gate",
         "min-of-8 peak-memory regression gate",
         run_memory_gate,
     ),
     ConfigSpec(
         "diag",
-        "c-unit.yml: diagnostic-gates + isa-baseline(x64)",
+        "c-unit.yml: run-linux diag + isa(x64)",
         "internal-state/release/ISA gates",
         run_diag,
         _need_uv,

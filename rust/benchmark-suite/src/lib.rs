@@ -1,4 +1,4 @@
-//! Native, isolated four-allocator benchmark producer.
+//! Native, isolated five-allocator benchmark producer.
 //!
 //! Phase 2 writes raw, paired measurements only. Statistical publication is
 //! intentionally deferred to Phase 3.

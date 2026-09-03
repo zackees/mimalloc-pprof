@@ -306,8 +306,9 @@ fn key_input() -> ComparisonKeyInput {
         allocators: vec![
             allocator("jemalloc", 'a'),
             allocator("mimalloc-pprof", 'b'),
-            allocator("tcmalloc", 'c'),
-            allocator("upstream-mimalloc", 'd'),
+            allocator("bun-mimalloc", 'c'),
+            allocator("tcmalloc", 'd'),
+            allocator("upstream-mimalloc", 'e'),
         ],
         runner: RunnerCompatibility {
             runner_class: "github-hosted".to_owned(),

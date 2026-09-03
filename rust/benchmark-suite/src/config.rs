@@ -57,6 +57,7 @@ impl AllocatorLock {
             "tcmalloc",
             "jemalloc",
             "upstream-mimalloc",
+            "bun-mimalloc",
             "mimalloc-pprof",
         ];
         if lock.schema_version != 1
@@ -68,7 +69,7 @@ impl AllocatorLock {
                 .collect::<Vec<_>>()
                 != expected
         {
-            return Err("lockfile must define the exact four Linux allocator IDs in order".into());
+            return Err("lockfile must define the exact five Linux allocator IDs in order".into());
         }
         for pin in &lock.allocators {
             if pin.repository_is_invalid()
@@ -95,6 +96,10 @@ impl AllocatorLock {
                 "upstream-mimalloc" => {
                     pin.pin == "dev3@bcee5a88"
                         && pin.source.commit == "bcee5a88e9311c08b8f93fbce3dcafe2f22a2d26"
+                }
+                "bun-mimalloc" => {
+                    pin.pin == "bun-dev3-v2@b20b60d9"
+                        && pin.source.commit == "b20b60d959093b1bc0e24306ec72ccacb3e46fb9"
                 }
                 "mimalloc-pprof" => {
                     pin.pin == "workflow-source" && pin.source.commit == "workflow-source"

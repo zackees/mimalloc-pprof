@@ -153,7 +153,13 @@ fn every_allocator_replays_one_stream_inside_a_paired_block() {
     // identical by construction. Prove it end to end through execution.
     for pattern in SCALING_PATTERNS {
         let mut observed: Vec<(u64, u64, u64, u64)> = Vec::new();
-        for allocator in ["tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof"] {
+        for allocator in [
+            "tcmalloc",
+            "jemalloc",
+            "upstream-mimalloc",
+            "bun-mimalloc",
+            "mimalloc-pprof",
+        ] {
             let adapter = MockAdapter::new(allocator);
             let request = request_for(pattern, 4, 1, allocator, 300);
             let response = execute_scaling_child_request(&adapter, request).unwrap();
@@ -293,7 +299,7 @@ fn complete_fixture_validates_and_builds_a_report() {
     assert_eq!(report.thread_points, SCALING_THREAD_POINTS.to_vec());
     assert_eq!(
         report.cell_summaries.len(),
-        SCALING_PATTERNS.len() * SCALING_THREAD_POINTS.len() * 4
+        SCALING_PATTERNS.len() * SCALING_THREAD_POINTS.len() * 5
     );
     assert!(report
         .cell_summaries
@@ -547,7 +553,7 @@ fn overlay_accepts_a_newer_fork_build_but_not_a_moved_competitor_pin() {
         attach_scaling_report(&mut fresh, moved_pin).is_err(),
         "a competitor built from a different commit must be rejected"
     );
-    assert_eq!(LOCK_PINNED_ALLOCATORS.len(), 3);
+    assert_eq!(LOCK_PINNED_ALLOCATORS.len(), 4);
 }
 
 #[test]

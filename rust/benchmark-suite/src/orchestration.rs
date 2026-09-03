@@ -8,10 +8,11 @@ use crate::model::{
     AllocatorIdentity, BenchmarkChildRequest, BenchmarkChildResponse, RawRun, RawSample,
 };
 
-pub const ALLOCATOR_IDS: [&str; 4] = [
+pub const ALLOCATOR_IDS: [&str; 5] = [
     "tcmalloc",
     "jemalloc",
     "upstream-mimalloc",
+    "bun-mimalloc",
     "mimalloc-pprof",
 ];
 
@@ -160,7 +161,7 @@ where
         return Err("child timeout must be nonzero".into());
     }
     if plan.children.len() != ALLOCATOR_IDS.len() {
-        return Err("exactly four directly linked child programs are required".into());
+        return Err("exactly five directly linked child programs are required".into());
     }
     for allocator in ALLOCATOR_IDS {
         let matches = plan
@@ -346,7 +347,7 @@ fn shell_quote(value: &str) -> String {
 pub struct BlockOrder {
     pub block_id: u32,
     pub workload_seed: u64,
-    pub allocator_ids: [String; 4],
+    pub allocator_ids: [String; 5],
 }
 
 /// Deterministically balances every ordinal position without selective retries.
@@ -358,9 +359,10 @@ pub fn balanced_block_orders(blocks: u32, run_seed: u64) -> Result<Vec<BlockOrde
     deterministic_shuffle(&mut base, run_seed);
     Ok((0..blocks)
         .map(|block_id| {
-            let rotation = (block_id % 4) as usize;
-            let allocator_ids =
-                std::array::from_fn(|ordinal| base[(ordinal + rotation) % 4].clone());
+            let rotation = (block_id as usize) % ALLOCATOR_IDS.len();
+            let allocator_ids = std::array::from_fn(|ordinal| {
+                base[(ordinal + rotation) % ALLOCATOR_IDS.len()].clone()
+            });
             BlockOrder {
                 block_id,
                 workload_seed: splitmix64(run_seed.wrapping_add(block_id as u64)),
@@ -370,14 +372,14 @@ pub fn balanced_block_orders(blocks: u32, run_seed: u64) -> Result<Vec<BlockOrde
         .collect())
 }
 
-/// Check the `floor(blocks/4)`/`ceil(blocks/4)` ordinal requirement.
+/// Check the `floor(blocks/5)`/`ceil(blocks/5)` ordinal requirement.
 pub fn validate_near_balanced(orders: &[BlockOrder]) -> Result<(), String> {
     if orders.is_empty() {
         return Err("no blocks supplied".into());
     }
-    let floor = orders.len() / 4;
-    let ceiling = (orders.len() + 3) / 4;
-    for ordinal in 0..4 {
+    let floor = orders.len() / ALLOCATOR_IDS.len();
+    let ceiling = orders.len().div_ceil(ALLOCATOR_IDS.len());
+    for ordinal in 0..ALLOCATOR_IDS.len() {
         for allocator in ALLOCATOR_IDS {
             let count = orders
                 .iter()
@@ -392,7 +394,7 @@ pub fn validate_near_balanced(orders: &[BlockOrder]) -> Result<(), String> {
 }
 
 /// A calibrated count belongs to one scenario/thread cell and is immutable for
-/// the complete four-allocator run.
+/// the complete five-allocator run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrozenCalibration {
     pub scenario_id: String,
@@ -440,7 +442,7 @@ pub fn validate_complete_raw_run(run: &RawRun, expected_blocks: u32) -> Result<(
         return Err("reduced smoke raw runs require exactly one block".into());
     }
     if run.samples.len() != expected_blocks as usize * ALLOCATOR_IDS.len() {
-        return Err("raw run does not contain exactly four samples per block".into());
+        return Err("raw run does not contain exactly five samples per block".into());
     }
     for block in 0..expected_blocks {
         let samples: Vec<&RawSample> = run
@@ -448,13 +450,13 @@ pub fn validate_complete_raw_run(run: &RawRun, expected_blocks: u32) -> Result<(
             .iter()
             .filter(|sample| sample.block_id == block)
             .collect();
-        if samples.len() != 4 {
+        if samples.len() != ALLOCATOR_IDS.len() {
             return Err(format!("block {block} is incomplete"));
         }
-        let mut seen_ordinals = [false; 4];
+        let mut seen_ordinals = [false; ALLOCATOR_IDS.len()];
         for sample in &samples {
             let ordinal = sample.ordinal as usize;
-            if ordinal >= 4 || seen_ordinals[ordinal] {
+            if ordinal >= ALLOCATOR_IDS.len() || seen_ordinals[ordinal] {
                 return Err(format!("block {block} has duplicate or invalid ordinals"));
             }
             seen_ordinals[ordinal] = true;
@@ -495,7 +497,7 @@ pub fn validate_complete_raw_run(run: &RawRun, expected_blocks: u32) -> Result<(
 }
 
 /// Contract check for the planted mutex-serialized control. It is kept out of
-/// headline output and exists only to prove the complete four-child/block path
+/// headline output and exists only to prove the complete five-child/block path
 /// remains sensitive to an intentionally slower execution mode.
 pub fn detect_planted_serialized_control(
     normal: &RawRun,
@@ -543,7 +545,7 @@ pub fn detect_planted_serialized_control(
     Ok(ratio)
 }
 
-fn deterministic_shuffle(values: &mut [String; 4], mut state: u64) {
+fn deterministic_shuffle(values: &mut [String; 5], mut state: u64) {
     for index in (1..values.len()).rev() {
         state = splitmix64(state);
         values.swap(index, (state as usize) % (index + 1));

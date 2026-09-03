@@ -44,7 +44,7 @@ pub fn benchmark_run_main() -> Result<(), String> {
 
 fn run(options: Options) -> Result<(), String> {
     if cfg!(not(target_os = "linux")) {
-        return Err("the four-allocator producer is Linux-only".into());
+        return Err("the five-allocator producer is Linux-only".into());
     }
     if options.output_dir.exists() {
         return Err(format!(
@@ -397,6 +397,18 @@ fn publication_options(id: &str) -> AllocatorFeatureOptions {
         "upstream-mimalloc" => AllocatorFeatureOptions {
             pprof_compiled: Disabled,
             pprof_runtime: Disabled,
+            memory_events_compiled: NotApplicable,
+            memory_events_runtime: NotApplicable,
+            frame_pointers: Enabled,
+            opt_arch: Disabled,
+            opt_simd: Enabled,
+        },
+        "bun-mimalloc" => AllocatorFeatureOptions {
+            // Bun's fork carries no MI_PPROF or memory-events option at all, so
+            // both are not-applicable rather than disabled; the architecture
+            // options are pinned to the same values as the other mimalloc rows.
+            pprof_compiled: NotApplicable,
+            pprof_runtime: NotApplicable,
             memory_events_compiled: NotApplicable,
             memory_events_runtime: NotApplicable,
             frame_pointers: Enabled,

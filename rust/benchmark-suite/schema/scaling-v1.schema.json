@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://zackees.github.io/mimalloc-pprof/schema/scaling-v1.schema.json",
   "title": "throughput-scaling-sparse-v1 metric report",
-  "description": "Sparse thread-scaling sweep: four seeded random allocation patterns measured at literal worker counts 1/4/16 for four allocators. This is an explicit coverage-mode downgrade of the dense scaling protocol: three blocks per cell, median with min/max, and deliberately no bootstrap intervals or noise gating. Every consumer must surface the rigor label.",
+  "description": "Sparse thread-scaling sweep: four seeded random allocation patterns measured at literal worker counts 1/4/16 for five allocators. This is an explicit coverage-mode downgrade of the dense scaling protocol: three blocks per cell, median with min/max, and deliberately no bootstrap intervals or noise gating. Every consumer must surface the rigor label.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -137,7 +137,7 @@
         "seed_chain": {
           "type": "string",
           "minLength": 1,
-          "description": "splitmix64 chain over (run seed, pattern tag, thread count, block, worker). The allocator is deliberately absent, which is what makes a paired block replay one identical stream for all four allocators."
+          "description": "splitmix64 chain over (run seed, pattern tag, thread count, block, worker). The allocator is deliberately absent, which is what makes a paired block replay one identical stream for all five allocators."
         },
         "pairing": { "type": "string", "minLength": 1 },
         "work_normalization": { "type": "string", "minLength": 1 },
@@ -152,9 +152,9 @@
     },
     "cell_summaries": {
       "type": "array",
-      "minItems": 48,
-      "maxItems": 48,
-      "description": "4 patterns x 3 thread points x 4 allocators.",
+      "minItems": 60,
+      "maxItems": 60,
+      "description": "4 patterns x 3 thread points x 5 allocators.",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -179,7 +179,13 @@
             "description": "True exactly when the factor exceeds 1.0. Oversubscribed points are honest contention data, never core scaling."
           },
           "allocator_id": {
-            "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof"]
+            "enum": [
+            "tcmalloc",
+            "jemalloc",
+            "upstream-mimalloc",
+            "bun-mimalloc",
+            "mimalloc-pprof"
+          ]
           },
           "block_count": { "const": 3 },
           "median_throughput": { "type": "number", "exclusiveMinimum": 0 },
@@ -195,9 +201,9 @@
     },
     "raw_samples": {
       "type": "array",
-      "minItems": 144,
-      "maxItems": 144,
-      "description": "Every measured block is retained, not only summaries: 48 cells x 3 blocks.",
+      "minItems": 180,
+      "maxItems": 180,
+      "description": "Every measured block is retained, not only summaries: 60 cells x 3 blocks.",
       "items": { "$ref": "#/$defs/rawSample" }
     }
   },
@@ -252,14 +258,20 @@
         "pattern": { "type": "string", "minLength": 1 },
         "thread_count": { "type": "integer", "minimum": 1 },
         "allocator_id": {
-          "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof"]
+          "enum": [
+            "tcmalloc",
+            "jemalloc",
+            "upstream-mimalloc",
+            "bun-mimalloc",
+            "mimalloc-pprof"
+          ]
         },
         "allocator_source_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
         "child_binary_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "operations_per_worker": {
           "type": "integer",
           "minimum": 1,
-          "description": "Frozen across all four allocators at a given (pattern, thread point); total work scales with worker count."
+          "description": "Frozen across all five allocators at a given (pattern, thread point); total work scales with worker count."
         },
         "reproduction_command": {
           "type": "string",

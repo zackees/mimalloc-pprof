@@ -5,7 +5,12 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::orchestration::ALLOCATOR_IDS;
 use crate::provenance::sha256_bytes;
+
+/// The locked headline allocator count; a comparison key is only meaningful
+/// when every locked allocator contributed to the run.
+const ALLOCATOR_COUNT: usize = ALLOCATOR_IDS.len();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComparisonKeyError(String);
@@ -217,9 +222,9 @@ pub fn comparison_key(input: &ComparisonKeyInput) -> Result<ComparisonKey, Compa
 }
 
 fn validate_shape(input: &ComparisonKeyInput) -> Result<(), ComparisonKeyError> {
-    if input.allocators.len() != 4 {
+    if input.allocators.len() != ALLOCATOR_COUNT {
         return Err(ComparisonKeyError::new(
-            "comparison key requires exactly four allocator identities",
+            "comparison key requires exactly five allocator identities",
         ));
     }
     let allocator_ids: BTreeSet<&str> = input

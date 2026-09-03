@@ -257,6 +257,7 @@ fn memory_fixture() -> MemoryRawRun {
                 "tcmalloc" => 120,
                 "jemalloc" => 110,
                 "upstream-mimalloc" => 100,
+                "bun-mimalloc" => 95,
                 "mimalloc-pprof" => 90,
                 _ => unreachable!(),
             } + u64::from(child_sample.block_id);
@@ -349,9 +350,9 @@ fn complete_memory_fixture_uses_paired_lower_is_better_statistics() {
     validate_memory_raw_run(&raw).unwrap();
     let report = build_memory_report(&raw).unwrap();
     assert_eq!(report.status, "complete");
-    assert_eq!(report.raw_samples.len(), 7 * 15 * 4);
-    assert_eq!(report.absolute_summaries.len(), 7 * 5 * 4);
-    assert_eq!(report.paired_summaries.len(), 7 * 5 * 3);
+    assert_eq!(report.raw_samples.len(), 7 * 15 * 5);
+    assert_eq!(report.absolute_summaries.len(), 7 * 5 * 5);
+    assert_eq!(report.paired_summaries.len(), 7 * 5 * 4);
     let planted = report
         .paired_summaries
         .iter()

@@ -3,8 +3,14 @@
   "builder": "synthetic_full_fixture",
   "expected_schema_version": "benchmark-raw-v1",
   "expected_suite_version": "core-throughput-v1",
-  "expected_allocator_ids": ["tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof"],
+  "expected_allocator_ids": [
+    "tcmalloc",
+    "jemalloc",
+    "upstream-mimalloc",
+    "bun-mimalloc",
+    "mimalloc-pprof"
+  ],
   "expected_cells": 30,
   "expected_blocks_per_cell": 15,
-  "expected_samples": 1800
+  "expected_samples": 2250
 }

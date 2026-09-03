@@ -353,7 +353,7 @@ impl BenchmarkChildRequest {
             return Err("unknown benchmark execution mode".into());
         }
         self.allocator.validate()?;
-        if self.ordinal >= 4
+        if self.ordinal >= crate::orchestration::ALLOCATOR_IDS.len() as u8
             || self.physical_cores == 0
             || self.logical_cores == 0
             || self.physical_cores > self.logical_cores
@@ -506,7 +506,7 @@ impl RawSample {
             || self.operation_count == 0
             || self.requested_transactions == 0
             || self.completed_transactions != self.requested_transactions
-            || self.ordinal >= 4
+            || self.ordinal >= crate::orchestration::ALLOCATOR_IDS.len() as u8
             || self.thread_count == 0
         {
             return Err("raw sample has invalid identity, timing, or transaction counts".into());

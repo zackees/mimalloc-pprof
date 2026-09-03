@@ -1,5 +1,40 @@
 name: c-unit
 
+# Two stages, one build per configuration (issue #307).
+#
+# This workflow used to be 16 jobs that each checked out, configured and REBUILT the
+# library for one configuration and then ran one slice of the suite. Run 33699111919 was
+# 20 jobs and 74 billed runner-minutes, most of it the same compile over and over. The
+# owner's direction was blunt: "All the tests need to be created all at once, all the
+# time, and then the runners need to run all the tests all at the same time, not a bunch
+# of tests that rebuild the product over and over."
+#
+# So:
+#
+#   1. `build` compiles every configuration exactly once, in parallel, and uploads a
+#      portable *test bundle* (`ci/bundle_tests.py`, #277 phase A) plus the
+#      `ctest --show-only=json-v1` enumeration of what that tree registers.
+#   2. `run-linux` downloads every Linux bundle and executes ALL of them in one wave
+#      (`ci/run_test_bundle.py --bundles ... --jobs 4`), then the gates that need the
+#      machine to itself. No CMake, no compiler, no build tree.
+#
+# The two rules that keep this honest:
+#
+#   * No test may be dropped. `ci/bundle_coverage.py` compares each build job's
+#     `show-only` name list against the names the run stage actually EXECUTED (from its
+#     JUnit) and fails on anything missing. A bundle that silently contains fewer tests
+#     than its tree registered, or a run that silently skips one, is red.
+#   * Concurrency must not change what a test asserts. Tests that measure process-wide
+#     RSS or a wall-clock deadline carry `RUN_SERIAL` in CMakeLists.txt; the bundler
+#     lowers that to a `serial` flag and the runner holds them back and runs them alone
+#     after the parallel wave. That is the mechanism for a test that passes serially and
+#     fails under load -- not a retry.
+#
+# Windows: CLAUDE.md rule 3's native `cl` gate is preserved by name and by toolchain
+# (`build-windows-native` compiles it with Microsoft's compiler, `run-windows-native`
+# runs it and is still called `ctest (windows-latest)`). Everything win-gnu, and the
+# cross-built MSVC-ABI comparison arms, live in `windows-bundles.yml` and are untouched.
+
 on:
   push:
     branches: [main, v4]
@@ -18,447 +53,551 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # THE RETAINED NATIVE MSVC GATE (#277 phase D). Every other windows-latest row in this
-  # repository is now informational, replaced by Linux-cross-built bundles that
-  # windows-bundles.yml's `run-windows` executes on one shared VM. This one is not, and
-  # must not become so without the owner amending CLAUDE.md rule 3 ("MSVC and win-gnu are
-  # priority platforms -- both, always"): the bundles are built by clang-cl, and a
-  # clang-cl binary is not a `cl` binary. clang-cl accepts `__attribute__`s that cl
-  # rejects, and cl's codegen, TLS lowering and DLL runtime are its own. This job is the
-  # only thing in CI that compiles this tree with Microsoft's compiler and runs the
-  # result. Do NOT add continue-on-error here.
-  ctest:
+  # ------------------------------------------------------------------------------------
+  # STAGE 1 -- every configuration, built exactly once, in parallel.
+  # ------------------------------------------------------------------------------------
+  #
+  # `kind` says what the job produces:
+  #
+  #   bundle  a `ci/bundle_tests.py` test bundle + its `show-only` enumeration. The run
+  #           stage executes it.
+  #   lib     a static library (and, for the diagnostic rows, `compile_commands.json`).
+  #           The run stage scans it; there is nothing to execute.
+  #   control a full bundle that must NOT be executed -- the deliberately leaky build the
+  #           memory gate's positive control needs. Same shape as windows-bundles.yml's
+  #           `*-leak` rows, and for the same reason: MI_BENCH_INJECT_LEAK is a separate
+  #           BUILD, so it cannot be an extra entry in another bundle's manifest.
+  build:
+    name: build (${{ matrix.config }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - config: release
+            container: ''
+            python: uv run
+            cmake: -DMI_PPROF=ON
+            build_config: Release
+            kind: bundle
+          - config: pprof-off
+            container: ''
+            python: uv run
+            cmake: -DMI_PPROF=OFF
+            kind: bundle
+          - config: debug-full
+            container: ''
+            python: uv run
+            # The awkward config: 6 `cmake -P run-negative.cmake` negative controls and a
+            # `cmake -E env` LD_PRELOAD wrapper, none of which is a plain argv. If the
+            # bundle format can carry this one it can carry anything (#277 phase A).
+            cmake: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
+            build_config: Debug
+            kind: bundle
+          - config: guarded
+            container: ''
+            python: uv run
+            # MI_GUARDED was documented as default-on in debug builds and had never once
+            # been enabled -- two dead CMake constructs (#116). The configure output is
+            # asserted below because the original bug was the flag not reaching the
+            # compiler at all, which no test could have caught.
+            cmake: -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_GUARDED=ON
+            assert_defines: MI_GUARDED=1
+            kind: bundle
+          - config: shared
+            container: ''
+            python: uv run
+            # Our src/static.c amalgamation compiles everything as one TU, which hides
+            # link errors that only appear when the library is a real DLL/so (#62).
+            cmake: -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
+            build_config: Release
+            kind: bundle
+          - config: musl
+            # Bun ships musl builds (`MI_LIBC_MUSL=1`, `-ftls-model=local-dynamic`);
+            # our CMake option compiled but nothing ran it, so "compiles" was not
+            # evidence (#273 8a). Alpine has no `uv`, and the node the runner injects for
+            # actions is the musl one, so this row drives the bundler with the container's
+            # own `python3` -- every ci/ script involved is stdlib-only by design.
+            container: alpine:3.20
+            python: python3
+            generator: -G Ninja
+            cmake: -DMI_LIBC_MUSL=ON -DMI_PPROF=ON -DCMAKE_C_FLAGS=-ftls-model=local-dynamic
+            kind: bundle
+          - config: musl-pprof-off
+            container: alpine:3.20
+            python: python3
+            generator: -G Ninja
+            cmake: -DMI_LIBC_MUSL=ON -DMI_PPROF=OFF -DCMAKE_C_FLAGS=-ftls-model=local-dynamic
+            kind: bundle
+          - config: memory-gate-leak
+            container: ''
+            python: uv run
+            cmake: -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
+            build_config: Release
+            kind: control
+          - config: isa-portable
+            container: ''
+            python: uv run
+            # Distro packagers build for a generic CPU. The run stage scans the shipped
+            # instruction stream rather than trusting the flag.
+            cmake: -DMI_PPROF=ON -DMI_NO_OPT_ARCH=ON
+            target: mimalloc-static
+            kind: lib
+          - config: isa-arch
+            container: ''
+            python: uv run
+            # The positive control: a check that has never been observed to fail proves
+            # nothing, so the same scanner must fire on this one.
+            cmake: -DMI_PPROF=ON -DMI_OPT_ARCH=ON
+            target: mimalloc-static
+            kind: lib
+          - config: diag-pprof-on
+            container: ''
+            python: uv run
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_DEBUG=OFF -DMI_PPROF=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+            target: mimalloc-static
+            kind: lib
+          - config: diag-pprof-off
+            container: ''
+            python: uv run
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_DEBUG=OFF -DMI_PPROF=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+            target: mimalloc-static
+            kind: lib
     steps:
+      # Before checkout: actions/checkout needs `git` on PATH, which alpine's base image
+      # does not carry. `tar` too -- busybox's applet cannot write the gzip archive the
+      # run stage unpacks with GNU tar.
+      - name: Install build dependencies (alpine only)
+        if: matrix.container != ''
+        run: apk add --no-cache build-base cmake ninja python3 git tar
       - uses: actions/checkout@v4
-      - run: cmake -B build -DMI_PPROF=ON
-      - run: cmake --build build --config Release
-      - run: ctest --test-dir build -C Release --output-on-failure
-
-  # Distro packagers build for a generic CPU. Verify a MI_NO_OPT_ARCH=ON build really
-  # is baseline-clean, by scanning the shipped instruction stream rather than trusting
-  # the flags.
-  #
-  # Runners are both Linux on purpose: x64 covers the x86-64-v1 baseline, and
-  # ubuntu-24.04-arm covers Debian's armv8.0-a arm64 baseline -- the case that actually
-  # bites, since CMakeLists.txt force-enables MI_OPT_ARCH on arm64. macOS is NOT used
-  # here: Apple Silicon is the baseline on that platform, so LSE atomics are expected
-  # there and a "clean" result would mean nothing.
-  isa-baseline:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      # The disassembly parser is itself a thing that can silently break (it did, on
-      # arm64). Fixtures for both layouts, checked on every runner.
-      - name: Disassembly parser selftest
-        run: python3 ci/check_isa_baseline.py --selftest
-      - name: Portable build must contain no above-baseline instructions
-        run: |
-          cmake -B build-portable -DMI_PPROF=ON -DMI_NO_OPT_ARCH=ON
-          cmake --build build-portable --target mimalloc-static
-          python3 ci/check_isa_baseline.py "$(ls build-portable/libmimalloc*.a | head -1)"
-      # A check that has never been observed to fail proves nothing. Build with the
-      # optimizations deliberately on and require the same scanner to catch it.
-      - name: Positive control -- scanner must fire on an MI_OPT_ARCH=ON build
-        run: |
-          cmake -B build-arch -DMI_PPROF=ON -DMI_OPT_ARCH=ON
-          cmake --build build-arch --target mimalloc-static
-          python3 ci/check_isa_baseline.py "$(ls build-arch/libmimalloc*.a | head -1)" --expect-dirty
-      - name: Upload portable library
-        uses: actions/upload-artifact@v4
-        with:
-          name: mimalloc-portable-${{ matrix.os }}
-          path: build-portable/libmimalloc*.a
-
-  # MI_GUARDED places guard pages behind sampled allocations. It was documented as
-  # default-on in debug builds and was NEVER enabled -- two dead CMake constructs (see
-  # #116). Now that it can turn on, it needs a job that actually builds with it, or we
-  # have simply moved the flag from "silently off" to "on and untested".
-  ctest-guarded:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure and prove MI_GUARDED survived
-        run: |
-          set -euo pipefail
-          cmake -B build-guarded -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_GUARDED=ON 2>&1 | tee cfg.log
-          # The whole point of #116 is that the flag silently did not reach the compiler.
-          # Assert on the resolved defines, not on the option we passed in.
-          if ! grep -qE "Compiler defines *:.*MI_GUARDED=1" cfg.log; then
-            echo "::error::MI_GUARDED=1 did not reach mi_defines -- the flag is not actually enabled."
-            grep -i "guard\|Compiler defines" cfg.log || true
-            exit 1
-          fi
-      - run: cmake --build build-guarded --parallel
-      - run: ctest --test-dir build-guarded --output-on-failure --timeout 900
-      # Guard every in-range allocation instead of 1-in-4000, so the guarded path is
-      # actually exercised rather than sampled into. Withheld earlier over two problems,
-      # both now resolved: the count assertion was T7's size-class scoping breaking under
-      # guarding (fixed in #133), and the "double free detected" line turned out to be
-      # EXPECTED output -- test-memory-events deliberately double-frees to verify
-      # mimalloc's detector no-ops before our hook runs (#131).
-      - name: Suite with guarding forced on every allocation
-        env:
-          MIMALLOC_GUARDED_SAMPLE_RATE: "1"
-        run: ctest --test-dir build-guarded --output-on-failure --timeout 900
-
-  ctest-pprof-off:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: cmake -B build -DMI_PPROF=OFF && cmake --build build && ctest --test-dir build --output-on-failure
-
-  # musl/Alpine C-engine job (#273 8a). Bun ships musl builds (`MI_LIBC_MUSL=1`,
-  # `-ftls-model=local-dynamic`); our CMake option compiled but nothing ran it, so
-  # "compiles" was not evidence. The profiler's Unix stack walker already avoids
-  # `<execinfo.h>` on non-glibc/non-Apple platforms (see src/prof.c), which is the right
-  # call for musl -- this job proves it, and the rest of the suite, actually pass.
-  #
-  # Runs inside the alpine:3.20 container directly (no cross toolchain): GitHub Actions
-  # defaults a containerized job's `run:` shell to `sh`, not `bash` -- Alpine ships no
-  # bash by default. `set -e` alone (no `-o pipefail`, a bash-only flag) is portable to
-  # ash/dash and used below; a bare matrix-expression `${{ matrix.pprof }}` interpolated
-  # straight into a `-D...` flag is avoided in favor of the `for pprof in ON OFF` shell
-  # loop the `diagnostic-gates` job above already uses, both because it is one job
-  # instead of two and because ci/tests/test_verify_local.py's drift guard specifically
-  # recognizes the literal `$pprof` shell-variable spelling.
-  #
-  # Verified locally before landing (docker run alpine:3.20): 34/34 tests pass with
-  # MI_PPROF=ON, 29/29 with MI_PPROF=OFF. The only failure found was
-  # test-free-before-init, fixed in the same PR -- musl's dynamic linker does not invoke
-  # `.preinit_array` for the main executable at all (a musl limitation, not a mimalloc
-  # bug; the test now falls back to its constructor approximation under MI_LIBC_MUSL).
-  ctest-musl:
-    runs-on: ubuntu-latest
-    container: alpine:3.20
-    steps:
-      # Before checkout: actions/checkout needs `git` on PATH, which alpine's base
-      # image does not carry.
-      - name: Install build dependencies
-        run: apk add --no-cache build-base cmake python3 ninja git
-      - uses: actions/checkout@v4
-      - name: Configure, build and test (musl, local-dynamic TLS) for MI_PPROF=ON and OFF
+      - uses: astral-sh/setup-uv@v3
+        if: matrix.container == ''
+      - name: Configure
+        shell: sh
         run: |
           set -e
-          for pprof in ON OFF; do
-            echo "::group::MI_PPROF=$pprof"
-            cmake -B "build-$pprof" -G Ninja -DMI_LIBC_MUSL=ON -DMI_PPROF="$pprof" -DCMAKE_C_FLAGS=-ftls-model=local-dynamic
-            cmake --build "build-$pprof"
-            ctest --test-dir "build-$pprof" --output-on-failure
-            echo "::endgroup::"
-          done
+          # Redirect rather than pipe through `tee`: this runs under alpine's `sh`, which
+          # has no `pipefail`, so a pipeline would report cmake's failure as success.
+          if ! cmake -B build ${{ matrix.generator }} ${{ matrix.cmake }} > configure.log 2>&1; then
+            cat configure.log
+            exit 1
+          fi
+          cat configure.log
+      - name: Prove the flag survived configure
+        if: matrix.assert_defines
+        shell: sh
+        run: |
+          set -e
+          # Assert on the RESOLVED defines, not on the option that was passed in: the
+          # whole point of #116 is that the flag silently did not reach the compiler.
+          if ! grep -qE "Compiler defines *:.*${{ matrix.assert_defines }}" configure.log; then
+            echo "::error::${{ matrix.assert_defines }} did not reach mi_defines"
+            grep -i "guard\|Compiler defines" configure.log || true
+            exit 1
+          fi
+      - name: Build
+        shell: sh
+        run: |
+          set -e
+          cmake --build build --parallel \
+            ${{ matrix.build_config && format('--config {0}', matrix.build_config) || '' }} \
+            ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+      - name: Enumerate the suite this tree registers
+        if: matrix.kind == 'bundle'
+        shell: sh
+        run: |
+          set -e
+          # Written from ctest itself, NOT derived from the bundle: this is the reference
+          # side of the coverage comparison, so it has to come from an independent source
+          # or the check would be the bundle agreeing with itself.
+          ctest --test-dir build --show-only=json-v1 \
+            ${{ matrix.build_config && format('-C {0}', matrix.build_config) || '' }} \
+            > show-only-${{ matrix.config }}.json
+      - name: Bundle the tests
+        if: matrix.kind == 'bundle' || matrix.kind == 'control'
+        shell: sh
+        run: |
+          set -e
+          ${{ matrix.python }} ci/bundle_tests.py build bundle \
+            ${{ matrix.build_config && format('--config {0}', matrix.build_config) || '' }}
+      - name: Pack the bundle
+        if: matrix.kind == 'bundle' || matrix.kind == 'control'
+        # tar, not a plain artifact upload: upload-artifact@v4 drops the executable bit
+        # and flattens the `libmimalloc-debug.so -> .so.3` SONAME symlink chain, either of
+        # which turns the bundle into something that cannot start on the run job.
+        shell: sh
+        run: tar -C bundle -czf ${{ matrix.config }}.tar.gz .
+      - name: Upload the bundle
+        if: matrix.kind == 'bundle' || matrix.kind == 'control'
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-unit-bundle-${{ matrix.config }}
+          path: |
+            ${{ matrix.config }}.tar.gz
+            show-only-${{ matrix.config }}.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload the library
+        if: matrix.kind == 'lib'
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-unit-lib-${{ matrix.config }}
+          path: |
+            build/libmimalloc*.a
+            build/compile_commands.json
+          if-no-files-found: error
+          retention-days: 1
 
-  # Bun consumer-surface parity check (#274, Bun parity P9a). Reproduces Bun's
-  # `scripts/build/deps/mimalloc.ts` DirectBuild outside CMake (that build never runs
-  # our CMake, so a green `ctest` job proves nothing about whether Bun could actually
-  # link against this tree): compiles `src/static.c` as C++ with Bun's exact defines,
-  # links `test/test-bun-surface.cpp` (the symbol/ABI probe) against it, and runs the
-  # result. See `ci/check_bun_surface.py` and `test/test-bun-surface.cpp` for what's
-  # checked.
-  #
-  # Hard gate as of 2026-09-02: `mi_on_thread_idle` (Bun parity P7a, issue #299) merged
-  # in `1dbbb8df`, and both glibc and musl (alpine:3.20) now report zero missing
-  # symbols -- a regression here blocks merge.
-  bun-surface:
+  # Bun's `scripts/build/deps/mimalloc.ts` DirectBuild never runs our CMake, so a green
+  # ctest proves nothing about whether Bun could link against this tree (#274, P9a). The
+  # compile half runs here so the run stage links prebuilt objects instead of rebuilding
+  # `src/static.c` -- the one thing #307 exists to stop doing.
+  build-bun-objects:
+    name: build-bun-objects (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: glibc
-            runs-on: ubuntu-latest
-            container: ""
-            args: ""
+            container: ''
+            python: uv run
+            args: ''
           - name: musl
-            runs-on: ubuntu-latest
             container: alpine:3.20
-            args: "--musl"
-    name: bun-surface (${{ matrix.name }})
-    runs-on: ${{ matrix.runs-on }}
-    container: ${{ matrix.container }}
+            python: python3
+            args: --musl
     steps:
       - name: Install build dependencies (alpine only)
-        if: matrix.name == 'musl'
+        if: matrix.container != ''
         run: apk add --no-cache build-base git python3
       - uses: actions/checkout@v4
-      - run: python3 ci/check_bun_surface.py ${{ matrix.args }}
-
-  ctest-debug-full:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    # TODO(#277 phase D, added 2026-09-02): DELETE the windows-latest row after ten pushes
-    # have compared it against `run-windows` in windows-bundles.yml, which runs the same
-    # test set from a Linux-built bundle on the shared Windows VM. Informational until
-    # then -- it is the control arm for a deliberate toolchain change (native `cl` /MDd
-    # vs cross clang-cl /MD), so do not delete it before that comparison has actually
-    # happened. A permanently-yellow job is worse than an absent one. The ubuntu-latest
-    # row of this matrix is NOT affected and stays a hard gate.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
-    steps:
-      - uses: actions/checkout@v4
-      - run: cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON && cmake --build build --config Debug && ctest --test-dir build -C Debug --output-on-failure
-
-  bundle-roundtrip:
-    # Issue #277 phase A. The plan in #277 is to build the macOS/Windows test binaries on
-    # Linux and ship them to one runner per OS as a portable *test bundle*. That is only
-    # credible if the bundle runs exactly the tests ctest runs and gets exactly the same
-    # results, so this job proves the equivalence on the config where every awkward
-    # command shape lives: MI_DEBUG_FULL emits 6 `cmake -P run-negative.cmake` negative
-    # controls and a `cmake -E env` LD_PRELOAD wrapper, none of which is a plain argv.
-    #
-    # The reference run and the bundle run are compared by name AND by pass/fail, so a
-    # bundle that silently drops a test fails here rather than reporting green on less.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: cmake -B build -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
-      - run: cmake --build build --config Debug
-      - name: ctest (the reference the bundle must reproduce)
-        # --output-junit resolves relative to the *build* directory, not the working
-        # directory, so an absolute path is required here: a relative one would land in
-        # build/ and be carried off by the `mv` below.
-        run: ctest --test-dir build -C Debug --output-on-failure --output-junit "$GITHUB_WORKSPACE/ctest.xml"
-      - name: Build the bundle
-        run: python3 ci/bundle_tests.py build bundle --config Debug
-      - name: Move the build tree out of the way
-        # The test executables carry an RPATH into the build tree. Without this the bundle
-        # would "pass" by loading the original libraries off disk, and the whole
-        # portability claim would be untested on the only machine that can check it.
-        run: mv build build.moved-away
-      - name: Replay the bundle and require identical results
-        run: python3 ci/run_test_bundle.py bundle --compare-junit ctest.xml --junit bundle.xml
+      - uses: astral-sh/setup-uv@v3
+        if: matrix.container == ''
+      - name: Compile the probe's objects with Bun's exact define set
+        shell: sh
+        run: ${{ matrix.python }} ci/check_bun_surface.py --emit-objects bun-objects ${{ matrix.args }}
       - uses: actions/upload-artifact@v4
         with:
-          name: test-bundle-ubuntu-debug-full
-          path: |
-            bundle
-            ctest.xml
-            bundle.xml
-          retention-days: 7
+          name: c-unit-bun-objects-${{ matrix.name }}
+          path: bun-objects
+          if-no-files-found: error
+          retention-days: 1
 
-  ctest-debug-full-win-gnu:
+  # THE RETAINED NATIVE MSVC GATE (#277 phase D, CLAUDE.md rule 3). Every other
+  # windows-latest row in this repository is replaced by Linux-cross-built bundles that
+  # windows-bundles.yml's `run-windows` executes on one shared VM. This one is not, and
+  # must not become so without the owner amending rule 3 ("MSVC and win-gnu are priority
+  # platforms -- both, always"): those bundles are built by clang-cl, and a clang-cl
+  # binary is not a `cl` binary. clang-cl accepts `__attribute__`s cl rejects, and cl's
+  # codegen, TLS lowering and DLL runtime are its own. This job is the only thing in CI
+  # that compiles this tree with Microsoft's compiler; `run-windows-native` runs what it
+  # produces. Do NOT add continue-on-error to either.
+  #
+  # #307 split it into build + run for the same reason as Linux -- the configuration is
+  # compiled once and the result is what gets executed -- not to weaken it.
+  build-windows-native:
     runs-on: windows-latest
-    # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
-    # it against `run-windows` in windows-bundles.yml, which runs the same test set
-    # from a Linux-built bundle on a shared Windows VM. Informational until then -- it is
-    # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
-    # mingw-w64 is UCRT), so do not delete it before that comparison has actually
-    # happened. A permanently-yellow job is worse than an absent one.
-    continue-on-error: true
+    timeout-minutes: 40
     defaults:
       run:
-        shell: msys2 {0}
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
+      - uses: astral-sh/setup-uv@v3
+      - run: cmake -B build -DMI_PPROF=ON
+      - run: cmake --build build --config Release
+      - name: Enumerate the suite this tree registers
+        run: ctest --test-dir build --show-only=json-v1 -C Release > show-only-windows-native.json
+      - name: Bundle the tests
+        # No --check-dll-closure here, unlike the cross lanes: the machine that builds
+        # this bundle is the machine that runs it, so "can it load somewhere else" is not
+        # the question this job answers.
+        run: uv run ci/bundle_tests.py build bundle --config Release
+      - name: Pack the bundle
+        run: tar -C bundle -czf windows-native.tar.gz .
+      - uses: actions/upload-artifact@v4
         with:
-          msystem: MINGW64
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
-      - run: cmake -B build -G Ninja -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DCMAKE_BUILD_TYPE=Debug
-      - run: cmake --build build
-      - run: ctest --test-dir build --output-on-failure
+          name: c-unit-bundle-windows-native
+          path: |
+            windows-native.tar.gz
+            show-only-windows-native.json
+          if-no-files-found: error
+          retention-days: 1
 
-  diagnostic-gates:
+  # ------------------------------------------------------------------------------------
+  # STAGE 2 -- every test, at once.
+  # ------------------------------------------------------------------------------------
+  run-linux:
+    needs: [build, build-bun-objects]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: Internal-state inventory and positive controls
-        run: |
-          python3 ci/check_internal_state.py
-          python3 ci/check_internal_state.py --selftest
-      - name: Release diagnostic/layout/data firewall and positive control
-        run: python3 ci/check_release_equivalence.py --selftest
-      - name: Diagnostic source and symbols are absent from release libraries
+      - uses: astral-sh/setup-uv@v3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: c-unit-bundle-*
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: c-unit-lib-*
+          path: libs
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: c-unit-bun-objects-*
+          path: bun-objects
+      - name: Unpack the bundles
         run: |
           set -euo pipefail
-          for pprof in ON OFF; do
-            build="build-release-${pprof,,}"
-            cmake -S . -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DMI_DEBUG=OFF -DMI_PPROF="$pprof" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-            if grep -q 'diagnostic.c' "$build/compile_commands.json"; then
-              echo "::error::diagnostic.c entered the MI_DEBUG=0 $pprof build"
-              exit 1
-            fi
-            cmake --build "$build" --target mimalloc-static
-            if nm -a "$build"/libmimalloc*.a | grep -q -e '_mi_.*diagnostic' -e '_mi_lock_debug'; then
-              echo "::error::diagnostic symbols entered the MI_DEBUG=0 $pprof library"
+          mkdir -p bundle manifests
+          for archive in artifacts/*/*.tar.gz; do
+            name=$(basename "$archive" .tar.gz)
+            mkdir -p "bundle/$name"
+            tar -C "bundle/$name" -xzf "$archive"
+          done
+          cp artifacts/*/show-only-*.json manifests/
+          # A download that silently produced fewer bundles would otherwise surface as a
+          # confusing `No such file` in the middle of a gate, or -- worse -- as a green
+          # run over less.
+          for expected in release pprof-off debug-full guarded shared musl musl-pprof-off \
+                          memory-gate-leak; do
+            if [ ! -d "bundle/$expected" ]; then
+              echo "::error::bundle/$expected was not downloaded"
+              ls bundle
               exit 1
             fi
           done
+          ls bundle
+          ls manifests
 
-  # Shared-library build (issue #62). Our src/static.c amalgamation compiles
-  # everything as one TU, which hides link errors that only appear when the library
-  # is built as a real DLL/so -- conda-forge carries a patch making
-  # `_mi_theap_malloc_zero` extern inline for exactly this reason on v3.4.1.
-  # Runs on both Windows toolchains because that is where the reported failure was.
-  #
-  # #69 (MIMALLOC_MEMORY_EVENTS env activation failing in an MSVC DLL build) is
-  # RESOLVED: windows-latest was confirmed green here on main (runs 33565889274,
-  # 33546799862) well before #266, so the stale note this comment used to carry --
-  # claiming windows-latest was a deliberate known-red diagnostic for #69 -- no longer
-  # describes reality and was corrected during #266's review (it was misleading anyone
-  # who saw this job red and assumed it was the old, expected #69 failure rather than a
-  # new regression).
-  #
-  # Do NOT add continue-on-error if this job goes red again -- see the note below on why
-  # a permanently-yellow job is worse than an absent one. Confirm any new failure is a
-  # real regression (as #266 round 2 did for test-profile/-accum/-auto's cross-thread
-  # sampled-free reclamation, fixed on this branch) before landing, per the same
-  # "confirm on CI, don't guess" discipline #69 was fixed under.
-  ctest-shared:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    # TODO(#277 phase D, added 2026-09-02): DELETE the windows-latest row after ten pushes
-    # have compared it against `run-windows` in windows-bundles.yml, which runs the same
-    # test set from a Linux-built bundle on the shared Windows VM. Informational until
-    # then -- it is the control arm for a deliberate toolchain change (native `cl` /MDd
-    # vs cross clang-cl /MD), so do not delete it before that comparison has actually
-    # happened. A permanently-yellow job is worse than an absent one. The ubuntu-latest
-    # row of this matrix is NOT affected and stays a hard gate.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
-    steps:
-      - uses: actions/checkout@v4
-      - run: cmake -B build -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
-      - run: cmake --build build --config Release
-      - run: ctest --test-dir build -C Release --output-on-failure
-
-  ctest-shared-win-gnu:
-    runs-on: windows-latest
-    # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
-    # it against `run-windows` in windows-bundles.yml, which runs the same test set
-    # from a Linux-built bundle on a shared Windows VM. Informational until then -- it is
-    # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
-    # mingw-w64 is UCRT), so do not delete it before that comparison has actually
-    # happened. A permanently-yellow job is worse than an absent one.
-    continue-on-error: true
-    defaults:
-      run:
-        shell: msys2 {0}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
-      - run: cmake -B build -G Ninja -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
-      - run: cmake --build build
-      - run: ctest --test-dir build --output-on-failure
-
-  # Memory + counter regression gate (issue #63). The test's own inline assertions are
-  # self-relative and gate on every runner unconditionally. The committed baselines add
-  # cross-COMMIT drift detection, which a per-run ratio cannot see: a leak introduced
-  # 3% at a time over ten PRs passes every self-relative check and still doubles memory.
-  #
-  # Baselines are per platform AND per MI_PPROF setting, never shared: lazy zeroing makes
-  # Linux RSS and Windows commit incomparable for identical behavior, and rule 4 puts the
-  # profiler's own arena in process memory so an ON build legitimately peaks higher.
-  memory-gate:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    # TODO(#277 phase D, added 2026-09-02): DELETE the windows-latest row after ten pushes
-    # have compared it against `run-windows` in windows-bundles.yml, which runs the same
-    # test set from a Linux-built bundle on the shared Windows VM. Informational until
-    # then -- it is the control arm for a deliberate toolchain change (native `cl` /MDd
-    # vs cross clang-cl /MD), so do not delete it before that comparison has actually
-    # happened. A permanently-yellow job is worse than an absent one. The ubuntu-latest
-    # row of this matrix is NOT affected and stays a hard gate.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
-    steps:
-      - uses: actions/checkout@v4
-      - run: cmake -B build -DMI_PPROF=ON
-      - run: cmake --build build --config Release
-      - name: Run the gate
-        shell: bash
+      # ---- the wave -------------------------------------------------------------------
+      - name: Run every glibc bundle at once
+        # --jobs 4 is the runner's vCPU count. Inside this one invocation bundles run
+        # alongside each other AND tests run alongside each other; the `serial` group
+        # (RUN_SERIAL in CMakeLists.txt) is held back and run alone afterwards.
+        #
+        # The guarded second pass -- every eligible allocation guarded instead of
+        # 1-in-4000 -- is an env VARIANT of the guarded bundle, scoped to it. It used to
+        # be a whole second serial `ctest` run of that config; here it joins the same
+        # wave, and scoping matters because an unscoped variant would double all five
+        # bundles including the part that does not divide by --jobs.
         run: |
           set -euo pipefail
-          ctest --test-dir build -C Release -R test-memory-gate --output-on-failure
-      - name: Emit JSON and compare against baseline
-        shell: bash
+          uv run ci/run_test_bundle.py \
+            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared \
+            --jobs 4 \
+            --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
+            --junit-dir results
+
+      - name: Run the musl bundles inside alpine
+        # Verified rather than assumed: a musl-linked executable from this tree requests
+        # `/lib/ld-musl-x86_64.so.1` as its program interpreter, which a glibc host does
+        # not have, so it cannot be executed on the runner directly. `python3 libstdc++`
+        # is the complete runtime set (checked by running the whole suite in a container
+        # with nothing else installed). ci/run_test_bundle.py is stdlib-only by design,
+        # which is what makes that possible.
+        #
+        # A separate step, so its serial group still runs with nothing else on the box.
         run: |
-          # NOTE: GitHub invokes `bash -e`, so a plain `set -uo pipefail` does NOT
-          # disable errexit -- the script would die on the gate's non-zero exit before
-          # the rc check could run. `set +e` is required, not decorative.
+          set -euo pipefail
+          docker run --rm -v "$GITHUB_WORKSPACE":/w -w /w alpine:3.20 sh -c '
+            set -e
+            apk add --no-cache python3 libstdc++ > /dev/null
+            python3 ci/run_test_bundle.py \
+              --bundles bundle/musl bundle/musl-pprof-off \
+              --jobs 4 --junit-dir results
+          '
+
+      # ---- gates that need the machine to themselves ----------------------------------
+      - name: Memory gate -- 8 runs from the release bundle
+        # Peak memory is noisy; the gate compares the minimum of several runs. The
+        # committed baselines are min-of-4, but ci/memory_gate.py's RUNS_EXPECTED is
+        # min-of-8 (#266): min-of-8 of the same distribution can only be <= min-of-4, so
+        # this is strictly conservative against those baselines while cutting the
+        # shared-runner noise that was flipping PASS/FAIL between pushes of identical
+        # object code. Unchanged from the job this replaces, deliberately -- #298 is
+        # revisiting the tolerance and must not have to fight this PR for it.
+        run: |
+          # NOTE: GitHub invokes `bash -e`, so a plain `set -uo pipefail` does NOT disable
+          # errexit -- the script would die on the gate's non-zero exit before the rc
+          # check could run. `set +e` is required, not decorative.
           set +e
           set -uo pipefail
-          exe=$(find build -name 'mimalloc-test-memory-gate*' -type f -perm -u+x | head -1)
-          # Peak memory is noisy; the gate compares the minimum of several runs. The
-          # committed baselines are min-of-4, but ci/memory_gate.py's RUNS_EXPECTED is
-          # min-of-8 (#266, 2026-09-02): min-of-8 of the same distribution can only be
-          # <= min-of-4, so this is strictly conservative against those baselines while
-          # cutting the shared-runner noise that was flipping PASS/FAIL between pushes
-          # of identical Release object code.
+          exe="$GITHUB_WORKSPACE/bundle/release/mimalloc-test-memory-gate"
           for i in 1 2 3 4 5 6 7 8; do
             MI_BENCH_JSON="result-$i.json" "$exe" > /dev/null
           done
           cat result-1.json
-          python3 ci/memory_gate.py check result-*.json
+          uv run ci/memory_gate.py check result-*.json
           rc=$?
           if [ $rc -eq 2 ]; then
             echo "::warning::No committed baseline for this platform yet -- bootstrap it from this run's artifact."
             exit 0
           fi
           exit $rc
-      # A gate that has never been observed to fire proves nothing -- it can be broken
-      # for months while every run stays green. Build a deliberately leaky copy and
-      # require the same comparison to catch it. This step failing means the gate above
-      # is decoration, so it is a hard failure, not a warning.
       - name: Positive control -- the gate must catch an injected leak
-        shell: bash
+        # A gate that has never been observed to fire proves nothing. The leaky build is
+        # a whole separate configuration, built once by the `memory-gate-leak` row; its
+        # tests are never executed (they would fail by construction), only this binary.
         run: |
           set -euo pipefail
-          cmake -B build-leak -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
-          cmake --build build-leak --config Release --target mimalloc-test-memory-gate
-          exe=$(find build-leak -name 'mimalloc-test-memory-gate*' -type f -perm -u+x | head -1)
-          # Matches the run count above: `control` calls the same report_runs() path,
-          # which warns if fewer than RUNS_EXPECTED runs are supplied.
+          exe="$GITHUB_WORKSPACE/bundle/memory-gate-leak/mimalloc-test-memory-gate"
           for i in 1 2 3 4 5 6 7 8; do
             MI_BENCH_JSON="leak-$i.json" "$exe" > /dev/null || true
           done
-          python3 ci/memory_gate.py control leak-*.json
-      # Upload even when the gate fails: a red gate is exactly when the raw
-      # per-run JSON is needed (to attribute the growth, or to re-baseline
-      # deliberately with `memory_gate.py update`). Skipping it on failure left
-      # every red run -- including main's own -- with no data to reason from.
+          uv run ci/memory_gate.py control leak-*.json
+
+      - name: Diagnostic gates -- internal state, release firewall, positive controls
+        run: |
+          set -euo pipefail
+          uv run ci/check_internal_state.py
+          uv run ci/check_internal_state.py --selftest
+          uv run ci/check_release_equivalence.py --selftest
+      - name: Diagnostic source and symbols are absent from release libraries
+        # The two `diag-*` build rows resolved MI_DEBUG=0 with MI_PPROF on and off; this
+        # is the scan over what they produced.
+        run: |
+          set -euo pipefail
+          for pprof in on off; do
+            dir="libs/c-unit-lib-diag-pprof-$pprof"
+            if grep -q 'diagnostic.c' "$dir/compile_commands.json"; then
+              echo "::error::diagnostic.c entered the MI_DEBUG=0 $pprof build"
+              exit 1
+            fi
+            if nm -a "$dir"/libmimalloc*.a | grep -q -e '_mi_.*diagnostic' -e '_mi_lock_debug'; then
+              echo "::error::diagnostic symbols entered the MI_DEBUG=0 $pprof library"
+              exit 1
+            fi
+          done
+      - name: ISA baseline (x64) -- portable build, and the scanner's positive control
+        run: |
+          set -euo pipefail
+          # The disassembly parser is itself a thing that can silently break (it did, on
+          # arm64). Fixtures for both layouts, checked on every runner.
+          uv run ci/check_isa_baseline.py --selftest
+          uv run ci/check_isa_baseline.py "$(ls libs/c-unit-lib-isa-portable/libmimalloc*.a | head -1)"
+          uv run ci/check_isa_baseline.py "$(ls libs/c-unit-lib-isa-arch/libmimalloc*.a | head -1)" --expect-dirty
+
+      - name: Bun consumer surface -- link the prebuilt glibc objects
+        run: uv run ci/check_bun_surface.py --objects bun-objects/c-unit-bun-objects-glibc
+      - name: Bun consumer surface -- link the prebuilt musl objects inside alpine
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$GITHUB_WORKSPACE":/w -w /w alpine:3.20 sh -c '
+            set -e
+            apk add --no-cache build-base python3 > /dev/null
+            python3 ci/check_bun_surface.py --musl --objects bun-objects/c-unit-bun-objects-musl
+          '
+
+      # ---- no test may be dropped -----------------------------------------------------
+      - name: Coverage -- every registered test was really executed
+        # The replacement for `bundle-roundtrip`. That job proved a bundle reproduces its
+        # tree's own ctest run by moving the build tree away first; here there IS no build
+        # tree on this machine, so the RPATH escape hatch it guarded against cannot exist.
+        # What is left to prove is the coverage half: for every configuration, each name
+        # `ctest --show-only` listed in the build job was executed here. The reference
+        # side comes from ctest, the candidate side from the JUnit the run wrote --
+        # neither is derived from the other.
+        #
+        # `memory-gate-leak` is deliberately absent: it is a control binary, not a lane.
+        run: |
+          set -euo pipefail
+          uv run ci/bundle_coverage.py \
+            --compare release manifests/show-only-release.json results/release.xml \
+            --compare pprof-off manifests/show-only-pprof-off.json results/pprof-off.xml \
+            --compare debug-full manifests/show-only-debug-full.json results/debug-full.xml \
+            --compare guarded manifests/show-only-guarded.json results/guarded.xml \
+            --compare shared manifests/show-only-shared.json results/shared.xml \
+            --compare musl manifests/show-only-musl.json results/musl.xml \
+            --compare musl-pprof-off manifests/show-only-musl-pprof-off.json results/musl-pprof-off.xml \
+            --heading "Coverage: registered by ctest vs executed by the run stage" \
+            --names "ctest --show-only" executed \
+            --summary "$GITHUB_STEP_SUMMARY"
+
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: memory-gate-${{ matrix.os }}
-          path: result-*.json
-          if-no-files-found: error
+          name: c-unit-linux-results
+          path: |
+            results
+            result-*.json
+            leak-*.json
+          if-no-files-found: warn
+          retention-days: 1
 
-  ctest-win-gnu:
+  # The name is load-bearing: CLAUDE.md rule 3, docs/ci-gates.md and #277/#298 all refer
+  # to `ctest (windows-latest)`. It still means the same thing -- Microsoft's `cl`
+  # compiled this tree and this runner executed the result -- and it is still a hard gate.
+  run-windows-native:
+    name: ctest (windows-latest)
+    needs: build-windows-native
     runs-on: windows-latest
-    # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
-    # it against `run-windows` in windows-bundles.yml, which runs the same test set
-    # from a Linux-built bundle on a shared Windows VM. Informational until then -- it is
-    # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
-    # mingw-w64 is UCRT), so do not delete it before that comparison has actually
-    # happened. A permanently-yellow job is worse than an absent one.
-    continue-on-error: true
+    timeout-minutes: 45
     defaults:
       run:
-        shell: msys2 {0}
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
+      - uses: astral-sh/setup-uv@v3
+      - uses: actions/download-artifact@v4
         with:
-          msystem: MINGW64
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
-      - run: cmake -B build -G Ninja -DMI_PPROF=ON
-      - run: cmake --build build
-      - run: ctest --test-dir build --output-on-failure
+          name: c-unit-bundle-windows-native
+          path: artifacts
+      - name: Unpack the bundle
+        run: |
+          set -euo pipefail
+          mkdir -p bundle/windows-native
+          tar -C bundle/windows-native -xzf artifacts/windows-native.tar.gz
+          ls bundle/windows-native | head -40
+      - name: Run the suite
+        run: uv run ci/run_test_bundle.py --bundles bundle/windows-native --jobs 4 --junit-dir results
+      - name: Coverage -- every registered test was really executed
+        run: |
+          set -euo pipefail
+          uv run ci/bundle_coverage.py \
+            --compare windows-native artifacts/show-only-windows-native.json results/windows-native.xml \
+            --heading "Coverage: registered by native cl ctest vs executed" \
+            --names "ctest --show-only" executed \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-unit-windows-native-results
+          path: results
+          if-no-files-found: warn
+          retention-days: 1
+
+  # Debian's arm64 baseline is armv8.0-a and CMakeLists.txt force-enables MI_OPT_ARCH on
+  # arm64, so this is the case that actually bites. It stays a self-contained build+scan
+  # job rather than joining the build/run split: the scan disassembles the library, and
+  # the host's objdump is single-target -- an x86_64 runner cannot disassemble aarch64, so
+  # there is no run stage to hand this artifact to. macOS is deliberately NOT covered
+  # here: Apple Silicon is the baseline there, so LSE atomics are expected and a "clean"
+  # result would mean nothing.
+  isa-baseline-arm64:
+    name: isa-baseline (ubuntu-24.04-arm)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Disassembly parser selftest
+        run: uv run ci/check_isa_baseline.py --selftest
+      - name: Portable build must contain no above-baseline instructions
+        run: |
+          set -euo pipefail
+          cmake -B build-portable -DMI_PPROF=ON -DMI_NO_OPT_ARCH=ON
+          cmake --build build-portable --target mimalloc-static
+          uv run ci/check_isa_baseline.py "$(ls build-portable/libmimalloc*.a | head -1)"
+      - name: Positive control -- scanner must fire on an MI_OPT_ARCH=ON build
+        run: |
+          set -euo pipefail
+          cmake -B build-arch -DMI_PPROF=ON -DMI_OPT_ARCH=ON
+          cmake --build build-arch --target mimalloc-static
+          uv run ci/check_isa_baseline.py "$(ls build-arch/libmimalloc*.a | head -1)" --expect-dirty

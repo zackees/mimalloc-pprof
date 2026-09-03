@@ -16,9 +16,14 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    the sub-issue. One PR per phase. Conventional commits (`feat:`, `fix:`, `ci:`, `docs:`, `test:`).
 2. **Never mix C-core paths (`src/`, `include/`, `test/`, `CMakeLists.txt`) and `rust/` paths
    in one commit.** This keeps upstream cherry-picks clean.
-3. **Merge gates for every PR:** `c-unit` green on ubuntu/windows-MSVC/windows-MinGW with
-   `MI_PPROF=ON`, the `OFF` job green (profiler hooks disabled; upstream allocator behavior
-   with independent memory-events tracking left runtime-disabled), `rust-native` green.
+3. **Merge gates for every PR:** `c-unit` green on ubuntu and windows-MSVC with
+   `MI_PPROF=ON`, the `OFF` configuration green (profiler hooks disabled; upstream allocator
+   behavior with independent memory-events tracking left runtime-disabled), win-gnu green in
+   `windows-bundles.yml`, `rust-native` green. Since #307 `c-unit.yml` is two stages —
+   every configuration built exactly once in `build`, then `run-linux` executes every
+   bundle at once — so "the OFF job" is a `build` matrix row plus its slice of that wave,
+   not a job of its own. A test that only passes with the machine to itself belongs in the
+   `RUN_SERIAL` group in `CMakeLists.txt`, never behind a retry.
    MSVC **and** win-gnu are priority platforms — both, always.
    The **macOS** gate is `macos-bundles.yml` and uses no Apple hardware (#277 phase B2):
    both Apple arches are cross-built on Linux through soldr, `x86_64` is *executed* inside a
@@ -32,17 +37,21 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    The **win-gnu** gate is `windows-bundles.yml` (#277 phase C): the bundles are cross-built
    on Linux by soldr's mingw-w64 and run on one Windows runner. Phase C changed *how*
    win-gnu is built, not whether it is tested — soldr's mingw-w64 is **UCRT**, while the
-   native MSYS2 MINGW64 jobs it replaces were msvcrt, so those stay informational for a
-   ≥10-push window. Keep win-gnu gated; do not drop it to "MSVC covers Windows".
+   native MSYS2 MINGW64 jobs it replaces were msvcrt, so those stayed informational for a
+   ≥10-push window — which elapsed, so #307 deleted `c-unit.yml`'s three MSYS2 rows.
+   Keep win-gnu gated; do not drop it to "MSVC covers Windows".
    The **MSVC** gate is split in two (#277 phase D), and the split is the rule, not an
    implementation detail. `windows-bundles.yml` cross-builds the MSVC-ABI bundles on Linux
    with soldr's **clang-cl** and runs them on the same single Windows runner as win-gnu —
    but **`c-unit.yml`'s `ctest (windows-latest)` (Release) stays native, stays built by
    Microsoft's `cl`, and stays a hard gate.** A clang-cl binary is not a `cl` binary:
    clang-cl accepts `__attribute__`s cl rejects, and cl's codegen, TLS lowering and DLL
-   runtime are its own. Do NOT make that job `continue-on-error` and do not delete it
-   without amending this rule explicitly. Every *other* `windows-latest` row is
-   informational for a ≥10-push window and carries a dated TODO. One further consequence:
+   runtime are its own. Since #307 that gate is two jobs — `build-windows-native` compiles
+   it with `cl`, `run-windows-native` runs the result and still reports under the name
+   **`ctest (windows-latest)`** — and both halves are hard gates. Do NOT make either
+   `continue-on-error` and do not delete them without amending this rule explicitly. Every
+   *other* `windows-latest` row was informational for a ≥10-push window with a dated TODO;
+   `c-unit.yml`'s share of those is gone (#307), the rest still stand. One further consequence:
    soldr's CRT splat has no `msvcrtd.lib`, so the cross lane is `/MD` only and cannot
    reproduce the native debug-full job's `/MDd` compile — it reproduces its defines
    (`MI_DEBUG=3`), which is what `MI_DEBUG_FULL` is for. See docs/ci-gates.md.

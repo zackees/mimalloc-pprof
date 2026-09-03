@@ -24,8 +24,8 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 |---|---|---|
 | **memory-gate** (`ci/memory_gate.py`) | peak memory or thread-count regressions vs a committed per-platform/arch/compiler baseline | builds a copy with an injected leak; the gate must fail — verified at +212% / +98% / +27% on linux/windows/macos. The macOS lane now measures inside the `dockurr/macos` guest and bootstraps its own `macos-x86_64-soldr-clang-21-pprof1.json` |
 | **isa-baseline** (`ci/check_isa_baseline.py`) | binaries containing instructions above the CPU baseline, which SIGILL on older hardware | builds with `MI_OPT_ARCH=ON`; the scanner must fire. The parser also self-tests against x86 and arm64 fixtures on every run |
-| **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW. **macOS uses no Apple hardware** (#277 phase B2): both arches are cross-built on Linux, x86_64 is executed under `dockurr/macos` on a Linux runner, arm64 is compile-only. **windows-MinGW is gated from Linux-built bundles run on one Windows runner** (`windows-bundles.yml`, #277 phase C — which also moves that lane from msvcrt to UCRT); the native MSYS2 MinGW jobs are informational during the comparison window | `ci/bundle_coverage.py` fails if a test in the arm64 bundle is missing from the executed x86_64 one, or if any test the native MinGW `ctest` would run is missing from a bundle; `ci/lint_no_macos_runners.py` fails if any workflow names a macOS runner |
-| **ctest-guarded** | the `MI_GUARDED` guard-page path, run twice: at the default sample rate and again with `MIMALLOC_GUARDED_SAMPLE_RATE=1` so every eligible allocation is guarded | configure step greps the resolved compiler defines for `MI_GUARDED=1`, since the original bug was the flag never reaching the compiler |
+| **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW. **macOS uses no Apple hardware** (#277 phase B2): both arches are cross-built on Linux, x86_64 is executed under `dockurr/macos` on a Linux runner, arm64 is compile-only. **windows-MinGW is gated from Linux-built bundles run on one Windows runner** (`windows-bundles.yml`, #277 phase C — which also moves that lane from msvcrt to UCRT); the native MSYS2 MinGW jobs are informational during the comparison window | `ci/bundle_coverage.py` fails if any test a build job's `ctest --show-only` listed was not executed by the run stage (#307), if a test in the arm64 bundle is missing from the executed x86_64 one, or if any test the native MinGW `ctest` would run is missing from a bundle; `ci/lint_no_macos_runners.py` fails if any workflow names a macOS runner |
+| **guarded** (a `build` row + its scoped env variant in `run-linux`) | the `MI_GUARDED` guard-page path, run twice: at the default sample rate and again with `MIMALLOC_GUARDED_SAMPLE_RATE=1` so every eligible allocation is guarded | configure step greps the resolved compiler defines for `MI_GUARDED=1`, since the original bug was the flag never reaching the compiler |
 | **asan** | use-after-free, overflow and leaks under AddressSanitizer | — |
 | **fuzz** (`test/fuzz/`) | crashes from structured random allocator-API sequences, with ASan as the oracle | builds with a planted use-after-free and requires an anchored `(ERROR\|SUMMARY): AddressSanitizer:` report naming it |
 | **amalgamation-drift** | a C change that never reached the vendored copy the Rust crate compiles — which broke `main` twice before this gate existed | — |
@@ -56,6 +56,12 @@ checkout**.
 `uv run ci/run_test_bundle.py <bundle> [--only NAME…] [--env K=V…] [--timeout-scale F]
 [--junit out.xml] [--compare-junit ctest.xml]` replays it serially and prints a
 ctest-shaped summary.
+
+Issue #307 made bundles the model for the Linux suite too, so the runner also takes
+`--bundles dir1 dir2 … --jobs N [--env-variant [BUNDLE:]LABEL K=V …] [--junit-dir DIR]`:
+several bundles in one wave, tests inside them running alongside each other, bounded by
+`N`, with one JUnit file per bundle. See [c-unit: build once, run
+everything](#c-unit-build-once-run-everything-at-once) below.
 
 ### `tests.json`
 
@@ -92,7 +98,7 @@ and UNC paths count as absolute even though `os.path.isabs` says otherwise on Li
 is where every cross bundle is built.
 
 Test properties are an **allowlist** (`ENVIRONMENT`, `TIMEOUT`, `WORKING_DIRECTORY`,
-`LABELS`, `WILL_FAIL`, `DISABLED`). Anything else — `PASS_REGULAR_EXPRESSION`,
+`LABELS`, `WILL_FAIL`, `DISABLED`, `RUN_SERIAL`). Anything else — `PASS_REGULAR_EXPRESSION`,
 `SKIP_RETURN_CODE`, `RESOURCE_LOCK` — is a hard error naming the test, as is any `cmake`
 argv shape not in the table, and so is an empty suite. All of that is the same principle
 as the rest of this document: a bundle that quietly carries fewer tests than ctest ran
@@ -101,11 +107,152 @@ dead gates above shared.
 
 ### The gate
 
-`bundle-roundtrip` (in `c-unit.yml`, ubuntu, `MI_PPROF=ON MI_DEBUG_FULL=ON`) builds, runs
-`ctest --output-junit`, bundles, **moves the build tree away**, replays the bundle, and
-requires the same test names with the same pass/fail (`--compare-junit`). Moving the build
-tree is the load-bearing step: the executables carry an RPATH into it, so without that
-`mv` a broken bundle would pass on the build machine by loading the original libraries.
+The pass/fail equivalence check — build, `ctest --output-junit`, bundle, **move the build
+tree away**, replay, require the same test names with the same results (`--compare-junit`)
+— now lives in `uv run ci/verify_local.py --only bundle`, which is where a build tree
+exists to compare against. Moving the build tree is the load-bearing step there: the
+executables carry an RPATH into it, so without that `mv` a broken bundle would pass on the
+build machine by loading the original libraries.
+
+CI's version of the same claim is stronger in one way and weaker in another, and the
+difference is worth stating plainly. `run-linux` has no build tree at all — nothing to
+compare against, and nothing for an RPATH to fall back on, so the escape hatch the `mv`
+guarded against cannot exist. What CI checks instead is coverage: for every configuration,
+every name the build job's `ctest --show-only=json-v1` listed was **executed**, read back
+out of the JUnit the run wrote (`ci/bundle_coverage.py`, which accepts a `.xml` candidate
+side for exactly this). The reference side comes from ctest and the candidate side from
+the run; neither is derived from the other.
+
+## c-unit: build once, run everything at once
+
+Issue #307. `c-unit.yml` used to be 16 jobs that each checked out, configured and **rebuilt
+the library** for one configuration before running one slice of the suite. Run
+33699111919 was 20 jobs and most of its wall time was the same compile repeated. The owner's
+direction: *"All the tests need to be created all at once, all the time, and then the
+runners need to run all the tests all at the same time, not a bunch of tests that rebuild
+the product over and over."*
+
+It is now two stages, the same model `windows-bundles.yml` and `macos-bundles.yml` use.
+
+### Stage 1 — `build`: every configuration, once, in parallel
+
+One matrix row per configuration, all on `ubuntu-latest` (the two musl rows inside
+`container: alpine:3.20`), plus `build-bun-objects` and `build-windows-native`. Each row
+runs no tests. `kind` says what it produces:
+
+| kind | rows | artifact |
+|---|---|---|
+| `bundle` | `release`, `pprof-off`, `debug-full`, `guarded`, `shared`, `musl`, `musl-pprof-off` | a `ci/bundle_tests.py` bundle, tarred, **plus** `show-only-<config>.json` straight from `ctest --show-only=json-v1` |
+| `control` | `memory-gate-leak` (`MI_BENCH_INJECT_LEAK=200000`) | a bundle that is never executed — only its `mimalloc-test-memory-gate` binary is, as the memory gate's positive control |
+| `lib` | `isa-portable`, `isa-arch`, `diag-pprof-on`, `diag-pprof-off` | `libmimalloc*.a` (+ `compile_commands.json`) for the run stage to scan |
+
+The bundles are **tarred**, not uploaded as loose files: `upload-artifact@v4` drops the
+executable bit and flattens the `libmimalloc-debug.so → .so.3` SONAME symlink chain, either
+of which produces a bundle that cannot start.
+
+`show-only-<config>.json` is written by ctest itself and uploaded beside the bundle, rather
+than derived from `tests.json`. That is deliberate: it is the reference side of the coverage
+check, and a reference derived from the candidate proves nothing.
+
+### Stage 2 — `run-linux`: every test, at once
+
+One job, no CMake, no compiler, no build tree. It unpacks every Linux bundle and runs the
+five glibc ones in a single wave:
+
+```
+uv run ci/run_test_bundle.py \
+  --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared \
+  --jobs 4 \
+  --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
+  --junit-dir results
+```
+
+Bundles run alongside each other *and* tests run alongside each other inside a bundle,
+bounded by `--jobs 4` (the runner's vCPU count). The guarded config's second pass — every
+eligible allocation guarded instead of 1-in-4000 — used to be a whole second serial `ctest`
+run of that configuration; it is now an **env variant scoped to that one bundle**, reported
+as `test-x [sample-rate-1]` with the JUnit `classname` left at `test-x`. The scoping is not
+cosmetic: an unscoped variant would double all five bundles, including the serial group,
+which is the part that does not divide by `--jobs`.
+
+Then, as separate steps so each has the machine to itself: the musl bundles, the memory
+gate and its leak control, the diagnostic and ISA scans, and the Bun surface link.
+
+### The serial group, and why it is in CMakeLists.txt
+
+Concurrency must not change what a test asserts. Some tests measure the **machine**, not
+just themselves:
+
+- **process-wide RSS** — `test-memory-gate` (min-of-8 peak RSS against a committed
+  baseline), `test-degenerate` (RSS must not grow per iteration), `test-process-rss` and
+  `test-thread-idle-rss`. Under memory pressure from a parallel wave, the kernel's reclaim
+  decisions, not the allocator's, move those numbers.
+- **a wall-clock deadline** — `test-park-handoff{,-no-scavenger,-eager}` wait a bounded time
+  for a hole sweep to land, and `test-profile-race{,-scavenger}` are oversubscribed thread
+  races whose windows close on time rather than on work. On an oversubscribed 4-vCPU runner
+  a missed deadline is indistinguishable from the regression the test exists to catch.
+- **a subprocess lifecycle** — `test-subproc-lifecycle`.
+
+Those carry `RUN_SERIAL TRUE` in `CMakeLists.txt` — ctest's own word for "run this with
+nothing else running". `ci/bundle_tests.py` lowers the property (or a `serial` label) into
+the manifest's `serial` flag, and `ci/run_test_bundle.py` holds those items back and runs
+them one at a time after the parallel wave, across all bundles.
+
+Encoding it there rather than in the workflow or in a name list inside the runner is the
+point: a new test declares its own scheduling requirement where it is defined, and `ctest
+-j` honours the same declaration locally. **A test that passes serially and fails under the
+wave belongs in that list, with a comment saying which of the three properties above it
+depends on — not behind a retry.**
+
+The trade this makes is explicit: the parallel wave divides by `--jobs`, the serial group
+does not. Measured locally on the release bundle, the serial group is ~38s of a ~75s run.
+`run-linux` is therefore wall-clock-comparable to the old layout while costing roughly half
+the runner-minutes. If the serial group grows, the lever is a second `run-linux-serial` job
+(a separate VM is exclusive by construction), not a shorter list.
+
+### Windows
+
+`build-windows-native` compiles the tree with Microsoft's `cl` (Release, `MI_PPROF=ON`) and
+bundles it; `run-windows-native` — still named **`ctest (windows-latest)`** — executes that
+bundle and checks its coverage. Same toolchain, same runner OS, same hard gate as before
+(CLAUDE.md rule 3); the only change is that the compile and the run are separate jobs, and
+that this is the first bundle produced from a native Visual Studio multi-config tree. All
+win-gnu work, and the cross-built MSVC-ABI comparison arms, stay in `windows-bundles.yml`.
+
+### musl runs inside `alpine:3.20`, and that was measured
+
+A musl-linked executable from this tree requests `/lib/ld-musl-x86_64.so.1` as its program
+interpreter, so a glibc host cannot execute it at all — `readelf -l` says so and the loader
+agrees. The musl bundles are therefore replayed in a container. `python3` and `libstdc++`
+are the complete runtime set; the whole suite was run in a container with nothing else
+installed to confirm it. `ci/run_test_bundle.py` is stdlib-only by design, which is what
+makes that possible:
+
+```
+docker run --rm -v "$PWD":/w -w /w alpine:3.20 sh -c '
+  apk add --no-cache python3 libstdc++ &&
+  python3 ci/run_test_bundle.py --bundles bundle/musl bundle/musl-pprof-off --jobs 4'
+```
+
+The same command reproduces the musl lane locally — it is the one row of the build matrix
+`ci/verify_local.py --like-ci` does not cover, because that script has no container runner.
+
+### `isa-baseline (ubuntu-24.04-arm)` stays one job
+
+The x64 ISA scan was split into a build row and a run-stage scan like everything else. The
+arm64 one was not, and cannot be: `ci/check_isa_baseline.py` disassembles the library with
+the host's `objdump`, which is single-target — an x86_64 runner cannot disassemble aarch64.
+There is no run stage to hand that artifact to, so it stays a self-contained build+scan job
+on `ubuntu-24.04-arm`.
+
+### Reproducing the whole layout locally
+
+`uv run ci/verify_local.py --like-ci` builds every configuration once (in parallel), then
+replays every bundle in one wave, then runs the run-stage gates — coverage comparison,
+memory gate + leak control, diagnostic and ISA scans, and both halves of the Bun surface
+check. `ci/tests/test_verify_local.py` parses `c-unit.yml`'s matrix `include:` rows as well
+as its `run:` blocks, so a cmake flag that moves into the matrix cannot silently escape the
+drift guard.
 
 ## macOS: cross-built on Linux, x86_64 executed under emulation
 
@@ -537,11 +684,17 @@ is not a failure.
 ### Rollout
 
 The native jobs stay as a control arm, `continue-on-error: true`, for at least ten pushes:
-`c-unit.yml`'s `ctest-win-gnu`, `ctest-debug-full-win-gnu` and `ctest-shared-win-gnu`,
 `rust-native.yml`'s `test-win-gnu`, and `cross.yml`'s `build-win-gnu` +
 `test (x86_64-pc-windows-gnu)`. Each carries a dated TODO naming what deletes it. Because
 this phase changes the CRT, that window is the only place the two runtimes are exercised
 side by side — do not delete the msvcrt arm before the comparison has actually happened.
+
+`c-unit.yml`'s three MSYS2 rows (`ctest-win-gnu`, `ctest-debug-full-win-gnu`,
+`ctest-shared-win-gnu`) were that workflow's share of this control arm. They were **deleted
+by #307**, after the window their TODOs named had elapsed: added 2026-09-02, deleted
+2026-09-03 with 19 `c-unit` runs on `main` in between and `windows-bundles.yml`'s
+`run-windows` green throughout. They are not coming back — win-gnu is gated from
+`windows-bundles.yml`, per CLAUDE.md rule 3.
 
 ## windows-msvc via cross-built bundles, and the one native `cl` gate that stays
 
@@ -565,8 +718,15 @@ CLAUDE.md rule 3 makes MSVC a priority platform. **A clang-cl binary is not a `c
 binary**: clang-cl accepts `__attribute__`s that `cl` rejects, and `cl`'s codegen, TLS
 lowering and DLL runtime are its own. So `c-unit.yml`'s **`ctest (windows-latest)`
 (Release) stays native and stays a hard gate** — it is not `continue-on-error`, and it is
-not scheduled for deletion. Every *other* `windows-latest` row in the repository is now
-informational with a dated TODO. Windows runner jobs per push: **13 → 2**.
+not scheduled for deletion. #307 split it into `build-windows-native` (the `cl` compile)
+and `run-windows-native` (the run, still reporting under the name `ctest
+(windows-latest)`); both halves are hard gates and neither is `continue-on-error`.
+
+Every *other* `windows-latest` row in the repository was informational with a dated TODO.
+`c-unit.yml`'s share of those — the `windows-latest` rows of `ctest-debug-full`,
+`ctest-shared` and `memory-gate` — was **deleted by #307** once that window had elapsed
+(see the phase C rollout note above for the run counts). Windows runner jobs per push from
+`c-unit.yml`: **7 → 2**, and those two are the retained `cl` gate's build and run halves.
 
 `run-windows` additionally configures all three MSVC configs with `cl` and builds the
 Release tree. That is not a duplicate gate; it is what gives the coverage comparison a real
@@ -802,7 +962,8 @@ follow-up as phase B's correction 8 and phase C's correction 7.
 
 Informational (`continue-on-error`) for at least ten pushes, each with a dated TODO naming
 what deletes it: `c-unit.yml`'s `ctest-debug-full`, `ctest-shared` and `memory-gate`
-**windows rows only**, `rust-native.yml`'s `test (windows-latest)`, `cross.yml`'s
+**windows rows only** (deleted by #307 on 2026-09-03, window elapsed),
+`rust-native.yml`'s `test (windows-latest)`, `cross.yml`'s
 `test (x86_64-pc-windows-msvc)`, and `benchmark-sentinel.yml`'s
 `benchmark-sentinel (windows-latest)`. When `cross.yml`'s msvc row goes, `build-cross`'s
 `x86_64-pc-windows-msvc` row goes with it — but **not** `aarch64-pc-windows-msvc`, which is

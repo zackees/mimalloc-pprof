@@ -301,7 +301,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # The two apple-darwin rows are GONE (#277 phase B2). Nothing Apple is executed on a
     # native macOS runner anywhere in this repository any more: the x86_64 test binaries
-    # `build-cross` still stages are executed by macos-bundles.yml's `run-macos-x64-dockur`
+    # `build-cross` still stages are executed by macos-bundles.yml's `run-macos-x64-recovery`
     # inside a dockurr/macos guest on a Linux runner, and aarch64 is compile-only. The
     # rows that used to be here measured 8-14 s of execution behind up to 5h26m / 6h13m of
     # queue wait.

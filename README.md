@@ -70,7 +70,8 @@ what that risk means and what was measured.
 
 **Contents**
 
-- [Quick start](#quick-start)
+- [At a glance](#at-a-glance--why-use-this-version) — what you get over upstream mimalloc, in one screen
+- [Integration](#integration) — pprof, exact stats and DHAT in Rust and C, plus the full API table
 - [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, TCMalloc, and jemalloc
 - [Why use this fork](#why-use-this-fork) — the most tested mimalloc fork in existence
 - [Bun features](#bun-features) — every feature ported from oven-sh/mimalloc, including a measured hole-purging chart
@@ -82,7 +83,69 @@ what that risk means and what was measured.
 
 ---
 
-## Quick start
+## At a glance — why use this version?
+
+Upstream mimalloc v3, plus everything below. Every item is on `main`, tested on every
+commit, and reachable from both C and Rust ([full API table](#api-surface)).
+
+- **pprof output.** A sampled heap profiler built into the allocator: `MIMALLOC_PROF=1`
+  or `mi_prof_start()` / `prof::start()`, dump `heap_v2` text or `profile.proto`, open in
+  `pprof` or any flame-graph tool. Sampling costs nothing on the fast path when it is
+  off — the `malloc` hot path disassembles byte-identical to an `MI_PPROF=OFF` build —
+  and ~512 KiB sampling intervals keep it cheap when it is on. Windows-native
+  (MSVC and MinGW), Linux, macOS. → [pprof](#pprof-sampled-heap-profiling)
+- **malloc stats.** Exact allocator statistics (`mi_stats_get`, `mi_stats_get_json`,
+  `stats::get()`), per sub-process and per heap, embedded as `#` comment lines in every
+  profile dump so a sampled profile can be checked against ground truth. Upstream v3's
+  API, bound completely in Rust here. → [Exact allocator stats](#exact-allocator-stats)
+- **DHAT total accounting.** Exact, every-allocation profiling with lifetimes and
+  access counts (`mi_dhat_start`, `dhat::start()`), dumped in Valgrind's DHAT format for
+  `dh_view.html`. Independent of `MI_PPROF`. → [DHAT](#dhat-exact-heap-profiling)
+- **Memory-events API.** Opt-in allocation-change callbacks and live-allocation
+  snapshots (`mi_memory_set_callbacks`, `memory_events::snapshot()`) for your own
+  counters — one relaxed flag check per operation while off, available even with the
+  profiler compiled out. → [memory events](docs/dhat-and-memory-events.md#memory-events-api)
+- **All of Bun's mimalloc enhancements**, ported from
+  [oven-sh/mimalloc](https://github.com/oven-sh/mimalloc) through `b20b60d9` and
+  re-verified under this tree's stress suite. → [Bun features](#bun-features)
+  - **"Hole punch" memory return.** Free blocks *inside* a still-used page are
+    discarded to the OS one page at a time, so a single long-lived object no longer
+    pins a 64 KiB–512 KiB page resident. On the churn benchmark it returns **74 % of
+    peak RSS** after idle, versus 18 % for the scavenger alone
+    (`mi_on_thread_idle()`, `MIMALLOC_PURGE_HOLES`). → [measured](#hole-purging-measured)
+  - **Background scavenger.** A demand-driven thread purges scheduled arena memory on a
+    100 ms timer instead of waiting for the next allocation; threads with an event loop
+    can hand the work off with `mi_on_thread_idle_start()` / `park_while_idle()`.
+  - **`fork()` safety.** `pthread_atfork` handlers with a documented lock order and an
+    `MI_DEBUG>2` runtime lock-order checker, so a forked child never inherits a lock
+    another thread held.
+  - **Heap teardown protocol.** A four-step claim protocol closes an ABA race between
+    `mi_heap_destroy` and a concurrent allocation, plus Bun's heap-teardown test corpus
+    and fault-injection hook; two further use-after-free classes were found and fixed
+    here.
+  - **Lazy abandoned-page bitmaps and unmapped abandon on release.** Per-bin abandoned
+    bitmaps are allocated on first use instead of eagerly (~110 KB and ~50 page faults
+    saved per heap), and a heap being released abandons its pages without mapping them.
+  - **Collect on sub-process-safe free.** `mi_heap_destroy` no longer strands ~170 KB
+    per destroyed heap in burst patterns.
+  - **`mi_heap_dump_json` / `mi_heap_get_seq`**, `MI_NO_PROCESS_DETACH` for embedders
+    that own teardown, zero-cost-when-off profiler fast path, TLS-slot zeroing, the
+    glibc 2.44 `free(NULL)`-before-init fix, Windows PRNG/RAM-sizing/NUMA fixes, and
+    macOS TLS slots 96/97.
+- **Upstream bugs found and fixed here first**, including two unbounded memory leaks
+  and an ARM64 atomics incompatibility, several since upstreamed by Microsoft.
+  → [Upstream bugs](#upstream-bugs-found-and-fixed)
+- **The most tested mimalloc fork.** Ubuntu, Windows MSVC, Windows MinGW and macOS
+  (cross-built on Linux, executed in a macOS guest — no Apple hardware) in Debug and
+  Release, profiler in and out, ASan, fuzzing, a memory-regression gate, and a positive
+  control for every gate that can carry one. → [Why use this fork](#why-use-this-fork)
+- **A Rust crate with full parity.** `mimalloc-pprof` on crates.io binds every fork C
+  export and every `mi_option_t` enumerator, with layout and enum-value checks against
+  the C compiler on every build. → [API surface](#api-surface)
+
+---
+
+## Integration
 
 Three instruments, each shown in Rust and C: **pprof** sampled profiling for
 production, **exact allocator stats** to check a sampled profile against, and
@@ -593,7 +656,7 @@ lands, so quality is maintained by machinery, not just intent.
 ## Bun features
 
 The largest source of features in this fork is not original work: **[oven-sh/mimalloc](https://github.com/oven-sh/mimalloc)**,
-Bun's mimalloc fork (MIT), pinned at [`942b8342`](https://github.com/oven-sh/mimalloc/commit/942b8342), has independently
+Bun's mimalloc fork (MIT), ingested through [`b20b60d9`](https://github.com/oven-sh/mimalloc/commit/b20b60d9), has independently
 solved several of the same problems — a background scavenger, hole purging, fork safety, heap-teardown races, profiler
 test coverage. Where its solution held up under this tree's own stress suite, it was ported rather than reinvented. The
 full survey, including what was *not* imported and why, is in [`MIMALLOC_FORKS.md`](MIMALLOC_FORKS.md).
@@ -612,6 +675,8 @@ full survey, including what was *not* imported and why, is in [`MIMALLOC_FORKS.m
 | Background scavenger thread + `mi_on_thread_idle*` | A demand-driven background thread that purges scheduled arena memory on a timer instead of only on allocation; `purge_delay` 1000 → 100 ms. | `src/scavenger.c` | [#299](https://github.com/zackees/mimalloc-pprof/pull/299) | Deviations from Bun: stopped from an `atexit` handler on Windows; lazy start fires only from a main-subprocess thread (a sub-subprocess-started scavenger has its TLS torn down first); the new `mi_subproc_t` fields are appended at the struct tail rather than mid-struct — Bun's placement shifts `stats`, which the free path touches, ~2 ns/alloc+free. (The park protocol itself is Bun's, imported as part of this PR.) |
 | Page hole purging (`purge_holes*`) | Discards the memory of free blocks *inside* a still-used page (OS-page units), so one long-lived object no longer pins a whole page resident. | `src/page.c` (+1038), `942b8342` | [#302](https://github.com/zackees/mimalloc-pprof/pull/302) | The whole engine, including the sweep drivers, was moved into a new `src/page-holes.c`; upstream files carry only five hook calls. See "Hole purging, measured" below. |
 | Windows PRNG / RAM-sizing / NUMA fixes; macOS TLS slots 96/97 | `ProcessPrng` instead of always loading `bcrypt.dll`; `GlobalMemoryStatusEx` instead of an SMBIOS parse; NUMA node count off-by-one; fixed TLS slots moved into libpthread's never-assigned gap (95 is the last assigned key). | Bun (`6ccccec2`, `c3c36aa8`, `75a1edf8`, `d676cced`, `include/mimalloc/prim-tls.h:356-361`); NUMA fix from upstream `66383f06`, cherry-picked by Bun as `16cd3684` | [#297](https://github.com/zackees/mimalloc-pprof/pull/297) | CI fetches `apple-oss-distributions/libpthread`'s `tsd_private.h` from `main` (not pinned) and fails if slot 96 or 97 is ever assigned upstream. |
+| Collect on sub-process-safe free | `_mi_free_subproc_safe` collects the page inside its own sub-process, so `mi_heap_destroy` no longer strands ~170 KB per destroyed heap in burst patterns. | [`04ced98d`](https://github.com/oven-sh/mimalloc/commit/04ced98d) | [#318](https://github.com/zackees/mimalloc-pprof/pull/318) | Hand-ported (trees diverged); converged on Bun's `MI_THREADID_DETACHED` test in `mi_stat_free` after review found a teardown-order NULL deref in the first draft. New `test-heap-burst-destroy` proves RED/GREEN. |
+| Lazy per-bin abandoned bitmaps, `heap->releasing`, unmapped abandon on release | Per-bin abandoned-page bitmaps are allocated on first abandon instead of eagerly (~110 KB and ~50 page faults per heap); a heap being released abandons its pages unmapped; the delete walk is ordered against concurrent frees. | [`787be2a8`](https://github.com/oven-sh/mimalloc/commit/787be2a8), [`91218f30`](https://github.com/oven-sh/mimalloc/commit/91218f30), [`a26c5de7`](https://github.com/oven-sh/mimalloc/commit/a26c5de7) | [#319](https://github.com/zackees/mimalloc-pprof/pull/319) | Review found the lazy allocation could re-enter `subproc->theap_meta_lock` from the abandon path; sub-process meta theaps now have `allow_page_abandon=false` like the process one, and meta pages skip the bitmap allocation. New tests `test-abandoned-lazy`, `test-heap-release-mt`. |
 
 ### Hole purging, measured
 

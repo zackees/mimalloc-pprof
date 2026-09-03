@@ -1017,10 +1017,11 @@ without touching the network.
 
 Three details worth stating, because each was an assumption that measurement overturned:
 
-- **Peak memory is not a low-variance signal.** Repeated runs of the same unchanged
-  binary span 6–12% on CI runners. The memory gate therefore compares the **minimum of
-  four runs** and prints the observed spread every time, warning if it ever approaches
-  the tolerance. A gate that flakes gets ignored, and an ignored gate is worse than none.
+- **Peak memory is not a low-variance signal — but a workload can be made one.** See
+  [the memory gate](#the-memory-gate-what-it-measures-298) below: the first version of
+  this bullet said the spread was 6–12% and that a minimum-of-N would absorb it. Measured
+  over twelve `main` runs it was 16–44%, no statistic absorbed it, and the fix had to be
+  in the workload rather than in the threshold.
 - **The gate scripts are gating code.** Several of the silent failures above were Python
   or YAML bugs rather than C bugs — the arm64 instruction scanner matched nothing at all
   and reported "clean". Hence `pyright --strict` over `ci/`, with the result schema
@@ -1029,6 +1030,126 @@ Three details worth stating, because each was an assumption that measurement ove
   was satisfied by libFuzzer's advice *to use* AddressSanitizer. Assertions about tool
   output should anchor on that tool's actual report format (`^(==[0-9]+==)?(ERROR|SUMMARY):`),
   never on a keyword that can appear in an explanatory sentence.
+
+## The memory gate: what it measures (#298)
+
+`memory-gate` builds `test/test-memory-gate.c` with `MI_PPROF=ON` in Release, runs it
+eight times, and compares the **minimum** peak of those runs against a committed
+per-platform/arch/compiler baseline in `ci/memory-baselines/`. On Windows the gated
+number is peak *commit* (the working set is trimmed under pressure and would hide
+committed-but-untouched growth); everywhere else it is peak RSS, from `ru_maxrss` via
+`mi_process_info`. A second build with `-DMI_BENCH_INJECT_LEAK=200000` runs the identical
+comparison through `memory_gate.py control`, which passes only if the gate *fails*.
+
+**What went wrong.** The gate was red on `main` for commits that changed no allocator
+code (docs-only #275, ci-only #278/#297), and its own output warned that the observed
+spread exceeded the tolerance it was being compared under. The `memory-gate-ubuntu-latest`
+artifacts of the last twelve `main` runs of `c-unit.yml`, against a 22.3 MB baseline with
+25.6 MB allowed:
+
+| run | min-of-8 | median | within-run spread |
+|---|---|---|---|
+| 33618717188 | 26.7 | 29.6 | 32.6% |
+| 33629562858 | 24.7 | 27.4 | 19.0% |
+| 33631613324 | 28.0 | 29.2 | 15.7% |
+| 33635722154 | 26.0 | 28.0 | 19.6% |
+| 33636560081 | 22.3 | 26.9 | 30.0% |
+| 33646494496 | 24.3 | 28.2 | 44.4% |
+| 33647332787 | 24.5 | 26.5 | 17.6% |
+| 33654892179 | 27.9 | 31.2 | 24.4% |
+| 33660325957 | 26.5 | 27.6 | 18.5% |
+| 33689409217 | 22.7 | 25.6 | 25.6% |
+| 33692432919 | 25.5 | 27.9 | 28.2% |
+| 33699070304 | 27.8 | 30.2 | 19.8% |
+
+min-of-8 spans 25.6% across runs and the median 21.9%, so **no statistic was going to
+rescue this** — the signal was not there to extract. The `profiler_arena_mb`,
+`purged_gb` and liveness counters in those same artifacts are constant across every run,
+which rules out the profiler's arena and the P7a/P7b purge machinery: the variance is
+entirely in peak RSS. A per-scenario decomposition (idle host, `taskset -c 0-3`) located
+it: scenario 1, the 8-thread churn, alone ranged 14.1 → 24.6 MB run to run, and every
+later scenario added ≤ 2 MB on top of it. Peak RSS is a high-water mark, so what the gate
+was actually measuring was **how many of the churn workers the runner's scheduler
+happened to overlap** — a property of the runner, not of the allocator.
+
+**The fix is in the workload.** `test/test-memory-gate.c` now rendezvouses the churn
+workers on a portable condition-variable barrier: every worker in a round allocates its
+live set, waits for all of them, then churns and waits again before freeing. "All N live
+at once" becomes the only reachable state, so the peak is the structural cost of N live
+sets. Scenario 3's `while (ready == 0) {}` handoff became the same barrier, so six
+consumers no longer burn the vCPUs the producers need. Wall time roughly halved and
+stopped scattering: 0.26 / 0.47 / 0.52 s before, 0.27 / 0.18 / 0.18 s after (same
+library, three runs each, `taskset -c 0-3` on an otherwise idle host).
+
+**The numbers.** Three independent `ubuntu-latest` runner VMs (`nproc=4`,
+THP=`always`), 16 runs each, identical object code:
+
+| lane | min | median | max | spread |
+|---|---|---|---|---|
+| new workload, run A | 58.0 | 58.3 | 58.5 | **0.9%** |
+| new workload, run B | 58.0 | 58.5 | 58.5 | **0.9%** |
+| new workload, run C | 58.0 | 58.3 | 58.6 | **1.0%** |
+| old workload, same three VMs | 26.4 / 27.4 / 25.5 | — | — | 26.1% / 24.5% / 23.1% |
+
+min-of-16 is 58.0 MB on all three VMs — 0.0% across-run variation of the estimator.
+Variants that changed nothing: `taskset -c 0-1` (0.5%), `taskset -c 0` (0.7%),
+`MIMALLOC_SCAVENGER=0 MIMALLOC_PURGE_HOLES=0` (1.2%). An unpinned 16-core workstation
+reads 58.2–58.3 MB — the same number as the 4-vCPU runner, where the *old* workload read
+58 MB unpinned against 23 MB pinned. The gate is now host-independent, which is why
+`memory_gate.py`'s local CPU pinning is no longer load-bearing (it is kept as a guard
+against a future scenario reintroducing the sensitivity).
+
+**Tolerance.** `PEAK_TOLERANCE = 0.05`, down from 0.15. That is 5× the largest observed
+spread and 2.9 MB of absolute headroom on the 58.0 MB baseline. The measurement would
+support 0.03; the difference is reserved for runner-image drift, which three runs on one
+image cannot bound — tighten it once ten `main` runs on a new image have been observed,
+with those numbers written into `ci/memory_gate.py`. `RUNS_EXPECTED` stays 8: min-of-8 and
+min-of-16 of this distribution are the same number, so more runs buy nothing and fewer
+would need a matching edit to `c-unit.yml`'s run loops.
+
+**Control margin.** The `MI_BENCH_INJECT_LEAK=200000` build reads min-of-8 82.6 / 82.4 /
+82.5 MB on those same three VMs — **+42.1%**, or 8.4× the tolerance, against a rule that
+the control must fire by at least 2×. CI confirms it on both gated metrics: run
+33701827771's controls report `peak_rss regressed: 82.5 MB vs baseline 58.0 MB (+42.2%)`
+and `peak_commit regressed: 113.7 MB vs baseline 74.4 MB (+52.8%)`. Note that the control
+no longer fires at ~3× the baseline as it did before this change — the injected leak is
+still the same ~32 MB, but the structural peak it has to clear went from ~22 MB to 58 MB.
+The rule that matters (≥2× the tolerance) is met with a factor of four to spare; if a
+larger absolute ratio is wanted, `MI_BENCH_INJECT_LEAK` is set in the workflow, so raising
+it belongs with #307's `c-unit.yml` rewrite rather than here. `ci/tests/test_memory_gate.py` asserts that ratio,
+so raising the tolerance past half the measured control margin is a failing test rather
+than a judgement call. Leak injection now `memset`s the whole block: RSS counts *resident*
+pages, and a leak whose pages were committed-but-untouched moved the peak by an amount
+that depended on purge timing — one measured batch had a control run land within 1% of
+the clean baseline, i.e. the control came within one sample of silently not firing.
+
+**Baselines.** `linux-pprof1.json` re-recorded at 58.0 MB (min-of-16, 0.9% spread) from
+run 33700518749; independently confirmed on two further runner VMs by runs 33701098707
+(min-of-8 58.2 MB, 0.7% spread) and 33701827771 (58.1 MB, 0.7%), for five independent
+`ubuntu-latest` VMs in total, all reading 58.0-58.2 MB.
+
+`windows-pprof1.json` re-recorded at **74.4 MB (min-of-8, 0.1% spread)** from run
+33701098707, and reproduced exactly by run 33701827771 (min-of-8 74.4 MB, 0.1% spread) on
+a second Windows runner — two runs, not one. Re-recorded because a workload change invalidates every baseline, not just the flaky one.
+Windows was never the *failing* lane but it was the noisy one: across the same twelve
+`main` runs it read min-of-8 51.2–57.0 MB (11.3% across runs) with within-run spreads of
+3.9–17.5%, and its committed baseline had itself been recorded at 9.9% spread. The
+rendezvous fixed it too, and by more than it fixed ubuntu — 17.5% → 0.1%, which is the
+clearest evidence available that the scheduler-overlap diagnosis was the right one: the
+same source code change collapses the spread on two unrelated kernels and two different
+gated metrics (peak RSS and peak commit).
+
+`macos-pprof1.json` is **left
+untouched and is stale**: it records a native-Xcode arm64 lane that #277 phase B2 deleted,
+and no lane compares against it any more (the dockur x86_64 lane keys on
+`macos-x86_64-soldr-clang-21-pprof1.json` and bootstraps its own). Delete or regenerate it
+if a macOS lane ever compares against `macos-pprof1.json` again.
+
+`ci/tests/test_memory_gate.py` additionally asserts that **every** committed baseline's
+own recorded `baseline_spread_pct` is below the tolerance it will be compared under —
+baselining from a measurement noisier than the threshold is the #298 failure mode in
+miniature.
+
 
 ## zero-tracking on Windows: a gated step, not a VM (#277 phase E)
 

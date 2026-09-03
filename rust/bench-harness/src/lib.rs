@@ -421,12 +421,20 @@ fn run_child_sample(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(BenchError::Spawn)?;
-    process
-        .stdin
-        .take()
-        .expect("child stdin piped")
-        .write_all(&request)
-        .map_err(BenchError::WriteRequest)?;
+    {
+        let mut stdin = process.stdin.take().expect("child stdin piped");
+        // A child that exits before reading its request (a crash, or a deliberately
+        // malformed test child that prints and returns) closes the pipe under us. That
+        // is not a request-delivery failure: fall through and let the child's exit
+        // status and output say what went wrong, so the reported error is the same
+        // whichever side won the race (#323).
+        match stdin.write_all(&request) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(error) => return Err(BenchError::WriteRequest(error)),
+        }
+        // Dropping stdin here closes the write end, so the child sees EOF.
+    }
 
     let started = Instant::now();
     loop {

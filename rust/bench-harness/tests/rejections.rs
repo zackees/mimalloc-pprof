@@ -44,18 +44,21 @@ fn benchmark_rejects_zero_measurement_rounds() {
 
 #[test]
 fn benchmark_rejects_partial_or_extra_child_output() {
-    assert!(matches!(
-        run_benchmark(config(), &child(Some("partial"))),
-        Err(BenchError::InvalidChildResponse(_))
-    ));
-    assert!(matches!(
-        run_benchmark(config(), &child(Some("extra"))),
-        Err(BenchError::InvalidChildResponse(_))
-    ));
-    assert!(matches!(
-        run_benchmark(config(), &child(Some("nonfinite"))),
-        Err(BenchError::InvalidChildResponse(_))
-    ));
+    let result = run_benchmark(config(), &child(Some("partial")));
+    assert!(
+        matches!(result, Err(BenchError::InvalidChildResponse(_))),
+        "partial: expected InvalidChildResponse, got {result:?}"
+    );
+    let result = run_benchmark(config(), &child(Some("extra")));
+    assert!(
+        matches!(result, Err(BenchError::InvalidChildResponse(_))),
+        "extra: expected InvalidChildResponse, got {result:?}"
+    );
+    let result = run_benchmark(config(), &child(Some("nonfinite")));
+    assert!(
+        matches!(result, Err(BenchError::InvalidChildResponse(_))),
+        "nonfinite: expected InvalidChildResponse, got {result:?}"
+    );
 }
 
 #[test]

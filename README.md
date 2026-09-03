@@ -332,8 +332,9 @@ For a measured chart of what this buys on a churn workload, see
 
 Every API this fork adds, in all three places it can be reached from: the C header,
 the crate's raw FFI module (`mimalloc_pprof::sys`, `unsafe`), and the crate's safe
-wrapper. There are no gaps — `ci/check_rust_surface.py` fails the build if a C export
-or an `mi_option_t` enumerator appears without a binding, and
+wrapper. There are no gaps — `ci/check_rust_surface.py` fails the build if a **fork** C export
+or an `mi_option_t` enumerator appears without a binding (upstream's own exports are
+bound opportunistically, not by requirement), and
 `rust/mimalloc-pprof/tests/t19_layout.rs` checks every mirrored struct layout and
 option value against what the C compiler actually laid out.
 

@@ -748,6 +748,270 @@ class EndToEndBundleTest(unittest.TestCase):
             self.assertIn("bundle_tests:", proc.stderr)
 
 
+# --------------------------------------------------------------------------------------
+# Multi-bundle mode, the serial group and env variants (issue #307)
+# --------------------------------------------------------------------------------------
+
+#: Writes an append-only interval log, so a test can assert on what actually overlapped
+#: rather than on the scheduler's own claim about what it did.
+TIMING_PROBE = """
+import os, sys, time
+name = sys.argv[1]
+duration = float(sys.argv[2])
+log = os.environ["PROBE_LOG"]
+with open(log, "a") as handle:
+    handle.write("%s start %.6f\\n" % (name, time.time()))
+time.sleep(duration)
+with open(log, "a") as handle:
+    handle.write("%s end %.6f\\n" % (name, time.time()))
+print("VARIANT=" + os.environ.get("VARIANT", "<unset>"))
+"""
+
+
+class SerialFlagLoweringTest(unittest.TestCase):
+    """`RUN_SERIAL` (and a `serial` label) reach the manifest, both spellings."""
+
+    def _one(self, properties: list[dict[str, object]]) -> bundle_tests.BundledTest:
+        payload = _wrap(
+            _test_entry("t", [str(BUILD / "mimalloc-test-t")], properties),
+        )
+        tests, _ = bundle_tests.convert(payload, BUILD)
+        return tests[0]
+
+    def test_run_serial_boolean_true_is_lowered(self) -> None:
+        # ctest --show-only=json-v1 emits RUN_SERIAL as a JSON boolean, not a string.
+        test = self._one([{"name": "RUN_SERIAL", "value": True}])
+        self.assertTrue(test.serial)
+        self.assertIs(test.to_json()["serial"], True)
+
+    def test_run_serial_string_spellings_are_lowered(self) -> None:
+        for value in ("TRUE", "ON", "1"):
+            with self.subTest(value=value):
+                self.assertTrue(self._one([{"name": "RUN_SERIAL", "value": value}]).serial)
+
+    def test_a_serial_label_means_the_same_thing(self) -> None:
+        test = self._one([{"name": "LABELS", "value": ["slow", "serial"]}])
+        self.assertTrue(test.serial)
+
+    def test_absent_property_means_parallel(self) -> None:
+        test = self._one([])
+        self.assertFalse(test.serial)
+        self.assertIs(test.to_json()["serial"], False)
+
+    def test_a_manifest_written_before_307_still_loads(self) -> None:
+        """Every bundle in flight when this landed has no `serial` key at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            (bundle / "tests.json").write_text(
+                json.dumps({"version": 1, "tests": [{"name": "t", "argv": ["x"]}]}),
+                encoding="utf-8",
+            )
+            specs = run_test_bundle.load_manifest(bundle)
+        self.assertEqual(len(specs), 1)
+        self.assertFalse(specs[0].serial)
+
+
+class VariantParsingTest(unittest.TestCase):
+    def test_base_pass_is_always_present(self) -> None:
+        self.assertEqual(run_test_bundle.parse_variants([]), [run_test_bundle.BASE_VARIANT])
+
+    def test_unscoped_variant_applies_everywhere(self) -> None:
+        variant = run_test_bundle.parse_variants([["guarded", "K=1"]])[1]
+        self.assertEqual(variant.label, "guarded")
+        self.assertEqual(variant.env, {"K": "1"})
+        self.assertTrue(variant.applies_to("anything"))
+
+    def test_scoped_variant_applies_to_one_bundle(self) -> None:
+        variant = run_test_bundle.parse_variants([["guarded:rate-1", "K=1"]])[1]
+        self.assertEqual(variant.label, "rate-1")
+        self.assertTrue(variant.applies_to("guarded"))
+        self.assertFalse(variant.applies_to("release"))
+
+    def test_a_label_with_no_assignment_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            run_test_bundle.parse_variants([["guarded"]])
+
+    def test_an_empty_label_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            run_test_bundle.parse_variants([["guarded:", "K=1"]])
+
+
+class MultiBundleRunnerTest(unittest.TestCase):
+    """The shape `c-unit.yml`'s run stage depends on: many bundles, one wave, one serial group."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.log = self.root / "intervals.log"
+
+    def make_bundle(self, name: str, tests: list[dict[str, object]]) -> Path:
+        bundle = self.root / name
+        bundle.mkdir()
+        (bundle / "probe.py").write_text(TIMING_PROBE, encoding="utf-8")
+        (bundle / "tests.json").write_text(
+            json.dumps({"version": 1, "tests": tests}), encoding="utf-8"
+        )
+        return bundle
+
+    def spec(
+        self, name: str, seconds: float = 0.4, *, serial: bool = False, **overrides: object
+    ) -> dict[str, object]:
+        entry: dict[str, object] = {
+            "name": name,
+            "argv": [sys.executable, "${BUNDLE}/probe.py", name, str(seconds)],
+            "env": {},
+            "cwd": "${BUNDLE}",
+            "timeout": 60.0,
+            "expect_nonzero": False,
+            "expect_text": None,
+            "labels": [],
+            "serial": serial,
+        }
+        entry.update(overrides)
+        return entry
+
+    def run_bundles(self, *args: str) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        environment["PROBE_LOG"] = str(self.log)
+        return subprocess.run(
+            [sys.executable, str(RUN_BUNDLE), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+
+    def intervals(self) -> dict[str, tuple[float, float]]:
+        starts: dict[str, float] = {}
+        ends: dict[str, float] = {}
+        for line in self.log.read_text(encoding="utf-8").splitlines():
+            name, event, stamp = line.rsplit(" ", 2)
+            (starts if event == "start" else ends)[name] = float(stamp)
+        return {name: (starts[name], ends[name]) for name in starts if name in ends}
+
+    def test_bundles_and_tests_run_concurrently(self) -> None:
+        first = self.make_bundle("alpha", [self.spec("a1"), self.spec("a2")])
+        second = self.make_bundle("beta", [self.spec("b1"), self.spec("b2")])
+        proc = self.run_bundles("--bundles", str(first), str(second), "--jobs", "4")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("out of 4", proc.stdout)
+        spans = self.intervals()
+        self.assertEqual(len(spans), 4)
+        overlapping = [
+            (x, y)
+            for x in spans
+            for y in spans
+            if x < y and spans[x][0] < spans[y][1] and spans[y][0] < spans[x][1]
+        ]
+        self.assertTrue(overlapping, f"nothing ran concurrently: {spans}")
+
+    def test_serial_tests_never_overlap_anything(self) -> None:
+        bundle = self.make_bundle(
+            "gamma",
+            [
+                self.spec("p1"),
+                self.spec("p2"),
+                self.spec("s1", serial=True),
+                self.spec("s2", serial=True),
+            ],
+        )
+        proc = self.run_bundles("--bundles", str(bundle), "--jobs", "4")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("2 in a 4-wide wave, 2 serialized afterwards", proc.stdout)
+        spans = self.intervals()
+        for serial_name in ("s1", "s2"):
+            for other, (start, end) in spans.items():
+                if other == serial_name:
+                    continue
+                own_start, own_end = spans[serial_name]
+                self.assertFalse(
+                    own_start < end and start < own_end,
+                    f"{serial_name} overlapped {other}: {spans}",
+                )
+
+    def test_env_variant_is_a_second_pass_with_a_stable_classname(self) -> None:
+        bundle = self.make_bundle("delta", [self.spec("d1", 0.0)])
+        results = self.root / "results"
+        proc = self.run_bundles(
+            "--bundles",
+            str(bundle),
+            "--env-variant",
+            "forced",
+            "VARIANT=on",
+            "--junit-dir",
+            str(results),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("out of 2", proc.stdout)
+        report = (results / "delta.xml").read_text(encoding="utf-8")
+        self.assertIn('name="d1"', report)
+        self.assertIn('name="d1 [forced]"', report)
+        self.assertEqual(report.count('classname="d1"'), 2)
+        self.assertIn("VARIANT=on", report)
+
+    def test_env_variant_scoped_to_one_bundle_leaves_the_others_alone(self) -> None:
+        first = self.make_bundle("eps", [self.spec("e1", 0.0)])
+        second = self.make_bundle("zeta", [self.spec("z1", 0.0)])
+        proc = self.run_bundles(
+            "--bundles", str(first), str(second), "--env-variant", "zeta:forced", "VARIANT=on"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("out of 3", proc.stdout)
+        self.assertIn("z1 [forced]", proc.stdout)
+        self.assertNotIn("e1 [forced]", proc.stdout)
+
+    def test_a_variant_scoped_to_an_unknown_bundle_is_an_error(self) -> None:
+        """Otherwise a typo silently drops the guarded second pass and still reports green."""
+        bundle = self.make_bundle("eta", [self.spec("h1", 0.0)])
+        proc = self.run_bundles("--bundles", str(bundle), "--env-variant", "typo:x", "K=1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("typo", proc.stderr)
+
+    def test_junit_dir_writes_one_file_per_bundle(self) -> None:
+        first = self.make_bundle("theta", [self.spec("t1", 0.0)])
+        second = self.make_bundle("iota", [self.spec("i1", 0.0)])
+        results = self.root / "out"
+        proc = self.run_bundles(
+            "--bundles", str(first), str(second), "--junit-dir", str(results), "--jobs", "2"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(sorted(path.name for path in results.iterdir()), ["iota.xml", "theta.xml"])
+        self.assertIn('name="t1"', (results / "theta.xml").read_text(encoding="utf-8"))
+
+    def test_a_failure_names_its_bundle(self) -> None:
+        bundle = self.make_bundle("kappa", [self.spec("k1", 0.0, timeout=0.0001)])
+        proc = self.run_bundles("--bundles", str(bundle))
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("kappa::k1", proc.stdout)
+
+    def test_both_bundle_forms_at_once_is_an_error(self) -> None:
+        bundle = self.make_bundle("lambda", [self.spec("l1", 0.0)])
+        proc = self.run_bundles(str(bundle), "--bundles", str(bundle))
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("exactly one", proc.stderr)
+
+    def test_compare_junit_is_refused_in_multi_bundle_mode(self) -> None:
+        bundle = self.make_bundle("mu", [self.spec("m1", 0.0)])
+        proc = self.run_bundles("--bundles", str(bundle), "--compare-junit", "ref.xml")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("single bundle", proc.stderr)
+
+    def test_compare_junit_is_refused_with_a_variant(self) -> None:
+        bundle = self.make_bundle("nu", [self.spec("n1", 0.0)])
+        proc = self.run_bundles(
+            str(bundle), "--env-variant", "forced", "K=1", "--compare-junit", "ref.xml"
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("single bundle", proc.stderr)
+
+    def test_selecting_nothing_is_an_error_not_a_green_run(self) -> None:
+        bundle = self.make_bundle("xi", [self.spec("x1", 0.0)])
+        proc = self.run_bundles("--bundles", str(bundle), "--only", "not-a-test")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("refusing to report a green run", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import xml.etree.ElementTree as ElementTree
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,13 +52,45 @@ def _as_array(value: object) -> list[object]:
     return cast("list[object]", value) if isinstance(value, list) else []
 
 
-def read_test_names(path: Path) -> set[str]:
-    """Test names from either shape: `ctest --show-only=json-v1` or a bundle manifest.
+def read_junit_names(path: Path) -> set[str]:
+    """Test names actually EXECUTED, from a JUnit file written by `run_test_bundle.py`.
 
-    Both put a `tests` array of objects with a `name` at the top level, which is not a
-    coincidence -- `bundle_tests.py` derives one from the other -- so one reader covers
-    both and the comparison cannot drift by reading them differently.
+    Issue #307 made this the candidate side in `c-unit.yml`: the run stage has no build
+    tree, so what it can prove is that every name the build job's `ctest --show-only`
+    listed was really executed -- a manifest only proves the bundle *contains* it.
+
+    `classname` is read in preference to `name` because an env-variant pass is reported
+    as `name [LABEL]` (the guarded config's `MIMALLOC_GUARDED_SAMPLE_RATE=1` second
+    pass); the coverage question is about the underlying test, not about how many
+    environments it ran under. A `skipped` case does not count as executed.
     """
+    try:
+        tree = ElementTree.parse(path)
+    except (OSError, ElementTree.ParseError) as exc:
+        raise CoverageError(f"{path}: {exc}") from exc
+    names: set[str] = set()
+    for case in tree.getroot().iter("testcase"):
+        if case.find("skipped") is not None:
+            continue
+        name = case.get("classname") or case.get("name")
+        if name:
+            names.add(name)
+    if not names:
+        raise CoverageError(f"{path}: contains no executed test names")
+    return names
+
+
+def read_test_names(path: Path) -> set[str]:
+    """Test names from any of the three shapes this repository produces.
+
+    `ctest --show-only=json-v1` and a bundle `tests.json` both put a `tests` array of
+    objects with a `name` at the top level, which is not a coincidence -- `bundle_tests.py`
+    derives one from the other -- so one reader covers both and the comparison cannot
+    drift by reading them differently. A `.xml` input is read as JUnit instead (#307), so
+    the candidate side can be "what actually ran" rather than "what was packaged".
+    """
+    if path.suffix.lower() == ".xml":
+        return read_junit_names(path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -132,10 +165,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--compare",
         nargs=3,
         action="append",
-        metavar=("LABEL", "NATIVE_JSON", "BUNDLE_MANIFEST"),
+        metavar=("LABEL", "REFERENCE", "CANDIDATE"),
         required=True,
         help="a reference manifest (ctest --show-only=json-v1 or a bundle tests.json) "
-        "and the bundle tests.json that replaces it",
+        "and what replaces it: another manifest, or a JUnit .xml of what actually ran",
     )
     parser.add_argument(
         "--heading",

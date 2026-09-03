@@ -91,5 +91,68 @@ class CoverageTest(unittest.TestCase):
         self.assertIn("test-api", names)
 
 
+class JUnitCandidateTest(unittest.TestCase):
+    """#307: the candidate side is what actually RAN, read from run_test_bundle's JUnit.
+
+    A manifest only proves the bundle *contains* a test. Once the run stage stopped
+    producing a native ctest reference of its own, "was it executed" became the property
+    worth asserting, so the comparison reads the JUnit the run wrote.
+    """
+
+    def _junit(self, directory: Path, name: str, body: str) -> str:
+        path = directory / name
+        path.write_text(f'<?xml version="1.0"?><testsuite>{body}</testsuite>', encoding="utf-8")
+        return str(path)
+
+    def test_executed_names_come_from_junit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = _write(Path(tmp), "show-only.json", ["test-api", "test-stress"])
+            executed = self._junit(
+                Path(tmp),
+                "release.xml",
+                '<testcase name="test-api" classname="test-api" status="run"/>'
+                '<testcase name="test-stress" classname="test-stress" status="run"/>',
+            )
+            self.assertEqual(bundle_coverage.main(["--compare", "release", reference, executed]), 0)
+
+    def test_a_name_that_was_never_executed_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = _write(Path(tmp), "show-only.json", ["test-api", "test-stress"])
+            executed = self._junit(
+                Path(tmp), "release.xml", '<testcase name="test-api" classname="test-api"/>'
+            )
+            self.assertEqual(bundle_coverage.main(["--compare", "release", reference, executed]), 1)
+
+    def test_env_variants_collapse_onto_their_base_name(self) -> None:
+        """`test-x [LABEL]` is another environment for test-x, not extra coverage."""
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = _write(Path(tmp), "show-only.json", ["test-api"])
+            executed = self._junit(
+                Path(tmp),
+                "guarded.xml",
+                '<testcase name="test-api" classname="test-api" status="run"/>'
+                '<testcase name="test-api [forced]" classname="test-api" status="run"/>',
+            )
+            self.assertEqual(bundle_coverage.read_test_names(Path(executed)), {"test-api"})
+            self.assertEqual(bundle_coverage.main(["--compare", "guarded", reference, executed]), 0)
+
+    def test_a_skipped_case_does_not_count_as_executed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = _write(Path(tmp), "show-only.json", ["test-api", "test-osx-zone"])
+            executed = self._junit(
+                Path(tmp),
+                "release.xml",
+                '<testcase name="test-api" classname="test-api" status="run"/>'
+                '<testcase name="test-osx-zone" classname="test-osx-zone"><skipped/></testcase>',
+            )
+            self.assertEqual(bundle_coverage.main(["--compare", "release", reference, executed]), 1)
+
+    def test_an_empty_junit_is_refused_rather_than_passing_trivially(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = _write(Path(tmp), "show-only.json", ["test-api"])
+            executed = self._junit(Path(tmp), "empty.xml", "")
+            self.assertEqual(bundle_coverage.main(["--compare", "release", reference, executed]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,17 @@ CI job calling this script (`.github/workflows/c-unit.yml`, job `bun-surface`) i
 gate: this script exits 1 whenever any symbol is missing, an ABI static_assert fails, or
 the resulting binary doesn't run clean, and that now blocks merge.
 
+Issue #307 split the script in two halves so `c-unit.yml`'s run stage does not rebuild
+`src/static.c` (the whole point of that issue is that every configuration is compiled
+exactly once, in the build stage):
+
+    uv run ci/check_bun_surface.py --emit-objects out/bun-glibc   # build stage: compile only
+    uv run ci/check_bun_surface.py --objects out/bun-glibc        # run stage: link, run, nm
+
+The two halves must agree on `--musl`, since the objects are ABI-specific; `--objects`
+therefore reads the `bun-surface.json` stamp `--emit-objects` writes beside them and
+refuses a mismatch rather than producing a confusing link error.
+
 Usage:
     uv run ci/check_bun_surface.py             # glibc build (Bun's default Linux config)
     uv run ci/check_bun_surface.py --musl       # + MI_LIBC_MUSL=1 -ftls-model=local-dynamic
@@ -28,6 +39,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -35,8 +47,13 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import cast
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+#: Written beside the objects by --emit-objects and checked by --objects. The objects are
+#: ABI-specific (musl vs glibc, and the compiler that produced them), so linking a musl
+#: static.o into a glibc probe has to fail with an explanation, not with a linker dump.
+STAMP_NAME = "bun-surface.json"
 STATIC_C = REPO_ROOT / "src" / "static.c"
 TEST_TU = REPO_ROOT / "test" / "test-bun-surface.cpp"
 INCLUDE_DIR = REPO_ROOT / "include"
@@ -121,6 +138,41 @@ def link(
     return run(command, cwd=REPO_ROOT)
 
 
+def emit_objects(cxx: str, out_dir: Path, extra_flags: list[str], musl: bool) -> int:
+    """Compile the two objects and stamp what they are. No link, no run (#307)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for source, target in ((STATIC_C, "static.o"), (TEST_TU, "test-bun-surface.o")):
+        print(f"[check_bun_surface] compiling {source.name} -> {target}...")
+        result = compile_object(cxx, source, out_dir / target, extra_flags)
+        if result.returncode != 0:
+            print(f"::error::{source.name} failed to compile under Bun's exact define set")
+            print(result.stdout)
+            print(result.stderr)
+            return 1
+    (out_dir / STAMP_NAME).write_text(
+        json.dumps({"musl": musl, "cxx": cxx}, indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"[check_bun_surface] objects written to {out_dir}")
+    return 0
+
+
+def check_stamp(out_dir: Path, musl: bool) -> str | None:
+    """None if the prebuilt objects match this invocation, else why they do not."""
+    stamp = out_dir / STAMP_NAME
+    if not stamp.is_file():
+        return f"{stamp} is missing -- these objects were not written by --emit-objects"
+    try:
+        payload = json.loads(stamp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"{stamp}: {exc}"
+    if not isinstance(payload, dict):
+        return f"{stamp}: not a JSON object"
+    recorded = cast("dict[str, object]", payload).get("musl")
+    if recorded is not musl:
+        return f"{stamp} was built with musl={recorded!r}, this run wants musl={musl!r}"
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -134,51 +186,85 @@ def main() -> int:
     parser.add_argument(
         "--keep-tmp", action="store_true", help="do not delete the scratch build directory"
     )
+    parser.add_argument(
+        "--emit-objects",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="compile static.o and test-bun-surface.o into DIR and stop (build stage, #307)",
+    )
+    parser.add_argument(
+        "--objects",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="link/run/nm from objects a previous --emit-objects wrote, compiling nothing",
+    )
     args = parser.parse_args()
 
-    cxx = args.cxx or os.environ.get("CXX") or shutil.which("c++") or "c++"
+    if args.emit_objects is not None and args.objects is not None:
+        print("--emit-objects and --objects are the two halves of one gate, not both at once")
+        return 1
 
+    cxx = args.cxx or os.environ.get("CXX") or shutil.which("c++") or "c++"
     extra_flags = list(BUN_MUSL_DEFINES + BUN_MUSL_CFLAGS) if args.musl else []
 
+    print(f"[check_bun_surface] compiler: {cxx}")
+    print(f"[check_bun_surface] musl: {args.musl}")
+
+    if args.emit_objects is not None:
+        return emit_objects(cxx, Path(args.emit_objects), extra_flags, bool(args.musl))
+
+    prebuilt = Path(args.objects) if args.objects is not None else None
     tmpdir = Path(tempfile.mkdtemp(prefix="bun-surface-"))
     try:
-        static_o = tmpdir / "static.o"
-        test_o = tmpdir / "test-bun-surface.o"
+        if prebuilt is not None:
+            problem = check_stamp(prebuilt, bool(args.musl))
+            if problem is not None:
+                print(f"::error::{problem}")
+                return 1
+            static_o = prebuilt / "static.o"
+            test_o = prebuilt / "test-bun-surface.o"
+            missing = [str(o) for o in (static_o, test_o) if not o.is_file()]
+            if missing:
+                print(f"::error::prebuilt object(s) not found: {', '.join(missing)}")
+                return 1
+            print(f"[check_bun_surface] using prebuilt objects from {prebuilt}")
+        else:
+            static_o = tmpdir / "static.o"
+            test_o = tmpdir / "test-bun-surface.o"
+
+            print("[check_bun_surface] compiling src/static.c as C++ with Bun's defines...")
+            r = compile_object(cxx, STATIC_C, static_o, extra_flags)
+            if r.returncode != 0:
+                print("::error::src/static.c failed to compile under Bun's exact define set")
+                print(r.stdout)
+                print(r.stderr)
+                return 1
+
+            print("[check_bun_surface] compiling test/test-bun-surface.cpp...")
+            r = compile_object(cxx, TEST_TU, test_o, extra_flags)
+            if r.returncode != 0:
+                # A compile failure here is almost always a failed static_assert -- i.e. an
+                # ABI drift (MI_MAX_ALIGN_SIZE, mi_heap_area_t layout, or an mi_option_t
+                # slot). Surface the compiler's own diagnostic, which already names the
+                # exact static_assert and its message.
+                print(
+                    "::error::test/test-bun-surface.cpp failed to compile -- likely an ABI static_assert failure"
+                )
+                print(r.stdout)
+                print(r.stderr)
+                return 1
+
         binary = tmpdir / "bun-surface-probe"
-
-        print(f"[check_bun_surface] compiler: {cxx}")
-        print(f"[check_bun_surface] musl: {args.musl}")
-
-        print("[check_bun_surface] compiling src/static.c as C++ with Bun's defines...")
-        r = compile_object(cxx, STATIC_C, static_o, extra_flags)
-        if r.returncode != 0:
-            print("::error::src/static.c failed to compile under Bun's exact define set")
-            print(r.stdout)
-            print(r.stderr)
-            return 1
-
-        print("[check_bun_surface] compiling test/test-bun-surface.cpp...")
-        r = compile_object(cxx, TEST_TU, test_o, extra_flags)
-        if r.returncode != 0:
-            # A compile failure here is almost always a failed static_assert -- i.e. an
-            # ABI drift (MI_MAX_ALIGN_SIZE, mi_heap_area_t layout, or an mi_option_t
-            # slot). Surface the compiler's own diagnostic, which already names the
-            # exact static_assert and its message.
-            print(
-                "::error::test/test-bun-surface.cpp failed to compile -- likely an ABI static_assert failure"
-            )
-            print(r.stdout)
-            print(r.stderr)
-            return 1
-
         print("[check_bun_surface] linking...")
         r = link(cxx, [test_o, static_o], binary, extra_flags)
         if r.returncode != 0:
-            missing = parse_missing_symbols(r.stdout + "\n" + r.stderr)
+            missing_symbols = parse_missing_symbols(r.stdout + "\n" + r.stderr)
             print("::error::link failed -- Bun would fail to link against this tree")
-            if missing:
-                print("MISSING_SYMBOLS: " + " ".join(missing))
-                for name in missing:
+            if missing_symbols:
+                print("MISSING_SYMBOLS: " + " ".join(missing_symbols))
+                for name in missing_symbols:
                     print(f"  - {name}")
             else:
                 print("(could not parse a missing-symbol list from the linker output below)")

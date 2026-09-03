@@ -7,6 +7,12 @@ on:
     paths:
       - 'rust/**'
       - 'ci/check_crate_package.py'
+      - 'ci/check_rust_surface.py'
+      # The C headers ARE an input to this job: ci/check_rust_surface.py fails when a
+      # header grows an export or an mi_option_t enumerator that rust/mimalloc-pprof's
+      # hand-written bindings do not mirror. Without these paths a C-only PR could add
+      # an API (or shift the option enum) and this job would never look.
+      - 'include/**'
       - '.github/workflows/rust-native.yml'
 
 concurrency:
@@ -48,6 +54,14 @@ jobs:
       - name: xtask check (vendored C amalgamation must match src/include/)
         if: runner.os != 'Windows'
         run: soldr cargo run -p xtask -- check
+      # The bindings in src/sys.rs are hand written, so nothing in the Rust build notices
+      # when C grows an export or shifts mi_option_t. This is what notices. Run before
+      # `cargo test` so a missing binding is reported as a missing binding rather than as
+      # a compile error three steps later.
+      - name: Rust binding surface covers the fork's C API
+        if: runner.os != 'Windows'
+        shell: bash
+        run: python ../ci/check_rust_surface.py
       - run: soldr cargo test --locked
       - name: cargo publish --dry-run (mimalloc-pprof)
         if: runner.os != 'Windows'

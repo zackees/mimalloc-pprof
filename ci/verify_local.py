@@ -641,6 +641,12 @@ def run_rust(ctx: RunCtx) -> bool:
     )
     if rc:
         return False
+    # rust-native.yml's "Rust binding surface covers the fork's C API" step. Cheap, and it
+    # names a missing binding as a missing binding instead of letting it surface (or not
+    # surface at all) three steps later.
+    rc, _ = run_logged(["uv", "run", "ci/check_rust_surface.py"], cwd=ROOT, log=ctx.log)
+    if rc:
+        return False
     rc, _ = run_logged(["cargo", "test", "--workspace"], cwd=rust_dir, log=ctx.log, env=env)
     return rc == 0
 
@@ -672,6 +678,8 @@ def run_lint(ctx: RunCtx) -> bool:
     for cmd in (
         ["uv", "run", "ci/check_isa_baseline.py", "--selftest"],
         ["uv", "run", "ci/check_internal_state.py", "--selftest"],
+        ["uv", "run", "ci/check_rust_surface.py", "--selftest"],
+        ["uv", "run", "ci/check_rust_surface.py"],
         ["uv", "run", "ci/check_isa_baseline.py", "--help"],
         ["uv", "run", "ci/check_release_equivalence.py", "--help"],
     ):

@@ -88,6 +88,10 @@ Three instruments, each shown in Rust and C: **pprof** sampled profiling for
 production, **exact allocator stats** to check a sampled profile against, and
 **DHAT** exact profiling for focused investigations.
 
+In a hurry, or looking for one specific call? [**API surface**](#api-surface) below
+is the whole thing in one table — every C entry point, its raw Rust FFI declaration,
+and its safe Rust wrapper.
+
 ### pprof: sampled heap profiling
 
 #### Rust
@@ -323,6 +327,156 @@ mi_purge_holes_report();        /* per size class: what could NOT be discarded, 
 
 For a measured chart of what this buys on a churn workload, see
 [Bun features: hole purging, measured](#hole-purging-measured).
+
+### API surface
+
+Every API this fork adds, in all three places it can be reached from: the C header,
+the crate's raw FFI module (`mimalloc_pprof::sys`, `unsafe`), and the crate's safe
+wrapper. There are no gaps — `ci/check_rust_surface.py` fails the build if a **fork** C export
+or an `mi_option_t` enumerator appears without a binding (upstream's own exports are
+bound opportunistically, not by requirement), and
+`rust/mimalloc-pprof/tests/t19_layout.rs` checks every mirrored struct layout and
+option value against what the C compiler actually laid out.
+
+Where the third column says **sys only**, that is deliberate and the reason is
+recorded in `ci/check_rust_surface.py`'s allowlist.
+
+#### Sampled pprof profiler — `include/mimalloc/profile.h`
+
+| C | Rust FFI (`sys::`) | Rust safe wrapper |
+|---|---|---|
+| `mi_prof_start` | ✅ | `prof::start` |
+| `mi_prof_start_seeded` | ✅ | `prof::start_seeded` |
+| `mi_prof_start_ex`, `mi_prof_config_t` | ✅ | `enable_heap_profiling_with(&ProfConfig)` |
+| `mi_prof_stop` | ✅ | `prof::stop` |
+| `mi_prof_is_enabled` | ✅ | `prof::is_enabled` |
+| `mi_prof_reset` | ✅ | `prof::reset` |
+| `mi_prof_dump` | ✅ | `prof::dump_file` |
+| `mi_prof_dump_writer` | ✅ | `prof::dump_to_vec` |
+| `mi_prof_dump_proto` | ✅ | `prof::dump_proto_file` |
+| `mi_prof_dump_proto_writer` | ✅ | `prof::dump_proto_to_vec` |
+| `mi_prof_stats_get`, `mi_prof_stats_t` | ✅ | `prof::stats() -> ProfStats` |
+| `mi_prof_snapshot_new` / `_visit` / `_free` | ✅ | `prof::samples() -> Vec<Sample>` |
+| `mi_prof_modules_visit` | ✅ | `prof::modules() -> Vec<ModuleInfo>` |
+| `mi_prof_visit` | ✅ | **sys only** — its visitor runs under the profiler lock, where an allocating Rust closure can deadlock; `prof::samples` takes a snapshot first |
+| `mi_prof_debug_stats` | ✅ | **sys only** — deprecated in favour of `mi_prof_stats_get` |
+| _no-code_: `MIMALLOC_PROF`, `MIMALLOC_PROF_DUMP_AT_EXIT`, … | — | see [options](#options--mi_option_t) below |
+
+Compiled out with the crate's `default-features = false` (mirrors `#if MI_PPROF`); the
+Rust API stays present and `prof::start` returns `false`.
+
+#### DHAT exact profiling — `include/mimalloc/dhat.h`
+
+| C | Rust FFI (`sys::`) | Rust safe wrapper |
+|---|---|---|
+| `mi_dhat_start` | ✅ | `dhat::start` |
+| `mi_dhat_stop` | ✅ | `dhat::stop` |
+| `mi_dhat_is_enabled` | ✅ | `dhat::is_enabled` |
+| `mi_dhat_stats_get`, `mi_dhat_stats_t` | ✅ | `dhat::stats() -> dhat::Stats` |
+| `mi_dhat_dump` | ✅ | `dhat::dump_file` |
+
+Independent of `MI_PPROF`: available in both feature modes.
+
+#### Memory events — `include/mimalloc/memory-events.h`
+
+| C | Rust FFI (`sys::`) | Rust safe wrapper |
+|---|---|---|
+| `mi_memory_tracking_set_enabled` | ✅ | `memory_events::set_enabled` |
+| `mi_memory_tracking_is_enabled` | ✅ | `memory_events::is_enabled` |
+| `mi_memory_snapshot`, `mi_memory_snapshot_t` | ✅ | `memory_events::snapshot() -> Snapshot` |
+| `mi_memory_set_callbacks`, `mi_memory_callbacks_t`, `mi_memory_change_t` | ✅ | `memory_events::set_callbacks(&'static Callbacks)` / `clear_callbacks` |
+| `mi_memory_visit_live_allocations` | ✅ | `unsafe memory_events::visit_live_allocations` |
+| `mi_unwrapped_malloc` / `_free` / `_realloc` | ✅ | `unwrapped_malloc` / `unwrapped_free` / `unwrapped_realloc` |
+
+Always compiled in, opt-in at runtime. Off by default, and while it is off every
+allocate/free/realloc pays for one relaxed flag check and nothing else.
+
+#### Exact allocator statistics — `include/mimalloc-stats.h`
+
+Upstream's API, not the fork's, but it is what a sampled profile is checked against —
+so the crate binds all of it.
+
+| C | Rust FFI (`sys::`) | Rust safe wrapper |
+|---|---|---|
+| `mi_stats_get`, `mi_stats_t` | ✅ | `stats::get() -> Stats` (derefs to the full struct) |
+| `mi_stats_get_json` | ✅ | `stats::json` |
+| `mi_stats_as_json` | ✅ | `Stats::to_json` |
+| `mi_stats_print_out` | ✅ | `stats::print` |
+| `mi_stats_get_bin_size` | ✅ | `stats::bin_size` |
+| `mi_subproc_stats_get` | ✅ | `stats::subproc_get` |
+| `mi_subproc_stats_get_exclusive` | ✅ | `stats::subproc_get_exclusive` |
+| `mi_subproc_stats_get_json` | ✅ | `stats::subproc_json` |
+| `mi_subproc_stats_print_out` | ✅ | `stats::subproc_print` |
+| `mi_subproc_heap_stats_print_out` | ✅ | `stats::subproc_heap_print` |
+| `mi_heap_stats_get` / `_get_json` / `_print_out`, `mi_heap_stats_merge_to_subproc` | ✅ | **sys only** — they take a `mi_heap_t*`, and v3 removed `mi_heap_get_default`, so Rust has no safe way to name a heap |
+
+Note what is **not** in `mi_stats_t`: the idle-sweep and hole-purging gauges. They live
+in `mi_purge_holes_stats_t` instead, because the sweep also covers pages no heap owns
+and `mi_stats_t` cannot grow (it is embedded in a theap, at the meta-allocator's 8 KB
+block limit).
+
+#### Heap dump
+
+| C | Rust FFI (`sys::`) | Rust safe wrapper |
+|---|---|---|
+| `mi_heap_dump_json` | ✅ | `heap_dump_json(include_blocks, hash_addresses)` |
+| `mi_heap_get_seq` | ✅ | **sys only** — needs a `mi_heap_t*` (see above); the seq numbers are already in `heap_dump_json`'s output |
+
+#### Thread idle, scavenger and hole purging
+
+A [Bun feature](#bun-features), ported from `oven-sh/mimalloc` — see that section for
+what hole purging buys on a churn workload. There is no single "hole punch" entry point:
+the feature is reached through the idle-sweep calls below, the `purge_holes*` options,
+and the `mi_purge_holes_stats_t` gauges.
+
+| C | Rust FFI (`sys::`) | Rust safe wrapper |
+|---|---|---|
+| `mi_on_thread_idle` | ✅ | `on_thread_idle()` |
+| `mi_on_thread_idle_start` / `_end` | ✅ | `park_while_idle() -> Option<IdlePark>` (ends on drop) |
+| `mi_scavenger_stop` | ✅ | `scavenger_stop()` |
+| `mi_purge_holes_stats_get`, `mi_purge_holes_stats_t` | ✅ | `purge_holes_stats() -> MiPurgeHolesStats` |
+| `mi_purge_holes_report` | ✅ | `purge_holes_report()` |
+
+#### Options — `mi_option_t`
+
+| C | Rust FFI (`sys::`) | Rust safe wrapper |
+|---|---|---|
+| `mi_option_t` (61 enumerators; 13 added by this fork at indices 47–59) | `sys::mi_option_*`, `sys::MI_OPTIONS_IN_ORDER` | `options::Opt` (named constants + range-checked `Opt::from_raw`) |
+| `mi_option_get` / `_get_clamp` / `_get_size` | ✅ | `options::get` / `get_clamp` / `get_size` |
+| `mi_option_set` / `_set_default` | ✅ | `options::set` / `set_default` |
+| `mi_option_is_enabled` / `_enable` / `_disable` / `_set_enabled` / `_set_enabled_default` | ✅ | `options::is_enabled` / `enable` / `disable` / `set_enabled` / `set_enabled_default` |
+| `mi_options_print_out` | ✅ | `options::print` |
+
+The thirteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the environment:
+
+| Option | Default | What it does |
+|---|---|---|
+| `prof` | `0` | start the sampled profiler at process start |
+| `prof_sample_rate` | `524288` | average bytes between samples |
+| `prof_bt_max` | `32` | max captured stack depth |
+| `prof_accum` | `0` | keep cumulative counters until `mi_prof_reset` |
+| `prof_seed` | `0` | sampling PRNG seed; 0 = nondeterministic |
+| `prof_max_bytes` | `0` | budget for profiler-internal arena memory; 0 = unbudgeted |
+| `memory_events` | `0` | enable allocation-change accounting/callbacks |
+| `purge_zeroes` | `0` | **dead** since #80; the slot is kept so nothing renumbers |
+| `scavenger` | `1` | run the background arena-purging thread |
+| `purge_holes` | `1` | discard free blocks inside still-used pages on idle |
+| `purge_holes_eager_zero` | `0` | zero before discarding, so a mis-scoped discard corrupts visibly |
+| `purge_holes_min_interval` | `100` | ms floor between sweeps of one thread's heaps |
+| `purge_holes_full_every` | `64` | every N-th sweep walks every page; 0 disables |
+
+Because they are positional, a stale Rust mirror of this enum would silently set the
+*wrong* option — which is why `tests/t19_layout.rs` checks every value against the C
+compiler and `ci/check_rust_surface.py` checks the whole sequence against the header.
+
+#### Allocation
+
+`MiMalloc` implements `GlobalAlloc`. Beyond that the crate binds `mi_malloc`,
+`mi_zalloc`, `mi_calloc`, `mi_realloc`, `mi_free`, their `_aligned` forms,
+`mi_usable_size`, `mi_expand`, and the zeroing-realloc family (`mi_rezalloc`,
+`mi_recalloc`, and their aligned forms) as `rezalloc` / `recalloc` / `expand` /
+`usable_size` — `GlobalAlloc` has no `grow_zeroed`, so without them a Rust caller would
+grow and `memset` by hand, redoing work mimalloc has already done.
 
 ### Going deeper
 

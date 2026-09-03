@@ -41,6 +41,10 @@ jobs:
         run: |
           python3 ci/check_isa_baseline.py --selftest
           python3 ci/check_internal_state.py --selftest
+          # Parses C headers and Rust source with regexes; a regex that matches nothing
+          # reports "clean" exactly as loudly as one that works.
+          python3 ci/check_rust_surface.py --selftest
+          python3 ci/check_rust_surface.py
           # A gate script that imports cleanly but crashes on argv is still broken.
           python3 ci/memory_gate.py 2>&1 | grep -q "Exit codes"
           python3 ci/check_isa_baseline.py --help > /dev/null

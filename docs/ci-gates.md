@@ -916,7 +916,9 @@ workers on a portable condition-variable barrier: every worker in a round alloca
 live set, waits for all of them, then churns and waits again before freeing. "All N live
 at once" becomes the only reachable state, so the peak is the structural cost of N live
 sets. Scenario 3's `while (ready == 0) {}` handoff became the same barrier, so six
-consumers no longer burn the vCPUs the producers need. The binary got *faster* (~0.1 s).
+consumers no longer burn the vCPUs the producers need. Wall time roughly halved and
+stopped scattering: 0.26 / 0.47 / 0.52 s before, 0.27 / 0.18 / 0.18 s after (same
+library, three runs each, `taskset -c 0-3` on an otherwise idle host).
 
 **The numbers.** Three independent `ubuntu-latest` runner VMs (`nproc=4`,
 THP=`always`), 16 runs each, identical object code:

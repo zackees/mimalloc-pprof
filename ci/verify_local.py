@@ -492,7 +492,7 @@ def run_memory_gate(ctx: RunCtx) -> bool:
 
     # Positive control: the gate must catch an injected leak, or it is decoration.
     build_leak = ctx.dir / "build-leak"
-    rc, _ = cmake_configure(ctx, build_leak, ["-DMI_PPROF=ON", "-DMI_BENCH_INJECT_LEAK=200000"])
+    rc, _ = cmake_configure(ctx, build_leak, ["-DMI_PPROF=ON", "-DMI_BENCH_INJECT_LEAK=600000"])
     if rc:
         return False
     if cmake_build(ctx, build_leak, config="Release", target="mimalloc-test-memory-gate"):
@@ -1258,7 +1258,8 @@ LIKE_CI_BUILDS: list[LikeCiBuild] = [
     ),
     LikeCiBuild(
         "memory-gate-leak",
-        ("-DMI_PPROF=ON", "-DMI_BENCH_INJECT_LEAK=200000"),
+        # See c-unit.yml's memory-gate-leak row for why 600000 rather than 200000.
+        ("-DMI_PPROF=ON", "-DMI_BENCH_INJECT_LEAK=600000"),
         "Release",
         kind="control",
     ),

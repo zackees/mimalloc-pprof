@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "full (all four allocators, >=15 blocks) or smoke (single allocator, 1 block)"
+        description: "full (all five allocators, >=15 blocks) or smoke (single allocator, 1 block)"
         type: choice
         options: [full, smoke]
         default: full

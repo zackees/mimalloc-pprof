@@ -171,6 +171,20 @@ def sys_option_mirror(source: str) -> list[tuple[str, int]]:
     return [(name, int(value)) for name, value in _SYS_OPTION_NAME_RE.findall(match.group(1))]
 
 
+def is_called_from_lib(name: str, lib_source: str) -> bool:
+    """Whether `src/lib.rs` actually calls `sys::<name>`.
+
+    Word-anchored rather than a plain substring test, because C's names nest:
+    `sys::mi_prof_start_seeded` contains `sys::mi_prof_start`, `sys::mi_option_get_clamp`
+    contains `sys::mi_option_get`, `sys::mi_option_set_default` contains
+    `sys::mi_option_set`. A substring test would report the shorter one as wrapped on the
+    strength of the longer one's call site -- which is precisely the regression this
+    check exists to catch. `\\b` does not match between `t` and `_`, so the longer name
+    no longer covers the shorter.
+    """
+    return re.search(rf"\bsys::{re.escape(name)}\b", lib_source) is not None
+
+
 def option_mirror_problems(header_options: list[str], mirror: list[tuple[str, int]]) -> list[str]:
     """Everything wrong with `sys.rs`'s `mi_option_t` mirror, as human-readable strings.
 
@@ -281,7 +295,7 @@ def check(*, verbose: bool = True) -> int:
     for name in sorted(fork_exports):
         if name not in declared:
             continue  # already reported (or allowlisted) above
-        if f"sys::{name}" in lib_source:
+        if is_called_from_lib(name, lib_source):
             continue
         reason = SYS_ONLY_WITH_REASON.get(name)
         if reason:
@@ -301,7 +315,7 @@ def check(*, verbose: bool = True) -> int:
                 f"{name} is on SYS_ONLY_WITH_REASON but is not a fork export. Remove the "
                 "allowlist entry.",
             )
-        elif f"sys::{name}" in lib_source:
+        elif is_called_from_lib(name, lib_source):
             _fail(
                 problems,
                 f"{name} is on SYS_ONLY_WITH_REASON but IS called from lib.rs. Remove the "
@@ -387,6 +401,13 @@ def selftest() -> int:
     declared = sys_declared_functions(_SELFTEST_SYS)
     if declared != {"mi_real_one", "mi_real_two"}:
         failures.append(f"sys.rs extern parsing: got {sorted(declared)}")
+
+    # C names nest, and a substring test would call the shorter one wrapped.
+    nested = "let x = unsafe { sys::mi_prof_start_seeded(0, 1) };"
+    if is_called_from_lib("mi_prof_start", nested):
+        failures.append("call-site matching: `mi_prof_start_seeded` satisfied `mi_prof_start`")
+    if not is_called_from_lib("mi_prof_start_seeded", nested):
+        failures.append("call-site matching: missed a real `sys::mi_prof_start_seeded` call")
 
     # The parsers must find something real in the actual tree, too: a regex that matches
     # nothing reports "clean" just as loudly as one that works.

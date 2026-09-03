@@ -49,6 +49,20 @@ class CheckRustSurfaceTests(unittest.TestCase):
         ]
         self.assertEqual(options[-len(fork_block) - 1 : -1], fork_block)
 
+    def test_a_nested_name_does_not_count_as_a_call_site(self) -> None:
+        """C names nest, and a substring test would call the shorter one wrapped.
+
+        `sys::mi_prof_start_seeded` contains `sys::mi_prof_start`, `sys::mi_option_get_clamp`
+        contains `sys::mi_option_get`, and so on -- so a plain `in` test would report an
+        UNwrapped function as wrapped on the strength of its longer sibling's call site.
+        """
+        source = "let x = unsafe { sys::mi_prof_start_seeded(0, 1) };"
+        self.assertFalse(surface.is_called_from_lib("mi_prof_start", source))
+        self.assertTrue(surface.is_called_from_lib("mi_prof_start_seeded", source))
+        clamp = "options::get_clamp(unsafe { sys::mi_option_get_clamp(o, a, b) })"
+        self.assertFalse(surface.is_called_from_lib("mi_option_get", clamp))
+        self.assertTrue(surface.is_called_from_lib("mi_option_get_clamp", clamp))
+
     def test_a_shifted_mirror_is_caught(self) -> None:
         """The negative control that matters.
 

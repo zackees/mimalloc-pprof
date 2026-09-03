@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+Bind every C API this fork adds, and gate the binding surface so it cannot drift again.
+
+- **New: `memory_events`** — the whole of `include/mimalloc/memory-events.h`, which had no
+  Rust binding at all: `set_enabled`/`is_enabled`, `snapshot`, `set_callbacks`/
+  `clear_callbacks` (per-kind `fn` pointers behind a `&'static Callbacks`, so the C side's
+  caller-owned `arg` cannot dangle), and `unsafe fn visit_live_allocations`.
+- **New: `options`** — `mi_option_*` with a range-checked `Opt` newtype and named constants
+  for all thirteen options this fork adds (`prof*`, `memory_events`, `purge_zeroes`,
+  `scavenger`, `purge_holes*`), plus get/set/clamp/size/enable/disable and their `_default`
+  forms.
+- **New: `stats`** — the exact-statistics surface from `include/mimalloc-stats.h`:
+  `mi_stats_t` mirrored field-for-field, `get`, `json`, `print`, `bin_size`, and the
+  subprocess-scoped getters (aggregated, exclusive, JSON, print, per-heap print).
+- **New: `purge_holes_report`** — the last unbound fork export in `mimalloc.h`.
+- **New ABI gate: `layout_probe.c` + `tests/t19_layout.rs`.** The C compiler now publishes
+  `sizeof`/`offsetof` for every mirrored struct and the value of every mirrored
+  `mi_option_t` enumerator; the test compares them by name. This is the hazard that
+  motivated the work: this fork inserts thirteen enumerators at indices 47..=59, so an
+  option mirror copied from upstream would set a *different* option than the caller named,
+  silently and forever. The existing mirrors were checked and were **correct**; they are
+  now checked on every build.
+- `ci/check_rust_surface.py` (new, gated in `python-lint` and `rust-native`) asserts that
+  every fork export and every `mi_option_t` enumerator in the C headers is declared in
+  `src/sys.rs`, with an allowlist that must give a reason for each intentional omission.
+
 ## 0.9.5
 
 - Add a default `pprof` feature so allocator-only consumers can compile sampled

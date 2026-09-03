@@ -882,6 +882,611 @@ pub mod prof {
     }
 }
 
+/// Print, per size class, what hole purging leaves behind (issue #272, Bun parity P7b).
+///
+/// Read-only: it purges nothing and mutates no free list. The report goes to mimalloc's
+/// own output sink (stderr by default, or whatever `mi_register_output` installed), not
+/// to a returned `String` — building a `String` here would allocate from inside a walk
+/// over the very free lists being reported. Pass a custom sink through
+/// [`sys::mi_purge_holes_report`]'s C counterpart if you need to capture it.
+///
+/// Like the idle sweep it only covers what the calling thread may safely read: its own
+/// theaps, plus the abandoned pages of the heaps behind them. Call it right after an
+/// [`on_thread_idle`] sweep, when the numbers still describe that sweep.
+pub fn purge_holes_report() {
+    unsafe { sys::mi_purge_holes_report() }
+}
+
+/// mimalloc's `mi_option_*` settings: the runtime knobs behind every `MIMALLOC_*`
+/// environment variable.
+///
+/// Options are read once, lazily, the first time the allocator needs them, so setting one
+/// after the allocation it governs has already happened has no effect. In particular
+/// [`Opt::SCAVENGER`] and the profiler options must be set before the first allocation to
+/// matter; [`Opt::PURGE_HOLES`] and its companions are re-read per sweep and can be
+/// changed at any time.
+///
+/// ```
+/// use mimalloc_pprof::options::{self, Opt};
+/// let previous = options::get(Opt::PURGE_HOLES_MIN_INTERVAL);
+/// options::set(Opt::PURGE_HOLES_MIN_INTERVAL, 0); // sweep on every idle call
+/// mimalloc_pprof::on_thread_idle();
+/// options::set(Opt::PURGE_HOLES_MIN_INTERVAL, previous);
+/// ```
+pub mod options {
+    use core::ffi::c_long;
+
+    use crate::sys;
+
+    /// One `mi_option_t` setting.
+    ///
+    /// The associated constants name this fork's own options plus the handful of upstream
+    /// ones that interact with them; [`Opt::from_raw`] reaches any other enumerator in
+    /// [`sys`] — it range-checks against `_mi_option_last`, because the C side indexes an
+    /// array with this value and an out-of-range option would read out of bounds.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct Opt(sys::mi_option_t);
+
+    impl Opt {
+        /// **Fork addition.** Enable the sampled profiler at process start (`MIMALLOC_PROF`).
+        pub const PROF: Self = Self(sys::mi_option_prof);
+        /// **Fork addition.** Average byte interval between profiler samples.
+        pub const PROF_SAMPLE_RATE: Self = Self(sys::mi_option_prof_sample_rate);
+        /// **Fork addition.** Maximum captured stack depth for the profiler.
+        pub const PROF_BT_MAX: Self = Self(sys::mi_option_prof_bt_max);
+        /// **Fork addition.** Keep cumulative profiler counters until [`crate::prof::reset`].
+        pub const PROF_ACCUM: Self = Self(sys::mi_option_prof_accum);
+        /// **Fork addition.** Profiler sampling PRNG seed; 0 = nondeterministic.
+        pub const PROF_SEED: Self = Self(sys::mi_option_prof_seed);
+        /// **Fork addition.** Budget in bytes for profiler-internal arena memory.
+        pub const PROF_MAX_BYTES: Self = Self(sys::mi_option_prof_max_bytes);
+        /// **Fork addition.** Enable [`crate::memory_events`] accounting
+        /// (`MIMALLOC_MEMORY_EVENTS`).
+        pub const MEMORY_EVENTS: Self = Self(sys::mi_option_memory_events);
+        /// **Fork addition, dead since #80.** Parses, but has no effect. Kept so nothing
+        /// renumbers; unrelated to [`Opt::PURGE_HOLES_EAGER_ZERO`].
+        pub const PURGE_ZEROES: Self = Self(sys::mi_option_purge_zeroes);
+        /// **Fork addition (Bun).** Run the background scavenger thread.
+        pub const SCAVENGER: Self = Self(sys::mi_option_scavenger);
+        /// **Fork addition (Bun).** Discard free blocks inside still-used pages on
+        /// [`crate::on_thread_idle`].
+        pub const PURGE_HOLES: Self = Self(sys::mi_option_purge_holes);
+        /// **Fork addition (Bun).** Zero a range before discarding it, so a mis-scoped
+        /// discard corrupts visibly. Forced on in debug builds.
+        pub const PURGE_HOLES_EAGER_ZERO: Self = Self(sys::mi_option_purge_holes_eager_zero);
+        /// **Fork addition (Bun).** Minimum milliseconds between sweeps of one thread's heaps.
+        pub const PURGE_HOLES_MIN_INTERVAL: Self = Self(sys::mi_option_purge_holes_min_interval);
+        /// **Fork addition (Bun).** Every N-th sweep walks every page; 0 disables.
+        pub const PURGE_HOLES_FULL_EVERY: Self = Self(sys::mi_option_purge_holes_full_every);
+
+        /// Upstream: milliseconds to delay purging, which the scavenger also honours.
+        pub const PURGE_DELAY: Self = Self(sys::mi_option_purge_delay);
+        /// Upstream: print statistics on process termination.
+        pub const SHOW_STATS: Self = Self(sys::mi_option_show_stats);
+        /// Upstream: print error messages.
+        pub const SHOW_ERRORS: Self = Self(sys::mi_option_show_errors);
+        /// Upstream: print verbose messages.
+        pub const VERBOSE: Self = Self(sys::mi_option_verbose);
+
+        /// Wrap a raw `mi_option_t` from [`sys`], or `None` if it is not a real option.
+        ///
+        /// The range check is load bearing: the C implementation indexes its option table
+        /// with this value, so an out-of-range option is an out-of-bounds read.
+        #[must_use]
+        pub fn from_raw(raw: sys::mi_option_t) -> Option<Self> {
+            if (0..sys::_mi_option_last).contains(&raw) {
+                Some(Self(raw))
+            } else {
+                None
+            }
+        }
+
+        /// The raw `mi_option_t` value.
+        #[must_use]
+        pub fn as_raw(self) -> sys::mi_option_t {
+            self.0
+        }
+
+        /// The C enumerator's name, e.g. `mi_option_purge_holes`.
+        #[must_use]
+        pub fn name(self) -> &'static str {
+            sys::MI_OPTIONS_IN_ORDER
+                .get(self.0 as usize)
+                .map_or("<unknown>", |(name, _)| *name)
+        }
+    }
+
+    /// Read an option's value.
+    ///
+    /// Note the width: mimalloc stores option values in a C `long`, which is 32-bit on
+    /// Windows and 64-bit on Linux/macOS. Use [`get_size`] for byte counts.
+    #[must_use]
+    pub fn get(option: Opt) -> c_long {
+        unsafe { sys::mi_option_get(option.as_raw()) }
+    }
+
+    /// Read an option's value, clamped into `min..=max`.
+    #[must_use]
+    pub fn get_clamp(option: Opt, min: c_long, max: c_long) -> c_long {
+        unsafe { sys::mi_option_get_clamp(option.as_raw(), min, max) }
+    }
+
+    /// Read an option's value as a `size_t`, for options that count bytes.
+    #[must_use]
+    pub fn get_size(option: Opt) -> usize {
+        unsafe { sys::mi_option_get_size(option.as_raw()) }
+    }
+
+    /// Set an option's value, overriding both the default and the environment.
+    pub fn set(option: Opt, value: c_long) {
+        unsafe { sys::mi_option_set(option.as_raw(), value) }
+    }
+
+    /// Set an option's value only if the environment did not already set it.
+    pub fn set_default(option: Opt, value: c_long) {
+        unsafe { sys::mi_option_set_default(option.as_raw(), value) }
+    }
+
+    /// Whether a boolean option is on.
+    #[must_use]
+    pub fn is_enabled(option: Opt) -> bool {
+        unsafe { sys::mi_option_is_enabled(option.as_raw()) }
+    }
+
+    /// Turn a boolean option on.
+    pub fn enable(option: Opt) {
+        unsafe { sys::mi_option_enable(option.as_raw()) }
+    }
+
+    /// Turn a boolean option off.
+    pub fn disable(option: Opt) {
+        unsafe { sys::mi_option_disable(option.as_raw()) }
+    }
+
+    /// Turn a boolean option on or off.
+    pub fn set_enabled(option: Opt, enabled: bool) {
+        unsafe { sys::mi_option_set_enabled(option.as_raw(), enabled) }
+    }
+
+    /// Set a boolean option's default, which the environment still overrides.
+    pub fn set_enabled_default(option: Opt, enabled: bool) {
+        unsafe { sys::mi_option_set_enabled_default(option.as_raw(), enabled) }
+    }
+
+    /// Print every option's current value to mimalloc's output sink.
+    ///
+    /// Goes to the sink rather than to a returned `String` for the same reason as
+    /// [`crate::purge_holes_report`]: capturing it would mean allocating from inside a
+    /// callback the allocator drives.
+    pub fn print() {
+        unsafe { sys::mi_options_print_out(None, core::ptr::null_mut()) }
+    }
+
+    /// Every option this build knows about, in C declaration order, as
+    /// `(name, value)` pairs — including the ones without an [`Opt`] constant.
+    #[must_use]
+    pub fn all() -> &'static [(&'static str, sys::mi_option_t)] {
+        sys::MI_OPTIONS_IN_ORDER
+    }
+}
+
+/// The allocator's own **exact** statistics, as opposed to the sampled numbers
+/// [`crate::prof::stats`] reports.
+///
+/// This is upstream mimalloc's `mimalloc-stats.h` surface. Note what is *not* here:
+/// hole-purging and idle-sweep gauges are **not** part of `mi_stats_t` — they live in
+/// [`crate::purge_holes_stats`], because the sweep also covers pages that no heap owns
+/// and `mi_stats_t` cannot grow (it is embedded in a theap, at the meta-allocator's 8 KB
+/// block limit).
+///
+/// `malloc_requested` is only maintained when the C library was built with `MI_STAT >= 2`
+/// (upstream enables that for debug builds only); a default release build reports 0 for
+/// it and for nothing else.
+pub mod stats {
+    use core::ops::Deref;
+    use std::ffi::CStr;
+
+    use crate::sys;
+
+    /// An owned copy of `mi_stats_t`, boxed because it is ~4 KB.
+    ///
+    /// Deref to reach every counter, e.g. `stats.committed.current`.
+    #[derive(Clone, Debug)]
+    pub struct Stats(Box<sys::mi_stats_t>);
+
+    impl Deref for Stats {
+        type Target = sys::mi_stats_t;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Stats {
+        /// Render these counters as mimalloc's statistics JSON.
+        ///
+        /// Returns `None` on allocation failure. Wraps `mi_stats_as_json`.
+        #[must_use]
+        pub fn to_json(&self) -> Option<String> {
+            // `mi_stats_as_json` takes a non-const pointer but only reads through it.
+            let mut copy = self.0.clone();
+            let ptr = unsafe { sys::mi_stats_as_json(&raw mut *copy, 0, core::ptr::null_mut()) };
+            take_c_string(ptr)
+        }
+
+        /// The raw C struct.
+        #[must_use]
+        pub fn as_raw(&self) -> &sys::mi_stats_t {
+            &self.0
+        }
+    }
+
+    /// A zeroed `mi_stats_t` with its `size`/`version` header filled in, which every
+    /// `*_stats_get` entry point checks before writing a single counter.
+    fn empty() -> Box<sys::mi_stats_t> {
+        let mut raw: Box<sys::mi_stats_t> = Box::new(unsafe { core::mem::zeroed() });
+        raw.size = size_of::<sys::mi_stats_t>();
+        raw.version = sys::MI_STAT_VERSION;
+        raw
+    }
+
+    /// Copy a `mi_malloc`-family C string out and release it with `mi_free`.
+    fn take_c_string(ptr: *mut core::ffi::c_char) -> Option<String> {
+        if ptr.is_null() {
+            return None;
+        }
+        let owned = unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { sys::mi_free(ptr.cast()) };
+        Some(owned)
+    }
+
+    /// Which subprocess a subprocess-scoped call refers to.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum Subproc {
+        /// The process-wide default subprocess (`mi_subproc_main`).
+        #[default]
+        Main,
+        /// The subprocess this thread belongs to (`mi_subproc_current`).
+        Current,
+    }
+
+    impl Subproc {
+        fn id(self) -> sys::mi_subproc_id_t {
+            unsafe {
+                match self {
+                    Self::Main => sys::mi_subproc_main(),
+                    Self::Current => sys::mi_subproc_current(),
+                }
+            }
+        }
+    }
+
+    /// Statistics for the current subprocess and all its heaps, aggregated.
+    ///
+    /// Wraps `mi_stats_get`. Returns `None` only if the C library rejects the struct
+    /// header, which would mean this crate's `mi_stats_t` mirror has drifted from the
+    /// library it is linked against (`tests/t19_layout.rs` gates exactly that).
+    #[must_use]
+    pub fn get() -> Option<Stats> {
+        let mut raw = empty();
+        unsafe { sys::mi_stats_get(&raw mut *raw) }.then_some(Stats(raw))
+    }
+
+    /// The same statistics as [`get`], rendered as JSON by the C library.
+    ///
+    /// Wraps `mi_stats_get_json`; returns `None` on allocation failure.
+    #[must_use]
+    pub fn json() -> Option<String> {
+        take_c_string(unsafe { sys::mi_stats_get_json(0, core::ptr::null_mut()) })
+    }
+
+    /// Print the current subprocess's statistics to mimalloc's output sink.
+    ///
+    /// Wraps `mi_stats_print_out(NULL, NULL)`. Use [`json`] to capture them instead:
+    /// routing the sink through a Rust closure would allocate from inside a callback the
+    /// allocator drives.
+    pub fn print() {
+        unsafe { sys::mi_stats_print_out(None, core::ptr::null_mut()) }
+    }
+
+    /// The block size served by size bin `bin` (`0..=`[`sys::MI_BIN_HUGE`]), matching the
+    /// `malloc_bins`/`page_bins` indices.
+    #[must_use]
+    pub fn bin_size(bin: usize) -> usize {
+        unsafe { sys::mi_stats_get_bin_size(bin) }
+    }
+
+    /// Statistics for one subprocess and all its heaps, aggregated.
+    #[must_use]
+    pub fn subproc_get(which: Subproc) -> Option<Stats> {
+        let mut raw = empty();
+        unsafe { sys::mi_subproc_stats_get(which.id(), &raw mut *raw) }.then_some(Stats(raw))
+    }
+
+    /// Statistics for one subprocess **without** aggregating its heaps.
+    #[must_use]
+    pub fn subproc_get_exclusive(which: Subproc) -> Option<Stats> {
+        let mut raw = empty();
+        unsafe { sys::mi_subproc_stats_get_exclusive(which.id(), &raw mut *raw) }
+            .then_some(Stats(raw))
+    }
+
+    /// One subprocess's aggregated statistics as JSON.
+    #[must_use]
+    pub fn subproc_json(which: Subproc) -> Option<String> {
+        take_c_string(unsafe {
+            sys::mi_subproc_stats_get_json(which.id(), 0, core::ptr::null_mut())
+        })
+    }
+
+    /// Print one subprocess's aggregated statistics to mimalloc's output sink.
+    pub fn subproc_print(which: Subproc) {
+        unsafe { sys::mi_subproc_stats_print_out(which.id(), None, core::ptr::null_mut()) }
+    }
+
+    /// Print one subprocess **and each of its heaps separately** to mimalloc's output sink.
+    pub fn subproc_heap_print(which: Subproc) {
+        unsafe {
+            sys::mi_subproc_heap_stats_print_out(which.id(), None, core::ptr::null_mut());
+        }
+    }
+}
+
+/// Opt-in allocation-change accounting and callbacks (`include/mimalloc/memory-events.h`).
+///
+/// Independent of the sampled profiler: this module is compiled into the C library in
+/// every configuration, including `default-features = false`. Tracking is **off** by
+/// default; while it is off every allocate/free/realloc pays for exactly one relaxed flag
+/// check and nothing else.
+///
+/// ```
+/// use mimalloc_pprof::{memory_events, MiMalloc};
+///
+/// // The counters only move for allocations that actually reach mimalloc, so this
+/// // example is only meaningful once mimalloc is the global allocator.
+/// #[global_allocator]
+/// static ALLOCATOR: MiMalloc = MiMalloc;
+///
+/// fn main() {
+///     memory_events::set_enabled(true);
+///     let before = memory_events::snapshot().expect("snapshot").accum_count;
+///     let v = vec![0_u8; 4096];
+///     std::hint::black_box(&v);
+///     let after = memory_events::snapshot().expect("snapshot").accum_count;
+///     assert!(after > before);
+///     memory_events::set_enabled(false);
+/// }
+/// ```
+pub mod memory_events {
+    use core::ffi::c_void;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use crate::sys;
+
+    /// Which kind of change a [`Change`] describes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[non_exhaustive]
+    pub enum ChangeKind {
+        /// A successful allocation.
+        Allocate,
+        /// A successful free.
+        Free,
+        /// A successful realloc, whether it grew or shrank.
+        Resize,
+    }
+
+    impl ChangeKind {
+        fn from_raw(raw: sys::mi_memory_change_kind_t) -> Option<Self> {
+            match raw {
+                sys::MI_MEMORY_ALLOCATE => Some(Self::Allocate),
+                sys::MI_MEMORY_FREE => Some(Self::Free),
+                sys::MI_MEMORY_RESIZE => Some(Self::Resize),
+                _ => None,
+            }
+        }
+
+        fn slot(self) -> usize {
+            match self {
+                Self::Allocate => sys::MI_MEMORY_ALLOCATE as usize,
+                Self::Free => sys::MI_MEMORY_FREE as usize,
+                Self::Resize => sys::MI_MEMORY_RESIZE as usize,
+            }
+        }
+    }
+
+    /// One observed allocation change, copied out of `mi_memory_change_t`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Change {
+        /// What happened.
+        pub kind: ChangeKind,
+        /// Tracked global live usable bytes after this operation.
+        pub total_bytes: u64,
+        /// Signed change in tracked live usable bytes: positive for allocation/growth,
+        /// negative for free/shrink, zero for a same-size-class resize.
+        pub delta_bytes: i64,
+        /// Caller-requested size for allocate and resize; zero for free.
+        pub request_size: u64,
+    }
+
+    /// Running totals maintained while tracking is enabled.
+    ///
+    /// Counters are **not** reconstructed for time spent with tracking off: a total is
+    /// exact only if tracking was enabled before the first allocation and never disabled.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Snapshot {
+        /// Tracked live usable bytes right now.
+        pub live_bytes: u64,
+        /// Cumulative usable bytes ever allocated.
+        pub accum_bytes: u64,
+        /// Tracked live allocation count right now.
+        pub live_count: u64,
+        /// Cumulative count of successful allocate events.
+        pub accum_count: u64,
+    }
+
+    /// Enable or disable tracking; returns the previous state.
+    ///
+    /// An explicit call is always authoritative over the `MIMALLOC_MEMORY_EVENTS`
+    /// environment read: called before the first allocation it *replaces* that read;
+    /// called after, it overrides the cached flag. Re-enabling does not reconstruct what
+    /// happened while tracking was off.
+    pub fn set_enabled(enabled: bool) -> bool {
+        unsafe { sys::mi_memory_tracking_set_enabled(enabled) }
+    }
+
+    /// Whether tracking is on.
+    #[must_use]
+    pub fn is_enabled() -> bool {
+        unsafe { sys::mi_memory_tracking_is_enabled() }
+    }
+
+    /// Read the running totals.
+    ///
+    /// Returns `None` only if the C library rejects the struct header, which would mean
+    /// this crate's mirror has drifted from the library (`tests/t19_layout.rs` gates that).
+    #[must_use]
+    pub fn snapshot() -> Option<Snapshot> {
+        let mut raw: sys::mi_memory_snapshot_t = unsafe { core::mem::zeroed() };
+        raw.size = size_of::<sys::mi_memory_snapshot_t>();
+        raw.version = sys::MI_MEMORY_SNAPSHOT_VERSION;
+        if !unsafe { sys::mi_memory_snapshot(&raw mut raw) } {
+            return None;
+        }
+        Some(Snapshot {
+            live_bytes: raw.live_bytes,
+            accum_bytes: raw.accum_bytes,
+            live_count: raw.live_count,
+            accum_count: raw.accum_count,
+        })
+    }
+
+    /// Handlers to install with [`set_callbacks`], one per [`ChangeKind`].
+    ///
+    /// Plain `fn` pointers rather than closures on purpose: the C side keeps the
+    /// registration until it is replaced, so anything captured would have to outlive the
+    /// process. Route per-instance state through a `static` (an atomic counter, a channel
+    /// sender in a `OnceLock`) instead.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Callbacks {
+        /// Called after each successful allocation.
+        pub allocate: Option<fn(&Change)>,
+        /// Called after each successful free.
+        pub free: Option<fn(&Change)>,
+        /// Called after each successful realloc.
+        pub resize: Option<fn(&Change)>,
+    }
+
+    impl Callbacks {
+        fn handler(&self, kind: ChangeKind) -> Option<fn(&Change)> {
+            match kind {
+                ChangeKind::Allocate => self.allocate,
+                ChangeKind::Free => self.free,
+                ChangeKind::Resize => self.resize,
+            }
+        }
+    }
+
+    /// The single C-ABI entry point for all three slots. `arg` is the `&'static Callbacks`
+    /// the caller handed to [`set_callbacks`]; the kind comes out of the change record, so
+    /// one trampoline serves every slot.
+    unsafe extern "C" fn dispatch(change: *const sys::mi_memory_change_t, arg: *mut c_void) {
+        if change.is_null() || arg.is_null() {
+            return;
+        }
+        let raw = unsafe { &*change };
+        let callbacks = unsafe { &*(arg as *const Callbacks) };
+        // An unknown kind means the C enum grew: ignore it rather than guessing.
+        let Some(kind) = ChangeKind::from_raw(raw.kind) else {
+            return;
+        };
+        let Some(handler) = callbacks.handler(kind) else {
+            return;
+        };
+        let change = Change {
+            kind,
+            total_bytes: raw.total_bytes,
+            delta_bytes: raw.delta_bytes,
+            request_size: raw.request_size,
+        };
+        // A panic must not unwind across the C frame that called us.
+        let _ = catch_unwind(AssertUnwindSafe(|| handler(&change)));
+    }
+
+    /// Install `callbacks`, replacing any previous table. Returns `false` if the C library
+    /// refused the table.
+    ///
+    /// `'static` is what makes this safe: the C side keeps the pointer until the table is
+    /// replaced or cleared, which is exactly the header's "`arg` pointers are caller-owned
+    /// and must stay valid" requirement.
+    ///
+    /// Callbacks run with no allocator locks held and **may** allocate, but a hook that
+    /// fires while another hook's callback is running on the same thread is suppressed —
+    /// so bytes a callback itself allocates never reach the running totals. Keep them
+    /// short, and let them return normally: a panic is caught and swallowed here, but a
+    /// C `longjmp` out of one is unsupported.
+    pub fn set_callbacks(callbacks: &'static Callbacks) -> bool {
+        let mut raw = sys::mi_memory_callbacks_t {
+            handlers: [None; sys::MI_MEMORY_CHANGE_COUNT],
+            args: [core::ptr::null_mut(); sys::MI_MEMORY_CHANGE_COUNT],
+        };
+        let arg = (callbacks as *const Callbacks).cast_mut().cast::<c_void>();
+        for kind in [ChangeKind::Allocate, ChangeKind::Free, ChangeKind::Resize] {
+            if callbacks.handler(kind).is_some() {
+                raw.handlers[kind.slot()] = Some(dispatch);
+                raw.args[kind.slot()] = arg;
+            }
+        }
+        unsafe { sys::mi_memory_set_callbacks(&raw const raw) }
+    }
+
+    /// Remove every installed callback. Accounting (and [`snapshot`]) keeps working.
+    pub fn clear_callbacks() -> bool {
+        unsafe { sys::mi_memory_set_callbacks(core::ptr::null()) }
+    }
+
+    unsafe extern "C" fn visit_trampoline<F>(
+        allocation: *mut c_void,
+        usable_size: usize,
+        arg: *mut c_void,
+    ) -> bool
+    where
+        F: FnMut(*mut u8, usize) -> bool,
+    {
+        let visitor = unsafe { &mut *(arg as *mut F) };
+        catch_unwind(AssertUnwindSafe(|| visitor(allocation.cast(), usable_size))).unwrap_or(false)
+    }
+
+    /// Walk the live allocations this thread may safely observe, calling `visitor` with
+    /// each one's address and usable size. Return `false` from `visitor` to stop early.
+    ///
+    /// Diagnostics only. This is **not** a consistent global snapshot: it is built on
+    /// `mi_heap_visit_blocks`, so another thread may free a reported allocation the
+    /// instant the callback begins.
+    ///
+    /// # Safety
+    ///
+    /// - `visitor` must not allocate, free, or otherwise reenter mimalloc while the walk
+    ///   is active — that includes anything that allocates indirectly, such as `println!`,
+    ///   growing a `Vec`, or formatting. Collect into a fixed-size buffer, or into
+    ///   [`crate::unwrapped_malloc`] memory, and process it after this returns.
+    /// - The pointers handed to `visitor` must not be dereferenced, retained, or freed:
+    ///   they may already be dead. Treat them as addresses, not as references.
+    /// - No other thread may be freeing into the heaps being walked (the
+    ///   `mi_heap_visit_blocks` precondition; see `include/mimalloc.h`).
+    pub unsafe fn visit_live_allocations<F>(mut visitor: F) -> bool
+    where
+        F: FnMut(*mut u8, usize) -> bool,
+    {
+        unsafe {
+            sys::mi_memory_visit_live_allocations(
+                visit_trampoline::<F>,
+                (&raw mut visitor).cast::<c_void>(),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

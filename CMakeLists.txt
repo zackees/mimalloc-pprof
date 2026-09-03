@@ -737,7 +737,15 @@ if(MI_USE_CXX)
   # link them -- the `windows-msvc` bundles failed with `lld-link: undefined symbol:
   # _mi_os_page_size`. Compiling these two as C++ alongside the library is what test-api.c
   # already does for the same reason.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c PROPERTIES LANGUAGE CXX )
+  # test-abandoned-lazy.c: Bun parity P10b (#317), ported from oven-sh/mimalloc @ c31ed9ed, MIT.
+  # Not required for linking in this tree today (the `mi_debug_abandoned_maps_allocated` hook it
+  # references is already `extern "C"` here -- see the internal.h `#if MI_DEBUG > 0` block's
+  # provenance comment -- so a plain C test links against the C++-mangled library fine, the same
+  # reason test-heap-teardown.c/test-heap-aba.c/test-heap-delete-race.c are NOT in this list).
+  # Ported anyway per the issue: harmless (the file's `#ifdef __cplusplus` branches already
+  # target this), and keeps the CMake shape identical to Bun's should this tree's extern "C"
+  # wrapping ever change.
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -988,7 +996,14 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  foreach(TEST_NAME api api-fill heap-burst-destroy stress-heaps stress-subprocs stress)
+  # abandoned-lazy / heap-release-mt: Bun parity P10b (#317), ported from oven-sh/mimalloc @
+  # 787be2a8 / a26c5de7 (+92930d0c, 47851447), MIT. Pure public API (mi_heap_new/delete/destroy,
+  # mi_heap_malloc, mi_free, mi_collect, mi_on_thread_idle*, mi_option_*) plus, for
+  # abandoned-lazy's counter check only, the MI_DEBUG-only mi_debug_abandoned_maps_allocated
+  # hook (declared extern in the test source itself, like test-heap-teardown.c's
+  # mi_debug_stall_in_heap_delete_claim) -- so both build and register unconditionally, unlike
+  # test-heap-teardown which #errors outright when MI_DEBUG==0.
+  foreach(TEST_NAME api api-fill heap-burst-destroy abandoned-lazy heap-release-mt stress-heaps stress-subprocs stress)
     add_executable(mimalloc-test-${TEST_NAME} test/test-${TEST_NAME}.c)
     target_compile_definitions(mimalloc-test-${TEST_NAME} PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE ${mi_cflags})
@@ -1264,6 +1279,16 @@ if (MI_BUILD_TESTS)
     # branch and still leave the heap correct (`mi_on_thread_idle` sweeping inline).
     add_test(NAME test-park-handoff-no-scavenger COMMAND mimalloc-test-park-handoff)
     set_tests_properties(test-park-handoff-no-scavenger PROPERTIES TIMEOUT 600
+                         ENVIRONMENT "MIMALLOC_SCAVENGER=0")
+    # test-heap-release-mt: Bun parity P10b (#317), ported from oven-sh/mimalloc @ a26c5de7 +
+    # 92930d0c/47851447, MIT. The executable itself is registered unconditionally above (the
+    # "static link tests" foreach) since it prints "skipped" and returns 0 on Windows/win-gnu
+    # rather than needing a CMake-level skip -- but this env-only "-no-scavenger" variant is
+    # only meaningful together with pthreads, so it lives here next to
+    # test-park-handoff-no-scavenger, same rationale: with no scavenger to hand off to,
+    # `mi_on_thread_idle_start` must do the park-mode sweep inline instead.
+    add_test(NAME test-heap-release-mt-no-scavenger COMMAND mimalloc-test-heap-release-mt)
+    set_tests_properties(test-heap-release-mt-no-scavenger PROPERTIES TIMEOUT 600
                          ENVIRONMENT "MIMALLOC_SCAVENGER=0")
     # ... and with the P7b sweep rate limit removed, so every park is due the moment it is
     # claimed: `test_park_inside_window_gets_swept` takes its "no window" branch and
@@ -1871,6 +1896,14 @@ endif()
 #     main heap's byte-count and process RSS across 4000 heap creates/destroys (single-
 #     threaded; no race), the same sensitivity class as the RSS-under-pressure tests above: a
 #     parallel wave's memory pressure can move both numbers independently of the allocator.
+#   * a debug-only process-wide counter (issue #317, Bun parity P10b) -- test-abandoned-lazy's
+#     `released_heaps_map_nothing` asserts `mi_debug_abandoned_maps_allocated` does not move
+#     across 50 heap create/fill/delete-or-destroy rounds; a parallel wave's own abandons would
+#     move it for reasons unrelated to the lazy-allocation regression this checks for.
+#   * a ~4-6s ~20-thread stress with its own wall-clock budget (issue #317, Bun parity P10b) --
+#     test-heap-release-mt (and its -no-scavenger variant) races heap delete/destroy against
+#     concurrent frees and, in its second half, against the scavenger's park sweep; same
+#     "oversubscribed runner, timing not work" class as test-park-handoff* above.
 #
 # RUN_SERIAL is ctest's own word for this ("do not run any other test concurrently"), so
 # it is set here rather than encoded as a name list inside the CI runner: a new test
@@ -1894,6 +1927,9 @@ set(mi_serial_tests
   test-profile-race-scavenger
   test-subproc-lifecycle
   test-heap-burst-destroy
+  test-abandoned-lazy
+  test-heap-release-mt
+  test-heap-release-mt-no-scavenger
 )
 # Next candidate if the wave ever goes flaky: test-fork-user-heap. It is not here because
 # nothing has been observed to fail -- it forks, and a fork's cost and timing are the

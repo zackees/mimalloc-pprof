@@ -222,6 +222,28 @@ static void mi_heap_detach_theaps(mi_heap_t* heap) {
     }
   }
   _mi_heap_detach_theaps(heap);
+  // Bun parity P10b (#317), ported from oven-sh/mimalloc @ 91218f30, MIT (`heap->releasing`).
+  // Bun sets this inside its `mi_heap_release_pages`, right after `if (_mi_is_heap_main(heap))
+  // return;`. We have no such function/early-return -- this static `mi_heap_detach_theaps` is
+  // our equivalent, called by both `mi_heap_delete` and `_mi_heap_force_destroy` (the latter
+  // also used for a SUBPROC main heap at subproc teardown, issue #128 B1). A bare early return
+  // (Bun's shape) is wrong here: the `_mi_theap_abandon` loop just below still has to run for a
+  // subproc main heap. Setting `releasing` on a main heap would be wrong for the opposite
+  // reason -- a main heap outlives this call and would then abandon every page unmapped
+  // forever, not just for the duration of this detach. `_mi_is_heap_main` is the right guard
+  // for both cases: it resolves via `heap->subproc`, so it is true for a subproc's own
+  // heap_main too (see the provenance comment in `mi_heap_free`, below), which is exactly the
+  // heap this must stay false for.
+  //
+  // Readers: `_mi_arenas_page_abandon` (arena.c) skips the lazy per-bin bitmap entirely once
+  // this is set, so a releasing heap's pages are abandoned unmapped -- reachable only through
+  // `pages`, which the pending `_mi_heap_move_pages`/`_mi_heap_destroy_pages` claim walk
+  // (claim_pages=true) reaches anyway. `_mi_arenas_page_try_reabandon_to_mapped` refuses to
+  // re-map one of this heap's pages for the same reason. This also means a releasing heap
+  // never needs `mi_arena_pages_abandoned_ensure` (and so never takes `subproc->theap_meta_lock`
+  // from inside this loop) -- the case where that edge is actually live is a MAIN heap, which
+  // never sets `releasing` and so is unaffected by any of this.
+  if (!_mi_is_heap_main(heap)) { mi_atomic_store_release(&heap->releasing, (uintptr_t)1); }
   mi_lock(&heap->theaps_lock) { // paranoia
     for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
       mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // detached
@@ -280,14 +302,28 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
         mi_arena_pages_t* arena_pages = mi_atomic_load_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i]);
         if (arena_pages!=NULL) {
           mi_atomic_store_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i], NULL);
-          // #316 (P10a): this free now collects in-subproc. Safe regardless of whether this
-          // thread is parked: `allow_collect` only reaches `mi_free_block_mt`/
-          // `mi_free_generic_mt` (free.c:mi_free_ex), while `_mi_park_leave_if_parked` lives
-          // only in the separate `mi_free_generic_local` owner-free path (free.c:167) -- so this
-          // can never newly reach the park protocol. `mi_free_try_collect_mt`'s own reclaim
-          // guards (`_mi_thread_is_initialized`, `_mi_page_associated_theap_peek` refusing a
-          // theap of another heap) apply unconditionally.
-          _mi_free_subproc_safe(arena_pages);
+          // #316 (P10a): the final `_mi_free_subproc_safe(arena_pages)` this used to be now
+          // collects in-subproc. Safe regardless of whether this thread is parked:
+          // `allow_collect` only reaches `mi_free_block_mt`/`mi_free_generic_mt`
+          // (free.c:mi_free_ex), while `_mi_park_leave_if_parked` lives only in the separate
+          // `mi_free_generic_local` owner-free path (free.c:167) -- so this can never newly
+          // reach the park protocol. `mi_free_try_collect_mt`'s own reclaim guards
+          // (`_mi_thread_is_initialized`, `_mi_page_associated_theap_peek` refusing a theap of
+          // another heap) apply unconditionally.
+          //
+          // #317 (P10b): switched to `_mi_arena_pages_free`, which also frees the on-demand
+          // per-bin abandoned bitmaps (arena.c) before freeing `arena_pages` itself -- both go
+          // through the same `_mi_free_subproc_safe`, so the P10a audit above still covers it.
+          // Lifetime invariant (see `_mi_arena_pages_free`'s own comment, arena.c): this must
+          // run after the heap is off `subproc->heaps` and every theap of it has been
+          // detached. We are inside `mi_heap_free`, called only after
+          // `mi_heap_detach_theaps`/`_mi_heap_move_pages`(or `_mi_heap_destroy_pages`)/
+          // `mi_heap_free_theaps` have already run (see `mi_heap_delete` /
+          // `_mi_heap_force_destroy`, below) and, for `mi_heap_delete`, strictly before the
+          // heap is unlinked from `subproc->heaps` a few lines down -- so assert the theaps
+          // side of the invariant here, where `heap` is in scope.
+          mi_assert_internal(heap->theaps == NULL);
+          _mi_arena_pages_free(arena_pages);
         }
       }
     }

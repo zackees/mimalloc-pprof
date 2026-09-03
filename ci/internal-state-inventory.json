@@ -445,6 +445,27 @@
       ]
     },
     {
+      "id": "arena-pages-abandoned-bitmap",
+      "path": "src/arena.c",
+      "callee": "_mi_meta_zalloc_aligned",
+      "args": "arena->subproc,size,MI_BCHUNK_SIZE,NULL",
+      "occurrence": 1,
+      "owner": "arena sub-process meta-data theap",
+      "initial_owner": "zeroed allocation from subproc->theap_meta (under theap_meta_lock)",
+      "owner_transitions": "CAS-published into arena_pages->pages_abandoned[bin]; loser frees its copy with _mi_free_subproc_safe",
+      "destroyable_by": "owning heap teardown (mi_heap_free -> _mi_arena_pages_free)",
+      "lifetime": "same as the (heap, arena) pair's arena_pages -- allocated lazily on first abandon of a page of this bin, not up front with arena_pages itself",
+      "logical_size": "mi_bitmap_size(arena->slice_count, NULL)",
+      "usable_size": "allocator size class; embedded bitmap layout uses logical size only",
+      "cleanup": "_mi_arena_pages_free at heap teardown (mi_heap_free, src/heap.c), which frees each non-NULL pages_abandoned[bin] before freeing arena_pages itself",
+      "publication": "mi_bitmap_init'd before the CAS into arena_pages->pages_abandoned[bin]; the CAS loser's copy is freed unpublished",
+      "locks": [
+        "allocation occurs under subproc->theap_meta_lock (inside _mi_meta_zalloc_aligned)",
+        "the caller (mi_arena_pages_abandoned_ensure) is reached from _mi_arenas_page_abandon, typically under heap->theaps_lock (mi_heap_detach_theaps's abandon loop) -- see the new heap->theaps_lock -> subproc->theap_meta_lock edge documented in src/fork.c's lock-order table (issue #317)",
+        "never reentrant against itself: a page belonging to subproc->theap_meta can no longer reach mi_page_to_full -> _mi_page_abandon -> _mi_arenas_page_abandon at all, now that mi_subproc_new (src/subproc.c) sets theap_meta->allow_page_abandon=false (matching init.c's process theap_meta); _mi_arenas_page_abandon also checks _mi_meta_is_meta_page_safe(page) and skips this allocator for a meta page regardless, belt and braces (Opus review of #317/#319)"
+      ]
+    },
+    {
       "id": "huge-os-pages-reservation",
       "path": "src/arena.c",
       "callee": "_mi_os_alloc_huge_os_pages",

@@ -135,6 +135,18 @@ terms of the MIT license. A copy of the license can be found in the file
                                     -> `mi_theap_free_mem` -> `_mi_meta_free` (theap.c:363)
                                     ... and, for a page owned by `theap_meta`, `mi_free`
                                     -> `mi_stat_free` (free.c:768) takes `theap_meta_lock`
+                                    ... and (Bun parity P10b, #317): `mi_heap_detach_theaps`
+                                    (heap.c) holds `theaps_lock` across its `_mi_theap_abandon`
+                                    loop -> `_mi_page_abandon` -> `_mi_arenas_page_abandon`
+                                    (arena.c) -> `mi_arena_pages_abandoned_ensure` (arena.c) ->
+                                    `_mi_meta_zalloc_aligned`, which takes `theap_meta_lock`.
+                                    Live only for a MAIN heap: a releasing (non-main) heap sets
+                                    `heap->releasing` just before this loop, which makes
+                                    `_mi_arenas_page_abandon` skip the `..._ensure` call
+                                    entirely (see the `heap->releasing` comment in
+                                    `mi_heap_detach_theaps`, heap.c). Same target level as the
+                                    edge above, no reordering needed (MI_FORK_LOCK_THEAPS=3
+                                    already precedes MI_FORK_LOCK_THEAP_META=7 below).
       -> tld->theaps_lock           `_mi_heap_detach_theaps` -- but `mi_lock_TRY_acquire`
                                     with a back-off retry (theap.c:412), so NOT a blocking
                                     edge; see the Phase 7 gap note below
@@ -172,6 +184,20 @@ terms of the MIT license. A copy of the license can be found in the file
                                     `theap_meta_lock`), which deadlocks against any thread
                                     starting up (`init.c:268` / `theap.c:329` allocate a
                                     fresh tld/theap through `_mi_meta_zalloc`).
+                                    NOT an edge: `_mi_arenas_page_abandon` (arena.c) must
+                                    never re-enter `_mi_meta_zalloc_aligned` for a page that
+                                    belongs to `theap_meta` itself -- that would be
+                                    `theap_meta_lock` against ITSELF on one stack (a self-edge
+                                    no acquisition ORDER can resolve, unlike every edge in
+                                    this table, which is between two DIFFERENT locks). Closed
+                                    two ways (Opus review of #317/#319): `subproc.c`'s
+                                    `mi_subproc_new` now sets `theap_meta->allow_page_abandon
+                                    = false` (matching `init.c`'s process theap_meta), so
+                                    `mi_page_to_full` never abandons one of `theap_meta`'s own
+                                    pages in the first place; `_mi_arenas_page_abandon` also
+                                    checks `_mi_meta_is_meta_page_safe(page)` and skips the
+                                    lazy-bitmap allocation for a meta page regardless (falls
+                                    through to the unmapped-abandon path), belt and braces.
 
     heap_main->arena_pages_lock     arena.c:685      LEAF. For the main heap
                                     `mi_heap_ensure_arena_pages` only stores

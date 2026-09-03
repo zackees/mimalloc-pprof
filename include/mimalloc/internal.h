@@ -326,6 +326,11 @@ extern mi_decl_export volatile long mi_debug_fail_os_commit_after;
 // `arena.c` (`mi_heap_visit_page_claim`) sets it to 2 once it has a page pinned but not yet
 // claimed, and stalls there until the test sets it back to 0.
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+// Bun parity P10b (#317), ported from oven-sh/mimalloc @ 1515c3c9 (C linkage) /
+// 787be2a8 (the counter itself). test-abandoned-lazy.c: per-bin abandoned bitmaps
+// (`mi_arena_pages_t::pages_abandoned[]`, arena.c) published so far via the CAS in
+// `mi_arena_pages_abandoned_ensure`.
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;
 #ifdef __cplusplus
 }
 #endif
@@ -413,6 +418,7 @@ void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* curren
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
+void          _mi_arena_pages_free(mi_arena_pages_t* arena_pages);  // Bun parity P10b, #317: frees the on-demand abandoned bitmaps then `arena_pages` itself
 
 // "page-map.c"
 bool          _mi_page_map_init(void);

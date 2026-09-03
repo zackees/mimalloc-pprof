@@ -77,6 +77,7 @@ what that risk means and what was measured.
 - [Bun features](#bun-features) — every feature ported from oven-sh/mimalloc, including a measured hole-purging chart
 - [Profiling and observability](#profiling-and-observability) — sampled pprof, exact stats, DHAT, memory events
 - [Upstream bugs found and fixed](#upstream-bugs-found-and-fixed) — including two unbounded memory leaks
+- [Q&A](#qa) — why fork from Microsoft and not from Bun, and other questions people ask
 - [Documentation](#documentation) — the full docs index
 - [Release history](#release-history)
 - [Prior art and credits](#prior-art-and-credits)
@@ -791,6 +792,41 @@ Root causes, measurements, and the regression tests that keep them fixed:
 **[docs/upstream-bugs.md](docs/upstream-bugs.md)**. The CI gates that guard every
 PR — including the seven gates that were found to be verifying nothing —
 are in **[docs/ci-gates.md](docs/ci-gates.md)**.
+
+---
+
+## Q&A
+
+### Why do we fork from microsoft/mimalloc and not from oven-sh/mimalloc?
+
+Because [oven-sh/mimalloc](https://github.com/oven-sh/mimalloc) is itself a fork of
+upstream, and forking the fork would cost more than it saves:
+
+- **Bun's changes come in anyway.** Every functional commit on Bun's `bun-dev3-v2`
+  branch is ported here by hand, reviewed, and gated by this tree's own tests
+  ([Bun features](#bun-features)). Sitting on upstream loses none of Bun's work; it only
+  changes *how* it arrives — as a reviewed port instead of a merge. Two of those reviews
+  found real bugs in the ported change, one of which Bun's tree still carries.
+- **Some of Bun's placements were rejected on purpose.** Bun adds scavenger fields
+  mid-struct in `mi_subproc_t`, which shifts the stats block the free path touches
+  (~2 ns per alloc/free here); its fork-handler lock order does not match this tree's
+  lock graph; it keeps `__thread` state on a path that deadlocks inside a macOS dylib; and
+  it has no exit-time scavenger stop on Windows. Each was re-derived for this tree rather
+  than inherited.
+- **Upstream is the audience for fixes.** This fork has found allocator bugs that
+  Microsoft then fixed upstream ([upstream bugs](#upstream-bugs-found-and-fixed)). Clean
+  patches against `dev3` are only possible when `dev3` is the base; a base of Bun's tree
+  would carry Bun's diff into every patch.
+- **Bun's tree is Bun's.** Its default branch has already been renamed once
+  (`bun` → `bun-dev3-v2`), it tracks whatever upstream commit Bun needs, and it is tested
+  through Bun rather than on its own. Pinning the overlay to an upstream commit
+  (`6def7be9`, which is also Bun's merge-base) keeps one moving target instead of two.
+
+The trade-off is porting lag — days, not hours — which is why Bun's tip is checked
+against what has been ingested and why Bun's fork is a row in the
+[benchmark charts](#performance). The full reasoning, including when re-basing onto
+Bun would start to make sense, is recorded in
+[#326](https://github.com/zackees/mimalloc-pprof/issues/326).
 
 ---
 

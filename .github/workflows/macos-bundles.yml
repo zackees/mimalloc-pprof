@@ -54,10 +54,11 @@ concurrency:
 
 jobs:
   build-macos:
-    # Disabled 2026-09-02 at the owner's request until the x64 golden image / unattended
-    # install question (#277, #283) is settled: set repo variable MACOS_LANE_ENABLED=true
-    # to re-enable. The no-native-macOS lint (ci/lint_no_macos_runners.py) stays active.
-    if: ${{ vars.MACOS_LANE_ENABLED == 'true' }}
+    # Ungated. The golden-image / unattended-install question (#277, #283) that this
+    # lane was parked behind is settled by not needing an installed macOS at all: the
+    # x86_64 bundles execute in macOS Recovery, booted off the image on an ordinary
+    # Linux runner, so there is nothing to install, cache, or keep alive. The
+    # no-native-macOS lint (ci/lint_no_macos_runners.py) stays active.
     name: build-macos (${{ matrix.bundle }})
     runs-on: ubuntu-latest
     strategy:
@@ -277,10 +278,11 @@ jobs:
           retention-days: 7
 
   build-rust-apple:
-    # Disabled 2026-09-02 at the owner's request until the x64 golden image / unattended
-    # install question (#277, #283) is settled: set repo variable MACOS_LANE_ENABLED=true
-    # to re-enable. The no-native-macOS lint (ci/lint_no_macos_runners.py) stays active.
-    if: ${{ vars.MACOS_LANE_ENABLED == 'true' }}
+    # Ungated. The golden-image / unattended-install question (#277, #283) that this
+    # lane was parked behind is settled by not needing an installed macOS at all: the
+    # x86_64 bundles execute in macOS Recovery, booted off the image on an ordinary
+    # Linux runner, so there is nothing to install, cache, or keep alive. The
+    # no-native-macOS lint (ci/lint_no_macos_runners.py) stays active.
     name: build-rust (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
@@ -416,8 +418,6 @@ jobs:
     name: run-macos-x64 (macOS Recovery on Linux)
     needs: [build-macos, build-rust-apple]
     runs-on: ubuntu-latest
-    # Gate stays until the owner flips it (#277, #283).
-    if: ${{ vars.MACOS_LANE_ENABLED == 'true' }}
     # Emulated guest, everything in it serial, one boot retry budgeted.
     timeout-minutes: 90
 

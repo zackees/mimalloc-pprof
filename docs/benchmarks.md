@@ -16,9 +16,9 @@ runs, no unpublished baselines.
 
 ## Methodology summary
 
-- **5 allocators** — mimalloc-pprof, upstream mimalloc (same `dev3` base),
-  Bun's mimalloc fork, TCMalloc, and jemalloc — pinned to immutable commits with
-  SHA-256-verified source archives.
+- **5 allocators** — mimalloc-pprof, upstream mimalloc (pinned `dev3@bcee5a88`,
+  v3.4.3), Bun's mimalloc fork, TCMalloc, and jemalloc — pinned to immutable
+  commits with SHA-256-verified source archives.
 - **Paired balanced blocks** — every block runs all five allocators in
   randomized order under one workload seed; ≥15 complete blocks per headline
   cell.
@@ -35,6 +35,17 @@ runs, no unpublished baselines.
   intended difference is `MI_PPROF` (`OFF` upstream, `ON` for this fork); Bun's
   tree has no such option, so its row simply omits it.
   `ci/build_benchmark_allocators.py` fails the build if any other flag differs.
+- **The three mimalloc rows are not the same base.**  One recipe is not one
+  tree: the `upstream-mimalloc` row is pinned at `bcee5a88`, which is
+  `MI_MALLOC_VERSION 30403` (v3.4.3), while Bun's `b20b60d9` and this fork's
+  base `6def7be9` are both `30500` (v3.5.0).  Among other things,
+  `MI_OPT_FREE_SMALL` does not exist in v3.4.3 and auto-enables in the two
+  v3.5.0 trees, so the Bun and fork rows are compiled with `MI_OPT_FREE_SMALL=1`
+  and the upstream row is not.  Read upstream-vs-Bun and upstream-vs-fork
+  differences as *base plus fork*, never as fork alone; the Bun-vs-fork
+  comparison is the like-for-like one.  Bumping the upstream row to the fork's
+  own base is tracked in
+  [#332](https://github.com/zackees/mimalloc-pprof/issues/332).
 - **Deterministic reproducibility** — every raw sample carries its exact command
   line and workload seed; the published site manifest carries a detached SHA-256
   digest of every file.

@@ -1003,6 +1003,35 @@ class MultiBundleRunnerTest(unittest.TestCase):
         self.assertIn("coloured", text)
         self.assertEqual([case.get("name") for case in parsed.getroot().iter("testcase")], ["o1"])
 
+    def test_select_splits_the_two_waves_for_two_runners(self) -> None:
+        """`--select` is what lets `run-linux` and `run-linux-serial` be separate VMs.
+
+        A separate runner is exclusive by construction, so the serial group still has a
+        machine to itself -- without its duration being added to the critical path.
+        """
+        bundle = self.make_bundle(
+            "pi",
+            [self.spec("p1", 0.0), self.spec("s1", 0.0, serial=True)],
+        )
+        wave = self.run_bundles("--bundles", str(bundle), "--select", "parallel", "--jobs", "4")
+        self.assertEqual(wave.returncode, 0, wave.stdout + wave.stderr)
+        self.assertIn("out of 1", wave.stdout)
+        self.assertIn("p1", wave.stdout)
+        self.assertNotIn("::s1", wave.stdout)
+
+        alone = self.run_bundles("--bundles", str(bundle), "--select", "serial", "--jobs", "1")
+        self.assertEqual(alone.returncode, 0, alone.stdout + alone.stderr)
+        self.assertIn("out of 1", alone.stdout)
+        self.assertIn("s1", alone.stdout)
+        self.assertNotIn("::p1", alone.stdout)
+
+    def test_a_selection_that_matches_nothing_is_an_error(self) -> None:
+        """A bundle with no serial tests must not report a green `--select serial` run."""
+        bundle = self.make_bundle("rho", [self.spec("r1", 0.0)])
+        proc = self.run_bundles("--bundles", str(bundle), "--select", "serial")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("--select serial", proc.stderr)
+
     def test_a_failure_names_its_bundle(self) -> None:
         bundle = self.make_bundle("kappa", [self.spec("k1", 0.0, timeout=0.0001)])
         proc = self.run_bundles("--bundles", str(bundle))

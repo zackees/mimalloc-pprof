@@ -147,6 +147,45 @@ class JUnitCandidateTest(unittest.TestCase):
             )
             self.assertEqual(bundle_coverage.main(["--compare", "release", reference, executed]), 1)
 
+    def test_a_directory_candidate_is_the_union_of_its_files(self) -> None:
+        """The run stage is two runners now: the wave's JUnit and the serial group's."""
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = _write(Path(tmp), "show-only.json", ["test-api", "test-memory-gate"])
+            merged = Path(tmp) / "merged"
+            merged.mkdir()
+            self._junit(
+                merged, "wave.xml", '<testcase name="test-api" classname="test-api" status="run"/>'
+            )
+            self._junit(
+                merged,
+                "serial.xml",
+                '<testcase name="test-memory-gate" classname="test-memory-gate" status="run"/>',
+            )
+            self.assertEqual(
+                bundle_coverage.main(["--compare", "release", reference, str(merged)]), 0
+            )
+
+    def test_a_directory_missing_one_half_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = _write(Path(tmp), "show-only.json", ["test-api", "test-memory-gate"])
+            merged = Path(tmp) / "merged"
+            merged.mkdir()
+            self._junit(
+                merged, "wave.xml", '<testcase name="test-api" classname="test-api" status="run"/>'
+            )
+            self.assertEqual(
+                bundle_coverage.main(["--compare", "release", reference, str(merged)]), 1
+            )
+
+    def test_an_empty_directory_is_refused_rather_than_passing_trivially(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = _write(Path(tmp), "show-only.json", ["test-api"])
+            empty = Path(tmp) / "empty"
+            empty.mkdir()
+            self.assertEqual(
+                bundle_coverage.main(["--compare", "release", reference, str(empty)]), 2
+            )
+
     def test_an_empty_junit_is_refused_rather_than_passing_trivially(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             reference = _write(Path(tmp), "show-only.json", ["test-api"])

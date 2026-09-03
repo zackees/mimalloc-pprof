@@ -154,18 +154,26 @@ of which produces a bundle that cannot start.
 than derived from `tests.json`. That is deliberate: it is the reference side of the coverage
 check, and a reference derived from the candidate proves nothing.
 
-### Stage 2 — `run-linux`: every test, at once
+### Stage 2 — `run-linux` + `run-linux-serial`: every test, at once
 
-One job, no CMake, no compiler, no build tree. It unpacks every Linux bundle and runs the
-five glibc ones in a single wave:
+No CMake, no compiler, no build tree on either. `run-linux` unpacks every Linux bundle and
+runs the five glibc ones in a single wave:
 
 ```
 uv run ci/run_test_bundle.py \
   --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared \
-  --jobs 4 \
+  --jobs 4 --select parallel \
   --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
   --junit-dir results
 ```
+
+`run-linux-serial` runs the same bundles with `--jobs 1 --select serial`, **on a runner of
+its own, at the same time**. A separate VM is exclusive by construction, which is exactly
+the guarantee "hold them back and run them last, alone" provides — without adding their
+duration to the critical path. Measured on run 33704383536, before the split: the serial
+group was 508 s of 2199 single-threaded test-seconds (23 %), about 8.5 of `run-linux`'s
+16 minutes. The list of serial tests is *not* relaxed by the split; it still lives in
+`CMakeLists.txt`.
 
 Bundles run alongside each other *and* tests run alongside each other inside a bundle,
 bounded by `--jobs 4` (the runner's vCPU count). The guarded config's second pass — every
@@ -175,8 +183,15 @@ as `test-x [sample-rate-1]` with the JUnit `classname` left at `test-x`. The sco
 cosmetic: an unscoped variant would double all five bundles, including the serial group,
 which is the part that does not divide by `--jobs`.
 
-Then, as separate steps so each has the machine to itself: the musl bundles, the memory
-gate and its leak control, the diagnostic and ISA scans, and the Bun surface link.
+Then, on `run-linux`, as separate steps so each has that machine to itself: the musl
+bundles, the memory gate and its leak control, the diagnostic and ISA scans, and the Bun
+surface link.
+
+Splitting the run stage in two means neither half can account for the whole suite on its
+own, so the coverage check is a third job (`coverage`) that needs both and compares each
+configuration against the **union** of the two JUnit sets — `ci/bundle_coverage.py` reads a
+directory as the union of the files in it. Without that, each half would report green on
+its own share, which is the "gate that verifies less" shape this document exists to stop.
 
 ### The serial group, and why it is in CMakeLists.txt
 
@@ -195,8 +210,10 @@ just themselves:
 
 Those carry `RUN_SERIAL TRUE` in `CMakeLists.txt` — ctest's own word for "run this with
 nothing else running". `ci/bundle_tests.py` lowers the property (or a `serial` label) into
-the manifest's `serial` flag, and `ci/run_test_bundle.py` holds those items back and runs
-them one at a time after the parallel wave, across all bundles.
+the manifest's `serial` flag, and `ci/run_test_bundle.py` runs those items one at a time
+with nothing else alongside: after the parallel wave in a single `--select all` invocation
+(what `--like-ci` and a local run do), or on a runner of their own via `--select serial`
+(what CI does).
 
 Encoding it there rather than in the workflow or in a name list inside the runner is the
 point: a new test declares its own scheduling requirement where it is defined, and `ctest
@@ -204,11 +221,12 @@ point: a new test declares its own scheduling requirement where it is defined, a
 wave belongs in that list, with a comment saying which of the three properties above it
 depends on — not behind a retry.**
 
-The trade this makes is explicit: the parallel wave divides by `--jobs`, the serial group
-does not. Measured locally on the release bundle, the serial group is ~38s of a ~75s run.
-`run-linux` is therefore wall-clock-comparable to the old layout while costing roughly half
-the runner-minutes. If the serial group grows, the lever is a second `run-linux-serial` job
-(a separate VM is exclusive by construction), not a shorter list.
+The trade the serial group makes is explicit: the parallel wave divides by `--jobs`, the
+serial group does not. That is why it gets its own runner rather than being appended to
+`run-linux` — and why, if it grows further, the lever is another runner rather than a
+shorter list. **Shortening the list is not the lever**: every entry is there because its
+assertion is about the machine, and a test that only passes when nothing else is running
+does not become correct by being run alongside something else.
 
 ### Windows
 

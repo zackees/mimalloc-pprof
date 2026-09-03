@@ -89,6 +89,19 @@ def read_test_names(path: Path) -> set[str]:
     drift by reading them differently. A `.xml` input is read as JUnit instead (#307), so
     the candidate side can be "what actually ran" rather than "what was packaged".
     """
+    if path.is_dir():
+        # A directory means "the union of these" -- what c-unit.yml needs since #307's
+        # follow-up split the run stage across two runners: the parallel wave writes one
+        # JUnit per bundle and the serial group writes another, and coverage is only
+        # meaningful over both. An empty directory is refused for the same reason an
+        # empty file is: it would make every comparison trivially pass.
+        names: set[str] = set()
+        for child in sorted(path.iterdir()):
+            if child.suffix.lower() in (".xml", ".json"):
+                names |= read_test_names(child)
+        if not names:
+            raise CoverageError(f"{path}: no .xml/.json inputs with any test names")
+        return names
     if path.suffix.lower() == ".xml":
         return read_junit_names(path)
     try:

@@ -330,6 +330,24 @@ def plan(
     return items
 
 
+SELECTIONS = ("all", "parallel", "serial")
+
+
+def partition(items: Sequence[WorkItem], selection: str) -> list[WorkItem]:
+    """The subset of `items` a `--select` value asks for.
+
+    `parallel` and `serial` exist so the two waves can run on *different machines*
+    (c-unit.yml's `run-linux` and `run-linux-serial`). A separate runner is exclusive by
+    construction, which is the same guarantee running the serial group last on one
+    machine gives -- without adding its duration to the critical path.
+    """
+    if selection == "parallel":
+        return [item for item in items if not item.spec.serial]
+    if selection == "serial":
+        return [item for item in items if item.spec.serial]
+    return list(items)
+
+
 def execute(
     items: Sequence[WorkItem], *, jobs: int, extra_env: dict[str, str], timeout_scale: float
 ) -> list[TestResult]:
@@ -585,6 +603,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "reported as `name [LABEL]`. Prefix the label with `<bundle>:` to scope the "
         "extra pass to one bundle (repeatable).",
     )
+    parser.add_argument(
+        "--select",
+        choices=SELECTIONS,
+        default="all",
+        help="run only the parallel-safe tests, only the `serial` ones, or both "
+        "(default). The two halves are split across runners in c-unit.yml so the serial "
+        "group still has a machine to itself without lengthening the critical path.",
+    )
     parser.add_argument("--timeout-scale", type=float, default=1.0)
     parser.add_argument("--junit", type=Path, default=None, metavar="FILE")
     parser.add_argument(
@@ -658,14 +684,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
 
-    items = plan(loaded, variants)
+    selection = cast("str", args.select)
+    items = partition(plan(loaded, variants), selection)
     if not items:
         # An empty run reports 100% passed and proves nothing -- the exact failure mode
         # docs/ci-gates.md exists to prevent.
-        print("no tests selected; refusing to report a green run on nothing", file=sys.stderr)
+        print(
+            f"no tests selected (--select {selection}); refusing to report a green run on nothing",
+            file=sys.stderr,
+        )
         return 1
 
-    print(f"Test bundles: {', '.join(name for name, _, _ in loaded)}")
+    print(f"Test bundles: {', '.join(name for name, _, _ in loaded)}  (--select {selection})")
     print(f"Host: {platform.system()} {platform.machine()}")
     started = time.monotonic()
     results = execute(

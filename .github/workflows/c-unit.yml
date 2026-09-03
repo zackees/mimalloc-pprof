@@ -17,6 +17,11 @@ name: c-unit
 #   2. `run-linux` downloads every Linux bundle and executes ALL of them in one wave
 #      (`ci/run_test_bundle.py --bundles ... --jobs 4`), then the gates that need the
 #      machine to itself. No CMake, no compiler, no build tree.
+#      Its twin `run-linux-serial` runs the `RUN_SERIAL` group -- the tests that measure
+#      process-wide RSS or a wall-clock deadline -- on a runner of its own, at the same
+#      time. A separate VM is exclusive by construction, which is exactly the guarantee
+#      "run them last, alone" gives, without adding their 8.5 min to the critical path.
+#      `coverage` then requires the two halves together to account for every test.
 #
 # The two rules that keep this honest:
 #
@@ -401,8 +406,10 @@ jobs:
       # ---- the wave -------------------------------------------------------------------
       - name: Run every glibc bundle at once
         # --jobs 4 is the runner's vCPU count. Inside this one invocation bundles run
-        # alongside each other AND tests run alongside each other; the `serial` group
-        # (RUN_SERIAL in CMakeLists.txt) is held back and run alone afterwards.
+        # alongside each other AND tests run alongside each other. `--select parallel`
+        # leaves the `serial` group (RUN_SERIAL in CMakeLists.txt) to `run-linux-serial`,
+        # which is running on its own VM at the same moment -- exclusive by construction,
+        # so those tests still measure a quiet machine.
         #
         # The guarded second pass -- every eligible allocation guarded instead of
         # 1-in-4000 -- is an env VARIANT of the guarded bundle, scoped to it. It used to
@@ -413,7 +420,7 @@ jobs:
           set -euo pipefail
           uv run ci/run_test_bundle.py \
             --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared \
-            --jobs 4 \
+            --jobs 4 --select parallel \
             --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
             --junit-dir results
 
@@ -433,7 +440,7 @@ jobs:
             apk add --no-cache python3 libstdc++ > /dev/null
             python3 ci/run_test_bundle.py \
               --bundles bundle/musl bundle/musl-pprof-off \
-              --jobs 4 --junit-dir results
+              --jobs 4 --select parallel --junit-dir results
           '
 
       # ---- gates that need the machine to themselves ----------------------------------
@@ -519,41 +526,136 @@ jobs:
             python3 ci/check_bun_surface.py --musl --objects bun-objects/c-unit-bun-objects-musl
           '
 
-      # ---- no test may be dropped -----------------------------------------------------
-      - name: Coverage -- every registered test was really executed
-        # The replacement for `bundle-roundtrip`. That job proved a bundle reproduces its
-        # tree's own ctest run by moving the build tree away first; here there IS no build
-        # tree on this machine, so the RPATH escape hatch it guarded against cannot exist.
-        # What is left to prove is the coverage half: for every configuration, each name
-        # `ctest --show-only` listed in the build job was executed here. The reference
-        # side comes from ctest, the candidate side from the JUnit the run wrote --
-        # neither is derived from the other.
-        #
-        # `memory-gate-leak` is deliberately absent: it is a control binary, not a lane.
-        run: |
-          set -euo pipefail
-          uv run ci/bundle_coverage.py \
-            --compare release manifests/show-only-release.json results/release.xml \
-            --compare pprof-off manifests/show-only-pprof-off.json results/pprof-off.xml \
-            --compare debug-full manifests/show-only-debug-full.json results/debug-full.xml \
-            --compare guarded manifests/show-only-guarded.json results/guarded.xml \
-            --compare shared manifests/show-only-shared.json results/shared.xml \
-            --compare musl manifests/show-only-musl.json results/musl.xml \
-            --compare musl-pprof-off manifests/show-only-musl-pprof-off.json results/musl-pprof-off.xml \
-            --heading "Coverage: registered by ctest vs executed by the run stage" \
-            --names "ctest --show-only" executed \
-            --summary "$GITHUB_STEP_SUMMARY"
-
+      # The coverage job needs this half's JUnit; `if: always()` so a red wave still
+      # uploads what it managed to run.
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: c-unit-linux-results
+          name: c-unit-results-parallel
           path: |
             results
             result-*.json
             leak-*.json
           if-no-files-found: warn
           retention-days: 1
+
+  # The RSS- and deadline-sensitive tests, on a runner of their own. Splitting them out
+  # rather than running them last on `run-linux` costs one small VM and takes ~8.5 min off
+  # the critical path, and it weakens nothing: what those tests need is a machine with
+  # nothing else on it, and a separate runner is exactly that. The list itself is
+  # unchanged and still lives in CMakeLists.txt as `RUN_SERIAL`.
+  run-linux-serial:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: c-unit-bundle-*
+          path: artifacts
+      - name: Unpack the bundles
+        run: |
+          set -euo pipefail
+          mkdir -p bundle
+          for archive in artifacts/*/*.tar.gz; do
+            name=$(basename "$archive" .tar.gz)
+            mkdir -p "bundle/$name"
+            tar -C "bundle/$name" -xzf "$archive"
+          done
+          for expected in release pprof-off debug-full guarded shared musl musl-pprof-off; do
+            if [ ! -d "bundle/$expected" ]; then
+              echo "::error::bundle/$expected was not downloaded"
+              ls bundle
+              exit 1
+            fi
+          done
+      - name: Run the serial group, one test at a time
+        # --jobs 1 is belt and braces: a `serial` item is run alone regardless.
+        run: |
+          set -euo pipefail
+          uv run ci/run_test_bundle.py \
+            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared \
+            --jobs 1 --select serial \
+            --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
+            --junit-dir results
+      - name: Run the musl serial group inside alpine
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$GITHUB_WORKSPACE":/w -w /w alpine:3.20 sh -c '
+            set -e
+            apk add --no-cache python3 libstdc++ > /dev/null
+            python3 ci/run_test_bundle.py \
+              --bundles bundle/musl bundle/musl-pprof-off \
+              --jobs 1 --select serial --junit-dir results
+          '
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-unit-results-serial
+          path: results
+          if-no-files-found: warn
+          retention-days: 1
+
+  # ---- no test may be dropped ---------------------------------------------------------
+  # The replacement for `bundle-roundtrip`. That job proved a bundle reproduces its tree's
+  # own ctest run by moving the build tree away first; here there IS no build tree on the
+  # machines that ran the tests, so the RPATH escape hatch it guarded against cannot exist.
+  # What is left to prove is the coverage half: for every configuration, each name
+  # `ctest --show-only` listed in the build job was executed -- by one half of the run
+  # stage or the other. The reference side comes from ctest, the candidate side from the
+  # JUnit the runs wrote; neither is derived from the other.
+  #
+  # It is its own job because the two halves finish on two different runners. Splitting the
+  # run stage without this would have left each half able to report green on its own share,
+  # which is precisely the "gate that verifies less" shape docs/ci-gates.md exists to stop.
+  coverage:
+    needs: [run-linux, run-linux-serial]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: c-unit-bundle-*
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: c-unit-results-parallel
+          path: parallel
+      - uses: actions/download-artifact@v4
+        with:
+          name: c-unit-results-serial
+          path: serial
+      - name: Merge the two halves per configuration
+        run: |
+          set -euo pipefail
+          mkdir -p manifests executed
+          cp artifacts/*/show-only-*.json manifests/
+          for config in release pprof-off debug-full guarded shared musl musl-pprof-off; do
+            mkdir -p "executed/$config"
+            cp "parallel/results/$config.xml" "executed/$config/parallel.xml"
+            cp "serial/results/$config.xml" "executed/$config/serial.xml"
+          done
+          ls -R executed | head -40
+      - name: Every registered test was really executed
+        # `ci/bundle_coverage.py` reads a directory as the union of the files in it, so
+        # each configuration is compared against both halves at once.
+        run: |
+          set -euo pipefail
+          uv run ci/bundle_coverage.py \
+            --compare release manifests/show-only-release.json executed/release \
+            --compare pprof-off manifests/show-only-pprof-off.json executed/pprof-off \
+            --compare debug-full manifests/show-only-debug-full.json executed/debug-full \
+            --compare guarded manifests/show-only-guarded.json executed/guarded \
+            --compare shared manifests/show-only-shared.json executed/shared \
+            --compare musl manifests/show-only-musl.json executed/musl \
+            --compare musl-pprof-off manifests/show-only-musl-pprof-off.json executed/musl-pprof-off \
+            --heading "Coverage: registered by ctest vs executed by the run stage" \
+            --names "ctest --show-only" executed \
+            --summary "$GITHUB_STEP_SUMMARY"
 
   # The name is load-bearing: CLAUDE.md rule 3, docs/ci-gates.md and #277/#298 all refer
   # to `ctest (windows-latest)`. It still means the same thing -- Microsoft's `cl`

@@ -1380,6 +1380,11 @@ def run_like_ci(jobs: int) -> int:
         return 1
 
     bundles = [row.config for row in LIKE_CI_BUILDS if row.kind == "bundle"]
+    # One invocation with the default `--select all`: this box is one machine, so the
+    # serial group runs after the wave here. CI splits the same two halves across
+    # `run-linux` and `run-linux-serial` (`--select parallel` / `--select serial`), which
+    # is a scheduling difference only -- a serial test has nothing else alongside it
+    # either way.
     print(f"verify_local --like-ci: stage 2, {len(bundles)} bundle(s) in one wave")
     results = LIKE_CI_ROOT / "results"
     if results.exists():

@@ -226,6 +226,7 @@ class VerifyLocalDriftTests(unittest.TestCase):
             "release",
             "off",
             "debug-full",
+            "debug3-extra",
             "guarded",
             "shared",
             "bundle",

@@ -393,8 +393,27 @@ elseif(CMAKE_BUILD_TYPE MATCHES "Debug")
 endif()
 
 # Debug-only lock diagnostics (#167). Keep this source out of release libraries
-# entirely; src/static.c includes it under the equivalent preprocessor guard.
-if(MI_DEBUG_FULL)
+# entirely -- ci/verify_local.py's `diag` config (and check_release_equivalence.py)
+# assert it never even reaches compile_commands.json for a MI_DEBUG=0 build, not just
+# that its (self-guarded, `#if MI_DEBUG > 2`) body compiles to nothing -- so this can't
+# be unconditional the way src/static.c's #include of it is.
+#
+# The old gate was just `if(MI_DEBUG_FULL)`, the CMake *option*. That missed every route
+# that sets the effective MI_DEBUG=3 preprocessor value without ever setting that option:
+# -DMI_EXTRA_CPPDEFS=MI_DEBUG=3, or a raw -DMI_DEBUG=3 smuggled into CMAKE_C_FLAGS. Either
+# leaves atomic.h's `#if MI_DEBUG > 2` calls into _mi_lock_debug_* with no definition,
+# undefined at link time (#312). So also scan MI_EXTRA_CPPDEFS/CMAKE_C_FLAGS for a
+# MI_DEBUG=N > 2 and treat that the same as MI_DEBUG_FULL=ON. This is intentionally
+# over-inclusive (it can't replicate the compiler's own "last -D wins" duplicate-macro
+# resolution), never under-inclusive: an MI_DEBUG=0/OFF release build sets neither of
+# these, so the diag gate above is unaffected by this addition.
+set(mi_need_diagnostic_c ${MI_DEBUG_FULL})
+foreach(mi_extra_def IN ITEMS "${MI_EXTRA_CPPDEFS}" "${CMAKE_C_FLAGS}")
+  if(mi_extra_def MATCHES "MI_DEBUG=([0-9]+)" AND CMAKE_MATCH_1 GREATER 2)
+    set(mi_need_diagnostic_c ON)
+  endif()
+endforeach()
+if(mi_need_diagnostic_c)
   list(APPEND mi_sources src/diagnostic.c)
 endif()
 

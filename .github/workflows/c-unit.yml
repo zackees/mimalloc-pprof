@@ -180,6 +180,18 @@ jobs:
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_DEBUG=OFF -DMI_PPROF=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
             target: mimalloc-static
             kind: lib
+          - config: debug3-extra
+            container: ''
+            python: uv run
+            # #312: MI_DEBUG=3 arriving through MI_EXTRA_CPPDEFS (not the MI_DEBUG_FULL
+            # option) used to leave src/diagnostic.c out of the build while atomic.h
+            # still called its `_mi_lock_debug_*` hooks -- an undefined reference that
+            # only a *test executable* link exposes (a static archive tolerates it),
+            # hence the target. Link-only; debug-full runs the suite for this define.
+            cmake: -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_EXTRA_CPPDEFS=MI_DEBUG=3
+            assert_defines: MI_DEBUG=3
+            target: mimalloc-test-api
+            kind: lib
     steps:
       # Before checkout: actions/checkout needs `git` on PATH, which alpine's base image
       # does not carry. `tar` too -- busybox's applet cannot write the gzip archive the

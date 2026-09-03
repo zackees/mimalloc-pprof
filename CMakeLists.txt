@@ -1871,6 +1871,10 @@ set(mi_serial_tests
   test-profile-race-scavenger
   test-subproc-lifecycle
 )
+# Next candidate if the wave ever goes flaky: test-fork-user-heap. It is not here because
+# nothing has been observed to fail -- it forks, and a fork's cost and timing are the
+# machine's, so it is the first place to look before anywhere else. Add it (with a line
+# saying which of the properties above it turned out to depend on) rather than retrying it.
 get_property(mi_registered_tests DIRECTORY PROPERTY TESTS)
 foreach(mi_serial_test IN LISTS mi_serial_tests)
   if(mi_serial_test IN_LIST mi_registered_tests)

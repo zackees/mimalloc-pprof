@@ -72,9 +72,9 @@ what that risk means and what was measured.
 
 - [At a glance](#at-a-glance--why-use-this-version) — what you get over upstream mimalloc, in one screen
 - [Integration](#integration) — pprof, exact stats and DHAT in Rust and C, plus the full API table
-- [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, Bun's fork, TCMalloc, and jemalloc
+- [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, Bun's fork, TCMalloc, and jemalloc, plus a measured memory-returned-after-idle chart
 - [Why use this fork](#why-use-this-fork) — the most tested mimalloc fork in existence
-- [Bun features](#bun-features) — every feature ported from oven-sh/mimalloc, including a measured hole-purging chart
+- [Bun features](#bun-features) — every feature ported from oven-sh/mimalloc, and what was deliberately left out
 - [Profiling and observability](#profiling-and-observability) — sampled pprof, exact stats, DHAT, memory events
 - [Upstream bugs found and fixed](#upstream-bugs-found-and-fixed) — including two unbounded memory leaks
 - [Q&A](#qa) — why fork from Microsoft and not from Bun, and other questions people ask
@@ -119,7 +119,7 @@ re-verified under this tree's stress suite. → [Bun features](#bun-features)
   discarded to the OS one page at a time, so a single long-lived object no longer
   pins a 64 KiB–512 KiB page resident. On the churn benchmark it returns **74 % of
   peak RSS** after idle, versus 18 % for the scavenger alone
-  (`mi_on_thread_idle()`, `MIMALLOC_PURGE_HOLES`). → [measured](#hole-purging-measured)
+  (`mi_on_thread_idle()`, `MIMALLOC_PURGE_HOLES`). → [measured](#memory-returned-after-idle)
 - **Background scavenger.** A demand-driven thread purges scheduled arena memory on a
   100 ms timer instead of waiting for the next allocation; threads with an event loop
   can hand the work off with `mi_on_thread_idle_start()` / `park_while_idle()`.
@@ -399,7 +399,7 @@ mi_purge_holes_report();        /* per size class: what could NOT be discarded, 
 ```
 
 For a measured chart of what this buys on a churn workload, see
-[Bun features: hole purging, measured](#hole-purging-measured).
+[Performance: memory returned after idle](#memory-returned-after-idle).
 
 ### API surface
 
@@ -622,6 +622,108 @@ allocators replay one identical stream inside each paired block.
 Full methodology, per-cell tables, and the pending metric roadmap:
 **[docs/benchmarks.md](docs/benchmarks.md)**.
 
+### Memory returned after idle
+
+Throughput is not the only thing a long-running process wants from its allocator.
+When a burst of work drains, does the memory come back? The chart below runs **one
+churn workload under four of the five pinned allocators** — 150k × 512 B + 100k ×
+1 KiB + 50k × 2 KiB blocks, a scattered 1-in-20 kept alive, the rest freed — then
+idles for 10 s and samples resident set size.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-idle-rss-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-idle-rss-light.svg" />
+  <img alt="At the first idle tick mimalloc-pprof returns 74% of peak RSS, Bun's mimalloc 74%, jemalloc 0% by default" src=".github/assets/allocator-idle-rss-light.svg" width="100%" />
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-idle-table-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-idle-table-light.svg" />
+  <img alt="Peak RSS, RSS after idle and percent returned, per allocator: mimalloc-pprof, jemalloc, Bun mimalloc and upstream mimalloc" src=".github/assets/allocator-idle-table-light.svg" width="100%" />
+</picture>
+
+Read it precisely — the third point is a caveat on the first two:
+
+- **The 74 % is cooperative, not automatic.** With a survivor every 20 blocks,
+  essentially every 64 KiB mimalloc page still holds something alive, so there is no
+  fully-free arena memory for the background scavenger to hand back on its own: the
+  `mimalloc-pprof, no idle hook` diagnostic row returns **0 %**. All 74 % of it is
+  hole purging, and it happens on the `mi_on_thread_idle()` call an embedder makes
+  before it blocks. Bun's fork behaves identically, because this is Bun's mechanism.
+- **jemalloc can return this memory if you ask; it does not after idle — by
+  default.** Its decay is advanced by allocation activity, not by time spent idle, so
+  the default-config line is flat for the whole window. The dashed line is the *same*
+  jemalloc given an explicit `mallctl("arena.<all>.purge")` on the same 100 ms tick:
+  **74 %**. And jemalloc's opt-in `background_thread:true` gets **73 %** over that
+  same window with nothing called at all. Both are measured, in the diagnostic rows.
+  The claim is therefore a narrow one, and worth stating as such: jemalloc's *default*
+  configuration keeps sitting on this memory — not that jemalloc is unable to give it
+  back.
+- **Upstream mimalloc is what hole purging is actually worth.** It has no
+  `mi_on_thread_idle` at all, so its default line is flat; given the nearest thing it
+  does have — `mi_collect(false)` on the same tick — it returns **18 %**, which
+  independently reproduces the 18 % the off-vs-on chart below measures for this
+  fork's scavenger with hole purging switched off. Whole-page return gets you 18 %;
+  punching holes in still-used pages gets you 74 %.
+
+Measured with
+[`ci/bench_hole_purging_allocators.py`](ci/bench_hole_purging_allocators.py) on the
+machine, kernel and commit each SVG names. Every allocator is the pinned,
+SHA-256-verified build from
+[`rust/benchmark-suite/allocators/allocator-lock.json`](rust/benchmark-suite/allocators/allocator-lock.json)
+— the same sources, flags and cmake recipe as the throughput charts above — and one
+identical driver source is compiled once per allocator, differing only in which
+static library it links and which idle entry point it calls. Peak is the kernel's
+`VmHWM`; after-idle is `VmRSS` at the end of the window; best of 3 runs by after-idle
+RSS, the same rule for every allocator; `taskset -c 0-3`. The driver `mmap`s its own
+bookkeeping and reads `/proc/self/status` through raw syscalls so that nothing in the
+harness allocates — `libmimalloc.a` overrides libc `malloc` and the prefixed jemalloc
+build does not, so a `printf` per tick would be allocator traffic in one arm and not
+the other. **tcmalloc is absent from this chart**: its locked build needs bazel, which
+the measuring machine did not have. Every run's numbers, every pin, and the exact
+idle mechanism per series are in
+[`.github/assets/allocator-idle-report.json`](.github/assets/allocator-idle-report.json).
+Regenerate with:
+
+```sh
+uv run ci/bench_hole_purging_allocators.py --build-root /tmp/allocator-idle --jobs 8
+uv run ci/bench_hole_purging_allocators.py --from-data --table
+```
+
+#### Isolating this fork's own contribution
+
+The chart above cannot separate hole purging from the rest of what this fork does at
+an idle point, because no competitor has a `MIMALLOC_PURGE_HOLES` to turn off. This
+pair does: one binary, the scavenger on in both runs, hole purging the only changed
+variable.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-rss-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-rss-light.svg" />
+  <img alt="Hole purging returns 74% of peak RSS after idle; the scavenger alone returns 18%" src=".github/assets/hole-purging-rss-light.svg" width="100%" />
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-table-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-table-light.svg" />
+  <img alt="Hole purging characteristics of the churn workload" src=".github/assets/hole-purging-table-light.svg" width="100%" />
+</picture>
+
+Both were measured at commit `be13eadf` with
+[`ci/bench_hole_purging.py`](ci/bench_hole_purging.py): 150k 512 B + 100k 1 KiB +
+50k 2 KiB blocks, a scattered 1-in-20 kept alive, then idled for 10 s calling
+`mi_on_thread_idle()` every 100 ms — median of 3 runs, pinned to 4 CPUs. The table's
+size-class breakdown, `discardable-vs-OS-page-size` curve and per-run text report are
+in [`.github/assets/hole-purging-report.json`](.github/assets/hole-purging-report.json);
+some counters `mi_purge_holes_stats_t` does not expose (a sweep count split by
+owner vs. scavenger thread, why-ineligible buckets, `min_interval` pacing skips) are
+not in the table because there is nothing to read them from. Regenerate both with:
+
+```sh
+uv run ci/bench_hole_purging.py --build-dir <build> --include-dir include --out-dir .github/assets
+uv run ci/bench_hole_purging.py --build-dir <build> --include-dir include --out-dir .github/assets --table
+```
+
 ---
 
 ## Why use this fork
@@ -694,7 +796,7 @@ full survey, including what was *not* imported and why, is in [`MIMALLOC_FORKS.m
 | `pthread_atfork` fork-safety handlers | Prepare/parent/child handlers so a `fork()`ing process doesn't inherit a lock held by another thread. | Bun (`_mi_process_fork_prepare/parent/child`) | [#289](https://github.com/zackees/mimalloc-pprof/pull/289) | The lock **skeleton** is Bun's; the lock **order** is not — re-derived from this tree's actual lock-nesting graph and documented edge-by-edge in `src/fork.c`, with an owner-tid + mutex-depth `MI_DEBUG>2` runtime detector that asserts every acquire agrees with the documented order. |
 | Heap delete/destroy teardown protocol | Four-step claim protocol closing an ABA race between `mi_heap_destroy` and a concurrent allocation on the same heap. | Bun (`src/theap.c`, `src/heap.c`, `src/arena.c`) | [#291](https://github.com/zackees/mimalloc-pprof/pull/291) | Adapted for the absence of `pthread_atfork`/scavenger state at the time. Also imported Bun's heap-teardown test corpus (`test-heap-teardown.c`, `test-heap-churn.c`, `test-heap-aba.c`) and its `mi_debug_fail_os_commit_after` fault-injection hook. Found and fixed two use-after-free classes the working protocol made reachable, beyond what Bun's own tree has. |
 | Background scavenger thread + `mi_on_thread_idle*` | A demand-driven background thread that purges scheduled arena memory on a timer instead of only on allocation; `purge_delay` 1000 → 100 ms. | `src/scavenger.c` | [#299](https://github.com/zackees/mimalloc-pprof/pull/299) | Deviations from Bun: stopped from an `atexit` handler on Windows; lazy start fires only from a main-subprocess thread (a sub-subprocess-started scavenger has its TLS torn down first); the new `mi_subproc_t` fields are appended at the struct tail rather than mid-struct — Bun's placement shifts `stats`, which the free path touches, ~2 ns/alloc+free. (The park protocol itself is Bun's, imported as part of this PR.) |
-| Page hole purging (`purge_holes*`) | Discards the memory of free blocks *inside* a still-used page (OS-page units), so one long-lived object no longer pins a whole page resident. | `src/page.c` (+1038), `942b8342` | [#302](https://github.com/zackees/mimalloc-pprof/pull/302) | The whole engine, including the sweep drivers, was moved into a new `src/page-holes.c`; upstream files carry only five hook calls. See "Hole purging, measured" below. |
+| Page hole purging (`purge_holes*`) | Discards the memory of free blocks *inside* a still-used page (OS-page units), so one long-lived object no longer pins a whole page resident. | `src/page.c` (+1038), `942b8342` | [#302](https://github.com/zackees/mimalloc-pprof/pull/302) | The whole engine, including the sweep drivers, was moved into a new `src/page-holes.c`; upstream files carry only five hook calls. Measured in [Memory returned after idle](#memory-returned-after-idle). |
 | Windows PRNG / RAM-sizing / NUMA fixes; macOS TLS slots 96/97 | `ProcessPrng` instead of always loading `bcrypt.dll`; `GlobalMemoryStatusEx` instead of an SMBIOS parse; NUMA node count off-by-one; fixed TLS slots moved into libpthread's never-assigned gap (95 is the last assigned key). | Bun (`6ccccec2`, `c3c36aa8`, `75a1edf8`, `d676cced`, `include/mimalloc/prim-tls.h:356-361`); NUMA fix from upstream `66383f06`, cherry-picked by Bun as `16cd3684` | [#297](https://github.com/zackees/mimalloc-pprof/pull/297) | CI fetches `apple-oss-distributions/libpthread`'s `tsd_private.h` from `main` (not pinned) and fails if slot 96 or 97 is ever assigned upstream. |
 | Collect on sub-process-safe free | `_mi_free_subproc_safe` collects the page inside its own sub-process, so `mi_heap_destroy` no longer strands ~170 KB per destroyed heap in burst patterns. | [`04ced98d`](https://github.com/oven-sh/mimalloc/commit/04ced98d) | [#318](https://github.com/zackees/mimalloc-pprof/pull/318) | Hand-ported (trees diverged); converged on Bun's `MI_THREADID_DETACHED` test in `mi_stat_free` after review found a teardown-order NULL deref in the first draft. New `test-heap-burst-destroy` proves RED/GREEN. |
 | Lazy per-bin abandoned bitmaps, `heap->releasing`, unmapped abandon on release | Per-bin abandoned-page bitmaps are allocated on first abandon instead of eagerly (~110 KB and ~50 page faults per heap); a heap being released abandons its pages unmapped; the delete walk is ordered against concurrent frees. | [`787be2a8`](https://github.com/oven-sh/mimalloc/commit/787be2a8), [`91218f30`](https://github.com/oven-sh/mimalloc/commit/91218f30), [`a26c5de7`](https://github.com/oven-sh/mimalloc/commit/a26c5de7) | [#319](https://github.com/zackees/mimalloc-pprof/pull/319) | Review found the lazy allocation could re-enter `subproc->theap_meta_lock` from the abandon path; sub-process meta theaps now have `allow_page_abandon=false` like the process one, and meta pages skip the bitmap allocation. New tests `test-abandoned-lazy`, `test-heap-release-mt`. |
@@ -706,7 +808,11 @@ instead of waiting for the next allocation to trigger a purge, so an idle proces
 stops sitting on memory it no longer needs (`MIMALLOC_SCAVENGER`, default on;
 `MIMALLOC_PURGE_DELAY` is 100 ms in this fork, upstream is 1000). Embedders with an
 event loop can call `mi_on_thread_idle()` right before blocking in the kernel to get
-that work done for free on the calling thread.
+that work done for free on the calling thread. That call is not a nicety on a workload
+whose survivors are scattered: when every page still holds something alive there is no
+fully-free arena memory for the scavenger to return by itself, and the measurement in
+[Memory returned after idle](#memory-returned-after-idle) puts the whole win on the
+idle call.
 
 The same idle point also punches **holes**: upstream mimalloc returns a page to the
 OS only once *every* block in it is free, so one long-lived object keeps a whole
@@ -719,34 +825,12 @@ nothing (default on, `MIMALLOC_PURGE_HOLES`; pacing via
 is a test knob, always on when `MI_DEBUG>1`, that zeroes a range before discarding it
 so a mis-scoped discard corrupts visibly rather than silently). Query it live with
 `mi_purge_holes_stats_get` / `mi_purge_holes_report`. **The scavenger is on in both
-runs of the chart below; the chart isolates hole purging's own contribution.**
+runs of the off-vs-on chart; that pair isolates hole purging's own contribution.**
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-rss-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-rss-light.svg" />
-  <img alt="Hole purging returns 74% of peak RSS after idle; the scavenger alone returns 18%" src=".github/assets/hole-purging-rss-light.svg" width="100%" />
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-table-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-table-light.svg" />
-  <img alt="Hole purging characteristics of the churn workload" src=".github/assets/hole-purging-table-light.svg" width="100%" />
-</picture>
-
-Both were measured at commit `be13eadf` with
-[`ci/bench_hole_purging.py`](ci/bench_hole_purging.py): 150k 512 B + 100k 1 KiB +
-50k 2 KiB blocks, a scattered 1-in-20 kept alive, then idled for 10 s calling
-`mi_on_thread_idle()` every 100 ms — median of 3 runs, pinned to 4 CPUs. The table's
-size-class breakdown, `discardable-vs-OS-page-size` curve and per-run text report are
-in [`.github/assets/hole-purging-report.json`](.github/assets/hole-purging-report.json);
-some counters `mi_purge_holes_stats_t` does not expose (a sweep count split by
-owner vs. scavenger thread, why-ineligible buckets, `min_interval` pacing skips) are
-not in the table because there is nothing to read them from. Regenerate both with:
-
-```sh
-uv run ci/bench_hole_purging.py --build-dir <build> --include-dir include --out-dir .github/assets
-uv run ci/bench_hole_purging.py --build-dir <build> --include-dir include --out-dir .github/assets --table
-```
+**The chart and table this used to carry now live in
+[Performance → Memory returned after idle](#memory-returned-after-idle)**, next to the
+other benchmarks and alongside a second chart that puts the same churn workload
+through jemalloc, upstream mimalloc and Bun's mimalloc.
 
 For comparison, the PR #302 description measured Bun's own workload shape
 (400k blocks, min of 5 runs): peak RSS went **210.0 MB → 105.0 MB**, and

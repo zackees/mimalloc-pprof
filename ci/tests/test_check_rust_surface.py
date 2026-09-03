@@ -63,6 +63,27 @@ class CheckRustSurfaceTests(unittest.TestCase):
         self.assertFalse(surface.is_called_from_lib("mi_option_get", clamp))
         self.assertTrue(surface.is_called_from_lib("mi_option_get_clamp", clamp))
 
+    def test_a_doc_comment_mention_is_not_a_call_site(self) -> None:
+        """lib.rs names the C functions it wraps in prose; prose must not count.
+
+        If a wrapper were deleted but its doc comment left behind, a raw text search
+        would still report the function as wrapped -- the gate would pass on a sentence.
+        """
+        described_only = (
+            "/// Stops the profiler. Thin wrapper around `sys::mi_prof_stop`.\n"
+            "//! See sys::mi_prof_stop for the raw declaration.\n"
+            "/* was: unsafe { sys::mi_prof_stop() } */\n"
+        )
+        self.assertFalse(surface.is_called_from_lib("mi_prof_stop", described_only))
+        self.assertTrue(
+            surface.is_called_from_lib("mi_prof_stop", "unsafe { sys::mi_prof_stop() }")
+        )
+
+    def test_a_url_in_source_does_not_swallow_the_rest_of_its_line(self) -> None:
+        """The trailing-comment rule must not treat the `//` of `https://` as a comment."""
+        line = 'let _ = "https://example.invalid/x"; unsafe { sys::mi_prof_reset() }'
+        self.assertTrue(surface.is_called_from_lib("mi_prof_reset", line))
+
     def test_a_shifted_mirror_is_caught(self) -> None:
         """The negative control that matters.
 

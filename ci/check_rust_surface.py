@@ -115,6 +115,12 @@ _COMMENT_LINE_RE = re.compile(r"//[^\n]*")
 _OPTION_ENUM_RE = re.compile(r"typedef\s+enum\s+mi_option_e\s*\{(.*?)\}\s*mi_option_t", re.DOTALL)
 _SYS_EXTERN_FN_RE = re.compile(r"^\s*pub fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]", re.MULTILINE)
 _SYS_OPTIONS_BLOCK_RE = re.compile(r"mi_options!\s*\{(.*?)\n\}", re.DOTALL)
+#: Rust comment shapes, stripped before searching `lib.rs` for a `sys::` call site: a
+#: doc comment that merely NAMES a C function must not count as calling it.
+_RUST_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_RUST_LINE_COMMENT_RE = re.compile(r"^[ \t]*//[^\n]*", re.MULTILINE)
+#: A trailing `// ...`, but not the `//` of a `https://` inside a string or doc link.
+_RUST_TRAILING_COMMENT_RE = re.compile(r"(?<!:)//[^\n]*")
 _SYS_OPTION_NAME_RE = re.compile(r"^\s*(_?mi_option_[A-Za-z0-9_]*)\s*=\s*(\d+);", re.MULTILINE)
 
 
@@ -171,8 +177,25 @@ def sys_option_mirror(source: str) -> list[tuple[str, int]]:
     return [(name, int(value)) for name, value in _SYS_OPTION_NAME_RE.findall(match.group(1))]
 
 
+def strip_rust_comments(source: str) -> str:
+    """Rust source with comments blanked out, for call-site searching.
+
+    `lib.rs` is heavily documented, and its doc comments name the C functions they wrap
+    ("Thin wrapper around `sys::mi_unwrapped_malloc`"). Searching raw text would let a
+    function be *described* rather than *called* and still count as wrapped -- the check
+    would pass on prose.
+
+    The trailing-comment rule requires the `//` not to follow a colon, so the `https://`
+    in a doc link does not truncate the rest of its line. Block comments go first, since
+    a `/* ... */` may span lines.
+    """
+    source = _RUST_BLOCK_COMMENT_RE.sub(" ", source)
+    source = _RUST_LINE_COMMENT_RE.sub(" ", source)
+    return _RUST_TRAILING_COMMENT_RE.sub(" ", source)
+
+
 def is_called_from_lib(name: str, lib_source: str) -> bool:
-    """Whether `src/lib.rs` actually calls `sys::<name>`.
+    """Whether `src/lib.rs` actually calls `sys::<name>` in code (not in a comment).
 
     Word-anchored rather than a plain substring test, because C's names nest:
     `sys::mi_prof_start_seeded` contains `sys::mi_prof_start`, `sys::mi_option_get_clamp`
@@ -181,8 +204,11 @@ def is_called_from_lib(name: str, lib_source: str) -> bool:
     strength of the longer one's call site -- which is precisely the regression this
     check exists to catch. `\\b` does not match between `t` and `_`, so the longer name
     no longer covers the shorter.
+
+    Comments are stripped first for the same reason: a wrapper that was deleted but whose
+    doc comment still mentions the C function must not read as wrapped.
     """
-    return re.search(rf"\bsys::{re.escape(name)}\b", lib_source) is not None
+    return re.search(rf"\bsys::{re.escape(name)}\b", strip_rust_comments(lib_source)) is not None
 
 
 def option_mirror_problems(header_options: list[str], mirror: list[tuple[str, int]]) -> list[str]:
@@ -377,6 +403,19 @@ unsafe extern "C" {
 """
 
 
+#: `mi_prof_stop` is only ever NAMED here (in a doc comment, in a block comment, and in a
+#: trailing comment); `mi_prof_reset` is genuinely called, on a line that also carries a
+#: `https://` the trailing-comment rule must not mistake for a comment.
+_SELFTEST_LIB_COMMENT_ONLY = """
+/// Stops the profiler. Thin wrapper around `sys::mi_prof_stop`.
+//! See sys::mi_prof_stop for the raw declaration.
+/* was: unsafe { sys::mi_prof_stop() } */
+pub fn reset() {
+    let _doc = "https://example.invalid/x"; unsafe { sys::mi_prof_reset() } // sys::mi_prof_stop
+}
+"""
+
+
 def selftest() -> int:
     """Check the parsers against fixtures; return 0 on success."""
     failures: list[str] = []
@@ -408,6 +447,12 @@ def selftest() -> int:
         failures.append("call-site matching: `mi_prof_start_seeded` satisfied `mi_prof_start`")
     if not is_called_from_lib("mi_prof_start_seeded", nested):
         failures.append("call-site matching: missed a real `sys::mi_prof_start_seeded` call")
+
+    # A function that is only *described* is not wrapped.
+    if is_called_from_lib("mi_prof_stop", _SELFTEST_LIB_COMMENT_ONLY):
+        failures.append("call-site matching: a doc comment satisfied the wrapper check")
+    if not is_called_from_lib("mi_prof_reset", _SELFTEST_LIB_COMMENT_ONLY):
+        failures.append("call-site matching: missed a real call on a line that also has a URL")
 
     # The parsers must find something real in the actual tree, too: a regex that matches
     # nothing reports "clean" just as loudly as one that works.

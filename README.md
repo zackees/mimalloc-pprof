@@ -1,6 +1,6 @@
 # mimalloc-pprof
 
-> ## mimalloc with native pprof-compatible heap profiling — on Windows, Linux, and macOS alike.
+> ## mimalloc with native pprof-compatible heap profiling — on Windows, Linux, and macOS alike — and all of Bun's memory-returning features (aka "hole punch") imported and re-verified.
 
 > **The one mimalloc heap profiler that runs natively on Windows.** Upstream mimalloc
 > has no profiler at all, and the only other known implementation

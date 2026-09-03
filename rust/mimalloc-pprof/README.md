@@ -99,6 +99,31 @@ println!(
 );
 ```
 
+## The full API
+
+Everything mimalloc-pprof exposes, grouped and shown next to its C counterpart, is in
+one table in the repository README:
+**[API surface](https://github.com/zackees/mimalloc-pprof#api-surface)**. It is not
+duplicated here — one table, kept honest by `ci/check_rust_surface.py`, which fails the
+build if a C export or an `mi_option_t` enumerator has no Rust binding.
+
+The short version. Safe wrappers, all at the crate root unless noted:
+
+| Module | What it covers |
+|---|---|
+| `prof` | sampled pprof profiling: start/stop, text and `profile.proto` dumps, `stats()`, `samples()`, `modules()` |
+| `dhat` | exact DHAT v2 profiling: start/stop, `stats()`, `dump_file()` |
+| `stats` | the allocator's **exact** counters: `get()`, `json()`, `print()`, `bin_size()`, and the subprocess-scoped forms |
+| `memory_events` | opt-in allocation-change accounting: `set_enabled`, `snapshot`, `set_callbacks`, `visit_live_allocations` |
+| `options` | every `mi_option_t`, including the thirteen this fork adds (`Opt::PROF`, `Opt::SCAVENGER`, `Opt::PURGE_HOLES`, …) |
+| crate root | `MiMalloc`, `heap_dump_json`, `on_thread_idle`, `park_while_idle`, `scavenger_stop`, `purge_holes_stats`, `purge_holes_report`, `rezalloc`/`recalloc`/`expand`, `unwrapped_malloc`/`_free`/`_realloc` |
+
+`mimalloc_pprof::sys` holds the raw `unsafe extern "C"` declarations and the `#[repr(C)]`
+struct mirrors behind all of the above. The mirrors are checked field-by-field against
+the C compiler's own layout on every build (`tests/t19_layout.rs`), because
+`mi_option_t` is positional and a mirror that drifted would silently set a different
+option than the caller named.
+
 ## Platforms and cross-compilation
 
 The crate vendors mimalloc as a single amalgamated C translation unit with no

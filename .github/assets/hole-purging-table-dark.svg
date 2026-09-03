@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 487" width="1000" height="487" role="img" aria-label="Hole purging characteristics, churn workload">
+<rect width="1000" height="487" fill="#0d1117"/>
+<g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<text x="24" y="26" font-size="17" font-weight="600" fill="#e6edf3">Hole purging characteristics: churn workload</text>
+<text x="24" y="44" font-size="12" fill="#8b949e">measured at be13eadf, AMD Ryzen 7 3700X 8-Core Processor, 6.18.48, taskset -c 0-3, median of 3</text>
+<text x="24" y="70" font-size="12" font-weight="600" fill="#8b949e">measurement</text>
+<text x="620" y="70" font-size="12" font-weight="600" text-anchor="end" fill="#8b949e">off</text>
+<text x="780" y="70" font-size="12" font-weight="600" text-anchor="end" fill="#8b949e">on</text>
+<text x="940" y="70" font-size="12" font-weight="600" text-anchor="end" fill="#8b949e">delta</text>
+<line x1="24" y1="90" x2="976" y2="90" stroke="#30363d" stroke-width="1"/>
+<text x="24" y="108" font-size="12" fill="#e6edf3">peak RSS, before idle</text>
+<text x="620" y="108" font-size="12" text-anchor="end" fill="#e6edf3">280.3 MB</text>
+<text x="780" y="108" font-size="12" text-anchor="end" fill="#e6edf3">280.3 MB</text>
+<text x="940" y="108" font-size="12" text-anchor="end" fill="#8b949e">—</text>
+<rect x="16" y="116" width="968" height="26" fill="#30363d" opacity="0.25"/>
+<text x="24" y="134" font-size="12" fill="#e6edf3">RSS after idle (median of 3)</text>
+<text x="620" y="134" font-size="12" text-anchor="end" fill="#e6edf3">230.7 MB</text>
+<text x="780" y="134" font-size="12" text-anchor="end" fill="#e6edf3">73.2 MB</text>
+<text x="940" y="134" font-size="12" text-anchor="end" fill="#8b949e">—</text>
+<text x="24" y="160" font-size="12" fill="#e6edf3">% returned (peak to after-idle)</text>
+<text x="620" y="160" font-size="12" text-anchor="end" fill="#e6edf3">18%</text>
+<text x="780" y="160" font-size="12" text-anchor="end" fill="#e6edf3">74%</text>
+<text x="940" y="160" font-size="12" text-anchor="end" fill="#8b949e">—</text>
+<line x1="24" y1="175" x2="976" y2="175" stroke="#30363d" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="24" y="199" font-size="12" fill="#e6edf3">discard syscalls (madvise/MEM_RESET)</text>
+<text x="620" y="199" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="780" y="199" font-size="12" text-anchor="end" fill="#e6edf3">12,672</text>
+<text x="940" y="199" font-size="12" text-anchor="end" fill="#8b949e">+12,672</text>
+<rect x="16" y="207" width="968" height="26" fill="#30363d" opacity="0.25"/>
+<text x="24" y="225" font-size="12" fill="#e6edf3">reuse syscalls (a hole handed back)</text>
+<text x="620" y="225" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="780" y="225" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="940" y="225" font-size="12" text-anchor="end" fill="#8b949e">0</text>
+<text x="24" y="251" font-size="12" fill="#e6edf3">bytes ever discarded</text>
+<text x="620" y="251" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="780" y="251" font-size="12" text-anchor="end" fill="#e6edf3">165,052,416</text>
+<text x="940" y="251" font-size="12" text-anchor="end" fill="#8b949e">+165,052,416</text>
+<rect x="16" y="259" width="968" height="26" fill="#30363d" opacity="0.25"/>
+<text x="24" y="277" font-size="12" fill="#e6edf3">pages fully freed back to the arena</text>
+<text x="620" y="277" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="780" y="277" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="940" y="277" font-size="12" text-anchor="end" fill="#8b949e">0</text>
+<text x="24" y="303" font-size="12" fill="#e6edf3">pages ineligible for discard (last sweep)</text>
+<text x="620" y="303" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="780" y="303" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="940" y="303" font-size="12" text-anchor="end" fill="#8b949e">0</text>
+<rect x="16" y="311" width="968" height="26" fill="#30363d" opacity="0.25"/>
+<text x="24" y="329" font-size="12" fill="#e6edf3">bytes held by those pages (last sweep)</text>
+<text x="620" y="329" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="780" y="329" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="940" y="329" font-size="12" text-anchor="end" fill="#8b949e">0</text>
+<text x="24" y="355" font-size="12" fill="#e6edf3">unformed-tail bytes discarded</text>
+<text x="620" y="355" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="780" y="355" font-size="12" text-anchor="end" fill="#e6edf3">94,208</text>
+<text x="940" y="355" font-size="12" text-anchor="end" fill="#8b949e">+94,208</text>
+<rect x="16" y="363" width="968" height="26" fill="#30363d" opacity="0.25"/>
+<text x="24" y="381" font-size="12" fill="#e6edf3">unformed-tail discard syscalls</text>
+<text x="620" y="381" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="780" y="381" font-size="12" text-anchor="end" fill="#e6edf3">2</text>
+<text x="940" y="381" font-size="12" text-anchor="end" fill="#8b949e">+2</text>
+<text x="24" y="407" font-size="12" fill="#e6edf3">pages skipped (nothing changed since last sweep)</text>
+<text x="620" y="407" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="780" y="407" font-size="12" text-anchor="end" fill="#e6edf3">350,361</text>
+<text x="940" y="407" font-size="12" text-anchor="end" fill="#8b949e">+350,361</text>
+<rect x="16" y="415" width="968" height="26" fill="#30363d" opacity="0.25"/>
+<text x="24" y="433" font-size="12" fill="#e6edf3">free-list blocks the sweep walked</text>
+<text x="620" y="433" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="780" y="433" font-size="12" text-anchor="end" fill="#e6edf3">320,766</text>
+<text x="940" y="433" font-size="12" text-anchor="end" fill="#8b949e">+320,766</text>
+<text x="24" y="459" font-size="12" fill="#e6edf3">sweeps that walked every page</text>
+<text x="620" y="459" font-size="12" text-anchor="end" fill="#e6edf3">0</text>
+<text x="780" y="459" font-size="12" text-anchor="end" fill="#e6edf3">1</text>
+<text x="940" y="459" font-size="12" text-anchor="end" fill="#8b949e">+1</text>
+</g></svg>

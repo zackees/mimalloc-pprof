@@ -135,6 +135,18 @@ terms of the MIT license. A copy of the license can be found in the file
                                     -> `mi_theap_free_mem` -> `_mi_meta_free` (theap.c:363)
                                     ... and, for a page owned by `theap_meta`, `mi_free`
                                     -> `mi_stat_free` (free.c:768) takes `theap_meta_lock`
+                                    ... and (Bun parity P10b, #317): `mi_heap_detach_theaps`
+                                    (heap.c) holds `theaps_lock` across its `_mi_theap_abandon`
+                                    loop -> `_mi_page_abandon` -> `_mi_arenas_page_abandon`
+                                    (arena.c) -> `mi_arena_pages_abandoned_ensure` (arena.c) ->
+                                    `_mi_meta_zalloc_aligned`, which takes `theap_meta_lock`.
+                                    Live only for a MAIN heap: a releasing (non-main) heap sets
+                                    `heap->releasing` just before this loop, which makes
+                                    `_mi_arenas_page_abandon` skip the `..._ensure` call
+                                    entirely (see the `heap->releasing` comment in
+                                    `mi_heap_detach_theaps`, heap.c). Same target level as the
+                                    edge above, no reordering needed (MI_FORK_LOCK_THEAPS=3
+                                    already precedes MI_FORK_LOCK_THEAP_META=7 below).
       -> tld->theaps_lock           `_mi_heap_detach_theaps` -- but `mi_lock_TRY_acquire`
                                     with a back-off retry (theap.c:412), so NOT a blocking
                                     edge; see the Phase 7 gap note below

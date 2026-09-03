@@ -662,6 +662,7 @@ typedef struct mi_heap_s {
   mi_lock_t             theaps_lock;                    // lock for the theaps list operations
 
   _Atomic(size_t)       abandoned_count[MI_BIN_COUNT];  // total count of abandoned pages in this heap
+  _Atomic(uintptr_t)    releasing;                      // set when `mi_heap_delete`/`mi_heap_destroy` starts: its pages are abandoned unmapped (Bun parity P10b, #317)
   mi_page_t*            os_abandoned_pages;             // list of pages that are OS allocated and not in an arena
   mi_lock_t             os_abandoned_pages_lock;        // lock for the os abandoned pages list (this lock protects list operations)
 
@@ -867,8 +868,14 @@ typedef struct mi_bbitmap_s mi_bbitmap_t;   // atomic binned bitmap (defined in 
 
 struct mi_arena_pages_s {
   mi_bitmap_t* pages;                // all registered pages (abandoned and owned)
-  mi_bitmap_t* pages_abandoned[MI_ARENA_BIN_COUNT];  // abandoned pages per size bin (a set bit means the start of the page)
-  // followed by the bitmaps (whose siz`es depend on the arena size)
+  // Abandoned pages per size bin (a set bit means the start of the page). Each bitmap is
+  // allocated the first time a page of that bin is abandoned (`mi_arena_pages_abandoned_ensure`,
+  // src/arena.c); NULL means no page of that bin was ever abandoned. Eagerly laying out all
+  // MI_ARENA_BIN_COUNT of them cost a page fault per bitmap (one header write each, on its own
+  // OS page) for every heap that touched an arena, and most heaps never abandon a page.
+  // (Bun parity P10b, #317, ported from oven-sh/mimalloc @ 787be2a8, MIT.)
+  _Atomic(mi_bitmap_t*) pages_abandoned[MI_ARENA_BIN_COUNT];
+  // followed by the `pages` bitmap (whose size depends on the arena size)
 };
 
 

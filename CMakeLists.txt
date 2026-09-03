@@ -1829,6 +1829,56 @@ if (MI_BUILD_TESTS)
 endif()
 
 # -----------------------------------------------------------------------------
+# Tests that must not share the machine (issue #307)
+# -----------------------------------------------------------------------------
+# CI no longer gives each configuration its own runner and its own serial `ctest`: every
+# configuration is built once and ONE job replays every bundle at once
+# (`ci/run_test_bundle.py --bundles ... --jobs N`). Most tests are indifferent to that,
+# but some assert on something that is a property of the *machine* rather than of the
+# test process alone:
+#
+#   * process-wide peak RSS / current RSS -- test-memory-gate (the committed baselines are
+#     min-of-8 peak RSS), test-degenerate (RSS must not grow per iteration),
+#     test-process-rss and test-thread-idle-rss (RSS must fall after a thread idles).
+#     Under memory pressure from a parallel wave the kernel's reclaim decisions, not the
+#     allocator's, decide those numbers.
+#   * a wall-clock deadline -- test-park-handoff* wait a bounded time for a hole sweep to
+#     land (`interval_ms * 10 + 1000`), and test-profile-race* are oversubscribed thread
+#     races whose windows close on time, not on work. On an oversubscribed 4-vCPU runner a
+#     missed deadline is indistinguishable from the regression these tests exist to catch.
+#   * a subprocess-shaped lifecycle -- test-subproc-lifecycle forks/execs and asserts on
+#     what the child does at exit.
+#
+# RUN_SERIAL is ctest's own word for this ("do not run any other test concurrently"), so
+# it is set here rather than encoded as a name list inside the CI runner: a new test
+# declares its own scheduling requirement where it is defined, and both `ctest -j` and
+# ci/run_test_bundle.py honour the same declaration. ci/bundle_tests.py lowers it into
+# the bundle manifest's `serial` flag.
+#
+# Set through the directory's TESTS property rather than a bare set_tests_properties()
+# call per name: most of these tests are registered inside a feature-conditional block
+# (MI_PPROF, non-Windows, ...), and set_tests_properties() on a test that was never
+# registered is a hard CMake error.
+set(mi_serial_tests
+  test-memory-gate
+  test-degenerate
+  test-process-rss
+  test-thread-idle-rss
+  test-park-handoff
+  test-park-handoff-no-scavenger
+  test-park-handoff-eager
+  test-profile-race
+  test-profile-race-scavenger
+  test-subproc-lifecycle
+)
+get_property(mi_registered_tests DIRECTORY PROPERTY TESTS)
+foreach(mi_serial_test IN LISTS mi_serial_tests)
+  if(mi_serial_test IN_LIST mi_registered_tests)
+    set_tests_properties(${mi_serial_test} PROPERTIES RUN_SERIAL TRUE)
+  endif()
+endforeach()
+
+# -----------------------------------------------------------------------------
 # Set override properties
 # -----------------------------------------------------------------------------
 if (MI_OVERRIDE)

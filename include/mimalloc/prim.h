@@ -65,6 +65,20 @@ int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit);
 // Returns error code or 0 on success.
 int _mi_prim_reset(void* addr, size_t size);
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+// Discard memory: like `_mi_prim_reset`, but release the physical pages *now*
+// (so `rss` drops immediately) while keeping the range committed and accessible.
+// Never changes the commit state of the range (in particular, never MEM_DECOMMIT).
+// Returns error code or 0 on success.
+// `MI_PRIM_HAS_DISCARD` is 0 where the primitive cannot release anything (and is a
+// no-op that must not be counted as a purge).
+#if defined(__wasi__) || defined(__EMSCRIPTEN__)
+#define MI_PRIM_HAS_DISCARD  (0)
+#else
+#define MI_PRIM_HAS_DISCARD  (1)
+#endif
+int _mi_prim_discard(void* addr, size_t size);
+
 // Reuse memory. This is called for memory that is already committed but
 // may have been reset (`_mi_prim_reset`) or decommitted (`_mi_prim_decommit`) where `needs_recommit` was false.
 // Returns error code or 0 on success. On most platforms this is a no-op.

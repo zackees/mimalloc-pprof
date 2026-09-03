@@ -598,6 +598,23 @@ int _mi_prim_reset(void* start, size_t size) {
   return err;
 }
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
+int _mi_prim_discard(void* start, size_t size) {
+  // Release the physical pages immediately but keep the mapping (and thus the
+  // commit state) intact and accessible -- this is `_mi_prim_decommit` without
+  // its `needs_recommit`/mprotect(PROT_NONE) part.
+  int err = 0;
+  #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
+    // as in `_mi_prim_decommit`: MADV_FREE_REUSABLE does immediate rss accounting (issue #1097)
+    err = unix_madvise(start, size, MADV_FREE_REUSABLE);
+    if (err) { err = unix_madvise(start, size, MADV_DONTNEED); }
+  #else
+    // MADV_DONTNEED decreases rss immediately (unlike MADV_FREE) and keeps the mapping
+    err = unix_madvise(start, size, MADV_DONTNEED);
+  #endif
+  return err;
+}
+
 int _mi_prim_protect(void* start, size_t size, bool protect) {
   int err = mprotect(start, size, protect ? PROT_NONE : (PROT_READ | PROT_WRITE));
   if (err != 0) { err = errno; }

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 #include "mimalloc/profile.h"
 
 static void profile_worker(void) {
@@ -993,7 +994,14 @@ static void test_meta_pages_never_sampled(void) {
    (page-queue.c) for the fix. */
 static volatile bool p267_stop_workers;
 enum { P267_BATCH = 256 };
-static void p267_worker_body(void) {
+enum { P267_WORKERS = 6 };
+/* How many bytes each worker has allocated so far -- what sizes the worker-only window in
+   `p267_workers_allocate` below. Plain `volatile size_t`, like `p267_stop_workers` above:
+   only the owning worker writes its own slot, and the main thread reads them solely to
+   decide when that window has seen enough allocation, where a stale read costs one more
+   turn around a spin loop and nothing else. */
+static volatile size_t p267_worker_bytes[P267_WORKERS];
+static void p267_worker_body(size_t idx) {
   static const size_t p267_sizes[3] = { 32, 96, 224 };  /* a few distinct size classes/pages */
   void* blocks[P267_BATCH];
   size_t round = 0;
@@ -1003,6 +1011,12 @@ static void p267_worker_body(void) {
       blocks[i] = mi_malloc(size);
       assert(blocks[i] != NULL);
       *(volatile char*)blocks[i] = (char)i;
+      /* Credited per BLOCK, not per batch. A window that opens just after the profiler
+         starts must not be closed by a batch whose blocks were allocated -- unsampled --
+         before it: one 224-byte batch is 57 KB, more than a whole window's worth, so a
+         single straddling batch could satisfy the window with almost no sampled
+         allocation in it. Per block, the straddle is at most one block. */
+      p267_worker_bytes[idx] += size;
     }
     /* Free the whole batch back-to-front so pages actually empty out and retire, rather
        than shedding one block at a time interleaved with allocation. */
@@ -1010,28 +1024,55 @@ static void p267_worker_body(void) {
     round++;
   }
 }
-enum { P267_WORKERS = 6 };
-/* Burn wall-clock time without allocating, so a "workers only, main thread idle" window
-   can be observed -- any sample growth during it is unambiguously worker-driven, not the
-   main thread's own canary allocations. */
-static void p267_spin(void) {
-  volatile size_t sink = 0;
-  for (size_t i = 0; i < 20000000; i++) { sink += i; }
-  (void)sink;
+/* The "workers only, main thread idle" window: this allocates NOTHING, so any sample growth
+   across it is unambiguously worker-driven and not this thread's own canary allocations. It
+   ends once the workers have collectively allocated `bytes` -- deliberately NOT after a fixed
+   number of spin iterations.
+
+   A fixed spin (20M volatile adds, what this used to be) makes the window's WIDTH the thing
+   the assertions below rest on, which is a bet on the OS scheduler rather than on the
+   profiler. Measured on `ctest-win-gnu` with per-worker instrumentation over 60 runs (#302):
+   the step-3 window is only ~12 ms wide -- step 1's is ~10x longer purely because sampling at
+   a 128-byte interval slows every thread down -- and inside those 12 ms, 23 of the 60 runs had
+   at least one of the six workers get NO cpu at all and 7 had two. Windows' long, non-varying
+   server quantum lets a freshly spawned thread at the back of a saturated ready queue wait out
+   a window that short. When all six lose it, the window holds almost no worker allocation, and
+   at step 3's coarse 8192-byte interval that is legitimately zero samples -- `test-profile`
+   failed exactly there once on that lane and passed on rerun.
+
+   Sizing the window by allocation volume asserts what this test is actually about (worker
+   allocations ARE sampled while the profiler runs) and asserts nothing about how much cpu the
+   scheduler handed the workers; the sample assertions themselves are unchanged. Returns the
+   volume actually observed, so the caller can require it -- with the deadline, six genuinely
+   stuck workers are a failed assertion at the call site rather than a hung test. */
+static size_t p267_workers_allocate(size_t bytes) {
+  size_t start = 0;
+  for (size_t i = 0; i < P267_WORKERS; i++) { start += p267_worker_bytes[i]; }
+  const time_t deadline = time(NULL) + 60;
+  size_t seen = 0;
+  do {
+    volatile size_t sink = 0;   /* idle, without allocating */
+    for (size_t i = 0; i < 100000; i++) { sink += i; }
+    (void)sink;
+    seen = 0;
+    for (size_t i = 0; i < P267_WORKERS; i++) { seen += p267_worker_bytes[i]; }
+    seen -= start;
+  } while (seen < bytes && time(NULL) < deadline);
+  return seen;
 }
 #ifdef _WIN32
-static DWORD WINAPI p267_worker(LPVOID arg) { (void)arg; p267_worker_body(); return 0; }
+static DWORD WINAPI p267_worker(LPVOID arg) { p267_worker_body((size_t)(uintptr_t)arg); return 0; }
 static void p267_spawn(HANDLE* threads) {
-  for (size_t i = 0; i < P267_WORKERS; i++) { threads[i] = CreateThread(NULL, 0, p267_worker, NULL, 0, NULL); assert(threads[i] != NULL); }
+  for (size_t i = 0; i < P267_WORKERS; i++) { threads[i] = CreateThread(NULL, 0, p267_worker, (LPVOID)(uintptr_t)i, 0, NULL); assert(threads[i] != NULL); }
 }
 static void p267_join(HANDLE* threads) {
   WaitForMultipleObjects(P267_WORKERS, threads, TRUE, INFINITE);
   for (size_t i = 0; i < P267_WORKERS; i++) CloseHandle(threads[i]);
 }
 #else
-static void* p267_worker(void* arg) { (void)arg; p267_worker_body(); return NULL; }
+static void* p267_worker(void* arg) { p267_worker_body((size_t)(uintptr_t)arg); return NULL; }
 static void p267_spawn(pthread_t* threads) {
-  for (size_t i = 0; i < P267_WORKERS; i++) assert(pthread_create(&threads[i], NULL, p267_worker, NULL) == 0);
+  for (size_t i = 0; i < P267_WORKERS; i++) assert(pthread_create(&threads[i], NULL, p267_worker, (void*)(uintptr_t)i) == 0);
 }
 static void p267_join(pthread_t* threads) {
   for (size_t i = 0; i < P267_WORKERS; i++) assert(pthread_join(threads[i], NULL) == 0);
@@ -1064,7 +1105,10 @@ static void test_start_while_allocating_stop_mid_sample_restart_reset(void) {
 
   mi_prof_stats_t_decl(before_workers_only);
   assert(mi_prof_stats_get(&before_workers_only));
-  p267_spin();   /* worker-only window: main thread allocates nothing here */
+  /* worker-only window: the main thread allocates nothing in it. 256x the sample interval
+     of worker allocation, so ~256 samples are expected whatever the interval is. */
+  const size_t window1 = 256 * (size_t)cfg1.sample_interval;
+  assert(p267_workers_allocate(window1) >= window1);   /* the workers really did allocate */
   mi_prof_stats_t_decl(after_workers_only);
   assert(mi_prof_stats_get(&after_workers_only));
   /* The real assertion: worker-thread allocations are sampled while the profiler runs,
@@ -1103,7 +1147,8 @@ static void test_start_while_allocating_stop_mid_sample_restart_reset(void) {
 
   mi_prof_stats_t_decl(before_workers_only2);
   assert(mi_prof_stats_get(&before_workers_only2));
-  p267_spin();
+  const size_t window2 = 256 * (size_t)cfg2.sample_interval;
+  assert(p267_workers_allocate(window2) >= window2);
   mi_prof_stats_t_decl(after_workers_only2);
   assert(mi_prof_stats_get(&after_workers_only2));
   assert(after_workers_only2.accum_samples > before_workers_only2.accum_samples);

@@ -113,8 +113,11 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   //mi_assert_internal(tfree_count <= page->thread_freed + 1);
   #endif
 
+  // #272 (P7b): blocks are conserved: used (incl. not-yet-collected thread frees) + free-listed
+  // + purged == capacity. Purged blocks are free but held OFF every free list (their memory is
+  // discarded); `_mi_page_purged_count` is 0 unless this page carries holes.
   size_t free_count = mi_page_list_count(page, page->free) + mi_page_list_count(page, page->local_free);
-  mi_assert_internal(page->used + free_count == page->capacity);
+  mi_assert_internal(page->used + free_count + _mi_page_purged_count(page) == page->capacity);
 
   return true;
 }
@@ -126,6 +129,9 @@ bool _mi_page_is_valid(mi_page_t* page) {
   #if MI_SECURE
   mi_assert_internal(page->keys[0] != 0);
   #endif
+  // #272 (P7b): the hole invariants (see `src/page-holes.c`). These are what make every existing
+  // test in the suite a test of the purge machinery. Debug-only, and a no-op without holes.
+  _mi_page_holes_assert_valid(page);
   if (!mi_page_is_abandoned(page)) {
     //mi_assert_internal(!_mi_process_is_initialized);
     mi_assert_internal(page->heap!=NULL);
@@ -221,7 +227,7 @@ static inline bool mi_page_free_quick_collect(mi_page_t* page) {
   return true;
 }
 
-void _mi_page_free_collect(mi_page_t* page, bool force) {
+static void mi_page_free_collect_ex(mi_page_t* page, bool force, bool allow_unpurge) {
   mi_assert_internal(page!=NULL);
 
   // collect the thread free list
@@ -250,6 +256,27 @@ void _mi_page_free_collect(mi_page_t* page, bool force) {
   }
 
   mi_assert_internal(!force || page->local_free == NULL);
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 1/5.
+  // Free list empty but this page has discarded holes: bring a whole run of them back. Every
+  // caller re-checks `mi_page_immediate_available` after collect, so the page becomes usable
+  // again without touching the other holes. (`_mi_page_unpurge_run` etc. live in
+  // `src/page-holes.c`; `mi_page_has_purged` is a bitmap scan of cold, tail-of-struct words.)
+  if (allow_unpurge && page->free == NULL && mi_page_has_purged(page) && !_mi_page_purge_holes_in_progress()) {
+    _mi_page_unpurge_run(page);
+  }
+}
+
+void _mi_page_free_collect(mi_page_t* page, bool force) {
+  mi_page_free_collect_ex(page, force, true);
+}
+
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 2/5.
+// Heap inspection must not mutate the heap: leave the holes discarded (they are still reported
+// as free, see `_mi_theap_area_visit_blocks`). Also used by the sweep itself, which is about to
+// discard and would only un-purge what it re-discards a moment later.
+void _mi_page_free_collect_no_unpurge(mi_page_t* page, bool force) {
+  mi_page_free_collect_ex(page, force, false);
 }
 
 // Collect elements in the thread-free list starting at `head`. This is an optimized
@@ -299,7 +326,10 @@ void _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page)
 }
 
 void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
-  _mi_page_free_collect(page, false); // ensure used count is up to date
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 3/5.
+  // no allocation to serve here either (see `mi_theap_page_collect`): un-purging would fault a run
+  // of this page's holes back in on the way out, for a page nobody is about to allocate from.
+  _mi_page_free_collect_no_unpurge(page, false); // ensure used count is up to date
   if (mi_page_all_free(page)) {
     _mi_page_free(page, pq);
   }
@@ -693,6 +723,12 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
     }
   }
 
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 4/5.
+  // The blocks we are about to format may sit in the discarded unformed tail: hand that memory
+  // back to the OS *before* the first free-list pointer is written into it (on macOS a discarded
+  // page stays reclaimable by the kernel, and stays charged to the process, until it is REUSE'd).
+  _mi_page_unpurge_unformed_upto(page, (uintptr_t)mi_page_start(page) + ((size_t)page->capacity + extend) * bsize);
+
   // and append the extend the free list
   if (extend < MI_MIN_SLICES || MI_SECURE<2) { //!mi_option_is_enabled(mi_option_secure)) {
     mi_page_free_list_extend(page, bsize, extend );
@@ -715,6 +751,9 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_assert(theap!=NULL);
   // page->heap = (_mi_is_heap_main(_mi_theap_heap(theap)) ? NULL : _mi_theap_heap(theap)); // faster for `mi_page_associated_theap`
   // mi_page_set_theap(page, theap);
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 5/5.
+  _mi_page_purged_reset(page);   // fresh (or recycled) page: no holes, never swept
 
   size_t page_size;
   uint8_t* page_start = mi_page_area(page, &page_size); MI_UNUSED(page_start);

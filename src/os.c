@@ -663,6 +663,46 @@ void _mi_os_reuse( mi_subproc_t* subproc, void* addr, size_t size ) {
   }
 }
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+// Release the physical pages of `[addr,addr+size)` right now, WITHOUT changing its commit
+// state -- see the "Page hole purging" block in `src/page-holes.c` for why the commit state
+// must stay untouched (the arena tracks commit per 64 KiB slice and cannot represent a
+// sub-slice hole). Returns whether anything was actually discarded.
+bool _mi_os_discard(mi_subproc_t* subproc, void* addr, size_t size) {
+  #if !MI_PRIM_HAS_DISCARD
+  MI_UNUSED(subproc); MI_UNUSED(addr); MI_UNUSED(size);
+  return false;   // `_mi_prim_discard` is a no-op here: nothing is released, so nothing is counted
+  #else
+  // page align conservatively *within* the range: never touch a partially covered OS page
+  size_t csize = 0;
+  void* const start = mi_os_page_align_area_conservative(addr, size, &csize);
+  if (csize == 0) return false;
+
+  #if !MI_TRACK_ENABLED
+  // Pretend the discard is eager (as `_mi_os_reset` does): on macOS MADV_FREE_REUSABLE
+  // keeps the data until the pages are actually reclaimed, so without this a range that
+  // wrongly overlaps a *live* block goes unnoticed. Always on in a debug build; the tests
+  // force it on with `purge_holes_eager_zero` so they are not vacuous in a release build.
+  #if (MI_DEBUG>1) && !MI_SECURE
+  const bool eager_zero = true;
+  #else
+  const bool eager_zero = mi_option_is_enabled(mi_option_purge_holes_eager_zero);
+  #endif
+  if (eager_zero) { _mi_memzero(start, csize); }
+  #endif
+
+  const int err = _mi_prim_discard(start, csize);
+  if (err != 0) {
+    _mi_warning_message("cannot discard OS memory (error: %d (0x%x), address: %p, size: 0x%zx bytes)\n", err, err, start, csize);
+    return false;
+  }
+  // count only what was actually discarded
+  mi_subproc_stat_counter_increase(subproc, purge_calls, 1);
+  mi_subproc_stat_counter_increase(subproc, purged, csize);
+  return true;
+  #endif
+}
+
 // either resets or decommits memory, returns true if the memory needs
 // to be recommitted if it is to be re-used later on.
 bool _mi_os_purge_ex(mi_subproc_t* subproc, void* p, size_t size, bool allow_reset, size_t stat_size, mi_commit_fun_t* commit_fun, void* commit_fun_arg)

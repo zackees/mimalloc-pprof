@@ -1021,6 +1021,70 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
 void _mi_prof_suppress_begin(void) { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->prof_callback_depth++; }
 void _mi_prof_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->prof_callback_depth--; }
 
+#if MI_DEBUG
+// #272 profiler-interaction invariant (1), see `mimalloc/internal.h`. Called from the hole
+// sweep (`src/page-holes.c`) just BEFORE `_mi_os_discard` on a range of `page`, so a wrong
+// range is caught before the debug eager-zero destroys the evidence.
+//
+// Two things are asserted:
+//  - no sampled record's block (`rec->ptr`) lies in the range. A record is attached to a LIVE
+//    block, and hole purging only ever discards OS pages in which every block is free, so this
+//    is a direct check of the sweep's central invariant against an independent bookkeeping.
+//  - the record STRUCT itself does not lie in the range: records come from the profiler's own
+//    raw-OS arena (`_mi_prof_arena_alloc`, CLAUDE.md rule 4), never from a mimalloc page, so a
+//    hit here means that invariant was broken somewhere else entirely.
+//
+// Split into a PREDICATE plus the assert over it (review of PR #302). The predicate is exported
+// so `test-profile-race.c`'s scenario 5 can use it as a repeatable NEGATIVE control: pointed at
+// a range that deliberately contains a live, record-bearing block it must return non-zero.
+// Without that, "the assert never fired" is indistinguishable from "the assert is vacuous", and
+// the only evidence for the difference was a one-off local `mi_assert_internal(false)` patch.
+// `_mi_prof_debug_records_compared` is the other half of the same question: it counts the
+// records this has actually looked at, so the test can assert the sweep really does reach pages
+// that carry records rather than only ever record-free ones.
+static _Atomic(size_t) prof_debug_records_compared;
+
+size_t _mi_prof_debug_records_compared(void) {
+  return mi_atomic_load_relaxed(&prof_debug_records_compared);
+}
+
+// The number of records the range [addr,addr+size) would swallow. MUST be 0 at every discard.
+// NOTE: 0 is also what a failed try-acquire returns (see below) -- for the assert that is the
+// intended "skip", and the test calls this single-threaded where the acquire always succeeds.
+size_t _mi_prof_debug_records_in(const mi_page_t* page, const void* addr, size_t size) {
+  if (page == NULL || !page->has_metadata || size == 0) return 0;
+  size_t hits = 0;
+  const uint8_t* const lo = (const uint8_t*)addr;
+  const uint8_t* const hi = lo + size;
+  // `page->metadata` is only mutated under `prof_lock`; a sweep runs on an arbitrary thread
+  // (the owner, or the scavenger for a parked one), so take it -- unless this thread is already
+  // inside it (mi_prof_visit's callback), where the list is ours to read anyway.
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  const bool own = (hooks != NULL && hooks->prof_lock_owner);
+  // TRY-acquire, never block: the sweep calls this while holding `tld->theaps_lock`
+  // (`_mi_purge_holes_of`), and `mi_prof_visit` holds `prof_lock` across the user callback --
+  // a callback that deletes a heap then waits on `theaps_lock`. Blocking here would close that
+  // ABBA cycle in debug builds. An assertion that occasionally does not run beats a deadlock;
+  // the sweep visits the same pages again at the next idle point.
+  if (!own && !mi_lock_try_acquire(&prof_lock)) return 0;
+  size_t compared = 0;
+  for (mi_prof_record_t* rec = (mi_prof_record_t*)page->metadata; rec != NULL; rec = rec->next) {
+    compared++;
+    if ((const uint8_t*)rec->ptr >= lo && (const uint8_t*)rec->ptr < hi) { hits++; }
+    if ((const uint8_t*)rec      >= lo && (const uint8_t*)rec      < hi) { hits++; }
+  }
+  if (!own) { mi_lock_release(&prof_lock); }
+  if (compared > 0) { mi_atomic_add_relaxed(&prof_debug_records_compared, compared); }
+  return hits;
+}
+
+void _mi_prof_debug_assert_no_records_in(const mi_page_t* page, const void* addr, size_t size) {
+  const size_t hits = _mi_prof_debug_records_in(page, addr, size);
+  mi_assert_internal(hits == 0);
+  MI_UNUSED(hits);
+}
+#endif
+
 static void prof_free_collect(mi_page_t* page, mi_block_t* head) { for (mi_block_t* b=head; b != NULL && page->has_metadata; b=mi_block_next(page,b)) prof_free_record(page,b); }
 static void prof_realloc_in_place(mi_page_t* page, void* p, size_t size) {
   // #266: callers pass the caller-visible pointer, which for a guarded (interior)

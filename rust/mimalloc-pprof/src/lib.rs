@@ -287,6 +287,33 @@ pub fn scavenger_stop() {
     unsafe { sys::mi_scavenger_stop() }
 }
 
+/// What page hole purging has reclaimed, process wide (issue #272, Bun parity P7b).
+///
+/// Hole purging discards the memory of the free blocks sitting inside pages that are still
+/// in use, at each [`on_thread_idle`] / [`park_while_idle`] point -- without it a page stays
+/// fully resident until every block in it is free, so one long-lived object pins a whole
+/// 64 KiB/512 KiB page. These counters are the only way to see how much that gets back;
+/// they are deliberately not part of `mi_stats_t`, because the sweep also covers pages that
+/// no heap owns.
+///
+/// Most fields are monotonic. `purged_bytes`, `purged_blocks` and `unformed_bytes` are
+/// gauges ("right now"), and the three `ineligible_*` fields are a gauge over the LAST sweep
+/// only. Everything is zero when the `purge_holes` option is off (`MIMALLOC_PURGE_HOLES=0`).
+///
+/// ```
+/// # use mimalloc_pprof as mi;
+/// let before = mi::purge_holes_stats().purged_bytes_total;
+/// mi::on_thread_idle();
+/// let after = mi::purge_holes_stats().purged_bytes_total;
+/// assert!(after >= before);
+/// ```
+#[must_use]
+pub fn purge_holes_stats() -> sys::MiPurgeHolesStats {
+    let mut stats = sys::MiPurgeHolesStats::default();
+    unsafe { sys::mi_purge_holes_stats_get(&raw mut stats) };
+    stats
+}
+
 /// Exact DHAT v2 heap/lifetime profiling controls.
 ///
 /// DHAT records every non-internal allocation from the moment [`start`] succeeds.

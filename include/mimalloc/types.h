@@ -226,6 +226,25 @@ terms of the MIT license. A copy of the license can be found in the file
 // Minimal commit for a page on-demand commit 
 #define MI_PAGE_MIN_COMMIT_SIZE  (16*MI_KiB) /* MI_ARENA_SLICE_SIZE */
 
+// imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+// Hole purging: a bitmap of the OS pages inside a mimalloc page whose memory has been
+// discarded. It is indexed by OS page (not by block), so its size does not depend on the
+// size class: a page needs `ceil(block_area / os_page_size)` bits. There is no extra bit
+// for the page header -- in v3 `mi_page_t` lives out of line, in the arena's meta slices
+// (`src/arena.c`, `page_ma_offset`), so the block area starts at the slice start and is
+// therefore OS-page aligned; `mi_page_purge_base`'s `align_down` is what keeps the count
+// (and the bit -> address mapping) right if a future layout ever put it back in the page.
+// So 256 bits covers, on every OS page size we support:
+//   4 KiB  OS page: small (64 KiB) = 16 bits, medium (512 KiB) = 128, large (4 MiB) = 1024
+//   16 KiB OS page: small = 4, medium = 32, large = 256  (fits, exactly at the limit)
+//   64 KiB OS page: small = 1, medium = 8,  large = 64
+// -- i.e. every small and medium page always, and a large page on a 16 KiB or larger OS
+// page. A large page on a 4 KiB OS page needs 1024 bits and stays ineligible. The check is
+// at runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in
+// `src/page-holes.c`), never at compile time: `_mi_os_page_size()` is not a constant.
+#define MI_PAGE_PURGE_BITS                (256)
+#define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from
@@ -429,7 +448,35 @@ typedef struct mi_page_s {
 
   struct mi_prof_record_s*  metadata;          // sampled live allocation records, or NULL (MI_PPROF)
   bool                      has_metadata;      // `true` if profiler records are attached to this page
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+  // The OS pages inside this page whose memory was discarded to the OS. A block is
+  // "purged" exactly when it overlaps one of them (we discard an OS page only when every
+  // block overlapping it is free), and a purged block is held OFF every free list: mimalloc
+  // threads its free list through the free blocks themselves, so a discarded block cannot
+  // hold a `next` pointer. COLD: touched only by the idle hole-purge sweep, so it stays at
+  // the very tail of the struct, after this fork's own `metadata`/`has_metadata` (which the
+  // free path reads) and after every upstream field.
+  uint64_t                  purged[MI_PAGE_PURGE_WORDS];
+
+  // The discarded part of the *unformed tail*: the blocks in `[capacity,reserved)` are not
+  // formatted yet, but when the page is carved from a recycled arena slice their memory is
+  // already resident. Byte offsets from `page_start`, OS-page aligned, `lo == hi` when
+  // nothing is discarded. Deliberately NOT part of `purged` above: a bit there means "this
+  // block is free and off every free list" (`_mi_page_is_valid`), and these blocks do not
+  // exist yet. The region only ever shrinks from the left, as `capacity` grows.
+  uint32_t                  unformed_purged_lo;
+  uint32_t                  unformed_purged_hi;
+
+  // The `(capacity,used)` the last hole sweep left this page in, packed as `(capacity<<32)|used`.
+  // A sweep that finds it unchanged skips the page without walking its free list at all: nothing
+  // was allocated or freed in it since, so the sweep has nothing new to discard (see
+  // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". Cold, like `purged` above.
+  uint64_t                  swept_state;
 } mi_page_t;
+
+// An impossible `(capacity,used)` (`used > capacity` never holds): "this page has no sweep state".
+#define MI_PAGE_SWEPT_NONE                (~(uint64_t)0)   // capacity is 16-bit, so a state with all upper bits set cannot occur
 
 
 // ------------------------------------------------------
@@ -775,6 +822,27 @@ struct mi_tld_s {
   mi_theap_t*           park_theap0;          // default theap, captured at the park (the scavenger has no TLS to find it)
   _Atomic(size_t)       park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
   mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
+
+  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
+  // State of a running hole sweep of THIS thread's heaps. It lives on the tld being swept and
+  // never in a thread-local of the sweeping thread: besides the scavenger sweeping many tlds
+  // from one thread, `_mi_page_purge_holes_in_progress` is read from inside the allocator
+  // (`mi_page_free_collect_ex`), and on targets where `__thread` is emulated the first access
+  // on a thread allocates -- re-entering the collect that is reading it, without bound
+  // (oven-sh/bun#38051). Plain (non-atomic) fields: only the one thread doing the sweep -- the
+  // owner, or the scavenger holding this tld in MI_PARK_SWEEPING -- ever touches them.
+  // If one of these ever DOES need to be atomic, declare it `_Atomic(size_t)`, never
+  // `_Atomic(uint32_t)`: MSVC's plain-C atomic wrapper (`mimalloc/atomic.h`) only implements
+  // uintptr_t/int64_t-width primitives, so `mi_atomic_load_*` on a 32-bit field issues an
+  // 8-byte `__iso_volatile_load64` and reads the next field into the high half (C4133). The
+  // process-wide hole counters in `src/page-holes.c` are `int64_t` for the same reason -- they
+  // go through `mi_atomic_addi64_relaxed`, the 64-bit primitive, exactly as `mi_stat_counter_t`.
+  size_t                holes_sweep_seq;      // idle sweeps of this thread's heaps so far (`purge_holes_full_every`)
+  mi_msecs_t            holes_sweep_last;     // when the last one ran (`purge_holes_min_interval` pacing)
+  bool                  holes_sweeping;       // a sweep of this thread's heaps is in progress right now
+  bool                  holes_sweep_full;     // ... and it ignores `page->swept_state` (every N'th sweep)
+  size_t                holes_sweep_skipped;  // per-pass counters, folded into the process-wide ones by
+  size_t                holes_sweep_visited;  // `_mi_page_purge_holes_end` (a per-page atomic would cost real time)
 };
 
 

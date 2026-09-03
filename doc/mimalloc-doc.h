@@ -1333,6 +1333,11 @@ typedef enum mi_option_e {
 
   mi_option_scavenger,                  ///< run a background thread that purges scheduled arena memory (=1). `MIMALLOC_SCAVENGER=0` disables it and purging stays allocation-driven, as upstream.
 
+  mi_option_purge_holes,                ///< discard the memory of the free blocks inside a still-used page, at each `mi_on_thread_idle` (=1). `MIMALLOC_PURGE_HOLES=0` disables it: a page then stays fully resident until every block in it is free, as upstream.
+  mi_option_purge_holes_eager_zero,     ///< zero a range before discarding it, so a mis-scoped discard corrupts visibly rather than silently on an OS that reclaims lazily (=0; always on when `MI_DEBUG>1`). A TEST knob -- it makes discarding more expensive, not cheaper.
+  mi_option_purge_holes_min_interval,   ///< minimum milli-seconds between two hole sweeps of the same thread's heaps (=100)
+  mi_option_purge_holes_full_every,     ///< every N'th hole sweep of a thread walks every page, ignoring the per-page "nothing changed since I last swept it" check (=64); 0 disables the periodic full walk
+
   // v3 options
   mi_option_page_reclaim_on_free,       ///< __v3__: reclaim abandoned pages on a free (=0). -1 disallowr always, 0 allows if the page originated from the current theap, 1 allow always
   mi_option_page_full_retain,           ///< __v3__: retain N full (small) pages per size class (=2). Use -1 for infinite (as in __v1__,__v2__).

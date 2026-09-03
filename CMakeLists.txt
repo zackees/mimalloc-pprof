@@ -95,6 +95,7 @@ set(mi_sources
     src/os.c
     src/page.c
     src/page-map.c
+    src/page-holes.c
     src/profile.c
     src/random.c
     src/scavenger.c
@@ -711,7 +712,13 @@ endif()
 # set language for source files now
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c PROPERTIES LANGUAGE CXX )
+  # #272 (P7b): test-purge-holes.c and test-profile-race.c reach `mimalloc/internal.h`
+  # (`_mi_ptr_page`, `mi_page_block_is_purged`, `_mi_os_page_size`, ...), which is NOT wrapped
+  # in `extern "C"`. With MI_USE_CXX the library's symbols are C++-mangled, so a C test cannot
+  # link them -- the `windows-msvc` bundles failed with `lld-link: undefined symbol:
+  # _mi_os_page_size`. Compiling these two as C++ alongside the library is what test-api.c
+  # already does for the same reason.
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -1007,6 +1014,13 @@ if (MI_BUILD_TESTS)
     target_include_directories(mimalloc-test-profile-race PRIVATE include)
     if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
       target_link_libraries(mimalloc-test-profile-race PRIVATE mimalloc-static ${mi_libraries})
+      # issue #272 (P7b): scenario 5's purged-block assertions need `_mi_ptr_page` /
+      # `mi_page_block_is_purged`, which a shared build hides. With the static library
+      # they are available; without it the scenario still runs (it is a concurrency test
+      # first) minus those two assertions -- see the test source.
+      # MI_TEST_LINKS_STATIC turns scenario 5's purged-block assertions on; MI_STATIC_LIB is
+      # what makes the internal declarations they use link on MSVC (see test-purge-holes above).
+      target_compile_definitions(mimalloc-test-profile-race PRIVATE MI_TEST_LINKS_STATIC=1 MI_STATIC_LIB)
     else()
       target_link_libraries(mimalloc-test-profile-race PRIVATE mimalloc ${mi_libraries})
     endif()
@@ -1232,6 +1246,60 @@ if (MI_BUILD_TESTS)
     add_test(NAME test-park-handoff-no-scavenger COMMAND mimalloc-test-park-handoff)
     set_tests_properties(test-park-handoff-no-scavenger PROPERTIES TIMEOUT 600
                          ENVIRONMENT "MIMALLOC_SCAVENGER=0")
+    # ... and with the P7b sweep rate limit removed, so every park is due the moment it is
+    # claimed: `test_park_inside_window_gets_swept` takes its "no window" branch and
+    # `test_parks_get_swept` stops spacing its parks (the file calls this the `-eager` variant).
+    add_test(NAME test-park-handoff-eager COMMAND mimalloc-test-park-handoff)
+    set_tests_properties(test-park-handoff-eager PROPERTIES TIMEOUT 600
+                         ENVIRONMENT "MIMALLOC_PURGE_HOLES_MIN_INTERVAL=0")
+
+    # test-purge-holes: imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 /
+    # Bun parity P7b). The hole engine's own test: survivors stay byte-for-byte intact
+    # across a discard, churn/aligned/lifecycle/abandoned/large-page cases, the unformed
+    # tail, the OS-page arithmetic, the read-only hole report, and the `swept_state` skip
+    # (including its `purge_holes_full_every` bound). It reaches internal headers, so it
+    # links the static library and is built with the library's own defines.
+    # It walks `mi_page_t` and calls `_mi_ptr_page` / `_mi_page_purged_count` /
+    # `_mi_page_purge_os_page_blocks` directly, and those are hidden in a shared build
+    # (`-fvisibility=hidden`), so this one is STATIC-ONLY -- the `ctest-shared` lane
+    # (`MI_BUILD_STATIC=OFF`) skips it rather than failing to link.
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      add_executable(mimalloc-test-purge-holes test/test-purge-holes.c)
+      target_compile_definitions(mimalloc-test-purge-holes PRIVATE ${mi_defines})
+      target_compile_options(mimalloc-test-purge-holes PRIVATE ${mi_cflags})
+      target_include_directories(mimalloc-test-purge-holes PRIVATE include)
+      # MI_STATIC_LIB: `mimalloc-static` is compiled with it (see the target above), and
+      # without it here MSVC resolves the internal declarations this test uses through
+      # `__declspec(dllimport)` and the link fails with LNK2019 on `_mi_os_page_size` /
+      # `__mi_page_map`. Same pattern as `mimalloc-test-tls-controls`.
+      target_compile_definitions(mimalloc-test-purge-holes PRIVATE MI_STATIC_LIB)
+      target_link_libraries(mimalloc-test-purge-holes PRIVATE mimalloc-static ${mi_libraries})
+      target_link_libraries(mimalloc-test-purge-holes PRIVATE Threads::Threads)
+      add_test(NAME test-purge-holes COMMAND mimalloc-test-purge-holes)
+      set_tests_properties(test-purge-holes PROPERTIES TIMEOUT 600)
+      # ... and with the feature off: every data-integrity check still runs, and the test
+      # additionally asserts that nothing is ever discarded (the option's off-path).
+      add_test(NAME test-purge-holes-off COMMAND mimalloc-test-purge-holes)
+      set_tests_properties(test-purge-holes-off PROPERTIES TIMEOUT 600
+                           ENVIRONMENT "MIMALLOC_PURGE_HOLES=0")
+    endif()
+
+    # test-purge-zero: imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 /
+    # Bun parity P7b). The purge path may hand a recycled slice back as "reads zero";
+    # this poisons everything, churns until slices are purged and recycled, and verifies
+    # every byte of every recycled mi_zalloc/mi_calloc allocation is zero. (Distinct from
+    # test-zero-tracking, which covers the -- since #80 dead -- `purge_zeroes` option.)
+    add_executable(mimalloc-test-purge-zero test/test-purge-zero.c)
+    target_compile_definitions(mimalloc-test-purge-zero PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-purge-zero PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-purge-zero PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-purge-zero PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-purge-zero PRIVATE mimalloc ${mi_libraries})
+    endif()
+    add_test(NAME test-purge-zero COMMAND mimalloc-test-purge-zero)
+    set_tests_properties(test-purge-zero PROPERTIES TIMEOUT 600)
   endif()
 
   # MI_NO_PROCESS_DETACH (issue #268, Bun parity P3): imported from

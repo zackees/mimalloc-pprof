@@ -7,15 +7,19 @@ terms of the MIT license. A copy of the license can be found in the file
 
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
 //
-// TWO DELIBERATE ADAPTATIONS for this tree, both marked `Phase 7b` inline:
-//  1. Bun's "did a sweep run?" observable is `mi_purge_holes_stats_get().discard_calls`, which
-//     belongs to hole purging (Phase 7b of #272). Here it is `_mi_test_idle_work_count()`
-//     (src/scavenger.c): the number of completed idle-work passes, which is the same signal for
-//     everything 7a can do and is in fact stricter (it counts passes, not syscalls). 7b adds the
-//     discard-count assertions on top.
-//  2. The two cases about `mi_option_purge_holes_min_interval` sweep pacing
-//     (`test_park_inside_window_gets_swept`, and the spacing inside `test_parks_get_swept`) need
-//     that option and are `#if 0 // Phase 7b` until it exists.
+// ADAPTATIONS for this tree (both marked inline where they appear):
+//   (a) the 7a-added `forced_collect_loop` stress case, which has no counterpart in Bun --
+//       see its comment; it guards this fork's blocking `mi_collect(true)` change.
+//   (b) Bun's "did a sweep run?" observable is `mi_purge_holes_stats_get().discard_calls`. Here it is
+//   `_mi_test_idle_work_count()` (src/scavenger.c): the number of completed idle-work passes.
+//   That is the same signal and a strictly stronger one -- it counts passes rather than
+//   madvise syscalls, so a pass that legitimately finds nothing discardable (a page whose free
+//   runs happen not to cover a whole OS page) still registers, and the pacing cases below stay
+//   deterministic. `min_interval` skips the tld in `_mi_theap_sweep_parked` before any work
+//   runs, so the counter is silent inside the window exactly as `discard_calls` would be.
+//   Phase 7b landed the hole engine, so this file now ALSO asserts, at the end, that the
+//   handoff really did discard hole memory (`mi_purge_holes_stats_get().discard_calls`) --
+//   the part of the contract only 7b can deliver.
 
 // `mi_on_thread_idle_start`/`mi_on_thread_idle_end`: a thread that is about to block hands its
 // theaps to the scavenger, which sweeps them while it is in the kernel.
@@ -146,10 +150,19 @@ static long first_corrupt_survivor(void** p) {
   return -1;
 }
 
-// Phase 7b adaptation (see the file header): Bun reads `mi_purge_holes_stats_get().discard_calls`.
+// see the file header: Bun reads `mi_purge_holes_stats_get().discard_calls` here.
 extern size_t _mi_test_idle_work_count(void);
 static size_t discards(void) {
   return _mi_test_idle_work_count();
+}
+
+// ... and the 7b half of the contract, which `_mi_test_idle_work_count` deliberately does not
+// cover: how much hole memory the idle work actually gave back.
+static size_t hole_discard_calls(void) {
+  mi_purge_holes_stats_t h; mi_purge_holes_stats_get(&h); return h.discard_calls;
+}
+static size_t hole_discarded_bytes(void) {
+  mi_purge_holes_stats_t h; mi_purge_holes_stats_get(&h); return h.purged_bytes_total;
 }
 
 // wait (bounded) for the handoff to have actually done a discard, standing in for a syscall
@@ -444,7 +457,7 @@ static void test_third_thread_frees_during_sweep(void) {
 // ---------------------------------------------------------------------------
 static void test_parks_get_swept(void) {
   enum { ROUNDS = 20 };
-  const long interval_ms = 0;   // Phase 7b: `mi_option_get(mi_option_purge_holes_min_interval)`
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
   void** p = (void**)calloc(LIVE, sizeof(void*));
   if (p == NULL) return;
   int missed = 0;
@@ -474,7 +487,6 @@ static void test_parks_get_swept(void) {
 // this time for long. That second park is passed over when it starts, and must be swept once the
 // window ends rather than at the scavenger's next unrelated wake (up to its 30s safety timeout).
 // ---------------------------------------------------------------------------
-#if 0 // Phase 7b (#272): needs `mi_option_purge_holes_min_interval`
 static void test_park_inside_window_gets_swept(void) {
   const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
   if (interval_ms <= 0) return;   // no window (the `-eager` variant)
@@ -514,10 +526,6 @@ static void test_park_inside_window_gets_swept(void) {
   check("park inside the rate window is swept when the window ends", parked && waited_ms >= 0);
 }
 
-#endif // Phase 7b
-static void test_park_inside_window_gets_swept(void) {
-  fprintf(stderr, "test: park inside the rate window is swept when the window ends...  skipped (Phase 7b)\n");
-}
 
 // ---------------------------------------------------------------------------
 // fork() by a thread that is between _start and _end -- fork does not allocate, so the contract
@@ -690,6 +698,143 @@ static void test_exit_while_swept_stress(void) {
 }
 
 // ---------------------------------------------------------------------------
+// #302 review: the same race, with the HOLE sweep as the thing being raced.
+//
+// 7a made `_mi_park_leave_if_parked` fire from the allocator's own slow paths, so a parked
+// thread that allocates or frees from a `thread_local` destructor un-parks itself in the
+// MIDDLE of whatever the scavenger is doing to its theaps. 7a's own stress case covers that
+// against the queue sweep (`mi_theap_collect`); this one covers it against the hole sweep,
+// which is a strictly longer walk (every page of every theap INCLUDING the full queue, plus
+// every abandoned page of every heap behind them) and therefore a strictly wider window.
+//
+// Two things make it that rather than a copy of the case above:
+//   * `purge_holes_min_interval` is set to 0 for its duration, so EVERY park gets a full hole
+//     sweep. At the default 100ms most of these parks are skipped before any work starts and
+//     the variant would mostly be testing the pacing.
+//   * its destructor both frees AND allocates. Only the slow paths carry the park-leave
+//     (`mi_free_generic_local` in `src/free.c`, `_mi_malloc_generic` in `src/page.c`); a
+//     destructor that only frees can stay on the fast path and never reach one.
+//
+// What must hold: `_mi_park_leave` does not return until the sweep has left MI_PARK_SWEEPING,
+// and the sweep reaches that state check quickly because every phase re-reads `park_reclaim`
+// (see the TEARDOWN section of `src/page-holes.c`). So the thread never tears its tld down
+// under a running sweep, and the sweep never touches a theap of a thread that has left.
+// ---------------------------------------------------------------------------
+
+// Bounded on the same signal as the three stress cases above -- `guard_every_alloc()`, not the
+// MI_GUARDED compile flag, for the reason spelled out with the FULL/BOUND counts near the top of
+// this file: MI_GUARDED is compiled into every MI_DEBUG build, but only `ctest-guarded`'s forced
+// `MIMALLOC_GUARDED_SAMPLE_RATE=1` pass actually guards every allocation. This case is the most
+// VMA-hungry of the four when it does -- its destructor allocates HOLE_EXIT_DTOR_N blocks a
+// SECOND time on each of THREADS threads, each its own guard-page mapping -- so it scales down
+// hardest there, while `ctest-debug-full` keeps the FULL counts and their discriminating power.
+#define HOLE_EXIT_THREADS_FULL   (12)
+#define HOLE_EXIT_ROUNDS_FULL    (60)
+#define HOLE_EXIT_DTOR_N_FULL    DTOR_BLOCKS
+
+#define HOLE_EXIT_THREADS_BOUND  (4)
+#define HOLE_EXIT_ROUNDS_BOUND   (10)
+#define HOLE_EXIT_DTOR_N_BOUND   (64)
+
+// The destructor and the thread body both need the block count, and the `calloc` length must
+// agree with the loop bound that walks it. Latched once in `test_exit_while_hole_swept_stress`
+// before the first `pthread_create` and never written again, so the threads only ever read it.
+static int hole_exit_dtor_n = HOLE_EXIT_DTOR_N_FULL;
+
+static atomic_int hole_exit_handoffs;
+
+static void dtor_frees_and_allocs(void* blocks_v) {
+  void** blocks = (void**)blocks_v;
+  if (blocks == NULL) return;
+  for (int i = 0; i < hole_exit_dtor_n; i++) { if (blocks[i] != NULL) { mi_free(blocks[i]); blocks[i] = NULL; } }
+  // ... and allocate again, on a thread that is parked and may be mid-sweep: this is the
+  // `_mi_malloc_generic` half of the park-leave, and it needs fresh pages (the frees above
+  // just emptied this thread's), so it really does take the slow path.
+  for (int i = 0; i < hole_exit_dtor_n; i++) {
+    blocks[i] = mi_malloc(24 + (size_t)(i % RACE_CLASSES) * 56);
+  }
+  for (int i = 0; i < hole_exit_dtor_n; i++) { if (blocks[i] != NULL) mi_free(blocks[i]); }
+  free(blocks);
+}
+
+static void* park_then_exit_racing_alloc_dtor(void* arg) {
+  const unsigned id = (unsigned)(uintptr_t)arg;
+  void** dblocks = (void**)calloc((size_t)hole_exit_dtor_n, sizeof(void*));
+  if (dblocks != NULL) {
+    for (int i = 0; i < hole_exit_dtor_n; i++) {
+      dblocks[i] = mi_malloc(16 + (size_t)(i % RACE_CLASSES) * 40);
+      if (dblocks[i] == NULL) break;
+    }
+    pthread_setspecific(dtor_key, dblocks);
+  }
+  // scattered survivors in every bin: the shape the hole sweep has the most work on
+  for (int c = 0; c < RACE_CLASSES; c++) {
+    const size_t sz = 16 + (size_t)c * 40;
+    void* keep = NULL;
+    for (int k = 0; k < RACE_PER_CLASS; k++) {
+      void* q = mi_malloc(sz);
+      if (q == NULL) break;
+      if (k == 0) { keep = q; } else { mi_free(q); }
+    }
+    (void)keep;   // deliberately leaked into this thread's teardown
+  }
+  void** p = (void**)calloc(LIVE, sizeof(void*));
+  if (p != NULL) { churn_pattern(p); free(p); }
+  if (mi_on_thread_idle_start()) { atomic_fetch_add(&hole_exit_handoffs, 1); }
+  // Three quarters exit 20-270us into the park, which lands the exit inside the scavenger's
+  // walk -- that is the race. But at that spacing the sweep bails on `park_reclaim` before it
+  // discards anything, so on its own this case can race a sweep that never does any work. Every
+  // fourth thread therefore stays parked long enough for a full hole sweep to complete, which
+  // is what the discard check below verifies actually happened.
+  if ((id % 4) == 3) { usleep(8000); } else { usleep(20 + (id * 13) % 250); }
+  pthread_exit(NULL);
+}
+
+static void test_exit_while_hole_swept_stress(void) {
+  enum { THREADS_MAX = HOLE_EXIT_THREADS_FULL };
+  const bool bound = guard_every_alloc();
+  const int THREADS = bound ? HOLE_EXIT_THREADS_BOUND : HOLE_EXIT_THREADS_FULL;
+  const int ROUNDS  = bound ? HOLE_EXIT_ROUNDS_BOUND  : HOLE_EXIT_ROUNDS_FULL;
+  hole_exit_dtor_n  = bound ? HOLE_EXIT_DTOR_N_BOUND  : HOLE_EXIT_DTOR_N_FULL;
+  const long saved = mi_option_get(mi_option_purge_holes_min_interval);
+  mi_option_set(mi_option_purge_holes_min_interval, 0);   // sweep on EVERY park: widest window
+  mi_purge_holes_stats_t before;
+  mi_purge_holes_stats_get(&before);
+
+  if (pthread_key_create(&dtor_key, &dtor_frees_and_allocs) != 0) {
+    mi_option_set(mi_option_purge_holes_min_interval, saved);
+    return;
+  }
+  for (int r = 0; r < ROUNDS; r++) {
+    pthread_t t[THREADS_MAX];
+    int made = 0;
+    for (int i = 0; i < THREADS; i++) {
+      if (pthread_create(&t[i], NULL, &park_then_exit_racing_alloc_dtor,
+                         (void*)(uintptr_t)(unsigned)(r * THREADS + i)) != 0) break;
+      made++;
+    }
+    for (int i = 0; i < made; i++) { pthread_join(t[i], NULL); }
+  }
+  pthread_key_delete(dtor_key);
+  mi_option_set(mi_option_purge_holes_min_interval, saved);
+
+  mi_purge_holes_stats_t after;
+  mi_purge_holes_stats_get(&after);
+  const int handoffs = atomic_load(&hole_exit_handoffs);
+  fprintf(stderr, "  hole-swept exit stress: %d parks handed off, %zu discards over the case\n",
+          handoffs, after.discard_calls - before.discard_calls);
+  check("exit while HOLE-swept, racing a destructor that allocates, is race-free", true);
+  // Otherwise the case ran but never actually raced a hole sweep. Gated on a handoff having
+  // happened at all: the `-no-scavenger` variant (`MIMALLOC_SCAVENGER=0`) has nothing to hand
+  // off to, so `mi_on_thread_idle_start` reports false everywhere and there is no sweep to race
+  // -- the threads still exit through the same allocating destructor, which is worth running,
+  // but the discard check has no subject.
+  check("... and the parks it raced really did discard holes",
+        !mi_option_is_enabled(mi_option_purge_holes) || handoffs == 0 ||
+        after.discard_calls > before.discard_calls);
+}
+
+// ---------------------------------------------------------------------------
 // Stopping the scavenger joins the thread: a park after it has nobody to hand off to and reports
 // false, and the process stays fully usable. Runs last, since it takes the scavenger away.
 // ---------------------------------------------------------------------------
@@ -715,8 +860,25 @@ int main(void) {
   test_park_then_exit();
   test_exit_while_swept_with_dyn_tls();
   test_exit_while_swept_stress();
+  test_exit_while_hole_swept_stress();   // #302 review: the same race against the HOLE sweep
   test_park_stress();
   test_scavenger_stop();
+  // #272 Phase 7b: the second clause of `mi_on_thread_idle`'s contract. Every case above churned
+  // pages with scattered survivors and then parked or idled, which is exactly the shape hole
+  // punching exists for -- so by now the idle path must have discarded real memory, not just
+  // completed passes. With the scavenger off (`MIMALLOC_SCAVENGER=0`) `mi_on_thread_idle`
+  // sweeps inline instead, so this holds in that variant too.
+  {
+    const size_t calls = hole_discard_calls();
+    const size_t bytes = hole_discarded_bytes();
+    fprintf(stderr, "  hole purging over the whole run: %zu discards, %zu bytes\n", calls, bytes);
+    if (mi_option_is_enabled(mi_option_purge_holes)) {
+      check("the idle handoff discarded hole memory (mi_purge_holes_stats_get)", calls > 0 && bytes > 0);
+    }
+    else {
+      check("purge_holes off: the idle handoff discarded nothing", calls == 0 && bytes == 0);
+    }
+  }
   fprintf(stderr, "\n%s\n", failures == 0 ? "all tests passed." : "SOME TESTS FAILED.");
   return failures == 0 ? 0 : 1;
 }

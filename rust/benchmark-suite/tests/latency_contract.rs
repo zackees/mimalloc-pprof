@@ -217,6 +217,7 @@ fn complete_raw_fixture() -> LatencyRawRun {
                 "tcmalloc" => 300,
                 "jemalloc" => 200,
                 "upstream-mimalloc" => 100,
+                "bun-mimalloc" => 50,
                 "mimalloc-pprof" => 0,
                 _ => unreachable!(),
             };

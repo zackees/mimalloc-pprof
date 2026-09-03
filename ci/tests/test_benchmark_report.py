@@ -6,6 +6,7 @@ from __future__ import annotations
 # ruff: noqa: I001
 
 import copy
+import gzip
 import json
 import math
 import re
@@ -15,6 +16,7 @@ import unittest
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 import benchmark_report as report
@@ -52,7 +54,7 @@ class BenchmarkReportTests(unittest.TestCase):
             and item.get("scenario_id") == "scenario-00"
             and item.get("thread_point") == "1"
         ]
-        self.assertEqual(15 * 4, len(templates))
+        self.assertEqual(15 * len(report.ALLOCATOR_IDS), len(templates))
         for scenario, point in report.MEMORY_CELLS:
             for template in templates:
                 child_value = copy.deepcopy(template)
@@ -67,6 +69,7 @@ class BenchmarkReportTests(unittest.TestCase):
                     "tcmalloc": 120,
                     "jemalloc": 110,
                     "upstream-mimalloc": 100,
+                    "bun-mimalloc": 95,
                     "mimalloc-pprof": 90,
                 }[allocator] + int(child_value["block_id"])
                 baseline = 100 * 1024 * 1024
@@ -575,6 +578,7 @@ class BenchmarkReportTests(unittest.TestCase):
             "tcmalloc": 120 * 1024 * 1024,
             "jemalloc": 110 * 1024 * 1024,
             "upstream-mimalloc": 100 * 1024 * 1024,
+            "bun-mimalloc": 95 * 1024 * 1024,
             "mimalloc-pprof": 90 * 1024 * 1024,
         }
         normalized = {
@@ -620,7 +624,7 @@ class BenchmarkReportTests(unittest.TestCase):
             for key, values in cells.items()
         }
         report.draw_ratio_bar_grid(canvas, normalized_cells)
-        # Cell 0 sits at (45, 85); bars start at x=59, allocator rows are 19 px
+        # Cell 0 sits at (45, 85); bars start at x=59, allocator rows are 15 px
         # apart, and the largest normalized value (1.2x) fills the 380 px bar
         # zone. The 1.0 reference line lands at 380 * 1.0/1.2 = 316 px.
         left, top = 45, 85
@@ -633,14 +637,14 @@ class BenchmarkReportTests(unittest.TestCase):
             return value[0], value[1], value[2]
 
         # tcmalloc (1.2x) fills the bar zone; its row is index 0.
-        self.assertEqual(report.COLORS[0], pixel(bar_left + 379, top + 10 + 5))
+        self.assertEqual(report.COLORS[0], pixel(bar_left + 379, top + 10 + 4))
         # upstream-mimalloc (1.0x) ends at 316 px; the reference line drawn on
         # top occupies that exact column.
-        self.assertEqual(report.COLORS[2], pixel(bar_left + 313, top + 10 + 2 * 19 + 5))
-        self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 2 * 19 + 5))
+        self.assertEqual(report.COLORS[2], pixel(bar_left + 313, top + 10 + 2 * 15 + 4))
+        self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 2 * 15 + 4))
         # mimalloc-pprof (0.9x) ends at 285 px; beyond it is background.
-        self.assertEqual(report.COLORS[3], pixel(bar_left + 284, top + 10 + 3 * 19 + 5))
-        self.assertEqual((235, 240, 246), pixel(bar_left + 286, top + 10 + 3 * 19 + 5))
+        self.assertEqual(report.COLORS[4], pixel(bar_left + 284, top + 10 + 4 * 15 + 4))
+        self.assertEqual((235, 240, 246), pixel(bar_left + 286, top + 10 + 4 * 15 + 4))
         # The reference line stays visible across the tcmalloc bar too.
         self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 5))
 
@@ -649,6 +653,7 @@ class BenchmarkReportTests(unittest.TestCase):
             "tcmalloc": 1.4,
             "jemalloc": 1.2,
             "upstream-mimalloc": 1.0,
+            "bun-mimalloc": 0.9,
             "mimalloc-pprof": 0.8,
         }
 
@@ -691,14 +696,14 @@ class BenchmarkReportTests(unittest.TestCase):
             value = canvas.pixels[offset : offset + 3]
             return value[0], value[1], value[2]
 
-        self.assertEqual(report.COLORS[0], pixel(bar_left + 379, top + 10 + 5))
+        self.assertEqual(report.COLORS[0], pixel(bar_left + 379, top + 10 + 4))
         # upstream-mimalloc (1.0) ends at 271 px; the reference line drawn on
         # top occupies that exact column.
-        self.assertEqual(report.COLORS[2], pixel(bar_left + 268, top + 10 + 2 * 19 + 5))
-        self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 2 * 19 + 5))
+        self.assertEqual(report.COLORS[2], pixel(bar_left + 268, top + 10 + 2 * 15 + 4))
+        self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 2 * 15 + 4))
         # mimalloc-pprof (0.8) ends at 217 px; beyond it is background.
-        self.assertEqual(report.COLORS[3], pixel(bar_left + 216, top + 10 + 3 * 19 + 5))
-        self.assertEqual((235, 240, 246), pixel(bar_left + 218, top + 10 + 3 * 19 + 5))
+        self.assertEqual(report.COLORS[4], pixel(bar_left + 216, top + 10 + 4 * 15 + 4))
+        self.assertEqual((235, 240, 246), pixel(bar_left + 218, top + 10 + 4 * 15 + 4))
 
     def test_memory_section_sits_next_to_throughput(self) -> None:
         latest = self.with_complete_memory(self.load_latest())
@@ -815,12 +820,14 @@ class BenchmarkReportTests(unittest.TestCase):
                 "tcmalloc": 1.6,
                 "jemalloc": 1.4,
                 "upstream-mimalloc": 1.2,
+                "bun-mimalloc": 1.1,
                 "mimalloc-pprof": 1.0,
             },
             ("scenario-01", "2"): {
                 "tcmalloc": 2.0,
                 "jemalloc": 1.8,
                 "upstream-mimalloc": 1.6,
+                "bun-mimalloc": 1.4,
                 "mimalloc-pprof": 1.2,
             },
         }
@@ -829,12 +836,14 @@ class BenchmarkReportTests(unittest.TestCase):
                 "tcmalloc": 3.0e8,
                 "jemalloc": 3.5e8,
                 "upstream-mimalloc": 4.0e8,
+                "bun-mimalloc": 4.2e8,
                 "mimalloc-pprof": 4.5e8,
             },
             ("scenario-01", "2"): {
                 "tcmalloc": 5.0e8,
                 "jemalloc": 5.5e8,
                 "upstream-mimalloc": 6.0e8,
+                "bun-mimalloc": 6.2e8,
                 "mimalloc-pprof": 6.5e8,
             },
         }
@@ -885,7 +894,7 @@ class BenchmarkReportTests(unittest.TestCase):
             "absolute_summaries": core_records,
         }
         points = report.pareto_points(memory_only, latest)
-        self.assertEqual(2 * 4, len(points))
+        self.assertEqual(2 * len(report.ALLOCATOR_IDS), len(points))
         canvas = report.Canvas(report.PARETO_WIDTH, report.PARETO_HEIGHT, (248, 250, 252))
         report.draw_pareto(canvas, points)
         x_max, y_max = report.pareto_scale(points)
@@ -1382,7 +1391,7 @@ class BenchmarkReportTests(unittest.TestCase):
                 "aggregation": "median with min/max",
                 "operation_stream": "seeded random operation stream",
                 "seed_chain": "splitmix64 chain over (run seed, pattern, threads, block, worker)",
-                "pairing": "one stream replayed by all four allocators",
+                "pairing": "one stream replayed by all five allocators",
                 "work_normalization": "frozen per-worker operation count",
                 "oversubscription": "literal worker counts; oversubscribed points labeled",
                 "cross_thread_backpressure": "bounded mailbox with producer self-free fallback",
@@ -1502,7 +1511,10 @@ class BenchmarkReportTests(unittest.TestCase):
         summaries = scaling["cell_summaries"]
         assert isinstance(summaries, list)
         summaries.pop()
-        with self.assertRaisesRegex(report.ReportError, "96 cells"):
+        with self.assertRaisesRegex(
+            report.ReportError,
+            f"{len(report.SCALING_PATTERN_IDS) * len(report.SCALING_THREAD_POINTS) * len(report.ALLOCATOR_IDS)} cells",
+        ):
             report.validate_latest(truncated, "truncated")
 
         mispinned = copy.deepcopy(latest)
@@ -1569,7 +1581,11 @@ class BenchmarkReportTests(unittest.TestCase):
         # ceiling is the largest median across all cells with 12% headroom,
         # and the x axis is log2. Circles must land at the exact computed
         # coordinates on the right-hand RSS panel.
-        rss_peak = (32 + 4 * report.SCALING_THREAD_POINTS[-1] + 3) * 1024 * 1024
+        rss_peak = (
+            (32 + 4 * report.SCALING_THREAD_POINTS[-1] + len(report.ALLOCATOR_IDS) - 1)
+            * 1024
+            * 1024
+        )
         ceiling = rss_peak * 1.12
         plot_height = report.SCALING_HEIGHT - report.SCALING_TOP - report.SCALING_BOTTOM
         for allocator_index in range(len(report.ALLOCATOR_IDS)):
@@ -1736,6 +1752,137 @@ class BenchmarkReportTests(unittest.TestCase):
         )
         megabyte_unit = report.axis_unit(5_000_000.0)
         self.assertEqual("5.0M", report.format_throughput(5_000_000.0, megabyte_unit))
+
+
+class LegacyAllocatorLineageTests(unittest.TestCase):
+    """The published branch carries artifacts recorded before the Bun row landed
+    (#325). They must keep validating, carrying forward, and rendering: a lineage
+    that stops parsing is a lineage that has been silently rewritten.
+
+    The fixtures here are this suite's own pre-#325 synthetic envelope and
+    history row -- the same shape the branch holds, not a copy of production
+    data. `latest.json.gz` is stored compressed: it is 2.4 MB of synthetic
+    samples that would otherwise dominate the repository's fixture bytes."""
+
+    LEGACY = FIXTURE / "legacy"
+
+    def load_legacy_latest(self) -> dict[str, object]:
+        with gzip.open(self.LEGACY / "latest.json.gz", "rt", encoding="utf-8") as source:
+            return json.loads(source.read())
+
+    def legacy_with_optional_sections(self) -> dict[str, object]:
+        """The pre-#325 envelope with complete memory/latency/scaling sections,
+        built against the four-allocator set those runs actually measured."""
+
+        helper = BenchmarkReportTests("test_memory_section_sits_next_to_throughput")
+        with mock.patch.object(report, "ALLOCATOR_IDS", report.LEGACY_ALLOCATOR_IDS):
+            legacy = self.load_legacy_latest()
+            legacy = helper.with_complete_memory(legacy)
+            legacy = helper.with_complete_latency(legacy)
+            return helper.with_complete_scaling(legacy)
+
+    def test_the_current_allocator_set_is_the_newest_accepted_lineage(self) -> None:
+        self.assertEqual(report.ALLOCATOR_IDS, report.ALLOCATOR_ID_LINEAGES[-1])
+        self.assertIn(report.LEGACY_ALLOCATOR_IDS, report.ALLOCATOR_ID_LINEAGES)
+        self.assertNotIn("bun-mimalloc", report.LEGACY_ALLOCATOR_IDS)
+
+    def test_an_unknown_allocator_set_is_still_rejected(self) -> None:
+        with self.assertRaises(report.ReportError):
+            report.declared_allocators(["tcmalloc", "jemalloc"], "truncated")
+        with self.assertRaises(report.ReportError):
+            report.declared_allocator_order(list(reversed(report.ALLOCATOR_IDS)), "out of order")
+
+    def test_a_four_allocator_history_row_still_validates(self) -> None:
+        row = json.loads((self.LEGACY / "history.jsonl").read_text(encoding="utf-8"))
+        identities = row["allocator_identities"]
+        assert isinstance(identities, list)
+        self.assertEqual(
+            list(report.LEGACY_ALLOCATOR_IDS),
+            [item["allocator_id"] for item in identities],
+        )
+        report.validate_history_row(row, "legacy history")
+
+    def test_a_four_allocator_latest_still_validates(self) -> None:
+        report.validate_latest(self.legacy_with_optional_sections(), "legacy latest")
+
+    def test_sections_measured_before_the_bun_row_carry_onto_a_five_row_latest(self) -> None:
+        current = json.loads((FIXTURE / "latest.json").read_text(encoding="utf-8"))
+        self.assertNotIn("memory", current)
+        self.assertTrue(
+            report.carry_forward_optional_metrics(current, self.legacy_with_optional_sections())
+        )
+        # The core run is five rows, the carried sections are four; the envelope
+        # must still validate and render rather than going red on the first run
+        # after a new allocator lands.
+        report.validate_latest(current, "mixed latest")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            source.write_text(json.dumps(current) + "\n", encoding="utf-8", newline="\n")
+            site = root / "site"
+            report.render(source, self.LEGACY / "history.jsonl", site, root / "digest", False)
+            self.assertTrue((site / "index.html").is_file())
+            self.assertTrue((site / "benchmark-rss-timeline.png").is_file())
+
+    def test_a_weekly_section_survives_the_fork_moving_under_it(self) -> None:
+        """`benchmark-stats` is daily and memory/latency are weekly, so the core
+        run routinely rebuilds mimalloc-pprof from a newer commit than the
+        section being carried onto it. Comparing the fork's own sha there held
+        the production workflow red for eight consecutive days from 2026-08-27
+        (run 33761935520); only the lock-pinned competitors are comparable."""
+
+        helper = BenchmarkReportTests("test_memory_section_sits_next_to_throughput")
+        latest = helper.with_complete_latency(helper.with_complete_memory(helper.load_latest()))
+        report.validate_latest(latest, "same-day latest")
+
+        moved_fork = copy.deepcopy(latest)
+        for item in cast(list[dict[str, object]], moved_fork["allocators"]):
+            if item["allocator_id"] == "mimalloc-pprof":
+                item["source_sha"] = "9" * 40
+        report.validate_latest(moved_fork, "fork rebuilt since the weekly run")
+
+        moved_competitor = copy.deepcopy(latest)
+        for item in cast(list[dict[str, object]], moved_competitor["allocators"]):
+            if item["allocator_id"] == "upstream-mimalloc":
+                item["source_sha"] = "f" * 40
+        with self.assertRaisesRegex(report.ReportError, "allocator source pins"):
+            report.validate_latest(moved_competitor, "competitor pin moved")
+
+    def test_render_rejects_a_core_envelope_recorded_under_the_older_set(self) -> None:
+        """Lineage tolerance is for artifacts that were already published, never
+        for one being produced now: a producer that silently dropped a row must
+        not be able to publish."""
+
+        legacy = self.legacy_with_optional_sections()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            source.write_text(json.dumps(legacy) + "\n", encoding="utf-8", newline="\n")
+            with self.assertRaisesRegex(report.ReportError, "current allocator set"):
+                report.render(
+                    source, self.LEGACY / "history.jsonl", root / "site", root / "digest", False
+                )
+
+    def test_a_carried_section_may_not_carry_a_different_pin(self) -> None:
+        """Tolerating a missing row must not tolerate a moved one: if the core
+        run rebuilt a competitor from another commit, its carried-forward memory
+        numbers no longer describe that build."""
+
+        current = json.loads((FIXTURE / "latest.json").read_text(encoding="utf-8"))
+        self.assertTrue(
+            report.carry_forward_optional_metrics(current, self.legacy_with_optional_sections())
+        )
+        report.validate_latest(current, "mixed latest")
+        allocators = current["allocators"]
+        assert isinstance(allocators, list)
+        moved = next(
+            item
+            for item in allocators
+            if isinstance(item, dict) and item["allocator_id"] == "upstream-mimalloc"
+        )
+        moved["source_sha"] = "f" * 40
+        with self.assertRaisesRegex(report.ReportError, "allocator source pins"):
+            report.validate_latest(current, "moved competitor pin")
 
 
 if __name__ == "__main__":

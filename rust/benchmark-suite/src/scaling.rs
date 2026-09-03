@@ -4,7 +4,7 @@
 //! a deterministic pseudo-random operation stream: the planner draws each
 //! operation, size, and slot from a splitmix64 chain that depends only on
 //! (run seed, pattern, thread count, block, worker). It never depends on the
-//! allocator, so the same worker replays the identical stream for all four
+//! allocator, so the same worker replays the identical stream for all five
 //! allocators inside one paired block.
 //!
 //! This protocol is explicitly a coverage-mode downgrade of the dense scaling
@@ -60,10 +60,11 @@ pub const SCALING_RIGOR_LABEL: &str = "coverage mode - reduced statistical rigor
 pub const SCALING_MIN_BLOCK_NS: u64 = 400_000_000;
 pub const SCALING_MAX_BLOCK_NS: u64 = 1_500_000_000;
 pub const SCALING_TARGET_BLOCK_NS: u64 = 750_000_000;
-const ALLOCATOR_IDS: [&str; 4] = [
+const ALLOCATOR_IDS: [&str; 5] = [
     "tcmalloc",
     "jemalloc",
     "upstream-mimalloc",
+    "bun-mimalloc",
     "mimalloc-pprof",
 ];
 const SEED_DOMAIN: u64 = 0x5343_414c_494e_4721;
@@ -609,7 +610,7 @@ impl ScalingChildRequest {
             return Err("scaling child request uses an undeclared thread count".into());
         }
         if self.operations_per_worker == 0
-            || self.ordinal >= 4
+            || self.ordinal >= ALLOCATOR_IDS.len() as u8
             || self.run_seed == 0
             || self.reproduction_command.is_empty()
         {
@@ -660,7 +661,7 @@ impl ScalingChildResponse {
 
     /// Same contract with the plan supplied by the caller. The plan is
     /// allocator-independent, so a controller running one paired block derives
-    /// it once instead of four times; replaying it per child would put the
+    /// it once instead of five times; replaying it per child would put the
     /// harness's own cost on the same order as the workload.
     pub fn validate_against_expected(
         &self,
@@ -1441,8 +1442,8 @@ pub fn methodology() -> ScalingMethodology {
         blocks_per_cell: SCALING_BLOCKS,
         aggregation: "median of per-block aggregate throughput, with min and max across the same blocks".into(),
         operation_stream: "seeded random operation stream; each operation, size, and slot is drawn from a splitmix64 stream that never observes allocator behavior".into(),
-        seed_chain: "splitmix64 chain over (run seed, pattern tag, thread count, block, worker); the allocator is deliberately absent so all four allocators replay one stream".into(),
-        pairing: "all four allocators run the same frozen per-worker operation count and the same stream inside one block, in a rotated near-balanced order".into(),
+        seed_chain: "splitmix64 chain over (run seed, pattern tag, thread count, block, worker); the allocator is deliberately absent so all five allocators replay one stream".into(),
+        pairing: "all five allocators run the same frozen per-worker operation count and the same stream inside one block, in a rotated near-balanced order".into(),
         work_normalization: "operations per worker are calibrated once per (pattern, thread point) against upstream-mimalloc and frozen across allocators; total work scales with worker count".into(),
         oversubscription: format!(
             "thread points are literal worker counts {}; points above the allowed logical CPU count are labeled oversubscribed and describe contention, not core scaling",
@@ -1488,7 +1489,7 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
             .collect::<BTreeSet<_>>()
             != ALLOCATOR_IDS.into_iter().collect::<BTreeSet<_>>()
     {
-        return Err("scaling raw run does not carry the four locked allocators".into());
+        return Err("scaling raw run does not carry the five locked allocators".into());
     }
     if raw.topology.allowed_logical_cpus == 0
         || raw.topology.physical_cores == 0
@@ -1541,7 +1542,7 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
         }
         if !ALLOCATOR_IDS.contains(&sample.allocator_id.as_str())
             || sample.metric_schema_version != SCALING_SCHEMA_VERSION
-            || sample.ordinal >= 4
+            || sample.ordinal >= ALLOCATOR_IDS.len() as u8
             || sample.reproduction_command.is_empty()
             || !is_lower_hex(&sample.allocator_source_sha, 40)
             || !is_lower_hex(&sample.child_binary_sha256, 64)
@@ -1565,7 +1566,7 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
         }
         // Re-derive the whole plan from the seed chain and compare every count.
         // The plan is allocator-independent, so it is derived once per
-        // (pattern, thread point, block) and reused across that block's four
+        // (pattern, thread point, block) and reused across that block's five
         // allocators rather than replayed 4x.
         let plan_key = (
             sample.pattern.clone(),
@@ -1642,7 +1643,7 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
     for (key, seen) in &ordinals {
         if seen.len() != ALLOCATOR_IDS.len() {
             return Err(format!(
-                "scaling block {key:?} is not a complete paired block of four allocators"
+                "scaling block {key:?} is not a complete paired block of five allocators"
             ));
         }
     }
@@ -1962,7 +1963,10 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                 compiler: format!("fixture-compiler-{index}"),
                 linker: format!("fixture-linker-{index}"),
                 static_library_sha256: crate::validate::repeated_hex((b'5' + index as u8) as char, 64),
-                child_binary_sha256: crate::validate::repeated_hex(['9', 'a', 'b', 'c'][index], 64),
+                child_binary_sha256: crate::validate::repeated_hex(
+                    ['9', 'a', 'b', 'c', 'd'][index],
+                    64,
+                ),
                 options: crate::validate::expected_options(&pin.id),
             }
         })
@@ -1998,6 +2002,7 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                     // renderer with separable lines and a realistic knee.
                     let allocator_scale = match allocator {
                         "mimalloc-pprof" => 96,
+                        "bun-mimalloc" => 98,
                         "upstream-mimalloc" => 100,
                         "tcmalloc" => 109,
                         _ => 118,
@@ -2082,7 +2087,8 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
 /// match the core run exactly: they are the comparison baseline, and a
 /// competitor built from a different commit would silently change what the
 /// chart means.
-pub const LOCK_PINNED_ALLOCATORS: [&str; 3] = ["tcmalloc", "jemalloc", "upstream-mimalloc"];
+pub const LOCK_PINNED_ALLOCATORS: [&str; 4] =
+    ["tcmalloc", "jemalloc", "upstream-mimalloc", "bun-mimalloc"];
 
 pub fn attach_scaling_report(
     latest: &mut LatestReport,

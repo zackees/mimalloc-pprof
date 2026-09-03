@@ -12,9 +12,9 @@
     "run": { "$ref": "raw-run-v1.schema.json#/$defs/run" },
     "comparison_key": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "runner": { "$ref": "raw-run-v1.schema.json#/$defs/runner" },
-    "allocator_identities": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/allocatorIdentity" } },
-    "absolute_summaries": { "type": "array", "minItems": 120, "items": { "$ref": "latest-v1.schema.json#/$defs/absoluteCell" } },
-    "paired_summaries": { "type": "array", "minItems": 90, "items": { "$ref": "latest-v1.schema.json#/$defs/pairedCell" } },
+    "allocator_identities": { "$comment": "Five identities is the current contract and what the producer emits. Rows published before the Bun row landed (#325) carry four; ci/benchmark_report.py accepts them via ALLOCATOR_ID_LINEAGES, which lists every allocator set a published artifact may declare, so an older lineage keeps parsing and rendering. This schema describes what is produced now, not everything the branch holds.", "type": "array", "minItems": 5, "maxItems": 5, "items": { "$ref": "#/$defs/allocatorIdentity" } },
+    "absolute_summaries": { "type": "array", "minItems": 150, "items": { "$ref": "latest-v1.schema.json#/$defs/absoluteCell" } },
+    "paired_summaries": { "type": "array", "minItems": 120, "items": { "$ref": "latest-v1.schema.json#/$defs/pairedCell" } },
     "memory": { "$ref": "memory-v1.schema.json#/$defs/history" },
     "latency": { "$ref": "latency-v1.schema.json#/$defs/history" }
   },
@@ -24,7 +24,7 @@
       "additionalProperties": false,
       "required": ["allocator_id", "allocator_version", "source_sha", "library_sha256", "child_binary_sha256"],
       "properties": {
-        "allocator_id": { "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof"] },
+        "allocator_id": { "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "bun-mimalloc", "mimalloc-pprof"] },
         "allocator_version": { "type": "string", "minLength": 1 },
         "source_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
         "library_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },

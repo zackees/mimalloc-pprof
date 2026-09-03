@@ -16,7 +16,9 @@ use crate::latency::{
 use crate::model::{
     BenchmarkChildRequest, CellCalibration, RunnerMetadata, CHILD_PROTOCOL_VERSION,
 };
-use crate::orchestration::{balanced_block_orders, calibrate_cell, run_child_sample};
+use crate::orchestration::{
+    balanced_block_orders, calibrate_cell, run_child_sample, ALLOCATOR_IDS,
+};
 use crate::provenance::ProducerProvenance;
 use crate::runner::{
     children_from_provenance, collect_publication_runner, collect_run_identity, create_new_writer,
@@ -153,7 +155,8 @@ fn run(options: Options) -> Result<(), String> {
     let mut block_wall = Duration::ZERO;
     let mut calibrations = Vec::with_capacity(cells.len());
     let mut denominators = BTreeMap::new();
-    let mut samples = Vec::with_capacity(cells.len() * options.blocks as usize * 4);
+    let mut samples =
+        Vec::with_capacity(cells.len() * options.blocks as usize * ALLOCATOR_IDS.len());
     for (card_id, thread_point, definition) in cells {
         let mut template = BenchmarkChildRequest {
             protocol_version: CHILD_PROTOCOL_VERSION.into(),
@@ -299,7 +302,7 @@ fn run(options: Options) -> Result<(), String> {
             &mut diagnostics,
             &json!({
                 "event": "latency-cell-complete", "cell": cell_key, "sample_denominator": denominator,
-                "transactions_per_worker": realized.transactions_per_worker, "raw_pairs": options.blocks * 4,
+                "transactions_per_worker": realized.transactions_per_worker, "raw_pairs": options.blocks * ALLOCATOR_IDS.len() as u32,
             }),
         )?;
     }

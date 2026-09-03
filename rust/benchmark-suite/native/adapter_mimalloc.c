@@ -5,10 +5,10 @@
 #include "mimalloc.h"
 
 /*
-  The same source builds both mimalloc children.  build.rs supplies string
-  literals for the lockfile ID (upstream-mimalloc or mimalloc-pprof) and source
-  identity, making a stale/wrong adapter build fail at compile time instead of
-  silently changing a measurement's identity.
+  The same source builds every mimalloc child.  build.rs supplies string
+  literals for the lockfile ID (upstream-mimalloc, bun-mimalloc or
+  mimalloc-pprof) and source identity, making a stale/wrong adapter build fail
+  at compile time instead of silently changing a measurement's identity.
 */
 #ifndef BENCH_ALLOCATOR_ID
 #error "BENCH_ALLOCATOR_ID must be a string literal supplied by the benchmark build"

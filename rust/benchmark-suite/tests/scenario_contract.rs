@@ -85,6 +85,7 @@ fn allocator_identity_cannot_change_a_request_stream() {
         "tcmalloc",
         "jemalloc",
         "upstream-mimalloc",
+        "bun-mimalloc",
         "mimalloc-pprof",
     ] {
         assert_eq!(cell.streams().unwrap(), baseline);

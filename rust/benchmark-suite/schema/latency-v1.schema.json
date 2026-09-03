@@ -7,7 +7,7 @@
   "allOf": [
     {
       "if": { "properties": { "status": { "const": "complete" } }, "required": ["status"] },
-      "then": { "properties": { "samples": { "minItems": 300 } } }
+      "then": { "properties": { "samples": { "minItems": 375 } } }
     }
   ],
   "required": ["metric_schema_version", "status", "run_seed", "run", "runner", "allocator_lock_sha256", "allocators", "calibrations", "sampling_denominators", "samples"],
@@ -18,10 +18,10 @@
     "run": { "$ref": "raw-run-v1.schema.json#/$defs/run" },
     "runner": { "$ref": "raw-run-v1.schema.json#/$defs/runner" },
     "allocator_lock_sha256": { "$ref": "raw-run-v1.schema.json#/$defs/sha256" },
-    "allocators": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "raw-run-v1.schema.json#/$defs/allocator" } },
+    "allocators": { "type": "array", "minItems": 5, "maxItems": 5, "items": { "$ref": "raw-run-v1.schema.json#/$defs/allocator" } },
     "calibrations": { "type": "array", "minItems": 5, "maxItems": 5, "items": { "$ref": "raw-run-v1.schema.json#/$defs/calibration" } },
     "sampling_denominators": { "$ref": "#/$defs/samplingDenominators" },
-    "samples": { "type": "array", "minItems": 20, "items": { "$ref": "#/$defs/sample" } }
+    "samples": { "type": "array", "minItems": 25, "items": { "$ref": "#/$defs/sample" } }
   },
   "$defs": {
     "nonempty": { "type": "string", "minLength": 1 },
@@ -64,7 +64,7 @@
       "required": ["metric_schema_version", "block_id", "ordinal", "workload_seed", "allocator_id", "allocator_source_sha", "child_binary_sha256", "scenario_id", "thread_point", "thread_count", "sample_denominator", "transaction_definition", "measured", "control"],
       "properties": {
         "metric_schema_version": { "const": "transaction-latency-v1" }, "block_id": { "type": "integer", "minimum": 0 }, "ordinal": { "type": "integer", "minimum": 0, "maximum": 3 }, "workload_seed": { "type": "integer", "minimum": 1 },
-        "allocator_id": { "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof"] }, "allocator_source_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" }, "child_binary_sha256": { "$ref": "#/$defs/sha256" },
+        "allocator_id": { "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "bun-mimalloc", "mimalloc-pprof"] }, "allocator_source_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" }, "child_binary_sha256": { "$ref": "#/$defs/sha256" },
         "scenario_id": { "enum": ["tiny-fixed-64", "small-log-mixed", "cross-thread-producer-consumer", "large-objects"] }, "thread_point": { "enum": ["1", "physical-core"] }, "thread_count": { "type": "integer", "minimum": 1 },
         "sample_denominator": { "type": "integer", "minimum": 1, "maximum": 1024 }, "transaction_definition": { "$ref": "#/$defs/nonempty" }, "measured": { "$ref": "#/$defs/child" }, "control": { "$ref": "#/$defs/child" }
       }
@@ -113,7 +113,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["allocator_id", "scenario_id", "thread_point", "transaction_definition", "measured", "control", "overhead_valid"],
       "properties": {
-        "allocator_id": { "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof"] },
+        "allocator_id": { "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "bun-mimalloc", "mimalloc-pprof"] },
         "scenario_id": { "enum": ["tiny-fixed-64", "small-log-mixed", "cross-thread-producer-consumer", "large-objects"] },
         "thread_point": { "enum": ["1", "physical-core"] },
         "transaction_definition": { "$ref": "#/$defs/nonempty" },
@@ -127,7 +127,7 @@
       "required": ["block_id", "allocator_id", "scenario_id", "thread_point", "measured", "control"],
       "properties": {
         "block_id": { "type": "integer", "minimum": 0 },
-        "allocator_id": { "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof"] },
+        "allocator_id": { "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "bun-mimalloc", "mimalloc-pprof"] },
         "scenario_id": { "enum": ["tiny-fixed-64", "small-log-mixed", "cross-thread-producer-consumer", "large-objects"] },
         "thread_point": { "enum": ["1", "physical-core"] },
         "measured": { "$ref": "#/$defs/distribution" },
@@ -157,7 +157,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["candidate_id", "reference_id", "direction", "block_count", "effect", "confidence_interval", "bootstrap", "informational"],
       "properties": {
-        "candidate_id": { "enum": ["tcmalloc", "jemalloc", "mimalloc-pprof"] },
+        "candidate_id": { "enum": ["tcmalloc", "jemalloc", "bun-mimalloc", "mimalloc-pprof"] },
         "reference_id": { "const": "upstream-mimalloc" },
         "direction": { "const": "lower-is-better" },
         "block_count": { "type": "integer", "minimum": 15 },
@@ -184,10 +184,10 @@
         "metric_schema_version": { "const": "transaction-latency-v1" }, "status": { "const": "complete" }, "invalid_reason": { "type": "null" }, "metric_comparison_key": { "$ref": "#/$defs/sha256" },
         "run": { "$ref": "raw-run-v1.schema.json#/$defs/run" }, "runner": { "$ref": "raw-run-v1.schema.json#/$defs/runner" }, "direction": { "const": "lower-is-better" }, "informational": { "const": true },
         "sampling_denominators": { "$ref": "#/$defs/samplingDenominators" }, "methodology": { "$ref": "#/$defs/methodology" },
-        "absolute_summaries": { "type": "array", "minItems": 20, "maxItems": 20, "items": { "$ref": "#/$defs/absoluteSummary" } },
-        "paired_summaries": { "type": "array", "minItems": 45, "maxItems": 45, "items": { "$ref": "#/$defs/pairedSummary" } },
-        "block_summaries": { "type": "array", "minItems": 300, "items": { "$ref": "#/$defs/blockSummary" } },
-        "raw_samples": { "type": "array", "minItems": 300, "items": { "$ref": "#/$defs/sample" } }
+        "absolute_summaries": { "type": "array", "minItems": 25, "maxItems": 25, "items": { "$ref": "#/$defs/absoluteSummary" } },
+        "paired_summaries": { "type": "array", "minItems": 60, "maxItems": 60, "items": { "$ref": "#/$defs/pairedSummary" } },
+        "block_summaries": { "type": "array", "minItems": 375, "items": { "$ref": "#/$defs/blockSummary" } },
+        "raw_samples": { "type": "array", "minItems": 375, "items": { "$ref": "#/$defs/sample" } }
       }
     },
     "history": {
@@ -197,9 +197,9 @@
         "metric_schema_version": { "const": "transaction-latency-v1" }, "status": { "const": "complete" }, "metric_comparison_key": { "$ref": "#/$defs/sha256" }, "run": { "$ref": "raw-run-v1.schema.json#/$defs/run" }, "runner_fingerprint_sha256": { "$ref": "#/$defs/sha256" },
         "direction": { "const": "lower-is-better" }, "informational": { "const": true },
         "sampling_denominators": { "$ref": "#/$defs/samplingDenominators" }, "methodology": { "$ref": "#/$defs/methodology" },
-        "absolute_summaries": { "type": "array", "minItems": 20, "maxItems": 20, "items": { "$ref": "#/$defs/absoluteSummary" } },
-        "paired_summaries": { "type": "array", "minItems": 45, "maxItems": 45, "items": { "$ref": "#/$defs/pairedSummary" } },
-        "block_summaries": { "type": "array", "minItems": 300, "items": { "$ref": "#/$defs/blockSummary" } }
+        "absolute_summaries": { "type": "array", "minItems": 25, "maxItems": 25, "items": { "$ref": "#/$defs/absoluteSummary" } },
+        "paired_summaries": { "type": "array", "minItems": 60, "maxItems": 60, "items": { "$ref": "#/$defs/pairedSummary" } },
+        "block_summaries": { "type": "array", "minItems": 375, "items": { "$ref": "#/$defs/blockSummary" } }
       }
     }
   }

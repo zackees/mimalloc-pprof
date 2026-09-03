@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::config::AllocatorLock;
-use crate::orchestration::balanced_block_orders;
+use crate::orchestration::{balanced_block_orders, ALLOCATOR_IDS};
 use crate::provenance::ProducerProvenance;
 use crate::runner::{
     children_from_provenance, collect_publication_runner, collect_run_identity, create_new_writer,
@@ -85,8 +85,8 @@ fn record_invalid_run(output_dir: &std::path::Path, reason: &str) -> Result<(), 
 }
 
 /// Calibrate one (pattern, thread point) against upstream-mimalloc only. The
-/// resulting per-worker operation count is frozen across all four allocators,
-/// which is what keeps the four lines on one facet comparable.
+/// resulting per-worker operation count is frozen across all five allocators,
+/// which is what keeps the five lines on one facet comparable.
 fn calibrate(
     child: &crate::orchestration::ChildProgram,
     template: &ScalingChildRequest,
@@ -236,7 +236,7 @@ fn run(options: Options) -> Result<(), String> {
             let started = Instant::now();
             for order in balanced_block_orders(options.blocks, options.run_seed)? {
                 // The plan is allocator-independent, so derive it once per
-                // block and reuse it for all four children. Replaying it per
+                // block and reuse it for all five children. Replaying it per
                 // child would cost as much as the measurement itself.
                 let plan = simulate_cell(
                     pattern,
@@ -297,7 +297,7 @@ fn run(options: Options) -> Result<(), String> {
                     "event": "scaling-cell-complete", "cell": cell_key,
                     "operations_per_worker": operations_per_worker,
                     "calibrated_elapsed_ns": probe.elapsed_ns,
-                    "samples": options.blocks * 4,
+                    "samples": options.blocks * ALLOCATOR_IDS.len() as u32,
                 }),
             )?;
         }

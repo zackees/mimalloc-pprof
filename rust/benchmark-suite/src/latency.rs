@@ -31,10 +31,11 @@ pub const LATENCY_MIN_SAMPLES: usize = 10_000;
 pub const LATENCY_INITIAL_SAMPLE_DENOMINATOR: u64 = 1024;
 pub const LATENCY_BOOTSTRAP_RESAMPLES: u32 = 10_000;
 const REFERENCE_ALLOCATOR: &str = "upstream-mimalloc";
-const ALLOCATOR_IDS: [&str; 4] = [
+const ALLOCATOR_IDS: [&str; 5] = [
     "tcmalloc",
     "jemalloc",
     "upstream-mimalloc",
+    "bun-mimalloc",
     "mimalloc-pprof",
 ];
 
@@ -848,7 +849,7 @@ pub fn validate_latency_raw_run(raw: &LatencyRawRun) -> Result<(), String> {
     let mut common_clock: Option<LatencyClock> = None;
     for sample in &raw.samples {
         if sample.metric_schema_version != LATENCY_SCHEMA_VERSION
-            || sample.ordinal >= 4
+            || sample.ordinal >= ALLOCATOR_IDS.len() as u8
             || sample.workload_seed == 0
         {
             return Err("latency sample has invalid identity".into());
@@ -1104,9 +1105,9 @@ pub fn validate_latency_raw_run(raw: &LatencyRawRun) -> Result<(), String> {
                     .iter()
                     .map(|sample| sample.ordinal)
                     .collect::<BTreeSet<_>>()
-                    != (0_u8..4).collect()
+                    != (0_u8..ALLOCATOR_IDS.len() as u8).collect()
             {
-                return Err("latency block is not an exact four-allocator permutation".into());
+                return Err("latency block is not an exact five-allocator permutation".into());
             }
         }
     }
@@ -1331,7 +1332,7 @@ pub fn validate_latency_report(report: &LatencyMetricReport) -> Result<(), Strin
         if sample.metric_schema_version != LATENCY_SCHEMA_VERSION
             || !expected_cells.contains(&key)
             || !ALLOCATOR_IDS.contains(&sample.allocator_id.as_str())
-            || sample.ordinal >= 4
+            || sample.ordinal >= ALLOCATOR_IDS.len() as u8
             || sample.workload_seed == 0
             || report.sampling_denominators.get(&key) != Some(&sample.sample_denominator)
             || sample.measured.protocol_version != LATENCY_CHILD_PROTOCOL_VERSION
@@ -1403,7 +1404,7 @@ pub fn validate_latency_report(report: &LatencyMetricReport) -> Result<(), Strin
                     .iter()
                     .map(|value| value.ordinal)
                     .collect::<BTreeSet<_>>()
-                    != (0_u8..4).collect()
+                    != (0_u8..ALLOCATOR_IDS.len() as u8).collect()
                 || block
                     .iter()
                     .map(|value| value.workload_seed)

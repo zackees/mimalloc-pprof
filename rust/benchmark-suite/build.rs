@@ -124,6 +124,7 @@ fn validate_identity(id: &str, version: &str, source_sha: &str, library_sha: &st
         "tcmalloc",
         "jemalloc",
         "upstream-mimalloc",
+        "bun-mimalloc",
         "mimalloc-pprof",
     ];
     if !IDS.contains(&id) {
@@ -247,7 +248,9 @@ fn compile_adapter(id: &str, version: &str, includes: &[PathBuf]) -> PathBuf {
     let (source_name, compiler_var, compiler_default, cxx) = match id {
         "tcmalloc" => ("adapter_tcmalloc.cc", "CXX", "c++", true),
         "jemalloc" => ("adapter_jemalloc.c", "CC", "cc", false),
-        "upstream-mimalloc" | "mimalloc-pprof" => ("adapter_mimalloc.c", "CC", "cc", false),
+        "upstream-mimalloc" | "bun-mimalloc" | "mimalloc-pprof" => {
+            ("adapter_mimalloc.c", "CC", "cc", false)
+        }
         _ => unreachable!(),
     };
     let source = manifest_dir.join("native").join(source_name);

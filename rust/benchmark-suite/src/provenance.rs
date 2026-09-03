@@ -5,6 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AllocatorLock;
+use crate::orchestration::ALLOCATOR_IDS;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolchainProvenance {
@@ -54,6 +55,10 @@ pub struct IntentionalMimallocDifference {
     pub field: String,
     #[serde(rename = "upstream-mimalloc")]
     pub upstream_mimalloc: String,
+    /// Bun's fork has no MI_PPROF option, so this records `not-applicable`
+    /// rather than a state the option could have been built in.
+    #[serde(rename = "bun-mimalloc")]
+    pub bun_mimalloc: String,
     #[serde(rename = "mimalloc-pprof")]
     pub mimalloc_pprof: String,
 }
@@ -80,8 +85,8 @@ pub struct ProducerProvenance {
 impl ProducerProvenance {
     pub fn parse_and_validate(input: &str, lock: &AllocatorLock) -> Result<Self, String> {
         let provenance: Self = serde_json::from_str(input).map_err(|error| error.to_string())?;
-        if provenance.schema_version != 1 || provenance.allocators.len() != 4 {
-            return Err("producer provenance must contain exactly four allocator builds".into());
+        if provenance.schema_version != 1 || provenance.allocators.len() != ALLOCATOR_IDS.len() {
+            return Err("producer provenance must contain exactly five allocator builds".into());
         }
         if !provenance.build_elapsed_seconds.is_finite() || provenance.build_elapsed_seconds < 0.0 {
             return Err("producer build elapsed time must be finite and nonnegative".into());
@@ -164,6 +169,7 @@ impl ProducerProvenance {
             || self.mimalloc_option_comparison.runtime_disabled_state != expected_runtime
             || difference.field != "MI_PPROF"
             || difference.upstream_mimalloc != "OFF"
+            || difference.bun_mimalloc != "not-applicable"
             || difference.mimalloc_pprof != "ON"
         {
             return Err("mimalloc build/runtime option comparison is incomplete or false".into());
@@ -205,8 +211,8 @@ fn validate_file_hash(path: &str, expected: &str, label: &str) -> Result<(), Str
 
 /// Reject accidental same-binary/multiple-allocator link reuse.
 pub fn validate_distinct_child_hashes(provenance: &[AllocatorProvenance]) -> Result<(), String> {
-    if provenance.len() != 4 {
-        return Err("expected four allocator child artifacts".into());
+    if provenance.len() != ALLOCATOR_IDS.len() {
+        return Err("expected five allocator child artifacts".into());
     }
     for (index, item) in provenance.iter().enumerate() {
         if provenance

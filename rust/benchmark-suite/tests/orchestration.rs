@@ -137,7 +137,7 @@ fn a_failed_child_aborts_without_retry_or_complete_raw_run() {
 }
 
 #[test]
-fn complete_controller_path_retains_all_four_raw_samples_per_block() {
+fn complete_controller_path_retains_all_five_raw_samples_per_block() {
     let plan = plan();
     let mut appended = 0;
     let run = run_balanced_cell_with(
@@ -149,8 +149,8 @@ fn complete_controller_path_retains_all_four_raw_samples_per_block() {
         |_, request, _| Ok(sample_for(request, 750_000_000)),
     )
     .unwrap();
-    assert_eq!(appended, 60);
-    assert_eq!(run.samples.len(), 60);
+    assert_eq!(appended, 75);
+    assert_eq!(run.samples.len(), 75);
     validate_complete_raw_run(&run, 15).unwrap();
 }
 
@@ -180,7 +180,7 @@ fn upstream_calibration_freezes_a_realized_count_in_target_interval() {
 }
 
 #[test]
-fn planted_serialized_control_is_detected_through_four_child_blocks() {
+fn planted_serialized_control_is_detected_through_five_child_blocks() {
     let mut normal_plan = plan();
     normal_plan.request_template.thread_point = "physical-core".into();
     normal_plan.request_template.physical_cores = 2;
@@ -225,7 +225,7 @@ fn one_block_is_allowed_only_when_explicitly_marked_reduced_smoke() {
     )
     .unwrap();
     assert_eq!(smoke.run_kind, "reduced-smoke");
-    assert_eq!(smoke.samples.len(), 4);
+    assert_eq!(smoke.samples.len(), 5);
 }
 
 fn plan() -> CellRunPlan {
@@ -236,9 +236,9 @@ fn plan() -> CellRunPlan {
             allocator: AllocatorIdentity {
                 allocator_id: allocator_id.into(),
                 allocator_version: "test".into(),
-                source_sha: ["a", "b", "c", "d"][index].repeat(40),
-                library_sha256: ["1", "2", "3", "4"][index].repeat(64),
-                child_binary_sha256: ["5", "6", "7", "8"][index].repeat(64),
+                source_sha: ["a", "b", "c", "d", "e"][index].repeat(40),
+                library_sha256: ["1", "2", "3", "4", "5"][index].repeat(64),
+                child_binary_sha256: ["6", "7", "8", "9", "a"][index].repeat(64),
             },
             program: format!("benchmark-child-{allocator_id}").into(),
             arguments: Vec::new(),

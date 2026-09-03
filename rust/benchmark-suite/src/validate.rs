@@ -19,10 +19,11 @@ use crate::{CORE_SUITE_VERSION, RAW_SCHEMA_VERSION};
 
 pub const MINIMUM_BLOCKS_PER_CELL: u32 = 15;
 pub const EXPECTED_CELL_COUNT: u32 = 30;
-pub const HEADLINE_ALLOCATORS: [&str; 4] = [
+pub const HEADLINE_ALLOCATORS: [&str; 5] = [
     "tcmalloc",
     "jemalloc",
     "upstream-mimalloc",
+    "bun-mimalloc",
     "mimalloc-pprof",
 ];
 pub const VALIDATION_CHECKS: [&str; 8] = [
@@ -243,9 +244,9 @@ fn validate_allocators<'a>(
     let lock = AllocatorLock::parse_and_validate(include_str!("../allocators/allocator-lock.json"))
         .map_err(|error| ValidationError::new(format!("embedded allocator lock: {error}")))?;
     let expected_lock_sha = sha256_bytes(include_bytes!("../allocators/allocator-lock.json"));
-    if input.allocator_lock_sha256 != expected_lock_sha || input.allocators.len() != 4 {
+    if input.allocator_lock_sha256 != expected_lock_sha || input.allocators.len() != HEADLINE_ALLOCATORS.len() {
         return Err(ValidationError::new(
-            "allocator provenance does not match the embedded four-allocator lock",
+            "allocator provenance does not match the embedded five-allocator lock",
         ));
     }
     let ids: Vec<&str> = input
@@ -354,6 +355,18 @@ pub(crate) fn expected_options(id: &str) -> AllocatorFeatureOptions {
         "upstream-mimalloc" => AllocatorFeatureOptions {
             pprof_compiled: Disabled,
             pprof_runtime: Disabled,
+            memory_events_compiled: NotApplicable,
+            memory_events_runtime: NotApplicable,
+            frame_pointers: Enabled,
+            opt_arch: Disabled,
+            opt_simd: Enabled,
+        },
+        "bun-mimalloc" => AllocatorFeatureOptions {
+            // Bun's fork carries no MI_PPROF or memory-events option at all, so
+            // both are not-applicable rather than disabled; the architecture
+            // options are pinned to the same values as the other mimalloc rows.
+            pprof_compiled: NotApplicable,
+            pprof_runtime: NotApplicable,
             memory_events_compiled: NotApplicable,
             memory_events_runtime: NotApplicable,
             frame_pointers: Enabled,
@@ -557,7 +570,7 @@ fn validate_samples(
                 cell.0, cell.1
             )));
         }
-        let mut ordinal_counts = [[0_u32; 4]; 4];
+        let mut ordinal_counts = [[0_u32; 5]; 5];
         for (block_id, samples) in blocks {
             validate_block(cell, *block_id, samples, &mut ordinal_counts)?;
         }
@@ -634,11 +647,11 @@ fn validate_block(
     cell: &CellKey,
     block_id: u32,
     samples: &[&RawSample],
-    ordinal_counts: &mut [[u32; 4]; 4],
+    ordinal_counts: &mut [[u32; 5]; 5],
 ) -> Result<(), ValidationError> {
-    if samples.len() != 4 {
+    if samples.len() != HEADLINE_ALLOCATORS.len() {
         return Err(ValidationError::new(format!(
-            "cell {}/{} block {block_id} does not contain exactly four allocators",
+            "cell {}/{} block {block_id} does not contain exactly five allocators",
             cell.0, cell.1
         )));
     }
@@ -678,10 +691,10 @@ fn validate_block(
         }
     }
     let expected_ids: BTreeSet<&str> = HEADLINE_ALLOCATORS.into_iter().collect();
-    let expected_ordinals: BTreeSet<u8> = (0..4).collect();
+    let expected_ordinals: BTreeSet<u8> = (0..HEADLINE_ALLOCATORS.len() as u8).collect();
     if ids != expected_ids || ordinals != expected_ordinals {
         return Err(ValidationError::new(format!(
-            "cell {}/{} block {block_id} order is not a permutation of the four allocators",
+            "cell {}/{} block {block_id} order is not a permutation of the five allocators",
             cell.0, cell.1
         )));
     }
@@ -704,7 +717,7 @@ fn looks_like_utc_timestamp(value: &str) -> bool {
 }
 
 /// Offline smoke for the CLI. It validates all checked-in schemas as JSON and
-/// exercises both a complete 1,800-sample run and a known incomplete matrix.
+/// exercises both a complete 2,250-sample run and a known incomplete matrix.
 pub fn selftest() -> Result<(), ValidationError> {
     for (name, schema) in [
         (
@@ -837,7 +850,7 @@ pub fn synthetic_full_fixture() -> Result<PublicationRawRun, ValidationError> {
                 compiler: format!("fixture-compiler-{index}"),
                 linker: format!("fixture-linker-{index}"),
                 static_library_sha256: repeated_hex((b'5' + index as u8) as char, 64),
-                child_binary_sha256: repeated_hex(['9', 'a', 'b', 'c'][index], 64),
+                child_binary_sha256: repeated_hex(['9', 'a', 'b', 'c', 'd'][index], 64),
                 options: expected_options(&pin.id),
             }
         })
@@ -885,7 +898,9 @@ pub fn synthetic_full_fixture() -> Result<PublicationRawRun, ValidationError> {
                         execution_mode: "normal".into(),
                         run_seed: 7,
                         block_id,
-                        ordinal: ((allocator_index as u32 + block_id) % 4) as u8,
+                        ordinal: ((allocator_index as u32 + block_id)
+                            % HEADLINE_ALLOCATORS.len() as u32)
+                            as u8,
                         workload_seed,
                         allocator_id: allocator.allocator_id.clone(),
                         allocator_version: allocator.allocator_version.clone(),

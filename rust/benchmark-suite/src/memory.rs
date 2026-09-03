@@ -32,10 +32,11 @@ pub const CONTROL_RECORD_BYTES: usize = 32;
 const CONTROL_MAGIC: &[u8; 4] = b"MPM1";
 
 const REFERENCE_ALLOCATOR: &str = "upstream-mimalloc";
-const ALLOCATOR_IDS: [&str; 4] = [
+const ALLOCATOR_IDS: [&str; 5] = [
     "tcmalloc",
     "jemalloc",
     "upstream-mimalloc",
+    "bun-mimalloc",
     "mimalloc-pprof",
 ];
 const METRICS: [(&str, &str); 5] = [
@@ -997,7 +998,10 @@ pub fn validate_memory_raw_run(raw: &MemoryRawRun) -> Result<(), String> {
     {
         return Err("memory raw run must be a complete linux-process-memory-v1 value".into());
     }
-    if raw.allocators.len() != 4 || raw.calibrations.len() != 7 || raw.samples.is_empty() {
+    if raw.allocators.len() != ALLOCATOR_IDS.len()
+        || raw.calibrations.len() != 7
+        || raw.samples.is_empty()
+    {
         return Err("memory raw run has an incomplete allocator/cell matrix".into());
     }
     let allocator_ids = raw
@@ -1092,7 +1096,7 @@ pub fn validate_memory_raw_run(raw: &MemoryRawRun) -> Result<(), String> {
             linker: allocator.linker.clone(),
         };
         if sample.metric_schema_version != MEMORY_SCHEMA_VERSION
-            || sample.ordinal >= 4
+            || sample.ordinal >= ALLOCATOR_IDS.len() as u8
             || sample.child_sample.run_kind != "headline"
             || sample.child_sample.execution_mode != "normal"
             || sample.child_sample.run_seed != raw.run_seed
@@ -1212,9 +1216,9 @@ pub fn validate_memory_raw_run(raw: &MemoryRawRun) -> Result<(), String> {
                 .iter()
                 .map(|sample| sample.workload_seed)
                 .collect::<BTreeSet<_>>();
-            if samples.len() != 4
+            if samples.len() != ALLOCATOR_IDS.len()
                 || ids != ALLOCATOR_IDS.into_iter().collect()
-                || ordinals != [0, 1, 2, 3].into_iter().collect()
+                || ordinals != (0..ALLOCATOR_IDS.len() as u8).collect()
                 || seeds.len() != 1
             {
                 return Err(format!(
@@ -1244,7 +1248,7 @@ pub fn validate_memory_raw_run(raw: &MemoryRawRun) -> Result<(), String> {
                 ));
             }
             // The deterministic scenario/checksum derivation is allocator-independent,
-            // so validate it once per complete paired block after all four children
+            // so validate it once per complete paired block after all five children
             // proved identical workload identity above.
             let first = samples[0];
             let calibration = calibrations

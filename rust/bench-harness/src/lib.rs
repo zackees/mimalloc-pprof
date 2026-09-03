@@ -421,12 +421,20 @@ fn run_child_sample(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(BenchError::Spawn)?;
-    process
+    // A child that exits before reading its request closes the pipe under us; that
+    // is judged by its exit status and output below, not by the write failing --
+    // otherwise a malformed-response child races the write and is reported as a
+    // harness I/O error instead of the protocol violation it is.
+    if let Err(error) = process
         .stdin
         .take()
         .expect("child stdin piped")
         .write_all(&request)
-        .map_err(BenchError::WriteRequest)?;
+    {
+        if error.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(BenchError::WriteRequest(error));
+        }
+    }
 
     let started = Instant::now();
     loop {

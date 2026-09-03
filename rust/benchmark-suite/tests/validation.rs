@@ -41,7 +41,7 @@ fn checked_fixture_spec_builds_a_valid_complete_matrix() {
 fn incomplete_matrix_and_missing_pair_are_rejected() {
     let mut input = valid();
     input.samples.pop();
-    assert!(rejection(&input).contains("exactly four allocators"));
+    assert!(rejection(&input).contains("exactly five allocators"));
 }
 
 #[test]

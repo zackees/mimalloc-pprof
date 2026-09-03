@@ -14,7 +14,7 @@ use crate::memory::{
 use crate::model::{
     BenchmarkChildRequest, CellCalibration, RunnerMetadata, CHILD_PROTOCOL_VERSION,
 };
-use crate::orchestration::{balanced_block_orders, calibrate_cell};
+use crate::orchestration::{balanced_block_orders, calibrate_cell, ALLOCATOR_IDS};
 use crate::provenance::ProducerProvenance;
 use crate::runner::{
     children_from_provenance, collect_publication_runner, collect_run_identity, create_new_writer,
@@ -117,7 +117,8 @@ fn run(options: Options) -> Result<(), String> {
     let mut calibration_wall = Duration::ZERO;
     let mut block_wall = Duration::ZERO;
     let mut calibrations = Vec::with_capacity(cells.len());
-    let mut samples = Vec::with_capacity(cells.len() * options.blocks as usize * 4);
+    let mut samples =
+        Vec::with_capacity(cells.len() * options.blocks as usize * ALLOCATOR_IDS.len());
     for (card_id, thread_point, _) in cells {
         let mut request = BenchmarkChildRequest {
             protocol_version: CHILD_PROTOCOL_VERSION.into(),
@@ -267,7 +268,7 @@ fn run(options: Options) -> Result<(), String> {
                 "scenario_id": card_id.as_str(),
                 "thread_point": thread_point.name(),
                 "operation_unit": card(card_id).operation_unit.name(),
-                "samples": options.blocks * 4,
+                "samples": options.blocks * ALLOCATOR_IDS.len() as u32,
             }),
         )?;
     }

@@ -28,7 +28,13 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import cast
 
-EXPECTED_IDS = ("tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof")
+EXPECTED_IDS = (
+    "tcmalloc",
+    "jemalloc",
+    "upstream-mimalloc",
+    "bun-mimalloc",
+    "mimalloc-pprof",
+)
 SHA256_LENGTH = 64
 GIT_SHA_LENGTH = 40
 CHUNK_SIZE = 1024 * 1024
@@ -64,6 +70,7 @@ COMPETITOR_SYMBOLS = {
     "tcmalloc": "TCMallocInternalMalloc",
     "jemalloc": "je_malloc",
     "upstream-mimalloc": "mi_malloc",
+    "bun-mimalloc": "mi_malloc",
     "mimalloc-pprof": "mi_malloc",
 }
 
@@ -178,6 +185,8 @@ def validate_source(allocator_id: str, pin: str, source: Mapping[str, object]) -
         raise LockfileError("jemalloc must record release 5.3.1 and its peeled commit")
     if allocator_id == "upstream-mimalloc" and pin != "dev3@bcee5a88":
         raise LockfileError("upstream-mimalloc must remain at dev3@bcee5a88")
+    if allocator_id == "bun-mimalloc" and pin != "bun-dev3-v2@b20b60d9":
+        raise LockfileError("bun-mimalloc must remain at bun-dev3-v2@b20b60d9")
     if allocator_id == "tcmalloc" and pin != commit:
         raise LockfileError("tcmalloc pin must equal its immutable commit")
 
@@ -1020,8 +1029,10 @@ def mimalloc_option_comparison(
     by_id = {require_string(record.get("id"), "allocator.id"): record for record in records}
     upstream = require_mapping(by_id["upstream-mimalloc"].get("build"), "upstream build")
     fork = require_mapping(by_id["mimalloc-pprof"].get("build"), "fork build")
+    bun = require_mapping(by_id["bun-mimalloc"].get("build"), "bun build")
     upstream_flags = set(require_string_list(upstream.get("flags"), "upstream flags"))
     fork_flags = set(require_string_list(fork.get("flags"), "fork flags"))
+    bun_flags = set(require_string_list(bun.get("flags"), "bun flags"))
     common = {
         "build_type": "Release",
         "MI_BUILD_STATIC": "ON",
@@ -1042,19 +1053,29 @@ def mimalloc_option_comparison(
         "-O3",
         "-fno-omit-frame-pointer",
     }
-    if not expected_common_flags.issubset(upstream_flags & fork_flags):
-        raise ArchiveError("upstream/fork mimalloc common build options are not equivalent")
+    if not expected_common_flags.issubset(upstream_flags & fork_flags & bun_flags):
+        raise ArchiveError("upstream/bun/fork mimalloc common build options are not equivalent")
     upstream_only = upstream_flags - fork_flags
     fork_only = fork_flags - upstream_flags
     if upstream_only != {"MI_PPROF=OFF"} or fork_only != {"MI_PPROF=ON"}:
         raise ArchiveError(
             "upstream/fork mimalloc options differ outside the intended MI_PPROF field"
         )
+    # Bun's tree has no MI_PPROF option at all, so the row carries the common
+    # flags and nothing else. Any other difference would make the Bun row a
+    # different build recipe rather than the same one against another source.
+    if bun_flags != expected_common_flags:
+        raise ArchiveError(
+            "bun mimalloc build options differ from the shared mimalloc recipe: "
+            f"extra={sorted(bun_flags - expected_common_flags)}, "
+            f"missing={sorted(expected_common_flags - bun_flags)}"
+        )
     return {
         "equivalent_fields": common,
         "intentional_difference": {
             "field": "MI_PPROF",
             "upstream-mimalloc": "OFF",
+            "bun-mimalloc": "not-applicable",
             "mimalloc-pprof": "ON",
         },
         "runtime_disabled_state": {
@@ -1184,7 +1205,7 @@ def build_records(
         )
     binary_hashes = [cast(str, build["child_binary_sha256"]) for build in builds]
     if len(set(binary_hashes)) != len(EXPECTED_IDS):
-        raise ArchiveError("the four allocator child executable hashes are not distinct")
+        raise ArchiveError("the five allocator child executable hashes are not distinct")
     build_elapsed_seconds = time.perf_counter() - producer_started
     if not (0.0 <= build_elapsed_seconds < float("inf")):
         raise ArchiveError("producer build elapsed time is not finite and nonnegative")

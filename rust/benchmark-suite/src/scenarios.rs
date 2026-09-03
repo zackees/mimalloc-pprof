@@ -699,7 +699,7 @@ impl ExpectedCounts {
 }
 
 /// A resolved cell. `transactions_per_worker` is deliberately explicit so the
-/// runner can freeze a calibrated count and replay it unchanged for all four
+/// runner can freeze a calibrated count and replay it unchanged for all five
 /// allocators in a paired block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScenarioCell {

@@ -11,6 +11,10 @@ docs/
 *.zip
 *.tar
 *.gz
+# ...except checked-in test fixtures, which are stored compressed on purpose:
+# ci/tests/fixtures/benchmark/legacy/latest.json.gz is 2.4 MB of synthetic
+# samples that would otherwise dominate the repository's fixture bytes.
+!ci/tests/fixtures/**/*.gz
 .vscode
 .DS_STore
 __pycache__/

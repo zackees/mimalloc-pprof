@@ -147,6 +147,53 @@
       "patches": { "source": [], "build": [] }
     },
     {
+      "id": "bun-mimalloc",
+      "pin": "bun-dev3-v2@b20b60d9",
+      "source": {
+        "kind": "archive",
+        "canonical_repository": "https://github.com/oven-sh/mimalloc",
+        "commit": "b20b60d959093b1bc0e24306ec72ccacb3e46fb9",
+        "archive_url": "https://github.com/oven-sh/mimalloc/archive/b20b60d959093b1bc0e24306ec72ccacb3e46fb9.tar.gz",
+        "archive_sha256": "433e122220c0238ffa6f7acf21cdd059e31dd861197d8e4f553a56bef1dc85ac"
+      },
+      "build": {
+        "system": "cmake-ninja",
+        "commands": [
+          [
+            "cmake",
+            "-S",
+            "{source_dir}",
+            "-B",
+            "{build_dir}",
+            "-G",
+            "Ninja",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DMI_BUILD_STATIC=ON",
+            "-DMI_BUILD_SHARED=OFF",
+            "-DMI_BUILD_TESTS=OFF",
+            "-DMI_OPT_ARCH=OFF",
+            "-DMI_OPT_SIMD=ON",
+            "-DCMAKE_C_FLAGS_RELEASE=-O3 -fno-omit-frame-pointer"
+          ],
+          ["cmake", "--build", "{build_dir}", "--parallel", "{jobs}"]
+        ],
+        "flags": [
+          "Release",
+          "MI_BUILD_STATIC=ON",
+          "MI_BUILD_SHARED=OFF",
+          "MI_BUILD_TESTS=OFF",
+          "MI_OPT_ARCH=OFF",
+          "MI_OPT_SIMD=ON",
+          "-O3",
+          "-fno-omit-frame-pointer"
+        ]
+      },
+      "expected_static_library": "libmimalloc.a",
+      "adapter_kind": "mimalloc-c-api",
+      "license": "MIT",
+      "patches": { "source": [], "build": [] }
+    },
+    {
       "id": "mimalloc-pprof",
       "pin": "workflow-source",
       "source": {

@@ -12,9 +12,9 @@ fn validated_raw_builds_complete_deterministic_latest_and_compact_history() {
 
     assert_eq!(first.latest_schema_version, LATEST_SCHEMA_VERSION);
     assert_eq!(first.statistics_version, STATISTICS_VERSION);
-    assert_eq!(first.raw_samples.len(), 30 * 15 * 4);
-    assert_eq!(first.absolute_summaries.len(), 30 * 4);
-    assert_eq!(first.paired_summaries.len(), 30 * 3);
+    assert_eq!(first.raw_samples.len(), 30 * 15 * 5);
+    assert_eq!(first.absolute_summaries.len(), 30 * 5);
+    assert_eq!(first.paired_summaries.len(), 30 * 4);
     assert!(first
         .paired_summaries
         .iter()

@@ -84,8 +84,25 @@ NEGATIVE_TIMEOUT_SECONDS = 10.0
 #: we do not implement (PASS_REGULAR_EXPRESSION, SKIP_RETURN_CODE, RESOURCE_LOCK, ...) must
 #: not be silently discarded into a bundle that then reports green.
 SUPPORTED_PROPERTIES = frozenset(
-    {"ENVIRONMENT", "TIMEOUT", "WORKING_DIRECTORY", "LABELS", "WILL_FAIL", "DISABLED"}
+    {
+        "ENVIRONMENT",
+        "TIMEOUT",
+        "WORKING_DIRECTORY",
+        "LABELS",
+        "WILL_FAIL",
+        "DISABLED",
+        # ctest's "run this test with nothing else running". Lowered into the manifest's
+        # `serial` flag for `ci/run_test_bundle.py`'s parallel wave (#307): a test that
+        # asserts on process-wide RSS or on a wall-clock deadline measures the machine,
+        # not just itself, so it declares that where it is defined rather than in a name
+        # list inside the runner.
+        "RUN_SERIAL",
+    }
 )
+
+#: The label spelling that means the same thing as RUN_SERIAL, for a test that wants to
+#: be findable by `ctest -L serial` too.
+SERIAL_LABEL = "serial"
 
 #: Shared/import libraries every bundle carries regardless of whether a test names them on
 #: its command line -- a dynamically linked test finds them through the loader, not argv.
@@ -139,6 +156,7 @@ class BundledTest:
     expect_text: str | None = None
     forbid_text: str | None = None
     labels: list[str] = field(default_factory=list[str])
+    serial: bool = False
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -151,6 +169,7 @@ class BundledTest:
             "expect_text": self.expect_text,
             "forbid_text": self.forbid_text,
             "labels": list(self.labels),
+            "serial": self.serial,
         }
 
 
@@ -528,6 +547,11 @@ def convert(payload: object, build_dir: Path) -> tuple[list[BundledTest], dict[s
                 else DEFAULT_TIMEOUT_SECONDS
             )
 
+        labels = _str_list(properties.get("LABELS"))
+        serial = properties.get("RUN_SERIAL") in (True, "TRUE", "ON", "1") or (
+            SERIAL_LABEL in labels
+        )
+
         working_directory = _as_str(properties.get("WORKING_DIRECTORY"))
         expect_nonzero = lowered.expect_nonzero or properties.get("WILL_FAIL") in (
             True,
@@ -548,7 +572,8 @@ def convert(payload: object, build_dir: Path) -> tuple[list[BundledTest], dict[s
                 expect_nonzero=expect_nonzero,
                 expect_text=lowered.expect_text,
                 forbid_text=lowered.forbid_text,
-                labels=_str_list(properties.get("LABELS")),
+                labels=labels,
+                serial=serial,
             )
         except BundleError as exc:
             problems.append(f"{name}: {exc}")
@@ -905,6 +930,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     wrapped = sum(1 for test in tests if test.env)
     if wrapped:
         print(f"  {wrapped} test(s) carry environment overrides")
+    serialized = sum(1 for test in tests if test.serial)
+    if serialized:
+        print(f"  {serialized} test(s) marked RUN_SERIAL (run alone by run_test_bundle.py)")
     if runtime_dlls:
         print(
             f"  {len(runtime_dlls)} toolchain runtime DLL(s): "

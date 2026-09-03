@@ -56,11 +56,25 @@ def is_linux_job(job: dict[str, Any]) -> bool:
 
 
 def job_run_text(job: dict[str, Any]) -> str:
+    """Every `run:` block, PLUS the string values of the job's matrix `include:` rows.
+
+    #307 moved c-unit.yml's cmake flags out of `run:` and into a `build` matrix, one row
+    per configuration. Reading only `run:` would have made this drift guard silently
+    vacuous for exactly the job it most needs to cover -- the one that decides what gets
+    built at all -- so the matrix rows are scanned too.
+    """
     chunks: list[str] = []
     for step in job.get("steps", []):
         run = step.get("run")
         if isinstance(run, str):
             chunks.append(run)
+    strategy = job.get("strategy", {})
+    matrix = strategy.get("matrix", {}) if isinstance(strategy, dict) else {}
+    include = matrix.get("include", []) if isinstance(matrix, dict) else []
+    if isinstance(include, list):
+        for row in include:
+            if isinstance(row, dict):
+                chunks.extend(str(value) for value in row.values() if isinstance(value, str))
     return "\n".join(chunks)
 
 
@@ -124,17 +138,18 @@ def expected_tokens(text: str) -> set[str]:
 # and the package-contents check for speed. Listed explicitly, rather than loosened in
 # the regex, so a *different* future gap still fails this test.
 #
-# c-unit.yml's ctest-musl job (#273 8a) runs inside `container: alpine:3.20` -- a
-# different execution model than every other config here, which builds directly on
-# this host's own toolchain. verify_local.py has no container runner, so this job is
-# out of scope for the same reason the "rust" gap above is: listed explicitly rather
-# than making the regex or `is_linux_job` blind to `container:` in general, so an
-# actually-in-scope job that starts using `-DCMAKE_C_FLAGS=...` still fails this test.
-# Covered instead by ci/dev_linux.py-style manual `docker run alpine:3.20 ...`
-# verification (see #273's PR description) and by CI itself.
+# c-unit.yml's two musl rows (#273 8a, now rows of the `build` matrix -- #307) build and
+# run inside `container: alpine:3.20` -- a different execution model than every other
+# config here, which builds directly on this host's own toolchain. verify_local.py has no
+# container runner, so those two flags are out of scope for the same reason the "rust" gap
+# above is: listed explicitly rather than making the regex or `is_linux_job` blind to
+# `container:` in general, so an actually-in-scope row that starts using
+# `-DCMAKE_C_FLAGS=...` still fails this test. Covered instead by manual
+# `docker run alpine:3.20 ...` verification (docs/ci-gates.md spells out the command) and
+# by CI itself.
 KNOWN_GAPS: dict[tuple[str, str], set[str]] = {
     ("rust-native.yml", "test"): {"ci/check_crate_package.py"},
-    ("c-unit.yml", "ctest-musl"): {
+    ("c-unit.yml", "build"): {
         "-DMI_LIBC_MUSL=ON",
         "-DCMAKE_C_FLAGS=-ftls-model=local-dynamic",
     },

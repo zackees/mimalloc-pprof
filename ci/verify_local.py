@@ -24,6 +24,7 @@ Usage:
     uv run ci/verify_local.py --only release,lint     # just these configs
     uv run ci/verify_local.py --slow                  # also run the long-tail ctest suite
     uv run ci/verify_local.py --list                  # print the config + bundle tables
+    uv run ci/verify_local.py --like-ci               # c-unit.yml's own two-stage layout
     uv run ci/verify_local.py --bundle macos-arm64-release   # cross-build one CI bundle
     uv run ci/verify_local.py --jobs 8                # override the worker/build budget
     uv run ci/verify_local.py --keep-going             # don't skip queued configs on a failure
@@ -273,7 +274,7 @@ def ctest_run(
 
 
 def run_release(ctx: RunCtx) -> bool:
-    """c-unit.yml job `ctest` (ubuntu-latest): cmake -B build -DMI_PPROF=ON; Release."""
+    """c-unit.yml `build (release)` + its slice of `run-linux`: -DMI_PPROF=ON, Release."""
     build = ctx.dir / "build"
     rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON"])
     if rc:
@@ -284,7 +285,7 @@ def run_release(ctx: RunCtx) -> bool:
 
 
 def run_off(ctx: RunCtx) -> bool:
-    """c-unit.yml job `ctest-pprof-off`: cmake -B build -DMI_PPROF=OFF."""
+    """c-unit.yml `build (pprof-off)` + its slice of `run-linux`: -DMI_PPROF=OFF."""
     build = ctx.dir / "build"
     rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=OFF"])
     if rc:
@@ -295,7 +296,7 @@ def run_off(ctx: RunCtx) -> bool:
 
 
 def run_debug_full(ctx: RunCtx) -> bool:
-    """c-unit.yml job `ctest-debug-full` (ubuntu-latest): -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug."""
+    """c-unit.yml `build (debug-full)` + its slice of `run-linux`: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug."""
     build = ctx.dir / "build"
     rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON"])
     if rc:
@@ -306,7 +307,13 @@ def run_debug_full(ctx: RunCtx) -> bool:
 
 
 def run_bundle(ctx: RunCtx) -> bool:
-    """c-unit.yml job `bundle-roundtrip`: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug.
+    """Bundle/ctest pass-and-fail equivalence: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug.
+
+    This is the half of #277 phase A's `bundle-roundtrip` job that CI can no longer run:
+    since #307 the run stage has no build tree, so there is no native ctest result to
+    compare against there (it checks executed-vs-registered *names* instead, with
+    ci/bundle_coverage.py). A build tree exists here, so the stronger claim -- same names
+    AND same pass/fail -- is still worth making, and this is where it lives now.
 
     Builds, records a reference `ctest --output-junit`, bundles with
     `ci/bundle_tests.py`, moves the build tree away so the executables' RPATH cannot
@@ -372,8 +379,9 @@ def run_bundle(ctx: RunCtx) -> bool:
 
 
 def run_guarded(ctx: RunCtx) -> bool:
-    """c-unit.yml job `ctest-guarded`: Debug + MI_GUARDED=ON, ctest twice (plain, then
-    with MIMALLOC_GUARDED_SAMPLE_RATE=1 forcing guarding on every allocation)."""
+    """c-unit.yml `build (guarded)` + its slice of `run-linux`: Debug + MI_GUARDED=ON, run
+    twice -- plain, then with MIMALLOC_GUARDED_SAMPLE_RATE=1 forcing guarding on every
+    allocation (in CI that second pass is an `--env-variant` scoped to this bundle)."""
     build = ctx.dir / "build-guarded"
     rc, configure_out = cmake_configure(
         ctx, build, ["-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_GUARDED=ON"]
@@ -395,7 +403,7 @@ def run_guarded(ctx: RunCtx) -> bool:
 
 
 def run_shared(ctx: RunCtx) -> bool:
-    """c-unit.yml job `ctest-shared` (ubuntu-latest): shared lib only, no static/object."""
+    """c-unit.yml `build (shared)` + its slice of `run-linux`: shared lib only, no static/object."""
     build = ctx.dir / "build"
     args = [
         "-DMI_PPROF=ON",
@@ -443,7 +451,7 @@ def run_gate_binary_pinned(ctx: RunCtx, binary: Path, out_dir: Path, runs: int =
 
 
 def run_memory_gate(ctx: RunCtx) -> bool:
-    """c-unit.yml job `memory-gate` (ubuntu-latest). Calls ci/memory_gate.py's `check`/
+    """c-unit.yml `run-linux`'s memory gate. Calls ci/memory_gate.py's `check`/
     `control` comparison functions directly (rather than shelling to `memory_gate.py
     check` with no args) so binary discovery is pinned to THIS config's own build dir
     -- with several configs building concurrently, the module's mtime-based
@@ -485,7 +493,7 @@ def run_memory_gate(ctx: RunCtx) -> bool:
 
     # Positive control: the gate must catch an injected leak, or it is decoration.
     build_leak = ctx.dir / "build-leak"
-    rc, _ = cmake_configure(ctx, build_leak, ["-DMI_PPROF=ON", "-DMI_BENCH_INJECT_LEAK=200000"])
+    rc, _ = cmake_configure(ctx, build_leak, ["-DMI_PPROF=ON", "-DMI_BENCH_INJECT_LEAK=600000"])
     if rc:
         return False
     if cmake_build(ctx, build_leak, config="Release", target="mimalloc-test-memory-gate"):
@@ -504,9 +512,11 @@ def run_memory_gate(ctx: RunCtx) -> bool:
 
 
 def run_diag(ctx: RunCtx) -> bool:
-    """c-unit.yml jobs `diagnostic-gates` AND the ubuntu-latest (x64) half of
-    `isa-baseline` -- both are cheap, ubuntu-only diagnostic checks over the same
-    kind of throwaway `mimalloc-static`-only build, so they share one config.
+    """c-unit.yml `run-linux`'s diagnostic gates AND its x64 `isa-baseline` scans --
+    both are cheap, ubuntu-only diagnostic checks over the same kind of throwaway
+    `mimalloc-static`-only build, so they share one config. (In CI those builds are the
+    `diag-pprof-*` and `isa-*` rows of the `build` matrix and the scans happen in the run
+    stage; here there is one machine, so build and scan stay together.)
 
     Shells out to `uv run ci/<script>.py` for each check (rather than importing the
     module and calling its argparse-driven `main()` in-process) so there is no need to
@@ -841,32 +851,48 @@ def _need_uv() -> str | None:
 
 
 CONFIGS: list[ConfigSpec] = [
-    ConfigSpec("release", "c-unit.yml: ctest", "Release, MI_PPROF=ON, full ctest", run_release),
-    ConfigSpec("off", "c-unit.yml: ctest-pprof-off", "MI_PPROF=OFF, full ctest", run_off),
     ConfigSpec(
-        "debug-full", "c-unit.yml: ctest-debug-full", "Debug, MI_DEBUG_FULL=ON", run_debug_full
+        "release",
+        "c-unit.yml: build(release)+run-linux",
+        "Release, MI_PPROF=ON, full ctest",
+        run_release,
     ),
     ConfigSpec(
-        "guarded", "c-unit.yml: ctest-guarded", "Debug, MI_GUARDED=ON, ctest x2", run_guarded
+        "off", "c-unit.yml: build(pprof-off)+run-linux", "MI_PPROF=OFF, full ctest", run_off
     ),
     ConfigSpec(
-        "shared", "c-unit.yml: ctest-shared", "shared lib only, no static/object", run_shared
+        "debug-full",
+        "c-unit.yml: build(debug-full)+run-linux",
+        "Debug, MI_DEBUG_FULL=ON",
+        run_debug_full,
+    ),
+    ConfigSpec(
+        "guarded",
+        "c-unit.yml: build(guarded)+run-linux",
+        "Debug, MI_GUARDED=ON, run x2",
+        run_guarded,
+    ),
+    ConfigSpec(
+        "shared",
+        "c-unit.yml: build(shared)+run-linux",
+        "shared lib only, no static/object",
+        run_shared,
     ),
     ConfigSpec(
         "bundle",
-        "c-unit.yml: bundle-roundtrip",
+        "local only: bundle pass/fail equivalence",
         "ctest vs. portable test bundle, build tree removed",
         run_bundle,
     ),
     ConfigSpec(
         "memory-gate",
-        "c-unit.yml: memory-gate",
+        "c-unit.yml: run-linux memory gate",
         "min-of-8 peak-memory regression gate",
         run_memory_gate,
     ),
     ConfigSpec(
         "diag",
-        "c-unit.yml: diagnostic-gates + isa-baseline(x64)",
+        "c-unit.yml: run-linux diag + isa(x64)",
         "internal-state/release/ISA gates",
         run_diag,
         _need_uv,
@@ -1264,6 +1290,334 @@ def run_bundle_build(name: str, jobs: int) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------------
+# --like-ci (#307): the two-stage layout, locally.
+#
+# c-unit.yml no longer gives each configuration its own runner and its own serial
+# ctest. It builds every configuration once, in parallel, and then ONE job replays
+# every bundle in a single wave. The per-config CONFIGS table above still mirrors what
+# each configuration *is*; this mode mirrors how they are now scheduled, which is the
+# part that can break on its own (a bundle that cannot be replayed without a build
+# tree, a test that only passes when it has the machine to itself, a coverage
+# comparison that has drifted).
+#
+# The two musl rows of c-unit.yml's build matrix are not reproduced: they build and run
+# inside `alpine:3.20`, and this script has no container runner -- the same, explicitly
+# recorded gap as the old `ctest-musl` job (see ci/tests/test_verify_local.py's
+# KNOWN_GAPS). Verify those with `docker run alpine:3.20 ...`; docs/ci-gates.md spells
+# out the command.
+# ---------------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class LikeCiBuild:
+    """One row of c-unit.yml's `build` matrix, reproduced locally."""
+
+    config: str
+    cmake: tuple[str, ...]
+    build_config: str | None = None
+    target: str | None = None
+    #: bundle = replayed in the wave; control = built but never executed (the memory
+    #: gate's leaky positive control); lib = scanned, not executed.
+    kind: str = "bundle"
+
+
+LIKE_CI_BUILDS: list[LikeCiBuild] = [
+    LikeCiBuild("release", ("-DMI_PPROF=ON",), "Release"),
+    LikeCiBuild("pprof-off", ("-DMI_PPROF=OFF",)),
+    LikeCiBuild("debug-full", ("-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON"), "Debug"),
+    LikeCiBuild("guarded", ("-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_GUARDED=ON")),
+    LikeCiBuild(
+        "shared",
+        (
+            "-DMI_PPROF=ON",
+            "-DMI_BUILD_SHARED=ON",
+            "-DMI_BUILD_STATIC=OFF",
+            "-DMI_BUILD_OBJECT=OFF",
+        ),
+        "Release",
+    ),
+    LikeCiBuild(
+        "memory-gate-leak",
+        # See c-unit.yml's memory-gate-leak row for why 600000 rather than 200000.
+        ("-DMI_PPROF=ON", "-DMI_BENCH_INJECT_LEAK=600000"),
+        "Release",
+        kind="control",
+    ),
+    LikeCiBuild(
+        "isa-portable",
+        ("-DMI_PPROF=ON", "-DMI_NO_OPT_ARCH=ON"),
+        target="mimalloc-static",
+        kind="lib",
+    ),
+    LikeCiBuild(
+        "isa-arch",
+        ("-DMI_PPROF=ON", "-DMI_OPT_ARCH=ON"),
+        target="mimalloc-static",
+        kind="lib",
+    ),
+    LikeCiBuild(
+        "diag-pprof-on",
+        (
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DMI_DEBUG=OFF",
+            "-DMI_PPROF=ON",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        ),
+        target="mimalloc-static",
+        kind="lib",
+    ),
+    LikeCiBuild(
+        "diag-pprof-off",
+        (
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DMI_DEBUG=OFF",
+            "-DMI_PPROF=OFF",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        ),
+        target="mimalloc-static",
+        kind="lib",
+    ),
+]
+
+LIKE_CI_ROOT = OUT_ROOT / "like-ci"
+
+
+def like_ci_build_one(row: LikeCiBuild, jobs: int) -> tuple[bool, Path]:
+    """Configure, build, enumerate and (for a bundle row) bundle one configuration."""
+    out = LIKE_CI_ROOT / row.config
+    log = out / "verify.log"
+    out.mkdir(parents=True, exist_ok=True)
+    log_start(log, f"=== build {row.config} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    ctx = RunCtx(name=row.config, dir=out, log=log, jobs=jobs, slow=True)
+    build = out / "build"
+    rc, configure_out = cmake_configure(ctx, build, list(row.cmake))
+    if rc:
+        return False, log
+    if row.config == "guarded" and not re.search(
+        r"Compiler defines\s*:.*MI_GUARDED=1", configure_out
+    ):
+        log_write(log, "\n[verify_local] FAIL: MI_GUARDED=1 did not reach mi_defines\n")
+        return False, log
+    if cmake_build(ctx, build, config=row.build_config, target=row.target):
+        return False, log
+    if row.kind == "lib":
+        return True, log
+
+    # The reference side of the coverage comparison, taken from ctest rather than from
+    # the bundle -- otherwise the check is the bundle agreeing with itself.
+    manifests = LIKE_CI_ROOT / "manifests"
+    manifests.mkdir(parents=True, exist_ok=True)
+    argv = ["ctest", "--test-dir", str(build), "--show-only=json-v1"]
+    if row.build_config:
+        argv += ["-C", row.build_config]
+    rc, show_only = run_logged(argv, cwd=ROOT, log=log)
+    if rc:
+        return False, log
+    (manifests / f"show-only-{row.config}.json").write_text(show_only, encoding="utf-8")
+
+    bundle = LIKE_CI_ROOT / "bundle" / row.config
+    if bundle.exists():
+        shutil.rmtree(bundle)
+    argv = [sys.executable, str(ROOT / "ci" / "bundle_tests.py"), str(build), str(bundle)]
+    if row.build_config:
+        argv += ["--config", row.build_config]
+    rc, _ = run_logged(argv, cwd=ROOT, log=log)
+    return rc == 0, log
+
+
+def run_like_ci(jobs: int) -> int:
+    """`--like-ci`: build every configuration once, then run every bundle in one wave.
+
+    Stage 1 mirrors c-unit.yml's `build` matrix (configure, build, `ctest
+    --show-only=json-v1`, `ci/bundle_tests.py`); stage 2 mirrors `run-linux`
+    (`ci/run_test_bundle.py --bundles ... --jobs N`, then `ci/bundle_coverage.py`, the
+    memory gate, the diagnostic/ISA scans and `ci/check_bun_surface.py`'s two halves).
+    """
+    LIKE_CI_ROOT.mkdir(parents=True, exist_ok=True)
+    log = LIKE_CI_ROOT / "run.log"
+    log_start(log, f"=== like-ci {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    per_build_jobs = max(2, jobs // max(1, len(LIKE_CI_BUILDS)))
+    print(
+        f"verify_local --like-ci: stage 1, {len(LIKE_CI_BUILDS)} configuration(s) built once "
+        f"({per_build_jobs} job(s) each)"
+    )
+    failures: list[str] = []
+    start = time.monotonic()
+    with ThreadPoolExecutor(max_workers=min(len(LIKE_CI_BUILDS), max(1, jobs))) as pool:
+        futures = {
+            pool.submit(like_ci_build_one, row, per_build_jobs): row for row in LIKE_CI_BUILDS
+        }
+        for fut in as_completed(futures):
+            row = futures[fut]
+            ok, row_log = fut.result()
+            print(f"    build {row.config:<18} {'PASS' if ok else 'FAIL'}")
+            if not ok:
+                failures.append(f"build {row.config}")
+                print_tail(row_log)
+    build_seconds = time.monotonic() - start
+    if failures:
+        print(f"\nFAILED: {', '.join(failures)}")
+        return 1
+
+    bundles = [row.config for row in LIKE_CI_BUILDS if row.kind == "bundle"]
+    # One invocation with the default `--select all`: this box is one machine, so the
+    # serial group runs after the wave here. CI splits the same two halves across
+    # `run-linux` and `run-linux-serial` (`--select parallel` / `--select serial`), which
+    # is a scheduling difference only -- a serial test has nothing else alongside it
+    # either way.
+    print(f"verify_local --like-ci: stage 2, {len(bundles)} bundle(s) in one wave")
+    results = LIKE_CI_ROOT / "results"
+    if results.exists():
+        shutil.rmtree(results)
+    start = time.monotonic()
+    rc, _ = run_logged(
+        [
+            sys.executable,
+            str(ROOT / "ci" / "run_test_bundle.py"),
+            "--bundles",
+            *[str(LIKE_CI_ROOT / "bundle" / name) for name in bundles],
+            "--jobs",
+            str(jobs),
+            "--env-variant",
+            "guarded:sample-rate-1",
+            "MIMALLOC_GUARDED_SAMPLE_RATE=1",
+            "--junit-dir",
+            str(results),
+        ],
+        cwd=ROOT,
+        log=log,
+    )
+    run_seconds = time.monotonic() - start
+    if rc:
+        failures.append("run_test_bundle")
+        print_tail(log, 60)
+
+    # No test may be dropped: every name ctest registered must have been executed.
+    compare: list[str] = []
+    for name in bundles:
+        compare += [
+            "--compare",
+            name,
+            str(LIKE_CI_ROOT / "manifests" / f"show-only-{name}.json"),
+            str(results / f"{name}.xml"),
+        ]
+    rc, _ = run_logged(
+        [
+            sys.executable,
+            str(ROOT / "ci" / "bundle_coverage.py"),
+            *compare,
+            "--heading",
+            "Coverage: registered by ctest vs executed by the run stage",
+            "--names",
+            "ctest --show-only",
+            "executed",
+        ],
+        cwd=ROOT,
+        log=log,
+    )
+    if rc:
+        failures.append("bundle_coverage")
+
+    if not like_ci_gates(jobs, log):
+        failures.append("gates")
+
+    print()
+    print(f"stage 1 (build all): {build_seconds:7.1f}s")
+    print(f"stage 2 (run all)  : {run_seconds:7.1f}s")
+    print(f"log                : {log}")
+    if failures:
+        print(f"\nFAILED: {', '.join(failures)}")
+        return 1
+    print("\nlike-ci: PASS")
+    return 0
+
+
+def like_ci_gates(jobs: int, log: Path) -> bool:
+    """The run-stage gates that need the machine to themselves, in c-unit.yml's order.
+
+    `ci/memory_gate.py` check + control, `ci/check_internal_state.py`,
+    `ci/check_release_equivalence.py`, the diagnostic-symbol scan over the two
+    `diag-pprof-*` libraries, `ci/check_isa_baseline.py` over the two `isa-*` libraries,
+    and `ci/check_bun_surface.py --emit-objects` followed by `--objects` (the build/run
+    split #307 introduced so the run stage never recompiles `src/static.c`).
+    """
+    import memory_gate
+
+    ok = True
+    ctx = RunCtx(name="like-ci", dir=LIKE_CI_ROOT, log=log, jobs=jobs, slow=True)
+
+    def find_gate_binary(under: Path) -> Path | None:
+        for name in ("mimalloc-test-memory-gate", "mimalloc-test-memory-gate.exe"):
+            candidate = under / name
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+
+    release_gate = find_gate_binary(LIKE_CI_ROOT / "bundle" / "release")
+    leak_gate = find_gate_binary(LIKE_CI_ROOT / "bundle" / "memory-gate-leak")
+    if release_gate is None or leak_gate is None:
+        log_write(log, "\n[verify_local] FAIL: memory-gate binaries missing from the bundles\n")
+        return False
+    gate_rc, _ = run_captured(
+        log,
+        lambda: memory_gate.check(run_gate_binary_pinned(ctx, release_gate, LIKE_CI_ROOT / "gate")),
+        label="memory_gate.check",
+    )
+    if gate_rc == 2:
+        log_write(log, "\n[verify_local] WARNING: no committed baseline for this platform\n")
+    elif gate_rc != 0:
+        ok = False
+    control_rc, _ = run_captured(
+        log,
+        lambda: memory_gate.control(
+            run_gate_binary_pinned(ctx, leak_gate, LIKE_CI_ROOT / "gate-leak")
+        ),
+        label="memory_gate.control",
+    )
+    ok = ok and control_rc == 0
+
+    def py(*args: str) -> bool:
+        rc, _ = run_logged(["uv", "run", f"ci/{args[0]}", *args[1:]], cwd=ROOT, log=log)
+        return rc == 0
+
+    ok = py("check_internal_state.py") and ok
+    ok = py("check_internal_state.py", "--selftest") and ok
+    ok = py("check_release_equivalence.py", "--selftest") and ok
+
+    for pprof in ("on", "off"):
+        build = LIKE_CI_ROOT / f"diag-pprof-{pprof}" / "build"
+        commands = build / "compile_commands.json"
+        if commands.is_file() and "diagnostic.c" in commands.read_text(encoding="utf-8"):
+            log_write(log, f"\n[verify_local] FAIL: diagnostic.c entered the {pprof} build\n")
+            ok = False
+        libs = sorted(build.glob("libmimalloc*.a"))
+        if not libs:
+            log_write(log, f"\n[verify_local] FAIL: no libmimalloc*.a for diag-pprof-{pprof}\n")
+            ok = False
+            continue
+        _, nm_out = run_logged(["nm", "-a", str(libs[0])], cwd=ROOT, log=log)
+        if re.search(r"_mi_.*diagnostic|_mi_lock_debug", nm_out):
+            log_write(log, f"\n[verify_local] FAIL: diagnostic symbols in the {pprof} library\n")
+            ok = False
+
+    ok = py("check_isa_baseline.py", "--selftest") and ok
+    for name, extra in (("isa-portable", []), ("isa-arch", ["--expect-dirty"])):
+        libs = sorted((LIKE_CI_ROOT / name / "build").glob("libmimalloc*.a"))
+        if not libs:
+            log_write(log, f"\n[verify_local] FAIL: no libmimalloc*.a for {name}\n")
+            ok = False
+            continue
+        ok = py("check_isa_baseline.py", str(libs[0]), *extra) and ok
+
+    # Bun's consumer surface, in the two halves c-unit.yml uses: the build stage compiles
+    # the objects, the run stage only links and runs them.
+    objects = LIKE_CI_ROOT / "bun-objects"
+    emitted = py("check_bun_surface.py", "--emit-objects", str(objects))
+    linked = py("check_bun_surface.py", "--objects", str(objects)) if emitted else False
+    return ok and emitted and linked
+
+
 def format_table(rows: Iterable[Outcome]) -> str:
     rows = list(rows)
     headers = ["config", "result", "seconds", "build dir", "log"]
@@ -1367,6 +1721,12 @@ def main(argv: list[str] | None = None) -> int:
         help="don't skip not-yet-started configs after a failure",
     )
     parser.add_argument(
+        "--like-ci",
+        action="store_true",
+        help="mirror c-unit.yml's two stages (#307): build every configuration once, "
+        "then replay every bundle in one wave with the run-stage gates after it",
+    )
+    parser.add_argument(
         "--selftest", action="store_true", help="trivially fast dry-run; no real builds"
     )
     args = parser.parse_args(argv)
@@ -1387,6 +1747,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.bundle:
         return run_bundle_build(args.bundle, args.jobs or os.cpu_count() or 4)
+
+    if args.like_ci:
+        return run_like_ci(args.jobs or os.cpu_count() or 4)
 
     if args.only:
         requested = [x.strip() for x in args.only.split(",") if x.strip()]

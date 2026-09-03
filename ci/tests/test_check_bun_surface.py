@@ -11,9 +11,12 @@ real one runs on every PR.
 
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
-from check_bun_surface import parse_missing_symbols
+from check_bun_surface import STAMP_NAME, check_stamp, parse_missing_symbols
 
 GNU_LD_SINGLE = (
     "/usr/bin/ld: test-bun-surface.o:(.data.rel.ro+0xd8): "
@@ -74,6 +77,41 @@ class ParseMissingSymbolsTest(unittest.TestCase):
 
     def test_empty_input_returns_empty(self):
         self.assertEqual(parse_missing_symbols(""), [])
+
+
+class PrebuiltObjectStampTest(unittest.TestCase):
+    """#307 compiles the probe's objects in the build stage and links them in the run one.
+
+    The objects are ABI-specific, so the halves have to agree on `--musl`. Without the
+    stamp a musl `static.o` linked by a glibc probe fails as an unexplained pile of
+    linker output rather than as one line saying which half is wrong.
+    """
+
+    def _stamp(self, directory: Path, payload: object) -> None:
+        (directory / STAMP_NAME).write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_matching_stamp_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._stamp(Path(tmp), {"musl": True, "cxx": "c++"})
+            self.assertIsNone(check_stamp(Path(tmp), True))
+
+    def test_musl_mismatch_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._stamp(Path(tmp), {"musl": False, "cxx": "c++"})
+            problem = check_stamp(Path(tmp), True)
+            self.assertIsNotNone(problem)
+            self.assertIn("musl", str(problem))
+
+    def test_a_missing_stamp_names_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            problem = check_stamp(Path(tmp), False)
+            self.assertIsNotNone(problem)
+            self.assertIn(STAMP_NAME, str(problem))
+
+    def test_a_corrupt_stamp_is_reported_not_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / STAMP_NAME).write_text("{not json", encoding="utf-8")
+            self.assertIsNotNone(check_stamp(Path(tmp), False))
 
 
 if __name__ == "__main__":

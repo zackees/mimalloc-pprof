@@ -363,19 +363,33 @@ stack-overflowed in the emulated-TLS recursion above, before `main`. Superseded 
 a cross build, where minject (a Windows PE utility) cannot run at all. Nothing to report
 upstream about minject.
 
-## Not upstreamable: two `MI_PADDING` release-build defects at the pinned base (#301)
+## Candidate: `mi_realloc` frees an interior pointer under `MI_PADDING` (#301)
 
-**Nothing to send upstream — recorded so the next person does not re-derive it.** Both
-defects reproduce on **stock upstream `6def7be9`** (the commit this fork's overlay pins,
-and Bun's mimalloc merge-base) with zero fork changes, and both are **already gone at
-`upstream/dev3` HEAD `34fbd7e7`**, which relabels `MI_OPT_FREE_SMALL` *"Deprecated"*,
-drops its release auto-enable, and validates the aligned-down page lookup against a new
-`page->self` pointer. Stock `34fbd7e7` passes `test-api` 50/50 with
-`-DMI_OPT_FREE_SMALL=ON -DMI_PADDING=1`.
+Both defects #301 turned up reproduce on **stock upstream `6def7be9`** — the commit this
+fork's overlay pins, and Bun's mimalloc merge-base — with zero fork changes. Their status
+against `upstream/dev3` HEAD (`34fbd7e7`) differs, and the difference is easy to get wrong,
+so it is stated here as measured rather than inferred. Full analysis in
+[upstream-bugs.md](upstream-bugs.md) (bugs 4 and 5).
 
-They still matter here, and to anyone else pinned near that base. Full analysis in
-[upstream-bugs.md](upstream-bugs.md) (bugs 4 and 5); the fixes are one hunk each in
-`src/arena.c` and `src/alloc.c`.
+**First, the trap.** A stock `34fbd7e7` build tells you nothing about either defect,
+because `include/mimalloc/types.h:68` there carries an unconditional `#define MI_PADDING 0`
+(added by `cda82f99`) that sits *above* the `MI_TRACK_ASAN`/`MI_SECURE>=3` auto-enable and
+silently clobbers a command-line `-DMI_PADDING=1` with a redefinition warning. `dev3` HEAD
+ships no block padding in any configuration. **That is itself worth reporting upstream** —
+it removes byte-precise `mi_usable_size` and heap-block-overflow detection on free.
+
+With that one line neutralized so padding is genuinely on (`MI_PADDING_SIZE == 8`,
+`mi_good_size(1024) == 1280`, i.e. the requested/block-size divergence is unchanged) and
+`-DMI_OPT_FREE_SMALL=ON`, `dev3` HEAD's `test-api` reports 49 ok / 1 failed:
+
+| Defect | `6def7be9` (our pin) | `34fbd7e7` (dev3 HEAD) | Upstreamable? |
+|---|---|---|---|
+| **4** — `mi_free_small` reads the caller's block as a page (SEGV) | reproduces | does **not** reproduce; small-page free path reworked by `82fd55ff` / `fe5a54c4` / `eab1ebe6` (which of them neutralizes it is not bisected) | no — pinned-base only |
+| **5** — `mi_realloc` frees an interior pointer | reproduces | **still fails** `mi_urealloc_invalid` | **yes** |
+| `MI_PADDING` unreachable (`types.h:68`, `cda82f99`) | n/a | present | **yes** |
+
+The fixes here are one hunk each in `src/arena.c` and `src/alloc.c`; only the `alloc.c` one
+is a candidate for a `pr/*` branch cut from `dev3`.
 
 1. **`mi_free_small` reads the caller's block as a page.** `mi_arenas_page_alloc_fresh`
    keeps the page meta in front of the slice for `block_size <= MI_SMALL_SIZE_MAX`, but
@@ -401,8 +415,13 @@ cmake --build b && ./b/mimalloc-test-api
 `free_small1` segfaults (defect 1); with that fixed, `mi_urealloc_invalid` fails
 (defect 2). Neither reproduces in a `Debug` build, because CMake auto-enables
 `MI_OPT_FREE_SMALL` only when `MI_DEBUG` is off — which is why upstream's ASan
-configuration never saw them either. Add `-DMI_OPT_FREE_SMALL=ON` when checking a tree
-whose CMake no longer auto-enables it.
+configuration never saw them either.
+
+On a `dev3` tree at or after `cda82f99`, two extra steps are required or the run proves
+nothing: delete the unconditional `#define MI_PADDING 0` at `include/mimalloc/types.h:68`,
+and pass `-DMI_OPT_FREE_SMALL=ON` (its release auto-enable is gone there). Check the
+configure output for `MI_OPT_FREE_SMALL=1` and the compile log for the absence of a
+`'MI_PADDING' redefined` warning before believing a green result.
 
 ## Local reproduction
 

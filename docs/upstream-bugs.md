@@ -80,7 +80,7 @@ out-of-memory.
 
 |  |  |
 |---|---|
-| **Affects** | upstream **v3** at `6def7be9` — the base this fork pins, which is also Bun's mimalloc merge-base. **Gone at `dev3` HEAD** (`34fbd7e7`), see *Upstream's own fix* below |
+| **Affects** | upstream **v3** at `6def7be9` — the base this fork pins, which is also Bun's mimalloc merge-base. **Not reproducible at `dev3` HEAD** (`34fbd7e7`), see *What changed at dev3 HEAD* below |
 | **Symptom** | NULL-pointer SEGV in `mi_arenas_page_free_ex` on `free()` of a 1009..1024 byte block |
 | **Status** | **fixed here** — one line in `src/arena.c` |
 
@@ -116,24 +116,53 @@ so the fix is a no-op in ordinary release builds.
 when `MI_DEBUG` is off**. The two therefore coexist only in a release-type sanitizer or
 secure build — and upstream's (and this fork's) ASan job built `Debug`.
 
-**Upstream's own fix.** At `dev3` HEAD (`34fbd7e7`) the option is relabelled
-*"Deprecated"*, the release auto-enable is gone, and the aligned-down lookup is validated
-against a new `page->self` pointer (`mi_ptr_page_is_valid_ex` in `free.c`). Stock
-`34fbd7e7` passes `test-api` 50/50 with `-DMI_OPT_FREE_SMALL=ON -DMI_PADDING=1`, so there
-is nothing to send upstream — but everything pinned at `6def7be9`, Bun included, still has
-this.
+**What changed at `dev3` HEAD — and a third upstream defect found on the way.** Do not
+conclude anything from a stock `34fbd7e7` run: **`MI_PADDING` cannot be enabled there at
+all.** `include/mimalloc/types.h:68` carries a bare, unconditional
+
+<!-- doc-snippet: skip (source excerpt, not a program) -->
+```c
+#define MI_PADDING 0
+```
+
+added by `cda82f99` *("check double free's even without padding", 2026-08-22)*, thirty
+lines *above* the `#if !defined(MI_PADDING) && (… MI_TRACK_ASAN …)` auto-enable it
+defeats. A `-DMI_PADDING=1` on the command line is clobbered by it with nothing but a
+`warning: 'MI_PADDING' redefined`, and `-DMI_TRACK_ASAN=ON` no longer turns padding on
+either. So `dev3` HEAD currently ships **no block padding in any configuration** — no
+byte-precise `mi_usable_size`, no heap-block-overflow detection on free. That is worth
+reporting upstream in its own right.
+
+Neutralize that one line so `MI_PADDING=1` actually takes effect (`MI_PADDING_SIZE == 8`,
+and `mi_good_size(1024) == 1280` — **the requested/block-size divergence is still there**,
+`arena.c:983` still uses the raw `MI_SMALL_SIZE_MAX`, `mi_free_small` still does the bare
+`_mi_align_down_ptr`, and its `page->self` checks are `mi_assert_internal`, compiled out in
+release), rebuild with `-DMI_OPT_FREE_SMALL=ON`, and `test-api` reports **49 ok / 1 failed**:
+
+- `free_small1` **passes** — bug 4 does not reproduce, even though a 1024-byte request
+  still comes back slice-aligned. The small-page free path was reworked in between
+  (`82fd55ff` "aligned page meta info for faster free", `fe5a54c4` / `eab1ebe6`
+  "faster/improve free_small", which introduce `MI_PAGE_META_IS_ALIGNED`,
+  `MI_PAGE_META_SMALL_IS_ALIGNED` and `page->self`). Which of those neutralizes it has not
+  been bisected — the claim here is the measurement, not a mechanism.
+- `mi_urealloc_invalid` **fails** — see bug 5, which *is* still live upstream.
+
+So bug 4 is a pinned-base defect: everything at or near `6def7be9`, Bun included, has it,
+and `dev3` HEAD does not.
 
 ## Bug 5: `mi_realloc` frees an interior pointer when the padding does not decode
 
 |  |  |
 |---|---|
-| **Affects** | upstream **v3** at `6def7be9`, any `MI_PADDING` non-debug build. **Gone at `dev3` HEAD** (`34fbd7e7`) |
+| **Affects** | upstream **v3** at `6def7be9` **and still at `dev3` HEAD** (`34fbd7e7`), any `MI_PADDING` non-debug build |
 | **Symptom** | upstream's own `mi_urealloc_invalid` test fails; an interior pointer is pushed onto the page free list |
 | **Status** | **fixed here** — `src/alloc.c` |
 
 Found in the same configuration as bug 4, and independent of it. Confirmed on **stock
 upstream `6def7be9`, zero fork changes**: the same `RelWithDebInfo -DMI_PADDING=1` build
-reports `FAILED: mi_urealloc_invalid`. Stock `34fbd7e7` does not.
+reports `FAILED: mi_urealloc_invalid`. **Still present at `dev3` HEAD** (`34fbd7e7`) once
+that tree's unconditional `#define MI_PADDING 0` (see bug 4) is neutralized so padding can
+actually be enabled — this one is genuinely upstreamable.
 
 With `MI_PADDING` on, `mi_page_usable_size_of` returns **0** when the padding canary
 does not decode — free.c says so itself: *"size can be zero if the padding is
@@ -157,7 +186,8 @@ builds: no allocation reports 0.
   carrying a patch for.
 - **Pinned to upstream v3 around `6def7be9`** (as Bun is) **and building with a
   sanitizer, Valgrind, ETW tracking or `MI_SECURE>=3` in a release build?** Bugs 4 and 5
-  apply to you. Upstream `dev3` HEAD has moved past both.
+  apply to you. `dev3` HEAD no longer reproduces bug 4; it still has bug 5, and it also
+  cannot enable `MI_PADDING` at all (see bug 4's *What changed* section).
 - **Using this fork?** All of the above are handled — v3 on `main`, and the v2 line
   carries its own variant of the bug 1 fix.
 

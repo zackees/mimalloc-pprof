@@ -280,6 +280,10 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
         mi_arena_pages_t* arena_pages = mi_atomic_load_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i]);
         if (arena_pages!=NULL) {
           mi_atomic_store_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i], NULL);
+          // #316 (P10a): this free now collects in-subproc. Safe here: this thread is deleting
+          // `heap` (mi_heap_free's only caller), so it is not parked, and mi_free_try_collect_mt's
+          // own reclaim guards (_mi_thread_is_initialized, _mi_page_associated_theap_peek refusing
+          // a theap of another heap) apply regardless.
           _mi_free_subproc_safe(arena_pages);
         }
       }
@@ -304,9 +308,11 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
   mi_lock_done(&heap->theaps_lock);
   mi_lock_done(&heap->os_abandoned_pages_lock);
   mi_lock_done(&heap->arena_pages_lock);
-  if (!_mi_is_process_heap_main(heap)) { 
+  if (!_mi_is_process_heap_main(heap)) {
     _mi_thread_local_free(heap->theap);
-    _mi_free_subproc_safe(heap); 
+    // #316 (P10a): same audit as the arena_pages free above -- this thread is deleting `heap`
+    // and is not parked; the collect this can now reach is guarded the same way.
+    _mi_free_subproc_safe(heap);
   }
 }
 

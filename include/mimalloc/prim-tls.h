@@ -147,13 +147,24 @@ static inline void* mi_prim_tls_slot(size_t slot) {
     #else
       return mi_prim_thread_pointer()[slot];
     #endif
+  #elif defined(__GNUC__) || defined(__clang__)
+    // The slot lives in the thread's control block, which the OS reuses for a later thread, so the
+    // exiting thread's last store (`_mi_thread_done`) and a new thread's first load touch the same
+    // address from different threads. A relaxed atomic is the same single load/store instruction and
+    // states that this is by design (and keeps TSAN quiet about it). Ported from oven-sh/mimalloc
+    // (issue #316, Bun parity P10a).
+    return __atomic_load_n(&mi_prim_thread_pointer()[slot], __ATOMIC_RELAXED);
   #else
     return mi_prim_thread_pointer()[slot];
   #endif
 }
 
 static inline void mi_prim_tls_slot_set(size_t slot, void* value) {
+  #if defined(__GNUC__) || defined(__clang__)
+  __atomic_store_n(&mi_prim_thread_pointer()[slot], value, __ATOMIC_RELAXED);
+  #else
   mi_prim_thread_pointer()[slot] = value;
+  #endif
 }
 #endif
 

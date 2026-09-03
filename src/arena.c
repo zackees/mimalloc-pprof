@@ -1589,6 +1589,14 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
     };
   }
   else if (memid.memkind == MI_MEM_MALLOC) {
+    // #316 (P10a): this free now collects in-subproc. No allocation site in this tree
+    // currently produces a MI_MEM_MALLOC memid that reaches here -- `_mi_meta_free` (subproc.c),
+    // the only place that creates one (`_mi_memid_create_malloc`), handles MI_MEM_MALLOC itself
+    // via a plain `mi_free(p)` and only forwards other memkinds to `_mi_arenas_free`; every
+    // caller of `_mi_arenas_free` we audited (heap.c:283/309, arena.c:794/935/1184) passes an
+    // arena- or OS-backed memid. This branch is upstream's fallback, kept for shape parity; if a
+    // future producer reaches it, the collect is guarded the same way as every other
+    // `mi_free_ex` path (`mi_free_try_collect_mt`'s own reclaim guards, unconditional).
     _mi_free_subproc_safe(p);
   }
   else {
@@ -2682,6 +2690,15 @@ mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;  // impor
 // too. This is the same protocol the abandoned-page map already uses
 // (`mi_arena_try_claim_abandoned`).
 //
+// ported from oven-sh/mimalloc commit a26c5de7, MIT (issue #316 / Bun parity P10a): the page
+// struct is only located (`mi_arena_page_at_slice`, which reads `page->block_size` when
+// `MI_PAGE_META_ALIGNED_FREE_SMALL`/`MI_OPT_FREE_SMALL` separates page meta) once the slice is
+// pinned -- before that a concurrent `mi_free` may still be freeing the page and the slice may
+// already be a fresh page of another heap by the time we look. Latent under our default
+// configs (`mi_arena_page_at_slice` is a pure function of `slice_index` there); a correctness
+// fix once `MI_OPT_FREE_SMALL` reads `block_size` off an unpinned slice. Returns the page we
+// now own, or NULL if it is gone.
+//
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): the
 // `_mi_process_is_forked_child` branch below was originally dropped here with a note to
 // "add it back once #270/PR #289 lands" -- #289 landed a handler-only fork design
@@ -2698,11 +2715,13 @@ static void mi_heap_visit_page_seize(mi_page_t* page) {
   mi_page_set_theap(page, NULL);
 }
 
-static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* page, size_t slice_index) {
+static mi_page_t* mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_arena_t* arena, size_t slice_index) {
   mi_bitmap_t* const pages = vinfo->arena_pages->pages;
+  mi_page_t* page = NULL;
   for (;;) {
-    if (!mi_bitmap_clear(pages, slice_index)) return false;   // freed by a concurrent `mi_free`
-    // pinned
+    if (!mi_bitmap_clear(pages, slice_index)) return NULL;   // freed by a concurrent `mi_free`
+    // pinned: now it is a page of this heap and stays one while we hold the bit
+    page = mi_arena_page_at_slice(arena, slice_index);
     #if MI_DEBUG > 0
     if (mi_atomic_load_relaxed(&mi_debug_stall_in_heap_delete_claim) == 1) {
       mi_atomic_store_release(&mi_debug_stall_in_heap_delete_claim, (uintptr_t)2);  // signal: pinned, not yet claimed
@@ -2716,8 +2735,8 @@ static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* pag
       // arena-pages bit propagated but the page-map entry or the owned bit did not, and that
       // thread no longer exists in this process to finish the update. Re-derive what we can
       // and take the page outright; there is nobody left to race.
-      if (mi_page_start(page) == NULL) return false;  // the page struct never made it across: leave it unpublished
-      if (_mi_safe_ptr_page(mi_page_start(page)) != page && !_mi_page_map_register(page)) return false;
+      if (mi_page_start(page) == NULL) return NULL;  // the page struct never made it across: leave it unpublished
+      if (_mi_safe_ptr_page(mi_page_start(page)) != page && !_mi_page_map_register(page)) return NULL;
       mi_page_claim_ownership(page);   // ours now, whether or not the dead thread held it
       mi_bitmap_set(pages, slice_index);
       if (!mi_page_is_abandoned(page)) { mi_heap_visit_page_seize(page); }
@@ -2744,15 +2763,19 @@ static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* pag
   mi_assert_internal(mi_page_is_owned(page) && mi_page_is_abandoned(page));
   mi_assert_internal(mi_bitmap_is_set(pages, slice_index));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page)) == page && mi_page_heap(page) == vinfo->heap);
-  return true;
+  return page;
 }
 
 static bool mi_heap_visit_page_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   MI_UNUSED(slice_count);
   mi_heap_visit_info_t* vinfo = (mi_heap_visit_info_t*)arg;
-  mi_page_t* page = mi_arena_page_at_slice(arena, slice_index);
+  mi_page_t* page;
   if (vinfo->claim_pages) {
-    if (!mi_heap_visit_page_claim(vinfo, page, slice_index)) return true;  // gone: skip
+    page = mi_heap_visit_page_claim(vinfo, arena, slice_index);
+    if (page == NULL) return true;  // gone: freed by a concurrent `mi_free`
+  }
+  else {
+    page = mi_arena_page_at_slice(arena, slice_index);
   }
   return mi_heap_visit_page(page, vinfo);
 }

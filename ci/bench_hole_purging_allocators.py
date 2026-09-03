@@ -133,12 +133,18 @@ CHURN_C_SOURCE = r"""
 #define BENCH_IDLE_ON_THREAD_IDLE 1
 #define BENCH_IDLE_MI_COLLECT    2
 #define BENCH_IDLE_JE_PURGE      3
+#define BENCH_IDLE_MI_COLLECT_FORCE 4
 
 static void bench_on_idle(void) {
 #if BENCH_IDLE_MODE == BENCH_IDLE_ON_THREAD_IDLE
   mi_on_thread_idle();
 #elif BENCH_IDLE_MODE == BENCH_IDLE_MI_COLLECT
   mi_collect(false);
+#elif BENCH_IDLE_MODE == BENCH_IDLE_MI_COLLECT_FORCE
+  /* `true` forces the purge instead of honouring purge_delay, which is 1000 ms on
+     upstream. Without this row, "upstream returns 18% even when told to collect"
+     invites the obvious objection that upstream simply lost to its own delay. */
+  mi_collect(true);
 #elif BENCH_IDLE_MODE == BENCH_IDLE_JE_PURGE
   /* MALLCTL_ARENAS_ALL is jemalloc's own "every arena" pseudo-index; building the
      name by stringifying the macro means a jemalloc that renumbers it cannot leave
@@ -312,12 +318,14 @@ IDLE_NOTHING = 0
 IDLE_ON_THREAD_IDLE = 1
 IDLE_MI_COLLECT = 2
 IDLE_JE_PURGE = 3
+IDLE_MI_COLLECT_FORCE = 4
 
 IDLE_DESCRIPTIONS = {
     IDLE_NOTHING: "nothing (a plain idle process)",
     IDLE_ON_THREAD_IDLE: "mi_on_thread_idle() every 100 ms",
     IDLE_MI_COLLECT: "mi_collect(false) every 100 ms",
     IDLE_JE_PURGE: 'mallctl("arena.<all>.purge") every 100 ms',
+    IDLE_MI_COLLECT_FORCE: "mi_collect(true) every 100 ms",
 }
 
 #: The same mechanisms, for a row that also has to name a non-default knob or window.
@@ -326,6 +334,7 @@ IDLE_SHORT = {
     IDLE_ON_THREAD_IDLE: "mi_on_thread_idle()",
     IDLE_MI_COLLECT: "mi_collect(false)",
     IDLE_JE_PURGE: 'mallctl("arena.<all>.purge")',
+    IDLE_MI_COLLECT_FORCE: "mi_collect(true)",
 }
 
 
@@ -414,13 +423,24 @@ SERIES: tuple[SeriesSpec, ...] = (
         note="is upstream's flat line only a missing API, or a missing mechanism?",
     ),
     SeriesSpec(
+        key="upstream-mimalloc-collect-force",
+        allocator_id="upstream-mimalloc",
+        label="upstream mimalloc, mi_collect(true)",
+        idle=IDLE_MI_COLLECT_FORCE,
+        charted=False,
+        note="did upstream only lose to its own 1000 ms purge_delay, rather than to page "
+        "granularity?",
+    ),
+    SeriesSpec(
         key="jemalloc-background-thread",
         allocator_id="jemalloc",
         label="jemalloc, background_thread:true",
         idle=IDLE_NOTHING,
         charted=False,
         env=((JEMALLOC_CONF_ENV, "background_thread:true"),),
-        note="jemalloc's opt-in decay thread, at the same 10 s window as the chart",
+        note="jemalloc's opt-in decay thread, at the same 10 s window as the chart; the "
+        "only series whose runs do not agree with each other -- see the run-consistency "
+        "footnote the table renders from the run records",
     ),
     SeriesSpec(
         key="jemalloc-background-thread-30s",
@@ -447,12 +467,17 @@ class Sample(NamedTuple):
     rss_kb: int
 
 
-class RunRecord(TypedDict, total=False):
-    """One repetition of one series."""
+class RunRecordMeasurements(TypedDict):
+    """The three numbers every repetition of every series produces."""
 
     peak_rss_mb: float
     idle_start_rss_mb: float
     after_idle_rss_mb: float
+
+
+class RunRecord(RunRecordMeasurements, total=False):
+    """One repetition of one series, plus whatever that allocator can report back."""
+
     #: jemalloc children only: the live `background_thread` setting they read back.
     background_thread: bool
 
@@ -663,6 +688,12 @@ def run_once(exe: Path, seconds: int, extra_env: Sequence[tuple[str, str]] = ())
         raise SystemExit(f"{exe} produced no samples")
     if peak_kb <= 0:
         raise SystemExit(f"{exe} produced no VmHWM reading")
+    # VmHWM and VmRSS are both maintained from per-CPU caches that are only flushed
+    # periodically, so they disagree by a few hundred kB and VmHWM can legitimately read
+    # BELOW a VmRSS sample taken moments earlier -- which it did in 13 of 27 runs while
+    # this was being written. A "peak" under the first post-free sample is nonsense to a
+    # reader, so the peak is the larger of the two.
+    peak_kb = max(peak_kb, samples[0].rss_kb)
     return RunResult(samples=samples, peak_rss_kb=peak_kb, background_thread=background_thread)
 
 
@@ -708,10 +739,10 @@ def measure_series(
 # ---------------------------------------------------------------------------
 
 WIDTH = 1000
-HEIGHT = 520
+HEIGHT = 537
 PAD_LEFT = 64
 PAD_RIGHT = 210
-PAD_TOP = 152
+PAD_TOP = 169
 PAD_BOTTOM = 48
 
 # The dataviz skill's validated categorical slots 1-4, taken verbatim from
@@ -758,6 +789,44 @@ def percent_returned(peak_mb: float, after_mb: float) -> float:
     return (peak_mb - after_mb) / peak_mb * 100 if peak_mb else 0.0
 
 
+#: A run "returned" if it gave back at least half of peak. The measured population is
+#: strongly bimodal -- every run so far has landed either near 0% or near 74% -- so any
+#: threshold in the middle separates them; half is the one that needs no explanation.
+RETURN_THRESHOLD_PCT = 50.0
+
+
+def runs_returned(summary: SeriesSummary) -> tuple[int, int]:
+    """How many of a series' repetitions actually returned memory, and how many ran."""
+    runs = summary["runs"]
+    returned = sum(
+        1
+        for run in runs
+        if percent_returned(run["peak_rss_mb"], run["after_idle_rss_mb"]) >= RETURN_THRESHOLD_PCT
+    )
+    return returned, len(runs)
+
+
+def inconsistent_series(
+    summaries: Mapping[str, SeriesSummary],
+) -> list[tuple[SeriesSummary, int, int]]:
+    """Series whose repetitions disagree about whether memory came back at all.
+
+    The charted figure is the best of 3, so a series that returned memory in only some
+    of its runs would otherwise be reported by its lucky run alone. Computing this from
+    the run records means the caveat cannot go stale the way a hand-written "2 of 3"
+    would on the next measurement.
+    """
+    out: list[tuple[SeriesSummary, int, int]] = []
+    for spec in SERIES:
+        summary = summaries.get(spec.key)
+        if summary is None:
+            continue
+        returned, total = runs_returned(summary)
+        if 0 < returned < total:
+            out.append((summary, returned, total))
+    return out
+
+
 def chart_title(summaries: Mapping[str, SeriesSummary]) -> str:
     """State the takeaway, with the measured numbers in it -- not just the axes.
 
@@ -779,16 +848,29 @@ def chart_title(summaries: Mapping[str, SeriesSummary]) -> str:
 
 
 def caption_lines(summaries: Mapping[str, SeriesSummary]) -> list[str]:
-    """The four sentences without which this chart would be misleading.
+    """The six sentences without which this chart would be misleading.
 
-    The last one is the important one: jemalloc's opt-in background decay thread does
-    return this memory. "by default" in the title is a real qualifier, not a hedge, and
-    a reader has to meet the counter-evidence on the chart itself rather than in a
-    footnote further down the page.
+    An SVG travels: it gets pasted into an issue, a slide, a chat. Every caveat that
+    would change a reader's conclusion has to be on the image itself, not only in the
+    README around it -- that the jemalloc figure is a default-configuration figure and
+    its opt-in decay thread does return the memory, that the mimalloc figure is
+    cooperative rather than something time alone produces, and how many repetitions of a
+    disagreeing series actually returned anything.
     """
     upstream = summaries["upstream-mimalloc"]
     purge = summaries["jemalloc-purge"]
     background = summaries["jemalloc-background-thread"]
+    no_hook = summaries["mimalloc-pprof-no-idle-hook"]
+    collect = summaries["upstream-mimalloc-collect"]
+
+    background_long = summaries["jemalloc-background-thread-30s"]
+
+    # Phrased so that it reads correctly whichever side of the boundary the short
+    # window lands on: jemalloc's default dirty_decay_ms is 10 s and this window is
+    # 10 s, so that row has been measured at both 0% and 73% in different sessions.
+    # Both windows are always stated, and a session whose repetitions disagreed says so.
+    returned, total = runs_returned(background)
+    consistency = "" if returned in (0, total) else f" (in {returned} of {total} runs)"
     return [
         "300k blocks in three small size classes, a scattered 1-in-20 kept alive, the rest "
         "freed, then a 10 s idle window.",
@@ -797,10 +879,22 @@ def caption_lines(summaries: Mapping[str, SeriesSummary]) -> list[str]:
         "jemalloc's decay is advanced by allocation, not by idling: nothing on its own, "
         f"{purge['percent_returned']:.0f}% via an explicit "
         'mallctl("arena.<all>.purge") (dashed).',
-        f"Its opt-in background_thread:true does return it -- "
-        f"{background['percent_returned']:.0f}% over this same window, with nothing called. "
-        "See the diagnostics in the table.",
+        "Its opt-in background_thread:true returns "
+        f"{background['percent_returned']:.0f}% inside this same 10 s window{consistency}, "
+        f"and {background_long['percent_returned']:.0f}% over "
+        f"{background_long['idle_seconds']} s.",
+        "jemalloc's default dirty_decay_ms is 10 s -- exactly this window -- so that row "
+        "sits on the boundary, not past it.",
+        "Cooperative, not passive: mimalloc-pprof with no idle hook returns "
+        f"{no_hook['percent_returned']:.0f}%, upstream given mi_collect() "
+        f"{collect['percent_returned']:.0f}%. See the table.",
     ]
+
+
+#: How close two end-of-window figures have to be before the chart calls them
+#: overlapping. Wide enough to catch the real cluster, narrow enough that a series
+#: which genuinely separated is not swept into the sentence.
+COINCIDENT_TOLERANCE_MB = 2.0
 
 
 def final_mb_of(series: Mapping[str, list[Sample]], spec: SeriesSpec) -> float:
@@ -897,16 +991,19 @@ def render_line_chart(
     )
 
     # Lines that genuinely coincide have to be called out, or a reader counts four.
-    coincident = [
-        s for s in charted if abs(final_mb_of(series, s) - lowest_mb(series, charted)) < 2
-    ]
+    # The tolerance and the number in the sentence are the same quantity, computed:
+    # a hand-written "within 1 MB" beside a 2 MB predicate is how that sentence goes
+    # quietly wrong on the next measurement.
+    lowest = lowest_mb(series, charted)
+    coincident = [s for s in charted if final_mb_of(series, s) - lowest < COINCIDENT_TOLERANCE_MB]
     if len(coincident) > 1:
         names = ", ".join(spec.label for spec in coincident)
+        spread = max(final_mb_of(series, s) for s in coincident) - lowest
         parts.append(
             f'<text x="{elbow_x + 14:.2f}" '
-            f'y="{y_of(lowest_mb(series, charted)) - 12:.2f}" font-size="11" '
-            f'fill="{theme.muted}">{escape(names)} overlap here, within 1 MB of each '
-            "other</text>"
+            f'y="{y_of(lowest) - 12:.2f}" font-size="11" '
+            f'fill="{theme.muted}">{escape(names)} overlap here, within '
+            f"{spread:.1f} MB of each other</text>"
         )
 
     # Direct end-of-line labels, each with its own line swatch: with five series the
@@ -968,7 +1065,8 @@ def render_table_svg(summaries: Mapping[str, SeriesSummary], theme: Theme, sourc
     rows = [summaries[s.key] for s in SERIES if s.key in summaries]
     n_charted = sum(1 for s in SERIES if s.charted and s.key in summaries)
     sep_gap = ROW_H // 2
-    height = TITLE_H + HEADER_H + ROW_H * len(rows) + sep_gap + 40
+    footnote_count = 1 + len(inconsistent_series(summaries))
+    height = TITLE_H + HEADER_H + ROW_H * len(rows) + sep_gap + 25 + 15 * footnote_count
 
     parts: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {TABLE_WIDTH} {height}" '
@@ -982,7 +1080,7 @@ def render_table_svg(summaries: Mapping[str, SeriesSummary], theme: Theme, sourc
         f"{escape(source_line)}</text>",
         f'<text x="{COL_LABEL_X}" y="61" font-size="12" fill="{theme.muted}">'
         "Peak is VmHWM; after-idle is VmRSS at the end of the idle window (10 s unless the "
-        "row says otherwise).</text>",
+        "row says otherwise). Both are kernel counters, good to a few hundred kB.</text>",
     ]
 
     header_y = TITLE_H + 14
@@ -1035,10 +1133,19 @@ def render_table_svg(summaries: Mapping[str, SeriesSummary], theme: Theme, sourc
             )
         top = bottom
 
-    parts.append(
-        f'<text x="{COL_LABEL_X}" y="{top + 22}" font-size="11" fill="{theme.muted}">'
-        "Rows below the dashed rule are diagnostics, not part of the chart.</text>"
-    )
+    footnotes = ["Rows below the dashed rule are diagnostics, not part of the chart."]
+    # A series whose repetitions disagree is reported by its best run like every other
+    # series, so the disagreement itself has to be on the image.
+    for summary, returned, total in inconsistent_series(summaries):
+        footnotes.append(
+            f"{summary['label']} returned memory in only {returned} of {total} runs; "
+            "the figure above is the best of them, as it is for every row."
+        )
+    for index, footnote in enumerate(footnotes):
+        parts.append(
+            f'<text x="{COL_LABEL_X}" y="{top + 22 + index * 15}" font-size="11" '
+            f'fill="{theme.muted}">{escape(footnote)}</text>'
+        )
     parts.append("</g></svg>")
     return "\n".join(parts) + "\n"
 
@@ -1084,8 +1191,8 @@ def probe_machine() -> tuple[str, str]:
     return cpu or platform.machine(), platform.release()
 
 
-def format_source_line(commit: str, cpu: str, kernel: str) -> str:
-    return f"measured at {commit}, {cpu}, {kernel}, taskset -c 0-3, best of 3 runs"
+def format_source_line(commit: str, cpu: str, kernel: str, runs: int) -> str:
+    return f"measured at {commit}, {cpu}, {kernel}, taskset -c 0-3, best of {runs} runs"
 
 
 def git_commit(repo_root: Path) -> str:
@@ -1101,10 +1208,11 @@ def git_commit(repo_root: Path) -> str:
     return out.stdout.strip()
 
 
-SELECTION_RULE = (
-    "per series, the run with the lowest after-idle VmRSS of 3 repetitions; the same "
-    "rule for every allocator"
-)
+def selection_rule(runs: int) -> str:
+    return (
+        f"per series, the run with the lowest after-idle VmRSS of {runs} repetitions; the "
+        "same rule for every allocator"
+    )
 
 
 def record_run(run: RunResult) -> RunRecord:
@@ -1237,7 +1345,9 @@ def main(argv: list[str] | None = None) -> int:
         # Read the committed machine/commit fields back rather than re-probing this
         # machine: otherwise the caption drifts from the SVG on every rebase or on a
         # different box, and --check could never pass anywhere but where it was made.
-        source_line = format_source_line(report["commit"], report["cpu"], report["kernel"])
+        source_line = format_source_line(
+            report["commit"], report["cpu"], report["kernel"], report["runs_per_series"]
+        )
         summaries = report["series"]
     else:
         if args.build_root is None:
@@ -1248,7 +1358,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         commit = git_commit(REPO_ROOT)
         cpu, kernel = probe_machine()
-        source_line = format_source_line(commit, cpu, kernel)
+        source_line = format_source_line(commit, cpu, kernel, args.runs)
         series, summaries = measure_all(
             args.build_root.resolve(), args.jobs, args.seconds, args.runs, args.lockfile
         )
@@ -1258,7 +1368,7 @@ def main(argv: list[str] | None = None) -> int:
             "kernel": kernel,
             "runs_per_series": args.runs,
             "idle_seconds": args.seconds,
-            "selection_rule": SELECTION_RULE,
+            "selection_rule": selection_rule(args.runs),
             "skipped_allocators": list(SKIPPED_ALLOCATORS),
             "series": summaries,
         }

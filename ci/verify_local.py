@@ -682,6 +682,14 @@ def run_lint(ctx: RunCtx) -> bool:
         ["uv", "run", "ci/check_rust_surface.py"],
         ["uv", "run", "ci/check_isa_baseline.py", "--help"],
         ["uv", "run", "ci/check_release_equivalence.py", "--help"],
+        # The committed chart SVGs must still re-render byte-for-byte from the
+        # committed CSV/JSON. Nothing ran these before, so a renderer edit could ship
+        # SVGs whose captions no longer matched the data they claim to come from.
+        # `--check` re-renders and compares; it never re-measures.
+        ["uv", "run", "ci/bench_hole_purging.py", "--check"],
+        ["uv", "run", "ci/bench_hole_purging.py", "--check", "--table"],
+        ["uv", "run", "ci/bench_hole_purging_allocators.py", "--check"],
+        ["uv", "run", "ci/bench_hole_purging_allocators.py", "--check", "--table"],
     ):
         rc, _ = run_logged(cmd, cwd=ROOT, log=ctx.log)
         ok = ok and rc == 0

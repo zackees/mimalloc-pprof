@@ -28,7 +28,9 @@ class BenchHolePurgingAllocatorsTests(unittest.TestCase):
 
     def test_line_chart_svg_is_well_formed_and_names_every_series(self) -> None:
         report, series = self.load()
-        source_line = bench.format_source_line(report["commit"], report["cpu"], report["kernel"])
+        source_line = bench.format_source_line(
+            report["commit"], report["cpu"], report["kernel"], report["runs_per_series"]
+        )
         for theme in (bench.LIGHT, bench.DARK):
             svg = bench.render_line_chart(series, report["series"], theme, source_line)
             root = ET.fromstring(svg)  # raises if malformed
@@ -58,7 +60,9 @@ class BenchHolePurgingAllocatorsTests(unittest.TestCase):
 
     def test_table_svg_lists_charted_rows_then_diagnostics(self) -> None:
         report, _ = self.load()
-        source_line = bench.format_source_line(report["commit"], report["cpu"], report["kernel"])
+        source_line = bench.format_source_line(
+            report["commit"], report["cpu"], report["kernel"], report["runs_per_series"]
+        )
         for theme in (bench.LIGHT, bench.DARK):
             svg = bench.render_table_svg(report["series"], theme, source_line)
             root = ET.fromstring(svg)
@@ -100,24 +104,116 @@ class BenchHolePurgingAllocatorsTests(unittest.TestCase):
             self.assertIsNone(spec.seconds, f"{spec.key} is charted with its own window")
 
     def test_from_data_matches_committed_svgs(self) -> None:
-        """The committed assets must reproduce byte-for-byte from the committed
-        CSV/JSON -- otherwise an SVG and the caption it carries (commit, CPU, kernel)
-        can silently drift apart."""
+        """Every committed asset must reproduce byte-for-byte from the committed
+        CSV/JSON -- otherwise an SVG and the caption it carries (commit, CPU, kernel,
+        repetition count) can silently drift apart. All four: a dark theme that had
+        stopped reproducing would have gone unnoticed while the light one passed."""
         csv_path = ASSETS / "allocator-idle-rss.csv"
         json_path = ASSETS / "allocator-idle-report.json"
         if not csv_path.exists() or not json_path.exists():
             self.skipTest("no committed allocator-idle assets in this checkout")
         report = bench.load_report_json(json_path)
         series = bench.load_csv(csv_path)
-        source_line = bench.format_source_line(report["commit"], report["cpu"], report["kernel"])
-        self.assertEqual(
-            (ASSETS / "allocator-idle-rss-light.svg").read_text(encoding="utf-8"),
-            bench.render_line_chart(series, report["series"], bench.LIGHT, source_line),
+        source_line = bench.format_source_line(
+            report["commit"], report["cpu"], report["kernel"], report["runs_per_series"]
         )
+        for theme in (bench.LIGHT, bench.DARK):
+            with self.subTest(theme=theme.name):
+                self.assertEqual(
+                    (ASSETS / f"allocator-idle-rss-{theme.name}.svg").read_text(encoding="utf-8"),
+                    bench.render_line_chart(series, report["series"], theme, source_line),
+                )
+                self.assertEqual(
+                    (ASSETS / f"allocator-idle-table-{theme.name}.svg").read_text(encoding="utf-8"),
+                    bench.render_table_svg(report["series"], theme, source_line),
+                )
+
+    def test_a_forcing_collect_row_backs_the_purge_delay_objection(self) -> None:
+        """The README says upstream returns the same 18% when the collect is forced.
+        That sentence needs a measured row behind it, not a side experiment."""
+        spec = next(s for s in bench.SERIES if s.key == "upstream-mimalloc-collect-force")
+        self.assertEqual(spec.idle, bench.IDLE_MI_COLLECT_FORCE)
+        self.assertEqual(spec.allocator_id, "upstream-mimalloc")
+        self.assertFalse(spec.charted)
+        self.assertIn("mi_collect(true)", bench.IDLE_DESCRIPTIONS[bench.IDLE_MI_COLLECT_FORCE])
+        self.assertIn("mi_collect(true);", bench.CHURN_C_SOURCE)
+        report, _ = self.load()
+        self.assertIn("upstream-mimalloc-collect-force", report["series"])
+
+    def test_a_series_whose_runs_disagree_is_counted_from_the_run_records(self) -> None:
+        """A "2 of 3" written by hand goes stale on the next measurement; this one is
+        computed, and it is the reason the table grows a footnote."""
+        report, _ = self.load()
+        consistent: bench.SeriesSummary = dict(report["series"]["mimalloc-pprof"])  # type: ignore[assignment]
+        consistent["runs"] = [
+            {"peak_rss_mb": 100.0, "idle_start_rss_mb": 100.0, "after_idle_rss_mb": 20.0},
+            {"peak_rss_mb": 100.0, "idle_start_rss_mb": 100.0, "after_idle_rss_mb": 21.0},
+        ]
+        self.assertEqual(bench.runs_returned(consistent), (2, 2))
+        flaky: bench.SeriesSummary = dict(consistent)  # type: ignore[assignment]
+        flaky["runs"] = [
+            *consistent["runs"],
+            {
+                "peak_rss_mb": 100.0,
+                "idle_start_rss_mb": 100.0,
+                "after_idle_rss_mb": 100.0,
+            },
+        ]
+        self.assertEqual(bench.runs_returned(flaky), (2, 3))
+        self.assertEqual(bench.inconsistent_series({"mimalloc-pprof": consistent}), [])
         self.assertEqual(
-            (ASSETS / "allocator-idle-table-light.svg").read_text(encoding="utf-8"),
-            bench.render_table_svg(report["series"], bench.LIGHT, source_line),
+            [
+                (returned, total)
+                for _, returned, total in bench.inconsistent_series({"mimalloc-pprof": flaky})
+            ],
+            [(2, 3)],
         )
+
+    def test_a_disagreeing_series_is_named_on_the_table_and_in_the_caption(self) -> None:
+        """Built synthetically on purpose. The committed run happens to be 3-of-3 on
+        every series, so asserting against it would pass vacuously -- and the
+        `background_thread` row is the one that has genuinely landed both ways, since
+        jemalloc's default `dirty_decay_ms` is exactly this window."""
+        report, _ = self.load()
+        summaries = dict(report["series"])
+        flaky: bench.SeriesSummary = dict(summaries["jemalloc-background-thread"])  # type: ignore[assignment]
+        flaky["runs"] = [
+            {"peak_rss_mb": 280.0, "idle_start_rss_mb": 280.0, "after_idle_rss_mb": 76.0},
+            {"peak_rss_mb": 280.0, "idle_start_rss_mb": 280.0, "after_idle_rss_mb": 76.0},
+            {"peak_rss_mb": 280.0, "idle_start_rss_mb": 280.0, "after_idle_rss_mb": 280.0},
+        ]
+        flaky["percent_returned"] = 73.0
+        summaries["jemalloc-background-thread"] = flaky
+
+        table = bench.render_table_svg(summaries, bench.LIGHT, "src")
+        self.assertIn("only 2 of 3 runs", table)
+        self.assertIn("(in 2 of 3 runs)", " ".join(bench.caption_lines(summaries)))
+
+        # ...and the same rendering says nothing of the kind for the committed run.
+        self.assertNotIn("of 3 runs;", bench.render_table_svg(report["series"], bench.LIGHT, "s"))
+
+    def test_the_caption_always_states_both_jemalloc_background_windows(self) -> None:
+        """The 10 s row sits exactly on jemalloc's default dirty_decay_ms, so it has
+        been measured at both 0% and 73%. Whichever side it lands on, the caption has
+        to carry the longer window too, or the chart reads as a verdict on jemalloc's
+        decay thread that the data does not support."""
+        report, _ = self.load()
+        captions = " ".join(bench.caption_lines(report["series"]))
+        short = report["series"]["jemalloc-background-thread"]
+        longer = report["series"]["jemalloc-background-thread-30s"]
+        self.assertIn(f"{short['percent_returned']:.0f}% inside this same 10 s window", captions)
+        self.assertIn(
+            f"{longer['percent_returned']:.0f}% over {longer['idle_seconds']} s", captions
+        )
+        self.assertIn("dirty_decay_ms", captions)
+
+    def test_the_caption_carries_the_cooperative_caveat(self) -> None:
+        """An SVG gets pasted into issues and slides on its own; the caveat that the
+        74% needs an idle call has to travel with it."""
+        report, _ = self.load()
+        captions = " ".join(bench.caption_lines(report["series"]))
+        self.assertIn("no idle hook", captions)
+        self.assertIn("mi_collect()", captions)
 
     def test_readme_alt_text_matches_the_rendered_chart_title(self) -> None:
         """The README's `<img alt>` states the takeaway; it has to be the same

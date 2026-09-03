@@ -1752,5 +1752,91 @@ class BenchmarkReportTests(unittest.TestCase):
         self.assertEqual("5.0M", report.format_throughput(5_000_000.0, megabyte_unit))
 
 
+class LegacyAllocatorLineageTests(unittest.TestCase):
+    """The published branch still carries artifacts recorded before the Bun row
+    landed (#325). They must keep validating, carrying forward, and rendering:
+    a lineage that stops parsing is a lineage that has been silently rewritten."""
+
+    LEGACY = FIXTURE / "legacy"
+
+    def load_legacy_latest(self) -> dict[str, object]:
+        return json.loads((self.LEGACY / "latest.json").read_text(encoding="utf-8"))
+
+    def legacy_with_optional_sections(self) -> dict[str, object]:
+        """The pre-#325 envelope with complete memory/latency/scaling sections,
+        built against the four-allocator set those runs actually measured."""
+
+        helper = BenchmarkReportTests("test_memory_section_sits_next_to_throughput")
+        with mock.patch.object(report, "ALLOCATOR_IDS", report.LEGACY_ALLOCATOR_IDS):
+            legacy = self.load_legacy_latest()
+            legacy = helper.with_complete_memory(legacy)
+            legacy = helper.with_complete_latency(legacy)
+            return helper.with_complete_scaling(legacy)
+
+    def test_the_current_allocator_set_is_the_newest_accepted_lineage(self) -> None:
+        self.assertEqual(report.ALLOCATOR_IDS, report.ALLOCATOR_ID_LINEAGES[-1])
+        self.assertIn(report.LEGACY_ALLOCATOR_IDS, report.ALLOCATOR_ID_LINEAGES)
+        self.assertNotIn("bun-mimalloc", report.LEGACY_ALLOCATOR_IDS)
+
+    def test_an_unknown_allocator_set_is_still_rejected(self) -> None:
+        with self.assertRaises(report.ReportError):
+            report.declared_allocators(["tcmalloc", "jemalloc"], "truncated")
+        with self.assertRaises(report.ReportError):
+            report.declared_allocator_order(list(reversed(report.ALLOCATOR_IDS)), "out of order")
+
+    def test_a_four_allocator_history_row_still_validates(self) -> None:
+        row = json.loads((self.LEGACY / "history.jsonl").read_text(encoding="utf-8"))
+        identities = row["allocator_identities"]
+        assert isinstance(identities, list)
+        self.assertEqual(
+            list(report.LEGACY_ALLOCATOR_IDS),
+            [item["allocator_id"] for item in identities],
+        )
+        report.validate_history_row(row, "legacy history")
+
+    def test_a_four_allocator_latest_still_validates(self) -> None:
+        report.validate_latest(self.legacy_with_optional_sections(), "legacy latest")
+
+    def test_sections_measured_before_the_bun_row_carry_onto_a_five_row_latest(self) -> None:
+        current = json.loads((FIXTURE / "latest.json").read_text(encoding="utf-8"))
+        self.assertNotIn("memory", current)
+        self.assertTrue(
+            report.carry_forward_optional_metrics(current, self.legacy_with_optional_sections())
+        )
+        # The core run is five rows, the carried sections are four; the envelope
+        # must still validate and render rather than going red on the first run
+        # after a new allocator lands.
+        report.validate_latest(current, "mixed latest")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            source.write_text(json.dumps(current) + "\n", encoding="utf-8", newline="\n")
+            site = root / "site"
+            report.render(source, self.LEGACY / "history.jsonl", site, root / "digest", False)
+            self.assertTrue((site / "index.html").is_file())
+            self.assertTrue((site / "benchmark-rss-timeline.png").is_file())
+
+    def test_a_carried_section_may_not_carry_a_different_pin(self) -> None:
+        """Tolerating a missing row must not tolerate a moved one: if the core
+        run rebuilt a competitor from another commit, its carried-forward memory
+        numbers no longer describe that build."""
+
+        current = json.loads((FIXTURE / "latest.json").read_text(encoding="utf-8"))
+        self.assertTrue(
+            report.carry_forward_optional_metrics(current, self.legacy_with_optional_sections())
+        )
+        report.validate_latest(current, "mixed latest")
+        allocators = current["allocators"]
+        assert isinstance(allocators, list)
+        moved = next(
+            item
+            for item in allocators
+            if isinstance(item, dict) and item["allocator_id"] == "upstream-mimalloc"
+        )
+        moved["source_sha"] = "f" * 40
+        with self.assertRaisesRegex(report.ReportError, "allocator source pins"):
+            report.validate_latest(current, "moved competitor pin")
+
+
 if __name__ == "__main__":
     unittest.main()

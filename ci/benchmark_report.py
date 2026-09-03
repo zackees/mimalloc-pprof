@@ -26,7 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import NoReturn, cast
@@ -48,6 +48,17 @@ ALLOCATOR_IDS = (
 # metric overlaid onto an older core envelope must match these exactly; the
 # fork's own commit legitimately moves between the two runs.
 LOCK_PINNED_ALLOCATORS = ("tcmalloc", "jemalloc", "upstream-mimalloc", "bun-mimalloc")
+# The allocator set published before the Bun row landed (#325).
+LEGACY_ALLOCATOR_IDS = ("tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-pprof")
+# Every allocator set this validator will accept, oldest first. New production
+# runs carry ALLOCATOR_IDS, but the published branch still holds history rows --
+# and a `latest.json` whose optional memory/latency/scaling sections are carried
+# forward between metric runs -- recorded before the Bun row existed, and those
+# must keep validating and rendering forever: a lineage that stops parsing is a
+# lineage that has been silently rewritten. A report is checked against the set
+# it declares, not against the current one. This mirrors
+# SCALING_THREAD_POINT_LINEAGES below.
+ALLOCATOR_ID_LINEAGES = (LEGACY_ALLOCATOR_IDS, ALLOCATOR_IDS)
 VALIDATION_CHECKS = (
     "schema-and-versions",
     "run-identity",
@@ -396,6 +407,48 @@ class ReportError(RuntimeError):
 
 def fail(message: str) -> NoReturn:
     raise ReportError(message)
+
+
+def validate_carried_pins(
+    observed: set[tuple[str, str]], expected: set[tuple[str, str]], label: str
+) -> None:
+    """Every (allocator, source) pair an optional metric section carries must be
+    a pair the core run also carries.
+
+    Pairs rather than a mapping: a mapping keeps only the last sample per
+    allocator, which would let a single mispinned sample through.
+
+    Subset rather than equality: an optional metric is measured on its own
+    schedule and carried forward onto later core envelopes, so a section
+    published before a new allocator row landed (#325) legitimately carries
+    fewer rows than the core run. It may never carry a different pin, or a row
+    the core run does not have.
+    """
+
+    if not observed or observed - expected:
+        fail(f"{label}: allocator source pins differ from the core run")
+
+
+def declared_allocators(ids: Iterable[object], label: str) -> tuple[str, ...]:
+    """The accepted allocator set a report actually carries, in canonical order.
+
+    Matching by set, so callers that collect ids out of summaries do not have to
+    sort them first."""
+
+    observed = set(ids)
+    for lineage in ALLOCATOR_ID_LINEAGES:
+        if observed == set(lineage):
+            return lineage
+    fail(f"{label}: not an accepted allocator set: {sorted(str(value) for value in observed)}")
+
+
+def declared_allocator_order(ids: Sequence[object], label: str) -> tuple[str, ...]:
+    """Same, where the declared order is itself part of the contract."""
+
+    for lineage in ALLOCATOR_ID_LINEAGES:
+        if tuple(ids) == lineage:
+            return lineage
+    fail(f"{label}: not an accepted allocator set in canonical order")
 
 
 def object_value(value: object, label: str) -> dict[str, object]:
@@ -1065,11 +1118,14 @@ def validate_memory_report(
             list_value(report.get("paired_summaries"), f"{label}.paired_summaries")
         )
     ]
+    declared = declared_allocators(
+        (item["allocator_id"] for item in absolute), f"{label}.absolute_summaries"
+    )
     expected_absolute = {
         (scenario, point, metric, allocator)
         for scenario, point in MEMORY_CELLS
         for metric in MEMORY_METRICS
-        for allocator in ALLOCATOR_IDS
+        for allocator in declared
     }
     actual_absolute = {
         (item["scenario_id"], item["thread_point"], item["metric_id"], item["allocator_id"])
@@ -1080,7 +1136,7 @@ def validate_memory_report(
         (scenario, point, metric, allocator)
         for scenario, point in MEMORY_CELLS
         for metric in MEMORY_METRICS
-        for allocator in ALLOCATOR_IDS
+        for allocator in declared
         if allocator != "upstream-mimalloc"
     }
     actual_paired = {
@@ -1149,7 +1205,7 @@ def validate_memory_report(
         prior_identity = allocator_identities.setdefault(sample["allocator_id"], identity)
         if prior_identity != identity:
             fail(f"{label}: allocator identity changed within the memory run")
-    if len(run_seeds) != 1 or set(allocator_identities) != set(ALLOCATOR_IDS):
+    if len(run_seeds) != 1 or set(allocator_identities) != set(declared):
         fail(f"{label}: memory run seed or allocator provenance is incomplete")
     blocks_by_cell: dict[tuple[object, object], set[object]] = {}
     for (scenario, point, block), samples in groups.items():
@@ -1157,9 +1213,9 @@ def validate_memory_report(
         ordinals = {sample["ordinal"] for sample in samples}
         seeds = {sample["workload_seed"] for sample in samples}
         if (
-            len(samples) != len(ALLOCATOR_IDS)
-            or ids != set(ALLOCATOR_IDS)
-            or ordinals != set(range(len(ALLOCATOR_IDS)))
+            len(samples) != len(declared)
+            or ids != set(declared)
+            or ordinals != set(range(len(declared)))
             or len(seeds) != 1
         ):
             fail(f"{label}: incomplete memory pair for {scenario}/{point}/block-{block}")
@@ -1472,10 +1528,17 @@ def validate_latency_report(
             fail(f"{label}.methodology: transaction boundary must include allocation through free")
 
     absolute = list_value(report.get("absolute_summaries"), f"{label}.absolute_summaries")
-    if len(absolute) != len(LATENCY_CELLS) * len(ALLOCATOR_IDS):
+    declared = declared_allocators(
+        [
+            object_value(value, f"{label}.absolute_summaries[{index}]").get("allocator_id")
+            for index, value in enumerate(absolute)
+        ],
+        f"{label}.absolute_summaries",
+    )
+    if len(absolute) != len(LATENCY_CELLS) * len(declared):
         fail(
             f"{label}.absolute_summaries: expected exact "
-            f"{len(LATENCY_CELLS)}x{len(ALLOCATOR_IDS)} matrix"
+            f"{len(LATENCY_CELLS)}x{len(declared)} matrix"
         )
     absolute_keys: set[tuple[str, str, str]] = set()
     for index, value in enumerate(absolute):
@@ -1527,7 +1590,7 @@ def validate_latency_report(
             fail(f"{label}.absolute_summaries[{index}]: control/sample threshold failed")
 
     paired = list_value(report.get("paired_summaries"), f"{label}.paired_summaries")
-    if len(paired) != len(LATENCY_CELLS) * (len(ALLOCATOR_IDS) - 1) * len(LATENCY_QUANTILES):
+    if len(paired) != len(LATENCY_CELLS) * (len(declared) - 1) * len(LATENCY_QUANTILES):
         fail(f"{label}.paired_summaries: expected exact quantile matrix")
     paired_keys: set[tuple[str, str, str, str]] = set()
     for index, value in enumerate(paired):
@@ -1570,7 +1633,7 @@ def validate_latency_report(
             item.get("control"), f"{label}.block_summaries[{index}].control"
         )
     for scenario, point in LATENCY_CELLS:
-        for allocator in ALLOCATOR_IDS:
+        for allocator in declared:
             if sum(1 for key in block_keys if key[:3] == (scenario, point, allocator)) < 15:
                 fail(f"{label}: incomplete block matrix for {scenario}/{point}/{allocator}")
 
@@ -1737,7 +1800,7 @@ def validate_latency_report(
         raw_blocks.setdefault(pair_key, []).append(item)
     for scenario, point in LATENCY_CELLS:
         cell_block_ids: set[int] | None = None
-        for allocator in ALLOCATOR_IDS:
+        for allocator in declared:
             group = raw_groups.get((scenario, point, allocator), [])
             block_ids = {cast(int, item["block_id"]) for item in group}
             if len(group) < 15 or len(block_ids) != len(group):
@@ -1768,13 +1831,13 @@ def validate_latency_report(
             fail(f"{label}: latency cells do not share an exact raw block set")
     if common_block_ids is None or common_block_ids != set(range(len(common_block_ids))):
         fail(f"{label}: latency block IDs must be contiguous from zero")
-    if len(raw) != len(LATENCY_CELLS) * len(ALLOCATOR_IDS) * len(common_block_ids):
+    if len(raw) != len(LATENCY_CELLS) * len(declared) * len(common_block_ids):
         fail(f"{label}: raw latency matrix contains missing or extra records")
     for (scenario, point, block_id), group in raw_blocks.items():
         if (
-            len(group) != len(ALLOCATOR_IDS)
-            or {item["allocator_id"] for item in group} != set(ALLOCATOR_IDS)
-            or {item["ordinal"] for item in group} != set(range(len(ALLOCATOR_IDS)))
+            len(group) != len(declared)
+            or {item["allocator_id"] for item in group} != set(declared)
+            or {item["ordinal"] for item in group} != set(range(len(declared)))
             or len({item["workload_seed"] for item in group}) != 1
         ):
             fail(f"{label}: incomplete paired raw block {scenario}/{point}/{block_id}")
@@ -1892,8 +1955,7 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
             report.get("allocator_ids"), f"{label}.validation_report.allocator_ids"
         )
     )
-    if ids != ALLOCATOR_IDS:
-        fail(f"{label}.validation_report.allocator_ids: expected exact headline allocators")
+    declared = declared_allocator_order(ids, f"{label}.validation_report.allocator_ids")
     checks = [
         string_value(value, f"{label}.validation_report.checks")
         for value in list_value(report.get("checks"), f"{label}.validation_report.checks")
@@ -1905,9 +1967,9 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
     validate_run(latest.get("run"), f"{label}.run")
     validate_runner(latest.get("runner"), f"{label}.runner")
     allocators = list_value(latest.get("allocators"), f"{label}.allocators")
-    if len(allocators) != len(ALLOCATOR_IDS):
-        fail(f"{label}.allocators: expected exactly five")
-    for index, allocator_id in enumerate(ALLOCATOR_IDS):
+    if len(allocators) != len(declared):
+        fail(f"{label}.allocators: expected exactly {len(declared)}")
+    for index, allocator_id in enumerate(declared):
         validate_allocator_build(allocators[index], f"{label}.allocators[{index}]", allocator_id)
     calibrations = list_value(latest.get("calibrations"), f"{label}.calibrations")
     if len(calibrations) != 30 or len(samples) < 1800:
@@ -1977,60 +2039,53 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
         or methodology.get("informational") is not True
     ):
         fail(f"{label}.methodology: unsupported methodology contract")
+    core_pins = {
+        (
+            str(object_value(value, f"{label}.allocators")["allocator_id"]),
+            str(object_value(value, f"{label}.allocators")["source_sha"]),
+        )
+        for value in allocators
+    }
     memory = latest.get("memory")
     if memory is not None:
         memory_report = validate_memory_report(memory, f"{label}.memory")
-        expected_sources = {
-            object_value(value, f"{label}.allocators")["allocator_id"]: object_value(
-                value, f"{label}.allocators"
-            )["source_sha"]
-            for value in allocators
-        }
-        observed_sources = {
-            object_value(value, f"{label}.memory.raw_samples")["allocator_id"]: object_value(
-                value, f"{label}.memory.raw_samples"
-            )["allocator_source_sha"]
-            for value in list_value(memory_report["raw_samples"], f"{label}.memory.raw_samples")
-        }
-        if observed_sources != expected_sources:
-            fail(f"{label}.memory: allocator source pins differ from the core run")
+        validate_carried_pins(
+            {
+                (
+                    str(object_value(value, f"{label}.memory.raw_samples")["allocator_id"]),
+                    str(object_value(value, f"{label}.memory.raw_samples")["allocator_source_sha"]),
+                )
+                for value in list_value(memory_report["raw_samples"], f"{label}.memory.raw_samples")
+            },
+            core_pins,
+            f"{label}.memory",
+        )
     latency = latest.get("latency")
     if latency is not None:
         latency_report = validate_latency_report(latency, f"{label}.latency")
-        expected_sources = {
-            object_value(value, f"{label}.allocators")["allocator_id"]: object_value(
-                value, f"{label}.allocators"
-            )["source_sha"]
-            for value in allocators
-        }
-        observed_sources = {
-            object_value(value, f"{label}.latency.raw_samples")["allocator_id"]: object_value(
-                value, f"{label}.latency.raw_samples"
-            )["allocator_source_sha"]
-            for value in list_value(latency_report["raw_samples"], f"{label}.latency.raw_samples")
-        }
-        if observed_sources != expected_sources:
-            fail(f"{label}.latency: allocator source pins differ from the core run")
+        validate_carried_pins(
+            {
+                (
+                    str(object_value(value, f"{label}.latency.raw_samples")["allocator_id"]),
+                    str(
+                        object_value(value, f"{label}.latency.raw_samples")["allocator_source_sha"]
+                    ),
+                )
+                for value in list_value(
+                    latency_report["raw_samples"], f"{label}.latency.raw_samples"
+                )
+            },
+            core_pins,
+            f"{label}.latency",
+        )
     scaling = latest.get("scaling")
     if scaling is not None:
         scaling_report = validate_scaling_report(scaling, f"{label}.scaling")
-        # Compare the set of (allocator, source) pairs rather than a mapping:
-        # a mapping keeps only the last sample per allocator, which would let a
-        # single mispinned sample through.
-        #
         # Only the lock-pinned competitors must match the core run. The sweep
         # runs weekly and overlays onto whichever daily core envelope is
         # published, so the fork's own commit is normally newer; requiring
         # equality there would make the overlay permanently unpublishable.
-        expected_pairs = {
-            (
-                str(object_value(value, f"{label}.allocators")["allocator_id"]),
-                str(object_value(value, f"{label}.allocators")["source_sha"]),
-            )
-            for value in allocators
-            if str(object_value(value, f"{label}.allocators")["allocator_id"])
-            in LOCK_PINNED_ALLOCATORS
-        }
+        expected_pairs = {pair for pair in core_pins if pair[0] in LOCK_PINNED_ALLOCATORS}
         scaling_samples = [
             object_value(value, f"{label}.scaling.raw_samples")
             for value in list_value(scaling_report["raw_samples"], f"{label}.scaling.raw_samples")
@@ -2040,8 +2095,7 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
             for value in scaling_samples
             if str(value["allocator_id"]) in LOCK_PINNED_ALLOCATORS
         }
-        if observed_pairs != expected_pairs:
-            fail(f"{label}.scaling: allocator source pins differ from the core run")
+        validate_carried_pins(observed_pairs, expected_pairs, f"{label}.scaling")
         fork_sources = {
             str(value["allocator_source_sha"])
             for value in scaling_samples
@@ -2177,8 +2231,13 @@ def validate_history_row(value: object, label: str) -> dict[str, object]:
     comparison_digest(row.get("comparison_key"), f"{label}.comparison_key")
     validate_runner(row.get("runner"), f"{label}.runner")
     allocators = list_value(row.get("allocator_identities"), f"{label}.allocator_identities")
-    if len(allocators) != len(ALLOCATOR_IDS):
-        fail(f"{label}.allocator_identities: expected five")
+    declared = declared_allocator_order(
+        [
+            object_value(value, f"{label}.allocator_identities[{index}]").get("allocator_id")
+            for index, value in enumerate(allocators)
+        ],
+        f"{label}.allocator_identities",
+    )
     for index, value in enumerate(allocators):
         item = object_value(value, f"{label}.allocator_identities[{index}]")
         exact_fields(
@@ -2192,7 +2251,7 @@ def validate_history_row(value: object, label: str) -> dict[str, object]:
             },
             f"{label}.allocator_identities[{index}]",
         )
-        if item.get("allocator_id") != ALLOCATOR_IDS[index]:
+        if item.get("allocator_id") != declared[index]:
             fail(f"{label}.allocator_identities[{index}].allocator_id: unexpected allocator")
         string_value(
             item.get("allocator_version"),
@@ -2945,8 +3004,9 @@ def _timeline_series(group: Sequence[Mapping[str, object]], label: str) -> dict[
         if allocator not in ALLOCATOR_IDS:
             fail(f"{label}: unknown allocator {allocator}")
         allocators.setdefault(allocator, []).append(sample)
+    declared = declared_allocators(allocators, label)
     series: dict[str, dict[str, object]] = {}
-    for allocator in ALLOCATOR_IDS:
+    for allocator in declared:
         samples = allocators[allocator]
         points: list[tuple[int, int]] = []
         for sample in samples:
@@ -3005,12 +3065,8 @@ def _timeline_series(group: Sequence[Mapping[str, object]], label: str) -> dict[
         }
     return {
         "series": series,
-        "drained_ns": _median_int(
-            [cast(int, series[allocator]["drained_ns"]) for allocator in ALLOCATOR_IDS]
-        ),
-        "active_ns": _median_int(
-            [cast(int, series[allocator]["active_ns"]) for allocator in ALLOCATOR_IDS]
-        ),
+        "drained_ns": _median_int([cast(int, value["drained_ns"]) for value in series.values()]),
+        "active_ns": _median_int([cast(int, value["active_ns"]) for value in series.values()]),
     }
 
 
@@ -3056,8 +3112,7 @@ def timeline_domain(cells: Sequence[Mapping[str, object]]) -> tuple[int, int, in
     t_max_values: list[int] = []
     rss_values: list[int] = []
     for cell in cells:
-        for allocator in ALLOCATOR_IDS:
-            series = object_value(cell["series"], "timeline series")[allocator]
+        for series in object_value(cell["series"], "timeline series").values():
             series = object_value(series, "timeline allocator series")
             active = int(cast(int, series["active_ns"]))
             active_values.append(active)
@@ -3169,11 +3224,11 @@ def draw_rss_timeline(canvas: Canvas, cells: Sequence[Mapping[str, object]]) -> 
         strokes: list[
             tuple[tuple[int, int, int], list[tuple[int, int]], list[tuple[int, int]]]
         ] = []
+        cell_series = object_value(cell["series"], "timeline series")
         for allocator in ALLOCATOR_IDS:
-            series = object_value(
-                object_value(cell["series"], "timeline series")[allocator],
-                "timeline allocator series",
-            )
+            if allocator not in cell_series:
+                continue
+            series = object_value(cell_series[allocator], "timeline allocator series")
             points = cast(list[tuple[int, int]], series["points"])
             if not points:
                 continue
@@ -3316,7 +3371,10 @@ def validate_scaling_rss(
             list_value(rss.get("cell_summaries"), f"{label}.cell_summaries")
         )
     ]
-    expected_cells = len(SCALING_PATTERN_IDS) * len(thread_points) * len(ALLOCATOR_IDS)
+    declared = declared_allocators(
+        (summary.get("allocator_id") for summary in summaries), f"{label}.cell_summaries"
+    )
+    expected_cells = len(SCALING_PATTERN_IDS) * len(thread_points) * len(declared)
     if len(summaries) != expected_cells:
         fail(f"{label}.cell_summaries: expected exactly {expected_cells} cells")
     seen: set[tuple[str, int, str]] = set()
@@ -3344,7 +3402,7 @@ def validate_scaling_rss(
         key = (pattern, threads, allocator)
         if (
             pattern not in SCALING_PATTERN_IDS
-            or allocator not in ALLOCATOR_IDS
+            or allocator not in declared
             or threads not in thread_points
             or key in seen
         ):
@@ -3432,7 +3490,14 @@ def validate_scaling_report(
     ):
         fail(f"{label}.methodology.blocks_per_cell: protocol fixes {SCALING_BLOCKS} blocks")
     summaries = list_value(report.get("cell_summaries"), f"{label}.cell_summaries")
-    expected_cells = len(SCALING_PATTERN_IDS) * len(thread_points) * len(ALLOCATOR_IDS)
+    declared = declared_allocators(
+        [
+            object_value(item, f"{label}.cell_summaries[{index}]").get("allocator_id")
+            for index, item in enumerate(summaries)
+        ],
+        f"{label}.cell_summaries",
+    )
+    expected_cells = len(SCALING_PATTERN_IDS) * len(thread_points) * len(declared)
     if len(summaries) != expected_cells:
         fail(f"{label}.cell_summaries: expected exactly {expected_cells} cells")
     seen: set[tuple[str, int, str]] = set()
@@ -3448,7 +3513,7 @@ def validate_scaling_report(
         )
         if (
             pattern not in SCALING_PATTERN_IDS
-            or allocator not in ALLOCATOR_IDS
+            or allocator not in declared
             or threads not in thread_points
         ):
             fail(f"{label}.cell_summaries[{index}]: undeclared pattern, allocator, or thread point")

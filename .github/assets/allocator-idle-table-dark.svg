@@ -1,9 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 395" width="1000" height="395" role="img" aria-label="Peak RSS, RSS after 10 s idle, and percent returned, per allocator">
-<rect width="1000" height="395" fill="#0d1117"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 421" width="1000" height="421" role="img" aria-label="Peak RSS, RSS after 10 s idle, and percent returned, per allocator">
+<rect width="1000" height="421" fill="#0d1117"/>
 <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
 <text x="24" y="26" font-size="17" font-weight="600" fill="#e6edf3">Memory returned after idle, by allocator</text>
-<text x="24" y="44" font-size="12" fill="#8b949e">measured at 37b77e2b, AMD Ryzen 7 3700X 8-Core Processor, 6.18.48, taskset -c 0-3, best of 3 runs</text>
-<text x="24" y="61" font-size="12" fill="#8b949e">Peak is VmHWM; after-idle is VmRSS at the end of the idle window (10 s unless the row says otherwise).</text>
+<text x="24" y="44" font-size="12" fill="#8b949e">measured at 86e0c5a4, AMD Ryzen 7 3700X 8-Core Processor, 6.18.48, taskset -c 0-3, best of 3 runs</text>
+<text x="24" y="61" font-size="12" fill="#8b949e">Peak is VmHWM; after-idle is VmRSS at the end of the idle window (10 s unless the row says otherwise). Both are kernel counters, good to a few hundred kB.</text>
 <text x="24" y="88" font-size="12" font-weight="600" text-anchor="start" fill="#8b949e">allocator</text>
 <text x="290" y="88" font-size="12" font-weight="600" text-anchor="start" fill="#8b949e">what runs during idle</text>
 <text x="740" y="88" font-size="12" font-weight="600" text-anchor="end" fill="#8b949e">peak RSS</text>
@@ -23,13 +23,13 @@
 <text x="976" y="152" font-size="12" text-anchor="end" fill="#e6edf3">0%</text>
 <text x="24" y="178" font-size="12" text-anchor="start" fill="#e6edf3">jemalloc + explicit purge</text>
 <text x="290" y="178" font-size="12" text-anchor="start" fill="#e6edf3">mallctl("arena.&lt;all&gt;.purge") every 100 ms</text>
-<text x="740" y="178" font-size="12" text-anchor="end" fill="#e6edf3">282.3 MB</text>
+<text x="740" y="178" font-size="12" text-anchor="end" fill="#e6edf3">282.4 MB</text>
 <text x="880" y="178" font-size="12" text-anchor="end" fill="#e6edf3">72.6 MB</text>
 <text x="976" y="178" font-size="12" text-anchor="end" fill="#e6edf3">74%</text>
 <rect x="16" y="186" width="968" height="26" fill="#30363d" opacity="0.25"/>
 <text x="24" y="204" font-size="12" text-anchor="start" fill="#e6edf3">Bun mimalloc</text>
 <text x="290" y="204" font-size="12" text-anchor="start" fill="#e6edf3">mi_on_thread_idle() every 100 ms</text>
-<text x="740" y="204" font-size="12" text-anchor="end" fill="#e6edf3">278.6 MB</text>
+<text x="740" y="204" font-size="12" text-anchor="end" fill="#e6edf3">278.7 MB</text>
 <text x="880" y="204" font-size="12" text-anchor="end" fill="#e6edf3">71.7 MB</text>
 <text x="976" y="204" font-size="12" text-anchor="end" fill="#e6edf3">74%</text>
 <text x="24" y="230" font-size="12" text-anchor="start" fill="#e6edf3">upstream mimalloc</text>
@@ -41,24 +41,30 @@
 <rect x="16" y="251" width="968" height="26" fill="#30363d" opacity="0.25"/>
 <text x="24" y="269" font-size="12" text-anchor="start" fill="#8b949e">mimalloc-pprof, no idle hook</text>
 <text x="290" y="269" font-size="12" text-anchor="start" fill="#8b949e">nothing (a plain idle process)</text>
-<text x="740" y="269" font-size="12" text-anchor="end" fill="#8b949e">278.7 MB</text>
-<text x="880" y="269" font-size="12" text-anchor="end" fill="#8b949e">278.7 MB</text>
+<text x="740" y="269" font-size="12" text-anchor="end" fill="#8b949e">278.8 MB</text>
+<text x="880" y="269" font-size="12" text-anchor="end" fill="#8b949e">278.8 MB</text>
 <text x="976" y="269" font-size="12" text-anchor="end" fill="#8b949e">0%</text>
 <text x="24" y="295" font-size="12" text-anchor="start" fill="#8b949e">upstream mimalloc, mi_collect(false)</text>
 <text x="290" y="295" font-size="12" text-anchor="start" fill="#8b949e">mi_collect(false) every 100 ms</text>
-<text x="740" y="295" font-size="12" text-anchor="end" fill="#8b949e">276.5 MB</text>
+<text x="740" y="295" font-size="12" text-anchor="end" fill="#8b949e">276.6 MB</text>
 <text x="880" y="295" font-size="12" text-anchor="end" fill="#8b949e">227.8 MB</text>
 <text x="976" y="295" font-size="12" text-anchor="end" fill="#8b949e">18%</text>
 <rect x="16" y="303" width="968" height="26" fill="#30363d" opacity="0.25"/>
-<text x="24" y="321" font-size="12" text-anchor="start" fill="#8b949e">jemalloc, background_thread:true</text>
-<text x="290" y="321" font-size="12" text-anchor="start" fill="#8b949e">nothing; JE_MALLOC_CONF=background_thread:true</text>
-<text x="740" y="321" font-size="12" text-anchor="end" fill="#8b949e">282.5 MB</text>
-<text x="880" y="321" font-size="12" text-anchor="end" fill="#8b949e">76.2 MB</text>
-<text x="976" y="321" font-size="12" text-anchor="end" fill="#8b949e">73%</text>
-<text x="24" y="347" font-size="12" text-anchor="start" fill="#8b949e">jemalloc, background_thread:true, 30 s</text>
-<text x="290" y="347" font-size="12" text-anchor="start" fill="#8b949e">nothing; JE_MALLOC_CONF=background_thread:true; 30 s window</text>
-<text x="740" y="347" font-size="12" text-anchor="end" fill="#8b949e">282.4 MB</text>
-<text x="880" y="347" font-size="12" text-anchor="end" fill="#8b949e">72.7 MB</text>
-<text x="976" y="347" font-size="12" text-anchor="end" fill="#8b949e">74%</text>
-<text x="24" y="377" font-size="11" fill="#8b949e">Rows below the dashed rule are diagnostics, not part of the chart.</text>
+<text x="24" y="321" font-size="12" text-anchor="start" fill="#8b949e">upstream mimalloc, mi_collect(true)</text>
+<text x="290" y="321" font-size="12" text-anchor="start" fill="#8b949e">mi_collect(true) every 100 ms</text>
+<text x="740" y="321" font-size="12" text-anchor="end" fill="#8b949e">276.6 MB</text>
+<text x="880" y="321" font-size="12" text-anchor="end" fill="#8b949e">227.8 MB</text>
+<text x="976" y="321" font-size="12" text-anchor="end" fill="#8b949e">18%</text>
+<text x="24" y="347" font-size="12" text-anchor="start" fill="#8b949e">jemalloc, background_thread:true</text>
+<text x="290" y="347" font-size="12" text-anchor="start" fill="#8b949e">nothing; JE_MALLOC_CONF=background_thread:true</text>
+<text x="740" y="347" font-size="12" text-anchor="end" fill="#8b949e">282.6 MB</text>
+<text x="880" y="347" font-size="12" text-anchor="end" fill="#8b949e">282.6 MB</text>
+<text x="976" y="347" font-size="12" text-anchor="end" fill="#8b949e">0%</text>
+<rect x="16" y="355" width="968" height="26" fill="#30363d" opacity="0.25"/>
+<text x="24" y="373" font-size="12" text-anchor="start" fill="#8b949e">jemalloc, background_thread:true, 30 s</text>
+<text x="290" y="373" font-size="12" text-anchor="start" fill="#8b949e">nothing; JE_MALLOC_CONF=background_thread:true; 30 s window</text>
+<text x="740" y="373" font-size="12" text-anchor="end" fill="#8b949e">282.6 MB</text>
+<text x="880" y="373" font-size="12" text-anchor="end" fill="#8b949e">72.7 MB</text>
+<text x="976" y="373" font-size="12" text-anchor="end" fill="#8b949e">74%</text>
+<text x="24" y="403" font-size="11" fill="#8b949e">Rows below the dashed rule are diagnostics, not part of the chart.</text>
 </g></svg>

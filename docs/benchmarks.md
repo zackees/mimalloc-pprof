@@ -162,8 +162,16 @@ the rest freed, then a 10 s idle window) run once per allocator.  Its rules:
   a `je_`-prefixed jemalloc ignores `MALLOC_CONF` (it reads `JE_MALLOC_CONF`) without
   a word of complaint, which produced a plausible, wrong 0% during development.
 - **Diagnostics are measured, labelled, and kept off the chart**: `mimalloc-pprof`
-  with no idle hook at all, `upstream-mimalloc` given `mi_collect(false)`, and
-  jemalloc with `background_thread:true` at both the chart's window and a longer one.
+  with no idle hook at all, `upstream-mimalloc` given `mi_collect(false)` and again
+  given `mi_collect(true)` (which forces the purge rather than honouring
+  `purge_delay`, so "upstream returns 18% even when told to collect" cannot be
+  answered with "you gave it the non-forcing one"), and jemalloc with
+  `background_thread:true` at both the chart's window and a longer one.
+- **A series whose repetitions disagree says so on the image.**  The charted figure is
+  the best of 3, so a series that returned memory in only some of its runs would
+  otherwise be represented by its lucky run alone.  The table renders an "only N of M
+  runs" footnote for any such series, counted from the run records rather than written
+  by hand.
 
 `ci/bench_hole_purging.py` — **inside one binary.**  The narrower A/B that no
 competitor can take part in: `MIMALLOC_PURGE_HOLES=0` against `=1` in a single
@@ -171,8 +179,19 @@ build, scavenger on in both, median of 3.  It is what isolates hole purging's ow
 contribution, and it also carries the `mi_purge_holes_stats_t` counter table.
 
 Both scripts commit their SVGs together with the CSV and report JSON they were
-rendered from, and `ci/tests/` fails if a committed SVG no longer reproduces from
-that data — so a chart and the caption it carries cannot drift apart.
+rendered from.  Two things enforce that they stay in step, because a chart and the
+caption it carries drifting apart is silent otherwise: `ci/tests/` re-renders all
+eight committed SVGs (both scripts, both charts, both themes) from the committed data
+and fails on any difference, and `python-lint.yml` — mirrored by
+`ci/verify_local.py --only lint` — runs `--check` on both scripts in both modes.
+Neither re-measures, so neither needs an allocator build or a benchmark machine.
+
+Both chart pairs are **dev-box measurements, not runner output**: unlike the
+throughput matrix above, they are not produced by a scheduled GitHub-hosted run, and
+each SVG names the machine, kernel and commit it was measured at in its own subtitle.
+The two pairs were measured on the same machine but are separate runs with different
+selection rules — median of 3 for the off-vs-on pair, best of 3 for the
+cross-allocator pair — and neither is rendered from the other's data.
 
 ## Pending Phase 6 panels
 

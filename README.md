@@ -119,9 +119,9 @@ re-verified under this tree's stress suite. → [Bun features](#bun-features)
   discarded to the OS one page at a time, so a single long-lived object no longer
   pins a 64 KiB–512 KiB page resident. On the churn benchmark it returns **74 % of
   peak RSS** at the next `mi_on_thread_idle()`, versus 18 % for whole-page return
-  alone — and 0 % for both upstream mimalloc, which has no such call, and jemalloc in
-  its default configuration (`MIMALLOC_PURGE_HOLES`).
-  → [measured](#memory-returned-after-idle)
+  alone — and 0 % for both upstream mimalloc, which has no such call (18 % if you call
+  `mi_collect` yourself), and jemalloc in its default configuration
+  (`MIMALLOC_PURGE_HOLES`). → [measured](#memory-returned-after-idle)
 - **Background scavenger.** A demand-driven thread purges scheduled arena memory on a
   100 ms timer instead of waiting for the next allocation; threads with an event loop
   can hand the work off with `mi_on_thread_idle_start()` / `park_while_idle()`.
@@ -660,19 +660,26 @@ third is what survives them:
   default.** Its decay is advanced by allocation activity, not by time spent idle, so
   the default-config line is flat for the whole window. The dashed line is the *same*
   jemalloc given an explicit `mallctl("arena.<all>.purge")` on the same 100 ms tick:
-  **74 %**. And jemalloc's opt-in `background_thread:true` gets **73 %** over that
-  same window with nothing called at all. Both are measured, in the diagnostic rows.
-  The claim is therefore a narrow one, and worth stating as such: jemalloc's *default*
-  configuration keeps sitting on this memory — not that jemalloc is unable to give it
-  back.
+  **74 %**. Its opt-in `background_thread:true` is measured too, and it lands on
+  jemalloc's own boundary — the default `dirty_decay_ms` is 10 s, exactly this
+  window — so the committed run returns **0 %** inside 10 s and **74 %** over 30 s.
+  (That row is genuinely borderline: an earlier session of the same benchmark had it
+  returning in two runs of three at 10 s. The 30 s row is what settles it, and both
+  are in the diagnostics.) The claim is therefore a narrow one, and worth stating as
+  such: jemalloc's *default* configuration keeps sitting on this memory for as long as
+  the process stays idle — not that jemalloc is unable to give it back.
 - **Upstream mimalloc is what hole purging is actually worth.** It has no
   `mi_on_thread_idle` at all, so its default line is flat; given the nearest thing it
-  does have — `mi_collect(false)` on the same tick — it returns **18 %**, and
-  `mi_collect(true)`, which forces the purge instead of honouring `purge_delay`,
-  returns the same 18 %: page granularity is the ceiling here, not the delay. That
+  does have — `mi_collect(false)` on the same tick — it returns **18 %**. Both
+  diagnostic rows are there, because the obvious objection is that upstream merely
+  lost to its own 1000 ms `purge_delay`: `mi_collect(true)`, which forces the purge
+  rather than honouring the delay, returns the same **18 %** on all three runs. Page
+  granularity is the ceiling here, not the delay. That
   independently reproduces the 18 % the off-vs-on chart below measures for this
   fork's scavenger with hole purging switched off. Whole-page return gets you 18 %;
-  punching holes in still-used pages gets you 74 %.
+  punching holes in still-used pages gets you 74 %. As above, the upstream row is
+  `bcee5a88` (v3.4.3) and not this fork's base, so upstream-vs-fork mixes base and
+  fork changes; the Bun row is the like-for-like line, and it lands on the same 74 %.
 
 Measured with
 [`ci/bench_hole_purging_allocators.py`](ci/bench_hole_purging_allocators.py) on the
@@ -703,7 +710,10 @@ uv run ci/bench_hole_purging_allocators.py --from-data --table
 The chart above cannot separate hole purging from the rest of what this fork does at
 an idle point, because no competitor has a `MIMALLOC_PURGE_HOLES` to turn off. This
 pair does: one binary, the scavenger on in both runs, hole purging the only changed
-variable.
+variable. Note the two pairs do not share a selection rule — this one is the **median**
+of 3 runs, the cross-allocator pair above is the **best** of 3 (the rule that is most
+generous to every allocator, including the ones this fork is measured against). Each
+SVG names its own, and neither pair was rendered from the other's data.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-rss-dark.svg" />

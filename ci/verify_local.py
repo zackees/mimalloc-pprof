@@ -306,6 +306,38 @@ def run_debug_full(ctx: RunCtx) -> bool:
     return ctest_run(ctx, build, config="Debug") == 0
 
 
+def run_debug3_extra(ctx: RunCtx) -> bool:
+    """c-unit.yml `build (debug3-extra)` (#312): MI_DEBUG=3 reaching the compiler via
+    `-DMI_EXTRA_CPPDEFS=MI_DEBUG=3` instead of `-DMI_DEBUG_FULL=ON`. CI only links
+    `mimalloc-test-api` (the failure was an undefined reference at executable link time);
+    this local config additionally runs a small ctest subset.
+
+    Only `test-fork-locks*` and `test-api*` run here (ctest -R 'lock|api'), not the full
+    suite `debug-full` covers -- and notably not #167's `test-lock-reentrancy` /
+    `-uncleared-owner` / `-nonowner-release` / `-destroy-owned` positive controls, which
+    are separately registered under `if(MI_DEBUG_FULL)` in CMakeLists.txt (the same
+    option-vs-effective-value gap this issue is about, but for *test* registration rather
+    than the *source* compiled -- there's no CMake-side way to see a MI_DEBUG=N smuggled
+    into CMAKE_C_FLAGS at the point those tests get registered, so left out of #312's fix).
+    """
+    build = ctx.dir / "build"
+    rc, configure_out = cmake_configure(
+        ctx,
+        build,
+        ["-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_EXTRA_CPPDEFS=MI_DEBUG=3"],
+    )
+    if rc:
+        return False
+    # #312: MI_DEBUG=3 must actually reach the compiler through this route (it collides
+    # with the MI_DEBUG=2 that CMAKE_BUILD_TYPE=Debug also appends; the later -D wins).
+    if not re.search(r"Compiler defines\s*:.*MI_DEBUG=3", configure_out):
+        log_write(ctx.log, "\n[verify_local] FAIL: MI_DEBUG=3 did not reach mi_defines\n")
+        return False
+    if cmake_build(ctx, build, config="Debug"):
+        return False
+    return ctest_run(ctx, build, config="Debug", filter_regex="lock|api") == 0
+
+
 def run_bundle(ctx: RunCtx) -> bool:
     """Bundle/ctest pass-and-fail equivalence: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug.
 
@@ -865,6 +897,12 @@ CONFIGS: list[ConfigSpec] = [
         "c-unit.yml: build(debug-full)+run-linux",
         "Debug, MI_DEBUG_FULL=ON",
         run_debug_full,
+    ),
+    ConfigSpec(
+        "debug3-extra",
+        "c-unit.yml: build(debug3-extra)+run-linux",
+        "Debug, MI_EXTRA_CPPDEFS=MI_DEBUG=3, lock|api ctest subset",
+        run_debug3_extra,
     ),
     ConfigSpec(
         "guarded",

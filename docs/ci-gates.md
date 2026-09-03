@@ -177,7 +177,7 @@ runs no tests. `kind` says what it produces:
 |---|---|---|
 | `bundle` | `release`, `pprof-off`, `debug-full`, `guarded`, `shared`, `musl`, `musl-pprof-off` | a `ci/bundle_tests.py` bundle, tarred, **plus** `show-only-<config>.json` straight from `ctest --show-only=json-v1` |
 | `control` | `memory-gate-leak` (`MI_BENCH_INJECT_LEAK=600000`) | a bundle that is never executed — only its `mimalloc-test-memory-gate` binary is, as the memory gate's positive control |
-| `lib` | `isa-portable`, `isa-arch`, `diag-pprof-on`, `diag-pprof-off` | `libmimalloc*.a` (+ `compile_commands.json`) for the run stage to scan |
+| `lib` | `isa-portable`, `isa-arch`, `diag-pprof-on`, `diag-pprof-off`, `debug3-extra` (#312: `MI_EXTRA_CPPDEFS=MI_DEBUG=3` must link `mimalloc-test-api`) | `libmimalloc*.a` (+ `compile_commands.json`) for the run stage to scan |
 
 The bundles are **tarred**, not uploaded as loose files: `upload-artifact@v4` drops the
 executable bit and flattens the `libmimalloc-debug.so → .so.3` SONAME symlink chain, either

@@ -892,9 +892,23 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
       mi_page_t* const page_meta = &arena->pages_meta[memid.mem.arena.slice_index];
       mi_assert_internal(page_meta->block_size == 0);
       #if MI_PAGE_META_ALIGNED_FREE_SMALL
-      // if `block_size <= MI_SMALL_SIZE_MAX` we put the page info in front of the slice,
-      // (note: it is important that `page_meta->block_size == 0` for `mi_arena_page_at_slice`)
-      if (block_size > MI_SMALL_SIZE_MAX)
+      // if the block size is one `mi_(heap_)malloc_small` can produce, we put the page info
+      // in front of the slice (note: it is important that `page_meta->block_size == 0` for
+      // `mi_arena_page_at_slice`).
+      //
+      // fork fix, issue #301: the bound must be `mi_good_size(MI_SMALL_SIZE_MAX)`, not the raw
+      // `MI_SMALL_SIZE_MAX` -- `mi_free_small` finds the page as `_mi_align_down_ptr(p,
+      // MI_SMALL_PAGE_SIZE)`, so the meta must be in front for every block `mi_malloc_small`
+      // can hand out (exactly the invariant free.c's own assert states). With MI_PADDING on
+      // (implied by MI_TRACK_ASAN/VALGRIND/ETW and MI_SECURE>=3) a 1009..1024 byte request
+      // still takes the small path but gets `mi_good_size(1024) == 1280` as its block size, so
+      // the meta went to `pages_meta` and `mi_free_small` read the user's own zeroed block as a
+      // `mi_page_t` (NULL `page->heap` deref here). Without padding this is a no-op, as
+      // `mi_good_size(MI_SMALL_SIZE_MAX) == MI_SMALL_SIZE_MAX`. Reproduced on STOCK upstream at
+      // our pinned base (6def7be9, arena.c:983, zero fork changes); upstream's dev3 HEAD
+      // (34fbd7e7) has since reworked the lookup and deprecated the option, so this is a
+      // pinned-base defect, not an upstreamable one. See docs/upstream-bugs.md.
+      if (block_size > mi_good_size(MI_SMALL_SIZE_MAX))
       #endif
       {
         page = page_meta;

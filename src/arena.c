@@ -1592,13 +1592,13 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
     // #316 (P10a): this free now collects in-subproc. No allocation site in this tree
     // currently produces a MI_MEM_MALLOC memid that reaches here -- the producers
     // (`_mi_meta_zalloc`/`_mi_meta_zalloc_aligned`/`_mi_meta_rezalloc`, subproc.c, via
-    // `_mi_memid_create_malloc`) hand it to `_mi_meta_free` (subproc.c), which handles
-    // MI_MEM_MALLOC itself with a plain `mi_free(p)` and only forwards other memkinds to
-    // `_mi_arenas_free`; every caller of `_mi_arenas_free` we audited (heap.c:283/309,
-    // arena.c:794/935/1184) passes an arena- or OS-backed memid. This branch is upstream's
-    // fallback, kept for shape parity; if a future producer reaches it, the collect is guarded
-    // the same way as every other `mi_free_ex` path (`mi_free_try_collect_mt`'s own reclaim
-    // guards, unconditional).
+    // `_mi_memid_create_malloc`) hand it to `_mi_meta_free` (subproc.c:94, the only caller of
+    // `_mi_arenas_free` that matters here), which handles MI_MEM_MALLOC itself with a plain
+    // `mi_free(p)` and only forwards other memkinds to `_mi_arenas_free` (subproc.c:99); the
+    // rest of `_mi_arenas_free`'s callers (arena.c:794/935/1184) pass an arena- or OS-backed
+    // memid. This branch is upstream's fallback, kept for shape parity; if a future producer
+    // reaches it, the collect is guarded the same way as every other `mi_free_ex` path
+    // (`mi_free_try_collect_mt`'s own reclaim guards, unconditional).
     _mi_free_subproc_safe(p);
   }
   else {

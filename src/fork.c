@@ -134,7 +134,7 @@ terms of the MIT license. A copy of the license can be found in the file
       -> sp->theap_meta_lock        `mi_heap_free_theaps` (heap.c:174) -> `_mi_theap_decref`
                                     -> `mi_theap_free_mem` -> `_mi_meta_free` (theap.c:363)
                                     ... and, for a page owned by `theap_meta`, `mi_free`
-                                    -> `mi_stat_free` (free.c:741) takes `theap_meta_lock`
+                                    -> `mi_stat_free` (free.c:768) takes `theap_meta_lock`
       -> tld->theaps_lock           `_mi_heap_detach_theaps` -- but `mi_lock_TRY_acquire`
                                     with a back-off retry (theap.c:412), so NOT a blocking
                                     edge; see the Phase 7 gap note below
@@ -146,7 +146,7 @@ terms of the MIT license. A copy of the license can be found in the file
                                     `mi_arena_pages_alloc` (arena.c:1544), which runs a FULL
                                     `mi_heap_zalloc_aligned(subproc->heap_main, ...)`
       -> sp->theap_meta_lock        `mi_heap_free` (heap.c:203-208) holds it across
-                                    `_mi_free_subproc_safe` -> `mi_stat_free` (free.c:741)
+                                    `_mi_free_subproc_safe` -> `mi_stat_free` (free.c:768)
       -> heap->os_abandoned_pages_lock   (same free, via `mi_arena_page_abandon`, arena.c:1224)
 
     mi_thread_locals_lock           threadlocal.c    TLS slot bitmap

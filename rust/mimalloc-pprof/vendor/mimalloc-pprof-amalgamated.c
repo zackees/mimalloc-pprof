@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit be81f936 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2d594c0f of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -2983,6 +2983,7 @@ typedef struct mi_heap_s {
   mi_lock_t             theaps_lock;                    // lock for the theaps list operations
 
   _Atomic(size_t)       abandoned_count[MI_BIN_COUNT];  // total count of abandoned pages in this heap
+  _Atomic(uintptr_t)    releasing;                      // set when `mi_heap_delete`/`mi_heap_destroy` starts: its pages are abandoned unmapped (Bun parity P10b, #317)
   mi_page_t*            os_abandoned_pages;             // list of pages that are OS allocated and not in an arena
   mi_lock_t             os_abandoned_pages_lock;        // lock for the os abandoned pages list (this lock protects list operations)
 
@@ -3188,8 +3189,14 @@ typedef struct mi_bbitmap_s mi_bbitmap_t;   // atomic binned bitmap (defined in 
 
 struct mi_arena_pages_s {
   mi_bitmap_t* pages;                // all registered pages (abandoned and owned)
-  mi_bitmap_t* pages_abandoned[MI_ARENA_BIN_COUNT];  // abandoned pages per size bin (a set bit means the start of the page)
-  // followed by the bitmaps (whose siz`es depend on the arena size)
+  // Abandoned pages per size bin (a set bit means the start of the page). Each bitmap is
+  // allocated the first time a page of that bin is abandoned (`mi_arena_pages_abandoned_ensure`,
+  // src/arena.c); NULL means no page of that bin was ever abandoned. Eagerly laying out all
+  // MI_ARENA_BIN_COUNT of them cost a page fault per bitmap (one header write each, on its own
+  // OS page) for every heap that touched an arena, and most heaps never abandon a page.
+  // (Bun parity P10b, #317, ported from oven-sh/mimalloc @ 787be2a8, MIT.)
+  _Atomic(mi_bitmap_t*) pages_abandoned[MI_ARENA_BIN_COUNT];
+  // followed by the `pages` bitmap (whose size depends on the arena size)
 };
 
 
@@ -4636,6 +4643,11 @@ extern mi_decl_export volatile long mi_debug_fail_os_commit_after;
 // `arena.c` (`mi_heap_visit_page_claim`) sets it to 2 once it has a page pinned but not yet
 // claimed, and stalls there until the test sets it back to 0.
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+// Bun parity P10b (#317), ported from oven-sh/mimalloc @ 1515c3c9 (C linkage) /
+// 787be2a8 (the counter itself). test-abandoned-lazy.c: per-bin abandoned bitmaps
+// (`mi_arena_pages_t::pages_abandoned[]`, arena.c) published so far via the CAS in
+// `mi_arena_pages_abandoned_ensure`.
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;
 #ifdef __cplusplus
 }
 #endif
@@ -4723,6 +4735,7 @@ void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* curren
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
+void          _mi_arena_pages_free(mi_arena_pages_t* arena_pages);  // Bun parity P10b, #317: frees the on-demand abandoned bitmaps then `arena_pages` itself
 
 // "page-map.c"
 bool          _mi_page_map_init(void);
@@ -10339,6 +10352,12 @@ mi_decl_nodiscard static inline bool mi_bbitmap_try_find_and_clearN(mi_bbitmap_t
 #error "The page_t.page_ma_offset field is not large enough to cover a full arena"
 #endif
 
+// Bun parity P10b (#317), ported from oven-sh/mimalloc @ 787be2a8, MIT: the per-bin abandoned
+// bitmaps of `mi_arena_pages_t` are allocated lazily, on first abandon. See the definitions
+// below (near `mi_arena_pages_alloc`) for the allocation/publish protocol.
+static mi_bitmap_t* mi_arena_pages_abandoned(mi_arena_pages_t* arena_pages, size_t bin);
+static mi_bitmap_t* mi_arena_pages_abandoned_ensure(mi_arena_t* arena, mi_arena_pages_t* arena_pages, size_t bin);
+
 /* -----------------------------------------------------------
   Arena id's
 ----------------------------------------------------------- */
@@ -11044,9 +11063,9 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
   mi_forall_suitable_arenas(heap, req_arena, tseq, match_numa, any_numa, allow_large, arena)
   {
     mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
-    if (arena_pages != NULL) {
+    mi_bitmap_t* const bitmap = (arena_pages != NULL ? mi_arena_pages_abandoned(arena_pages, bin) : NULL);
+    if (bitmap != NULL) {
       size_t slice_index;
-      mi_bitmap_t* const bitmap = arena_pages->pages_abandoned[bin];
 
       if (mi_bitmap_try_find_and_claim(bitmap, tseq, &slice_index, &mi_arena_try_claim_abandoned, arena)) {
         // found an abandoned page of the right size
@@ -11431,7 +11450,7 @@ static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_
     mi_arena_t* const arena = mi_arena_from_memid(page->memid, &slice_index, &slice_count);
     mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
     mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
-    mi_assert_internal(bin >= MI_ARENA_BIN_COUNT || mi_bitmap_is_clearN(arena_pages->pages_abandoned[bin], slice_index, 1));
+    mi_assert_internal(bin >= MI_ARENA_BIN_COUNT || mi_arena_pages_abandoned(arena_pages, bin) == NULL || mi_bitmap_is_clearN(mi_arena_pages_abandoned(arena_pages, bin), slice_index, 1));
     // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
     // 8286bfb6): dropped `mi_assert_internal(mi_bitmap_is_setN(arena_pages->pages, slice_index, 1))`.
     // No longer holds under the heap delete/destroy claim protocol: a concurrent
@@ -11582,8 +11601,11 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
   // mi_assert_internal(current_theap == _mi_page_associated_theap(page));
 
   // add to abandoned?
-  mi_heap_t* heap = mi_page_heap(page); 
-  if (page->memid.memkind==MI_MEM_ARENA && !mi_page_is_full(page)) {
+  // (not for a heap that is being released: its teardown claims every page through `pages`
+  // -- see the `heap->releasing` guard placement in `mi_heap_detach_theaps`, src/heap.c,
+  // Bun parity P10b, #317, ported from oven-sh/mimalloc @ 91218f30, MIT.)
+  mi_heap_t* heap = mi_page_heap(page);
+  if (page->memid.memkind==MI_MEM_ARENA && !mi_page_is_full(page) && mi_atomic_load_relaxed(&heap->releasing) == 0) {
     // make available for allocations
     size_t bin = _mi_bin(mi_page_block_size(page));
     mi_assert_internal(bin < MI_ARENA_BIN_COUNT);
@@ -11598,13 +11620,20 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
       mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
       mi_assert_internal(mi_bitmap_is_setN(arena->slices_dirty, slice_index, slice_count));
 
-      mi_page_set_abandoned_mapped(page);
-      const bool was_clear = mi_bitmap_set(arena_pages->pages_abandoned[bin], slice_index);
-      MI_UNUSED(was_clear); mi_assert_internal(was_clear);
-      mi_atomic_increment_relaxed(&heap->abandoned_count[bin]);
-      mi_theap_stat_increase(current_theap, pages_abandoned, 1);
-      mi_abandoned_page_unown(page, current_theap);
-      return;
+      // Bun parity P10b (#317), ported from oven-sh/mimalloc @ 787be2a8, MIT: the bin's
+      // abandoned bitmap is allocated on first use. If that allocation fails, fall through
+      // and abandon the page unmapped, like a full page: it stays reachable through `pages`
+      // and is reclaimed once a block in it is freed.
+      mi_bitmap_t* const bitmap = mi_arena_pages_abandoned_ensure(arena, arena_pages, bin);
+      if mi_likely(bitmap != NULL) {
+        mi_page_set_abandoned_mapped(page);
+        const bool was_clear = mi_bitmap_set(bitmap, slice_index);
+        MI_UNUSED(was_clear); mi_assert_internal(was_clear);
+        mi_atomic_increment_relaxed(&heap->abandoned_count[bin]);
+        mi_theap_stat_increase(current_theap, pages_abandoned, 1);
+        mi_abandoned_page_unown(page, current_theap);
+        return;
+      }
     }
   }
   // otherwise,
@@ -11636,6 +11665,11 @@ bool _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page) {
   mi_assert_internal(!mi_page_all_free(page));
   mi_assert_internal(!mi_page_is_singleton(page));
   if (mi_page_is_full(page) || mi_page_is_abandoned_mapped(page) || page->memid.memkind != MI_MEM_ARENA) {
+    return false;
+  }
+  else if (mi_atomic_load_relaxed(&mi_page_heap(page)->releasing) != 0) {
+    // Bun parity P10b (#317): the heap is being released and claims the page through `pages`
+    // (see the `heap->releasing` guard placement in `mi_heap_detach_theaps`, src/heap.c).
     return false;
   }
   else {
@@ -11676,7 +11710,9 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
     mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
 
     // this busy waits until a concurrent reader (from alloc_abandoned) is done
-    mi_bitmap_clear_once_set(arena->subproc, arena_pages->pages_abandoned[bin], slice_index);
+    mi_bitmap_t* const bitmap = mi_arena_pages_abandoned(arena_pages, bin);
+    mi_assert_internal(bitmap != NULL);  // a mapped page was set in it
+    mi_bitmap_clear_once_set(arena->subproc, bitmap, slice_index);
     mi_page_clear_abandoned_mapped(page);
     mi_atomic_decrement_relaxed(&heap->abandoned_count[bin]);
   }
@@ -11768,7 +11804,8 @@ void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
       // singleton bins have no abandoned bitmap (upstream ad1bcdbf, to shrink arena meta).
       for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
         if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
-        mi_bitmap_t* const bitmap = arena_pages->pages_abandoned[bin];
+        mi_bitmap_t* const bitmap = mi_arena_pages_abandoned(arena_pages, bin);
+        if (bitmap == NULL) continue;
         mi_purge_holes_arg_t parg = { bitmap, tld };
         (void)_mi_bitmap_forall_set(bitmap, &mi_arena_page_purge_holes_at, arena, &parg);
       }
@@ -11811,7 +11848,8 @@ void _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep) {
     if (arena_pages != NULL) {
       for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {   // see above: not MI_BIN_COUNT
         if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
-        mi_arena_holes_report_arg_t ra = { arena_pages->pages_abandoned[bin], rep };
+        mi_arena_holes_report_arg_t ra = { mi_arena_pages_abandoned(arena_pages, bin), rep };
+        if (ra.bitmap == NULL) continue;
         (void)_mi_bitmap_forall_set(ra.bitmap, &mi_arena_page_holes_report_at, arena, &ra);
       }
     }
@@ -12045,8 +12083,7 @@ static size_t mi_arena_pages_size(size_t slice_count, size_t* bitmap_base) {
   if (slice_count == 0) slice_count = MI_BCHUNK_BITS;
   mi_assert_internal((slice_count % MI_BCHUNK_BITS) == 0);
   const size_t base_size = _mi_align_up(sizeof(mi_arena_pages_t), MI_BCHUNK_SIZE);
-  const size_t bitmaps_count = 1 + MI_ARENA_BIN_COUNT; // pages, and abandoned
-  const size_t bitmaps_size = bitmaps_count * mi_bitmap_size(slice_count, NULL);
+  const size_t bitmaps_size = mi_bitmap_size(slice_count, NULL); // pages (the abandoned bitmaps are allocated on demand, Bun parity P10b #317)
   const size_t size = base_size + bitmaps_size;
   if (bitmap_base != NULL) *bitmap_base = base_size;
   return size;
@@ -12056,7 +12093,7 @@ static size_t mi_arena_info_slices_needed(size_t slice_count, size_t* bitmap_bas
   if (slice_count == 0) slice_count = MI_BCHUNK_BITS;
   mi_assert_internal((slice_count % MI_BCHUNK_BITS) == 0);
   const size_t base_size = _mi_align_up(sizeof(mi_arena_t), MI_BCHUNK_SIZE);
-  const size_t bitmaps_count = 4 + MI_ARENA_BIN_COUNT; // commit, dirty, purge, pages, and abandoned
+  const size_t bitmaps_count = 4; // commit, dirty, purge, and pages (the abandoned bitmaps are allocated on demand, Bun parity P10b #317)
   const size_t bitmaps_size = bitmaps_count * mi_bitmap_size(slice_count, NULL) + mi_bbitmap_size(slice_count, NULL); // + free
   #if MI_PAGE_META_IS_SEPARATED
   const size_t pages_size = slice_count * sizeof(mi_page_t);
@@ -12094,10 +12131,85 @@ static mi_arena_pages_t* mi_arena_pages_alloc(mi_arena_t* arena) {
   uint8_t* base = (uint8_t*)arena_pages + bitmap_base;
   mi_assert_internal(_mi_is_aligned(base, MI_BCHUNK_SIZE));
   arena_pages->pages = mi_arena_bitmap_init(slice_count, &base);
-  for (size_t i = 0; i < MI_ARENA_BIN_COUNT; i++) {
-    arena_pages->pages_abandoned[i] = mi_arena_bitmap_init(slice_count, &base);
-  }
+  // `pages_abandoned[]` stays NULL (the allocation is zeroed) until a page of that bin is
+  // abandoned -- Bun parity P10b, #317, ported from oven-sh/mimalloc @ 787be2a8, MIT.
   return arena_pages;
+}
+
+// The abandoned-pages bitmap of `bin`, or NULL if no page of that bin was ever abandoned in
+// this (heap, arena) pair. A NULL bitmap reads as all-clear.
+// Bun parity P10b, #317, ported from oven-sh/mimalloc @ 787be2a8, MIT.
+static mi_bitmap_t* mi_arena_pages_abandoned(mi_arena_pages_t* arena_pages, size_t bin) {
+  mi_assert_internal(bin < MI_ARENA_BIN_COUNT);
+  return mi_atomic_load_ptr_acquire(mi_bitmap_t, &arena_pages->pages_abandoned[bin]);
+}
+
+#if MI_DEBUG > 0
+mi_decl_export _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;  // test hook (test-abandoned-lazy.c): per-bin abandoned maps published so far (Bun parity P10b, #317)
+#endif
+
+// The abandoned-pages bitmap of `bin`, allocated on first use. Allocated from the subproc
+// meta-data heap (`_mi_meta_zalloc_aligned`) so this is safe on the abandon paths (a thread
+// tearing down its theaps, a foreign free re-abandoning a page), where allocating from a
+// regular heap is not -- see CLAUDE.md rule 4 and issue #317 (2.3): this is allocator
+// metadata, not profiler-internal memory, and the meta theap is the same allocator
+// `_mi_thread_local_create` (threadlocal.c) already uses for the thread-local slot bitmap.
+// Publishing is a CAS so no lock is needed: a loser frees its copy with
+// `_mi_free_subproc_safe` and uses the winner's. Returns NULL only if the allocation failed.
+//
+// New lock order edge: `heap->theaps_lock` -> `subproc->theap_meta_lock`. Already consistent
+// with src/fork.c's documented order (MI_FORK_LOCK_THEAPS=3 precedes MI_FORK_LOCK_THEAP_META=7);
+// see the comment added there for the new call chain.
+// Bun parity P10b, #317, ported from oven-sh/mimalloc @ 787be2a8, MIT.
+static mi_bitmap_t* mi_arena_pages_abandoned_ensure(mi_arena_t* arena, mi_arena_pages_t* arena_pages, size_t bin) {
+  mi_bitmap_t* bitmap = mi_arena_pages_abandoned(arena_pages, bin);
+  if mi_likely(bitmap != NULL) return bitmap;
+  const size_t slice_count = arena->slice_count;
+  const size_t size = mi_bitmap_size(slice_count, NULL);
+  mi_bitmap_t* fresh = (mi_bitmap_t*)_mi_meta_zalloc_aligned(arena->subproc, size, MI_BCHUNK_SIZE, NULL);
+  if (fresh == NULL) return NULL;
+  mi_bitmap_init(fresh, slice_count, true /* already zero */);
+  mi_bitmap_t* expected = NULL;
+  if (mi_atomic_cas_ptr_strong_acq_rel(mi_bitmap_t, &arena_pages->pages_abandoned[bin], &expected, fresh)) {
+    #if MI_DEBUG > 0
+    mi_atomic_increment_relaxed(&mi_debug_abandoned_maps_allocated);
+    #endif
+    return fresh;
+  }
+  // another thread published one first
+  _mi_free_subproc_safe(fresh);
+  mi_assert_internal(expected != NULL);
+  return expected;
+}
+
+// Release the on-demand abandoned bitmaps of a heap's arena pages (the `pages` bitmap is part
+// of the `arena_pages` allocation itself).
+//
+// Lifetime invariant (this is the scavenger interaction, issue #317 2.4): the hole sweep
+// (`_mi_arenas_purge_abandoned_holes`, above) and the hole report (`_mi_arenas_holes_report`,
+// above) read `arena_pages->pages_abandoned[bin]` while holding `tld->theaps_lock` for the
+// whole walk (see src/page-holes.c), and that lock is what keeps the heap alive (a heap is
+// only freed after `_mi_heap_detach_theaps` detached every theap of it, and detaching needs
+// that lock). `_mi_arena_pages_free` runs strictly later still, inside `mi_heap_free` under
+// `heap->arena_pages_lock`. So the same argument that already keeps the heap alive keeps its
+// per-bin bitmaps alive -- but only because this free is in `mi_heap_free` and not earlier: a
+// future refactor must not move it up.
+// Bun parity P10b, #317, ported from oven-sh/mimalloc @ 787be2a8, MIT.
+static void mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages) {
+  for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
+    if (mi_atomic_load_ptr_relaxed(mi_bitmap_t, &arena_pages->pages_abandoned[bin]) == NULL) continue;  // the common case
+    mi_bitmap_t* bitmap = mi_atomic_exchange_ptr_acq_rel(mi_bitmap_t, &arena_pages->pages_abandoned[bin], NULL);
+    if (bitmap != NULL) { _mi_free_subproc_safe(bitmap); }
+  }
+}
+
+// Caller (`mi_heap_free`, heap.c) asserts the lifetime invariant documented above -- that the
+// heap is already off `subproc->heaps` and `heap->theaps == NULL` -- right before this call,
+// where `heap` is in scope; this function itself has no handle to the owning heap.
+void _mi_arena_pages_free(mi_arena_pages_t* arena_pages) {
+  if (arena_pages == NULL) return;
+  mi_arena_pages_free_abandoned(arena_pages);
+  _mi_free_subproc_safe(arena_pages);
 }
 
 static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
@@ -12178,8 +12290,11 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   arena->slices_dirty = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_purge = mi_arena_bitmap_init(slice_count, &base);
   arena->pages_main.pages = mi_arena_bitmap_init(slice_count, &base);
+  // Allocated on first abandon (Bun parity P10b, #317, ported from oven-sh/mimalloc @
+  // 787be2a8, MIT); the arena's own memory is not yet fully zeroed at this point in every
+  // memid path (`memid.initially_zero`), so store explicitly rather than relying on that.
   for (size_t i = 0; i < MI_ARENA_BIN_COUNT; i++) {
-    arena->pages_main.pages_abandoned[i] = mi_arena_bitmap_init(slice_count, &base);
+    mi_atomic_store_ptr_relaxed(mi_bitmap_t, &arena->pages_main.pages_abandoned[i], NULL);
   }
   #if MI_PAGE_META_IS_SEPARATED
   arena->pages_meta = (mi_page_t*)base;
@@ -13151,7 +13266,9 @@ bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_bloc
         for (size_t bin = 0; ok && bin < MI_ARENA_BIN_COUNT; bin++) {
           // todo: if we had a single abandoned page map as well, this can be faster.
           if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) > 0) {
-            ok = _mi_bitmap_forall_set(arena_pages->pages_abandoned[bin], &mi_heap_visit_page_at, arena, &visit_info);
+            mi_bitmap_t* const bitmap = mi_arena_pages_abandoned(arena_pages, bin);
+            if (bitmap == NULL) continue;
+            ok = _mi_bitmap_forall_set(bitmap, &mi_heap_visit_page_at, arena, &visit_info);
           }
         }
       }
@@ -15842,6 +15959,28 @@ static void mi_heap_detach_theaps(mi_heap_t* heap) {
     }
   }
   _mi_heap_detach_theaps(heap);
+  // Bun parity P10b (#317), ported from oven-sh/mimalloc @ 91218f30, MIT (`heap->releasing`).
+  // Bun sets this inside its `mi_heap_release_pages`, right after `if (_mi_is_heap_main(heap))
+  // return;`. We have no such function/early-return -- this static `mi_heap_detach_theaps` is
+  // our equivalent, called by both `mi_heap_delete` and `_mi_heap_force_destroy` (the latter
+  // also used for a SUBPROC main heap at subproc teardown, issue #128 B1). A bare early return
+  // (Bun's shape) is wrong here: the `_mi_theap_abandon` loop just below still has to run for a
+  // subproc main heap. Setting `releasing` on a main heap would be wrong for the opposite
+  // reason -- a main heap outlives this call and would then abandon every page unmapped
+  // forever, not just for the duration of this detach. `_mi_is_heap_main` is the right guard
+  // for both cases: it resolves via `heap->subproc`, so it is true for a subproc's own
+  // heap_main too (see the provenance comment in `mi_heap_free`, below), which is exactly the
+  // heap this must stay false for.
+  //
+  // Readers: `_mi_arenas_page_abandon` (arena.c) skips the lazy per-bin bitmap entirely once
+  // this is set, so a releasing heap's pages are abandoned unmapped -- reachable only through
+  // `pages`, which the pending `_mi_heap_move_pages`/`_mi_heap_destroy_pages` claim walk
+  // (claim_pages=true) reaches anyway. `_mi_arenas_page_try_reabandon_to_mapped` refuses to
+  // re-map one of this heap's pages for the same reason. This also means a releasing heap
+  // never needs `mi_arena_pages_abandoned_ensure` (and so never takes `subproc->theap_meta_lock`
+  // from inside this loop) -- the case where that edge is actually live is a MAIN heap, which
+  // never sets `releasing` and so is unaffected by any of this.
+  if (!_mi_is_heap_main(heap)) { mi_atomic_store_release(&heap->releasing, (uintptr_t)1); }
   mi_lock(&heap->theaps_lock) { // paranoia
     for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
       mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // detached
@@ -15900,14 +16039,28 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
         mi_arena_pages_t* arena_pages = mi_atomic_load_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i]);
         if (arena_pages!=NULL) {
           mi_atomic_store_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i], NULL);
-          // #316 (P10a): this free now collects in-subproc. Safe regardless of whether this
-          // thread is parked: `allow_collect` only reaches `mi_free_block_mt`/
-          // `mi_free_generic_mt` (free.c:mi_free_ex), while `_mi_park_leave_if_parked` lives
-          // only in the separate `mi_free_generic_local` owner-free path (free.c:167) -- so this
-          // can never newly reach the park protocol. `mi_free_try_collect_mt`'s own reclaim
-          // guards (`_mi_thread_is_initialized`, `_mi_page_associated_theap_peek` refusing a
-          // theap of another heap) apply unconditionally.
-          _mi_free_subproc_safe(arena_pages);
+          // #316 (P10a): the final `_mi_free_subproc_safe(arena_pages)` this used to be now
+          // collects in-subproc. Safe regardless of whether this thread is parked:
+          // `allow_collect` only reaches `mi_free_block_mt`/`mi_free_generic_mt`
+          // (free.c:mi_free_ex), while `_mi_park_leave_if_parked` lives only in the separate
+          // `mi_free_generic_local` owner-free path (free.c:167) -- so this can never newly
+          // reach the park protocol. `mi_free_try_collect_mt`'s own reclaim guards
+          // (`_mi_thread_is_initialized`, `_mi_page_associated_theap_peek` refusing a theap of
+          // another heap) apply unconditionally.
+          //
+          // #317 (P10b): switched to `_mi_arena_pages_free`, which also frees the on-demand
+          // per-bin abandoned bitmaps (arena.c) before freeing `arena_pages` itself -- both go
+          // through the same `_mi_free_subproc_safe`, so the P10a audit above still covers it.
+          // Lifetime invariant (see `_mi_arena_pages_free`'s own comment, arena.c): this must
+          // run after the heap is off `subproc->heaps` and every theap of it has been
+          // detached. We are inside `mi_heap_free`, called only after
+          // `mi_heap_detach_theaps`/`_mi_heap_move_pages`(or `_mi_heap_destroy_pages`)/
+          // `mi_heap_free_theaps` have already run (see `mi_heap_delete` /
+          // `_mi_heap_force_destroy`, below) and, for `mi_heap_delete`, strictly before the
+          // heap is unlinked from `subproc->heaps` a few lines down -- so assert the theaps
+          // side of the invariant here, where `heap` is in scope.
+          mi_assert_internal(heap->theaps == NULL);
+          _mi_arena_pages_free(arena_pages);
         }
       }
     }
@@ -16156,6 +16309,18 @@ terms of the MIT license. A copy of the license can be found in the file
                                     -> `mi_theap_free_mem` -> `_mi_meta_free` (theap.c:363)
                                     ... and, for a page owned by `theap_meta`, `mi_free`
                                     -> `mi_stat_free` (free.c:768) takes `theap_meta_lock`
+                                    ... and (Bun parity P10b, #317): `mi_heap_detach_theaps`
+                                    (heap.c) holds `theaps_lock` across its `_mi_theap_abandon`
+                                    loop -> `_mi_page_abandon` -> `_mi_arenas_page_abandon`
+                                    (arena.c) -> `mi_arena_pages_abandoned_ensure` (arena.c) ->
+                                    `_mi_meta_zalloc_aligned`, which takes `theap_meta_lock`.
+                                    Live only for a MAIN heap: a releasing (non-main) heap sets
+                                    `heap->releasing` just before this loop, which makes
+                                    `_mi_arenas_page_abandon` skip the `..._ensure` call
+                                    entirely (see the `heap->releasing` comment in
+                                    `mi_heap_detach_theaps`, heap.c). Same target level as the
+                                    edge above, no reordering needed (MI_FORK_LOCK_THEAPS=3
+                                    already precedes MI_FORK_LOCK_THEAP_META=7 below).
       -> tld->theaps_lock           `_mi_heap_detach_theaps` -- but `mi_lock_TRY_acquire`
                                     with a back-off retry (theap.c:412), so NOT a blocking
                                     edge; see the Phase 7 gap note below

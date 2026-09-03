@@ -13,6 +13,8 @@ its own file instead of silently borrowing another's.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -162,6 +164,73 @@ class OptionParsingTest(unittest.TestCase):
     def test_a_dangling_option_is_an_error(self) -> None:
         with self.assertRaises(ValueError):
             memory_gate.take_option(["check", "--arch"], "arch")
+
+
+class ToleranceTest(unittest.TestCase):
+    """#298: the threshold, and the two invariants that keep it from being a guess.
+
+    The gate spent months red on commits that changed no allocator code because the
+    tolerance (0.15) was smaller than the workload's own run-to-run spread (16-44%). The
+    fix was to make the workload deterministic, and these tests pin the two properties
+    that make the resulting number defensible rather than merely smaller.
+    """
+
+    def _check(self, peaks: list[float], **overrides: object) -> tuple[int, str]:
+        base = json.loads((BASELINES / "linux-pprof1.json").read_text(encoding="utf-8"))["peak_mb"]
+        with tempfile.TemporaryDirectory() as tmp:
+            paths: list[str] = []
+            for i, factor in enumerate(peaks):
+                path = Path(tmp) / f"r{i}.json"
+                result = _result(platform="linux", peak_mb=base * factor, **overrides)
+                path.write_text(json.dumps(result), encoding="utf-8")
+                paths.append(str(path))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = memory_gate.check(paths, _control=bool(overrides.get("inject_leak")))
+        return rc, out.getvalue()
+
+    def test_a_run_inside_the_tolerance_passes(self) -> None:
+        rc, _ = self._check([1.0 + memory_gate.PEAK_TOLERANCE * 0.9] * 8)
+        self.assertEqual(rc, 0)
+
+    def test_a_run_past_the_tolerance_fails(self) -> None:
+        rc, out = self._check([1.0 + memory_gate.PEAK_TOLERANCE * 1.1] * 8)
+        self.assertEqual(rc, 1)
+        self.assertIn("regressed", out)
+
+    def test_the_measured_control_margin_is_at_least_twice_the_tolerance(self) -> None:
+        # Measured on three ubuntu-latest runner VMs (#298): the
+        # MI_BENCH_INJECT_LEAK=200000 build reads min-of-8 82.4 MB against a 58.0 MB
+        # baseline, i.e. +42.1%. A gate whose control only just fires is a gate one
+        # runner-image change away from proving nothing, so the rule is 2x -- and this
+        # test turns "the tolerance may not be raised past that" into a failing test
+        # rather than a sentence in a comment.
+        measured_control_margin = (82.4 - 58.0) / 58.0
+        self.assertGreaterEqual(measured_control_margin, 2.0 * memory_gate.PEAK_TOLERANCE)
+
+    def test_every_committed_baseline_is_quieter_than_the_tolerance(self) -> None:
+        # A baseline recorded from a measurement noisier than the threshold it will be
+        # compared under is the #298 failure mode in miniature: the number is then a
+        # sample of the noise, not the allocator. `update` records the spread it saw, so
+        # this is checkable rather than a matter of trust.
+        for path in sorted(BASELINES.glob("*.json")):
+            record = json.loads(path.read_text(encoding="utf-8"))
+            spread = record.get("baseline_spread_pct")
+            if spread is None:
+                continue  # recorded before `update` started stamping it
+            with self.subTest(baseline=path.name):
+                self.assertLess(spread, 100.0 * memory_gate.PEAK_TOLERANCE, path.name)
+
+    def test_a_control_run_is_not_told_to_raise_the_tolerance(self) -> None:
+        # A leak build's spread is meaningless as advice about the real threshold.
+        rc, out = self._check([1.4, 1.8, 2.4], inject_leak=200000)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("raise RUNS_EXPECTED", out)
+
+    def test_a_real_run_still_is(self) -> None:
+        rc, out = self._check([1.0, 1.0 + 2 * memory_gate.PEAK_TOLERANCE])
+        self.assertEqual(rc, 0)  # min is inside the tolerance ...
+        self.assertIn("raise RUNS_EXPECTED", out)  # ... but the spread is not credible
 
 
 if __name__ == "__main__":

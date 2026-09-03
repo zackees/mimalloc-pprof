@@ -4,14 +4,38 @@ name: benchmark-sentinel
 # Produces JSON + HTML report uploaded as a CI artifact.
 # Hosted-runner results are labelled informational — not accepted for
 # small-timing claims (requires stable reference host per #170).
+#
+# ON DEMAND, OR ONCE A DAY -- NOT ON EVERY PUSH. This used to run two 10-minute
+# jobs on every pull_request push that touched rust/, src/ or include/. Nobody
+# reads the result of most of those: the numbers are informational by
+# construction (#170/#171 -- a hosted runner is not a stable reference host) and
+# no gate consumes them, so a per-push cadence bought a trend nobody plots at the
+# price of ~20 runner-minutes per push, on the same hosted pool the correctness
+# lanes queue for. It now runs when someone actually wants a number --
+# `workflow_dispatch`, or a `benchmark` label on the PR (add the label and the
+# `labeled` event below starts it, no push needed) -- and once a day on schedule
+# so the trend line still gets a daily point.
 
 on:
   pull_request:
+    # `labeled` is what makes the escape hatch work without a dummy commit.
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - rust/**
       - src/**
       - include/**
       - .github/workflows/benchmark-sentinel.yml
+      # Documentation is not a benchmark input. These `!` patterns subtract from the
+      # includes above (path filters are evaluated in order), so a markdown-only edit
+      # inside rust/ -- a README, a design note -- no longer even queues the gate job.
+      - '!**/*.md'
+      - '!**/*.txt'
+      - '!docs/**'
+  schedule:
+    # Daily, off the hour to dodge scheduler congestion. This is the "or one day has
+    # passed" half of the policy above; the benchmark-* publication workflows keep
+    # their own (weekly/daily) crons and are untouched.
+    - cron: "43 6 * * *"
   workflow_dispatch:
 
 env:
@@ -25,6 +49,11 @@ concurrency:
 jobs:
   sentinel:
     name: benchmark-sentinel (${{ matrix.os }})
+    # The on-demand half of the policy in the header: a pull_request event only
+    # measures when the PR carries the `benchmark` label. Schedule and manual
+    # dispatch always measure. A skipped job still reports on the PR, so the check
+    # stays visible (and re-runnable by labelling) instead of silently vanishing.
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'benchmark') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     # TODO(#277 phase D, added 2026-09-02): DELETE the windows-latest row after ten pushes

@@ -885,10 +885,10 @@ pub mod prof {
 /// Print, per size class, what hole purging leaves behind (issue #272, Bun parity P7b).
 ///
 /// Read-only: it purges nothing and mutates no free list. The report goes to mimalloc's
-/// own output sink (stderr by default, or whatever `mi_register_output` installed), not
-/// to a returned `String` — building a `String` here would allocate from inside a walk
-/// over the very free lists being reported. Pass a custom sink through
-/// [`sys::mi_purge_holes_report`]'s C counterpart if you need to capture it.
+/// own output sink (stderr by default), not to a returned `String` — building a `String`
+/// here would allocate from inside a walk over the very free lists being reported.
+/// `mi_purge_holes_report` takes no sink argument at all; to capture the text, install a
+/// process-wide sink with C's `mi_register_output` (not bound by this crate).
 ///
 /// Like the idle sweep it only covers what the calling thread may safely read: its own
 /// theaps, plus the abandoned pages of the heaps behind them. Call it right after an

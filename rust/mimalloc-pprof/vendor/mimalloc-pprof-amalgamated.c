@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2d594c0f of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit a63848f5 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -11624,7 +11624,23 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
       // abandoned bitmap is allocated on first use. If that allocation fails, fall through
       // and abandon the page unmapped, like a full page: it stays reachable through `pages`
       // and is reclaimed once a block in it is freed.
-      mi_bitmap_t* const bitmap = mi_arena_pages_abandoned_ensure(arena, arena_pages, bin);
+      //
+      // Defensive guard (Opus review of #319): never call `mi_arena_pages_abandoned_ensure`
+      // -> `_mi_meta_zalloc_aligned` for a page belonging to the subproc's own meta theap.
+      // That would re-enter `subproc->theap_meta_lock` non-recursively: `_mi_meta_zalloc_aligned`
+      // (subproc.c) holds the lock across a full `mi_theap_zalloc_aligned` on `theap_meta`,
+      // whose slow path can retire a full page of `theap_meta` itself (`mi_page_to_full`,
+      // page.c) into `_mi_page_abandon` -> here -> `..._ensure` -> the same lock again.
+      // `subproc.c`'s `mi_subproc_new` now sets `theap_meta->allow_page_abandon = false` (like
+      // `init.c`'s process theap_meta) to close the live path -- a meta theap's pages are
+      // never abandoned at all, so `_mi_page_abandon` should never reach here for one -- but a
+      // self-edge like this cannot be resolved by the MI_FORK_LOCK_* ordering (that orders
+      // acquisition across DIFFERENT call sites, not a lock against itself on one stack), so
+      // keep this check as belt and braces against a future option/call-graph change.
+      mi_bitmap_t* bitmap = NULL;
+      if (!_mi_meta_is_meta_page_safe(page)) {
+        bitmap = mi_arena_pages_abandoned_ensure(arena, arena_pages, bin);
+      }
       if mi_likely(bitmap != NULL) {
         mi_page_set_abandoned_mapped(page);
         const bool was_clear = mi_bitmap_set(bitmap, slice_index);
@@ -12293,6 +12309,16 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   // Allocated on first abandon (Bun parity P10b, #317, ported from oven-sh/mimalloc @
   // 787be2a8, MIT); the arena's own memory is not yet fully zeroed at this point in every
   // memid path (`memid.initially_zero`), so store explicitly rather than relying on that.
+  //
+  // Not a leak (Opus review of #319): unlike a regular heap's `arena_pages` (freed by
+  // `_mi_arena_pages_free` in `mi_heap_free`, see below), `pages_main`'s on-demand bitmaps
+  // are never explicitly freed anywhere -- `mi_heap_free` skips the whole arena-pages loop
+  // for the main heap (`if (!is_main)`, src/heap.c), since `pages_main` is embedded in the
+  // arena itself, not a separately allocated `arena_pages`. Each bitmap is allocated from
+  // `arena->subproc`'s meta theap (`mi_arena_pages_abandoned_ensure`), which is itself backed
+  // by the same arenas -- so this is exactly the same "lives as long as the arena/subproc it
+  // is part of, freed only by tearing the whole arena down" lifetime `arena->slices_free` /
+  // `arena->pages_main.pages` already have, not a new leak class.
   for (size_t i = 0; i < MI_ARENA_BIN_COUNT; i++) {
     mi_atomic_store_ptr_relaxed(mi_bitmap_t, &arena->pages_main.pages_abandoned[i], NULL);
   }
@@ -16358,6 +16384,20 @@ terms of the MIT license. A copy of the license can be found in the file
                                     `theap_meta_lock`), which deadlocks against any thread
                                     starting up (`init.c:268` / `theap.c:329` allocate a
                                     fresh tld/theap through `_mi_meta_zalloc`).
+                                    NOT an edge: `_mi_arenas_page_abandon` (arena.c) must
+                                    never re-enter `_mi_meta_zalloc_aligned` for a page that
+                                    belongs to `theap_meta` itself -- that would be
+                                    `theap_meta_lock` against ITSELF on one stack (a self-edge
+                                    no acquisition ORDER can resolve, unlike every edge in
+                                    this table, which is between two DIFFERENT locks). Closed
+                                    two ways (Opus review of #317/#319): `subproc.c`'s
+                                    `mi_subproc_new` now sets `theap_meta->allow_page_abandon
+                                    = false` (matching `init.c`'s process theap_meta), so
+                                    `mi_page_to_full` never abandons one of `theap_meta`'s own
+                                    pages in the first place; `_mi_arenas_page_abandon` also
+                                    checks `_mi_meta_is_meta_page_safe(page)` and skips the
+                                    lazy-bitmap allocation for a meta page regardless (falls
+                                    through to the unmapped-abandon path), belt and braces.
 
     heap_main->arena_pages_lock     arena.c:685      LEAF. For the main heap
                                     `mi_heap_ensure_arena_pages` only stores
@@ -28825,6 +28865,20 @@ mi_subproc_id_t mi_subproc_new(void) {
   mi_assert_internal(parent->theap_meta->tld!=NULL);
   mi_assert_internal(parent->theap_meta->tld->thread_id == MI_THREADID_DETACHED);
   _mi_theap_init(theap_meta,heap_main,parent->theap_meta->tld /* detached tld */);
+  // Same reasoning as init.c's process-main theap_meta bootstrap ("for security, don't
+  // share with other threads"), plus a reentrancy hazard that reasoning doesn't mention but
+  // this one closes too (Opus review of #317/#319): `_mi_theap_init` -> `mi_theap_options_init`
+  // (theap.c) derives `allow_page_abandon` from `mi_option_page_full_retain`, which defaults
+  // enabled -- so without this line, a subproc's theap_meta (unlike the process's) could
+  // retire one of its own full pages through `mi_page_to_full` (page.c) -> `_mi_page_abandon`
+  // -> `_mi_arenas_page_abandon` (arena.c) -> `mi_arena_pages_abandoned_ensure` ->
+  // `_mi_meta_zalloc_aligned`, which re-enters `subproc->theap_meta_lock` from inside the very
+  // `mi_theap_zalloc_aligned` call that lock is already held across (subproc.c, above) -- an
+  // MI_DEBUG>2 reentrant-lock abort, or a Release-build hang. Setting this false means a meta
+  // page is never abandoned in the first place, so `_mi_page_abandon` never reaches that path
+  // for one; `_mi_arenas_page_abandon` also carries its own belt-and-braces
+  // `_mi_meta_is_meta_page_safe` guard (arena.c) in case this ever regresses.
+  theap_meta->allow_page_abandon = false;
   #if MI_GUARDED
   // See the matching comment in init.c's process-main theap_meta bootstrap (#266):
   // internal allocator bookkeeping must never be guarded.

@@ -10,12 +10,19 @@ Windows commit report different numbers for identical allocator behavior, and ma
 compresses memory so its resident figure falls under pressure while a leak grows. Only
 same-OS deltas are meaningful.
 
-Peak memory is *not* a low-variance signal, so both commands take several runs of the
-same binary and use the **minimum** observed peak. Noise on a shared CI runner only ever
-adds memory (another tenant's page cache, a straggler thread still winding down), so the
-minimum is the estimator closest to the allocator's true high-water mark, and it is far
-more stable than any single run. The spread across runs is printed every time -- if it
+Both commands take several runs of the same binary and use the **minimum** observed peak.
+Noise on a shared CI runner only ever adds memory (another tenant's page cache, a
+straggler thread still winding down), so the minimum is the estimator closest to the
+allocator's true high-water mark. The spread across runs is printed every time -- if it
 ever approaches the tolerance, the tolerance is wrong and the printout says so.
+
+The minimum is not what makes this gate stable, though; #298 established that no
+statistic could rescue the old workload (min-of-8 across twelve consecutive `main` runs
+spanned 22.3-28.0 MB, the median 25.6-31.2 MB), because the peak was set by how many of
+test-memory-gate's churn workers the runner's scheduler happened to overlap. The fix was
+in the workload, not here: test/test-memory-gate.c now rendezvouses those workers, so the
+peak is the structural cost of N live sets rather than a scheduler coin flip. The minimum
+stays because one-sided noise makes it the right estimator, not because it is load-bearing.
 
 Usage:
     memory_gate.py check   [<result.json> ...]   # no paths: build/run the binary itself
@@ -95,42 +102,66 @@ class Result(TypedDict):
 
 # Peak memory tolerance, applied to the minimum of RUNS_EXPECTED runs.
 #
-# An earlier version of this file asserted that memory was "the low-variance signal here
-# (the gated numbers are kernel high-water marks, not sampled)" and set this to 0.10.
-# That was an assumption, and measuring disproved it: repeated runs of the same binary
-# span roughly 20% peak-to-peak. Taking the minimum of several runs cuts that to a few
-# percent, which is what makes a tight threshold defensible rather than flaky.
+# 2026-09-03 (#298). This number is derived from measurement, not chosen. History first,
+# because it is what the derivation has to beat:
 #
-# This number is set from the observed spread reported by the runs below, not guessed.
-# Raise it only with the measurement that justifies it; a gate that flakes gets ignored,
-# and an ignored gate is worse than none.
+#   The tolerance was 0.15 and the ubuntu gate still flipped red on commits that changed
+#   no allocator code at all (docs-only #275, ci-only #278/#297). The `memory-gate-
+#   ubuntu-latest` artifacts of the last twelve `main` runs of c-unit.yml say why --
+#   min-of-8 / median / within-run spread, against a 22.3 MB baseline and a 25.6 MB
+#   allowed:
+#     33618717188  26.7 / 29.6 / 32.6%      33647332787  24.5 / 26.5 / 17.6%
+#     33629562858  24.7 / 27.4 / 19.0%      33654892179  27.9 / 31.2 / 24.4%
+#     33631613324  28.0 / 29.2 / 15.7%      33660325957  26.5 / 27.6 / 18.5%
+#     33635722154  26.0 / 28.0 / 19.6%      33689409217  22.7 / 25.6 / 25.6%
+#     33636560081  22.3 / 26.9 / 30.0%      33692432919  25.5 / 27.9 / 28.2%
+#     33646494496  24.3 / 28.2 / 44.4%      33699070304  27.8 / 30.2 / 19.8%
+#   Every within-run spread exceeds the tolerance it was compared under, min-of-8 across
+#   runs spans 25.6% and the median 21.9%. No tolerance and no statistic can separate a
+#   regression from that; a per-scenario decomposition (idle host, `taskset -c 0-3`)
+#   found scenario 1 -- the 8-thread churn -- alone ranging 14.1 -> 24.6 MB run to run,
+#   with every later scenario adding <= 2 MB on top. The gate was measuring the runner.
 #
-# 2026-09-02 (#266): min-of-4 on ubuntu-latest was flaky enough to flip PASS/FAIL between
-# consecutive pushes of the *same* Release object code (diagnostic.c-only commits do not
-# touch the Release build). Five consecutive PR #276 / main measurements, all min-of-4,
-# baseline 22.3 MB, allowed 25.6 MB:
-#   238218d5 -> 24.7 MB PASS (spread 17.8%)
-#   5d1d6ae3 -> 26.5 MB FAIL (spread  9.1%)
-#   32e08564 -> 25.4 MB PASS (spread 23.2%)
-#   0e23010b -> 29.2 MB FAIL (spread 14.7%)   <- identical Release code to 32e08564
-#   main #275 (docs-only, no allocator-path changes at all) -> 25.8 MB FAIL (+15.7%)
-# Four of five spreads are at or above PEAK_TOLERANCE itself -- the threshold this
-# comment used to warn "cannot distinguish a regression from noise" was already
-# happening in practice, not just hypothetically. Per that same comment's own rule
-# ("raise RUNS_EXPECTED or the tolerance, with this measurement as the justification"),
-# these five measurements are that justification for min-of-8: RUNS_EXPECTED below moves
-# from 4 to 8. PEAK_TOLERANCE stays 0.15 and ci/memory-baselines/*.json is deliberately
-# NOT touched -- the baseline was recorded as a min-of-4 (22.3 MB, 5.8% spread, #70), and
-# a min-of-8 of the same underlying peak-RSS distribution can only be <= a min-of-4 of
-# that distribution, never higher, so doubling the run count here is strictly
-# conservative with respect to that baseline: it cannot manufacture a new pass, only
-# remove noise-driven false failures.
-PEAK_TOLERANCE = 0.15
+#   So the workload was fixed instead (test/test-memory-gate.c: the churn workers
+#   rendezvous, and the cross-thread handoff no longer busy-spins). Three independent
+#   ubuntu-latest runner VMs (nproc=4, THP=always), 16 runs each, the same object code:
+#     33700518749  min 58.0  med 58.3  max 58.5  spread 0.9%
+#     33700575788  min 58.0  med 58.5  max 58.5  spread 0.9%
+#     33700583919  min 58.0  med 58.3  max 58.6  spread 1.0%
+#   min-of-16 is 58.0 MB on all three -- 0.0% across-run variation of the estimator, and
+#   1.0% across all 48 samples. Pinning changes nothing any more (`taskset -c 0-1` 0.5%,
+#   `-c 0` 0.7%), `MIMALLOC_SCAVENGER=0 MIMALLOC_PURGE_HOLES=0` changes nothing (1.2%),
+#   and an unpinned 16-core workstation reads 58.2-58.3 -- the same number as the 4-vCPU
+#   runner, where the old workload read 58 MB unpinned vs 23 MB pinned. The old workload
+#   re-measured on those same three VMs for comparison: 26.4 / 27.4 / 25.5 min-of-16,
+#   spreads 26.1% / 24.5% / 23.1%.
+#
+# 0.05 is therefore 5x the largest observed spread (1.0%) and infinitely more than the
+# observed across-run variation of the estimator itself (0.0%), leaving 2.9 MB of
+# absolute headroom on a 58 MB baseline. The measurement would support 0.03; the
+# difference is reserved for runner-image drift, which three runs on one image cannot
+# bound. Tighten it once ten `main` runs on a new image have been observed, with those
+# numbers written here.
+#
+# The positive control's margin, which is the other half of a defensible threshold: the
+# MI_BENCH_INJECT_LEAK=200000 build read min-of-8 82.6 / 82.4 / 82.5 MB on the same three
+# VMs -- +42.1% over the baseline, or 8.4x this tolerance. The rule is that the control
+# must fail by at least 2x the tolerance, so a leak this size is caught with a factor of
+# four to spare, and the smallest regression the gate can now see is 2.9 MB (5% of a
+# 58 MB structural peak) instead of "nothing at all under 25% of noise".
+PEAK_TOLERANCE = 0.05
 
 # Number of runs the CI job is expected to supply. Fewer is allowed (with a warning) so
-# the script stays usable locally, but the committed baselines are min-of-N (N=4 for the
-# existing ci/memory-baselines/*.json; see the RUNS_EXPECTED comment above for why a
-# larger N here is still a valid, strictly-conservative comparison against those files).
+# the script stays usable locally.
+#
+# Left at 8 by #298 rather than raised or lowered, and that is a measured decision both
+# ways. Raising it buys nothing: min-of-16 and min-of-8 of the post-#298 distribution are
+# the same 58.0 MB on all three runner VMs measured above, because the distribution is
+# 0.6 MB wide. Lowering it to 4 would also be defensible on those numbers and would need a
+# matching edit to the `for i in 1 2 3 4 5 6 7 8` loops in c-unit.yml -- not worth the
+# churn for a binary that now completes in ~0.1 s (the busy-spin removal in scenario 3
+# made it faster, not slower). Eight runs also keep the printed spread informative enough
+# to notice an image change before it becomes a red gate.
 RUNS_EXPECTED = 8
 
 # Counters are exact, not statistical. A thread that was created and joined must not
@@ -139,17 +170,17 @@ RUNS_EXPECTED = 8
 MAX_LIVE_THREADS = 32
 
 
-# CI's runners are 4-core (ubuntu-latest/windows-latest/macos-latest as of the baselines
-# this gate compares against). A wider local box measurably inflates the peak this test
-# exercises: it drives MI_BENCH_THREADS()-many concurrently-running threads doing an
-# allocation churn, and peak RSS/commit scales with how many of those threads the OS
-# actually schedules onto distinct CPUs at once, not just with the allocator's true
-# high-water mark. Observed on this repo: 58 MB on an unrestricted 16-core host vs ~23 MB
-# under `taskset -c 0-3` on the same host, for the identical binary and commit -- an
-# apples-to-oranges comparison against the 4-core baselines that nothing about the JSON
-# schema flags as such. Pinning the child to <= 4 CPUs here is what makes a local
-# `python ci/memory_gate.py check` (no path arguments) comparable to the CI numbers
-# instead of just plausible-looking.
+# CI's runners are 4-core. This pinning was load-bearing before #298: the old workload's
+# peak scaled with how many of its churn threads the OS put on distinct CPUs at once, so
+# an unrestricted 16-core host read 58 MB against a 4-core baseline of ~23 MB for the
+# identical binary and commit -- an apples-to-oranges comparison nothing in the JSON
+# flagged as such.
+#
+# It is no longer load-bearing, and the measurement that says so is in PEAK_TOLERANCE
+# above: with the rendezvoused workload the same 16-core host reads 58.2-58.3 MB unpinned
+# and the 4-vCPU runner reads 58.0-58.6 MB. It is kept as a cheap guard -- a future
+# scenario that reintroduces CPU-count sensitivity would otherwise make local numbers
+# quietly incomparable to CI's again, which is exactly how #298 stayed hidden for so long.
 MAX_GATE_CPUS = 4
 
 
@@ -292,7 +323,16 @@ def load_runs(
     return best, peaks, spread
 
 
-def report_runs(peaks: list[float], spread: float) -> None:
+def report_runs(peaks: list[float], spread: float, *, gated: bool = True) -> None:
+    """Print the run distribution; `gated=False` for a run nothing is thresholded against.
+
+    The spread warning below is advice about *this gate's* threshold, so it must not fire
+    on the positive control. A leak build's runs legitimately span tens of percent (the
+    injected blocks land in already-resident arena memory or not, depending on purge
+    timing: 82.6-129.8 MB across one measured control run), and telling a reader to raise
+    RUNS_EXPECTED or the tolerance on the strength of that would be advice to loosen a
+    real gate because a deliberately broken build was noisy.
+    """
     print("  {:<22} {}".format("runs (MB)", "  ".join(f"{p:.1f}" for p in peaks)))
     print(
         "  {:<22} {:.1f}%  (min is used; noise on a shared runner only adds memory)".format(
@@ -304,10 +344,11 @@ def report_runs(peaks: list[float], spread: float) -> None:
             f"  WARNING: only {len(peaks)} run(s); the committed baselines are min-of-{RUNS_EXPECTED}. "
             "A single run is not comparable."
         )
-    if spread >= 100.0 * PEAK_TOLERANCE:
+    if gated and spread >= 100.0 * PEAK_TOLERANCE:
         print(
             f"  WARNING: observed spread ({spread:.1f}%) is at or above the tolerance "
             f"({100.0 * PEAK_TOLERANCE:.0f}%). The threshold cannot distinguish a regression from noise -- "
+            "fix the workload's determinism first (that is what #298 did), and only then "
             "raise RUNS_EXPECTED or the tolerance, with this measurement as the "
             "justification."
         )
@@ -404,7 +445,7 @@ def check(
             "profiler arena", result.get("profiler_arena_mb", 0.0)
         )
     )
-    report_runs(peaks, spread)
+    report_runs(peaks, spread, gated=not _control)
 
     if peak > allowed:
         failures.append(

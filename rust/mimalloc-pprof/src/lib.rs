@@ -1470,6 +1470,12 @@ pub mod memory_events {
     ///   is active — that includes anything that allocates indirectly, such as `println!`,
     ///   growing a `Vec`, or formatting. Collect into a fixed-size buffer, or into
     ///   [`crate::unwrapped_malloc`] memory, and process it after this returns.
+    /// - `visitor` must not panic. Raising a panic allocates its payload and its message
+    ///   through the global allocator, which reenters mimalloc in the middle of the walk
+    ///   -- the very thing the bullet above forbids. The `catch_unwind` inside the
+    ///   trampoline stops the unwind from crossing the C frame; it does **not** and
+    ///   cannot prevent that allocation, which has already happened by the time it runs.
+    ///   Report failures by setting a flag the caller reads after the walk returns.
     /// - The pointers handed to `visitor` must not be dereferenced, retained, or freed:
     ///   they may already be dead. Treat them as addresses, not as references.
     /// - No other thread may be freeing into the heaps being walked (the

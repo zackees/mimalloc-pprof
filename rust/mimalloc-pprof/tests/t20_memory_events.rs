@@ -88,6 +88,11 @@ fn tracking_off_records_nothing() {
 }
 
 fn unwrapped_allocations_are_excluded_from_accounting() {
+    // This section asserts strict equality across a window, so nothing else may allocate
+    // through mimalloc inside it. The background scavenger runs on a timer and can, so
+    // quiesce it first -- same reason t23_purge_holes_report.rs does.
+    mimalloc_pprof::scavenger_stop();
+
     let previous = memory_events::set_enabled(true);
     let before = memory_events::snapshot().expect("snapshot while enabled");
 

@@ -58,6 +58,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
@@ -396,6 +397,20 @@ def format_progress(index: int, total: int, result: TestResult, width: int) -> s
     )
 
 
+#: Characters XML 1.0 does not allow at all -- not even escaped. mimalloc's own verbose
+#: output carries ANSI colour codes (ESC, 0x1b), so a captured log routinely contains
+#: them; before #307 nothing parsed these files back and the invalid bytes went unnoticed,
+#: and `guarded.xml` then failed the coverage step with "not well-formed (invalid token)"
+#: rather than reporting on coverage. Dropped rather than escaped, because there is no
+#: legal escape for them.
+_XML_FORBIDDEN = re.compile("[^\u0009\u000a\u000d\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
+
+def xml_safe(text: str) -> str:
+    """`text` with every character XML 1.0 forbids removed."""
+    return _XML_FORBIDDEN.sub("", text)
+
+
 def write_junit(path: Path, results: Sequence[TestResult], suite: str = "test-bundle") -> None:
     failures = sum(1 for result in results if not result.passed)
     total_time = sum(result.seconds for result in results)
@@ -407,12 +422,13 @@ def write_junit(path: Path, results: Sequence[TestResult], suite: str = "test-bu
     for result in results:
         status = "run" if result.passed else "fail"
         lines.append(
-            f"  <testcase name={quoteattr(result.name)} classname={quoteattr(result.classname)} "
+            f"  <testcase name={quoteattr(xml_safe(result.name))} "
+            f"classname={quoteattr(xml_safe(result.classname))} "
             f'time="{result.seconds:.6f}" status="{status}">'
         )
         if not result.passed:
-            lines.append(f"    <failure message={quoteattr(result.reason)}/>")
-        lines.append(f"    <system-out>{escape(result.output)}</system-out>")
+            lines.append(f"    <failure message={quoteattr(xml_safe(result.reason))}/>")
+        lines.append(f"    <system-out>{escape(xml_safe(result.output))}</system-out>")
         lines.append("  </testcase>")
     lines.append("</testsuite>")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

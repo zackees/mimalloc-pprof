@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 import bundle_tests
@@ -978,6 +979,29 @@ class MultiBundleRunnerTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(sorted(path.name for path in results.iterdir()), ["iota.xml", "theta.xml"])
         self.assertIn('name="t1"', (results / "theta.xml").read_text(encoding="utf-8"))
+
+    def test_junit_stays_parseable_when_a_test_prints_ansi_escapes(self) -> None:
+        """mimalloc's own MIMALLOC_VERBOSE output is coloured; ESC is illegal in XML 1.0.
+
+        Nothing parsed these files back before #307, so an invalid byte went unnoticed
+        until the coverage step read the guarded bundle's JUnit and reported "not
+        well-formed (invalid token)" instead of reporting on coverage.
+        """
+        bundle = self.make_bundle("omicron", [self.spec("o1", 0.0)])
+        (bundle / "probe.py").write_text(
+            "import sys\nsys.stdout.write('\\x1b[37mcoloured\\x1b[0m\\x00\\n')\n",
+            encoding="utf-8",
+        )
+        results = self.root / "ansi"
+        proc = self.run_bundles("--bundles", str(bundle), "--junit-dir", str(results))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        report = results / "omicron.xml"
+        parsed = ElementTree.parse(report)  # would raise ParseError on a stray ESC
+        text = report.read_text(encoding="utf-8")
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x00", text)
+        self.assertIn("coloured", text)
+        self.assertEqual([case.get("name") for case in parsed.getroot().iter("testcase")], ["o1"])
 
     def test_a_failure_names_its_bundle(self) -> None:
         bundle = self.make_bundle("kappa", [self.spec("k1", 0.0, timeout=0.0001)])

@@ -319,6 +319,20 @@ jobs:
         # this bundle is the machine that runs it, so "can it load somewhere else" is not
         # the question this job answers.
         run: uv run ci/bundle_tests.py build bundle --config Release
+      - name: The bundle must carry the DLLs its executables load
+        # `build_tests.py` copies these by glob rather than because a test names them on
+        # its command line, so a layout change would drop them silently and the tests
+        # would exit 0xC0000135 -- a dialog-free exit code, not a failure that says what
+        # happened. windows-bundles.yml makes the same assertion for the same reason.
+        run: |
+          set -euo pipefail
+          if grep -nE '"(/|[A-Za-z]:[\\/])' bundle/tests.json; then
+            echo "::error::the bundle manifest contains an absolute path"
+            exit 1
+          fi
+          ls bundle | grep -q '^mimalloc\.dll$'
+          ls bundle | grep -q '^mimalloc-redirect\.dll$'
+          uv run python -c "import json; d=json.load(open('bundle/tests.json')); print(len(d['tests']), 'tests')"
       - name: Pack the bundle
         run: tar -C bundle -czf windows-native.tar.gz .
       - uses: actions/upload-artifact@v4

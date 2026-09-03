@@ -1433,12 +1433,17 @@ void mi_bitmap_clear_once_set(mi_subproc_t* subproc, mi_bitmap_t* bitmap, size_t
 
 
 // Visit all set bits in a bitmap.
+// The loads are acquire: `mi_heap_delete` walks its `arena_pages->pages` with this and then frees the
+// heap and the bitmap itself (`arena.c:mi_heap_visit_page_claim` against `mi_arenas_page_free_prim`),
+// while a concurrent `mi_free` that frees a page of the heap reads both and then clears the page's bit
+// (release) as its last access. Seeing that bit clear here is what orders those reads before our free
+// of the memory they read (issue #316, Bun parity P10a, commit a26c5de7).
 // todo: optimize further? maybe use avx512 to directly get all indices using a mask_compressstore?
 bool _mi_bitmap_forall_set(mi_bitmap_t* bitmap, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
   // for all chunkmap entries
   const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmap), MI_BFIELD_BITS);
   for(size_t i = 0; i < chunkmap_max; i++) {
-    mi_bfield_t cmap_entry = mi_atomic_load_relaxed(&bitmap->chunkmap.bfields[i]);
+    mi_bfield_t cmap_entry = mi_atomic_load_acquire(&bitmap->chunkmap.bfields[i]);
     size_t cmap_idx;
     // for each chunk (corresponding to a set bit in a chunkmap entry)
     while (mi_bfield_foreach_bit(&cmap_entry, &cmap_idx)) {
@@ -1447,7 +1452,7 @@ bool _mi_bitmap_forall_set(mi_bitmap_t* bitmap, mi_forall_set_fun_t* visit, mi_a
       mi_bchunk_t* const chunk = &bitmap->chunks[chunk_idx];
       for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
         const size_t base_idx = (chunk_idx*MI_BCHUNK_BITS) + (j*MI_BFIELD_BITS);
-        mi_bfield_t b = mi_atomic_load_relaxed(&chunk->bfields[j]);
+        mi_bfield_t b = mi_atomic_load_acquire(&chunk->bfields[j]);
         size_t bidx;
         while (mi_bfield_foreach_bit(&b, &bidx)) {
           const size_t idx = base_idx + bidx;

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 872c37d8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit be81f936 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -6470,13 +6470,24 @@ static inline void* mi_prim_tls_slot(size_t slot) {
     #else
       return mi_prim_thread_pointer()[slot];
     #endif
+  #elif defined(__GNUC__) || defined(__clang__)
+    // The slot lives in the thread's control block, which the OS reuses for a later thread, so the
+    // exiting thread's last store (`_mi_thread_done`) and a new thread's first load touch the same
+    // address from different threads. A relaxed atomic is the same single load/store instruction and
+    // states that this is by design (and keeps TSAN quiet about it). Ported from oven-sh/mimalloc
+    // (issue #316, Bun parity P10a).
+    return __atomic_load_n(&mi_prim_thread_pointer()[slot], __ATOMIC_RELAXED);
   #else
     return mi_prim_thread_pointer()[slot];
   #endif
 }
 
 static inline void mi_prim_tls_slot_set(size_t slot, void* value) {
+  #if defined(__GNUC__) || defined(__clang__)
+  __atomic_store_n(&mi_prim_thread_pointer()[slot], value, __ATOMIC_RELAXED);
+  #else
   mi_prim_thread_pointer()[slot] = value;
+  #endif
 }
 #endif
 
@@ -7460,10 +7471,31 @@ void _mi_free_subproc_safe_in_page(void* p, mi_page_t* page) mi_attr_noexcept {
   mi_free_ex(p, page, NULL, false);
 }
 
-// Free a pointer that is potentially allocated in a different sub-process
+// The sub-process of a page we do not own. On a multi-threaded free we cannot go through
+// `page->heap` (`mi_page_heap`): a concurrent `mi_heap_delete` moves the page to the main
+// heap and frees the heap struct. `page->memid` is immutable after page creation, so its
+// arena (`mi_memid_arena`) is a safe read regardless of who owns the page right now -- the
+// same read `_mi_meta_is_meta_page_safe` (internal.h:266) already trusts, with the same
+// provenance. For the (rare) OS-allocated pages, which carry no arena, fall back to our own
+// subproc, as Bun does (issue #316, Bun parity P10a, commit 04ced98d).
+static mi_subproc_t* mi_page_subproc_unowned(const mi_page_t* page) {
+  mi_arena_t* const arena = mi_memid_arena(page->memid);
+  return (arena != NULL ? arena->subproc : _mi_subproc());
+}
+
+// Free a pointer that is potentially allocated in a different sub-process.
+// Collecting an abandoned page (free it, reclaim it, or re-map it) must not cross sub-processes,
+// but inside our own it must still happen: a full page is abandoned and unmapped, and a block
+// freed into it without collecting is never found again and pins the page (`mi_heap_free` frees
+// every `mi_heap_t` and `mi_arena_pages_t` through here; see the call sites for why the park
+// protocol is safe with collecting turned on).
 void _mi_free_subproc_safe(void* p) mi_attr_noexcept {
-  mi_page_t* const page = mi_validate_ptr_page(p,"_mi_free_subproc_safe");  
-  mi_free_ex(p, page, NULL, false);
+  mi_page_t* const page = mi_validate_ptr_page(p,"_mi_free_subproc_safe");
+  if mi_unlikely(page==NULL) return;   // p==NULL, or an invalid pointer already reported by mi_validate_ptr_page;
+                                        // mi_free_ex below guards NULL too, but mi_page_subproc_unowned needs
+                                        // a non-NULL page to read page->memid from.
+  const bool allow_collect = (mi_page_subproc_unowned(page) == _mi_subproc());
+  mi_free_ex(p, page, NULL, allow_collect);
 }
 
 
@@ -7932,18 +7964,35 @@ static void mi_stat_free(const mi_page_t* page, const mi_block_t* block) {
   // This can run for a cross-thread free (mi_free_block_mt) racing a concurrent
   // mi_heap_delete/mi_heap_destroy of page's heap on another thread -- reproduced as a
   // SIGSEGV reading page->heap->subproc here (see memory-events.c's _mi_memevt_on_free
-  // provenance comment for the first instance of this class of bug and its fix). _mi_subproc()
-  // is this (the freeing) thread's own subproc -- always safe, no dereference of anything
-  // reachable only through `page`. Matches the pre-existing (commented out, "never collect
-  // across subprocesses") assumption a few lines below that the two agree in the normal case;
-  // the rare cross-subprocess free this could get wrong (attributing the stat decrease to the
-  // wrong subproc's theap_meta) was already an unverified edge case, not a memory-safety one.
-  mi_subproc_t* const subproc = _mi_subproc();
-  mi_theap_t* const theap_meta = subproc->theap_meta;
+  // provenance comment for the first instance of this class of bug and its fix).
+  // Converged in #316 (Bun parity P10a) onto `mi_page_subproc_unowned` (defined earlier in this
+  // file, called a few lines below in this function), the same arena-derived read that replaced
+  // `page->heap->subproc`: `page->memid` is immutable after
+  // page creation, so reading the arena through it never dereferences `page->heap` either, and
+  // is strictly more accurate than the previous stand-in of "this (the freeing) thread's own
+  // subproc" -- it agrees with that whenever the page is in fact ours (the common case, per the
+  // "never collect across subprocesses" assumption a few lines below), and gets the actual
+  // owning subproc right in the rare cross-subprocess free the old comment conceded was an
+  // unverified edge case.
+  //
+  // #316 (P10a): the condition below is Bun's original shape, not our prior
+  // `theap_meta != NULL && mi_page_thread_id(page) == theap_meta->tld->thread_id` -- that reads
+  // `theap_meta->tld` unconditionally once `theap_meta != NULL`, but `mi_heap_free_theaps` nulls
+  // a theap's `tld` *before* `mi_subproc_unsafe_destroy` nulls `subproc->theap_meta`, so a
+  // *foreign* subproc mid-teardown (only reachable now that `subproc` need not be our own) can
+  // have `theap_meta != NULL` with `theap_meta->tld == NULL` -- a NULL deref. Every `theap_meta`
+  // shares the same static `mi_tld_detached` (`init.c:101`, `subproc.c:209`'s assert), whose
+  // `thread_id` is the compile-time constant `MI_THREADID_DETACHED`, so
+  // `mi_page_thread_id(page) == theap_meta->tld->thread_id` for the meta theap is equivalent to
+  // `mi_page_thread_id(page) == MI_THREADID_DETACHED` without reading `theap_meta` (let alone its
+  // `tld`) at all in the condition. `subproc`/`theap_meta` are loaded inside the branch instead,
+  // where they are actually needed, and past their own `theap_meta == NULL` guard.
   if mi_unlikely(!mi_theap_is_initialized(theap) || // can happen if free'd after thread_done was called (usually a thread cleanup call by the OS)
-                  // page->theap == subproc->theap_meta  .. but we cannot read `theap` if we don't own the page
-                  (theap_meta != NULL && mi_page_thread_id(page) == theap_meta->tld->thread_id)) { 
-    theap = theap_meta;
+                  mi_page_thread_id(page) == MI_THREADID_DETACHED) { // page->theap == subproc->theap_meta .. but we cannot read `theap` if we don't own the page (only the meta theap has the detached thread id)
+    // account on the subproc of the page (we cannot use our own theap here)
+    mi_subproc_t* const subproc = mi_page_subproc_unowned(page);
+    if (subproc->theap_meta == NULL) return;  // give up (the subproc is being destroyed)
+    theap = subproc->theap_meta;
     lock = &subproc->theap_meta_lock;
     mi_lock_acquire(lock);
   }
@@ -11850,6 +11899,16 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
     };
   }
   else if (memid.memkind == MI_MEM_MALLOC) {
+    // #316 (P10a): this free now collects in-subproc. No allocation site in this tree
+    // currently produces a MI_MEM_MALLOC memid that reaches here -- the producers
+    // (`_mi_meta_zalloc`/`_mi_meta_zalloc_aligned`/`_mi_meta_rezalloc`, subproc.c, via
+    // `_mi_memid_create_malloc`) hand it to `_mi_meta_free` (subproc.c:94, the only caller of
+    // `_mi_arenas_free` that matters here), which handles MI_MEM_MALLOC itself with a plain
+    // `mi_free(p)` and only forwards other memkinds to `_mi_arenas_free` (subproc.c:99); the
+    // rest of `_mi_arenas_free`'s callers (arena.c:794/935/1184) pass an arena- or OS-backed
+    // memid. This branch is upstream's fallback, kept for shape parity; if a future producer
+    // reaches it, the collect is guarded the same way as every other `mi_free_ex` path
+    // (`mi_free_try_collect_mt`'s own reclaim guards, unconditional).
     _mi_free_subproc_safe(p);
   }
   else {
@@ -12943,6 +13002,15 @@ mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;  // impor
 // too. This is the same protocol the abandoned-page map already uses
 // (`mi_arena_try_claim_abandoned`).
 //
+// ported from oven-sh/mimalloc commit a26c5de7, MIT (issue #316 / Bun parity P10a): the page
+// struct is only located (`mi_arena_page_at_slice`, which reads `page->block_size` when
+// `MI_PAGE_META_ALIGNED_FREE_SMALL`/`MI_OPT_FREE_SMALL` separates page meta) once the slice is
+// pinned -- before that a concurrent `mi_free` may still be freeing the page and the slice may
+// already be a fresh page of another heap by the time we look. Latent under our default
+// configs (`mi_arena_page_at_slice` is a pure function of `slice_index` there); a correctness
+// fix once `MI_OPT_FREE_SMALL` reads `block_size` off an unpinned slice. Returns the page we
+// now own, or NULL if it is gone.
+//
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): the
 // `_mi_process_is_forked_child` branch below was originally dropped here with a note to
 // "add it back once #270/PR #289 lands" -- #289 landed a handler-only fork design
@@ -12959,11 +13027,13 @@ static void mi_heap_visit_page_seize(mi_page_t* page) {
   mi_page_set_theap(page, NULL);
 }
 
-static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* page, size_t slice_index) {
+static mi_page_t* mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_arena_t* arena, size_t slice_index) {
   mi_bitmap_t* const pages = vinfo->arena_pages->pages;
+  mi_page_t* page = NULL;
   for (;;) {
-    if (!mi_bitmap_clear(pages, slice_index)) return false;   // freed by a concurrent `mi_free`
-    // pinned
+    if (!mi_bitmap_clear(pages, slice_index)) return NULL;   // freed by a concurrent `mi_free`
+    // pinned: now it is a page of this heap and stays one while we hold the bit
+    page = mi_arena_page_at_slice(arena, slice_index);
     #if MI_DEBUG > 0
     if (mi_atomic_load_relaxed(&mi_debug_stall_in_heap_delete_claim) == 1) {
       mi_atomic_store_release(&mi_debug_stall_in_heap_delete_claim, (uintptr_t)2);  // signal: pinned, not yet claimed
@@ -12977,8 +13047,8 @@ static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* pag
       // arena-pages bit propagated but the page-map entry or the owned bit did not, and that
       // thread no longer exists in this process to finish the update. Re-derive what we can
       // and take the page outright; there is nobody left to race.
-      if (mi_page_start(page) == NULL) return false;  // the page struct never made it across: leave it unpublished
-      if (_mi_safe_ptr_page(mi_page_start(page)) != page && !_mi_page_map_register(page)) return false;
+      if (mi_page_start(page) == NULL) return NULL;  // the page struct never made it across: leave it unpublished
+      if (_mi_safe_ptr_page(mi_page_start(page)) != page && !_mi_page_map_register(page)) return NULL;
       mi_page_claim_ownership(page);   // ours now, whether or not the dead thread held it
       mi_bitmap_set(pages, slice_index);
       if (!mi_page_is_abandoned(page)) { mi_heap_visit_page_seize(page); }
@@ -13005,15 +13075,19 @@ static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* pag
   mi_assert_internal(mi_page_is_owned(page) && mi_page_is_abandoned(page));
   mi_assert_internal(mi_bitmap_is_set(pages, slice_index));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page)) == page && mi_page_heap(page) == vinfo->heap);
-  return true;
+  return page;
 }
 
 static bool mi_heap_visit_page_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   MI_UNUSED(slice_count);
   mi_heap_visit_info_t* vinfo = (mi_heap_visit_info_t*)arg;
-  mi_page_t* page = mi_arena_page_at_slice(arena, slice_index);
+  mi_page_t* page;
   if (vinfo->claim_pages) {
-    if (!mi_heap_visit_page_claim(vinfo, page, slice_index)) return true;  // gone: skip
+    page = mi_heap_visit_page_claim(vinfo, arena, slice_index);
+    if (page == NULL) return true;  // gone: freed by a concurrent `mi_free`
+  }
+  else {
+    page = mi_arena_page_at_slice(arena, slice_index);
   }
   return mi_heap_visit_page(page, vinfo);
 }
@@ -14764,12 +14838,17 @@ void mi_bitmap_clear_once_set(mi_subproc_t* subproc, mi_bitmap_t* bitmap, size_t
 
 
 // Visit all set bits in a bitmap.
+// The loads are acquire: `mi_heap_delete` walks its `arena_pages->pages` with this and then frees the
+// heap and the bitmap itself (`arena.c:mi_heap_visit_page_claim` against `mi_arenas_page_free_prim`),
+// while a concurrent `mi_free` that frees a page of the heap reads both and then clears the page's bit
+// (release) as its last access. Seeing that bit clear here is what orders those reads before our free
+// of the memory they read (issue #316, Bun parity P10a, commit a26c5de7).
 // todo: optimize further? maybe use avx512 to directly get all indices using a mask_compressstore?
 bool _mi_bitmap_forall_set(mi_bitmap_t* bitmap, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
   // for all chunkmap entries
   const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmap), MI_BFIELD_BITS);
   for(size_t i = 0; i < chunkmap_max; i++) {
-    mi_bfield_t cmap_entry = mi_atomic_load_relaxed(&bitmap->chunkmap.bfields[i]);
+    mi_bfield_t cmap_entry = mi_atomic_load_acquire(&bitmap->chunkmap.bfields[i]);
     size_t cmap_idx;
     // for each chunk (corresponding to a set bit in a chunkmap entry)
     while (mi_bfield_foreach_bit(&cmap_entry, &cmap_idx)) {
@@ -14778,7 +14857,7 @@ bool _mi_bitmap_forall_set(mi_bitmap_t* bitmap, mi_forall_set_fun_t* visit, mi_a
       mi_bchunk_t* const chunk = &bitmap->chunks[chunk_idx];
       for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
         const size_t base_idx = (chunk_idx*MI_BCHUNK_BITS) + (j*MI_BFIELD_BITS);
-        mi_bfield_t b = mi_atomic_load_relaxed(&chunk->bfields[j]);
+        mi_bfield_t b = mi_atomic_load_acquire(&chunk->bfields[j]);
         size_t bidx;
         while (mi_bfield_foreach_bit(&b, &bidx)) {
           const size_t idx = base_idx + bidx;
@@ -15821,6 +15900,13 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
         mi_arena_pages_t* arena_pages = mi_atomic_load_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i]);
         if (arena_pages!=NULL) {
           mi_atomic_store_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i], NULL);
+          // #316 (P10a): this free now collects in-subproc. Safe regardless of whether this
+          // thread is parked: `allow_collect` only reaches `mi_free_block_mt`/
+          // `mi_free_generic_mt` (free.c:mi_free_ex), while `_mi_park_leave_if_parked` lives
+          // only in the separate `mi_free_generic_local` owner-free path (free.c:167) -- so this
+          // can never newly reach the park protocol. `mi_free_try_collect_mt`'s own reclaim
+          // guards (`_mi_thread_is_initialized`, `_mi_page_associated_theap_peek` refusing a
+          // theap of another heap) apply unconditionally.
           _mi_free_subproc_safe(arena_pages);
         }
       }
@@ -15845,9 +15931,11 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
   mi_lock_done(&heap->theaps_lock);
   mi_lock_done(&heap->os_abandoned_pages_lock);
   mi_lock_done(&heap->arena_pages_lock);
-  if (!_mi_is_process_heap_main(heap)) { 
+  if (!_mi_is_process_heap_main(heap)) {
     _mi_thread_local_free(heap->theap);
-    _mi_free_subproc_safe(heap); 
+    // #316 (P10a): same audit as the arena_pages free above -- `allow_collect` cannot reach the
+    // park protocol from here either, for the same call-graph reason.
+    _mi_free_subproc_safe(heap);
   }
 }
 
@@ -16067,7 +16155,7 @@ terms of the MIT license. A copy of the license can be found in the file
       -> sp->theap_meta_lock        `mi_heap_free_theaps` (heap.c:174) -> `_mi_theap_decref`
                                     -> `mi_theap_free_mem` -> `_mi_meta_free` (theap.c:363)
                                     ... and, for a page owned by `theap_meta`, `mi_free`
-                                    -> `mi_stat_free` (free.c:741) takes `theap_meta_lock`
+                                    -> `mi_stat_free` (free.c:768) takes `theap_meta_lock`
       -> tld->theaps_lock           `_mi_heap_detach_theaps` -- but `mi_lock_TRY_acquire`
                                     with a back-off retry (theap.c:412), so NOT a blocking
                                     edge; see the Phase 7 gap note below
@@ -16079,7 +16167,7 @@ terms of the MIT license. A copy of the license can be found in the file
                                     `mi_arena_pages_alloc` (arena.c:1544), which runs a FULL
                                     `mi_heap_zalloc_aligned(subproc->heap_main, ...)`
       -> sp->theap_meta_lock        `mi_heap_free` (heap.c:203-208) holds it across
-                                    `_mi_free_subproc_safe` -> `mi_stat_free` (free.c:741)
+                                    `_mi_free_subproc_safe` -> `mi_stat_free` (free.c:768)
       -> heap->os_abandoned_pages_lock   (same free, via `mi_arena_page_abandon`, arena.c:1224)
 
     mi_thread_locals_lock           threadlocal.c    TLS slot bitmap

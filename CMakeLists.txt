@@ -988,7 +988,7 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  foreach(TEST_NAME api api-fill stress-heaps stress-subprocs stress)
+  foreach(TEST_NAME api api-fill heap-burst-destroy stress-heaps stress-subprocs stress)
     add_executable(mimalloc-test-${TEST_NAME} test/test-${TEST_NAME}.c)
     target_compile_definitions(mimalloc-test-${TEST_NAME} PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE ${mi_cflags})
@@ -1867,6 +1867,10 @@ endif()
 #     missed deadline is indistinguishable from the regression these tests exist to catch.
 #   * a subprocess-shaped lifecycle -- test-subproc-lifecycle forks/execs and asserts on
 #     what the child does at exit.
+#   * process-wide meta-data bookkeeping under load -- test-heap-burst-destroy measures the
+#     main heap's byte-count and process RSS across 4000 heap creates/destroys (single-
+#     threaded; no race), the same sensitivity class as the RSS-under-pressure tests above: a
+#     parallel wave's memory pressure can move both numbers independently of the allocator.
 #
 # RUN_SERIAL is ctest's own word for this ("do not run any other test concurrently"), so
 # it is set here rather than encoded as a name list inside the CI runner: a new test
@@ -1889,6 +1893,7 @@ set(mi_serial_tests
   test-profile-race
   test-profile-race-scavenger
   test-subproc-lifecycle
+  test-heap-burst-destroy
 )
 # Next candidate if the wave ever goes flaky: test-fork-user-heap. It is not here because
 # nothing has been observed to fail -- it forks, and a fork's cost and timing are the

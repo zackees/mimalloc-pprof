@@ -280,10 +280,31 @@ void _mi_free_subproc_safe_in_page(void* p, mi_page_t* page) mi_attr_noexcept {
   mi_free_ex(p, page, NULL, false);
 }
 
-// Free a pointer that is potentially allocated in a different sub-process
+// The sub-process of a page we do not own. On a multi-threaded free we cannot go through
+// `page->heap` (`mi_page_heap`): a concurrent `mi_heap_delete` moves the page to the main
+// heap and frees the heap struct. `page->memid` is immutable after page creation, so its
+// arena (`mi_memid_arena`) is a safe read regardless of who owns the page right now -- the
+// same read `_mi_meta_is_meta_page_safe` (internal.h:266) already trusts, with the same
+// provenance. For the (rare) OS-allocated pages, which carry no arena, fall back to our own
+// subproc, as Bun does (issue #316, Bun parity P10a, commit 04ced98d).
+static mi_subproc_t* mi_page_subproc_unowned(const mi_page_t* page) {
+  mi_arena_t* const arena = mi_memid_arena(page->memid);
+  return (arena != NULL ? arena->subproc : _mi_subproc());
+}
+
+// Free a pointer that is potentially allocated in a different sub-process.
+// Collecting an abandoned page (free it, reclaim it, or re-map it) must not cross sub-processes,
+// but inside our own it must still happen: a full page is abandoned and unmapped, and a block
+// freed into it without collecting is never found again and pins the page (`mi_heap_free` frees
+// every `mi_heap_t` and `mi_arena_pages_t` through here; see the call sites for why the park
+// protocol is safe with collecting turned on).
 void _mi_free_subproc_safe(void* p) mi_attr_noexcept {
-  mi_page_t* const page = mi_validate_ptr_page(p,"_mi_free_subproc_safe");  
-  mi_free_ex(p, page, NULL, false);
+  mi_page_t* const page = mi_validate_ptr_page(p,"_mi_free_subproc_safe");
+  if mi_unlikely(page==NULL) return;   // p==NULL, or an invalid pointer already reported by mi_validate_ptr_page;
+                                        // mi_free_ex below guards NULL too, but mi_page_subproc_unowned needs
+                                        // a non-NULL page to read page->memid from.
+  const bool allow_collect = (mi_page_subproc_unowned(page) == _mi_subproc());
+  mi_free_ex(p, page, NULL, allow_collect);
 }
 
 
@@ -752,18 +773,35 @@ static void mi_stat_free(const mi_page_t* page, const mi_block_t* block) {
   // This can run for a cross-thread free (mi_free_block_mt) racing a concurrent
   // mi_heap_delete/mi_heap_destroy of page's heap on another thread -- reproduced as a
   // SIGSEGV reading page->heap->subproc here (see memory-events.c's _mi_memevt_on_free
-  // provenance comment for the first instance of this class of bug and its fix). _mi_subproc()
-  // is this (the freeing) thread's own subproc -- always safe, no dereference of anything
-  // reachable only through `page`. Matches the pre-existing (commented out, "never collect
-  // across subprocesses") assumption a few lines below that the two agree in the normal case;
-  // the rare cross-subprocess free this could get wrong (attributing the stat decrease to the
-  // wrong subproc's theap_meta) was already an unverified edge case, not a memory-safety one.
-  mi_subproc_t* const subproc = _mi_subproc();
-  mi_theap_t* const theap_meta = subproc->theap_meta;
+  // provenance comment for the first instance of this class of bug and its fix).
+  // Converged in #316 (Bun parity P10a) onto `mi_page_subproc_unowned` (defined earlier in this
+  // file, called a few lines below in this function), the same arena-derived read that replaced
+  // `page->heap->subproc`: `page->memid` is immutable after
+  // page creation, so reading the arena through it never dereferences `page->heap` either, and
+  // is strictly more accurate than the previous stand-in of "this (the freeing) thread's own
+  // subproc" -- it agrees with that whenever the page is in fact ours (the common case, per the
+  // "never collect across subprocesses" assumption a few lines below), and gets the actual
+  // owning subproc right in the rare cross-subprocess free the old comment conceded was an
+  // unverified edge case.
+  //
+  // #316 (P10a): the condition below is Bun's original shape, not our prior
+  // `theap_meta != NULL && mi_page_thread_id(page) == theap_meta->tld->thread_id` -- that reads
+  // `theap_meta->tld` unconditionally once `theap_meta != NULL`, but `mi_heap_free_theaps` nulls
+  // a theap's `tld` *before* `mi_subproc_unsafe_destroy` nulls `subproc->theap_meta`, so a
+  // *foreign* subproc mid-teardown (only reachable now that `subproc` need not be our own) can
+  // have `theap_meta != NULL` with `theap_meta->tld == NULL` -- a NULL deref. Every `theap_meta`
+  // shares the same static `mi_tld_detached` (`init.c:101`, `subproc.c:209`'s assert), whose
+  // `thread_id` is the compile-time constant `MI_THREADID_DETACHED`, so
+  // `mi_page_thread_id(page) == theap_meta->tld->thread_id` for the meta theap is equivalent to
+  // `mi_page_thread_id(page) == MI_THREADID_DETACHED` without reading `theap_meta` (let alone its
+  // `tld`) at all in the condition. `subproc`/`theap_meta` are loaded inside the branch instead,
+  // where they are actually needed, and past their own `theap_meta == NULL` guard.
   if mi_unlikely(!mi_theap_is_initialized(theap) || // can happen if free'd after thread_done was called (usually a thread cleanup call by the OS)
-                  // page->theap == subproc->theap_meta  .. but we cannot read `theap` if we don't own the page
-                  (theap_meta != NULL && mi_page_thread_id(page) == theap_meta->tld->thread_id)) { 
-    theap = theap_meta;
+                  mi_page_thread_id(page) == MI_THREADID_DETACHED) { // page->theap == subproc->theap_meta .. but we cannot read `theap` if we don't own the page (only the meta theap has the detached thread id)
+    // account on the subproc of the page (we cannot use our own theap here)
+    mi_subproc_t* const subproc = mi_page_subproc_unowned(page);
+    if (subproc->theap_meta == NULL) return;  // give up (the subproc is being destroyed)
+    theap = subproc->theap_meta;
     lock = &subproc->theap_meta_lock;
     mi_lock_acquire(lock);
   }

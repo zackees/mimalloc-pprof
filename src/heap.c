@@ -280,6 +280,13 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
         mi_arena_pages_t* arena_pages = mi_atomic_load_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i]);
         if (arena_pages!=NULL) {
           mi_atomic_store_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i], NULL);
+          // #316 (P10a): this free now collects in-subproc. Safe regardless of whether this
+          // thread is parked: `allow_collect` only reaches `mi_free_block_mt`/
+          // `mi_free_generic_mt` (free.c:mi_free_ex), while `_mi_park_leave_if_parked` lives
+          // only in the separate `mi_free_generic_local` owner-free path (free.c:167) -- so this
+          // can never newly reach the park protocol. `mi_free_try_collect_mt`'s own reclaim
+          // guards (`_mi_thread_is_initialized`, `_mi_page_associated_theap_peek` refusing a
+          // theap of another heap) apply unconditionally.
           _mi_free_subproc_safe(arena_pages);
         }
       }
@@ -304,9 +311,11 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
   mi_lock_done(&heap->theaps_lock);
   mi_lock_done(&heap->os_abandoned_pages_lock);
   mi_lock_done(&heap->arena_pages_lock);
-  if (!_mi_is_process_heap_main(heap)) { 
+  if (!_mi_is_process_heap_main(heap)) {
     _mi_thread_local_free(heap->theap);
-    _mi_free_subproc_safe(heap); 
+    // #316 (P10a): same audit as the arena_pages free above -- `allow_collect` cannot reach the
+    // park protocol from here either, for the same call-graph reason.
+    _mi_free_subproc_safe(heap);
   }
 }
 

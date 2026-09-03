@@ -52,7 +52,7 @@ class BenchmarkReportTests(unittest.TestCase):
             and item.get("scenario_id") == "scenario-00"
             and item.get("thread_point") == "1"
         ]
-        self.assertEqual(15 * 4, len(templates))
+        self.assertEqual(15 * len(report.ALLOCATOR_IDS), len(templates))
         for scenario, point in report.MEMORY_CELLS:
             for template in templates:
                 child_value = copy.deepcopy(template)
@@ -67,6 +67,7 @@ class BenchmarkReportTests(unittest.TestCase):
                     "tcmalloc": 120,
                     "jemalloc": 110,
                     "upstream-mimalloc": 100,
+                    "bun-mimalloc": 95,
                     "mimalloc-pprof": 90,
                 }[allocator] + int(child_value["block_id"])
                 baseline = 100 * 1024 * 1024
@@ -575,6 +576,7 @@ class BenchmarkReportTests(unittest.TestCase):
             "tcmalloc": 120 * 1024 * 1024,
             "jemalloc": 110 * 1024 * 1024,
             "upstream-mimalloc": 100 * 1024 * 1024,
+            "bun-mimalloc": 95 * 1024 * 1024,
             "mimalloc-pprof": 90 * 1024 * 1024,
         }
         normalized = {
@@ -620,7 +622,7 @@ class BenchmarkReportTests(unittest.TestCase):
             for key, values in cells.items()
         }
         report.draw_ratio_bar_grid(canvas, normalized_cells)
-        # Cell 0 sits at (45, 85); bars start at x=59, allocator rows are 19 px
+        # Cell 0 sits at (45, 85); bars start at x=59, allocator rows are 15 px
         # apart, and the largest normalized value (1.2x) fills the 380 px bar
         # zone. The 1.0 reference line lands at 380 * 1.0/1.2 = 316 px.
         left, top = 45, 85
@@ -633,14 +635,14 @@ class BenchmarkReportTests(unittest.TestCase):
             return value[0], value[1], value[2]
 
         # tcmalloc (1.2x) fills the bar zone; its row is index 0.
-        self.assertEqual(report.COLORS[0], pixel(bar_left + 379, top + 10 + 5))
+        self.assertEqual(report.COLORS[0], pixel(bar_left + 379, top + 10 + 4))
         # upstream-mimalloc (1.0x) ends at 316 px; the reference line drawn on
         # top occupies that exact column.
-        self.assertEqual(report.COLORS[2], pixel(bar_left + 313, top + 10 + 2 * 19 + 5))
-        self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 2 * 19 + 5))
+        self.assertEqual(report.COLORS[2], pixel(bar_left + 313, top + 10 + 2 * 15 + 4))
+        self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 2 * 15 + 4))
         # mimalloc-pprof (0.9x) ends at 285 px; beyond it is background.
-        self.assertEqual(report.COLORS[3], pixel(bar_left + 284, top + 10 + 3 * 19 + 5))
-        self.assertEqual((235, 240, 246), pixel(bar_left + 286, top + 10 + 3 * 19 + 5))
+        self.assertEqual(report.COLORS[4], pixel(bar_left + 284, top + 10 + 4 * 15 + 4))
+        self.assertEqual((235, 240, 246), pixel(bar_left + 286, top + 10 + 4 * 15 + 4))
         # The reference line stays visible across the tcmalloc bar too.
         self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 5))
 
@@ -649,6 +651,7 @@ class BenchmarkReportTests(unittest.TestCase):
             "tcmalloc": 1.4,
             "jemalloc": 1.2,
             "upstream-mimalloc": 1.0,
+            "bun-mimalloc": 0.9,
             "mimalloc-pprof": 0.8,
         }
 
@@ -691,14 +694,14 @@ class BenchmarkReportTests(unittest.TestCase):
             value = canvas.pixels[offset : offset + 3]
             return value[0], value[1], value[2]
 
-        self.assertEqual(report.COLORS[0], pixel(bar_left + 379, top + 10 + 5))
+        self.assertEqual(report.COLORS[0], pixel(bar_left + 379, top + 10 + 4))
         # upstream-mimalloc (1.0) ends at 271 px; the reference line drawn on
         # top occupies that exact column.
-        self.assertEqual(report.COLORS[2], pixel(bar_left + 268, top + 10 + 2 * 19 + 5))
-        self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 2 * 19 + 5))
+        self.assertEqual(report.COLORS[2], pixel(bar_left + 268, top + 10 + 2 * 15 + 4))
+        self.assertEqual((90, 102, 115), pixel(baseline_x, top + 10 + 2 * 15 + 4))
         # mimalloc-pprof (0.8) ends at 217 px; beyond it is background.
-        self.assertEqual(report.COLORS[3], pixel(bar_left + 216, top + 10 + 3 * 19 + 5))
-        self.assertEqual((235, 240, 246), pixel(bar_left + 218, top + 10 + 3 * 19 + 5))
+        self.assertEqual(report.COLORS[4], pixel(bar_left + 216, top + 10 + 4 * 15 + 4))
+        self.assertEqual((235, 240, 246), pixel(bar_left + 218, top + 10 + 4 * 15 + 4))
 
     def test_memory_section_sits_next_to_throughput(self) -> None:
         latest = self.with_complete_memory(self.load_latest())
@@ -815,12 +818,14 @@ class BenchmarkReportTests(unittest.TestCase):
                 "tcmalloc": 1.6,
                 "jemalloc": 1.4,
                 "upstream-mimalloc": 1.2,
+                "bun-mimalloc": 1.1,
                 "mimalloc-pprof": 1.0,
             },
             ("scenario-01", "2"): {
                 "tcmalloc": 2.0,
                 "jemalloc": 1.8,
                 "upstream-mimalloc": 1.6,
+                "bun-mimalloc": 1.4,
                 "mimalloc-pprof": 1.2,
             },
         }
@@ -829,12 +834,14 @@ class BenchmarkReportTests(unittest.TestCase):
                 "tcmalloc": 3.0e8,
                 "jemalloc": 3.5e8,
                 "upstream-mimalloc": 4.0e8,
+                "bun-mimalloc": 4.2e8,
                 "mimalloc-pprof": 4.5e8,
             },
             ("scenario-01", "2"): {
                 "tcmalloc": 5.0e8,
                 "jemalloc": 5.5e8,
                 "upstream-mimalloc": 6.0e8,
+                "bun-mimalloc": 6.2e8,
                 "mimalloc-pprof": 6.5e8,
             },
         }
@@ -885,7 +892,7 @@ class BenchmarkReportTests(unittest.TestCase):
             "absolute_summaries": core_records,
         }
         points = report.pareto_points(memory_only, latest)
-        self.assertEqual(2 * 4, len(points))
+        self.assertEqual(2 * len(report.ALLOCATOR_IDS), len(points))
         canvas = report.Canvas(report.PARETO_WIDTH, report.PARETO_HEIGHT, (248, 250, 252))
         report.draw_pareto(canvas, points)
         x_max, y_max = report.pareto_scale(points)
@@ -1382,7 +1389,7 @@ class BenchmarkReportTests(unittest.TestCase):
                 "aggregation": "median with min/max",
                 "operation_stream": "seeded random operation stream",
                 "seed_chain": "splitmix64 chain over (run seed, pattern, threads, block, worker)",
-                "pairing": "one stream replayed by all four allocators",
+                "pairing": "one stream replayed by all five allocators",
                 "work_normalization": "frozen per-worker operation count",
                 "oversubscription": "literal worker counts; oversubscribed points labeled",
                 "cross_thread_backpressure": "bounded mailbox with producer self-free fallback",
@@ -1502,7 +1509,10 @@ class BenchmarkReportTests(unittest.TestCase):
         summaries = scaling["cell_summaries"]
         assert isinstance(summaries, list)
         summaries.pop()
-        with self.assertRaisesRegex(report.ReportError, "96 cells"):
+        with self.assertRaisesRegex(
+            report.ReportError,
+            f"{len(report.SCALING_PATTERN_IDS) * len(report.SCALING_THREAD_POINTS) * len(report.ALLOCATOR_IDS)} cells",
+        ):
             report.validate_latest(truncated, "truncated")
 
         mispinned = copy.deepcopy(latest)
@@ -1569,7 +1579,11 @@ class BenchmarkReportTests(unittest.TestCase):
         # ceiling is the largest median across all cells with 12% headroom,
         # and the x axis is log2. Circles must land at the exact computed
         # coordinates on the right-hand RSS panel.
-        rss_peak = (32 + 4 * report.SCALING_THREAD_POINTS[-1] + 3) * 1024 * 1024
+        rss_peak = (
+            (32 + 4 * report.SCALING_THREAD_POINTS[-1] + len(report.ALLOCATOR_IDS) - 1)
+            * 1024
+            * 1024
+        )
         ceiling = rss_peak * 1.12
         plot_height = report.SCALING_HEIGHT - report.SCALING_TOP - report.SCALING_BOTTOM
         for allocator_index in range(len(report.ALLOCATOR_IDS)):

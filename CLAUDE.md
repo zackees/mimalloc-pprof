@@ -22,13 +22,17 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    MSVC **and** win-gnu are priority platforms — both, always.
    The **macOS** gate is `macos-bundles.yml` and uses no Apple hardware (#277 phase B2):
    both Apple arches are cross-built on Linux through soldr, `x86_64` is *executed* inside a
-   `dockurr/macos` guest on a Linux runner (`run-macos-x64-dockur`), and `aarch64` is
+   macOS Recovery guest on a Linux runner (`run-macos-x64-recovery`), and `aarch64` is
    **compile-only** — a build plus Mach-O header assertions, with its test-name set checked
    against the executed x86_64 bundle. Never add a `macos-*` runner label to a workflow or
    to `azure-pipelines.yml`; `ci/lint_no_macos_runners.py` fails `python-lint` if you do.
-   The dockur guest needs a golden disk built once by hand (`ci/macos_golden_local.sh`,
-   published by `macos-golden-upload.yml`), so `run-macos-x64-dockur` is red until that
-   exists — deliberately, and documented in docs/ci-gates.md.
+   The guest boots macOS **Recovery** straight off the image every run via the
+   `zackees/docker-mac-x64` action — no golden disk, no Actions cache, nothing to expire
+   (the hand-built-image design and its keep-alive workflow are gone). Recovery has no
+   dyld shared cache, so three profiler tests asserting that stack PCs resolve to loaded
+   modules cannot pass there; they are not skipped — the full bundle runs and
+   `ci/recovery_expected_failures.py` requires the failure set to be *exactly* those
+   three, so both a new failure and one of them starting to pass are red.
    The **win-gnu** gate is `windows-bundles.yml` (#277 phase C): the bundles are cross-built
    on Linux by soldr's mingw-w64 and run on one Windows runner. Phase C changed *how*
    win-gnu is built, not whether it is tested — soldr's mingw-w64 is **UCRT**, while the

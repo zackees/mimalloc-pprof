@@ -64,7 +64,7 @@ jobs:
       fail-fast: false
       matrix:
         # Both Apple architectures, three configs each. arm64 stops after the build +
-        # Mach-O evidence (compile-only); x86_64 is carried on to `run-macos-x64-dockur`
+        # Mach-O evidence (compile-only); x86_64 is carried on to `run-macos-x64-recovery`
         # and actually executed.
         include:
           # Exactly today's macOS C coverage, no more: `ctest (macos-latest)` and
@@ -385,56 +385,42 @@ jobs:
 
 
   # ---------------------------------------------------------------------------------
-  # The execution lane. No Apple hardware, no macOS runner: a dockurr/macos guest
-  # (QEMU + KVM) on an ordinary ubuntu-24.04 runner runs the x86_64 bundles.
+  # The execution lane. No Apple hardware, no macOS runner: a macOS guest (QEMU + KVM)
+  # on an ordinary Linux runner executes the x86_64 bundles, via the
+  # zackees/docker-mac-x64 action.
   #
-  # Why x86_64 only: dockur publishes no arm64 image and Apple ships no arm64 macOS that
-  # boots under QEMU on Linux, so arm64 is compile-only (see this file's header). The
-  # arm64 suite is still compared against this one, below, so an arm64-only test cannot
-  # go missing unnoticed.
+  # Why x86_64 only: there is no arm64 macOS image that boots under QEMU on Linux, so
+  # arm64 is compile-only (see this file's header). Its suite is still compared against
+  # this one, below, so an arm64-only test cannot go missing unnoticed.
   #
-  # Why a prebuilt disk: macOS has no unattended installer. Apple's Recovery installer is
-  # a GUI that must be driven by a human through dockur's web viewer on :8006 (verified
-  # against the image: /run/install.sh has no automation hook, and the image exposes no
-  # unattended/answer-file variable the way dockur/windows does). Installing on every run
-  # is therefore not an option at any price. The disk is built ONCE, on a maintainer's own
-  # machine, by `ci/macos_golden_local.sh`, and published into the Actions cache by
-  # `macos-golden-upload.yml`. A cache miss here is a hard error naming both, never a
-  # silent skip.
+  # NO GOLDEN DISK. The previous design booted a prebuilt macOS installed once by hand
+  # (ci/macos_golden_local.sh -> macos-golden-upload.yml -> Actions cache) because macOS
+  # has no unattended installer. That image was never built, so this job was red by
+  # design, and it carried a standing cost: a 40 GB+ cache entry that expires, needs a
+  # maintainer to sit through Apple's GUI installer to rebuild, and a keep-alive workflow
+  # (macos-golden-touch.yml) whose only job was to stop it expiring.
   #
-  # The install is deliberately NOT done on a runner. Driving Apple's Recovery GUI in CI
-  # would mean exposing dockur's web viewer -- an unauthenticated noVNC console with
-  # keyboard and mouse control of the VM -- to the public internet for the hours an
-  # emulated install takes, from a public repository. Loopback on a maintainer's machine
-  # costs nothing and risks nothing.
+  # This lane boots macOS RECOVERY instead, straight off the image, every run. Recovery
+  # is a full userland with a Terminal; the bundles are static Mach-O binaries and run in
+  # it unmodified. Nothing to install, nothing to cache, nothing to expire, and no
+  # unauthenticated noVNC console ever exposed. Cold boot to a shell is ~6 minutes.
   #
-  # CONSEQUENCE, stated plainly rather than left for a reviewer to discover: until that
-  # image has been built and uploaded once, THIS JOB IS RED -- on the PR that introduces
-  # it and on every push to main after it merges. That is deliberate. A gate that reports
-  # "I have no disk to run on" is worth more than one that skips itself into a green tick,
-  # which is the exact failure mode docs/ci-gates.md exists to prevent. It fails in about
-  # two minutes and costs one Linux runner.
+  # What Recovery costs, stated plainly rather than left for a reviewer to find: it has
+  # no dyld shared cache, so three profiler tests that assert stack PCs resolve to loaded
+  # modules cannot pass there. They are NOT skipped -- the full bundle runs and
+  # ci/recovery_expected_failures.py asserts the failure set is exactly those three, so a
+  # new failure is red AND one of them starting to pass is also red. 42 of 45 tests in
+  # the release bundle execute for real (measured).
   # ---------------------------------------------------------------------------------
-  run-macos-x64-dockur:
-    # Disabled 2026-09-02 at the owner's request until the x64 golden image / unattended
-    # install question (#277, #283) is settled: set repo variable MACOS_LANE_ENABLED=true
-    # to re-enable. The no-native-macOS lint (ci/lint_no_macos_runners.py) stays active.
-    if: ${{ vars.MACOS_LANE_ENABLED == 'true' }}
-    name: run-macos-x64 (dockurr/macos on Linux)
+  run-macos-x64-recovery:
+    name: run-macos-x64 (macOS Recovery on Linux)
     needs: [build-macos, build-rust-apple]
-    runs-on: ubuntu-24.04
-    # Generous on purpose: the guest is emulated, the host may be AMD (which dockur pins
-    # to a single core, see below), and everything in it runs serially.
-    timeout-minutes: 120
-    env:
-      # Bump the trailing version when the golden image is rebuilt, so a stale disk can
-      # never be silently reused after the guest's toolchain or user setup changes.
-      GOLDEN_KEY: macos-x64-golden-ventura-v1
-      # The guest is ephemeral, reachable only on this runner's loopback, and holds
-      # nothing but test binaries; a fixed local password is what the golden image is
-      # built with so that this job needs no repository secret and no key distribution.
-      GUEST_USER: ci
-      GUEST_PASS: ci
+    runs-on: ubuntu-latest
+    # Gate stays until the owner flips it (#277, #283).
+    if: ${{ vars.MACOS_LANE_ENABLED == 'true' }}
+    # Emulated guest, everything in it serial, one boot retry budgeted.
+    timeout-minutes: 90
+
     steps:
       - uses: actions/checkout@v4
 
@@ -451,15 +437,10 @@ jobs:
           name: rust-test-bins-x86_64-apple-darwin
           path: rust-bins
 
-      # Measured on ubuntu-24.04 (#277 phase B2 probe): one 145 GB `/dev/root` with
-      # ~87 GB free, and `/mnt` on that same filesystem rather than a separate temp disk.
-      # 87 GB is ample for a 64 GB sparse guest disk, but print it -- a full disk during a
-      # macOS boot surfaces as an unexplained QEMU exit.
       - name: Unpack both arches' bundles on the runner
-        # Done here, before anything touches the guest, because the coverage comparison
-        # below is a property of the two bundles and not of the guest: if macOS never
-        # boots, "do these two bundles cover the same tests" is still a question with an
-        # answer, and still worth failing on. Staging into the guest copies from here.
+        # Before anything touches the guest: the coverage comparison below is a
+        # property of the two bundles, not of the guest, so it still has an
+        # answer worth failing on even if macOS never boots.
         run: |
           set -euo pipefail
           for archive in artifacts/*/*.tar.gz arm64-artifacts/*/*.tar.gz; do
@@ -470,132 +451,22 @@ jobs:
           ls -1 bundles
 
       - name: Coverage -- the executed x86_64 bundles must run the whole arm64 suite
-        # There is no native macOS runner left to enumerate a ctest suite on, so the
-        # reference side is the arm64 bundle: arm64 is compile-only, and this is what
-        # stops a test that exists only there from quietly never running anywhere.
+        # arm64 is compile-only, so it is the reference side: this is what stops a
+        # test that exists only there from quietly never running anywhere.
         run: |
           set -euo pipefail
           python3 ci/bundle_coverage.py \
-            --heading "macOS coverage: arm64 (compile-only) vs x86_64 (executed under dockurr/macos)" \
+            --heading "macOS coverage: arm64 (compile-only) vs x86_64 (executed in macOS Recovery)" \
             --names arm64 x86_64 \
             --compare "release" bundles/macos-arm64-release/tests.json bundles/macos-x64-release/tests.json \
             --compare "debug-full" bundles/macos-arm64-debug-full/tests.json bundles/macos-x64-debug-full/tests.json \
             --summary "$GITHUB_STEP_SUMMARY"
 
-      - name: Make room for the guest disk
+      - name: Build the guest payload
         run: |
           set -euo pipefail
-          df -h / /mnt
-          sudo mkdir -p /mnt/macstore /mnt/golden
-          sudo chown "$USER" /mnt/macstore /mnt/golden
-
-      - name: Restore the golden macOS disk
-        id: golden
-        uses: actions/cache/restore@v4
-        with:
-          path: /mnt/golden
-          key: ${{ env.GOLDEN_KEY }}
-
-      - name: A golden disk is required
-        if: steps.golden.outputs.cache-hit != 'true'
-        run: |
-          echo "::error::No golden macOS disk under cache key '$GOLDEN_KEY'." \
-               "macOS has no unattended installer, so this job cannot bootstrap itself." \
-               "Build the image once on your own machine with ci/macos_golden_local.sh" \
-               "(boot -> click through Apple's installer -> pack), then publish it with" \
-               "the 'macos-golden-upload' workflow and re-run this job."
-          exit 1
-
-      - name: Give containers access to /dev/kvm
-        # This is the sequence GitHub's nested-virtualisation documentation prescribes.
-        # Measured caveat (#277 phase B2 probe on ubuntu-24.04): the rule does NOT change
-        # the mode -- /dev/kvm is `crw-rw---- root kvm` before and after -- and containers
-        # can open it anyway. So the rule is kept as documented-but-harmless, and the
-        # `docker run` below is the check that actually decides, because it tests the
-        # thing the guest needs rather than the permission bits it was assumed to need.
-        run: |
-          set -euo pipefail
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
-          # Assert the container can really open it. Without this the failure surfaces
-          # much later as an unexplained QEMU exit.
-          docker run --rm --device=/dev/kvm alpine ls -l /dev/kvm
-
-      - name: Unpack the golden disk and boot the guest
-        id: boot
-        run: |
-          set -euo pipefail
-          # NOT `zstd -d --sparse ... -c`: sparse mode cannot apply to a pipe, and zstd
-          # does not ignore the flag, it fails -- `zstd: error 92 : Sparse skip error`,
-          # reproduced on zstd 1.5.7, which then feeds tar a truncated stream and reports
-          # "This does not look like a tar archive". The holes are preserved anyway,
-          # because `macos_golden_local.sh pack` recorded them with `tar -cSf`; GNU tar
-          # restores a sparse member's holes on extraction from that format on its own.
-          zstd -dc /mnt/golden/macstore.tar.zst | tar -C /mnt/macstore -xSf -
-          du -sh /mnt/macstore
-
-          # dockur pins AMD hosts to one core (dockur/macos#268: the guest panics with
-          # more). Detect rather than hardcode -- GitHub's Linux pool mixes Intel Xeon and
-          # AMD EPYC, and picking wrong is either a panic loop or a needless 4x slowdown.
-          vendor=$(lscpu | awk -F: '/Vendor ID/{gsub(/ /,"",$2); print $2}')
-          if [ "$vendor" = "AuthenticAMD" ]; then cores=1; else cores=$(nproc); fi
-          echo "host CPU vendor=$vendor -> CPU_CORES=$cores"
-          echo "cores=$cores" >> "$GITHUB_OUTPUT"
-
-          # CPU_MODEL is NOT dockur's default, and this is the single most load-bearing
-          # line in the job. Measured on an AMD Zen 2 host (Ryzen 7 3700X): with dockur's
-          # default profile for macOS 13 (`Haswell-noTSX`) the guest resets immediately
-          # after "HANDOFF TO XNU" and loops forever -- 987 resets in 7 hours, 685 MB ever
-          # written, no installer screen. Holding everything else identical and setting
-          # `Skylake-Client-v4` boots macOS Recovery in about 5 minutes. dockur#268
-          # describes the AMD symptom and the single-core mitigation; the CPU model is the
-          # other half and it is not defaulted for macOS 13.
-          # 127.0.0.1 explicitly: Docker's default publish address is 0.0.0.0, and the
-          # guest's sshd accepts a fixed password. Nothing outside this runner has any
-          # business reaching it. (Port 8006, dockur's VNC console, is not published at
-          # all -- nothing here drives the GUI.)
-          docker run -d --name macguest \
-            --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
-            -p 127.0.0.1:2222:22 \
-            -e VERSION=13 -e RAM_SIZE=6G -e CPU_CORES="$cores" -e DISK_SIZE=64G \
-            -e CPU_MODEL="Skylake-Client-v4" \
-            -v /mnt/macstore:/storage \
-            dockurr/macos
-
-      - name: Wait for the guest to accept ssh
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
-          # A boot probe, never a fixed sleep: an emulated macOS boot is minutes and
-          # varies with the host. Poll the thing that actually has to work.
-          deadline=$(( $(date +%s) + 1800 ))
-          until sshpass -p "$GUEST_PASS" ssh -p 2222 \
-                  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                  -o ConnectTimeout=5 -o ConnectionAttempts=1 "$GUEST_USER@127.0.0.1" true 2>/dev/null; do
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::the macOS guest never accepted ssh within 30 minutes"
-              docker logs macguest 2>&1 | grep -viE 'BdsDxe|EXITBS|EB\.BST|B:BOOT|HANDOFF|End of efiboot' | tail -40
-              # A boot LOOP and a slow boot look identical from outside; this is what
-              # tells them apart in the log.
-              echo "XNU handoffs (a climbing count means a panic loop, not a slow boot): \
-                $(docker logs macguest 2>&1 | grep -c 'HANDOFF TO XNU' || true)"
-              exit 1
-            fi
-            sleep 10
-          done
-          echo "guest is up after $SECONDS s"
-          sshpass -p "$GUEST_PASS" ssh -p 2222 -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null "$GUEST_USER@127.0.0.1" \
-            'sw_vers; uname -m; sysctl -n machdep.cpu.brand_string'
-
-      - name: Stage the payload into the guest
-        run: |
-          set -euo pipefail
-          mkdir -p payload
-          # Only the x86_64 bundles go into the guest; the arm64 ones exist on the runner
+          mkdir -p payload share
+          # Only x86_64 goes into the guest; the arm64 bundles exist on the runner
           # for the coverage comparison and are never executed anywhere.
           cp -r bundles/macos-x64-* payload/
           chmod +x rust-bins/* || true
@@ -603,138 +474,122 @@ jobs:
           cp ci/run_test_bundle.py ci/memory_gate.py payload/
           cp -r ci/memory-baselines payload/memory-baselines
 
-          # A relocatable CPython, because the guest's /usr/bin/python3 is a Command Line
-          # Tools stub that pops a GUI dialog on a machine with no one to click it, and
-          # the golden image deliberately does not carry Xcode. run_test_bundle.py and
-          # memory_gate.py are stdlib-only, so a bare interpreter is enough.
+          # A relocatable CPython: Recovery has no python3 at all, and the one in a
+          # full macOS is a Command Line Tools stub that opens a GUI dialog.
           curl -fsSL -o cpython.tar.gz \
             "https://github.com/astral-sh/python-build-standalone/releases/download/20250612/cpython-3.12.11+20250612-x86_64-apple-darwin-install_only.tar.gz"
-          cp cpython.tar.gz payload/
+          tar -xzf cpython.tar.gz -C payload
+          # ...which does not load in Recovery until this one dylib reference is
+          # repointed. See ci/patch_recovery_python.py for the dyld error it fixes.
+          python3 ci/patch_recovery_python.py payload/python/lib/libpython3.12.dylib
 
-          tar -czf payload.tar.gz payload
-          ls -lh payload.tar.gz
-          sshpass -p "$GUEST_PASS" scp -P 2222 -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null payload.tar.gz "$GUEST_USER@127.0.0.1:~/"
-          sshpass -p "$GUEST_PASS" ssh -p 2222 -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null "$GUEST_USER@127.0.0.1" \
-            'set -e; rm -rf ~/w; mkdir ~/w; tar -C ~/w -xzf ~/payload.tar.gz; \
-             tar -C ~/w/payload -xzf ~/w/payload/cpython.tar.gz; \
-             ~/w/payload/python/bin/python3 -VV; \
-             file ~/w/payload/macos-x64-release/mimalloc-test-api'
+          tar -czf share/payload.tar.gz -C payload .
+          ls -lh share/payload.tar.gz
 
-      # Everything below runs INSIDE the guest. `G` is the one place the ssh incantation
-      # lives; every step reuses it so a change to the transport cannot half-apply.
-      - name: ctest (macOS x86_64) equivalent -- macos-x64-release
-        run: |
-          set -euo pipefail
-          ./ci/dockur_guest.sh run \
-            'cd ~/w/payload && ./python/bin/python3 run_test_bundle.py macos-x64-release --junit ~/bundle-release.xml'
-      - name: ctest-debug-full (macOS x86_64) equivalent -- macos-x64-debug-full
-        # Carries the six run-negative.cmake controls and the DYLD_INSERT_LIBRARIES
-        # interposition test; run serially after the release bundle, never alongside it.
-        run: |
-          set -euo pipefail
-          ./ci/dockur_guest.sh run \
-            'cd ~/w/payload && ./python/bin/python3 run_test_bundle.py macos-x64-debug-full --junit ~/bundle-debug-full.xml'
-
-      - name: Run the cross-built Rust test binaries
-        # Replaces cross.yml's `test (x86_64-apple-darwin)` row. That row had
-        # `pprof: false`, so there is no pprof-parses-a-dump step here either -- parity,
-        # not a silent reduction. These link MI_STATIC_LIB, so no dylib interposition is
-        # involved. Native x86_64 in this guest: no Rosetta anywhere, which is one whole
-        # class of "is this Rosetta or is this us" ambiguity gone.
-        run: |
-          set -euo pipefail
-          ./ci/dockur_guest.sh run \
-            'set -e; cd ~/w/payload/rust-bins; chmod +x *; \
-             for t in *; do echo "== $t"; ./"$t" --test-threads=4; done'
-
-      - name: Memory gate -- 8 runs from the release bundle
-        run: |
-          set -euo pipefail
-          # --arch/--compiler give this lane its own baseline. Without them it would be
-          # compared against ci/memory-baselines/macos-pprof1.json, which Apple clang
-          # recorded on a native Intel runner -- a cross-toolchain, cross-machine
-          # comparison dressed as a regression check. The numbers here are additionally
-          # taken under emulation, which is exactly why they need their own file.
-          ./ci/dockur_guest.sh run 'set -e; cd ~/w/payload; \
-            for i in 1 2 3 4 5 6 7 8; do \
-              MI_BENCH_JSON="$PWD/result-$i.json" ./macos-x64-release/mimalloc-test-memory-gate > /dev/null; \
-            done; \
-            count=0; for f in result-*.json; do [ -e "$f" ] && count=$((count+1)); done; \
-            if [ "$count" -ne 8 ]; then echo "only $count of 8 memory-gate runs produced JSON"; exit 1; fi; \
-            cat result-1.json'
-          # `where` distinguishes "no baseline yet" (3) from "cannot read this run" (2);
-          # `check` collapses both into 2, so gating the yellow bootstrap path on check's
-          # own status would report an unreadable result as a bootstrap and exit green.
-          rc=0
-          ./ci/dockur_guest.sh run 'cd ~/w/payload && ./python/bin/python3 memory_gate.py where \
-             --arch x86_64 --compiler soldr-clang-21 result-1.json' || rc=$?
-          case "$rc" in
-            0) ./ci/dockur_guest.sh run 'cd ~/w/payload && ./python/bin/python3 memory_gate.py check \
-                 --arch x86_64 --compiler soldr-clang-21 result-*.json' ;;
-            3) echo "::warning::No committed baseline for the dockur x86_64 lane yet -- bootstrap it from this run's memory-gate artifact."
-               ./ci/dockur_guest.sh run 'cd ~/w/payload && ./python/bin/python3 memory_gate.py check \
-                 --arch x86_64 --compiler soldr-clang-21 result-*.json' || true ;;
-            *) echo "::error::memory_gate could not read this run's JSON (rc=$rc)"; exit 1 ;;
-          esac
-
-      - name: Positive control -- the gate must catch an injected leak
-        run: |
-          set -euo pipefail
-          ./ci/dockur_guest.sh run 'set -e; cd ~/w/payload; \
-            for i in 1 2 3 4 5 6 7 8; do \
-              MI_BENCH_JSON="$PWD/leak-$i.json" ./macos-x64-leak/mimalloc-test-memory-gate > /dev/null || true; \
-            done; \
-            count=0; for f in leak-*.json; do [ -e "$f" ] && count=$((count+1)); done; \
-            if [ "$count" -ne 8 ]; then echo "only $count of 8 leak-control runs produced JSON"; exit 1; fi'
-          # `control` requires `check` to FAIL. A missing baseline is not a failure, it is
-          # a bootstrap, so before this lane's baseline is committed the control would go
-          # red for the wrong reason.
-          rc=0
-          ./ci/dockur_guest.sh run 'cd ~/w/payload && ./python/bin/python3 memory_gate.py where \
-             --arch x86_64 --compiler soldr-clang-21 leak-1.json' || rc=$?
-          case "$rc" in
-            0) ./ci/dockur_guest.sh run 'cd ~/w/payload && ./python/bin/python3 memory_gate.py control \
-                 --arch x86_64 --compiler soldr-clang-21 leak-*.json' ;;
-            3) echo "::warning::the dockur x86_64 lane has no committed baseline yet, so its positive control cannot run. Commit the baseline, then this becomes a hard gate." ;;
-            *) echo "::error::memory_gate could not read the leak control's JSON (rc=$rc)"; exit 1 ;;
-          esac
-
-      - name: Retrieve results from the guest
-        if: ${{ !cancelled() }}
-        run: |
-          set -euo pipefail
-          ./ci/dockur_guest.sh pull '~/bundle-release.xml' bundle-release.xml || true
-          ./ci/dockur_guest.sh pull '~/bundle-debug-full.xml' bundle-debug-full.xml || true
-          ./ci/dockur_guest.sh pull '~/w/payload/result-\*.json' . || true
-          ./ci/dockur_guest.sh pull '~/w/payload/leak-\*.json' . || true
-          ls -l bundle-*.xml result-*.json leak-*.json 2>/dev/null || true
-
-      - name: Guest and QEMU logs
-        if: ${{ !cancelled() }}
-        run: |
-          docker logs macguest 2>&1 \
-            | grep -viE 'BdsDxe|EXITBS|EB\.BST|B:BOOT|HANDOFF|End of efiboot' \
-            | tail -60 > dockur.log || true
-          echo "XNU handoffs: $(docker logs macguest 2>&1 | grep -c 'HANDOFF TO XNU' || true)" >> dockur.log
-          cat dockur.log
-
-      - if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+      - name: Boot macOS Recovery and run the bundles
+        id: macos
+        uses: zackees/docker-mac-x64@main
         with:
-          name: memory-gate-macos-x64-dockur
-          path: |
-            result-*.json
-            leak-*.json
-          if-no-files-found: warn
+          share-dir: share
+          collect: /tmp/w/out
+          ram: '8'
+          run-timeout: '3600'
+          # One boot, everything serial inside it. Nothing here may abort the
+          # script on a test failure: a red bundle still has to post its JUnit
+          # back, and the runner decides pass/fail afterwards.
+          run: |
+            set -x
+            mkdir -p /tmp/w/out && cd /tmp/w
+            curl -s -o payload.tar.gz http://10.0.2.2:8000/payload.tar.gz
+            mkdir -p payload && tar -xzf payload.tar.gz -C payload
+            cd payload
+            ./python/bin/python3 -VV || exit 91
+
+            ./python/bin/python3 run_test_bundle.py macos-x64-release \
+              --junit /tmp/w/out/bundle-release.xml
+            echo $? > /tmp/w/out/release.rc
+
+            ./python/bin/python3 run_test_bundle.py macos-x64-debug-full \
+              --junit /tmp/w/out/bundle-debug-full.xml
+            echo $? > /tmp/w/out/debug-full.rc
+
+            ( cd rust-bins && chmod +x ./* && for t in ./*; do
+                echo "== $t"; "$t" --test-threads=4 || exit 1
+              done ) > /tmp/w/out/rust-bins.log 2>&1
+            echo $? > /tmp/w/out/rust-bins.rc
+
+            for i in 1 2 3 4 5 6 7 8; do
+              MI_BENCH_JSON=/tmp/w/out/result-$i.json \
+                ./macos-x64-release/mimalloc-test-memory-gate > /dev/null
+            done
+            for i in 1 2 3 4 5 6 7 8; do
+              MI_BENCH_JSON=/tmp/w/out/leak-$i.json \
+                ./macos-x64-leak/mimalloc-test-memory-gate > /dev/null || true
+            done
+
+            # memory_gate runs IN the guest so its platform/arch/compiler key is
+            # computed where the numbers were produced, not on the Linux runner.
+            cd /tmp/w/out
+            cp /tmp/w/payload/memory_gate.py .
+            cp -r /tmp/w/payload/memory-baselines .
+            /tmp/w/payload/python/bin/python3 memory_gate.py where \
+              --arch x86_64 --compiler soldr-clang-21 result-1.json
+            echo $? > where.rc
+            /tmp/w/payload/python/bin/python3 memory_gate.py check \
+              --arch x86_64 --compiler soldr-clang-21 result-*.json > check.log 2>&1
+            echo $? > check.rc
+            /tmp/w/payload/python/bin/python3 memory_gate.py control \
+              --arch x86_64 --compiler soldr-clang-21 leak-*.json > control.log 2>&1
+            echo $? > control.rc
+            echo "guest script complete"
+
+      - name: Test results -- exactly the waived Recovery failures, no others
+        run: |
+          set -euo pipefail
+          C="${{ steps.macos.outputs.workdir }}/collected"
+          ls -l "$C"
+          test -f "$C/bundle-release.xml" || { echo "::error::no JUnit came back from the guest"; exit 1; }
+          python3 ci/recovery_expected_failures.py \
+            "$C/bundle-release.xml" "$C/bundle-debug-full.xml"
+
+      - name: Rust test binaries must pass
+        run: |
+          set -euo pipefail
+          C="${{ steps.macos.outputs.workdir }}/collected"
+          tail -40 "$C/rust-bins.log" || true
+          rc=$(cat "$C/rust-bins.rc")
+          test "$rc" = "0" || { echo "::error::cross-built Rust tests failed in the guest (rc=$rc)"; exit 1; }
+
+      - name: Memory gate
+        run: |
+          set -euo pipefail
+          C="${{ steps.macos.outputs.workdir }}/collected"
+          n=$(ls "$C"/result-*.json 2>/dev/null | wc -l)
+          test "$n" -eq 8 || { echo "::error::only $n of 8 memory-gate runs produced JSON"; exit 1; }
+          # `where` separates "no baseline yet" (3) from "cannot read this run" (2);
+          # `check` collapses both into 2, so the bootstrap path must be decided on
+          # where's status, not check's.
+          where=$(cat "$C/where.rc")
+          case "$where" in
+            0) cat "$C/check.log"
+               test "$(cat "$C/check.rc")" = "0" || { echo "::error::memory gate regressed"; exit 1; }
+               cat "$C/control.log"
+               test "$(cat "$C/control.rc")" = "0" || { echo "::error::the leak control did not fire -- the gate is not gating"; exit 1; } ;;
+            3) echo "::warning::No committed baseline for the Recovery x86_64 lane yet. Bootstrap it from this run's memory-gate artifact; until then neither the gate nor its positive control can be enforced."
+               cat "$C/check.log" || true ;;
+            *) echo "::error::memory_gate could not read this run's JSON (rc=$where)"; exit 1 ;;
+          esac
+
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: macos-bundle-results
-          path: |
-            bundle-release.xml
-            bundle-debug-full.xml
-            dockur.log
+          path: ${{ steps.macos.outputs.workdir }}/collected/
           if-no-files-found: warn
           retention-days: 7
+      - if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-guest-screens
+          path: ${{ steps.macos.outputs.workdir }}/results/*.ppm
+          if-no-files-found: warn

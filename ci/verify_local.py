@@ -819,7 +819,7 @@ CONFIG_NAMES = [c.name for c in CONFIGS]
 # execution step: `soldr prepare` provisions the same cross toolchain the runner uses,
 # cmake/toolchains/soldr-<triple>.cmake feeds CMake nothing but what soldr exported, and
 # ci/bundle_tests.py turns the build tree into the same portable bundle the workflow
-# uploads. So a red `run-macos-x64-dockur` or `run-windows` that is really a *build* or
+# uploads. So a red `run-macos-x64-recovery` or `run-windows` that is really a *build* or
 # *bundling* failure can be reproduced in one command instead of a push-and-wait cycle.
 #
 # The flags below are copied verbatim out of macos-bundles.yml's and windows-bundles.yml's

@@ -72,7 +72,7 @@ what that risk means and what was measured.
 
 - [At a glance](#at-a-glance--why-use-this-version) — what you get over upstream mimalloc, in one screen
 - [Integration](#integration) — pprof, exact stats and DHAT in Rust and C, plus the full API table
-- [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, TCMalloc, and jemalloc
+- [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, Bun's fork, TCMalloc, and jemalloc
 - [Why use this fork](#why-use-this-fork) — the most tested mimalloc fork in existence
 - [Bun features](#bun-features) — every feature ported from oven-sh/mimalloc, including a measured hole-purging chart
 - [Profiling and observability](#profiling-and-observability) — sampled pprof, exact stats, DHAT, memory events
@@ -659,8 +659,8 @@ failed review stayed out, each with its reasoning recorded
 ([docs/fork-divergence.md](docs/fork-divergence.md)).
 
 **Measured against its peers, continuously.** Throughput is benchmarked against
-upstream mimalloc, TCMalloc, and jemalloc on every publication cycle, with sealed
-artifacts and reproduction commands — the charts above.
+upstream mimalloc, Bun's fork, TCMalloc, and jemalloc on every publication cycle,
+with sealed artifacts and reproduction commands — the charts above.
 
 **Committed to for the long term.** [Zach Vorhies](https://github.com/zackees),
 the author, commits to maintaining this fork long-term.

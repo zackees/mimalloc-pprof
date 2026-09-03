@@ -47,6 +47,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -689,17 +690,64 @@ def run_lint(ctx: RunCtx) -> bool:
     return ok and rc == 0
 
 
-def run_asan(ctx: RunCtx) -> bool:
-    """asan.yml job `asan` (already ubuntu-latest only): CC=clang CXX=clang++,
-    -DMI_TRACK_ASAN=ON, plus its two positive/negative controls."""
-    build = ctx.dir / "build-asan"
-    env = {"CC": "clang", "CXX": "clang++"}
-    rc, configure_out = cmake_configure(
-        ctx,
-        build,
-        ["-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON", "-DMI_TRACK_ASAN=ON"],
-        env=env,
-    )
+# Issue #301. `MI_TRACK_ASAN` is not a compiler flag we control -- CMakeLists probes for
+# `sanitizer/asan_interface.h` and silently resolves the option to OFF when it is missing.
+# On a distribution whose clang ships without compiler-rt's headers (Nix, some minimal
+# containers) the previous clang-only config could not configure at all, and every agent
+# hand-rolled a gcc ASan build instead -- which is how #301 sat unreproduced in CI. So
+# probe instead of assuming: prefer clang (what asan.yml's Debug row uses), fall back to
+# gcc, and SKIP with the reason when neither compiler can see the header.
+ASAN_PROBE_SOURCE = "#include <sanitizer/asan_interface.h>\nint main(void){return 0;}\n"
+
+
+_ASAN_TOOLCHAIN_CACHE: dict[str, tuple[str, str] | None] = {}
+
+
+def _asan_toolchain() -> tuple[str, str] | None:
+    """(cc, cxx) for the first compiler on PATH whose <sanitizer/asan_interface.h> resolves,
+    or None. Cached, since both `needs()` and the runner ask."""
+    if "value" in _ASAN_TOOLCHAIN_CACHE:
+        return _ASAN_TOOLCHAIN_CACHE["value"]
+    found: tuple[str, str] | None = None
+    for cc, cxx in (("clang", "clang++"), ("gcc", "g++")):
+        if shutil.which(cc) is None or shutil.which(cxx) is None:
+            continue
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "probe.c"
+            src.write_text(ASAN_PROBE_SOURCE, encoding="utf-8")
+            try:
+                rc = subprocess.run(
+                    [cc, "-fsyntax-only", str(src)],
+                    cwd=td,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=120,
+                ).returncode
+            except (OSError, subprocess.SubprocessError):
+                continue
+        if rc == 0:
+            found = (cc, cxx)
+            break
+    _ASAN_TOOLCHAIN_CACHE["value"] = found
+    return found
+
+
+def _need_asan_toolchain() -> str | None:
+    if _asan_toolchain() is None:
+        return (
+            "no compiler on PATH resolves <sanitizer/asan_interface.h> "
+            "(tried clang then gcc); CMake would silently set MI_TRACK_ASAN=OFF"
+        )
+    return None
+
+
+def _run_asan_one(ctx: RunCtx, cc: str, cxx: str, label: str, cmake_args: list[str]) -> bool:
+    """One asan.yml matrix row: configure, prove ASan survived, build, ctest, UAF control.
+    `cmake_args` is copied verbatim from the workflow (ci/tests/test_verify_local.py expands
+    the matrix and checks it), so build it at the call site rather than from `label`."""
+    build = ctx.dir / f"build-asan-{label}"
+    env = {"CC": cc, "CXX": cxx}
+    rc, configure_out = cmake_configure(ctx, build, cmake_args, env=env)
     if rc:
         return False
     if "Compile with address sanitizer support (MI_TRACK_ASAN=ON)" not in configure_out:
@@ -746,6 +794,39 @@ def run_asan(ctx: RunCtx) -> bool:
         )
         return False
     return True
+
+
+def run_asan(ctx: RunCtx) -> bool:
+    """asan.yml job `asan` (already ubuntu-latest only), both build types.
+
+    The RelWithDebInfo row is not a duplicate of the Debug one: `MI_TRACK_ASAN` implies
+    `MI_PADDING`, and CMakeLists auto-enables `MI_OPT_FREE_SMALL` (hence
+    `MI_PAGE_META_ALIGNED_FREE_SMALL`) only when `MI_DEBUG` is off, so the Debug lane never
+    executes `mi_free_small`'s page-from-alignment fast path -- the one #301's SEGV lived on.
+    """
+    toolchain = _asan_toolchain()
+    if toolchain is None:  # pragma: no cover -- guarded by _need_asan_toolchain
+        log_write(ctx.log, "\n[verify_local] FAIL: no ASan-capable compiler\n")
+        return False
+    cc, cxx = toolchain
+    log_write(ctx.log, f"\n[verify_local] asan toolchain: CC={cc} CXX={cxx}\n")
+    debug_ok = _run_asan_one(
+        ctx,
+        cc,
+        cxx,
+        "debug",
+        ["-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON", "-DMI_TRACK_ASAN=ON"],
+    )
+    # `and` in this order, not short-circuited away by `debug_ok and ...`: --keep-going is
+    # about seeing every failure in one run, and the release row is the interesting one here.
+    release_ok = _run_asan_one(
+        ctx,
+        cc,
+        cxx,
+        "relwithdebinfo",
+        ["-DCMAKE_BUILD_TYPE=RelWithDebInfo", "-DMI_PPROF=ON", "-DMI_TRACK_ASAN=ON"],
+    )
+    return release_ok and debug_ok
 
 
 @dataclasses.dataclass(frozen=True)
@@ -827,9 +908,9 @@ CONFIGS: list[ConfigSpec] = [
     ConfigSpec(
         "asan",
         "asan.yml: asan",
-        "clang ASan build, ctest, UAF positive control",
+        "ASan Debug + RelWithDebInfo builds, ctest, UAF positive control",
         run_asan,
-        _need_clang,
+        _need_asan_toolchain,
     ),
 ]
 

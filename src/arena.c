@@ -892,9 +892,16 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
       mi_page_t* const page_meta = &arena->pages_meta[memid.mem.arena.slice_index];
       mi_assert_internal(page_meta->block_size == 0);
       #if MI_PAGE_META_ALIGNED_FREE_SMALL
-      // if `block_size <= MI_SMALL_SIZE_MAX` we put the page info in front of the slice,
+      // The meta stays in front of the slice for every block size `mi_(heap_)malloc_small` can
+      // produce, which is what `mi_free_small`'s align-down page lookup requires -- and with
+      // MI_PADDING on that is `mi_good_size(MI_SMALL_SIZE_MAX)`, not the raw constant (#301,
+      // docs/upstream-bugs.md bug 4). Split so non-padding codegen is bit-identical.
       // (note: it is important that `page_meta->block_size == 0` for `mi_arena_page_at_slice`)
+      #if MI_PADDING
+      if (block_size > mi_good_size(MI_SMALL_SIZE_MAX))
+      #else
       if (block_size > MI_SMALL_SIZE_MAX)
+      #endif
       #endif
       {
         page = page_meta;

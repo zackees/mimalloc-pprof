@@ -25,11 +25,36 @@ concurrency:
 
 jobs:
   asan:
-    name: address sanitizer
+    # Issue #301. One row is not enough. `MI_TRACK_ASAN` implies `MI_PADDING`, and
+    # CMakeLists auto-enables `MI_OPT_FREE_SMALL` (hence `MI_PAGE_META_ALIGNED_FREE_SMALL`)
+    # only when `MI_DEBUG` is off -- so a Debug-only ASan lane can never reach the
+    # `mi_free_small` fast path at all, and sat green through a NULL-deref SEGV in
+    # `mi_arenas_page_free_ex` that any release-type padding build hits in `test-api`'s
+    # `free_small1`. The RelWithDebInfo rows are that missing coverage. gcc is in the matrix
+    # because gcc is what the bug was reported against, and clang stays because the bug is
+    # compiler-independent -- if a row ever goes red on one compiler only, that asymmetry is
+    # itself the finding.
+    name: address sanitizer (${{ matrix.cc }}, ${{ matrix.build_type }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: clang
+            cxx: clang++
+            build_type: Debug
+            extra: -DMI_DEBUG_FULL=ON
+          - cc: gcc
+            cxx: g++
+            build_type: RelWithDebInfo
+            extra: ''
+          - cc: clang
+            cxx: clang++
+            build_type: RelWithDebInfo
+            extra: ''
     env:
-      CC: clang
-      CXX: clang++
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
     steps:
       - uses: actions/checkout@v4
 
@@ -39,8 +64,8 @@ jobs:
       - name: Configure (and prove ASan actually enabled)
         run: |
           set -euo pipefail
-          cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug \
-                -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_TRACK_ASAN=ON 2>&1 | tee configure.log
+          cmake -B build-asan -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+                -DMI_PPROF=ON ${{ matrix.extra }} -DMI_TRACK_ASAN=ON 2>&1 | tee configure.log
           if ! grep -q "Compile with address sanitizer support (MI_TRACK_ASAN=ON)" configure.log; then
             echo "::error::MI_TRACK_ASAN did not survive configure -- the sanitizer is NOT enabled."
             grep -i "sanitizer" configure.log || true

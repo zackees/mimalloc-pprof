@@ -30,6 +30,7 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 
 DFLAG_RE = re.compile(r'-D([A-Z_][A-Z0-9_]*)=("\$pprof"|\$pprof|[^\s"\'\)]+)')
 SCRIPT_RE = re.compile(r"ci/[A-Za-z0-9_./-]+\.py")
+MATRIX_REF_RE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
 
 
 def load_workflow(name: str) -> dict[str, Any]:
@@ -77,6 +78,48 @@ def job_run_text(job: dict[str, Any]) -> str:
     return "\n".join(chunks)
 
 
+def matrix_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """The concrete matrix rows of `job` -- `include:` entries, else the cartesian product
+    of the plain axes. Empty when the job has no matrix.
+
+    Needed because a matrixed job may template its cmake flags (asan.yml does:
+    `-DCMAKE_BUILD_TYPE=${{ matrix.build_type }}`). Without expansion the drift guard would
+    demand the literal token `-DCMAKE_BUILD_TYPE=${{` appear in verify_local.py, i.e. it
+    would either fail on a correct mirror or, if silenced, stop checking that job's flags at
+    all -- the exact blind spot issue #301 was hiding in.
+    """
+    strategy = job.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    if not isinstance(matrix, dict):
+        return []
+    include = matrix.get("include")
+    if isinstance(include, list):
+        return [row for row in include if isinstance(row, dict)]
+    axes = {k: v for k, v in matrix.items() if k != "exclude" and isinstance(v, list)}
+    if not axes:
+        return []
+    rows: list[dict[str, Any]] = [{}]
+    for key, values in axes.items():
+        rows = [{**row, key: value} for row in rows for value in values]
+    return rows
+
+
+def expand_matrix(text: str, rows: list[dict[str, Any]]) -> list[str]:
+    """`text` once per matrix row, with `${{ matrix.<key> }}` substituted. A reference the
+    row does not define is left alone, so it surfaces as an obviously-wrong token rather
+    than being silently dropped."""
+    if not rows:
+        return [text]
+
+    def substitute(row: dict[str, Any]) -> str:
+        def one(m: re.Match[str]) -> str:
+            return str(row[m.group(1)]) if m.group(1) in row else m.group(0)
+
+        return MATRIX_REF_RE.sub(one, text)
+
+    return [substitute(row) for row in rows]
+
+
 def expected_tokens(text: str) -> set[str]:
     tokens: set[str] = set()
     for name, value in DFLAG_RE.findall(text):
@@ -121,7 +164,10 @@ def linux_job_tokens(workflow_name: str) -> dict[str, set[str]]:
     for job_name, job in jobs.items():
         if not is_linux_job(job):
             continue
-        out[job_name] = expected_tokens(job_run_text(job))
+        tokens: set[str] = set()
+        for text in expand_matrix(job_run_text(job), matrix_rows(job)):
+            tokens |= expected_tokens(text)
+        out[job_name] = tokens
     return out
 
 
@@ -158,6 +204,17 @@ class VerifyLocalDriftTests(unittest.TestCase):
 
     def test_asan_yml(self) -> None:
         self.assert_all_present("asan.yml")
+
+    def test_asan_yml_matrix_expands_to_both_build_types(self) -> None:
+        """#301: the release-type ASan row is the one that can reach `mi_free_small`'s
+        page-from-alignment fast path (CMakeLists only auto-enables MI_OPT_FREE_SMALL when
+        MI_DEBUG is off), so losing it would silently un-cover the bug. Assert it is both in
+        the workflow and mirrored locally, not just that the matrix parses."""
+        tokens = linux_job_tokens("asan.yml")["asan"]
+        self.assertIn("-DCMAKE_BUILD_TYPE=Debug", tokens)
+        self.assertIn("-DCMAKE_BUILD_TYPE=RelWithDebInfo", tokens)
+        self.assertIn("-DMI_TRACK_ASAN=ON", tokens)
+        self.assertNotIn("-DCMAKE_BUILD_TYPE=${{", tokens)
 
     def test_config_table_names_are_unique(self) -> None:
         names = verify_local.CONFIG_NAMES

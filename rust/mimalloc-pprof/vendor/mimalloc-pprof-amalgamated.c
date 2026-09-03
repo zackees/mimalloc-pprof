@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 9f321fff of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 872c37d8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -8423,6 +8423,23 @@ static mi_decl_forceinline void* mi_theap_realloc_zero_ex(mi_theap_t* theap, voi
       return NULL;
     } 
     size = _mi_page_usable_size(page,p);
+    #if (MI_PADDING || MI_GUARDED)
+    // fork fix, issue #301: a usable size of 0 for a non-NULL `p` means the padding decode
+    // failed (`mi_page_usable_size_of` in free.c: "size can be zero if the padding is
+    // corrupted") -- `p` is not a block start, or the block was overrun. Reallocating would
+    // free `p`, an interior pointer, corrupting the free list. Report it the way the contract
+    // above prescribes: NULL, with `p` not freed -- which is what a MI_DEBUG build already
+    // returns via `mi_validate_ptr_page`. Guarded like the zero-size bump in
+    // `mi_theap_malloc_small_zero_nonnull`, since only a padding build can reach it: no valid
+    // block has usable size 0 (the padding path bumps a 0-byte request to `sizeof(void*)`),
+    // and without padding `mi_page_usable_size_of` returns `mi_page_usable_block_size` > 0.
+    // Reproduced by upstream's own `mi_urealloc_invalid` test; see docs/upstream-bugs.md.
+    if mi_unlikely(size == 0) {
+      if (pblock_size_pre!=NULL) { *pblock_size_pre = 0; }
+      if (pblock_size_post!=NULL) { *pblock_size_post = 0; }
+      return NULL;
+    }
+    #endif
     if (pblock_size_pre!=NULL) { *pblock_size_pre = mi_page_block_size(page); }
   }
   // check if we can reuse the existing block
@@ -11136,9 +11153,16 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
       mi_page_t* const page_meta = &arena->pages_meta[memid.mem.arena.slice_index];
       mi_assert_internal(page_meta->block_size == 0);
       #if MI_PAGE_META_ALIGNED_FREE_SMALL
-      // if `block_size <= MI_SMALL_SIZE_MAX` we put the page info in front of the slice,
+      // The meta stays in front of the slice for every block size `mi_(heap_)malloc_small` can
+      // produce, which is what `mi_free_small`'s align-down page lookup requires -- and with
+      // MI_PADDING on that is `mi_good_size(MI_SMALL_SIZE_MAX)`, not the raw constant (#301,
+      // docs/upstream-bugs.md bug 4). Split so non-padding codegen is bit-identical.
       // (note: it is important that `page_meta->block_size == 0` for `mi_arena_page_at_slice`)
+      #if MI_PADDING
+      if (block_size > mi_good_size(MI_SMALL_SIZE_MAX))
+      #else
       if (block_size > MI_SMALL_SIZE_MAX)
+      #endif
       #endif
       {
         page = page_meta;

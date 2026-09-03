@@ -3,9 +3,11 @@ name: benchmark-scaling
 # Linux-only thread-scaling sweep. It serializes with the daily producer and
 # publishes through the same sealed branch/Pages pipeline. Coverage mode:
 # 4 patterns x 6 thread points x 5 allocators x 3 blocks. The sweep doubled
-# with the dense thread points (issue #211 WP4); measured cost on this runner
-# is ~6 min of sweep on top of a ~6 min fixed build, so the 20-minute budget
-# below still holds. ci/check_benchmark_scaling_workflow.py pins the thread
+# with the dense thread points (issue #211 WP4) and grew another 25% with the
+# Bun row (#325), which also adds a fifth benchmark-child build: budget ~7.5 min
+# of sweep on top of a ~7.5 min fixed build against the 20-minute limit below.
+# That is now the tightest of the four benchmark budgets; if a run times out,
+# raise timeout-minutes rather than dropping a thread point or a row. ci/check_benchmark_scaling_workflow.py pins the thread
 # points in rust/benchmark-suite/src/scaling.rs to the ones ci/benchmark_report.py
 # validates, so the two halves of the contract cannot drift apart silently.
 on:

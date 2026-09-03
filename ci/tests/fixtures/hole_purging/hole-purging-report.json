@@ -1,0 +1,51 @@
+{
+  "commit": "fixture01",
+  "cpu": "Fixture CPU",
+  "kernel": "0.0.0-fixture",
+  "off": {
+    "peak_rss_mb": 280.3,
+    "tail_mean_rss_mb": 230.7,
+    "report_text": "holes report: fixture off run\n",
+    "stats": {
+      "purged_bytes": 0,
+      "purged_blocks": 0,
+      "purged_bytes_total": 0,
+      "discard_calls": 0,
+      "reuse_calls": 0,
+      "pages_freed": 0,
+      "ineligible_pages": 0,
+      "ineligible_bytes": 0,
+      "ineligible_free_bytes": 0,
+      "unformed_bytes": 0,
+      "unformed_bytes_total": 0,
+      "unformed_discard_calls": 0,
+      "unformed_reuse_calls": 0,
+      "pages_skipped": 0,
+      "blocks_visited": 0,
+      "full_sweeps": 0
+    }
+  },
+  "on": {
+    "peak_rss_mb": 280.3,
+    "tail_mean_rss_mb": 73.2,
+    "report_text": "holes report: fixture on run\n",
+    "stats": {
+      "purged_bytes": 165052416,
+      "purged_blocks": 149252,
+      "purged_bytes_total": 165052416,
+      "discard_calls": 12672,
+      "reuse_calls": 0,
+      "pages_freed": 0,
+      "ineligible_pages": 0,
+      "ineligible_bytes": 0,
+      "ineligible_free_bytes": 0,
+      "unformed_bytes": 94208,
+      "unformed_bytes_total": 94208,
+      "unformed_discard_calls": 2,
+      "unformed_reuse_calls": 0,
+      "pages_skipped": 350361,
+      "blocks_visited": 320766,
+      "full_sweeps": 1
+    }
+  }
+}

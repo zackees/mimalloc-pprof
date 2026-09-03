@@ -53,6 +53,15 @@ top reports, and profile diffs.
 Profiling is **opt-in at runtime**: a build with `MI_PPROF=ON` (the default) does
 not sample until you call a start API or set `MIMALLOC_PROF=1`.
 
+**v3 only.** This fork tracks upstream mimalloc's `dev3` line (crate
+[`mimalloc-pprof` 0.9.x](https://crates.io/crates/mimalloc-pprof)). The legacy v2
+line (0.8.x, upstream `main`) is preserved on the
+[`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch but is not
+maintained going forward. Upstream mimalloc v3 (`dev3`) is itself still a
+pre-release branch with less field exposure than v2 — see
+[how v3 was validated](docs/fork-divergence.md#how-v3-was-validated) for exactly
+what that risk means and what was measured.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/star-history-dark.svg" />
   <source media="(prefers-color-scheme: light)" srcset=".github/assets/star-history-light.svg" />
@@ -64,7 +73,7 @@ not sample until you call a start API or set `MIMALLOC_PROF=1`.
 - [Quick start](#quick-start)
 - [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, TCMalloc, and jemalloc
 - [Why use this fork](#why-use-this-fork) — the most tested mimalloc fork in existence
-- [Choosing a version: v2 or v3](#choosing-a-version-v2-or-v3)
+- [Bun features](#bun-features) — every feature ported from oven-sh/mimalloc, including a measured hole-purging chart
 - [Profiling and observability](#profiling-and-observability) — sampled pprof, exact stats, DHAT, memory events
 - [Upstream bugs found and fixed](#upstream-bugs-found-and-fixed) — including two unbounded memory leaks
 - [Documentation](#documentation) — the full docs index
@@ -312,6 +321,9 @@ mi_purge_holes_stats_get(&h);   /* discarded bytes/blocks now, totals, syscalls,
 mi_purge_holes_report();        /* per size class: what could NOT be discarded, and why */
 ```
 
+For a measured chart of what this buys on a churn workload, see
+[Bun features: hole purging, measured](#hole-purging-measured).
+
 ### Going deeper
 
 Everything deeper — CMake install and linking, the zeroing-realloc family,
@@ -424,31 +436,96 @@ lands, so quality is maintained by machinery, not just intent.
 
 ---
 
-## Choosing a version: v2 or v3
+## Bun features
 
-**When in doubt choose v3, the current default.**
+The largest source of features in this fork is not original work: **[oven-sh/mimalloc](https://github.com/oven-sh/mimalloc)**,
+Bun's mimalloc fork (MIT), pinned at [`942b8342`](https://github.com/oven-sh/mimalloc/commit/942b8342), has independently
+solved several of the same problems — a background scavenger, hole purging, fork safety, heap-teardown races, profiler
+test coverage. Where its solution held up under this tree's own stress suite, it was ported rather than reinvented. The
+full survey, including what was *not* imported and why, is in [`MIMALLOC_FORKS.md`](MIMALLOC_FORKS.md).
 
-Two engine lines are published as two version ranges of the same crate. The
-profiler API, environment variables, and output formats are **identical** in both,
-so switching is a version bump, not a code change.
+| Feature | What it does | Bun source | Landed in | Notes / deviations |
+|---|---|---|---|---|
+| TLS-slot zeroing after slot-array growth | Zeroes newly-grown thread-local slot-array entries so a stale, uninitialized slot can never be returned as a `mi_theap_t*`. | [`afb41757`](https://github.com/oven-sh/mimalloc/commit/afb41757) | [#148](https://github.com/zackees/mimalloc-pprof/pull/148) | Symmetry fix: this tree had separately fixed the same function's pointer-*provenance* bug; each fork carried only half the fix until this import. |
+| Adversarial profiler test cases | Two adversarial profiler tests: aligned allocations (interior-pointer resolution) and empty-profile dumps. | `test/test-prof-adversarial.c` (`942b8342`) | [#51](https://github.com/zackees/mimalloc-pprof/pull/51) | Found via a survey of other mimalloc v3 profiler forks (issue #50). Two of Bun's cases imported so far; more remain (rated 5 in `MIMALLOC_FORKS.md`). |
+| Zero-tracking idea (`zalloc` skips `memset` after a zero-purge) | Tracks when a purge left a range reading back zero so `mi_zalloc` can skip its `memset`. | Bun's fork (idea; rated 4/5 in `MIMALLOC_FORKS.md`) | [#79](https://github.com/zackees/mimalloc-pprof/pull/79) | Reimplemented earlier, behind `mi_option_purge_zeroes`. Lost in the v3 pin bump and never restored (issue #80); `mi_option_purge_zeroes` / `MIMALLOC_PURGE_ZEROES` is now a dead, no-op option slot — kept, never renumbered, so existing configs don't break. |
+| glibc 2.44 `free(NULL)`-before-init page-map fix | The 2-level page map's initial submap-0 entry is `NULL`; the release/unchecked lookup indexed it without a NULL check, so glibc 2.44's loader-time `free(NULL)` (before any constructor runs) faulted at address 0. | [`7ac561ab`](https://github.com/oven-sh/mimalloc/commit/7ac561ab) | [#276](https://github.com/zackees/mimalloc-pprof/pull/276) | Landed together with the overlay pin bump to `6def7be9` that introduced upstream's 2-level page-map rewrite (this bug did not exist at the previous pin). |
+| Zero-cost-when-off profiler fast path (`prof_force_slow`) | Poisons `pages_free_direct` while profiling runs so `mi_malloc`'s fast path disassembles byte-identical whether `MI_PPROF` is on or off with the profiler stopped. | `942b8342` (strategy import) | [#281](https://github.com/zackees/mimalloc-pprof/pull/281) | Own functions adapted to this tree's `mi_theap_t`/`mi_subproc_t` layout rather than Bun's page-flag-bit mechanism. Fixed a +70% ns/alloc regression. |
+| `MI_NO_PROCESS_DETACH` | Opt out of the exit-time destructor entirely, for embedders that own their own teardown. | Bun (unconditional) | [#284](https://github.com/zackees/mimalloc-pprof/pull/284) | ~5-line port: a CMake option, an early return in `_mi_auto_process_done`, a guarded destructor registration. `MIMALLOC_PROF_DUMP_AT_EXIT` / DHAT dump-at-exit are consequently also skipped under the define. |
+| `mi_heap_dump_json` / `mi_heap_get_seq` + stats snapshot printing | JSON heap dump API, and printing `_mi_stats_print` from a snapshot (`mi_stats_add`) instead of the live, concurrently-updated struct. | `942b8342` | [#286](https://github.com/zackees/mimalloc-pprof/pull/286) | `mi_heap_t::heap_seq` already existed at this tree's pin; only the accessor and the dump walk (`src/heap-dump.c`) were new. |
+| `pthread_atfork` fork-safety handlers | Prepare/parent/child handlers so a `fork()`ing process doesn't inherit a lock held by another thread. | Bun (`_mi_process_fork_prepare/parent/child`) | [#289](https://github.com/zackees/mimalloc-pprof/pull/289) | The lock **skeleton** is Bun's; the lock **order** is not — re-derived from this tree's actual lock-nesting graph and documented edge-by-edge in `src/fork.c`, with an owner-tid + mutex-depth `MI_DEBUG>2` runtime detector that asserts every acquire agrees with the documented order. |
+| Heap delete/destroy teardown protocol | Four-step claim protocol closing an ABA race between `mi_heap_destroy` and a concurrent allocation on the same heap. | Bun (`src/theap.c`, `src/heap.c`, `src/arena.c`) | [#291](https://github.com/zackees/mimalloc-pprof/pull/291) | Adapted for the absence of `pthread_atfork`/scavenger state at the time. Also imported Bun's heap-teardown test corpus (`test-heap-teardown.c`, `test-heap-churn.c`, `test-heap-aba.c`) and its `mi_debug_fail_os_commit_after` fault-injection hook. Found and fixed two use-after-free classes the working protocol made reachable, beyond what Bun's own tree has. |
+| Background scavenger thread + `mi_on_thread_idle*` | A demand-driven background thread that purges scheduled arena memory on a timer instead of only on allocation; `purge_delay` 1000 → 100 ms. | `src/scavenger.c` | [#299](https://github.com/zackees/mimalloc-pprof/pull/299) | Deviations from Bun: stopped from an `atexit` handler on Windows; lazy start fires only from a main-subprocess thread (a sub-subprocess-started scavenger has its TLS torn down first); the new `mi_subproc_t` fields are appended at the struct tail rather than mid-struct — Bun's placement shifts `stats`, which the free path touches, ~2 ns/alloc+free. (The park protocol itself is Bun's, imported as part of this PR.) |
+| Page hole purging (`purge_holes*`) | Discards the memory of free blocks *inside* a still-used page (OS-page units), so one long-lived object no longer pins a whole page resident. | `src/page.c` (+1038), `942b8342` | [#302](https://github.com/zackees/mimalloc-pprof/pull/302) | The whole engine, including the sweep drivers, was moved into a new `src/page-holes.c`; upstream files carry only five hook calls. See "Hole purging, measured" below. |
+| Windows PRNG / RAM-sizing / NUMA fixes; macOS TLS slots 96/97 | `ProcessPrng` instead of always loading `bcrypt.dll`; `GlobalMemoryStatusEx` instead of an SMBIOS parse; NUMA node count off-by-one; fixed TLS slots moved into libpthread's never-assigned gap (95 is the last assigned key). | Bun (`6ccccec2`, `c3c36aa8`, `75a1edf8`, `d676cced`, `include/mimalloc/prim-tls.h:356-361`); NUMA fix from upstream `66383f06`, cherry-picked by Bun as `16cd3684` | [#297](https://github.com/zackees/mimalloc-pprof/pull/297) | CI fetches `apple-oss-distributions/libpthread`'s `tsd_private.h` from `main` (not pinned) and fails if slot 96 or 97 is ever assigned upstream. |
 
-| | **v3 — current** | **v2 — previous** |
-|---|---|---|
-| Crate | [`mimalloc-pprof` 0.9.x](https://crates.io/crates/mimalloc-pprof) | [0.8.x](https://crates.io/crates/mimalloc-pprof/0.8.0) |
-| Lives on | `main` | the [`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch |
-| Upstream base | mimalloc v3 (`upstream/dev3`) | mimalloc v2 (`upstream/main`) |
-| Allocator design | arena-of-slices + page-map; `mi_heap_t`/`mi_theap_t` split | segment allocator |
-| Allocator statistics | **per-heap and per-partition** (a "subproc" — mimalloc's in-process isolation domain, *not* an OS child process) | process-wide totals only |
-| Memory under thread churn (MinGW) | **flat** | leaked in published 0.8.0; fixed on the `v2` branch — [bug 1](docs/upstream-bugs.md#bug-1-thread-exit-cleanup-never-runs-on-mingw--unbounded-memory-leak) |
+### Hole purging, measured
 
-**Use v3 (0.9.x)** unless you have a specific reason not to. It has strictly more
-test coverage, richer statistics, and fixes two upstream bugs that v2 still had.
+A background **scavenger** thread returns freed arena memory to the OS on a timer
+instead of waiting for the next allocation to trigger a purge, so an idle process
+stops sitting on memory it no longer needs (`MIMALLOC_SCAVENGER`, default on;
+`MIMALLOC_PURGE_DELAY` is 100 ms in this fork, upstream is 1000). Embedders with an
+event loop can call `mi_on_thread_idle()` right before blocking in the kernel to get
+that work done for free on the calling thread.
 
-**The caveat worth stating plainly:** upstream mimalloc v3 (`dev3`) is still a
-pre-release branch. It has had less field exposure than v2 no matter how green a
-test suite looks. That risk is real and testing cannot retire it — see
-[how v3 was validated](docs/fork-divergence.md#how-v3-was-validated) for exactly
-what was measured.
+The same idle point also punches **holes**: upstream mimalloc returns a page to the
+OS only once *every* block in it is free, so one long-lived object keeps a whole
+64 KiB/512 KiB page resident. Hole purging discards the free blocks *inside* a
+still-used page instead, one OS page at a time, via `MADV_DONTNEED` /
+`MADV_FREE_REUSABLE` / `MEM_RESET` — commit state is never touched, and the free
+list is rebuilt before anything is discarded. It costs the malloc/free fast path
+nothing (default on, `MIMALLOC_PURGE_HOLES`; pacing via
+`MIMALLOC_PURGE_HOLES_MIN_INTERVAL`, default 100 ms; `MIMALLOC_PURGE_HOLES_EAGER_ZERO`
+is a test knob, always on when `MI_DEBUG>1`, that zeroes a range before discarding it
+so a mis-scoped discard corrupts visibly rather than silently). Query it live with
+`mi_purge_holes_stats_get` / `mi_purge_holes_report`. **The scavenger is on in both
+runs of the chart below; the chart isolates hole purging's own contribution.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-rss-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-rss-light.svg" />
+  <img alt="Hole purging returns 74% of peak RSS after idle; the scavenger alone returns 18%" src=".github/assets/hole-purging-rss-light.svg" width="100%" />
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-table-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-table-light.svg" />
+  <img alt="Hole purging characteristics of the churn workload" src=".github/assets/hole-purging-table-light.svg" width="100%" />
+</picture>
+
+Both were measured at commit `be13eadf` with
+[`ci/bench_hole_purging.py`](ci/bench_hole_purging.py): 150k 512 B + 100k 1 KiB +
+50k 2 KiB blocks, a scattered 1-in-20 kept alive, then idled for 10 s calling
+`mi_on_thread_idle()` every 100 ms — median of 3 runs, pinned to 4 CPUs. The table's
+size-class breakdown, `discardable-vs-OS-page-size` curve and per-run text report are
+in [`.github/assets/hole-purging-report.json`](.github/assets/hole-purging-report.json);
+some counters `mi_purge_holes_stats_t` does not expose (a sweep count split by
+owner vs. scavenger thread, why-ineligible buckets, `min_interval` pacing skips) are
+not in the table because there is nothing to read them from. Regenerate both with:
+
+```sh
+uv run ci/bench_hole_purging.py --build-dir <build> --include-dir include --out-dir .github/assets
+uv run ci/bench_hole_purging.py --build-dir <build> --include-dir include --out-dir .github/assets --table
+```
+
+For comparison, the PR #302 description measured Bun's own workload shape
+(400k blocks, min of 5 runs): peak RSS went **210.0 MB → 105.0 MB**, and
+single-threaded alloc/free latency was unchanged within noise across three
+independent rounds (the free path gains no new code in a release build — the only
+addition sits inside the `MI_CHECK_DOUBLE_FREE` path, debug/secure builds only). The
+one real cost is `sizeof(mi_page_t)` growing 144 → 192 bytes, all of it appended at
+the tail.
+
+The engine, including the sweep drivers, is `src/page-holes.c`, invoked from
+the idle sweep in `src/scavenger.c` (`src/page.c` and `src/theap.c` carry only a
+handful of hook calls). More detail, including the options reference, is in
+[docs/c-integration.md](docs/c-integration.md#scavenger-and-hole-purging).
+
+### Not imported (yet)
+
+- **macOS malloc-zone introspection** — in-/out-of-process `memory_reader_t` support for `leaks`/`heap`/`vmmap`. Open, unscheduled (rated 3 in `MIMALLOC_FORKS.md`).
+- **Heap snapshot + `mi-heapview`** — Bun's live heap snapshot format and CLI viewer (`src/heap-snapshot.c`, `tools/mi-heapview.c`). Not called by Bun itself by default; a debug tool, not a shipped feature (rated 2).
+- **Bun's `<linux/futex.h>` include** — deliberately not carried over: it is a kernel uapi header that breaks the musl/Alpine build. `src/scavenger.c` documents the deviation and uses a portable alternative instead ([fix](https://github.com/zackees/mimalloc-pprof/commit/bc228369)).
 
 ---
 
@@ -502,7 +579,7 @@ are in **[docs/ci-gates.md](docs/ci-gates.md)**.
 
 | Document | Contents |
 |---|---|
-| [docs/c-integration.md](docs/c-integration.md) | CMake build/install, linking, zeroing-realloc variants, frame-pointer flags |
+| [docs/c-integration.md](docs/c-integration.md) | CMake build/install, linking, zeroing-realloc variants, frame-pointer flags, scavenger and hole-purging options |
 | [docs/rust-integration.md](docs/rust-integration.md) | Crate setup, stats API, cargo config, cross-compilation |
 | [docs/profiler.md](docs/profiler.md) | Profiler reference: cost, env vars, seeding, embedded-mimalloc concerns, exact stats |
 | [docs/dhat-and-memory-events.md](docs/dhat-and-memory-events.md) | Exact DHAT profiling and the memory-events API |

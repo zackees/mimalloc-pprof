@@ -634,10 +634,22 @@ jobs:
           set -euo pipefail
           mkdir -p manifests executed
           cp artifacts/*/show-only-*.json manifests/
+          # `find`, not a fixed path: download-artifact strips the common root, so an
+          # artifact uploaded with one `path:` lands as `<dest>/<file>` while one uploaded
+          # with several lands as `<dest>/results/<file>`. Locating the file makes this
+          # step independent of that, and a missing half is a named error rather than a
+          # bare `cp: No such file`.
           for config in release pprof-off debug-full guarded shared musl musl-pprof-off; do
             mkdir -p "executed/$config"
-            cp "parallel/results/$config.xml" "executed/$config/parallel.xml"
-            cp "serial/results/$config.xml" "executed/$config/serial.xml"
+            for half in parallel serial; do
+              found=$(find "$half" -type f -name "$config.xml" | head -1)
+              if [ -z "$found" ]; then
+                echo "::error::the $half half produced no JUnit for $config"
+                find "$half" -type f | head -20
+                exit 1
+              fi
+              cp "$found" "executed/$config/$half.xml"
+            done
           done
           ls -R executed | head -40
       - name: Every registered test was really executed

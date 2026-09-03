@@ -184,6 +184,20 @@ terms of the MIT license. A copy of the license can be found in the file
                                     `theap_meta_lock`), which deadlocks against any thread
                                     starting up (`init.c:268` / `theap.c:329` allocate a
                                     fresh tld/theap through `_mi_meta_zalloc`).
+                                    NOT an edge: `_mi_arenas_page_abandon` (arena.c) must
+                                    never re-enter `_mi_meta_zalloc_aligned` for a page that
+                                    belongs to `theap_meta` itself -- that would be
+                                    `theap_meta_lock` against ITSELF on one stack (a self-edge
+                                    no acquisition ORDER can resolve, unlike every edge in
+                                    this table, which is between two DIFFERENT locks). Closed
+                                    two ways (Opus review of #317/#319): `subproc.c`'s
+                                    `mi_subproc_new` now sets `theap_meta->allow_page_abandon
+                                    = false` (matching `init.c`'s process theap_meta), so
+                                    `mi_page_to_full` never abandons one of `theap_meta`'s own
+                                    pages in the first place; `_mi_arenas_page_abandon` also
+                                    checks `_mi_meta_is_meta_page_safe(page)` and skips the
+                                    lazy-bitmap allocation for a meta page regardless (falls
+                                    through to the unmapped-abandon path), belt and braces.
 
     heap_main->arena_pages_lock     arena.c:685      LEAF. For the main heap
                                     `mi_heap_ensure_arena_pages` only stores

@@ -1301,7 +1301,23 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
       // abandoned bitmap is allocated on first use. If that allocation fails, fall through
       // and abandon the page unmapped, like a full page: it stays reachable through `pages`
       // and is reclaimed once a block in it is freed.
-      mi_bitmap_t* const bitmap = mi_arena_pages_abandoned_ensure(arena, arena_pages, bin);
+      //
+      // Defensive guard (Opus review of #319): never call `mi_arena_pages_abandoned_ensure`
+      // -> `_mi_meta_zalloc_aligned` for a page belonging to the subproc's own meta theap.
+      // That would re-enter `subproc->theap_meta_lock` non-recursively: `_mi_meta_zalloc_aligned`
+      // (subproc.c) holds the lock across a full `mi_theap_zalloc_aligned` on `theap_meta`,
+      // whose slow path can retire a full page of `theap_meta` itself (`mi_page_to_full`,
+      // page.c) into `_mi_page_abandon` -> here -> `..._ensure` -> the same lock again.
+      // `subproc.c`'s `mi_subproc_new` now sets `theap_meta->allow_page_abandon = false` (like
+      // `init.c`'s process theap_meta) to close the live path -- a meta theap's pages are
+      // never abandoned at all, so `_mi_page_abandon` should never reach here for one -- but a
+      // self-edge like this cannot be resolved by the MI_FORK_LOCK_* ordering (that orders
+      // acquisition across DIFFERENT call sites, not a lock against itself on one stack), so
+      // keep this check as belt and braces against a future option/call-graph change.
+      mi_bitmap_t* bitmap = NULL;
+      if (!_mi_meta_is_meta_page_safe(page)) {
+        bitmap = mi_arena_pages_abandoned_ensure(arena, arena_pages, bin);
+      }
       if mi_likely(bitmap != NULL) {
         mi_page_set_abandoned_mapped(page);
         const bool was_clear = mi_bitmap_set(bitmap, slice_index);
@@ -1970,6 +1986,16 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   // Allocated on first abandon (Bun parity P10b, #317, ported from oven-sh/mimalloc @
   // 787be2a8, MIT); the arena's own memory is not yet fully zeroed at this point in every
   // memid path (`memid.initially_zero`), so store explicitly rather than relying on that.
+  //
+  // Not a leak (Opus review of #319): unlike a regular heap's `arena_pages` (freed by
+  // `_mi_arena_pages_free` in `mi_heap_free`, see below), `pages_main`'s on-demand bitmaps
+  // are never explicitly freed anywhere -- `mi_heap_free` skips the whole arena-pages loop
+  // for the main heap (`if (!is_main)`, src/heap.c), since `pages_main` is embedded in the
+  // arena itself, not a separately allocated `arena_pages`. Each bitmap is allocated from
+  // `arena->subproc`'s meta theap (`mi_arena_pages_abandoned_ensure`), which is itself backed
+  // by the same arenas -- so this is exactly the same "lives as long as the arena/subproc it
+  // is part of, freed only by tearing the whole arena down" lifetime `arena->slices_free` /
+  // `arena->pages_main.pages` already have, not a new leak class.
   for (size_t i = 0; i < MI_ARENA_BIN_COUNT; i++) {
     mi_atomic_store_ptr_relaxed(mi_bitmap_t, &arena->pages_main.pages_abandoned[i], NULL);
   }

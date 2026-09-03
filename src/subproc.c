@@ -208,6 +208,20 @@ mi_subproc_id_t mi_subproc_new(void) {
   mi_assert_internal(parent->theap_meta->tld!=NULL);
   mi_assert_internal(parent->theap_meta->tld->thread_id == MI_THREADID_DETACHED);
   _mi_theap_init(theap_meta,heap_main,parent->theap_meta->tld /* detached tld */);
+  // Same reasoning as init.c's process-main theap_meta bootstrap ("for security, don't
+  // share with other threads"), plus a reentrancy hazard that reasoning doesn't mention but
+  // this one closes too (Opus review of #317/#319): `_mi_theap_init` -> `mi_theap_options_init`
+  // (theap.c) derives `allow_page_abandon` from `mi_option_page_full_retain`, which defaults
+  // enabled -- so without this line, a subproc's theap_meta (unlike the process's) could
+  // retire one of its own full pages through `mi_page_to_full` (page.c) -> `_mi_page_abandon`
+  // -> `_mi_arenas_page_abandon` (arena.c) -> `mi_arena_pages_abandoned_ensure` ->
+  // `_mi_meta_zalloc_aligned`, which re-enters `subproc->theap_meta_lock` from inside the very
+  // `mi_theap_zalloc_aligned` call that lock is already held across (subproc.c, above) -- an
+  // MI_DEBUG>2 reentrant-lock abort, or a Release-build hang. Setting this false means a meta
+  // page is never abandoned in the first place, so `_mi_page_abandon` never reaches that path
+  // for one; `_mi_arenas_page_abandon` also carries its own belt-and-braces
+  // `_mi_meta_is_meta_page_safe` guard (arena.c) in case this ever regresses.
+  theap_meta->allow_page_abandon = false;
   #if MI_GUARDED
   // See the matching comment in init.c's process-main theap_meta bootstrap (#266):
   // internal allocator bookkeeping must never be guarded.

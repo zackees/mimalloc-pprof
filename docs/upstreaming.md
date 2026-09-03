@@ -363,6 +363,47 @@ stack-overflowed in the emulated-TLS recursion above, before `main`. Superseded 
 a cross build, where minject (a Windows PE utility) cannot run at all. Nothing to report
 upstream about minject.
 
+## Not upstreamable: two `MI_PADDING` release-build defects at the pinned base (#301)
+
+**Nothing to send upstream — recorded so the next person does not re-derive it.** Both
+defects reproduce on **stock upstream `6def7be9`** (the commit this fork's overlay pins,
+and Bun's mimalloc merge-base) with zero fork changes, and both are **already gone at
+`upstream/dev3` HEAD `34fbd7e7`**, which relabels `MI_OPT_FREE_SMALL` *"Deprecated"*,
+drops its release auto-enable, and validates the aligned-down page lookup against a new
+`page->self` pointer. Stock `34fbd7e7` passes `test-api` 50/50 with
+`-DMI_OPT_FREE_SMALL=ON -DMI_PADDING=1`.
+
+They still matter here, and to anyone else pinned near that base. Full analysis in
+[upstream-bugs.md](upstream-bugs.md) (bugs 4 and 5); the fixes are one hunk each in
+`src/arena.c` and `src/alloc.c`.
+
+1. **`mi_free_small` reads the caller's block as a page.** `mi_arenas_page_alloc_fresh`
+   keeps the page meta in front of the slice for `block_size <= MI_SMALL_SIZE_MAX`, but
+   the small *allocation* path is entered on the **requested** size. `MI_PADDING` makes
+   those diverge (`mi_good_size(1024) == 1280`), so a 1009..1024 byte request gets a page
+   whose meta is in `pages_meta` while `mi_free_small` looks for it at
+   `_mi_align_down_ptr(p, MI_SMALL_PAGE_SIZE)`. NULL `page->heap` dereference. The bound
+   should be `mi_good_size(MI_SMALL_SIZE_MAX)` — the invariant `mi_free_small`'s own
+   assertion states.
+2. **`mi_realloc` frees an interior pointer.** With `MI_PADDING`, a failed padding decode
+   makes `mi_page_usable_size_of` return 0; `mi_theap_realloc_zero_ex` then reallocates
+   and frees `p`, pushing an interior pointer onto the page free list. It should return
+   `NULL` without freeing, as its own header comment promises.
+
+Reproduce either on stock upstream `6def7be9`, with no sanitizer and either compiler
+(verified with gcc 15.2 and clang 21.1):
+
+```sh
+cmake -S . -B b -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_FLAGS=-DMI_PADDING=1
+cmake --build b && ./b/mimalloc-test-api
+```
+
+`free_small1` segfaults (defect 1); with that fixed, `mi_urealloc_invalid` fails
+(defect 2). Neither reproduces in a `Debug` build, because CMake auto-enables
+`MI_OPT_FREE_SMALL` only when `MI_DEBUG` is off — which is why upstream's ASan
+configuration never saw them either. Add `-DMI_OPT_FREE_SMALL=ON` when checking a tree
+whose CMake no longer auto-enables it.
+
 ## Local reproduction
 
 ```sh

@@ -3,8 +3,9 @@
 *Part of the [mimalloc-pprof](../README.md) documentation.*
 
 This page exists because the bugs below are **defects in upstream
-microsoft/mimalloc**, not in the profiler, and they affect anyone using mimalloc on
-Windows/MinGW whether or not they use this fork.
+microsoft/mimalloc**, not in the profiler, and they affect anyone using mimalloc
+whether or not they use this fork — bugs 1-3 on Windows/MinGW, bugs 4-5 on every
+platform.
 
 Every one was confirmed by building **stock upstream at the same commit with the
 same toolchain** and reproducing it there with zero fork changes. Where a fix is
@@ -75,10 +76,88 @@ check, so any allocation failure becomes an opaque segfault far from its cause.
 This is what made bug 1 present as a mysterious crash rather than an obvious
 out-of-memory.
 
+## Bug 4: `mi_free_small` reads the user's block as a page when `MI_PADDING` is on
+
+|  |  |
+|---|---|
+| **Affects** | upstream **v3** at `6def7be9` — the base this fork pins, which is also Bun's mimalloc merge-base. **Gone at `dev3` HEAD** (`34fbd7e7`), see *Upstream's own fix* below |
+| **Symptom** | NULL-pointer SEGV in `mi_arenas_page_free_ex` on `free()` of a 1009..1024 byte block |
+| **Status** | **fixed here** — one line in `src/arena.c` |
+
+Reported as [issue #301](https://github.com/zackees/mimalloc-pprof/issues/301): a gcc
+AddressSanitizer build of `test-api` crashed at `free_small1`. It is neither
+gcc-specific nor ASan-specific — `RelWithDebInfo -DMI_PADDING=1` crashes identically
+under gcc *and* clang, with no sanitizer involved.
+
+Confirmed on **stock upstream `6def7be9`, zero fork changes**: `cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_FLAGS=-DMI_PADDING=1` then `mimalloc-test-api` segfaults at `free_small1`.
+
+**Root cause.** `MI_OPT_FREE_SMALL` makes `mi_free_small(p)` locate the page as
+`_mi_align_down_ptr(p, MI_SMALL_PAGE_SIZE)` instead of consulting the page map, which
+is only valid while the page metadata sits in front of the slice.
+`mi_arenas_page_alloc_fresh` decided that with the raw `MI_SMALL_SIZE_MAX`:
+
+<!-- doc-snippet: skip (source excerpt, not a program) -->
+```c
+if (block_size > MI_SMALL_SIZE_MAX) { /* meta goes in the separate pages_meta array */ }
+```
+
+But the *entry* condition for the small path is the **requested** size, not the block
+size, and `MI_PADDING` makes the two diverge: `mi_good_size(1024) == 1280`. So a
+1009..1024 byte request still took the small path, its page meta went to `pages_meta`,
+and `mi_free_small` then read the caller's own (zeroed) block as an `mi_page_t` —
+`mi_page_all_free()` on garbage, then a NULL `page->heap` dereference.
+
+The correct bound is the one `mi_free_small`'s own assertion already states,
+`mi_good_size(MI_SMALL_SIZE_MAX)`. Without padding that is exactly `MI_SMALL_SIZE_MAX`,
+so the fix is a no-op in ordinary release builds.
+
+**Why nobody hit it.** `MI_PADDING` is implied by `MI_TRACK_ASAN`, `MI_TRACK_VALGRIND`,
+`MI_TRACK_ETW` and `MI_SECURE>=3`, and CMake auto-enables `MI_OPT_FREE_SMALL` **only
+when `MI_DEBUG` is off**. The two therefore coexist only in a release-type sanitizer or
+secure build — and upstream's (and this fork's) ASan job built `Debug`.
+
+**Upstream's own fix.** At `dev3` HEAD (`34fbd7e7`) the option is relabelled
+*"Deprecated"*, the release auto-enable is gone, and the aligned-down lookup is validated
+against a new `page->self` pointer (`mi_ptr_page_is_valid_ex` in `free.c`). Stock
+`34fbd7e7` passes `test-api` 50/50 with `-DMI_OPT_FREE_SMALL=ON -DMI_PADDING=1`, so there
+is nothing to send upstream — but everything pinned at `6def7be9`, Bun included, still has
+this.
+
+## Bug 5: `mi_realloc` frees an interior pointer when the padding does not decode
+
+|  |  |
+|---|---|
+| **Affects** | upstream **v3** at `6def7be9`, any `MI_PADDING` non-debug build. **Gone at `dev3` HEAD** (`34fbd7e7`) |
+| **Symptom** | upstream's own `mi_urealloc_invalid` test fails; an interior pointer is pushed onto the page free list |
+| **Status** | **fixed here** — `src/alloc.c` |
+
+Found in the same configuration as bug 4, and independent of it. Confirmed on **stock
+upstream `6def7be9`, zero fork changes**: the same `RelWithDebInfo -DMI_PADDING=1` build
+reports `FAILED: mi_urealloc_invalid`. Stock `34fbd7e7` does not.
+
+With `MI_PADDING` on, `mi_page_usable_size_of` returns **0** when the padding canary
+does not decode — free.c says so itself: *"size can be zero if the padding is
+corrupted"*. That means `p` is not a block start, or the block was overrun.
+`mi_theap_realloc_zero_ex` took the 0 at face value, treated the block as zero bytes
+long, allocated a replacement, copied nothing into it, and **freed `p`** — an interior
+pointer onto the page's free list.
+
+The fix returns `NULL` without freeing `p`, which is both the contract stated at the top
+of that function (*"returning NULL always indicates an error, and `p` will not have been
+freed"*) and the answer a `MI_DEBUG` build already gives via `mi_validate_ptr_page`.
+No valid block ever reports usable size 0 — the padding path bumps a zero-byte request
+to `sizeof(void*)` — verified by exhaustively probing `mi_malloc`/`mi_zalloc`/
+`mi_calloc`/`mi_realloc` over 0..4096 bytes and `mi_*_aligned`/`mi_malloc_aligned_at`
+over 0..2048 bytes × alignments 1..8192, in padding and non-padding, debug and release
+builds: no allocation reports 0.
+
 ## What this means for you
 
 - **Using upstream mimalloc on Windows/MinGW?** Bug 1 applies to you and is worth
   carrying a patch for.
+- **Pinned to upstream v3 around `6def7be9`** (as Bun is) **and building with a
+  sanitizer, Valgrind, ETW tracking or `MI_SECURE>=3` in a release build?** Bugs 4 and 5
+  apply to you. Upstream `dev3` HEAD has moved past both.
 - **Using this fork?** All of the above are handled — v3 on `main`, and the v2 line
   carries its own variant of the bug 1 fix.
 

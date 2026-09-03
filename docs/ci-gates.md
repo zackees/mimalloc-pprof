@@ -26,7 +26,7 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 | **isa-baseline** (`ci/check_isa_baseline.py`) | binaries containing instructions above the CPU baseline, which SIGILL on older hardware | builds with `MI_OPT_ARCH=ON`; the scanner must fire. The parser also self-tests against x86 and arm64 fixtures on every run |
 | **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW. **macOS uses no Apple hardware** (#277 phase B2): both arches are cross-built on Linux, x86_64 is executed under `dockurr/macos` on a Linux runner, arm64 is compile-only. **windows-MinGW is gated from Linux-built bundles run on one Windows runner** (`windows-bundles.yml`, #277 phase C — which also moves that lane from msvcrt to UCRT); the native MSYS2 MinGW jobs are informational during the comparison window | `ci/bundle_coverage.py` fails if a test in the arm64 bundle is missing from the executed x86_64 one, or if any test the native MinGW `ctest` would run is missing from a bundle; `ci/lint_no_macos_runners.py` fails if any workflow names a macOS runner |
 | **ctest-guarded** | the `MI_GUARDED` guard-page path, run twice: at the default sample rate and again with `MIMALLOC_GUARDED_SAMPLE_RATE=1` so every eligible allocation is guarded | configure step greps the resolved compiler defines for `MI_GUARDED=1`, since the original bug was the flag never reaching the compiler |
-| **asan** | use-after-free, overflow and leaks under AddressSanitizer | — |
+| **asan** | use-after-free, overflow and leaks under AddressSanitizer, across **two build types** — see below | the `mimalloc-test-asan-control` binary reads freed memory through `mi_free` and must abort with an AddressSanitizer report; the configure step also greps its own output for `MI_TRACK_ASAN=ON`, since the option silently self-disables when its header is missing |
 | **fuzz** (`test/fuzz/`) | crashes from structured random allocator-API sequences, with ASan as the oracle | builds with a planted use-after-free and requires an anchored `(ERROR\|SUMMARY): AddressSanitizer:` report naming it |
 | **amalgamation-drift** | a C change that never reached the vendored copy the Rust crate compiles — which broke `main` twice before this gate existed | — |
 | **doc-snippets** (`ci/check_doc_snippets.py`) | fenced ```c examples in `README.md`/`docs/*.md` that don't compile against the real headers — caught one in PR #259 (a snippet using `mi_prof_config_t_decl`/`mi_prof_start_ex` with no `#include` at all) | `--self-test` plants a snippet calling an undeclared mimalloc function; the checker must reject it, on both gcc and clang |
@@ -44,6 +44,39 @@ so the job in `.github/workflows/c-unit.yml` runs with no `continue-on-error`: a
 regression here blocks merge, the same as every other row in the table above.
 `docs/bun-gap-analysis-2026-09-02.md` tracks the rest of what's still open (hole
 purging, #302) before the Bun issue itself (P9c) can be filed.
+
+### The ASan job runs Debug **and** RelWithDebInfo, and that is the rule
+
+Issue #301. A Debug-only ASan lane cannot see an entire class of bug, and sat green
+through a NULL-pointer SEGV that any release-type sanitizer build hits within seconds.
+
+The mechanism: `MI_TRACK_ASAN` implies `MI_PADDING` (`types.h`), and `CMakeLists.txt`
+auto-enables `MI_OPT_FREE_SMALL` — hence `MI_PAGE_META_ALIGNED_FREE_SMALL`, the
+`mi_free_small` fast path that finds a page by aligning the pointer down instead of
+consulting the page map — **only when `MI_DEBUG` is off**. So the two features that had
+to be combined to expose the bug are, by construction, mutually exclusive in a Debug
+build. `test-api`'s `free_small1` crashed in `mi_arenas_page_free_ex` on every
+`RelWithDebInfo -DMI_TRACK_ASAN=ON` build and on none of CI's.
+
+`asan.yml` is therefore a matrix, and all three rows are hard gates:
+
+| Row | Why |
+|---|---|
+| `clang, Debug` (+ `MI_DEBUG_FULL=ON`) | the original lane: every internal assertion armed |
+| `gcc, RelWithDebInfo` | the configuration #301 was reported against, and the one that reaches `mi_free_small` |
+| `clang, RelWithDebInfo` | the same coverage on the other compiler — #301 was *reported* as gcc-specific and is not, so an asymmetry between these two rows is itself a finding |
+
+`ci/verify_local.py`'s `asan` config mirrors both build types. It also **probes for a
+compiler that can actually see `sanitizer/asan_interface.h`** — clang first, then gcc,
+else SKIP with that reason — because on a distribution whose clang ships without
+compiler-rt's headers the config previously could not configure at all, every agent
+hand-rolled a gcc ASan build instead, and #301 stayed out of CI as a result.
+
+Because a matrixed job can template its cmake flags, `ci/tests/test_verify_local.py`
+expands `${{ matrix.* }}` before checking that every `-D` flag in a workflow still
+appears in `verify_local.py`. Without that, a templated flag would read as the literal
+token `-DCMAKE_BUILD_TYPE=${{` and the drift guard would have to be silenced — the same
+kind of blind spot as the seven dead gates listed at the top of this page.
 
 ## Test bundles
 

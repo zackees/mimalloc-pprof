@@ -34,7 +34,24 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 | **zero-tracking** | correctness and footprint of `mi_option_purge_zeroes`, reported as paired interleaved A/B medians with the within-arm spread alongside. Linux runs it in its own path-filtered workflow; Windows runs it as a gated step inside `run-windows` (#277 phase E), and the *correctness* half is unconditional there because `test-zero-tracking*` are ordinary ctest tests carried in every bundle | — |
 | **bun-surface** (`ci/check_bun_surface.py`) | whether `oven-sh/bun`'s exact `scripts/build/deps/mimalloc.ts` DirectBuild (`src/static.c` compiled as C++ with Bun's define set) can actually link against every `mi_*` symbol Bun's Rust FFI and C++ consumers reference, plus `MI_MAX_ALIGN_SIZE` / `mi_heap_area_t` / `mi_option_t` slot-0-42 ABI drift via `test/test-bun-surface.cpp`'s `static_assert`s | the script's own exit code already reflects reality (1 on any missing symbol or failed assert) |
 
-### `bun-surface` is a hard gate
+### macOS execution is manual-only (2026-09-03)
+
+`macos-bundles.yml`'s `run-macos-x64-recovery` job (x86_64 bundles executed inside a macOS
+Recovery guest on a Linux runner, PR #308) takes ~25 min when the guest cooperates and up
+to the 90-min job timeout when it does not, so it is **not** a per-PR gate. It runs only on
+`workflow_dispatch`:
+
+```
+gh workflow run macos-bundles.yml --ref <branch>            # default 3600 s guest run
+gh workflow run macos-bundles.yml --ref <branch> -f run-timeout=1800
+```
+
+Every push/PR still cross-builds all six macOS bundles (both arches) and runs the Mach-O
+and coverage assertions, so a macOS build break is caught immediately; only the execution
+is on demand. Run it before merging changes to macOS-specific paths (`src/prim/osx`,
+interpose, TLS slots) and when a Linux-green change touches the arena/heap lifecycle.
+
+## `bun-surface` is a hard gate
 
 Issue #274 (Bun parity P9a). `mi_on_thread_idle` is part of Bun's linked surface
 (`mimalloc_sys.rs:30`) and merged to `main` with Bun parity P7a (issue #299, `1dbbb8df`).

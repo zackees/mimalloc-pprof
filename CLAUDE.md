@@ -26,10 +26,13 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    `RUN_SERIAL` group in `CMakeLists.txt`, never behind a retry.
    MSVC **and** win-gnu are priority platforms — both, always.
    The **macOS** gate is `macos-bundles.yml` and uses no Apple hardware (#277 phase B2):
-   both Apple arches are cross-built on Linux through soldr, `x86_64` is *executed* inside a
-   macOS Recovery guest on a Linux runner (`run-macos-x64-recovery`), and `aarch64` is
-   **compile-only** — a build plus Mach-O header assertions, with its test-name set checked
-   against the executed x86_64 bundle. Never add a `macos-*` runner label to a workflow or
+   both Apple arches are cross-built on Linux through soldr on every push/PR (that build is
+   the gate), and `aarch64` is **compile-only** — a build plus Mach-O header assertions, with
+   its test-name set checked against the x86_64 bundle. *Executing* the x86_64 bundles inside
+   a macOS Recovery guest on a Linux runner (`run-macos-x64-recovery`) is **manual-only**
+   (`workflow_dispatch`; owner decision 2026-09-03: ~25–90 min per run cannot gate PRs).
+   Run it with `gh workflow run macos-bundles.yml --ref <branch>` before merging changes
+   to macOS-specific allocator paths (prim/osx, interpose, TLS slots), and on demand. Never add a `macos-*` runner label to a workflow or
    to `azure-pipelines.yml`; `ci/lint_no_macos_runners.py` fails `python-lint` if you do.
    The guest boots macOS **Recovery** straight off the image every run via the
    `zackees/docker-mac-x64` action — no golden disk, no Actions cache, nothing to expire

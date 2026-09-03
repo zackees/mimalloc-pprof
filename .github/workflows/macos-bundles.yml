@@ -34,6 +34,18 @@ env:
   SOLDR_GITHUB_TOKEN: ${{ github.token }}
 
 on:
+  # The Recovery *execution* job (`run-macos-x64-recovery`) is manual-only: a full run is
+  # ~25 min when the guest cooperates and up to the 90-min job timeout when it does not,
+  # which is too slow for a per-PR gate (owner decision, 2026-09-03). Push/PR events still
+  # cross-compile every macOS bundle (both arches) so a build break is caught at once;
+  # trigger this workflow from the Actions tab (or `gh workflow run macos-bundles.yml
+  # --ref <branch>`) to execute the x86_64 bundles inside the Recovery guest.
+  workflow_dispatch:
+    inputs:
+      run-timeout:
+        description: seconds the guest gets to run the bundles
+        default: '3600'
+        required: false
   push:
     branches: [main, v4]
   pull_request:
@@ -417,6 +429,9 @@ jobs:
   run-macos-x64-recovery:
     name: run-macos-x64 (macOS Recovery on Linux)
     needs: [build-macos, build-rust-apple]
+    # Manual only -- see the `on:` block. Not a PR gate; run it before merging changes to
+    # the allocator's macOS-specific paths (prim/osx, interpose, TLS slots) or on demand.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     # Emulated guest, everything in it serial, one boot retry budgeted.
     timeout-minutes: 90
@@ -493,7 +508,7 @@ jobs:
           share-dir: share
           collect: /tmp/w/out
           ram: '8'
-          run-timeout: '3600'
+          run-timeout: ${{ inputs.run-timeout || '3600' }}
           # One boot, everything serial inside it. Nothing here may abort the
           # script on a test failure: a red bundle still has to post its JUnit
           # back, and the runner decides pass/fail afterwards.

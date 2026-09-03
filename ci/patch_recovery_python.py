@@ -25,8 +25,10 @@ command's size is fixed; libSystem is both shorter and guaranteed present.
 
     python3 ci/patch_recovery_python.py <libpython3.12.dylib>
 """
+
 import struct
 import sys
+from pathlib import Path
 
 OLD = b"/usr/lib/libpanel.5.4.dylib"
 NEW = b"/usr/lib/libSystem.B.dylib"
@@ -34,12 +36,13 @@ NEW = b"/usr/lib/libSystem.B.dylib"
 DYLIB_CMDS = (0x0C, 0x18, 0x1F, 0x20)
 
 
-def patch(path):
+def patch(path: str) -> None:
     assert len(NEW) <= len(OLD), "replacement path must fit the existing load command"
-    data = bytearray(open(path, "rb").read())
+    target = Path(path)
+    data = bytearray(target.read_bytes())
     magic, _, _, _, ncmds, _, _, _ = struct.unpack_from("<8I", data, 0)
     if magic != 0xFEEDFACF:
-        raise SystemExit("not a 64-bit little-endian Mach-O: %s (magic %#x)" % (path, magic))
+        raise SystemExit(f"not a 64-bit little-endian Mach-O: {path} (magic {magic:#x})")
 
     off, patched = 32, 0
     for _ in range(ncmds):
@@ -51,16 +54,15 @@ def patch(path):
             if bytes(data[start:end]) == OLD:
                 # Clear the whole name field first: the old path is longer, and a
                 # trailing tail would otherwise survive past the new NUL.
-                data[start:off + cmdsize] = b"\x00" * (cmdsize - nameoff)
-                data[start:start + len(NEW)] = NEW
+                data[start : off + cmdsize] = b"\x00" * (cmdsize - nameoff)
+                data[start : start + len(NEW)] = NEW
                 patched += 1
         off += cmdsize
 
     if patched != 1:
-        raise SystemExit("expected exactly 1 %s load command, found %d"
-                         % (OLD.decode(), patched))
-    open(path, "wb").write(bytes(data))
-    print("patched %s: %s -> %s" % (path, OLD.decode(), NEW.decode()))
+        raise SystemExit(f"expected exactly 1 {OLD.decode()} load command, found {patched}")
+    target.write_bytes(bytes(data))
+    print(f"patched {path}: {OLD.decode()} -> {NEW.decode()}")
 
 
 if __name__ == "__main__":

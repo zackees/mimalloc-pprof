@@ -21,6 +21,7 @@ so the waiver cannot rot in either direction.
 
     python3 ci/recovery_expected_failures.py bundle-release.xml [more.xml ...]
 """
+
 import sys
 import xml.etree.ElementTree as ET
 
@@ -33,25 +34,29 @@ EXPECTED = {
 REASON = "no dyld shared cache in Recovery; stack PCs do not resolve to modules"
 
 
-def failures(path):
-    out = set()
+def failures(path: str) -> set[str]:
+    out: set[str] = set()
     root = ET.parse(path).getroot()
     for case in root.iter("testcase"):
         if case.find("failure") is not None or case.find("error") is not None:
-            out.add(case.get("name"))
+            name = case.get("name")
+            if name is not None:
+                out.add(name)
     return out
 
 
-def names(path):
-    return {c.get("name") for c in ET.parse(path).getroot().iter("testcase")}
+def names(path: str) -> set[str]:
+    root = ET.parse(path).getroot()
+    return {name for case in root.iter("testcase") if (name := case.get("name")) is not None}
 
 
-def main(argv):
+def main(argv: list[str]) -> int:
     if not argv:
         print("usage: recovery_expected_failures.py <junit.xml> [...]", file=sys.stderr)
         return 2
 
-    failed, seen = set(), set()
+    failed: set[str] = set()
+    seen: set[str] = set()
     for p in argv:
         failed |= failures(p)
         seen |= names(p)
@@ -61,22 +66,25 @@ def main(argv):
     # from this bundle says nothing either way.
     stale = (EXPECTED & seen) - failed
 
-    print("ran %d tests across %d bundle(s)" % (len(seen), len(argv)))
-    print("failed: %s" % (sorted(failed) or "none"))
+    print(f"ran {len(seen)} tests across {len(argv)} bundle(s)")
+    print(f"failed: {sorted(failed) or 'none'}")
 
     rc = 0
     if unexpected:
-        print("::error::Recovery lane has UNEXPECTED failures: %s" % sorted(unexpected))
+        print(f"::error::Recovery lane has UNEXPECTED failures: {sorted(unexpected)}")
         rc = 1
     if stale:
-        print("::error::These are waived as Recovery-only but PASSED: %s. "
-              "Remove them from EXPECTED in ci/recovery_expected_failures.py."
-              % sorted(stale))
+        print(
+            f"::error::These are waived as Recovery-only but PASSED: {sorted(stale)}. "
+            "Remove them from EXPECTED in ci/recovery_expected_failures.py."
+        )
         rc = 1
     if not rc:
         waived = sorted(EXPECTED & seen)
-        print("OK: the only failures are the %d waived Recovery-environment ones (%s): %s"
-              % (len(waived), REASON, waived))
+        print(
+            f"OK: the only failures are the {len(waived)} waived "
+            f"Recovery-environment ones ({REASON}): {waived}"
+        )
     return rc
 
 

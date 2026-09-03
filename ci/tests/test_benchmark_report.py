@@ -6,6 +6,7 @@ from __future__ import annotations
 # ruff: noqa: I001
 
 import copy
+import gzip
 import json
 import math
 import re
@@ -15,6 +16,7 @@ import unittest
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 import benchmark_report as report
@@ -1753,14 +1755,20 @@ class BenchmarkReportTests(unittest.TestCase):
 
 
 class LegacyAllocatorLineageTests(unittest.TestCase):
-    """The published branch still carries artifacts recorded before the Bun row
-    landed (#325). They must keep validating, carrying forward, and rendering:
-    a lineage that stops parsing is a lineage that has been silently rewritten."""
+    """The published branch carries artifacts recorded before the Bun row landed
+    (#325). They must keep validating, carrying forward, and rendering: a lineage
+    that stops parsing is a lineage that has been silently rewritten.
+
+    The fixtures here are this suite's own pre-#325 synthetic envelope and
+    history row -- the same shape the branch holds, not a copy of production
+    data. `latest.json.gz` is stored compressed: it is 2.4 MB of synthetic
+    samples that would otherwise dominate the repository's fixture bytes."""
 
     LEGACY = FIXTURE / "legacy"
 
     def load_legacy_latest(self) -> dict[str, object]:
-        return json.loads((self.LEGACY / "latest.json").read_text(encoding="utf-8"))
+        with gzip.open(self.LEGACY / "latest.json.gz", "rt", encoding="utf-8") as source:
+            return json.loads(source.read())
 
     def legacy_with_optional_sections(self) -> dict[str, object]:
         """The pre-#325 envelope with complete memory/latency/scaling sections,
@@ -1815,6 +1823,45 @@ class LegacyAllocatorLineageTests(unittest.TestCase):
             report.render(source, self.LEGACY / "history.jsonl", site, root / "digest", False)
             self.assertTrue((site / "index.html").is_file())
             self.assertTrue((site / "benchmark-rss-timeline.png").is_file())
+
+    def test_a_weekly_section_survives_the_fork_moving_under_it(self) -> None:
+        """`benchmark-stats` is daily and memory/latency are weekly, so the core
+        run routinely rebuilds mimalloc-pprof from a newer commit than the
+        section being carried onto it. Comparing the fork's own sha there held
+        the production workflow red for eight consecutive days from 2026-08-27
+        (run 33761935520); only the lock-pinned competitors are comparable."""
+
+        helper = BenchmarkReportTests("test_memory_section_sits_next_to_throughput")
+        latest = helper.with_complete_latency(helper.with_complete_memory(helper.load_latest()))
+        report.validate_latest(latest, "same-day latest")
+
+        moved_fork = copy.deepcopy(latest)
+        for item in cast(list[dict[str, object]], moved_fork["allocators"]):
+            if item["allocator_id"] == "mimalloc-pprof":
+                item["source_sha"] = "9" * 40
+        report.validate_latest(moved_fork, "fork rebuilt since the weekly run")
+
+        moved_competitor = copy.deepcopy(latest)
+        for item in cast(list[dict[str, object]], moved_competitor["allocators"]):
+            if item["allocator_id"] == "upstream-mimalloc":
+                item["source_sha"] = "f" * 40
+        with self.assertRaisesRegex(report.ReportError, "allocator source pins"):
+            report.validate_latest(moved_competitor, "competitor pin moved")
+
+    def test_render_rejects_a_core_envelope_recorded_under_the_older_set(self) -> None:
+        """Lineage tolerance is for artifacts that were already published, never
+        for one being produced now: a producer that silently dropped a row must
+        not be able to publish."""
+
+        legacy = self.legacy_with_optional_sections()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            source.write_text(json.dumps(legacy) + "\n", encoding="utf-8", newline="\n")
+            with self.assertRaisesRegex(report.ReportError, "current allocator set"):
+                report.render(
+                    source, self.LEGACY / "history.jsonl", root / "site", root / "digest", False
+                )
 
     def test_a_carried_section_may_not_carry_a_different_pin(self) -> None:
         """Tolerating a missing row must not tolerate a moved one: if the core

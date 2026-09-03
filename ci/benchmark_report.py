@@ -410,22 +410,33 @@ def fail(message: str) -> NoReturn:
 
 
 def validate_carried_pins(
-    observed: set[tuple[str, str]], expected: set[tuple[str, str]], label: str
+    observed: set[tuple[str, str]], core: set[tuple[str, str]], label: str
 ) -> None:
-    """Every (allocator, source) pair an optional metric section carries must be
-    a pair the core run also carries.
+    """Every lock-pinned (allocator, source) pair an optional metric section
+    carries must be a pair the core run also carries.
 
     Pairs rather than a mapping: a mapping keeps only the last sample per
     allocator, which would let a single mispinned sample through.
 
-    Subset rather than equality: an optional metric is measured on its own
-    schedule and carried forward onto later core envelopes, so a section
-    published before a new allocator row landed (#325) legitimately carries
-    fewer rows than the core run. It may never carry a different pin, or a row
-    the core run does not have.
+    Only the lock-pinned competitors are compared. Memory, latency and scaling
+    are measured weekly and carried forward onto whichever daily core envelope
+    is published next, so the fork's own commit is normally *newer* in the core
+    run than in the section that is being carried. Requiring equality there
+    makes a carried section unpublishable the moment the fork moves -- which is
+    exactly what held `benchmark-stats` red for eight consecutive days from
+    2026-08-27. The commit each section was measured at is recorded on the
+    section itself, so the two halves of `latest.json` can never be read as one
+    build.
+
+    Subset rather than equality among those competitors: a section published
+    before a new allocator row landed (#325) legitimately carries fewer rows
+    than the core run. It may never carry a different pin, or a row the core run
+    does not have.
     """
 
-    if not observed or observed - expected:
+    pinned_observed = {pair for pair in observed if pair[0] in LOCK_PINNED_ALLOCATORS}
+    pinned_core = {pair for pair in core if pair[0] in LOCK_PINNED_ALLOCATORS}
+    if not pinned_observed or pinned_observed - pinned_core:
         fail(f"{label}: allocator source pins differ from the core run")
 
 
@@ -2081,11 +2092,6 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
     scaling = latest.get("scaling")
     if scaling is not None:
         scaling_report = validate_scaling_report(scaling, f"{label}.scaling")
-        # Only the lock-pinned competitors must match the core run. The sweep
-        # runs weekly and overlays onto whichever daily core envelope is
-        # published, so the fork's own commit is normally newer; requiring
-        # equality there would make the overlay permanently unpublishable.
-        expected_pairs = {pair for pair in core_pins if pair[0] in LOCK_PINNED_ALLOCATORS}
         scaling_samples = [
             object_value(value, f"{label}.scaling.raw_samples")
             for value in list_value(scaling_report["raw_samples"], f"{label}.scaling.raw_samples")
@@ -2093,9 +2099,8 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
         observed_pairs = {
             (str(value["allocator_id"]), str(value["allocator_source_sha"]))
             for value in scaling_samples
-            if str(value["allocator_id"]) in LOCK_PINNED_ALLOCATORS
         }
-        validate_carried_pins(observed_pairs, expected_pairs, f"{label}.scaling")
+        validate_carried_pins(observed_pairs, core_pins, f"{label}.scaling")
         fork_sources = {
             str(value["allocator_source_sha"])
             for value in scaling_samples
@@ -2569,14 +2574,22 @@ def throughput_png(latest: Mapping[str, object]) -> bytes:
         column, row = ordinal % 3, ordinal // 3
         left, top = 55 + column * 410, 100 + row * 145
         canvas.rectangle(left, top, 370, 118, (235, 240, 246))
+        # Sort by allocator so a bar's colour is that allocator's legend colour
+        # rather than whatever position it happened to occupy in the summary
+        # list, matching latency_png.
+        values.sort(key=lambda value: ALLOCATOR_IDS.index(cast(str, value["allocator_id"])))
         medians = [
             float_value(object_value(value["summary"], "summary")["median"], "median", True)
             for value in values
         ]
         maximum = max(medians)
-        for index, median in enumerate(medians[: len(ALLOCATOR_IDS)]):
+        for index, (value, median) in enumerate(zip(values, medians)):
             canvas.rectangle(
-                left + 18, top + 18 + index * 19, int(325 * median / maximum), 12, COLORS[index]
+                left + 18,
+                top + 18 + index * 19,
+                int(325 * median / maximum),
+                12,
+                COLORS[ALLOCATOR_IDS.index(cast(str, value["allocator_id"]))],
             )
     return encode_png(1280, 720, canvas.pixels, "Validated paired benchmark throughput")
 
@@ -4186,6 +4199,20 @@ def render(
 ) -> str:
     latest = read_json(input_path)
     validate_latest(latest, str(input_path))
+    # Lineage tolerance exists for artifacts that were *published* under an older
+    # allocator set: carried-forward optional sections, the prior latest, and
+    # history rows. A core envelope being produced right now has no such excuse
+    # -- it must carry today's set, or a producer that silently dropped a row
+    # would publish successfully and only be noticed as a missing chart line.
+    core_ids = tuple(
+        str(object_value(value, f"{input_path}.allocators")["allocator_id"])
+        for value in list_value(latest["allocators"], f"{input_path}.allocators")
+    )
+    if core_ids != ALLOCATOR_IDS:
+        fail(
+            f"{input_path}: a freshly produced core envelope must carry the current "
+            f"allocator set {list(ALLOCATOR_IDS)}, got {list(core_ids)}"
+        )
     carried_optional_metrics = False
     if prior_latest_path is not None:
         prior = read_json(prior_latest_path)

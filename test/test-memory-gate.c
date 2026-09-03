@@ -75,6 +75,75 @@ static void thread_start(thread_t* t, thread_fun_t fn, void* arg) {
 static void thread_join(thread_t t) { assert(pthread_join(t, NULL) == 0); }
 #endif
 
+/* ---- portable rendezvous barrier -------------------------------------- */
+/* Why this exists at all: the gated number is peak RSS, a high-water mark, and before
+   this barrier the high-water mark was set by *how many* of the CHURN_THREADS workers
+   happened to be holding their live set at the same instant. On a 4-vCPU shared runner
+   that is a scheduler coin flip, and it was the single largest term in the measurement:
+   a per-scenario decomposition on an idle 4-CPU-pinned host showed scenario 1 alone
+   ranging 14.1 -> 24.6 MB across four consecutive runs of the identical binary, with
+   every later scenario adding <= 2 MB on top. Rendezvousing the workers makes "all of
+   them live at once" the *only* reachable state, so the peak becomes a property of the
+   allocator (how much memory N threads' live sets actually cost) instead of a property
+   of the runner's scheduler.
+
+   Condition variables rather than a spin flag or C11 atomics: a spin flag burns a vCPU
+   that a 4-vCPU runner needs for the threads we are actually measuring (that is a second
+   noise source -- see scenario 3), and MSVC's <stdatomic.h> is gated behind
+   /experimental:c11atomics, which this test cannot require. Both primitives below ship
+   in every toolchain the gate builds on. */
+#ifdef _WIN32
+typedef struct barrier_s {
+  CRITICAL_SECTION    lock;
+  CONDITION_VARIABLE  cond;
+  int n, waiting, generation;
+} barrier_t;
+static void barrier_init(barrier_t* b, int n) {
+  InitializeCriticalSection(&b->lock);
+  InitializeConditionVariable(&b->cond);
+  b->n = n; b->waiting = 0; b->generation = 0;
+}
+static void barrier_destroy(barrier_t* b) { DeleteCriticalSection(&b->lock); }
+static void barrier_wait(barrier_t* b) {
+  EnterCriticalSection(&b->lock);
+  const int gen = b->generation;
+  if (++b->waiting == b->n) {
+    b->waiting = 0; b->generation++;
+    WakeAllConditionVariable(&b->cond);
+  }
+  else {
+    while (b->generation == gen) { SleepConditionVariableCS(&b->cond, &b->lock, INFINITE); }
+  }
+  LeaveCriticalSection(&b->lock);
+}
+#else
+typedef struct barrier_s {
+  pthread_mutex_t lock;
+  pthread_cond_t  cond;
+  int n, waiting, generation;
+} barrier_t;
+static void barrier_init(barrier_t* b, int n) {
+  assert(pthread_mutex_init(&b->lock, NULL) == 0);
+  assert(pthread_cond_init(&b->cond, NULL) == 0);
+  b->n = n; b->waiting = 0; b->generation = 0;
+}
+static void barrier_destroy(barrier_t* b) {
+  pthread_mutex_destroy(&b->lock); pthread_cond_destroy(&b->cond);
+}
+static void barrier_wait(barrier_t* b) {
+  pthread_mutex_lock(&b->lock);
+  const int gen = b->generation;
+  if (++b->waiting == b->n) {
+    b->waiting = 0; b->generation++;
+    pthread_cond_broadcast(&b->cond);
+  }
+  else {
+    while (b->generation == gen) { pthread_cond_wait(&b->cond, &b->lock); }
+  }
+  pthread_mutex_unlock(&b->lock);
+}
+#endif
+
 /* ---- measurement ------------------------------------------------------- */
 
 typedef struct sample_s {
@@ -166,7 +235,15 @@ static void inject_leak(void) {
   if (n == 0 || inject_armed == 0) return;
   void* p = mi_malloc(n);
   if (p != NULL) {
-    memset(p, 0x5A, n < 4096 ? n : 4096);
+    /* Touch the WHOLE block, not the first page. RSS counts resident pages, so a leak
+       whose pages are committed-but-untouched moves peak RSS by an amount that depends
+       on when the allocator happened to zero or reuse them: measured across 24 runs of
+       the control, that made the control's own peak span 78-105 MB, and one run in an
+       earlier batch read within 1% of the clean baseline -- i.e. the control came within
+       one sample of silently not firing. Faulting every page makes the injected leak
+       worth a deterministic n bytes of RSS. This code exists only in a build compiled
+       with MI_BENCH_INJECT_LEAK, so it cannot affect a real measurement. */
+    memset(p, 0x5A, n);
     size_t i = inject_idx++;
     if (i < 4096) { inject_sink[i] = p; } else { /* keep leaking, drop the handle */ }
   }
@@ -184,18 +261,23 @@ static void arm_injection(void) {
 /* Scenario 1: thread churn. The shape of both shipped leaks -- threads that own real
    pages and then exit. If thread-exit cleanup regresses, this is what catches it. */
 static THREAD_RET churn_worker(void* arg) {
-  (void)arg;
+  barrier_t* rendezvous = (barrier_t*)arg;
   void* keep[48];
   for (size_t i = 0; i < 48; i++) {
     keep[i] = mi_malloc(64*1024);
     assert(keep[i] != NULL);
     memset(keep[i], 0x5A, 4096);
   }
+  /* Every worker in the round now holds its live set. Nobody frees until everybody has
+     allocated, so the round's contribution to peak RSS is CHURN_THREADS live sets --
+     always, not "as many as the scheduler happened to overlap". */
+  barrier_wait(rendezvous);
   for (size_t i = 0; i < 1500; i++) {
     void* p = mi_malloc(64 + (i % 900));
     assert(p != NULL);
     mi_free(p);
   }
+  barrier_wait(rendezvous);   /* ... and the churn free lists are all live at once too. */
   for (size_t i = 0; i < 48; i++) { mi_free(keep[i]); }
   inject_leak();
   return THREAD_OK;
@@ -203,9 +285,12 @@ static THREAD_RET churn_worker(void* arg) {
 
 static void scenario_thread_churn(void) {
   for (int r = 0; r < CHURN_ROUNDS; r++) {
+    barrier_t rendezvous;
+    barrier_init(&rendezvous, CHURN_THREADS);
     thread_t th[CHURN_THREADS];
-    for (int i = 0; i < CHURN_THREADS; i++) thread_start(&th[i], (thread_fun_t)churn_worker, NULL);
+    for (int i = 0; i < CHURN_THREADS; i++) thread_start(&th[i], (thread_fun_t)churn_worker, &rendezvous);
     for (int i = 0; i < CHURN_THREADS; i++) thread_join(th[i]);
+    barrier_destroy(&rendezvous);
   }
 }
 
@@ -224,16 +309,21 @@ static void scenario_sawtooth(void) {
 
 /* Scenario 3: cross-thread free. Allocate on one thread, free on another -- the path
    that defers work and therefore the one most able to hide retention. */
-typedef struct xchan_s { void* blocks[3000]; volatile int ready; } xchan_t;
+/* The handoff is a two-party barrier rather than the `while (ready==0) {}` spin this
+   used to be: six spinning consumers on a 4-vCPU runner preempt the producers they are
+   waiting on, which both slows the scenario and randomizes how much of the 6 x 3000
+   block set is resident at once. Blocking on a condition variable leaves the vCPUs to
+   the threads doing the allocating. */
+typedef struct xchan_s { void* blocks[3000]; barrier_t handoff; } xchan_t;
 static THREAD_RET x_producer(void* arg) {
   xchan_t* c = (xchan_t*)arg;
   for (size_t i = 0; i < 3000; i++) { c->blocks[i] = mi_malloc(((i%6)+1)*128); assert(c->blocks[i]!=NULL); }
-  c->ready = 1;
+  barrier_wait(&c->handoff);
   return THREAD_OK;
 }
 static THREAD_RET x_consumer(void* arg) {
   xchan_t* c = (xchan_t*)arg;
-  while (c->ready == 0) { /* spin */ }
+  barrier_wait(&c->handoff);
   for (size_t i = 0; i < 3000; i++) { mi_free(c->blocks[i]); }
   return THREAD_OK;
 }
@@ -242,10 +332,14 @@ static void scenario_cross_thread_free(void) {
   for (int r = 0; r < 6; r++) {
     static xchan_t ch[pairs];
     thread_t p[pairs], c[pairs];
-    memset(ch, 0, sizeof(ch));
+    for (int i = 0; i < pairs; i++) {
+      memset(ch[i].blocks, 0, sizeof(ch[i].blocks));
+      barrier_init(&ch[i].handoff, 2);
+    }
     for (int i = 0; i < pairs; i++) { thread_start(&p[i], (thread_fun_t)x_producer, &ch[i]);
                                      thread_start(&c[i], (thread_fun_t)x_consumer, &ch[i]); }
     for (int i = 0; i < pairs; i++) { thread_join(p[i]); thread_join(c[i]); }
+    for (int i = 0; i < pairs; i++) { barrier_destroy(&ch[i].handoff); }
   }
 }
 

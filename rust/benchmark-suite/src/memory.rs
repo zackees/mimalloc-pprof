@@ -268,7 +268,10 @@ pub struct MemoryRawSample {
     pub post_drain_rss_delta_100ms_bytes: i64,
     pub post_drain_rss_delta_1s_bytes: i64,
     pub post_drain_rss_delta_5s_bytes: i64,
-    pub fragmentation_proxy: f64,
+    /// `None` when the proxy is unavailable for this sample; the paired
+    /// `fragmentation_proxy_reason` then names why. Exactly one of the two is set.
+    pub fragmentation_proxy: Option<f64>,
+    pub fragmentation_proxy_reason: Option<String>,
     pub hwm_discrepancy: bool,
     pub hwm_tolerance_bytes: u64,
     pub sampling: SamplingIntervalDistribution,
@@ -398,17 +401,80 @@ pub fn signed_delta(value: u64, baseline: u64) -> Result<i64, String> {
     i64::try_from(delta).map_err(|_| "memory delta exceeds signed 64-bit range".into())
 }
 
-pub fn fragmentation_proxy(delta_bytes: i64, peak_live_requested: u64) -> Result<f64, String> {
-    if delta_bytes <= 0 || peak_live_requested == 0 {
-        return Err(
-            "fragmentation proxy needs positive RSS delta and live-byte denominator".into(),
-        );
+/// Scenarios whose live set is not the quantity under measurement, so the
+/// ratio `peak RSS delta / peak live bytes` carries no fragmentation meaning.
+///
+/// `thread-churn` measures thread creation and destruction against a live set
+/// of about one kilobyte, so the ratio reports thread-stack and arena RSS over
+/// an incidental denominator. It is excluded by design rather than per run.
+pub const FRAGMENTATION_EXCLUDED_SCENARIOS: [&str; 1] = ["thread-churn"];
+
+/// The proxy is not defined for this scenario at all (see
+/// [`FRAGMENTATION_EXCLUDED_SCENARIOS`]).
+pub const FRAGMENTATION_REASON_SCENARIO_NOT_APPLICABLE: &str = "scenario_not_applicable";
+/// Peak RSS never rose above the post-warmup baseline: a real outcome, not an error.
+pub const FRAGMENTATION_REASON_NON_POSITIVE_RSS_DELTA: &str = "non_positive_rss_delta";
+/// The child reported no peak live bytes, so the ratio has no denominator.
+pub const FRAGMENTATION_REASON_ZERO_LIVE_BYTES: &str = "zero_live_bytes";
+/// The division did not produce a finite positive ratio.
+pub const FRAGMENTATION_REASON_NON_FINITE_RATIO: &str = "non_finite_ratio";
+
+/// Whether the fragmentation proxy is a meaningful ratio for a scenario.
+pub fn fragmentation_applies(scenario_id: &str) -> bool {
+    !FRAGMENTATION_EXCLUDED_SCENARIOS.contains(&scenario_id)
+}
+
+/// A fragmentation-proxy observation: either a ratio, or the reason there is none.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FragmentationProxy {
+    pub value: Option<f64>,
+    pub reason: Option<String>,
+}
+
+impl FragmentationProxy {
+    fn measured(value: f64) -> Self {
+        Self {
+            value: Some(value),
+            reason: None,
+        }
+    }
+
+    fn unavailable(reason: &str) -> Self {
+        Self {
+            value: None,
+            reason: Some(reason.to_owned()),
+        }
+    }
+
+    /// Exactly one of the ratio and the reason is always present.
+    pub fn is_well_formed(&self) -> bool {
+        self.value.is_some() != self.reason.is_some()
+    }
+}
+
+/// The fragmentation proxy for one sample.
+///
+/// This never fails: a degenerate input is recorded as an absent value plus the
+/// reason it is absent, so one unusable cell cannot destroy a measurement run.
+pub fn fragmentation_proxy(
+    scenario_id: &str,
+    delta_bytes: i64,
+    peak_live_requested: u64,
+) -> FragmentationProxy {
+    if !fragmentation_applies(scenario_id) {
+        return FragmentationProxy::unavailable(FRAGMENTATION_REASON_SCENARIO_NOT_APPLICABLE);
+    }
+    if delta_bytes <= 0 {
+        return FragmentationProxy::unavailable(FRAGMENTATION_REASON_NON_POSITIVE_RSS_DELTA);
+    }
+    if peak_live_requested == 0 {
+        return FragmentationProxy::unavailable(FRAGMENTATION_REASON_ZERO_LIVE_BYTES);
     }
     let ratio = delta_bytes as f64 / peak_live_requested as f64;
     if !ratio.is_finite() || ratio <= 0.0 {
-        return Err("fragmentation proxy is non-finite or non-positive".into());
+        return FragmentationProxy::unavailable(FRAGMENTATION_REASON_NON_FINITE_RATIO);
     }
-    Ok(ratio)
+    FragmentationProxy::measured(ratio)
 }
 
 pub fn validate_sampler_ownership(parent_pid: u32, sampled_pid: u32) -> Result<(), String> {
@@ -814,10 +880,11 @@ pub fn run_memory_child_sample(
             .ok_or_else(|| "memory workload timeline is empty".to_string())?;
         let sampled_peak_rss_delta_bytes =
             signed_delta(sampled_peak_rss_bytes, baseline.rss_bytes)?;
-        let fragmentation_proxy = fragmentation_proxy(
+        let fragmentation = fragmentation_proxy(
+            &request.scenario_id,
             sampled_peak_rss_delta_bytes,
             response.sample.peak_live_requested_bytes,
-        )?;
+        );
         let hwm_delta = signed_delta(kernel_peak_hwm_bytes, baseline.hwm_bytes)?;
         let magnitude = sampled_peak_rss_delta_bytes.max(hwm_delta).max(0) as u64;
         let hwm_tolerance_bytes = (8 * 1024 * 1024).max(magnitude / 5);
@@ -865,7 +932,8 @@ pub fn run_memory_child_sample(
                 post_drain_rss_5s_bytes,
                 baseline.rss_bytes,
             )?,
-            fragmentation_proxy,
+            fragmentation_proxy: fragmentation.value,
+            fragmentation_proxy_reason: fragmentation.reason,
             hwm_discrepancy,
             hwm_tolerance_bytes,
             sampling,
@@ -980,15 +1048,38 @@ pub fn memory_comparison_key(input: &MemoryCompatibility) -> Result<String, Stri
     Ok(sha256_bytes(&bytes))
 }
 
-fn sample_value(sample: &MemoryRawSample, metric: &str) -> f64 {
+/// The metric value for one sample, or `None` when the sample has no
+/// fragmentation ratio. Every other metric is always present.
+fn sample_value(sample: &MemoryRawSample, metric: &str) -> Option<f64> {
     match metric {
-        "sampled-peak-rss-bytes" => sample.sampled_peak_rss_bytes as f64,
-        "post-drain-rss-100ms-bytes" => sample.post_drain_rss_100ms_bytes as f64,
-        "post-drain-rss-1s-bytes" => sample.post_drain_rss_1s_bytes as f64,
-        "post-drain-rss-5s-bytes" => sample.post_drain_rss_5s_bytes as f64,
+        "sampled-peak-rss-bytes" => Some(sample.sampled_peak_rss_bytes as f64),
+        "post-drain-rss-100ms-bytes" => Some(sample.post_drain_rss_100ms_bytes as f64),
+        "post-drain-rss-1s-bytes" => Some(sample.post_drain_rss_1s_bytes as f64),
+        "post-drain-rss-5s-bytes" => Some(sample.post_drain_rss_5s_bytes as f64),
         "fragmentation-proxy" => sample.fragmentation_proxy,
         _ => unreachable!("metric list is fixed"),
     }
+}
+
+/// Blocks of one cell where every allocator recorded a fragmentation ratio.
+///
+/// A block where any allocator's proxy is unavailable is dropped from the
+/// fragmentation metric for all allocators, so that metric keeps the same
+/// complete-block pairing unit as the byte metrics.
+fn complete_fragmentation_blocks<'a>(
+    samples: impl Iterator<Item = &'a MemoryRawSample>,
+) -> BTreeSet<u32> {
+    let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for sample in samples {
+        if sample.fragmentation_proxy.is_some() {
+            *counts.entry(sample.block_id).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_block, count)| *count == ALLOCATOR_IDS.len())
+        .map(|(block, _count)| block)
+        .collect()
 }
 
 pub fn validate_memory_raw_run(raw: &MemoryRawRun) -> Result<(), String> {
@@ -1146,6 +1237,11 @@ pub fn validate_memory_raw_run(raw: &MemoryRawRun) -> Result<(), String> {
             .map(|point| point.rss_bytes)
             .max()
             .ok_or_else(|| "memory sample timeline is empty".to_string())?;
+        let expected_fragmentation = fragmentation_proxy(
+            &sample.scenario_id,
+            sample.sampled_peak_rss_delta_bytes,
+            sample.peak_live_requested_bytes,
+        );
         if maximum != sample.sampled_peak_rss_bytes
             || signed_delta(sample.sampled_peak_rss_bytes, sample.baseline_rss_bytes)?
                 != sample.sampled_peak_rss_delta_bytes
@@ -1155,10 +1251,9 @@ pub fn validate_memory_raw_run(raw: &MemoryRawRun) -> Result<(), String> {
                 != sample.post_drain_rss_delta_1s_bytes
             || signed_delta(sample.post_drain_rss_5s_bytes, sample.baseline_rss_bytes)?
                 != sample.post_drain_rss_delta_5s_bytes
-            || fragmentation_proxy(
-                sample.sampled_peak_rss_delta_bytes,
-                sample.peak_live_requested_bytes,
-            )? != sample.fragmentation_proxy
+            || expected_fragmentation.value != sample.fragmentation_proxy
+            || expected_fragmentation.reason != sample.fragmentation_proxy_reason
+            || !expected_fragmentation.is_well_formed()
             || sample
                 .environment
                 .compatibility(sample.sampling.target_interval_ns)
@@ -1360,22 +1455,50 @@ pub fn build_memory_report(raw: &MemoryRawRun) -> Result<MemoryMetricReport, Str
         let cell_samples = raw.samples.iter().filter(|sample| {
             sample.scenario_id == card.as_str() && sample.thread_point == point.name()
         });
+        // The fragmentation metric is summarized only over blocks where every
+        // allocator produced a ratio; a cell whose scenario excludes the proxy
+        // contributes no fragmentation summaries at all.
+        let fragmentation_blocks = complete_fragmentation_blocks(cell_samples.clone());
+        if fragmentation_applies(card.as_str())
+            && fragmentation_blocks.len() < MEMORY_MIN_BLOCKS as usize
+        {
+            return Err(format!(
+                "memory cell {}/{} has {} of the required {} blocks with a usable fragmentation proxy",
+                card.as_str(),
+                point.name(),
+                fragmentation_blocks.len(),
+                MEMORY_MIN_BLOCKS,
+            ));
+        }
         for (metric, _unit) in METRICS {
-            let observations = cell_samples
+            let is_fragmentation = metric == "fragmentation-proxy";
+            if is_fragmentation && !fragmentation_applies(card.as_str()) {
+                continue;
+            }
+            let metric_samples = cell_samples.clone().filter(|sample| {
+                !is_fragmentation || fragmentation_blocks.contains(&sample.block_id)
+            });
+            let observations = metric_samples
                 .clone()
-                .map(|sample| MetricObservation {
-                    block_id: sample.block_id,
-                    allocator_id: sample.allocator_id.clone(),
-                    value: sample_value(sample, metric),
+                .map(|sample| {
+                    Ok(MetricObservation {
+                        block_id: sample.block_id,
+                        allocator_id: sample.allocator_id.clone(),
+                        value: sample_value(sample, metric)
+                            .ok_or_else(|| format!("memory sample has no {metric} value"))?,
+                    })
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, String>>()?;
             let cell_id = format!("{}/{}/{metric}", card.as_str(), point.name());
             for allocator in ALLOCATOR_IDS {
-                let values = cell_samples
+                let values = metric_samples
                     .clone()
                     .filter(|sample| sample.allocator_id == allocator)
-                    .map(|sample| sample_value(sample, metric))
-                    .collect::<Vec<_>>();
+                    .map(|sample| {
+                        sample_value(sample, metric)
+                            .ok_or_else(|| format!("memory sample has no {metric} value"))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
                 absolute_summaries.push(AbsoluteCellSummary {
                     scenario_id: card.as_str().into(),
                     thread_point: point.name().into(),
@@ -1424,7 +1547,7 @@ pub fn build_memory_report(raw: &MemoryRawRun) -> Result<MemoryMetricReport, Str
             baseline_definition: "external RSS/HWM after child warmup and baseline-ready, before begin".into(),
             sampled_peak_definition: "maximum external smaps_rollup RSS timestamped inside workload-active..workload-drained".into(),
             post_drain_definition: "external smaps_rollup RSS at >=100ms, >=1s, and >=5s after workload-drained".into(),
-            fragmentation_formula: "(sampled_peak_rss_bytes - baseline_rss_bytes) / peak_live_requested_bytes; both operands must be positive".into(),
+            fragmentation_formula: "(sampled_peak_rss_bytes - baseline_rss_bytes) / peak_live_requested_bytes; null with a reason when either operand is unusable or the scenario excludes the proxy".into(),
             hwm_discrepancy_tolerance: "flag when abs(sampled RSS delta - VmHWM delta) > max(8 MiB, 20% of the larger positive delta)".into(),
             page_touch_contract: "every allocation touches deterministic boundary bytes and at least one byte per OS page".into(),
             purge_policy: "natural allocator behavior only; no allocator-specific purge call".into(),

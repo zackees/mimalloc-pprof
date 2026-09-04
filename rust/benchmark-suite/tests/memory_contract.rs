@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 use benchmark_suite::memory::{
-    attach_memory_report, build_memory_report, fragmentation_proxy, memory_comparison_key,
-    memory_scenario_cells, parse_smaps_rollup, parse_status_hwm, read_control_record,
-    read_proc_snapshot, validate_memory_raw_run, validate_sampler_ownership, validate_timeline,
-    write_control_record, ControlKind, ControlRecord, LiveRequestedOracle, MemoryCompatibility,
-    MemoryEnvironment, MemoryRawRun, MemoryRawSample, MemoryTimelinePoint, MEMORY_SAMPLE_TARGET_NS,
-    MEMORY_SCHEMA_VERSION,
+    attach_memory_report, build_memory_report, fragmentation_applies, fragmentation_proxy,
+    memory_comparison_key, memory_scenario_cells, parse_smaps_rollup, parse_status_hwm,
+    read_control_record, read_proc_snapshot, validate_memory_raw_run, validate_sampler_ownership,
+    validate_timeline, write_control_record, ControlKind, ControlRecord, LiveRequestedOracle,
+    MemoryCompatibility, MemoryEnvironment, MemoryRawRun, MemoryRawSample, MemoryTimelinePoint,
+    MEMORY_SAMPLE_TARGET_NS, MEMORY_SCHEMA_VERSION,
 };
 use benchmark_suite::model::LatestReport;
 use benchmark_suite::report::build_latest_report;
@@ -43,11 +43,38 @@ fn missing_or_malformed_proc_fields_fail_closed() {
 }
 
 #[test]
-fn fragmentation_rejects_nonpositive_inputs_without_clamping() {
-    assert_eq!(fragmentation_proxy(4096, 2048).unwrap(), 2.0);
-    assert!(fragmentation_proxy(0, 2048).is_err());
-    assert!(fragmentation_proxy(-1, 2048).is_err());
-    assert!(fragmentation_proxy(4096, 0).is_err());
+fn fragmentation_records_a_ratio_only_from_positive_operands() {
+    let measured = fragmentation_proxy("large-objects", 4096, 2048);
+    assert_eq!(measured.value, Some(2.0));
+    assert_eq!(measured.reason, None);
+    assert!(measured.is_well_formed());
+}
+
+#[test]
+fn degenerate_fragmentation_operands_record_a_reason_instead_of_failing() {
+    for (delta, live, reason) in [
+        (0_i64, 2048_u64, "non_positive_rss_delta"),
+        (-1, 2048, "non_positive_rss_delta"),
+        (4096, 0, "zero_live_bytes"),
+    ] {
+        let unavailable = fragmentation_proxy("large-objects", delta, live);
+        assert_eq!(unavailable.value, None, "{delta}/{live}");
+        assert_eq!(
+            unavailable.reason.as_deref(),
+            Some(reason),
+            "{delta}/{live}"
+        );
+        assert!(unavailable.is_well_formed());
+    }
+}
+
+#[test]
+fn thread_churn_never_carries_a_fragmentation_ratio() {
+    assert!(!fragmentation_applies("thread-churn"));
+    assert!(fragmentation_applies("large-objects"));
+    let excluded = fragmentation_proxy("thread-churn", 4096, 2048);
+    assert_eq!(excluded.value, None);
+    assert_eq!(excluded.reason.as_deref(), Some("scenario_not_applicable"));
 }
 
 #[test]
@@ -264,6 +291,11 @@ fn memory_fixture() -> MemoryRawRun {
             let delta = delta_mib * 1024 * 1024;
             let sampled_peak = baseline + delta;
             let post = baseline + delta / 2;
+            let fragmentation = fragmentation_proxy(
+                &child_sample.scenario_id,
+                delta as i64,
+                child_sample.peak_live_requested_bytes,
+            );
             MemoryRawSample {
                 metric_schema_version: MEMORY_SCHEMA_VERSION.into(),
                 block_id: child_sample.block_id,
@@ -295,7 +327,8 @@ fn memory_fixture() -> MemoryRawRun {
                 post_drain_rss_delta_100ms_bytes: (delta / 2) as i64,
                 post_drain_rss_delta_1s_bytes: (delta / 2) as i64,
                 post_drain_rss_delta_5s_bytes: (delta / 2) as i64,
-                fragmentation_proxy: delta as f64 / child_sample.peak_live_requested_bytes as f64,
+                fragmentation_proxy: fragmentation.value,
+                fragmentation_proxy_reason: fragmentation.reason,
                 hwm_discrepancy: false,
                 hwm_tolerance_bytes: (8 * 1024 * 1024).max(delta / 5),
                 sampling: benchmark_suite::memory::SamplingIntervalDistribution {
@@ -351,8 +384,19 @@ fn complete_memory_fixture_uses_paired_lower_is_better_statistics() {
     let report = build_memory_report(&raw).unwrap();
     assert_eq!(report.status, "complete");
     assert_eq!(report.raw_samples.len(), 7 * 15 * 5);
-    assert_eq!(report.absolute_summaries.len(), 7 * 5 * 5);
-    assert_eq!(report.paired_summaries.len(), 7 * 5 * 4);
+    // Six of the seven cells carry all five metrics; thread-churn excludes the
+    // fragmentation proxy by design, so it carries four.
+    assert_eq!(report.absolute_summaries.len(), (6 * 5 + 4) * 5);
+    assert_eq!(report.paired_summaries.len(), (6 * 5 + 4) * 4);
+    assert!(!report.absolute_summaries.iter().any(|summary| {
+        summary.scenario_id == "thread-churn" && summary.metric_id == "fragmentation-proxy"
+    }));
+    assert!(report
+        .raw_samples
+        .iter()
+        .filter(|sample| sample.scenario_id == "thread-churn")
+        .all(|sample| sample.fragmentation_proxy.is_none()
+            && sample.fragmentation_proxy_reason.as_deref() == Some("scenario_not_applicable")));
     let planted = report
         .paired_summaries
         .iter()
@@ -362,6 +406,75 @@ fn complete_memory_fixture_uses_paired_lower_is_better_statistics() {
         })
         .unwrap();
     assert!(planted.summary.effect > 1.0);
+}
+
+/// Rewrite one sample as a block whose peak RSS never rose above the
+/// post-warmup baseline, the outcome that used to abort the whole run.
+fn plant_non_positive_delta(sample: &mut MemoryRawSample) {
+    sample.sampled_peak_rss_bytes = sample.baseline_rss_bytes;
+    sample.kernel_peak_hwm_bytes = sample.baseline_hwm_bytes;
+    sample.sampled_peak_rss_delta_bytes = 0;
+    for point in &mut sample.timeline {
+        point.rss_bytes = sample.baseline_rss_bytes;
+    }
+    sample.hwm_tolerance_bytes = 8 * 1024 * 1024;
+    sample.hwm_discrepancy = false;
+    let fragmentation = fragmentation_proxy(
+        &sample.scenario_id,
+        sample.sampled_peak_rss_delta_bytes,
+        sample.peak_live_requested_bytes,
+    );
+    sample.fragmentation_proxy = fragmentation.value;
+    sample.fragmentation_proxy_reason = fragmentation.reason;
+}
+
+#[test]
+fn a_non_positive_delta_cell_stays_valid_and_keeps_every_other_metric() {
+    let mut raw = memory_fixture();
+    let index = raw
+        .samples
+        .iter()
+        .position(|sample| sample.scenario_id == "large-objects")
+        .unwrap();
+    plant_non_positive_delta(&mut raw.samples[index]);
+
+    // The sample stays a valid measurement: only the ratio is unavailable.
+    validate_memory_raw_run(&raw).unwrap();
+    let planted = &raw.samples[index];
+    assert_eq!(planted.fragmentation_proxy, None);
+    assert_eq!(
+        planted.fragmentation_proxy_reason.as_deref(),
+        Some("non_positive_rss_delta")
+    );
+    assert!(planted.sampled_peak_rss_bytes > 0 && planted.post_drain_rss_5s_bytes > 0);
+
+    // The fixture carries exactly the minimum block count, so dropping the one
+    // incomplete block leaves the fragmentation metric short. That is reported
+    // by name against the assembled run, not by aborting the measurement.
+    let error = build_memory_report(&raw).unwrap_err();
+    assert!(error.contains("usable fragmentation proxy"), "{error}");
+}
+
+#[test]
+fn a_fabricated_or_unexplained_fragmentation_value_is_rejected() {
+    let mut fabricated = memory_fixture();
+    let churn = fabricated
+        .samples
+        .iter()
+        .position(|sample| sample.scenario_id == "thread-churn")
+        .unwrap();
+    fabricated.samples[churn].fragmentation_proxy = Some(21.0);
+    fabricated.samples[churn].fragmentation_proxy_reason = None;
+    assert!(validate_memory_raw_run(&fabricated).is_err());
+
+    let mut unexplained = memory_fixture();
+    unexplained.samples[0].fragmentation_proxy = None;
+    unexplained.samples[0].fragmentation_proxy_reason = None;
+    assert!(validate_memory_raw_run(&unexplained).is_err());
+
+    let mut wrong_reason = memory_fixture();
+    wrong_reason.samples[churn].fragmentation_proxy_reason = Some("zero_live_bytes".into());
+    assert!(validate_memory_raw_run(&wrong_reason).is_err());
 }
 
 #[test]

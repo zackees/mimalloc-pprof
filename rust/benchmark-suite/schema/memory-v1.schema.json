@@ -62,10 +62,10 @@
     },
     "sample": {
       "type": "object", "additionalProperties": false,
-      "required": ["metric_schema_version", "block_id", "ordinal", "workload_seed", "allocator_id", "allocator_source_sha", "child_binary_sha256", "scenario_id", "thread_point", "thread_count", "baseline_ready_ns", "workload_active_ns", "workload_drained_ns", "post_drain_sample_100ms_ns", "post_drain_sample_1s_ns", "post_drain_sample_5s_ns", "sampler_pid", "sampled_pid", "baseline_rss_bytes", "baseline_hwm_bytes", "sampled_peak_rss_bytes", "kernel_peak_hwm_bytes", "peak_live_requested_bytes", "post_drain_rss_100ms_bytes", "post_drain_rss_1s_bytes", "post_drain_rss_5s_bytes", "sampled_peak_rss_delta_bytes", "post_drain_rss_delta_100ms_bytes", "post_drain_rss_delta_1s_bytes", "post_drain_rss_delta_5s_bytes", "fragmentation_proxy", "hwm_discrepancy", "hwm_tolerance_bytes", "sampling", "timeline", "environment", "child_sample"],
+      "required": ["metric_schema_version", "block_id", "ordinal", "workload_seed", "allocator_id", "allocator_source_sha", "child_binary_sha256", "scenario_id", "thread_point", "thread_count", "baseline_ready_ns", "workload_active_ns", "workload_drained_ns", "post_drain_sample_100ms_ns", "post_drain_sample_1s_ns", "post_drain_sample_5s_ns", "sampler_pid", "sampled_pid", "baseline_rss_bytes", "baseline_hwm_bytes", "sampled_peak_rss_bytes", "kernel_peak_hwm_bytes", "peak_live_requested_bytes", "post_drain_rss_100ms_bytes", "post_drain_rss_1s_bytes", "post_drain_rss_5s_bytes", "sampled_peak_rss_delta_bytes", "post_drain_rss_delta_100ms_bytes", "post_drain_rss_delta_1s_bytes", "post_drain_rss_delta_5s_bytes", "fragmentation_proxy", "fragmentation_proxy_reason", "hwm_discrepancy", "hwm_tolerance_bytes", "sampling", "timeline", "environment", "child_sample"],
       "properties": {
         "metric_schema_version": { "const": "linux-process-memory-v1" },
-        "block_id": { "type": "integer", "minimum": 0 }, "ordinal": { "type": "integer", "minimum": 0, "maximum": 3 }, "workload_seed": { "type": "integer", "minimum": 0 },
+        "block_id": { "type": "integer", "minimum": 0 }, "ordinal": { "type": "integer", "minimum": 0, "maximum": 4 }, "workload_seed": { "type": "integer", "minimum": 0 },
         "allocator_id": { "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "bun-mimalloc", "mimalloc-pprof"] },
         "allocator_source_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" }, "child_binary_sha256": { "$ref": "#/$defs/sha256" },
         "scenario_id": { "enum": ["large-objects", "sawtooth-retain-drain", "small-log-mixed", "cross-thread-producer-consumer", "thread-churn"] },
@@ -76,7 +76,9 @@
         "baseline_rss_bytes": { "type": "integer", "minimum": 1 }, "baseline_hwm_bytes": { "type": "integer", "minimum": 1 }, "sampled_peak_rss_bytes": { "type": "integer", "minimum": 1 }, "kernel_peak_hwm_bytes": { "type": "integer", "minimum": 1 }, "peak_live_requested_bytes": { "type": "integer", "minimum": 1 },
         "post_drain_rss_100ms_bytes": { "type": "integer", "minimum": 1 }, "post_drain_rss_1s_bytes": { "type": "integer", "minimum": 1 }, "post_drain_rss_5s_bytes": { "type": "integer", "minimum": 1 },
         "sampled_peak_rss_delta_bytes": { "type": "integer" }, "post_drain_rss_delta_100ms_bytes": { "type": "integer" }, "post_drain_rss_delta_1s_bytes": { "type": "integer" }, "post_drain_rss_delta_5s_bytes": { "type": "integer" },
-        "fragmentation_proxy": { "type": "number", "exclusiveMinimum": 0 }, "hwm_discrepancy": { "type": "boolean" }, "hwm_tolerance_bytes": { "type": "integer", "minimum": 1 },
+        "fragmentation_proxy": { "type": ["number", "null"], "exclusiveMinimum": 0, "description": "null when the proxy is unavailable for this sample; fragmentation_proxy_reason then names why. Exactly one of the two is non-null." },
+        "fragmentation_proxy_reason": { "enum": [null, "scenario_not_applicable", "non_positive_rss_delta", "zero_live_bytes", "non_finite_ratio"], "description": "scenario_not_applicable is by design for thread-churn, whose live set is not the measured quantity; the others record a degenerate operand on a scenario where the proxy does apply." },
+        "hwm_discrepancy": { "type": "boolean" }, "hwm_tolerance_bytes": { "type": "integer", "minimum": 1 },
         "sampling": { "$ref": "#/$defs/sampling" }, "timeline": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/timeline" } }, "environment": { "$ref": "#/$defs/environment" },
         "child_sample": { "$ref": "raw-run-v1.schema.json#/$defs/sample" }
       }
@@ -97,7 +99,7 @@
         "baseline_definition": { "const": "external RSS/HWM after child warmup and baseline-ready, before begin" },
         "sampled_peak_definition": { "const": "maximum external smaps_rollup RSS timestamped inside workload-active..workload-drained" },
         "post_drain_definition": { "const": "external smaps_rollup RSS at >=100ms, >=1s, and >=5s after workload-drained" },
-        "fragmentation_formula": { "const": "(sampled_peak_rss_bytes - baseline_rss_bytes) / peak_live_requested_bytes; both operands must be positive" },
+        "fragmentation_formula": { "const": "(sampled_peak_rss_bytes - baseline_rss_bytes) / peak_live_requested_bytes; null with a reason when either operand is unusable or the scenario excludes the proxy" },
         "hwm_discrepancy_tolerance": { "const": "flag when abs(sampled RSS delta - VmHWM delta) > max(8 MiB, 20% of the larger positive delta)" },
         "page_touch_contract": { "const": "every allocation touches deterministic boundary bytes and at least one byte per OS page" },
         "purge_policy": { "const": "natural allocator behavior only; no allocator-specific purge call" }
@@ -109,7 +111,7 @@
       "properties": {
         "metric_schema_version": { "const": "linux-process-memory-v1" }, "status": { "const": "complete" }, "invalid_reason": { "type": "null" }, "metric_comparison_key": { "$ref": "#/$defs/sha256" },
         "run": { "$ref": "raw-run-v1.schema.json#/$defs/run" }, "runner": { "$ref": "raw-run-v1.schema.json#/$defs/runner" }, "sampling_target_interval_ns": { "const": 5000000 }, "purge_policy": { "const": "natural-only" }, "units": { "$ref": "#/$defs/units" }, "direction": { "const": "lower-is-better" }, "informational": { "const": true }, "methodology": { "$ref": "#/$defs/methodology" },
-        "absolute_summaries": { "type": "array", "minItems": 175, "items": { "$ref": "latest-v1.schema.json#/$defs/absoluteCell" } }, "paired_summaries": { "type": "array", "minItems": 140, "items": { "$ref": "latest-v1.schema.json#/$defs/pairedCell" } }, "raw_samples": { "type": "array", "minItems": 525, "items": { "$ref": "#/$defs/sample" } }
+        "absolute_summaries": { "type": "array", "minItems": 170, "items": { "$ref": "latest-v1.schema.json#/$defs/absoluteCell" } }, "paired_summaries": { "type": "array", "minItems": 136, "items": { "$ref": "latest-v1.schema.json#/$defs/pairedCell" } }, "raw_samples": { "type": "array", "minItems": 525, "items": { "$ref": "#/$defs/sample" } }
       }
     },
     "history": {
@@ -117,7 +119,7 @@
       "required": ["metric_schema_version", "status", "metric_comparison_key", "run", "runner_fingerprint_sha256", "sampling_target_interval_ns", "purge_policy", "units", "direction", "informational", "methodology", "absolute_summaries", "paired_summaries"],
       "properties": {
         "metric_schema_version": { "const": "linux-process-memory-v1" }, "status": { "const": "complete" }, "metric_comparison_key": { "$ref": "#/$defs/sha256" }, "run": { "$ref": "raw-run-v1.schema.json#/$defs/run" }, "runner_fingerprint_sha256": { "$ref": "#/$defs/sha256" }, "sampling_target_interval_ns": { "const": 5000000 }, "purge_policy": { "const": "natural-only" }, "units": { "$ref": "#/$defs/units" }, "direction": { "const": "lower-is-better" }, "informational": { "const": true }, "methodology": { "$ref": "#/$defs/methodology" },
-        "absolute_summaries": { "type": "array", "minItems": 175, "items": { "$ref": "latest-v1.schema.json#/$defs/absoluteCell" } }, "paired_summaries": { "type": "array", "minItems": 140, "items": { "$ref": "latest-v1.schema.json#/$defs/pairedCell" } }
+        "absolute_summaries": { "type": "array", "minItems": 170, "items": { "$ref": "latest-v1.schema.json#/$defs/absoluteCell" } }, "paired_summaries": { "type": "array", "minItems": 136, "items": { "$ref": "latest-v1.schema.json#/$defs/pairedCell" } }
       }
     }
   }

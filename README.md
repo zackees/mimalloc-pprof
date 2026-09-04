@@ -2,11 +2,14 @@
 
 > ## mimalloc with native pprof-compatible heap profiling — on Windows, Linux, and macOS alike — and all of Bun's memory-returning features (aka "hole punch") imported and re-verified.
 
-> **The one mimalloc heap profiler that runs natively on Windows.** Upstream mimalloc
-> has no profiler at all, and the only other known implementation
+> **The one mimalloc heap profiler that produces usable Windows profiles.** Upstream
+> mimalloc has no profiler at all, and the only other known implementation
 > ([Bun's](https://github.com/oven-sh/mimalloc), surveyed in
-> [`MIMALLOC_FORKS.md`](MIMALLOC_FORKS.md)) is POSIX-only — its stack capture is guarded
-> behind glibc/Apple `<execinfo.h>`.
+> [`MIMALLOC_FORKS.md`](MIMALLOC_FORKS.md)) captures Win32 stacks but emits **no module
+> mappings** there — its `mi_prof_collect_mappings` has a Linux/FreeBSD branch, an Apple
+> branch, and an empty `#else` — so a Windows profile carries raw addresses with no
+> module table and nothing symbolizes. This fork enumerates the loaded modules
+> explicitly (`src/profile-maps.c`).
 
 A fork of [microsoft/mimalloc](https://github.com/microsoft/mimalloc) that adds
 **pprof-compatible sampled heap profiling**, with native Windows as a first-class

@@ -104,6 +104,7 @@ jobs:
         id: setup_soldr
         continue-on-error: true
         with:
+          version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
@@ -113,6 +114,7 @@ jobs:
         if: steps.setup_soldr.outcome == 'failure'
         uses: zackees/setup-soldr@v0
         with:
+          version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
@@ -182,6 +184,7 @@ jobs:
       - uses: astral-sh/setup-uv@v3
       - uses: zackees/setup-soldr@v0
         with:
+          version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           # This job drives CMake directly; there is no `soldr cargo` for zccache to wrap.
           cache: false
           toolchain-file: rust/rust-toolchain.toml
@@ -400,6 +403,7 @@ jobs:
         id: setup_soldr
         continue-on-error: true
         with:
+          version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
@@ -409,6 +413,7 @@ jobs:
         if: steps.setup_soldr.outcome == 'failure'
         uses: zackees/setup-soldr@v0
         with:
+          version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target

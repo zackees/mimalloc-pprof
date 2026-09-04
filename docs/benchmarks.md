@@ -213,3 +213,45 @@ panel), a fragmentation-proxy panel with its own 1.0 reference line, an
 RSS-over-time timeline with the workload-drained marker and the 100 ms / 1 s /
 5 s return-to-OS points annotated, and a speed–memory Pareto scatter (upper-left
 is better).
+
+### The fragmentation proxy is optional per cell
+
+The fragmentation proxy is
+`(sampled_peak_rss_bytes - baseline_rss_bytes) / peak_live_requested_bytes`: peak
+RSS above the post-warmup baseline, per byte the workload asked to keep live. It
+only means anything where the live set is the quantity being measured, so it is
+reported per cell rather than for every cell
+([#222](https://github.com/zackees/mimalloc-pprof/issues/222)).
+
+`thread-churn` is **not applicable by design**. It measures thread creation and
+destruction against a live set of about one kilobyte, so the ratio would report
+thread-stack and arena RSS divided by an incidental kilobyte — observed values
+ran from 21x to 3195x, which is noise, not fragmentation. The scenario is named
+in `FRAGMENTATION_EXCLUDED_SCENARIOS` (Rust `memory.rs` and `ci/benchmark_report.py`
+agree), it carries no fragmentation summaries at all, and the panel and table
+both read `n/a` for it.
+
+Where the proxy does apply, a sample records `fragmentation_proxy: null` plus a
+`fragmentation_proxy_reason` instead of a ratio when an operand is unusable:
+
+| reason | meaning |
+|---|---|
+| `scenario_not_applicable` | the scenario excludes the proxy (above) |
+| `non_positive_rss_delta` | peak RSS never rose above the baseline — a real outcome, not an error |
+| `zero_live_bytes` | the child reported no peak live bytes, so the ratio has no denominator |
+| `non_finite_ratio` | the division did not produce a finite positive ratio |
+
+Exactly one of the value and the reason is ever set; a null without a reason, or
+a ratio on an excluded scenario, is rejected by both validators. Memory sections
+already published under the older contract — a ratio on every cell, no reason
+field, the older `fragmentation_formula` string — keep validating and rendering
+as their own lineage, the way older allocator sets do; only a producer is held
+to the current shape. A cell keeps
+every one of its other metrics (peak RSS, the three post-drain points, retained
+bytes) when its proxy is unavailable, and the measurement run continues — this
+used to abort the entire run, throwing away ~50 minutes of already-recorded
+samples. Blocks where any allocator's proxy is unavailable are dropped from the
+fragmentation metric for every allocator, so it keeps the same complete-block
+pairing unit as the byte metrics. If that leaves an applicable cell with fewer
+than the required 15 blocks, `benchmark-memory-validate` reports it by name
+against the assembled run; the raw samples are already on disk either way.

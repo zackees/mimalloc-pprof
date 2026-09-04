@@ -663,11 +663,10 @@ third is what survives them:
   **74 %**. Its opt-in `background_thread:true` is measured too, and it lands on
   jemalloc's own boundary — the default `dirty_decay_ms` is 10 s, exactly this
   window — so the committed run returns **0 %** inside 10 s and **74 %** over 30 s.
-  (That row is genuinely borderline: an earlier session of the same benchmark had it
-  returning in two runs of three at 10 s. The 30 s row is what settles it, and both
-  are in the diagnostics.) The claim is therefore a narrow one, and worth stating as
-  such: jemalloc's *default* configuration keeps sitting on this memory for as long as
-  the process stays idle — not that jemalloc is unable to give it back.
+  Both are in the diagnostics; the 30 s row is the one that settles what that thread
+  can do. The claim is therefore a narrow one, and worth stating as such: jemalloc's
+  *default* configuration keeps sitting on this memory for as long as the process
+  stays idle — not that jemalloc is unable to give it back.
 - **Upstream mimalloc is what hole purging is actually worth.** It has no
   `mi_on_thread_idle` at all, so its default line is flat; given the nearest thing it
   does have — `mi_collect(false)` on the same tick — it returns **18 %**. Both

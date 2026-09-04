@@ -226,7 +226,7 @@ jobs:
           # find_link_library() hands the host's ELF librt.so to a Mach-O link.
           case "${{ matrix.triple }}" in
             *-apple-darwin) want='pthread' ;;
-            *)              want='psapi;shell32;user32;advapi32;bcrypt' ;;
+            *)              want='psapi;shell32;user32;advapi32;bcrypt;synchronization' ;;  # synchronization: WaitOnAddress for the scavenger park protocol (#299)
           esac
           if ! grep -qE "^-- Link libraries *: *${want}\$" configure.log; then
             echo "::error::the ${{ matrix.triple }} link resolved unexpected libraries; expected exactly '${want}'"

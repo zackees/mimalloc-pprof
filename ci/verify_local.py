@@ -690,6 +690,10 @@ def run_lint(ctx: RunCtx) -> bool:
         ["uv", "run", "ci/bench_hole_purging.py", "--check", "--table"],
         ["uv", "run", "ci/bench_hole_purging_allocators.py", "--check"],
         ["uv", "run", "ci/bench_hole_purging_allocators.py", "--check", "--table"],
+        # Same idea for the README's allocator feature table and its two SVGs: they
+        # render from docs/allocator-features.json, and `--check` fails if any of the
+        # three has drifted from it.
+        ["uv", "run", "ci/render_feature_table.py", "--check"],
     ):
         rc, _ = run_logged(cmd, cwd=ROOT, log=ctx.log)
         ok = ok and rc == 0

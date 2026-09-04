@@ -158,8 +158,8 @@ re-verified under this tree's stress suite. → [Bun features](#bun-features)
 
 ### Feature comparison
 
-Everything the four allocators in the [benchmark charts](#performance) do, side by
-side: this fork, upstream mimalloc v3, [Bun's fork](https://github.com/oven-sh/mimalloc),
+Everything the four allocators in the
+[memory-return chart](#memory-returned-after-idle) do, side by side: this fork, upstream mimalloc v3, [Bun's fork](https://github.com/oven-sh/mimalloc),
 and [jemalloc](https://jemalloc.net/). Every cell is sourced — a `path:line` in this
 tree, a path in the pinned upstream commit, or an official doc anchor — in
 [`docs/allocator-features.json`](docs/allocator-features.json), which is what both the
@@ -220,7 +220,7 @@ image and the table below are rendered from.
 | NUMA-aware reservation | ✅ use_numa_nodes | ✅ use_numa_nodes | ✅ use_numa_nodes | ❌ no NUMA option |
 | Bring your own memory region | ✅ mi_manage_os_memory | ✅ mi_manage_os_memory | ✅ mi_manage_os_memory | ✅ extent hooks |
 | Lazy abandoned-page bitmaps | ✅ ~110 KB saved per heap | ❌ allocated eagerly | ✅ ~110 KB saved per heap | ❌ no such structure |
-| Fixed TLS slots on macOS | ✅ slots 96/97 | ❌ pthread_getspecific | ✅ slots 96/97 | ❌ pthread_getspecific |
+| Fixed TLS slots on macOS | ✅ slots 96/97 | ⚠️ slots 108/109 — collide | ✅ slots 96/97 | ❌ pthread_getspecific |
 | Zero-tracking (zalloc skips its memset) | ❌ lost in a rebase — [#337](https://github.com/zackees/mimalloc-pprof/issues/337) | ❌ | ✅ _mi_os_purge_zero | ❌ opt.zero always fills |
 | Opt out of the exit-time destructor | ✅ MI_NO_PROCESS_DETACH | ❌ | ✅ MI_NO_PROCESS_DETACH | ❌ |
 

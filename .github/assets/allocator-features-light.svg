@@ -533,9 +533,10 @@
 <circle cx="493.3" cy="1231.0" r="7.0" fill="#1a7f47"/>
 <path d="M 489.9 1231.2 l 2.2 2.4 l 4.2 -5.0" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="504.3" y="1235.0" font-size="11" fill="#59636e">slots 96/97</text>
-<circle cx="681.7" cy="1231.0" r="7.0" fill="#cf222e"/>
-<path d="M 678.7 1228.0 l 6.0 6.0 M 684.7 1228.0 l -6.0 6.0" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linecap="round"/>
-<text x="692.7" y="1235.0" font-size="11" fill="#59636e">pthread_getspecific</text>
+<circle cx="670.9" cy="1231.0" r="7.0" fill="#bf8700"/>
+<path d="M 670.9 1227.4 l 0 4.4" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round"/>
+<circle cx="670.9" cy="1234.4" r="1.1" fill="#ffffff"/>
+<text x="681.9" y="1235.0" font-size="11" fill="#59636e">slots 108/109 — collide</text>
 <circle cx="913.3" cy="1231.0" r="7.0" fill="#1a7f47"/>
 <path d="M 909.9 1231.2 l 2.2 2.4 l 4.2 -5.0" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="924.3" y="1235.0" font-size="11" fill="#59636e">slots 96/97</text>

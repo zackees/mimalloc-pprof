@@ -1,0 +1,339 @@
+{
+  "commit": "86e0c5a4",
+  "cpu": "AMD Ryzen 7 3700X 8-Core Processor",
+  "idle_seconds": 10,
+  "kernel": "6.18.48",
+  "runs_per_series": 3,
+  "selection_rule": "per series, the run with the lowest after-idle VmRSS of 3 repetitions; the same rule for every allocator",
+  "series": {
+    "bun-mimalloc": {
+      "after_idle_rss_mb": 71.6640625,
+      "allocator_id": "bun-mimalloc",
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "mi_on_thread_idle() every 100 ms",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 278.7265625,
+      "label": "Bun mimalloc",
+      "note": "",
+      "peak_rss_mb": 278.7265625,
+      "percent_returned": 74.28875746279115,
+      "pin": "bun-dev3-v2@b20b60d9",
+      "runs": [
+        {
+          "after_idle_rss_mb": 71.6640625,
+          "idle_start_rss_mb": 278.7265625,
+          "peak_rss_mb": 278.7265625
+        },
+        {
+          "after_idle_rss_mb": 71.6796875,
+          "idle_start_rss_mb": 278.7421875,
+          "peak_rss_mb": 278.7421875
+        },
+        {
+          "after_idle_rss_mb": 71.69921875,
+          "idle_start_rss_mb": 278.76171875,
+          "peak_rss_mb": 278.76171875
+        }
+      ]
+    },
+    "jemalloc": {
+      "after_idle_rss_mb": 282.48828125,
+      "allocator_id": "jemalloc",
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "nothing (a plain idle process)",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 282.42578125,
+      "label": "jemalloc",
+      "note": "",
+      "peak_rss_mb": 282.48828125,
+      "percent_returned": 0.0,
+      "pin": "5.3.1@81034ce1f1373e37dc865038e1bc8eeecf559ce8",
+      "runs": [
+        {
+          "after_idle_rss_mb": 282.49609375,
+          "background_thread": false,
+          "idle_start_rss_mb": 282.43359375,
+          "peak_rss_mb": 282.49609375
+        },
+        {
+          "after_idle_rss_mb": 282.48828125,
+          "background_thread": false,
+          "idle_start_rss_mb": 282.42578125,
+          "peak_rss_mb": 282.48828125
+        },
+        {
+          "after_idle_rss_mb": 282.50390625,
+          "background_thread": false,
+          "idle_start_rss_mb": 282.44140625,
+          "peak_rss_mb": 282.50390625
+        }
+      ]
+    },
+    "jemalloc-background-thread": {
+      "after_idle_rss_mb": 282.6328125,
+      "allocator_id": "jemalloc",
+      "charted": false,
+      "env": {
+        "JE_MALLOC_CONF": "background_thread:true"
+      },
+      "idle_mechanism": "nothing; JE_MALLOC_CONF=background_thread:true",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 282.5703125,
+      "label": "jemalloc, background_thread:true",
+      "note": "jemalloc's opt-in decay thread, at the same 10 s window as the chart; the only series whose runs do not agree with each other -- see the run-consistency footnote the table renders from the run records",
+      "peak_rss_mb": 282.6328125,
+      "percent_returned": 0.0,
+      "pin": "5.3.1@81034ce1f1373e37dc865038e1bc8eeecf559ce8",
+      "runs": [
+        {
+          "after_idle_rss_mb": 282.671875,
+          "background_thread": true,
+          "idle_start_rss_mb": 282.609375,
+          "peak_rss_mb": 282.671875
+        },
+        {
+          "after_idle_rss_mb": 282.6328125,
+          "background_thread": true,
+          "idle_start_rss_mb": 282.5703125,
+          "peak_rss_mb": 282.6328125
+        },
+        {
+          "after_idle_rss_mb": 282.65625,
+          "background_thread": true,
+          "idle_start_rss_mb": 282.59375,
+          "peak_rss_mb": 282.65625
+        }
+      ]
+    },
+    "jemalloc-background-thread-30s": {
+      "after_idle_rss_mb": 72.69921875,
+      "allocator_id": "jemalloc",
+      "charted": false,
+      "env": {
+        "JE_MALLOC_CONF": "background_thread:true"
+      },
+      "idle_mechanism": "nothing; JE_MALLOC_CONF=background_thread:true; 30 s window",
+      "idle_seconds": 30,
+      "idle_start_rss_mb": 282.55078125,
+      "label": "jemalloc, background_thread:true, 30 s",
+      "note": "the same, past jemalloc's 10 s default dirty_decay_ms -- its best case",
+      "peak_rss_mb": 282.55078125,
+      "percent_returned": 74.27038834280343,
+      "pin": "5.3.1@81034ce1f1373e37dc865038e1bc8eeecf559ce8",
+      "runs": [
+        {
+          "after_idle_rss_mb": 72.73828125,
+          "background_thread": true,
+          "idle_start_rss_mb": 282.5703125,
+          "peak_rss_mb": 282.5703125
+        },
+        {
+          "after_idle_rss_mb": 72.69921875,
+          "background_thread": true,
+          "idle_start_rss_mb": 282.55078125,
+          "peak_rss_mb": 282.55078125
+        },
+        {
+          "after_idle_rss_mb": 72.734375,
+          "background_thread": true,
+          "idle_start_rss_mb": 282.3671875,
+          "peak_rss_mb": 282.3671875
+        }
+      ]
+    },
+    "jemalloc-purge": {
+      "after_idle_rss_mb": 72.57421875,
+      "allocator_id": "jemalloc",
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "mallctl(\"arena.<all>.purge\") every 100 ms",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 282.44921875,
+      "label": "jemalloc + explicit purge",
+      "note": "",
+      "peak_rss_mb": 282.44921875,
+      "percent_returned": 74.30539228567082,
+      "pin": "5.3.1@81034ce1f1373e37dc865038e1bc8eeecf559ce8",
+      "runs": [
+        {
+          "after_idle_rss_mb": 72.60546875,
+          "background_thread": false,
+          "idle_start_rss_mb": 282.47265625,
+          "peak_rss_mb": 282.47265625
+        },
+        {
+          "after_idle_rss_mb": 72.625,
+          "background_thread": false,
+          "idle_start_rss_mb": 282.4765625,
+          "peak_rss_mb": 282.4765625
+        },
+        {
+          "after_idle_rss_mb": 72.57421875,
+          "background_thread": false,
+          "idle_start_rss_mb": 282.44921875,
+          "peak_rss_mb": 282.44921875
+        }
+      ]
+    },
+    "mimalloc-pprof": {
+      "after_idle_rss_mb": 71.6328125,
+      "allocator_id": "mimalloc-pprof",
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "mi_on_thread_idle() every 100 ms",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 278.6953125,
+      "label": "mimalloc-pprof",
+      "note": "",
+      "peak_rss_mb": 278.6953125,
+      "percent_returned": 74.29708743307263,
+      "pin": "workflow-source",
+      "runs": [
+        {
+          "after_idle_rss_mb": 71.67578125,
+          "idle_start_rss_mb": 278.73828125,
+          "peak_rss_mb": 278.73828125
+        },
+        {
+          "after_idle_rss_mb": 71.6484375,
+          "idle_start_rss_mb": 278.7109375,
+          "peak_rss_mb": 278.7109375
+        },
+        {
+          "after_idle_rss_mb": 71.6328125,
+          "idle_start_rss_mb": 278.6953125,
+          "peak_rss_mb": 278.6953125
+        }
+      ]
+    },
+    "mimalloc-pprof-no-idle-hook": {
+      "after_idle_rss_mb": 278.75390625,
+      "allocator_id": "mimalloc-pprof",
+      "charted": false,
+      "env": {},
+      "idle_mechanism": "nothing (a plain idle process)",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 278.69140625,
+      "label": "mimalloc-pprof, no idle hook",
+      "note": "does the background scavenger alone return memory, with no cooperation?",
+      "peak_rss_mb": 278.75390625,
+      "percent_returned": 0.0,
+      "pin": "workflow-source",
+      "runs": [
+        {
+          "after_idle_rss_mb": 278.8046875,
+          "idle_start_rss_mb": 278.7421875,
+          "peak_rss_mb": 278.8046875
+        },
+        {
+          "after_idle_rss_mb": 278.80078125,
+          "idle_start_rss_mb": 278.73828125,
+          "peak_rss_mb": 278.80078125
+        },
+        {
+          "after_idle_rss_mb": 278.75390625,
+          "idle_start_rss_mb": 278.69140625,
+          "peak_rss_mb": 278.75390625
+        }
+      ]
+    },
+    "upstream-mimalloc": {
+      "after_idle_rss_mb": 276.6640625,
+      "allocator_id": "upstream-mimalloc",
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "nothing (a plain idle process)",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 276.6015625,
+      "label": "upstream mimalloc",
+      "note": "",
+      "peak_rss_mb": 276.6640625,
+      "percent_returned": 0.0,
+      "pin": "dev3@bcee5a88",
+      "runs": [
+        {
+          "after_idle_rss_mb": 276.72265625,
+          "idle_start_rss_mb": 276.66015625,
+          "peak_rss_mb": 276.72265625
+        },
+        {
+          "after_idle_rss_mb": 276.69921875,
+          "idle_start_rss_mb": 276.63671875,
+          "peak_rss_mb": 276.69921875
+        },
+        {
+          "after_idle_rss_mb": 276.6640625,
+          "idle_start_rss_mb": 276.6015625,
+          "peak_rss_mb": 276.6640625
+        }
+      ]
+    },
+    "upstream-mimalloc-collect": {
+      "after_idle_rss_mb": 227.81640625,
+      "allocator_id": "upstream-mimalloc",
+      "charted": false,
+      "env": {},
+      "idle_mechanism": "mi_collect(false) every 100 ms",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 276.62890625,
+      "label": "upstream mimalloc, mi_collect(false)",
+      "note": "is upstream's flat line only a missing API, or a missing mechanism?",
+      "peak_rss_mb": 276.62890625,
+      "percent_returned": 17.645480604939493,
+      "pin": "dev3@bcee5a88",
+      "runs": [
+        {
+          "after_idle_rss_mb": 227.8359375,
+          "idle_start_rss_mb": 276.6484375,
+          "peak_rss_mb": 276.6484375
+        },
+        {
+          "after_idle_rss_mb": 227.83203125,
+          "idle_start_rss_mb": 276.64453125,
+          "peak_rss_mb": 276.64453125
+        },
+        {
+          "after_idle_rss_mb": 227.81640625,
+          "idle_start_rss_mb": 276.62890625,
+          "peak_rss_mb": 276.62890625
+        }
+      ]
+    },
+    "upstream-mimalloc-collect-force": {
+      "after_idle_rss_mb": 227.78125,
+      "allocator_id": "upstream-mimalloc",
+      "charted": false,
+      "env": {},
+      "idle_mechanism": "mi_collect(true) every 100 ms",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 276.59375,
+      "label": "upstream mimalloc, mi_collect(true)",
+      "note": "did upstream only lose to its own 1000 ms purge_delay, rather than to page granularity?",
+      "peak_rss_mb": 276.59375,
+      "percent_returned": 17.647723421082365,
+      "pin": "dev3@bcee5a88",
+      "runs": [
+        {
+          "after_idle_rss_mb": 227.8125,
+          "idle_start_rss_mb": 276.625,
+          "peak_rss_mb": 276.66796875
+        },
+        {
+          "after_idle_rss_mb": 227.84765625,
+          "idle_start_rss_mb": 276.66015625,
+          "peak_rss_mb": 276.66015625
+        },
+        {
+          "after_idle_rss_mb": 227.78125,
+          "idle_start_rss_mb": 276.59375,
+          "peak_rss_mb": 276.59375
+        }
+      ]
+    }
+  },
+  "skipped_allocators": [
+    "tcmalloc"
+  ]
+}

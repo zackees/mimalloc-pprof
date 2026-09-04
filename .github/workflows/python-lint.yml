@@ -66,5 +66,19 @@ jobs:
       - name: No workflow may schedule onto a native macOS runner
         run: python3 ci/lint_no_macos_runners.py
 
+      # The committed chart SVGs under .github/assets must still re-render
+      # byte-for-byte from the committed CSV/JSON they name. `--check` re-renders and
+      # compares; it never re-measures, so this needs no allocator build and no
+      # benchmark machine. Without it, a renderer edit can ship an SVG whose caption
+      # no longer matches the data it claims to come from -- which is exactly the kind
+      # of drift the charts exist to rule out.
+      - name: Committed benchmark charts still re-render from their committed data
+        run: |
+          set -euo pipefail
+          python3 ci/bench_hole_purging.py --check
+          python3 ci/bench_hole_purging.py --check --table
+          python3 ci/bench_hole_purging_allocators.py --check
+          python3 ci/bench_hole_purging_allocators.py --check --table
+
       - name: Benchmark report and policy unit tests
         run: python3 -m pytest ci/tests -q

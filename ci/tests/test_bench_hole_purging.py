@@ -86,9 +86,20 @@ class BenchHolePurgingTests(unittest.TestCase):
         report = bench.load_report_json(json_path)
         series = bench.load_csv(csv_path)
         source_line = bench.format_source_line(report["commit"], report["cpu"], report["kernel"])
-        committed = (assets / "hole-purging-rss-light.svg").read_text(encoding="utf-8")
-        rendered = bench.render_line_chart(series["off"], series["on"], bench.LIGHT, source_line)
-        self.assertEqual(committed, rendered)
+        off_stats = cast(Mapping[str, int], report["off"]["stats"])
+        on_stats = cast(Mapping[str, int], report["on"]["stats"])
+        for theme in (bench.LIGHT, bench.DARK):
+            with self.subTest(theme=theme.name):
+                self.assertEqual(
+                    (assets / f"hole-purging-rss-{theme.name}.svg").read_text(encoding="utf-8"),
+                    bench.render_line_chart(series["off"], series["on"], theme, source_line),
+                )
+                self.assertEqual(
+                    (assets / f"hole-purging-table-{theme.name}.svg").read_text(encoding="utf-8"),
+                    bench.render_table_svg(
+                        off_stats, on_stats, report["off"], report["on"], theme, source_line
+                    ),
+                )
 
     def test_median_run_picks_middle_by_tail_rss(self) -> None:
         low = bench.RunResult(

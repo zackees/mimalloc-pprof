@@ -119,16 +119,79 @@ allocators replay one identical stream inside each paired block.
 tables, min/max spreads, and the metric comparison key are on the
 [dashboard](https://zackees.github.io/mimalloc-pprof/#scaling).*
 
-## Not covered by the five-allocator matrix
+## Memory returned after idle — a second, separate measurement
 
-The README's [hole-purging chart](../README.md#hole-purging-measured) is a
-separate, single-binary measurement (`ci/bench_hole_purging.py`) that compares
-`MIMALLOC_PURGE_HOLES=0` against `=1` in one build.  Bun's fork carries the same
-`mi_on_thread_idle` / `mi_purge_holes_stats_t` API, so a third `bun` series is
-technically possible, but the committed light/dark SVGs, CSV and report JSON are
-one measured artifact set produced together on the reference machine — adding a
-series means re-measuring all of it, not editing the renderer.  It is therefore
-left for a run on that machine rather than fabricated here.
+The README's [memory-returned-after-idle chart](../README.md#memory-returned-after-idle)
+is not produced by the paired throughput harness above.  It is a separate,
+single-threaded measurement that answers a question the throughput matrix cannot:
+when a process stops allocating, which allocators hand the memory back?  Two
+scripts produce it, and they answer different questions.
+
+`ci/bench_hole_purging_allocators.py` — **across allocators.**  One churn workload
+(150k × 512 B + 100k × 1 KiB + 50k × 2 KiB blocks, a scattered 1-in-20 kept alive,
+the rest freed, then a 10 s idle window) run once per allocator.  Its rules:
+
+- **The locked builds, not ad-hoc ones.**  Sources, checksums and build commands
+  come from the same
+  [`allocator-lock.json`](../rust/benchmark-suite/allocators/allocator-lock.json)
+  records the throughput matrix uses, so the pins and flags are identical.
+  **tcmalloc is not in this chart**: its locked build needs bazel, which the
+  measuring machine did not have, and a substitute build would not be the pinned
+  one.
+- **"Idle" is realised per allocator, and named in the chart and table.**  The
+  mimalloc children call `mi_on_thread_idle()` every 100 ms — Bun's fork carries the
+  same API, and upstream mimalloc at its pin has none, which the script detects by
+  reading the extracted header rather than assuming.  jemalloc is given nothing
+  beyond a normal idle process, plus a second series that calls
+  `mallctl("arena.<all>.purge")` on the same tick, so the chart states what jemalloc
+  can do when asked as well as what it does on its own.
+- **Nothing in the harness allocates.**  The block table is `mmap`ed, RSS is read
+  with `open`/`read`/`close` into a stack buffer, and samples leave through
+  `write(2)`.  `libmimalloc.a` overrides libc `malloc` and the `je_`-prefixed
+  jemalloc build does not, so a `printf` per idle tick would be allocator traffic in
+  one arm and not the other — and allocator traffic during "idle" is exactly what
+  jemalloc's decay needs in order to fire.
+- **Peak is `VmHWM`**, the kernel's own high-water mark, read at the end.  Sampling
+  starts at the top of the idle window, so a sampled maximum would be post-free RSS,
+  not the peak.
+- **Best of 3 runs by after-idle RSS, the same rule for every allocator**, pinned
+  with `taskset -c 0-3`.  Every run's number is in the report JSON, not just the
+  charted one.
+- **A knob that did not take is fatal.**  A diagnostic row that tunes an allocator
+  reads the setting back out of the allocator and refuses to publish on a mismatch —
+  a `je_`-prefixed jemalloc ignores `MALLOC_CONF` (it reads `JE_MALLOC_CONF`) without
+  a word of complaint, which produced a plausible, wrong 0% during development.
+- **Diagnostics are measured, labelled, and kept off the chart**: `mimalloc-pprof`
+  with no idle hook at all, `upstream-mimalloc` given `mi_collect(false)` and again
+  given `mi_collect(true)` (which forces the purge rather than honouring
+  `purge_delay`, so "upstream returns 18% even when told to collect" cannot be
+  answered with "you gave it the non-forcing one"), and jemalloc with
+  `background_thread:true` at both the chart's window and a longer one.
+- **A series whose repetitions disagree says so on the image.**  The charted figure is
+  the best of 3, so a series that returned memory in only some of its runs would
+  otherwise be represented by its lucky run alone.  The table renders an "only N of M
+  runs" footnote for any such series, counted from the run records rather than written
+  by hand.
+
+`ci/bench_hole_purging.py` — **inside one binary.**  The narrower A/B that no
+competitor can take part in: `MIMALLOC_PURGE_HOLES=0` against `=1` in a single
+build, scavenger on in both, median of 3.  It is what isolates hole purging's own
+contribution, and it also carries the `mi_purge_holes_stats_t` counter table.
+
+Both scripts commit their SVGs together with the CSV and report JSON they were
+rendered from.  Two things enforce that they stay in step, because a chart and the
+caption it carries drifting apart is silent otherwise: `ci/tests/` re-renders all
+eight committed SVGs (both scripts, both charts, both themes) from the committed data
+and fails on any difference, and `python-lint.yml` — mirrored by
+`ci/verify_local.py --only lint` — runs `--check` on both scripts in both modes.
+Neither re-measures, so neither needs an allocator build or a benchmark machine.
+
+Both chart pairs are **dev-box measurements, not runner output**: unlike the
+throughput matrix above, they are not produced by a scheduled GitHub-hosted run, and
+each SVG names the machine, kernel and commit it was measured at in its own subtitle.
+The two pairs were measured on the same machine but are separate runs with different
+selection rules — median of 3 for the off-vs-on pair, best of 3 for the
+cross-allocator pair — and neither is rendered from the other's data.
 
 ## Pending Phase 6 panels
 

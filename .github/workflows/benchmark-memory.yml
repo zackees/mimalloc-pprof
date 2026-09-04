@@ -15,9 +15,12 @@ on:
         required: false
         type: string
       blocks:
-        description: "Blocks per cell (minimum 15 for full; smoke must use 1)"
+        # 15 is the floor a publishable run must clear. The default is two
+        # blocks above it so a cell that loses a block to an unavailable
+        # fragmentation proxy (#222) still clears the minimum.
+        description: "Blocks per cell (minimum 15 for full, default 17; smoke must use 1)"
         type: number
-        default: 15
+        default: 17
         required: false
   schedule:
     - cron: "41 8 * * 0"
@@ -88,7 +91,7 @@ jobs:
       - name: run external memory suite
         env:
           MEMORY_MODE: ${{ inputs.mode || 'full' }}
-          MEMORY_BLOCKS: ${{ inputs.blocks || 15 }}
+          MEMORY_BLOCKS: ${{ inputs.blocks || 17 }}
           MEMORY_RUN_SEED: ${{ steps.seed.outputs.seed }}
         run: |
           set -euxo pipefail
@@ -136,7 +139,7 @@ jobs:
           MEMORY_REPOSITORY: ${{ github.repository }}
           MEMORY_REF: ${{ github.ref }}
           MEMORY_MODE: ${{ inputs.mode || 'full' }}
-          MEMORY_BLOCKS: ${{ inputs.blocks || 15 }}
+          MEMORY_BLOCKS: ${{ inputs.blocks || 17 }}
         run: |
           set -euo pipefail
           ELIGIBLE=false

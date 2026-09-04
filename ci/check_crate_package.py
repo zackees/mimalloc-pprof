@@ -53,7 +53,10 @@ def main() -> None:
         library = member_text(archive, "/src/lib.rs")
         native = member_text(archive, "/vendor/mimalloc-pprof-amalgamated.c")
 
-    required_manifest = ('version = "0.9.5"', 'default = ["pprof"]', "pprof = []")
+    version = crate_version(
+        Path(__file__).resolve().parent.parent / "rust" / "mimalloc-pprof" / "Cargo.toml"
+    )
+    required_manifest = (f'version = "{version}"', 'default = ["pprof"]', "pprof = []")
     for text in required_manifest:
         if text not in manifest:
             raise AssertionError(f"published manifest missing {text!r}")

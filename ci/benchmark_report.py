@@ -311,9 +311,19 @@ MEMORY_METHODOLOGY = {
 # no per-sample reason. Lineage tolerance is for artifacts already on the
 # publishing branch, never for one being produced now: the producer emits only
 # the current contract.
+# Frozen literal, never derived from MEMORY_METHODOLOGY: a published section is
+# a fixed set of strings, so editing any current key must not silently redefine
+# what those sections declared.
 LEGACY_MEMORY_METHODOLOGY = {
-    **MEMORY_METHODOLOGY,
+    "rss_source": "/proc/<pid>/smaps_rollup Rss, parsed as integer kB * 1024",
+    "hwm_source": "/proc/<pid>/status VmHWM, parsed as integer kB * 1024; cross-check only",
+    "baseline_definition": "external RSS/HWM after child warmup and baseline-ready, before begin",
+    "sampled_peak_definition": "maximum external smaps_rollup RSS timestamped inside workload-active..workload-drained",
+    "post_drain_definition": "external smaps_rollup RSS at >=100ms, >=1s, and >=5s after workload-drained",
     "fragmentation_formula": "(sampled_peak_rss_bytes - baseline_rss_bytes) / peak_live_requested_bytes; both operands must be positive",
+    "hwm_discrepancy_tolerance": "flag when abs(sampled RSS delta - VmHWM delta) > max(8 MiB, 20% of the larger positive delta)",
+    "page_touch_contract": "every allocation touches deterministic boundary bytes and at least one byte per OS page",
+    "purge_policy": "natural allocator behavior only; no allocator-specific purge call",
 }
 MEMORY_METHODOLOGY_LINEAGES = (LEGACY_MEMORY_METHODOLOGY, MEMORY_METHODOLOGY)
 MEMORY_HISTORY_FIELDS = MEMORY_REPORT_FIELDS - {"invalid_reason", "runner", "raw_samples"} | {

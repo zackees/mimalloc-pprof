@@ -1961,6 +1961,25 @@ class LegacyAllocatorLineageTests(unittest.TestCase):
             self.assertTrue((site / "index.html").is_file())
             self.assertTrue((site / "benchmark-rss-timeline.png").is_file())
 
+    def test_the_legacy_memory_methodology_is_frozen_not_derived(self) -> None:
+        """The legacy dict is a literal copy on purpose. Derived from the
+        current one, editing any unrelated key would silently redefine what the
+        published sections declared and take the render step red."""
+
+        self.assertEqual(set(report.MEMORY_METHODOLOGY), set(report.LEGACY_MEMORY_METHODOLOGY))
+        self.assertEqual(
+            {"fragmentation_formula"},
+            {
+                key
+                for key, value in report.MEMORY_METHODOLOGY.items()
+                if report.LEGACY_MEMORY_METHODOLOGY[key] != value
+            },
+        )
+        self.assertEqual(
+            (report.LEGACY_MEMORY_METHODOLOGY, report.MEMORY_METHODOLOGY),
+            report.MEMORY_METHODOLOGY_LINEAGES,
+        )
+
     def test_a_memory_section_from_before_the_optional_proxy_still_validates(self) -> None:
         """`benchmark-stats` already carries memory sections measured when the
         fragmentation proxy was mandatory on every cell (#222). They must keep

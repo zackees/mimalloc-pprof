@@ -38,7 +38,7 @@
             "upstream": {
               "status": "no",
               "note": "mi_collect is caller-only",
-              "source": "microsoft/mimalloc@6def7be9 include/mimalloc.h:193"
+              "source": "microsoft/mimalloc@6def7be9 src/theap.c:157"
             },
             "bun": {
               "status": "no",
@@ -72,7 +72,7 @@
             },
             "jemalloc": {
               "status": "yes",
-              "note": "thread.tcache.flush",
+              "note": "tcache.flush + arena.i.purge",
               "source": "https://jemalloc.net/jemalloc.3.html#thread.tcache.flush"
             }
           }
@@ -96,8 +96,8 @@
               "source": "oven-sh/mimalloc@b20b60d9 src/scavenger.c:207"
             },
             "jemalloc": {
-              "status": "no",
-              "note": "no cross-thread flush",
+              "status": "partial",
+              "note": "arena purge, not their tcache",
               "source": "https://jemalloc.net/jemalloc.3.html#thread.tcache.flush"
             }
           }
@@ -251,8 +251,8 @@
               "source": "oven-sh/mimalloc@b20b60d9 src/prof.c:165, :563"
             },
             "jemalloc": {
-              "status": "no",
-              "note": "needs libunwind/libgcc",
+              "status": "partial",
+              "note": "not MSVC; MinGW untested",
               "source": "https://github.com/jemalloc/jemalloc/blob/81034ce1f1373e37dc865038e1bc8eeecf559ce8/INSTALL.md#L134"
             }
           }
@@ -401,9 +401,9 @@
               "source": "oven-sh/mimalloc@b20b60d9 src/ (no memory-events)"
             },
             "jemalloc": {
-              "status": "no",
-              "note": "utrace traces, not calls",
-              "source": "https://jemalloc.net/jemalloc.3.html"
+              "status": "partial",
+              "note": "experimental.hooks.install",
+              "source": "jemalloc 5.3.1@81034ce1 src/ctl.c:882"
             }
           }
         },
@@ -466,8 +466,8 @@
               "source": "src/alloc.c:122, include/mimalloc/types.h:616, docs/profiler.md:10"
             },
             "upstream": {
-              "status": "no",
-              "note": "no profiler to cost",
+              "status": "yes",
+              "note": "nothing to cost",
               "source": "microsoft/mimalloc@6def7be9 src/ (no prof.c)"
             },
             "bun": {
@@ -531,9 +531,9 @@
               "source": "oven-sh/mimalloc@b20b60d9 src/ (no lock-order check)"
             },
             "jemalloc": {
-              "status": "no",
-              "note": "",
-              "source": "jemalloc 5.3.1@81034ce1 src/ (no lock-order check)"
+              "status": "yes",
+              "note": "witness ranks, --enable-debug",
+              "source": "jemalloc 5.3.1@81034ce1 src/witness.c:96"
             }
           }
         },
@@ -581,9 +581,9 @@
               "source": "oven-sh/mimalloc@b20b60d9 CMakeLists.txt:12"
             },
             "jemalloc": {
-              "status": "no",
-              "note": "no guard-page option",
-              "source": "https://jemalloc.net/jemalloc.3.html"
+              "status": "partial",
+              "note": "opt.san_guard_small/large",
+              "source": "jemalloc 5.3.1@81034ce1 src/conf.c:1125, src/san.c"
             }
           }
         },
@@ -631,8 +631,8 @@
               "source": "oven-sh/mimalloc@b20b60d9 CMakeLists.txt:24-26"
             },
             "jemalloc": {
-              "status": "partial",
-              "note": "Valgrind dropped in 5.0",
+              "status": "no",
+              "note": "no ASan, no ETW; Valgrind gone",
               "source": "jemalloc 5.3.1@81034ce1 ChangeLog:687"
             }
           }
@@ -758,7 +758,7 @@
             "bun": {
               "status": "yes",
               "note": "in- and out-of-process",
-              "source": "oven-sh/mimalloc@b20b60d9 src/prim/osx/alloc-override-zone.c:306"
+              "source": "oven-sh/mimalloc@b20b60d9 src/prim/osx/alloc-override-zone.c:304"
             },
             "jemalloc": {
               "status": "no",
@@ -1048,7 +1048,7 @@
           }
         },
         {
-          "feature": "Zero-tracking (zalloc skips its memset)",
+          "feature": "Purged memory tracked as still-zero",
           "cells": {
             "mimalloc-pprof": {
               "status": "no",
@@ -1057,8 +1057,8 @@
             },
             "upstream": {
               "status": "no",
-              "note": "",
-              "source": "microsoft/mimalloc@6def7be9 src/os.c (no _mi_os_purge_zero)"
+              "note": "_mi_os_purge has no is_zero",
+              "source": "microsoft/mimalloc@6def7be9 src/os.c"
             },
             "bun": {
               "status": "yes",
@@ -1066,9 +1066,9 @@
               "source": "oven-sh/mimalloc@b20b60d9 src/os.c:658"
             },
             "jemalloc": {
-              "status": "no",
-              "note": "opt.zero always fills",
-              "source": "https://jemalloc.net/jemalloc.3.html"
+              "status": "yes",
+              "note": "edata_zeroed after forced purge",
+              "source": "jemalloc 5.3.1@81034ce1 src/extent.c:1212"
             }
           }
         },

@@ -181,31 +181,31 @@ image and the table below are rendered from.
 |  | this fork, 0.9.x | v3 dev3 @ 6def7be9 | oven-sh @ b20b60d9 | 5.3.1 @ 81034ce1 |
 | **Memory return** | | | | |
 | Process-wide eager purge, from any thread | ❌ not yet — [#335](https://github.com/zackees/mimalloc-pprof/issues/335) | ❌ mi_collect is caller-only | ❌ mi_collect is caller-only | ✅ MALLCTL_ARENAS_ALL |
-| Purge the calling thread's own memory | ✅ mi_collect, idle hook | ✅ mi_collect | ✅ mi_collect, idle hook | ✅ thread.tcache.flush |
-| Sweep another thread's heap for it | ⚠️ parked threads — [#335](https://github.com/zackees/mimalloc-pprof/issues/335) | ❌ no scavenger at all | ⚠️ parked threads only | ❌ no cross-thread flush |
+| Purge the calling thread's own memory | ✅ mi_collect, idle hook | ✅ mi_collect | ✅ mi_collect, idle hook | ✅ tcache.flush + arena.i.purge |
+| Sweep another thread's heap for it | ⚠️ parked threads — [#335](https://github.com/zackees/mimalloc-pprof/issues/335) | ❌ no scavenger at all | ⚠️ parked threads only | ⚠️ arena purge, not their tcache |
 | Sub-page return inside a still-used page | ✅ hole purging, on by default | ❌ whole pages only | ✅ hole purging, on by default | ❌ extent-granular purge |
 | Background purge thread | ✅ on by default | ❌ purge waits for a malloc | ✅ on by default | ⚠️ off by default |
 | Time-delayed / decaying purge | ✅ purge_delay 100 ms | ✅ purge_delay 1000 ms | ✅ purge_delay 100 ms | ✅ dirty_decay_ms 10 s |
 | RSS returned after 10 s idle (churn) | 74 % | 0 % (18 % w/ mi_collect) | 74 % | 0 % (74 % if asked) |
 | **Profiling and observability** | | | | |
 | pprof-compatible sampled heap profiler | ✅ runtime opt-in | ❌ none at all | ✅ runtime opt-in | ✅ build-time --enable-prof |
-| Heap profiler on Windows | ✅ MSVC and MinGW | ❌ no profiler | ⚠️ frames, no module map | ❌ needs libunwind/libgcc |
+| Heap profiler on Windows | ✅ MSVC and MinGW | ❌ no profiler | ⚠️ frames, no module map | ⚠️ not MSVC; MinGW untested |
 | profile.proto (protobuf) output | ✅ and gperftools text | ❌ no profiler | ✅ | ❌ text format; jeprof reads |
 | Exact allocator statistics | ✅ mi_stats_get | ✅ mi_stats_get | ✅ mi_stats_get | ✅ mallctl / malloc_stats_print |
 | Statistics as JSON | ✅ mi_stats_get_json | ✅ mi_stats_get_json | ✅ mi_stats_get_json | ✅ the "J" opts flag |
 | Per-heap JSON dump | ✅ mi_heap_dump_json | ❌ process-wide stats only | ✅ mi_heap_dump_json | ❌ per-arena, not per-heap |
 | DHAT exact profiling (Valgrind format) | ✅ mi_dhat_start | ❌ | ❌ | ❌ |
-| Allocation-event callbacks | ✅ mi_memory_set_callbacks | ❌ | ❌ | ❌ utrace traces, not calls |
+| Allocation-event callbacks | ✅ mi_memory_set_callbacks | ❌ | ❌ | ⚠️ experimental.hooks.install |
 | Walk every live block in a heap | ✅ mi_heap_visit_blocks | ✅ mi_heap_visit_blocks | ✅ mi_heap_visit_blocks | ❌ no iteration mallctl |
 | Live heap snapshot with a viewer | ❌ not imported — [#338](https://github.com/zackees/mimalloc-pprof/issues/338) | ❌ | ✅ + tools/mi-heapview | ❌ |
-| No fast-path cost while profiling is off | ✅ malloc path byte-identical | ❌ no profiler to cost | ✅ sample rate 0 by default | ⚠️ build-time opt-in |
+| No fast-path cost while profiling is off | ✅ malloc path byte-identical | ✅ nothing to cost | ✅ sample rate 0 by default | ⚠️ build-time opt-in |
 | **Robustness** | | | | |
 | fork() handlers (pthread_atfork) | ✅ documented lock order | ❌ none registered | ✅ | ✅ jemalloc_prefork |
-| Runtime lock-order checker | ✅ MI_DEBUG>2 | ❌ no fork handlers either | ❌ order kept by hand | ❌ |
+| Runtime lock-order checker | ✅ MI_DEBUG>2 | ❌ no fork handlers either | ❌ order kept by hand | ✅ witness ranks, --enable-debug |
 | Heap-teardown ABA claim protocol | ✅ + fault-injection tests | ❌ | ✅ | ❌ caller must flush first |
-| Guard-page (guarded) allocations | ✅ MI_GUARDED | ✅ MI_GUARDED | ✅ MI_GUARDED | ❌ no guard-page option |
+| Guard-page (guarded) allocations | ✅ MI_GUARDED | ✅ MI_GUARDED | ✅ MI_GUARDED | ⚠️ opt.san_guard_small/large |
 | Hardened / secure build mode | ✅ MI_SECURE 1-4 | ✅ MI_SECURE 1-4 | ✅ MI_SECURE 1-4 | ❌ no equivalent mode |
-| ASan / Valgrind / ETW tracking | ✅ all three | ✅ all three | ✅ all three | ⚠️ Valgrind dropped in 5.0 |
+| ASan / Valgrind / ETW tracking | ✅ all three | ✅ all three | ✅ all three | ❌ no ASan, no ETW; Valgrind gone |
 | **Platform and integration** | | | | |
 | Windows MSVC as a first-class target | ✅ native cl gate per PR | ✅ in the test matrix | ✅ in the test matrix | ⚠️ no prof, no bg thread |
 | Windows malloc override via a redirect DLL | ✅ mimalloc-redirect.dll | ✅ mimalloc-redirect.dll | ✅ mimalloc-redirect.dll | ❌ link-time replacement only |
@@ -224,7 +224,7 @@ image and the table below are rendered from.
 | Bring your own memory region | ✅ mi_manage_os_memory | ✅ mi_manage_os_memory | ✅ mi_manage_os_memory | ✅ extent hooks |
 | Lazy abandoned-page bitmaps | ✅ ~110 KB saved per heap | ❌ allocated eagerly | ✅ ~110 KB saved per heap | ❌ no such structure |
 | Fixed TLS slots on macOS | ✅ slots 96/97 | ⚠️ slots 108/109 — collide | ✅ slots 96/97 | ❌ pthread_getspecific |
-| Zero-tracking (zalloc skips its memset) | ❌ lost in a rebase — [#337](https://github.com/zackees/mimalloc-pprof/issues/337) | ❌ | ✅ _mi_os_purge_zero | ❌ opt.zero always fills |
+| Purged memory tracked as still-zero | ❌ lost in a rebase — [#337](https://github.com/zackees/mimalloc-pprof/issues/337) | ❌ _mi_os_purge has no is_zero | ✅ _mi_os_purge_zero | ✅ edata_zeroed after forced purge |
 | Opt out of the exit-time destructor | ✅ MI_NO_PROCESS_DETACH | ❌ | ✅ MI_NO_PROCESS_DETACH | ❌ |
 
 ✅ has it &nbsp;·&nbsp; ⚠️ partly — see the note &nbsp;·&nbsp; ❌ does not. `mimalloc-pprof` is [this fork](https://github.com/zackees/mimalloc-pprof); *upstream* is [microsoft/mimalloc](https://github.com/microsoft/mimalloc) at the pinned `dev3` commit `6def7be9`; *Bun* is [oven-sh/mimalloc](https://github.com/oven-sh/mimalloc) at `b20b60d9`; *jemalloc* is 5.3.1 (`81034ce1`), the build in [`allocator-lock.json`](rust/benchmark-suite/allocators/allocator-lock.json). Every ❌ and ⚠️ in the `mimalloc-pprof` column links the issue tracking it. The per-cell sources — a `path:line` in this tree, a path in the pinned upstream or Bun commit, or a jemalloc doc anchor — are in [`docs/allocator-features.json`](docs/allocator-features.json), which this table and the image above are both rendered from by [`ci/render_feature_table.py`](ci/render_feature_table.py).

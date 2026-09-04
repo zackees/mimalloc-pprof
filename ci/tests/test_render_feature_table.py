@@ -8,7 +8,7 @@ Two halves, deliberately:
 * `RealDataTests` do the opposite: they read the real file and enforce the rules the
   table's credibility rests on -- every cell cites a source, and every gap in the
   `mimalloc-pprof` column names a tracking issue. Those are the rules a reviewer
-  cannot check by eye across ~180 cells.
+  cannot check by eye across 168 cells.
 """
 
 from __future__ import annotations

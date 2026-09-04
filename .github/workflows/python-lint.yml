@@ -14,6 +14,13 @@ on:
       - 'ci/**'
       - 'pyproject.toml'
       - '.github/workflows/**'
+      # The feature table renders from docs/allocator-features.json into the README
+      # region and both SVGs. Without these three, an edit to any of them would skip
+      # this job entirely and the `--check` below could not catch the drift it exists
+      # to catch.
+      - 'README.md'
+      - 'docs/allocator-features.json'
+      - '.github/assets/allocator-features-*.svg'
 
 concurrency:
   # Pure verification: a superseded push's answer is worthless.
@@ -79,6 +86,14 @@ jobs:
           python3 ci/bench_hole_purging.py --check --table
           python3 ci/bench_hole_purging_allocators.py --check
           python3 ci/bench_hole_purging_allocators.py --check --table
+
+      # Same argument, different data: the README's allocator feature table and the two
+      # allocator-features SVGs are rendered from docs/allocator-features.json. Editing
+      # the JSON without re-rendering, or hand-editing the README region, would ship a
+      # table that disagrees with its own sourced data -- which is worse than no table,
+      # because the sources are the whole reason to believe it.
+      - name: The feature table still re-renders from docs/allocator-features.json
+        run: python3 ci/render_feature_table.py --check
 
       - name: Benchmark report and policy unit tests
         run: python3 -m pytest ci/tests -q

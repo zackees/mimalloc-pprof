@@ -21,9 +21,10 @@ every one of them is a line that has to be re-reasoned on each upstream sync.
 
 > **Not the only pprof profiler for mimalloc.** [Bun's fork](https://github.com/oven-sh/mimalloc)
 > built one independently (`src/prof.c`), and upstream branch `pr-1266` carries a third from
-> Datadog — using the same filenames as ours. What distinguishes this one is **native
-> Windows support**: Bun's stack capture is guarded behind glibc/Apple `<execinfo.h>`.
-> See [`MIMALLOC_FORKS.md`](../MIMALLOC_FORKS.md).
+> Datadog — using the same filenames as ours. What distinguishes this one is **usable
+> Windows profiles**: Bun captures Win32 stacks (`RtlCaptureStackBackTrace`) but its
+> `mi_prof_collect_mappings` has an empty `#else`, so it emits no module mappings there and
+> a Win32 profile cannot be symbolized. See [`MIMALLOC_FORKS.md`](../MIMALLOC_FORKS.md).
 
 ## Bug fixes in upstream code
 

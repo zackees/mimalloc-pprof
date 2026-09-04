@@ -42,7 +42,13 @@ class BenchmarkReportTests(unittest.TestCase):
     def write_json(self, path: Path, value: object) -> None:
         path.write_text(json.dumps(value) + "\n", encoding="utf-8", newline="\n")
 
-    def with_complete_memory(self, latest: dict[str, object]) -> dict[str, object]:
+    def with_complete_memory(
+        self, latest: dict[str, object], *, legacy: bool = False
+    ) -> dict[str, object]:
+        """A complete memory section. `legacy` builds the pre-#222 shape: the
+        old methodology string, a ratio on every sample with no reason field,
+        and fragmentation summaries on every cell."""
+
         value = copy.deepcopy(latest)
         raw_samples = value["raw_samples"]
         assert isinstance(raw_samples, list)
@@ -76,6 +82,18 @@ class BenchmarkReportTests(unittest.TestCase):
                 delta = delta_mib * 1024 * 1024
                 peak = baseline + delta
                 post = baseline + delta // 2
+                ratio = delta / int(child_value["peak_live_requested_bytes"])
+                excluded = scenario in report.FRAGMENTATION_EXCLUDED_SCENARIOS
+                proxy: dict[str, object] = (
+                    {"fragmentation_proxy": ratio}
+                    if legacy
+                    else {
+                        "fragmentation_proxy": None if excluded else ratio,
+                        "fragmentation_proxy_reason": (
+                            "scenario_not_applicable" if excluded else None
+                        ),
+                    }
+                )
                 memory_samples.append(
                     {
                         "metric_schema_version": report.MEMORY_SCHEMA,
@@ -108,8 +126,7 @@ class BenchmarkReportTests(unittest.TestCase):
                         "post_drain_rss_delta_100ms_bytes": delta // 2,
                         "post_drain_rss_delta_1s_bytes": delta // 2,
                         "post_drain_rss_delta_5s_bytes": delta // 2,
-                        "fragmentation_proxy": delta
-                        / int(child_value["peak_live_requested_bytes"]),
+                        **proxy,
                         "hwm_discrepancy": False,
                         "hwm_tolerance_bytes": max(8 * 1024 * 1024, delta // 5),
                         "sampling": {
@@ -157,6 +174,12 @@ class BenchmarkReportTests(unittest.TestCase):
         }
         for scenario, point in report.MEMORY_CELLS:
             for metric in report.MEMORY_METRICS:
+                if (
+                    not legacy
+                    and metric == "fragmentation-proxy"
+                    and scenario in report.FRAGMENTATION_EXCLUDED_SCENARIOS
+                ):
+                    continue
                 metric_stats = copy.deepcopy(stats)
                 if metric == "fragmentation-proxy":
                     metric_stats.update(median=1.1, min=1.0, max=1.2, q1=1.05, q3=1.15, iqr=0.1)
@@ -213,7 +236,9 @@ class BenchmarkReportTests(unittest.TestCase):
             },
             "direction": "lower-is-better",
             "informational": True,
-            "methodology": copy.deepcopy(report.MEMORY_METHODOLOGY),
+            "methodology": copy.deepcopy(
+                report.LEGACY_MEMORY_METHODOLOGY if legacy else report.MEMORY_METHODOLOGY
+            ),
             "absolute_summaries": absolute,
             "paired_summaries": paired,
             "raw_samples": memory_samples,
@@ -704,6 +729,118 @@ class BenchmarkReportTests(unittest.TestCase):
         # mimalloc-pprof (0.8) ends at 217 px; beyond it is background.
         self.assertEqual(report.COLORS[4], pixel(bar_left + 216, top + 10 + 4 * 15 + 4))
         self.assertEqual((235, 240, 246), pixel(bar_left + 218, top + 10 + 4 * 15 + 4))
+
+    def plant_non_positive_delta(self, latest: dict[str, object]) -> dict[str, object]:
+        """Rewrite one applicable-scenario sample as a block whose peak RSS
+        never rose above the post-warmup baseline."""
+
+        memory = latest["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list)
+        target = next(
+            sample
+            for sample in samples
+            if isinstance(sample, dict) and sample["scenario_id"] == "large-objects"
+        )
+        baseline = int(target["baseline_rss_bytes"])
+        timeline = target["timeline"]
+        assert isinstance(timeline, list)
+        target.update(
+            sampled_peak_rss_bytes=baseline,
+            kernel_peak_hwm_bytes=int(target["baseline_hwm_bytes"]),
+            sampled_peak_rss_delta_bytes=0,
+            hwm_tolerance_bytes=8 * 1024 * 1024,
+            hwm_discrepancy=False,
+            fragmentation_proxy=None,
+            fragmentation_proxy_reason="non_positive_rss_delta",
+            timeline=[
+                {"elapsed_ns": point["elapsed_ns"], "rss_bytes": baseline}
+                for point in timeline
+                if isinstance(point, dict)
+            ],
+        )
+        return target
+
+    def test_a_null_fragmentation_proxy_with_a_reason_keeps_the_cell_valid(self) -> None:
+        latest = self.with_complete_memory(self.load_latest())
+        target = self.plant_non_positive_delta(latest)
+        report.validate_latest(latest, "null fragmentation proxy")
+        self.assertIsNone(target["fragmentation_proxy"])
+        self.assertEqual("non_positive_rss_delta", target["fragmentation_proxy_reason"])
+        # Every other metric of the cell survives the unavailable ratio.
+        self.assertGreater(cast(int, target["sampled_peak_rss_bytes"]), 0)
+        self.assertGreater(cast(int, target["post_drain_rss_5s_bytes"]), 0)
+
+    def test_a_null_proxy_without_a_reason_or_a_fabricated_ratio_is_rejected(self) -> None:
+        unexplained = self.with_complete_memory(self.load_latest())
+        target = self.plant_non_positive_delta(unexplained)
+        target["fragmentation_proxy_reason"] = None
+        with self.assertRaisesRegex(report.ReportError, "fragmentation_proxy"):
+            report.validate_latest(unexplained, "unexplained null")
+
+        wrong_reason = self.with_complete_memory(self.load_latest())
+        target = self.plant_non_positive_delta(wrong_reason)
+        target["fragmentation_proxy_reason"] = "zero_live_bytes"
+        with self.assertRaisesRegex(report.ReportError, "fragmentation_proxy_reason"):
+            report.validate_latest(wrong_reason, "wrong reason")
+
+        fabricated = self.with_complete_memory(self.load_latest())
+        memory = fabricated["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list)
+        churn = next(
+            sample
+            for sample in samples
+            if isinstance(sample, dict) and sample["scenario_id"] == "thread-churn"
+        )
+        churn["fragmentation_proxy"] = 21.0
+        churn["fragmentation_proxy_reason"] = None
+        with self.assertRaisesRegex(report.ReportError, "fragmentation_proxy"):
+            report.validate_latest(fabricated, "fabricated ratio")
+
+    def test_fragmentation_panel_and_table_mark_an_excluded_scenario_not_applicable(
+        self,
+    ) -> None:
+        cells = {
+            ("large-objects", "1"): {
+                allocator: 1.4 - index * 0.1 for index, allocator in enumerate(report.ALLOCATOR_IDS)
+            }
+        }
+        canvas = report.Canvas(
+            report.MEMORY_PANEL_WIDTH, report.MEMORY_PANEL_HEIGHT, (248, 250, 252)
+        )
+        report.draw_ratio_bar_grid(
+            canvas,
+            cells,
+            unavailable={("thread-churn", "physical-core"): "n/a scenario_not_applicable"},
+        )
+
+        def pixel(x: int, y: int) -> tuple[int, int, int]:
+            offset = (y * report.MEMORY_PANEL_WIDTH + x) * 3
+            value = canvas.pixels[offset : offset + 3]
+            return value[0], value[1], value[2]
+
+        left, top = 45 + 460, 85
+        observed = {pixel(x, y) for y in range(top, top + 92) for x in range(left, left + 420)}
+        for color in report.COLORS:
+            self.assertNotIn(color, observed, "an unavailable cell must draw no bar")
+        self.assertGreater(len(observed), 1, "the unavailable cell must be labeled")
+
+        latest = self.with_complete_memory(self.load_latest())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            self.assertIn(
+                "<td>thread-churn</td><td>physical-core</td>"
+                "<td>fragmentation-proxy</td><td>-</td><td>n/a</td>",
+                page,
+            )
 
     def test_memory_section_sits_next_to_throughput(self) -> None:
         latest = self.with_complete_memory(self.load_latest())
@@ -1823,6 +1960,57 @@ class LegacyAllocatorLineageTests(unittest.TestCase):
             report.render(source, self.LEGACY / "history.jsonl", site, root / "digest", False)
             self.assertTrue((site / "index.html").is_file())
             self.assertTrue((site / "benchmark-rss-timeline.png").is_file())
+
+    def test_a_memory_section_from_before_the_optional_proxy_still_validates(self) -> None:
+        """`benchmark-stats` already carries memory sections measured when the
+        fragmentation proxy was mandatory on every cell (#222). They must keep
+        validating and rendering; only the producer is held to the new shape."""
+
+        helper = BenchmarkReportTests("test_memory_section_sits_next_to_throughput")
+        legacy = helper.with_complete_memory(helper.load_latest(), legacy=True)
+        report.validate_latest(legacy, "legacy memory section")
+        memory = legacy["memory"]
+        assert isinstance(memory, dict)
+        absolute = memory["absolute_summaries"]
+        assert isinstance(absolute, list)
+        self.assertTrue(
+            any(
+                item["scenario_id"] == "thread-churn" and item["metric_id"] == "fragmentation-proxy"
+                for item in absolute
+                if isinstance(item, dict)
+            )
+        )
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list) and isinstance(samples[0], dict)
+        self.assertNotIn("fragmentation_proxy_reason", samples[0])
+        report.validate_history_row(report.history_row(legacy), "legacy memory history")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            source.write_text(json.dumps(legacy) + "\n", encoding="utf-8", newline="\n")
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            self.assertTrue((site / "benchmark-fragmentation.png").is_file())
+
+        # The tolerance is for the old shape exactly, not for a mixture: the old
+        # producer could not emit a non-positive delta, and the new one always
+        # writes the reason field.
+        degenerate = helper.with_complete_memory(helper.load_latest(), legacy=True)
+        target = helper.plant_non_positive_delta(degenerate)
+        del target["fragmentation_proxy_reason"]
+        target["fragmentation_proxy"] = 1.0
+        with self.assertRaisesRegex(report.ReportError, "positive delta"):
+            report.validate_latest(degenerate, "legacy non-positive delta")
+
+        mixed = helper.with_complete_memory(helper.load_latest(), legacy=True)
+        memory = mixed["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list) and isinstance(samples[0], dict)
+        samples[0]["fragmentation_proxy_reason"] = None
+        with self.assertRaisesRegex(report.ReportError, "fields mismatch"):
+            report.validate_latest(mixed, "mixed memory shape")
 
     def test_a_weekly_section_survives_the_fork_moving_under_it(self) -> None:
         """`benchmark-stats` is daily and memory/latency are weekly, so the core

@@ -241,6 +241,18 @@ MEMORY_CELLS = (
     ("cross-thread-producer-consumer", "physical-core"),
     ("thread-churn", "physical-core"),
 )
+FRAGMENTATION_METRIC = "fragmentation-proxy"
+# Scenarios whose live set is not the measured quantity, so the ratio
+# `peak RSS delta / peak live bytes` carries no fragmentation meaning.
+# thread-churn measures thread creation and destruction against a live set of
+# about one kilobyte. Excluded by design, not per run.
+FRAGMENTATION_EXCLUDED_SCENARIOS = ("thread-churn",)
+FRAGMENTATION_REASONS = (
+    "scenario_not_applicable",
+    "non_positive_rss_delta",
+    "zero_live_bytes",
+    "non_finite_ratio",
+)
 LATENCY_SCHEMA = "transaction-latency-v1"
 LATENCY_CHILD_PROTOCOL = "transaction-latency-child-v1"
 LATENCY_QUANTILES = ("p50", "p95", "p99")
@@ -290,11 +302,20 @@ MEMORY_METHODOLOGY = {
     "baseline_definition": "external RSS/HWM after child warmup and baseline-ready, before begin",
     "sampled_peak_definition": "maximum external smaps_rollup RSS timestamped inside workload-active..workload-drained",
     "post_drain_definition": "external smaps_rollup RSS at >=100ms, >=1s, and >=5s after workload-drained",
-    "fragmentation_formula": "(sampled_peak_rss_bytes - baseline_rss_bytes) / peak_live_requested_bytes; both operands must be positive",
+    "fragmentation_formula": "(sampled_peak_rss_bytes - baseline_rss_bytes) / peak_live_requested_bytes; null with a reason when either operand is unusable or the scenario excludes the proxy",
     "hwm_discrepancy_tolerance": "flag when abs(sampled RSS delta - VmHWM delta) > max(8 MiB, 20% of the larger positive delta)",
     "page_touch_contract": "every allocation touches deterministic boundary bytes and at least one byte per OS page",
     "purge_policy": "natural allocator behavior only; no allocator-specific purge call",
 }
+# Sections published before #222 report the proxy for every scenario and carry
+# no per-sample reason. Lineage tolerance is for artifacts already on the
+# publishing branch, never for one being produced now: the producer emits only
+# the current contract.
+LEGACY_MEMORY_METHODOLOGY = {
+    **MEMORY_METHODOLOGY,
+    "fragmentation_formula": "(sampled_peak_rss_bytes - baseline_rss_bytes) / peak_live_requested_bytes; both operands must be positive",
+}
+MEMORY_METHODOLOGY_LINEAGES = (LEGACY_MEMORY_METHODOLOGY, MEMORY_METHODOLOGY)
 MEMORY_HISTORY_FIELDS = MEMORY_REPORT_FIELDS - {"invalid_reason", "runner", "raw_samples"} | {
     "runner_fingerprint_sha256"
 }
@@ -841,9 +862,36 @@ def validate_memory_environment(value: object, label: str) -> dict[str, object]:
     return environment
 
 
-def validate_memory_sample(value: object, label: str) -> dict[str, object]:
+def fragmentation_applies(scenario_id: str) -> bool:
+    """Whether the fragmentation proxy is a meaningful ratio for a scenario."""
+
+    return scenario_id not in FRAGMENTATION_EXCLUDED_SCENARIOS
+
+
+def fragmentation_reason(scenario_id: str, delta_bytes: int, peak_live_bytes: int) -> str | None:
+    """The reason a sample carries no fragmentation ratio, or None when it does.
+
+    Mirrors `fragmentation_proxy` in rust/benchmark-suite/src/memory.rs,
+    including the order the reasons are tested in.
+    """
+
+    if not fragmentation_applies(scenario_id):
+        return "scenario_not_applicable"
+    if delta_bytes <= 0:
+        return "non_positive_rss_delta"
+    if peak_live_bytes == 0:
+        return "zero_live_bytes"
+    if not math.isfinite(delta_bytes / peak_live_bytes):
+        return "non_finite_ratio"
+    return None
+
+
+def validate_memory_sample(value: object, label: str, *, legacy: bool = False) -> dict[str, object]:
     sample = object_value(value, label)
-    exact_fields(sample, MEMORY_SAMPLE_FIELDS, label)
+    if legacy:
+        exact_fields(sample, MEMORY_SAMPLE_FIELDS, label)
+    else:
+        exact_fields(sample, MEMORY_SAMPLE_FIELDS | {"fragmentation_proxy_reason"}, label)
     if sample.get("metric_schema_version") != MEMORY_SCHEMA:
         fail(f"{label}.metric_schema_version: unsupported memory metric")
     allocator = string_value(sample.get("allocator_id"), f"{label}.allocator_id")
@@ -918,16 +966,36 @@ def validate_memory_sample(value: object, label: str) -> dict[str, object]:
     for field, expected in derived.items():
         if signed_int_value(sample.get(field), f"{label}.{field}") != expected:
             fail(f"{label}.{field}: inconsistent signed delta")
-    if derived["sampled_peak_rss_delta_bytes"] <= 0:
-        fail(
-            f"{label}.sampled_peak_rss_delta_bytes: fragmentation denominator delta must be positive"
-        )
-    expected_ratio = derived["sampled_peak_rss_delta_bytes"] / cast(
-        int, sample["peak_live_requested_bytes"]
-    )
-    ratio = float_value(sample.get("fragmentation_proxy"), f"{label}.fragmentation_proxy", True)
-    if not math.isclose(ratio, expected_ratio, rel_tol=1e-12):
-        fail(f"{label}.fragmentation_proxy: inconsistent ratio")
+    # A degenerate operand is a recorded outcome, not a failure: the proxy is
+    # null and names its reason, and the cell keeps every other metric. A
+    # section published before that contract carries a ratio on every sample,
+    # because its producer aborted the run rather than record one without.
+    delta = derived["sampled_peak_rss_delta_bytes"]
+    peak_live = cast(int, sample["peak_live_requested_bytes"])
+    if legacy:
+        if delta <= 0:
+            fail(f"{label}.sampled_peak_rss_delta_bytes: legacy proxy needs a positive delta")
+        ratio = float_value(sample.get("fragmentation_proxy"), f"{label}.fragmentation_proxy", True)
+        if not math.isclose(ratio, delta / peak_live, rel_tol=1e-12):
+            fail(f"{label}.fragmentation_proxy: inconsistent ratio")
+    else:
+        expected_reason = fragmentation_reason(cast(str, sample["scenario_id"]), delta, peak_live)
+        recorded_reason = sample.get("fragmentation_proxy_reason")
+        if recorded_reason is not None and recorded_reason not in FRAGMENTATION_REASONS:
+            fail(f"{label}.fragmentation_proxy_reason: unknown reason")
+        if expected_reason is None:
+            if recorded_reason is not None:
+                fail(f"{label}.fragmentation_proxy_reason: a measured ratio carries no reason")
+            ratio = float_value(
+                sample.get("fragmentation_proxy"), f"{label}.fragmentation_proxy", True
+            )
+            if not math.isclose(ratio, delta / peak_live, rel_tol=1e-12):
+                fail(f"{label}.fragmentation_proxy: inconsistent ratio")
+        else:
+            if sample.get("fragmentation_proxy") is not None:
+                fail(f"{label}.fragmentation_proxy: an unavailable proxy must be null")
+            if recorded_reason != expected_reason:
+                fail(f"{label}.fragmentation_proxy_reason: expected {expected_reason}")
     if not isinstance(sample.get("hwm_discrepancy"), bool):
         fail(f"{label}.hwm_discrepancy: expected boolean")
     hwm_delta = cast(int, sample["kernel_peak_hwm_bytes"]) - cast(int, sample["baseline_hwm_bytes"])
@@ -1115,8 +1183,11 @@ def validate_memory_report(
         fail(f"{label}: invalid units, direction, or hosted-runner interpretation")
     methodology = object_value(report.get("methodology"), f"{label}.methodology")
     exact_fields(methodology, set(MEMORY_METHODOLOGY), f"{label}.methodology")
-    if methodology != MEMORY_METHODOLOGY:
+    if methodology not in MEMORY_METHODOLOGY_LINEAGES:
         fail(f"{label}.methodology: unsupported Linux process-memory contract")
+    # A section measured before #222 reports the proxy on every cell, including
+    # the ones it is meaningless for. Newer sections omit those.
+    legacy = methodology == LEGACY_MEMORY_METHODOLOGY
     absolute = [
         validate_absolute(item, f"{label}.absolute_summaries[{index}]")
         for index, item in enumerate(
@@ -1137,6 +1208,7 @@ def validate_memory_report(
         for scenario, point in MEMORY_CELLS
         for metric in MEMORY_METRICS
         for allocator in declared
+        if legacy or fragmentation_applies(scenario) or metric != FRAGMENTATION_METRIC
     }
     actual_absolute = {
         (item["scenario_id"], item["thread_point"], item["metric_id"], item["allocator_id"])
@@ -1149,6 +1221,7 @@ def validate_memory_report(
         for metric in MEMORY_METRICS
         for allocator in declared
         if allocator != "upstream-mimalloc"
+        and (legacy or fragmentation_applies(scenario) or metric != FRAGMENTATION_METRIC)
     }
     actual_paired = {
         (
@@ -1177,7 +1250,7 @@ def validate_memory_report(
     if compact:
         return report
     raw = [
-        validate_memory_sample(item, f"{label}.raw_samples[{index}]")
+        validate_memory_sample(item, f"{label}.raw_samples[{index}]", legacy=legacy)
         for index, item in enumerate(list_value(report.get("raw_samples"), f"{label}.raw_samples"))
     ]
     groups: dict[tuple[object, object, object], list[dict[str, object]]] = {}
@@ -2685,17 +2758,24 @@ def memory_bar_length(value: float, maximum: float) -> int:
 
 
 def draw_ratio_bar_grid(
-    canvas: Canvas, cells: Mapping[tuple[str, str], Mapping[str, float]]
+    canvas: Canvas,
+    cells: Mapping[tuple[str, str], Mapping[str, float]],
+    unavailable: Mapping[tuple[str, str], str] | None = None,
 ) -> None:
     """Shared two-column bar grid for ratio panels: bars scale to each cell's
     largest value, every cell carries a 1.0 reference line, and cells are
     labeled. The 1.0 line is the honest reading for both panels: upstream
     parity for the normalized memory bars, RSS-equals-live-bytes for the
-    fragmentation proxy."""
+    fragmentation proxy.
 
+    Cells named in `unavailable` are drawn as a labeled empty box: the metric
+    has no value there, and the panel says so rather than inventing one."""
+
+    missing = dict(unavailable or {})
     canvas.rectangle(0, 0, MEMORY_PANEL_WIDTH, 62, (24, 35, 52))
     draw_allocator_legend(canvas, 30, 22)
-    if not cells:
+    keys = sorted(set(cells) | set(missing))
+    if not keys:
         empty = "no ratio cells in this envelope"
         canvas.text(
             (MEMORY_PANEL_WIDTH - text_width(empty, 2)) // 2,
@@ -2705,11 +2785,15 @@ def draw_ratio_bar_grid(
             2,
         )
         return
-    for ordinal, (key, values) in enumerate(sorted(cells.items())):
+    for ordinal, key in enumerate(keys):
         column, row = ordinal % 2, ordinal // 2
         left, top = 45 + column * 460, 85 + row * 112
         canvas.rectangle(left, top, 420, 92, (235, 240, 246))
         canvas.text(left + 8, top - 14, f"{key[0]}/{key[1]}", (90, 102, 115), 1)
+        values = cells.get(key) or {}
+        if key in missing or not values:
+            canvas.text(left + 14, top + 38, missing.get(key, "n/a"), (117, 126, 140), 2)
+            continue
         maximum = max(values.values())
         bar_left = left + 14
         for index, allocator in enumerate(ALLOCATOR_IDS):
@@ -2770,9 +2854,14 @@ def fragmentation_png(memory: Mapping[str, object]) -> bytes:
     """Fragmentation proxy (sampled peak RSS delta / peak live bytes) as its
     own lower-is-better panel with a 1.0 reference line."""
 
-    cells = memory_bar_cells(memory, "fragmentation-proxy")
+    cells = memory_bar_cells(memory, FRAGMENTATION_METRIC)
+    unavailable = {
+        (scenario, point): "n/a not applicable to this scenario"
+        for scenario, point in MEMORY_CELLS
+        if not fragmentation_applies(scenario)
+    }
     canvas = Canvas(MEMORY_PANEL_WIDTH, MEMORY_PANEL_HEIGHT, (248, 250, 252))
-    draw_ratio_bar_grid(canvas, cells)
+    draw_ratio_bar_grid(canvas, cells, unavailable)
     return encode_png(
         MEMORY_PANEL_WIDTH,
         MEMORY_PANEL_HEIGHT,
@@ -4064,13 +4153,22 @@ def render_html(latest: Mapping[str, object]) -> bytes:
                 f"<td>{escaped(display)}</td><td>{escaped(relative)}</td></tr>"
             )
 
-        memory_rows = "".join(memory_row(value) for value in memory_absolute)
+        # Cells the fragmentation proxy does not apply to are listed as n/a so
+        # the table never implies the metric was simply not measured.
+        not_applicable_rows = "".join(
+            f"<tr><td>{escaped(scenario)}</td><td>{escaped(point)}</td>"
+            f"<td>{escaped(FRAGMENTATION_METRIC)}</td><td>-</td><td>n/a</td>"
+            "<td>not applicable to this scenario</td></tr>"
+            for scenario, point in MEMORY_CELLS
+            if not fragmentation_applies(scenario)
+        )
+        memory_rows = "".join(memory_row(value) for value in memory_absolute) + not_applicable_rows
         memory_actions = (
             f"https://github.com/zackees/mimalloc-pprof/actions/runs/{escaped(memory_run['run_id'])}"
             if memory_run["run_origin"] == "github-actions"
             else "https://github.com/zackees/mimalloc-pprof/actions"
         )
-        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Sampled peak RSS normalized to upstream-mimalloc; 1.0 equals upstream; lower is better"><img src="benchmark-pareto.png" alt="Speed-memory Pareto scatter: fragmentation proxy versus median throughput; upper-left is better"><img src="benchmark-rss-timeline.png" alt="Linux process RSS over time with workload-drained marker and post-drain return-to-OS points; lower is better"><img src="benchmark-fragmentation.png" alt="Fragmentation proxy ratio bars with a 1.0 reference line; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. The bar chart normalizes sampled peak RSS to <code>upstream-mimalloc</code> = 1.0 (matching the throughput panel), with absolute MiB in the table below. The Pareto scatter pairs each allocator's fragmentation proxy with its median throughput on the matching scenario/thread cell; upper-left is better. The timeline shows RSS growth, the workload-drained marker, and the 100 ms / 1 s / 5 s post-drain points so return-to-OS behavior is visible. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th><th>vs upstream</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
+        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Sampled peak RSS normalized to upstream-mimalloc; 1.0 equals upstream; lower is better"><img src="benchmark-pareto.png" alt="Speed-memory Pareto scatter: fragmentation proxy versus median throughput; upper-left is better"><img src="benchmark-rss-timeline.png" alt="Linux process RSS over time with workload-drained marker and post-drain return-to-OS points; lower is better"><img src="benchmark-fragmentation.png" alt="Fragmentation proxy ratio bars with a 1.0 reference line; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. The bar chart normalizes sampled peak RSS to <code>upstream-mimalloc</code> = 1.0 (matching the throughput panel), with absolute MiB in the table below. The Pareto scatter pairs each allocator's fragmentation proxy with its median throughput on the matching scenario/thread cell; upper-left is better. The timeline shows RSS growth, the workload-drained marker, and the 100 ms / 1 s / 5 s post-drain points so return-to-OS behavior is visible. The fragmentation proxy is reported only where the live set is the measured quantity; <code>thread-churn</code> reads n/a by design, and any cell whose peak RSS never rose above its baseline records no ratio rather than a fabricated one. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th><th>vs upstream</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
     latency_html = ""
     if "latency" in latest:
         latency = validate_latency_report(latest["latency"], "latest.latency")

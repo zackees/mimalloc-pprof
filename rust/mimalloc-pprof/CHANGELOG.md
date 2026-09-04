@@ -1,6 +1,33 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
+
+The v3 line catches up with everything merged since 0.9.5: full Bun parity through
+oven-sh/mimalloc `b20b60d9`, a Rust binding for every C API this fork adds, and a CI that
+cross-builds every platform from Linux.
+
+- **Bun parity P0–P10** ([#264](https://github.com/zackees/mimalloc-pprof/issues/264),
+  [#315](https://github.com/zackees/mimalloc-pprof/issues/315)): background scavenger and
+  `mi_on_thread_idle*` park protocol, page hole purging (`purge_holes*`), `pthread_atfork`
+  handlers with a runtime lock-order checker, heap delete/destroy teardown protocol,
+  `mi_heap_dump_json`/`mi_heap_get_seq`, `MI_NO_PROCESS_DETACH`, zero-cost-when-off
+  profiler fast path, TLS-slot zeroing, glibc 2.44 `free(NULL)`-before-init fix, Windows
+  PRNG/RAM/NUMA fixes, macOS TLS slots 96/97, collect on sub-process-safe free, lazy
+  per-bin abandoned bitmaps and unmapped abandon on heap release.
+- **Padding and small-free fixes** ([#301](https://github.com/zackees/mimalloc-pprof/issues/301)):
+  `MI_OPT_FREE_SMALL` + `MI_PADDING` misrouting of 1009–1024 B blocks and `realloc` freeing
+  an interior pointer.
+- **Memory-regression gate made deterministic** ([#298](https://github.com/zackees/mimalloc-pprof/issues/298)):
+  a barrier in the churn workload; 5 % tolerance.
+- **`MI_DEBUG=3` via `MI_EXTRA_CPPDEFS` links** ([#312](https://github.com/zackees/mimalloc-pprof/issues/312)).
+- **CI**: every Windows and macOS artifact is cross-built on Linux (soldr); macOS x86_64
+  bundles execute in a macOS Recovery guest on a Linux runner, on demand; build-once /
+  run-all test bundles ([#307](https://github.com/zackees/mimalloc-pprof/issues/307)).
+- **Benchmarks**: Bun's fork is a fifth allocator row in every suite
+  ([#325](https://github.com/zackees/mimalloc-pprof/issues/325)); the idle memory-return
+  chart is measured under jemalloc, upstream mimalloc, Bun and this fork.
+
+### Rust crate
 
 Bind every C API this fork adds, and gate the binding surface so it cannot drift again.
 

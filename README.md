@@ -57,7 +57,7 @@ Profiling is **opt-in at runtime**: a build with `MI_PPROF=ON` (the default) doe
 not sample until you call a start API or set `MIMALLOC_PROF=1`.
 
 **v3 only.** This fork tracks upstream mimalloc's `dev3` line (crate
-[`mimalloc-pprof` 0.9.x](https://crates.io/crates/mimalloc-pprof)). The legacy v2
+[`mimalloc-pprof` 0.10.x](https://crates.io/crates/mimalloc-pprof)). The legacy v2
 line (0.8.x, upstream `main`) is preserved on the
 [`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch but is not
 maintained going forward. Upstream mimalloc v3 (`dev3`) is itself still a
@@ -1093,7 +1093,7 @@ Design history and milestone decisions are in
 
 The authoritative release record, with the reasoning behind each fix, is
 [`rust/mimalloc-pprof/CHANGELOG.md`](rust/mimalloc-pprof/CHANGELOG.md). The v3
-line ships as [`mimalloc-pprof` 0.9.x](https://crates.io/crates/mimalloc-pprof);
+line ships as [`mimalloc-pprof` 0.10.x](https://crates.io/crates/mimalloc-pprof);
 the v2 line (0.8.x) is maintained on the
 [`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch.
 

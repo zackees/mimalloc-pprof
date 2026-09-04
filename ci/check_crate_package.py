@@ -18,6 +18,18 @@ def member_text(archive: tarfile.TarFile, suffix: str) -> str:
     return stream.read().decode("utf-8")
 
 
+def crate_version(manifest: Path) -> str:
+    in_package = False
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_package = stripped == "[package]"
+            continue
+        if in_package and stripped.startswith("version"):
+            return stripped.split("=", 1)[1].strip().strip('"')
+    raise AssertionError(f"no [package] version in {manifest}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("archive", type=Path)
@@ -25,7 +37,12 @@ def main() -> None:
 
     archive_path = args.archive
     if archive_path.is_dir():
-        matches = list(archive_path.rglob("mimalloc-pprof-0.9.5.crate"))
+        # Resolve the crate version from the manifest instead of hard-coding it, so a
+        # release bump cannot make this check look for an archive that no longer exists.
+        version = crate_version(
+            Path(__file__).resolve().parent.parent / "rust" / "mimalloc-pprof" / "Cargo.toml"
+        )
+        matches = list(archive_path.rglob(f"mimalloc-pprof-{version}.crate"))
         if len(matches) != 1:
             raise AssertionError(f"expected one packaged archive, found {len(matches)}")
         archive_path = matches[0]

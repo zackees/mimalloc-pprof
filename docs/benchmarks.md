@@ -255,3 +255,5 @@ fragmentation metric for every allocator, so it keeps the same complete-block
 pairing unit as the byte metrics. If that leaves an applicable cell with fewer
 than the required 15 blocks, `benchmark-memory-validate` reports it by name
 against the assembled run; the raw samples are already on disk either way.
+`benchmark-memory.yml` therefore dispatches 17 blocks by default, so a cell can
+lose two blocks and still clear the minimum.

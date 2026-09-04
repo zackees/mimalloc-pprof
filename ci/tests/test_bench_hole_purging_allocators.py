@@ -189,6 +189,21 @@ class BenchHolePurgingAllocatorsTests(unittest.TestCase):
         self.assertIn("only 2 of 3 runs", table)
         self.assertIn("(in 2 of 3 runs)", " ".join(bench.caption_lines(summaries)))
 
+        # The footnote block grows the table, and an SVG has no layout engine: a second
+        # footnote that collides with the first, or falls outside the viewBox, renders
+        # silently wrong. The committed run is 3-of-3 everywhere, so this synthetic
+        # table is the only place that shape is ever drawn.
+        root = ET.fromstring(table)
+        height = float(root.attrib["viewBox"].split()[3])
+        footnotes = sorted(
+            float(node.attrib["y"])
+            for node in root.iter("{http://www.w3.org/2000/svg}text")
+            if node.attrib.get("font-size") == "11"
+        )
+        self.assertEqual(len(footnotes), 2, "expected the standing note plus one run note")
+        self.assertGreaterEqual(footnotes[1] - footnotes[0], 12, "footnote lines collide")
+        self.assertLess(footnotes[-1], height, "a footnote falls outside the viewBox")
+
         # ...and the same rendering says nothing of the kind for the committed run.
         self.assertNotIn("of 3 runs;", bench.render_table_svg(report["series"], bench.LIGHT, "s"))
 

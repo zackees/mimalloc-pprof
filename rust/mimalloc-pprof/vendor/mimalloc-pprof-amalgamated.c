@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 1d3ee8bb of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit be4badf9 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -18609,6 +18609,19 @@ mi_theap_t* _mi_thread_init_with_heap(mi_heap_t* heap_main)
     // of another one -- so nothing is lost.
     _mi_scavenger_start_lazy();
   }
+  #if MI_OWNER_GATE
+  // #366: in a gated build a thread that is not inside an allocator call is PARKED, and a
+  // thread that has JUST initialised is outside one -- unless this init ran from inside a
+  // gated operation (depth >= 1: a `mi_heap_new` under the gate, say), which stays RUNNING.
+  // `_mi_gate_enter` initialises at depth 0 too and then acquires (PARKED -> RUNNING), so the
+  // store is right for it as well. Without this, a thread the platform initialises for us
+  // (the Windows loader's TLS callback runs `mi_thread_init` for every new thread) that
+  // never allocates would sit RUNNING forever and be "pending" to every `mi_purge_all`.
+  // Done LAST: the theap must be fully set up before a sweeper may claim the tld.
+  if (theap != NULL && theap->tld != NULL && theap->tld->thread_id == _mi_thread_id() && theap->tld->gate_depth == 0) {
+    mi_atomic_store_release(&theap->tld->park_state, (size_t)MI_PARK_PARKED);
+  }
+  #endif
   return theap;
 }
 

@@ -143,12 +143,17 @@ typedef struct mi_purge_walk_s {
 static mi_tld_t* mi_purge_walk_claim(mi_subproc_t* sp, mi_tld_t* my_tld, mi_purge_walk_t* w, bool* unstamped) {
   mi_tld_t* claimed = NULL;
   const uintptr_t me = (uintptr_t)_mi_thread_id();
+  mi_tld_t* const scav_tld = _mi_scavenger_tld_ptr();   // NULL: the scavenger has no tld (every non-DLL build), or none runs
   *unstamped = false;
   mi_lock(&sp->tlds_lock) {
     for (mi_tld_t* tld = sp->tlds; tld != NULL; tld = tld->subproc_next) {
       if (mi_atomic_load_relaxed(&tld->purge_epoch) == w->seq) continue;   // done, given up, or born after `seq`
       if (tld == my_tld) {                                                 // phase C did it
         mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);
+        continue;
+      }
+      if (scav_tld != NULL && tld == scav_tld) {                           // the scavenger's own tld (Windows DLL build):
+        mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);                // it owns nothing and never parks -- neither swept nor pending
         continue;
       }
       if ((mi_atomic_load_relaxed(&tld->gate_flags) & MI_GATE_FLAG_ORPHAN) != 0) {

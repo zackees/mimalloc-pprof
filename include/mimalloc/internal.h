@@ -407,6 +407,7 @@ void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0);
 // per-page loops (collect MI_FORCE, hole pacing ignored).
 void          _mi_thread_idle_work_ex(mi_tld_t* tld, mi_theap_t* theap0, bool force);
 void          _mi_park_leave_gate(mi_tld_t* tld);   // #366: `_mi_park_leave` without the parked_count decrement (owner-gate acquire)
+mi_tld_t*     _mi_scavenger_tld_ptr(void);          // #366: the scavenger's own tld if it has one (a Windows DLL build gives it one; the purge walk skips it), else NULL
 mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);
 // #272 test observable (test/test-park-handoff.c). `mi_decl_export` because the
 // `ctest-shared` job links that test against the shared library, where the default

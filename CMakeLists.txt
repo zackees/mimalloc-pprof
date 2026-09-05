@@ -1574,17 +1574,19 @@ if (MI_BUILD_TESTS)
   # ci/check_macos_labels.py requires the `macos` label (applied below with the others).
   # The remote one forks and takes the child's task port -- RUN_SERIAL keeps a wave of
   # other tests from sharing the machine while it does.
-  if(APPLE AND MI_OVERRIDE AND MI_OSX_ZONE)
+  # Linked against the OBJECT library, not mimalloc-static: the zone is registered by a
+  # constructor in alloc-override-zone.c, and an archive member nothing references is
+  # never pulled into the link, so with mimalloc-static the constructor never runs and
+  # `malloc_default_zone()` stays "DefaultMallocZone" (measured in the Recovery guest on
+  # PR #349's first run). The object library is upstream's documented way to get static
+  # override on macOS (readme-upstream.md, "Static override").
+  if(APPLE AND MI_OVERRIDE AND MI_OSX_ZONE AND MI_BUILD_OBJECT AND NOT MI_DEBUG_TSAN)
     foreach(mi_osx_test test-osx-zone-introspect test-osx-zone-introspect-remote)
-      add_executable(mimalloc-${mi_osx_test} test/${mi_osx_test}.c)
+      add_executable(mimalloc-${mi_osx_test} test/${mi_osx_test}.c $<TARGET_OBJECTS:mimalloc-obj>)
       target_compile_definitions(mimalloc-${mi_osx_test} PRIVATE ${mi_defines})
       target_compile_options(mimalloc-${mi_osx_test} PRIVATE ${mi_cflags})
       target_include_directories(mimalloc-${mi_osx_test} PRIVATE include)
-      if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
-        target_link_libraries(mimalloc-${mi_osx_test} PRIVATE mimalloc-static ${mi_libraries})
-      else()
-        target_link_libraries(mimalloc-${mi_osx_test} PRIVATE mimalloc ${mi_libraries})
-      endif()
+      target_link_libraries(mimalloc-${mi_osx_test} PRIVATE ${mi_libraries})
       add_test(NAME ${mi_osx_test} COMMAND mimalloc-${mi_osx_test})
     endforeach()
   endif()

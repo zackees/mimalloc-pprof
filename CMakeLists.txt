@@ -1975,6 +1975,13 @@ set(mi_macos_tests
   test-osx-zone-introspect-remote
   test-tls-slots-heap
   test-threadlocal-growth
+  # #354: portable tests whose Darwin behaviour differs from Linux enough to be worth a
+  # Recovery run whenever a Darwin path changes. fork: #270's handlers live in the zone
+  # file's force_lock/reinit_lock and in libSystem's _malloc_fork_* interposes;
+  # stress-dynamic: the DYLD_INSERT_LIBRARIES path. (test-redirect-probe is Windows-only.)
+  test-fork-locks
+  test-fork-user-heap
+  test-stress-dynamic
 )
 foreach(mi_macos_test IN LISTS mi_macos_tests)
   if(mi_macos_test IN_LIST mi_registered_tests)

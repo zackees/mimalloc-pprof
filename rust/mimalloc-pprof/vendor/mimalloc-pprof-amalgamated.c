@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 90941fc3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 1d3ee8bb of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4779,6 +4779,7 @@ void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0);
 // per-page loops (collect MI_FORCE, hole pacing ignored).
 void          _mi_thread_idle_work_ex(mi_tld_t* tld, mi_theap_t* theap0, bool force);
 void          _mi_park_leave_gate(mi_tld_t* tld);   // #366: `_mi_park_leave` without the parked_count decrement (owner-gate acquire)
+mi_tld_t*     _mi_scavenger_tld_ptr(void);          // #366: the scavenger's own tld if it has one (a Windows DLL build gives it one; the purge walk skips it), else NULL
 mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);
 // #272 test observable (test/test-park-handoff.c). `mi_decl_export` because the
 // `ctest-shared` job links that test against the shared library, where the default
@@ -26295,12 +26296,17 @@ typedef struct mi_purge_walk_s {
 static mi_tld_t* mi_purge_walk_claim(mi_subproc_t* sp, mi_tld_t* my_tld, mi_purge_walk_t* w, bool* unstamped) {
   mi_tld_t* claimed = NULL;
   const uintptr_t me = (uintptr_t)_mi_thread_id();
+  mi_tld_t* const scav_tld = _mi_scavenger_tld_ptr();   // NULL: the scavenger has no tld (every non-DLL build), or none runs
   *unstamped = false;
   mi_lock(&sp->tlds_lock) {
     for (mi_tld_t* tld = sp->tlds; tld != NULL; tld = tld->subproc_next) {
       if (mi_atomic_load_relaxed(&tld->purge_epoch) == w->seq) continue;   // done, given up, or born after `seq`
       if (tld == my_tld) {                                                 // phase C did it
         mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);
+        continue;
+      }
+      if (scav_tld != NULL && tld == scav_tld) {                           // the scavenger's own tld (Windows DLL build):
+        mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);                // it owns nothing and never parks -- neither swept nor pending
         continue;
       }
       if ((mi_atomic_load_relaxed(&tld->gate_flags) & MI_GATE_FLAG_ORPHAN) != 0) {
@@ -28763,7 +28769,8 @@ void _mi_scavenger_start(void) { }
 void _mi_scavenger_stop(void)  { }
 void _mi_scavenger_wake(mi_subproc_t* subproc) { MI_UNUSED(subproc); }
 bool _mi_scavenger_is_running(void) { return false; }
-void _mi_scavenger_forked_child(void) { }
+void _mi_scavenger_forked_child(void) {
+  mi_atomic_store_release(&_mi_scavenger_tld, (uintptr_t)0); }   // #366: that thread did not survive the fork
 void _mi_scavenger_start_lazy(void) { _mi_scavenger_start(); }
 
 #else
@@ -28775,6 +28782,16 @@ static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = runnin
 // thread any more. Without it `_mi_scavenger_start_lazy` -- reachable from a thread that parks
 // while the process is tearing down -- can spawn a scavenger AFTER the stop that was supposed
 // to join it, leaving a thread walking a subproc that is being dismantled.
+// #366: the scavenger's own thread id. In a Windows DLL build the loader's TLS callback runs
+// `mi_win_main(DLL_THREAD_ATTACH)` -> `mi_thread_init` for EVERY new thread, this one included,
+// so the scavenger owns a registered tld it never allocates from and never parks -- a thread
+// that would sit RUNNING forever and be reported "pending" by every `mi_purge_all`. The walk
+// skips it (src/purge-all.c) -- by POINTER, never by thread id: a fork child's first new thread
+// reuses the dead sibling's TLS base, i.e. its id, and an id match would alias that orphan.
+// NULL until the thread runs, or when it has no tld (every non-DLL build); reset in the child.
+static _Atomic(uintptr_t) _mi_scavenger_tld;
+mi_tld_t* _mi_scavenger_tld_ptr(void) { return (mi_tld_t*)mi_atomic_load_acquire(&_mi_scavenger_tld); }
+
 static _Atomic(uintptr_t) _mi_scavenger_shutdown;
 
 // -----------------------------------------------------------------------------
@@ -28965,6 +28982,10 @@ static void mi_scav_init(void) { }
 // -----------------------------------------------------------------------------
 
 static void mi_scavenger_run(void) {
+  {   // #366: see `_mi_scavenger_tld`
+    mi_theap_t* const own = _mi_theap_default();
+    mi_atomic_store_release(&_mi_scavenger_tld, (uintptr_t)(mi_theap_is_initialized(own) ? own->tld : NULL));
+  }
   // Use the main subproc directly: this thread never allocates, so don't
   // initialise a theap/tld via _mi_subproc()'s TLS path.
   mi_subproc_t* const subproc = _mi_subproc_main();
@@ -29118,7 +29139,8 @@ void _mi_scavenger_stop(void) {
   }
 }
 
-void _mi_scavenger_forked_child(void) { }    // no fork on Windows
+void _mi_scavenger_forked_child(void) {
+  mi_atomic_store_release(&_mi_scavenger_tld, (uintptr_t)0); }   // #366: that thread did not survive the fork    // no fork on Windows
 void _mi_scavenger_start_lazy(void) {        // see the POSIX one
   if (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0) return;
   static _Atomic(uintptr_t) started;
@@ -29207,6 +29229,7 @@ void _mi_scavenger_stop(void) {
 // child would: take the wake path in `_mi_arenas_purge_now` and signal nobody (so never purge at
 // all), and `pthread_join` a `pthread_t` that names no thread at exit.
 void _mi_scavenger_forked_child(void) {
+  mi_atomic_store_release(&_mi_scavenger_tld, (uintptr_t)0);   // #366: that thread did not survive the fork
   mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)0);   // a fresh image, not a teardown
   mi_atomic_store_release(&_mi_scavenger_joinable, (uintptr_t)0);
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);

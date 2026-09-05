@@ -19,8 +19,13 @@ fn churn() -> Vec<Vec<u8>> {
     held
 }
 
+// cargo runs the tests of one file on parallel threads; two purges in flight at once means one
+// of them is legitimately `Busy`. Serialise them so "the only purge in flight" holds.
+static ONE_PURGE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn purge_all_from_a_second_thread_with_live_allocations() {
+    let _serial = ONE_PURGE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let held = churn();
 
     let (tx, rx) = mpsc::channel();
@@ -74,6 +79,7 @@ fn purge_all_from_a_second_thread_with_live_allocations() {
 
 #[test]
 fn purge_all_convenience_form() {
+    let _serial = ONE_PURGE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let held = churn();
     let report = mimalloc_pprof::purge_all(true);
     assert_eq!(report.gated, cfg!(feature = "owner-gate"));

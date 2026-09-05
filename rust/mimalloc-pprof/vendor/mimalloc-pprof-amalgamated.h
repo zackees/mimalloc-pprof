@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit a63848f5 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 1e2be6f8 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -609,10 +609,9 @@ typedef enum mi_option_e {
   mi_option_prof_seed,                  // profiler sampling PRNG seed; 0 = nondeterministic (=0)
   mi_option_prof_max_bytes,             // budget (in bytes) for profiler-internal arena memory; 0 = unbudgeted (=0)
   mi_option_memory_events,              // enable opt-in allocation-change accounting/callbacks (MIMALLOC_MEMORY_EVENTS) (=0)
-  mi_option_purge_zeroes,               // DEAD since #80: the implementation added by #79 went away with the v3 pin bump and was never
-                                        // restored (see issue #67). The option slot is kept -- never renumber -- and setting
-                                        // MIMALLOC_PURGE_ZEROES still parses, it just has no effect. NOT related to
-                                        // `purge_holes_eager_zero` below, which is the opposite knob (it zeroes MORE, for testing).
+  mi_option_purge_zeroes,               // zero-tracking (=0, #67/#337): after a decommit-purge that the OS documents as zero-filling, forget the slices were dirty so the next
+                                        // mi_zalloc skips its memset and untouched pages never become resident again. Linux + macOS; Windows never claims zero.
+                                        // Not to be confused with `purge_holes_eager_zero` below, the opposite knob (it zeroes MORE, for testing).
   mi_option_scavenger,                  // run a background thread that purges scheduled arena memory (=1). imported from oven-sh/mimalloc @ 942b8342, MIT (#272)
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b). Appended
   // after `scavenger`, NOT at Bun's slot numbers 50-53: slots 47+ diverged long ago (#264).

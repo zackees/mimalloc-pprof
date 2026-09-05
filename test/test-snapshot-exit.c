@@ -139,8 +139,8 @@ int main(int argc, char** argv) {
   _putenv("MIMALLOC_SNAPSHOT_ON_EXIT=2");
   { char buf[1024]; snprintf(buf, sizeof buf, "MIMALLOC_SNAPSHOT_PATH=%s", path); _putenv(buf); }
   const char* args[] = { argv[0], "--child", NULL };
-  intptr_t rc = _spawnv(_P_WAIT, argv[0], args);
-  if (rc != 0) { fprintf(stderr, "FAIL: child exited %d\n", (int)rc); return 1; }
+  const intptr_t child_rc = _spawnv(_P_WAIT, argv[0], args);
+  if (child_rc != 0) { fprintf(stderr, "FAIL: child exited %d\n", (int)child_rc); return 1; }
   #else
   setenv("MIMALLOC_SNAPSHOT_ON_EXIT", "2", 1);
   setenv("MIMALLOC_SNAPSHOT_PATH", path, 1);

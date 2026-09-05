@@ -746,9 +746,9 @@
           "feature": "macOS zone introspection (leaks, vmmap)",
           "cells": {
             "mimalloc-pprof": {
-              "status": "no",
-              "note": "stub enumerator — #339",
-              "source": "https://github.com/zackees/mimalloc-pprof/issues/339"
+              "status": "yes",
+              "note": "in- and out-of-process — #349",
+              "source": "https://github.com/zackees/mimalloc-pprof/pull/349"
             },
             "upstream": {
               "status": "no",

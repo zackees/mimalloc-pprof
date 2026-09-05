@@ -436,8 +436,8 @@
           "feature": "Live heap snapshot with a viewer",
           "cells": {
             "mimalloc-pprof": {
-              "status": "no",
-              "note": "not imported — #338",
+              "status": "yes",
+              "note": "mi_heap_snapshot — #338",
               "source": "https://github.com/zackees/mimalloc-pprof/issues/338"
             },
             "upstream": {

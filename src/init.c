@@ -721,6 +721,7 @@ void mi_process_init(void) mi_attr_noexcept {
 // Called when the process is done
 static void mi_process_done_once(void) {
   _mi_scavenger_stop();   // #272: stop the background scavenger before any teardown
+  _mi_heap_snapshot_on_exit();   // #338 (Bun parity): heap snapshot at exit, after the scavenger stopped and before anything is torn down
   // only shutdown if we were initialized
   if (!_mi_process_is_initialized) return;
   // ensure we are called once

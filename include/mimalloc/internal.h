@@ -192,6 +192,7 @@ void          _mi_theap_cached_set(mi_theap_t* theap);
 mi_subproc_t* _mi_subproc_main_init(void);
 void          _mi_subproc_main_done(void);
 mi_subproc_t* _mi_subproc_main(void);
+void          _mi_heap_snapshot_on_exit(void);   // heap-snapshot.c (#338): honours mi_option_snapshot_on_exit
 bool          _mi_subproc_is_main(mi_subproc_t* subproc);
 mi_subproc_t* _mi_subproc(void);          // current subproc of this thread
 mi_heap_t*    _mi_subproc_heap_main(mi_subproc_t* subproc);

@@ -591,6 +591,38 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout)
         self.assertIn("out of 1", proc.stdout)
 
+    def test_label_selects_by_manifest_labels(self) -> None:
+        """#339: `--label macos` runs exactly the tests whose LABELS carry `macos`."""
+        self.write_manifest(
+            [
+                self.spec("t-mac", "ok", labels=["macos"]),
+                self.spec("t-mac-serial", "ok", labels=["serial", "macos"]),
+                self.spec("t-linux", "boom"),
+            ]
+        )
+        proc = self.run_bundle("--label", "macos")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("out of 2", proc.stdout)
+
+    def test_label_and_only_intersect(self) -> None:
+        self.write_manifest(
+            [
+                self.spec("t-mac", "ok", labels=["macos"]),
+                self.spec("t-mac2", "boom", labels=["macos"]),
+            ]
+        )
+        proc = self.run_bundle("--label", "macos", "--only", "t-mac")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("out of 1", proc.stdout)
+
+    def test_label_nobody_carries_is_an_error_not_an_empty_green(self) -> None:
+        """The 'gate that verifies nothing' shape: a mistyped label, or a macOS-only test
+        that forgot its LABELS, must be red -- never a 100% pass of zero tests."""
+        self.write_manifest([self.spec("t-ok", "ok")])
+        proc = self.run_bundle("--label", "macos")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("carries any of the labels", proc.stderr)
+
     def test_only_with_an_unknown_name_is_an_error(self) -> None:
         self.write_manifest([self.spec("t-ok", "ok")])
         proc = self.run_bundle("--only", "t-nope")

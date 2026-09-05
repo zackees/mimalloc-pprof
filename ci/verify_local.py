@@ -694,6 +694,10 @@ def run_lint(ctx: RunCtx) -> bool:
         # render from docs/allocator-features.json, and `--check` fails if any of the
         # three has drifted from it.
         ["uv", "run", "ci/render_feature_table.py", "--check"],
+        # Selective macOS lane helpers (#339): the label check that runs on every
+        # cross-built bundle and the PR-diff decision that picks the lane.
+        ["uv", "run", "ci/check_macos_labels.py", "--selftest"],
+        ["uv", "run", "ci/macos_lane_decide.py", "--selftest"],
     ):
         rc, _ = run_logged(cmd, cwd=ROOT, log=ctx.log)
         ok = ok and rc == 0

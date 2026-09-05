@@ -72,6 +72,11 @@ jobs:
       # see the module docstring for why it parses the YAML instead of grepping it.
       - name: No workflow may schedule onto a native macOS runner
         run: python3 ci/lint_no_macos_runners.py
+      - name: Selective macOS lane helpers (#339)
+        run: |
+          set -euo pipefail
+          python3 ci/check_macos_labels.py --selftest
+          python3 ci/macos_lane_decide.py --selftest
 
       # The committed chart SVGs under .github/assets must still re-render
       # byte-for-byte from the committed CSV/JSON they name. `--check` re-renders and

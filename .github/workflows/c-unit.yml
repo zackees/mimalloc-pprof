@@ -44,13 +44,8 @@ on:
   push:
     branches: [main, v4]
   pull_request:
-    paths:
-      - 'src/**'
-      - 'include/**'
-      - 'test/**'
-      - 'CMakeLists.txt'
-      - 'ci/**'
-      - '.github/workflows/c-unit.yml'
+    # No `paths` filter (#360): every job here is a required status check on `main`, and a
+    # filtered workflow never reports on a PR outside its paths, leaving that PR BLOCKED.
 
 concurrency:
   # The macOS/Windows queue hog (#277). A superseded push's ctest result is worthless.

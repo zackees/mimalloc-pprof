@@ -62,14 +62,12 @@ it. `macos-bundles.yml` has two more jobs:
   `CMakeLists.txt`, the lane's own files — or whether the PR carries the `needs-macos`
   label. It always completes, so it is the job branch protection requires; a
   conditional job cannot be.
-- **Branch protection (#352)** requires `decide` plus 13 other checks on `main`. Known
-  hole: `c-unit.yml`, `macos-bundles.yml`, `windows-bundles.yml` and `python-lint.yml`
-  are all `pull_request.paths`-filtered, so a PR that touches none of those paths
-  (docs-only, for instance) never gets its required checks reported and stays BLOCKED.
-  Such PRs are merged with `gh pr merge --admin` (`enforce_admins` is off for exactly
-  this); the proper fix — an always-running workflow that reports the required
-  contexts as success when the filtered paths are untouched — is tracked as a
-  follow-up on #351.
+- **Branch protection (#352)** requires `decide` plus 13 other checks on `main`. Since
+  #360 the four gate workflows (`c-unit.yml`, `macos-bundles.yml`, `windows-bundles.yml`,
+  `python-lint.yml`) have **no `pull_request.paths` filter**: a required check that never
+  reports leaves a PR BLOCKED, which is what happened to docs-only PRs (#359 had to be
+  admin-merged). The price is a full CI run on a docs-only PR; do not put the filters
+  back without also solving the reporting problem. Push triggers keep their filters.
 - **`run-macos-x64-selective`** runs when `decide` says so: the same Recovery guest,
   but `run_test_bundle.py --label macos` on the release and debug-full bundles, judged
   by the same `ci/recovery_expected_failures.py` (a waiver for a test that did not run

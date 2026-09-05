@@ -10,17 +10,8 @@ on:
   push:
     branches: [main, v4]
   pull_request:
-    paths:
-      - 'ci/**'
-      - 'pyproject.toml'
-      - '.github/workflows/**'
-      # The feature table renders from docs/allocator-features.json into the README
-      # region and both SVGs. Without these three, an edit to any of them would skip
-      # this job entirely and the `--check` below could not catch the drift it exists
-      # to catch.
-      - 'README.md'
-      - 'docs/allocator-features.json'
-      - '.github/assets/allocator-features-*.svg'
+    # No `paths` filter (#360): every job here is a required status check on `main`, and a
+    # filtered workflow never reports on a PR outside its paths, leaving that PR BLOCKED.
 
 concurrency:
   # Pure verification: a superseded push's answer is worthless.

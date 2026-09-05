@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 590" width="1400" height="590" role="img">
+<rect width="1400" height="590" fill="#0d1117"/>
+<rect x="92" y="118" width="560" height="362" fill="#111823" rx="6"/>
+<rect x="519.9" y="118" width="132.1" height="362" fill="#1a2230" rx="6"/>
+<text x="644.0" y="138.0" fill="#7d8da5" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">oversubscribed (&gt; 4 vCPU)</text>
+<line x1="92" y1="480.0" x2="652" y2="480.0" stroke="#1f2937" stroke-width="1"/>
+<text x="80.0" y="484.0" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">0</text>
+<line x1="92" y1="389.5" x2="652" y2="389.5" stroke="#1f2937" stroke-width="1"/>
+<text x="80.0" y="393.5" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">15.1M</text>
+<line x1="92" y1="299.0" x2="652" y2="299.0" stroke="#1f2937" stroke-width="1"/>
+<text x="80.0" y="303.0" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">30.2M</text>
+<line x1="92" y1="208.5" x2="652" y2="208.5" stroke="#1f2937" stroke-width="1"/>
+<text x="80.0" y="212.5" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">45.3M</text>
+<line x1="92" y1="118.0" x2="652" y2="118.0" stroke="#1f2937" stroke-width="1"/>
+<text x="80.0" y="122.0" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">60.4M</text>
+<line x1="92.0" y1="118" x2="92.0" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="92.0" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">1</text>
+<line x1="278.7" y1="118" x2="278.7" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="278.7" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">2</text>
+<line x1="387.9" y1="118" x2="387.9" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="387.9" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">3</text>
+<line x1="465.3" y1="118" x2="465.3" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="465.3" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">4</text>
+<line x1="574.5" y1="118" x2="574.5" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="574.5" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">6</text>
+<text x="574.5" y="524.0" fill="#7d8da5" font-size="11" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="middle">1.5x</text>
+<line x1="652.0" y1="118" x2="652.0" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="652.0" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">8</text>
+<text x="652.0" y="524.0" fill="#7d8da5" font-size="11" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="middle">2x</text>
+<path d="M92.0 369.3 L278.7 267.7 L387.9 243.2 L465.3 206.3 L574.5 209.1 L652.0 205.2" fill="none" stroke="#e3b341" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="92.0" cy="369.3" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<circle cx="278.7" cy="267.7" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<circle cx="387.9" cy="243.2" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<circle cx="465.3" cy="206.3" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<circle cx="574.5" cy="209.1" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<circle cx="652.0" cy="205.2" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<path d="M92.0 355.1 L278.7 234.4 L387.9 203.1 L465.3 161.6 L574.5 158.1 L652.0 156.8" fill="none" stroke="#bc8cff" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="92.0" cy="355.1" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<circle cx="278.7" cy="234.4" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<circle cx="387.9" cy="203.1" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<circle cx="465.3" cy="161.6" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<circle cx="574.5" cy="158.1" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<circle cx="652.0" cy="156.8" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<path d="M92.0 355.0 L278.7 241.2 L387.9 207.1 L465.3 164.4 L574.5 160.8 L652.0 158.4" fill="none" stroke="#3fb950" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="92.0" cy="355.0" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="278.7" cy="241.2" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="387.9" cy="207.1" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="465.3" cy="164.4" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="574.5" cy="160.8" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="652.0" cy="158.4" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<path d="M92.0 361.9 L278.7 241.4 L387.9 215.9 L465.3 176.1 L574.5 167.9 L652.0 168.4" fill="none" stroke="#ff9d5c" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="92.0" cy="361.9" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<circle cx="278.7" cy="241.4" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<circle cx="387.9" cy="215.9" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<circle cx="465.3" cy="176.1" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<circle cx="574.5" cy="167.9" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<circle cx="652.0" cy="168.4" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<path d="M92.0 384.0 L278.7 339.0 L387.9 331.0 L465.3 325.5 L574.5 325.0 L652.0 325.1" fill="none" stroke="#58a6ff" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="92.0" cy="384.0" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<circle cx="278.7" cy="339.0" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<circle cx="387.9" cy="331.0" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<circle cx="465.3" cy="325.5" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<circle cx="574.5" cy="325.0" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<circle cx="652.0" cy="325.1" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<text x="80.0" y="72.0" fill="#e8eef7" font-size="20" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="start">General mix (8 B-4 KiB, with realloc)</text>
+<text x="80.0" y="94.0" fill="#7d8da5" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="start">aggregate throughput (operations/second) by worker thread count</text>
+<rect x="712" y="118" width="560" height="362" fill="#111823" rx="6"/>
+<rect x="1139.9" y="118" width="132.1" height="362" fill="#1a2230" rx="6"/>
+<text x="1264.0" y="138.0" fill="#7d8da5" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">oversubscribed (&gt; 4 vCPU)</text>
+<line x1="712" y1="480.0" x2="1272" y2="480.0" stroke="#1f2937" stroke-width="1"/>
+<text x="700.0" y="484.0" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">0</text>
+<line x1="712" y1="389.5" x2="1272" y2="389.5" stroke="#1f2937" stroke-width="1"/>
+<text x="700.0" y="393.5" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">11.1M</text>
+<line x1="712" y1="299.0" x2="1272" y2="299.0" stroke="#1f2937" stroke-width="1"/>
+<text x="700.0" y="303.0" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">22.3M</text>
+<line x1="712" y1="208.5" x2="1272" y2="208.5" stroke="#1f2937" stroke-width="1"/>
+<text x="700.0" y="212.5" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">33.4M</text>
+<line x1="712" y1="118.0" x2="1272" y2="118.0" stroke="#1f2937" stroke-width="1"/>
+<text x="700.0" y="122.0" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="end">44.5M</text>
+<line x1="712.0" y1="118" x2="712.0" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="712.0" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">1</text>
+<line x1="898.7" y1="118" x2="898.7" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="898.7" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">2</text>
+<line x1="1007.9" y1="118" x2="1007.9" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="1007.9" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">3</text>
+<line x1="1085.3" y1="118" x2="1085.3" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="1085.3" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">4</text>
+<line x1="1194.5" y1="118" x2="1194.5" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="1194.5" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">6</text>
+<text x="1194.5" y="524.0" fill="#7d8da5" font-size="11" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="middle">1.5x</text>
+<line x1="1272.0" y1="118" x2="1272.0" y2="480" stroke="#1f2937" stroke-width="1"/>
+<text x="1272.0" y="506.0" fill="#e8eef7" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="middle">8</text>
+<text x="1272.0" y="524.0" fill="#7d8da5" font-size="11" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="middle">2x</text>
+<path d="M712.0 328.7 L898.7 311.7 L1007.9 302.3 L1085.3 292.5 L1194.5 276.9 L1272.0 261.6" fill="none" stroke="#e3b341" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="712.0" cy="328.7" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<circle cx="898.7" cy="311.7" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<circle cx="1007.9" cy="302.3" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<circle cx="1085.3" cy="292.5" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<circle cx="1194.5" cy="276.9" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<circle cx="1272.0" cy="261.6" r="4.5" fill="#0d1117" stroke="#e3b341" stroke-width="2.5"/>
+<path d="M712.0 401.3 L898.7 366.2 L1007.9 331.8 L1085.3 279.9 L1194.5 226.8 L1272.0 156.8" fill="none" stroke="#bc8cff" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="712.0" cy="401.3" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<circle cx="898.7" cy="366.2" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<circle cx="1007.9" cy="331.8" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<circle cx="1085.3" cy="279.9" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<circle cx="1194.5" cy="226.8" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<circle cx="1272.0" cy="156.8" r="4.5" fill="#0d1117" stroke="#bc8cff" stroke-width="2.5"/>
+<path d="M712.0 382.5 L898.7 365.4 L1007.9 331.2 L1085.3 297.0 L1194.5 245.2 L1272.0 194.4" fill="none" stroke="#3fb950" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="712.0" cy="382.5" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="898.7" cy="365.4" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="1007.9" cy="331.2" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="1085.3" cy="297.0" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="1194.5" cy="245.2" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="1272.0" cy="194.4" r="4.5" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<path d="M712.0 381.9 L898.7 347.7 L1007.9 330.6 L1085.3 295.9 L1194.5 245.1 L1272.0 193.8" fill="none" stroke="#ff9d5c" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="712.0" cy="381.9" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<circle cx="898.7" cy="347.7" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<circle cx="1007.9" cy="330.6" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<circle cx="1085.3" cy="295.9" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<circle cx="1194.5" cy="245.1" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<circle cx="1272.0" cy="193.8" r="4.5" fill="#0d1117" stroke="#ff9d5c" stroke-width="2.5"/>
+<path d="M712.0 381.8 L898.7 347.7 L1007.9 330.6 L1085.3 296.3 L1194.5 245.1 L1272.0 193.7" fill="none" stroke="#58a6ff" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="712.0" cy="381.8" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<circle cx="898.7" cy="347.7" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<circle cx="1007.9" cy="330.6" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<circle cx="1085.3" cy="296.3" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<circle cx="1194.5" cy="245.1" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<circle cx="1272.0" cy="193.7" r="4.5" fill="#0d1117" stroke="#58a6ff" stroke-width="2.5"/>
+<text x="700.0" y="72.0" fill="#e8eef7" font-size="20" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="600" text-anchor="start">peak RSS by worker count</text>
+<text x="700.0" y="94.0" fill="#7d8da5" font-size="13" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="start">external smaps_rollup peak during the measured block; lower is better</text>
+<rect x="80.0" y="536" width="22" height="4" rx="2" fill="#e3b341"/>
+<text x="110.0" y="543.0" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="start">tcmalloc</text>
+<rect x="173.2" y="536" width="22" height="4" rx="2" fill="#bc8cff"/>
+<text x="203.2" y="543.0" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="start">jemalloc</text>
+<rect x="266.4" y="536" width="22" height="4" rx="2" fill="#3fb950"/>
+<text x="296.4" y="543.0" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="start">upstream-mimalloc</text>
+<rect x="426.2" y="536" width="22" height="4" rx="2" fill="#ff9d5c"/>
+<text x="456.2" y="543.0" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="start">bun-mimalloc</text>
+<rect x="549.0" y="536" width="22" height="4" rx="2" fill="#58a6ff"/>
+<text x="579.0" y="543.0" fill="#8b98ad" font-size="12" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="start">mimalloc-pprof</text>
+<text x="80.0" y="574.0" fill="#7d8da5" font-size="11" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-weight="normal" text-anchor="start">coverage mode - reduced statistical rigor (3 blocks) | median of 3 paired blocks | runner 2P/4L | informational</text>
+</svg>

@@ -219,8 +219,9 @@ mi_subproc_id_t mi_subproc_new(void) {
   // `mi_theap_zalloc_aligned` call that lock is already held across (subproc.c, above) -- an
   // MI_DEBUG>2 reentrant-lock abort, or a Release-build hang. Setting this false means a meta
   // page is never abandoned in the first place, so `_mi_page_abandon` never reaches that path
-  // for one; `_mi_arenas_page_abandon` also carries its own belt-and-braces
-  // `_mi_meta_is_meta_page_safe` guard (arena.c) in case this ever regresses.
+  // for one. (Since #350 the lazy bitmap is raw OS memory and takes no `theap_meta_lock`, so
+  // the self-edge itself is gone; this line stays because a meta theap abandoning its own
+  // pages is still pointless work, and it keeps parity with init.c.)
   theap_meta->allow_page_abandon = false;
   #if MI_GUARDED
   // See the matching comment in init.c's process-main theap_meta bootstrap (#266):

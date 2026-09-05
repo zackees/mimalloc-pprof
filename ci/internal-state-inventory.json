@@ -445,24 +445,23 @@
       ]
     },
     {
-      "id": "arena-pages-abandoned-bitmap",
+"id": "arena-pages-abandoned-bitmap",
       "path": "src/arena.c",
-      "callee": "_mi_meta_zalloc_aligned",
-      "args": "arena->subproc,size,MI_BCHUNK_SIZE,NULL",
+      "callee": "_mi_os_zalloc",
+      "args": "arena->subproc,total,&memid",
       "occurrence": 1,
-      "owner": "arena sub-process meta-data theap",
-      "initial_owner": "zeroed allocation from subproc->theap_meta (under theap_meta_lock)",
-      "owner_transitions": "CAS-published into arena_pages->pages_abandoned[bin]; loser frees its copy with _mi_free_subproc_safe",
+      "owner": "the (heap, arena) pair's arena_pages entry pages_abandoned[bin]",
+      "initial_owner": "zeroed raw OS allocation (mi_arena_pages_abandoned_ensure); a MI_BCHUNK_SIZE header (subproc, total, memid) precedes the MI_BCHUNK_SIZE-aligned bitmap",
+      "owner_transitions": "CAS-published into arena_pages->pages_abandoned[bin]; loser frees its copy with mi_arena_abandoned_map_free (_mi_os_free via the header)",
       "destroyable_by": "owning heap teardown (mi_heap_free -> _mi_arena_pages_free)",
-      "lifetime": "same as the (heap, arena) pair's arena_pages -- allocated lazily on first abandon of a page of this bin, not up front with arena_pages itself",
-      "logical_size": "mi_bitmap_size(arena->slice_count, NULL)",
-      "usable_size": "allocator size class; embedded bitmap layout uses logical size only",
-      "cleanup": "_mi_arena_pages_free at heap teardown (mi_heap_free, src/heap.c), which frees each non-NULL pages_abandoned[bin] before freeing arena_pages itself",
+      "lifetime": "same as the (heap, arena) pair's arena_pages -- allocated lazily on first abandon of a page of this bin, not up front with arena_pages itself (Bun parity P10b, #317); raw OS memory rather than Bun's meta-theap block since #350",
+      "logical_size": "MI_BCHUNK_SIZE + mi_bitmap_size(arena->slice_count, NULL), rounded up to the OS page size",
+      "usable_size": "the same rounded total; the bitmap uses its logical size only",
+      "cleanup": "_mi_arena_pages_free at heap teardown (mi_heap_free, src/heap.c), which frees each non-NULL pages_abandoned[bin] through its header (_mi_os_free) before freeing arena_pages itself",
       "publication": "mi_bitmap_init'd before the CAS into arena_pages->pages_abandoned[bin]; the CAS loser's copy is freed unpublished",
       "locks": [
-        "allocation occurs under subproc->theap_meta_lock (inside _mi_meta_zalloc_aligned)",
-        "the caller (mi_arena_pages_abandoned_ensure) is reached from _mi_arenas_page_abandon, typically under heap->theaps_lock (mi_heap_detach_theaps's abandon loop) -- see the new heap->theaps_lock -> subproc->theap_meta_lock edge documented in src/fork.c's lock-order table (issue #317)",
-        "never reentrant against itself: a page belonging to subproc->theap_meta can no longer reach mi_page_to_full -> _mi_page_abandon -> _mi_arenas_page_abandon at all, now that mi_subproc_new (src/subproc.c) sets theap_meta->allow_page_abandon=false (matching init.c's process theap_meta); _mi_arenas_page_abandon also checks _mi_meta_is_meta_page_safe(page) and skips this allocator for a meta page regardless, belt and braces (Opus review of #317/#319)"
+        "none: raw OS allocation, no allocator lock (#350 -- the former _mi_meta_zalloc_aligned allocation under subproc->theap_meta_lock on the thread-exit abandon path made the Linux memory gate bimodal, and created a heap->theaps_lock -> theap_meta_lock edge that is now gone from src/fork.c's table)",
+        "the caller (mi_arena_pages_abandoned_ensure) is reached from _mi_arenas_page_abandon, typically under heap->theaps_lock (mi_heap_detach_theaps's abandon loop); safe for a meta-theap page too, so #319's _mi_meta_is_meta_page_safe guard was removed"
       ]
     },
     {

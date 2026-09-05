@@ -65,6 +65,8 @@ name = "t17_realloc_profiling"
 required-features = ["pprof"]
 
 [[test]]
+name = "t18_heap_snapshot"
+[[test]]
 name = "feature_contract"
 
 [build-dependencies]

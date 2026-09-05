@@ -25,8 +25,11 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <AvailabilityMacros.h>
 #include <malloc/malloc.h>
-#include <string.h>  // memset
+#include <string.h>  // memset, memcpy
+#include <stddef.h>  // offsetof
 #include <stdlib.h>
+
+#include "mimalloc-stats.h"   // mi_stats_get (intro_statistics)
 
 #ifdef __cplusplus
 extern "C" {
@@ -147,14 +150,226 @@ static boolean_t zone_claimed_address(malloc_zone_t* zone, void* p) {
    Introspection members
 ------------------------------------------------------ */
 
-static kern_return_t intro_enumerator(task_t task, void* p,
+// #339: real zone enumeration (Bun parity; ported from oven-sh/mimalloc @ b20b60d9,
+// src/prim/osx/alloc-override-zone.c, MIT). This is what `leaks`, `heap`, `vmmap` and
+// `malloc_history` call: in-process with an identity reader, or from ANOTHER task with a
+// `memory_reader_t` that copies the target's memory. Every pointer below is therefore a
+// REMOTE address and is only ever dereferenced through `reader` (the `MI_ZR` macro);
+// a read that fails, or a free-list link that points outside its page, ends the walk
+// with KERN_FAILURE / a bounded break instead of a crash on a torn or hostile heap.
+//
+// The root is `zone->reserved1`, set to `_mi_subproc_main()` at zone registration.
+
+#define MI_ZONE_ENUM_BATCH 256
+
+typedef struct mi_zone_enum_s {
+  task_t   task;
+  void*    context;
+  unsigned type_mask;
+  vm_range_recorder_t* recorder;
+  unsigned count;
+  vm_range_t ranges[MI_ZONE_ENUM_BATCH];
+} mi_zone_enum_t;
+
+static void mi_zone_enum_flush(mi_zone_enum_t* e, unsigned type) {
+  if (e->count > 0) {
+    e->recorder(e->task, e->context, type, e->ranges, e->count);
+    e->count = 0;
+  }
+}
+
+static void mi_zone_enum_push(mi_zone_enum_t* e, unsigned type, void* addr, size_t size) {
+  if (e->count == MI_ZONE_ENUM_BATCH) mi_zone_enum_flush(e, type);
+  e->ranges[e->count].address = (vm_address_t)addr;
+  e->ranges[e->count].size    = (vm_size_t)size;
+  e->count++;
+}
+
+/* ------------------------------------------------------
+   Out-of-process enumeration (leaks/heap/malloc_history).
+   Every pointer is a remote address; dereference via `reader`.
+------------------------------------------------------ */
+
+#include "../../bitmap.h"   // mi_bitmap_t / mi_bchunk_t layout
+
+static kern_return_t mi_zr_identity(task_t task, vm_address_t addr, vm_size_t size, void** out) {
+  MI_UNUSED(task); MI_UNUSED(size);
+  *out = (void*)addr;
+  return KERN_SUCCESS;
+}
+
+#define MI_ZR(dst, rptr, sz) do { \
+  void* _p = NULL; \
+  if (reader(task, (vm_address_t)(rptr), (vm_size_t)(sz), &_p) != KERN_SUCCESS || _p == NULL) return KERN_FAILURE; \
+  memcpy((dst), _p, (sz)); \
+} while(0)
+
+static kern_return_t mi_zone_enum_remote_freelist(task_t task, memory_reader_t reader,
+                                                  vm_address_t rpage, const mi_page_t* lpage,
+                                                  vm_address_t pstart, size_t bsize,
+                                                  mi_block_t* rhead, uintptr_t* free_map, size_t cap)
+{
+  MI_UNUSED(rpage); MI_UNUSED(lpage);
+  vm_address_t rb = (vm_address_t)rhead;
+  size_t guard = 0;
+  while (rb != 0 && guard++ <= cap) {
+    if (rb < pstart || (size_t)(rb - pstart) >= cap * bsize) break;  // corrupt / out of page
+    size_t idx = (size_t)(rb - pstart) / bsize;
+    free_map[idx / MI_INTPTR_BITS] |= ((uintptr_t)1 << (idx % MI_INTPTR_BITS));
+    mi_encoded_t enc;
+    MI_ZR(&enc, rb, sizeof(enc));
+    #if MI_ENCODE_FREELIST
+    rb = (vm_address_t)mi_ptr_decode((const void*)rpage, enc, lpage->keys);
+    #else
+    rb = (vm_address_t)enc;
+    #endif
+  }
+  return KERN_SUCCESS;
+}
+
+static kern_return_t mi_zone_enum_remote_page(task_t task, memory_reader_t reader,
+                                              mi_zone_enum_t* e, vm_address_t rpage)
+{
+  mi_page_t lpage;
+  MI_ZR(&lpage, rpage, sizeof(lpage));
+  const size_t bsize  = lpage.block_size;
+  if (bsize == 0 || lpage.capacity == 0) return KERN_SUCCESS;
+  const size_t ubsize = bsize - MI_PADDING_SIZE;
+  // `lpage` is a local copy of a page that lives in the TARGET process, so the block start
+  // must be rebuilt from the remote page address -- mi_page_start(&lpage) would offset from
+  // our own copy. (The start is stored as an offset from the page struct, in `MI_MAX_ALIGN_SIZE` units.)
+  const vm_address_t pstart = (vm_address_t)(rpage + ((size_t)lpage.page_ma_offset * MI_MAX_ALIGN_SIZE));
+
+  if (e->type_mask & MALLOC_PTR_REGION_RANGE_TYPE) {
+    mi_zone_enum_flush(e, MALLOC_PTR_IN_USE_RANGE_TYPE);
+    mi_zone_enum_push(e, MALLOC_PTR_REGION_RANGE_TYPE, (void*)pstart, (size_t)lpage.reserved * bsize);
+    mi_zone_enum_flush(e, MALLOC_PTR_REGION_RANGE_TYPE);
+  }
+  if (!(e->type_mask & MALLOC_PTR_IN_USE_RANGE_TYPE)) return KERN_SUCCESS;
+  if (lpage.used == 0) return KERN_SUCCESS;
+
+  // `xthread_free` is atomic in the live page; this is a memcpy'd snapshot, so a relaxed
+  // load of the copy is the honest way to read it (and keeps -Watomic-* quiet).
+  mi_block_t* xtf = (mi_block_t*)((uintptr_t)mi_atomic_load_relaxed(&lpage.xthread_free) & ~(uintptr_t)1);
+  if (lpage.free == NULL && lpage.local_free == NULL && xtf == NULL) {
+    for (size_t i = 0; i < lpage.capacity; i++) {
+      mi_zone_enum_push(e, MALLOC_PTR_IN_USE_RANGE_TYPE, (void*)(pstart + i*bsize), ubsize);
+    }
+    return KERN_SUCCESS;
+  }
+
+  #define MI_ZR_MAX_BLOCKS  (MI_SMALL_PAGE_SIZE / sizeof(void*))
+  uintptr_t free_map[MI_ZR_MAX_BLOCKS / MI_INTPTR_BITS];
+  const size_t cap = (lpage.capacity > MI_ZR_MAX_BLOCKS ? MI_ZR_MAX_BLOCKS : lpage.capacity);
+  const size_t mapw = _mi_divide_up(cap, MI_INTPTR_BITS);
+  memset(free_map, 0, mapw * sizeof(uintptr_t));
+
+  if (mi_zone_enum_remote_freelist(task, reader, rpage, &lpage, pstart, bsize, lpage.free,       free_map, cap) != KERN_SUCCESS) return KERN_FAILURE;
+  if (mi_zone_enum_remote_freelist(task, reader, rpage, &lpage, pstart, bsize, lpage.local_free, free_map, cap) != KERN_SUCCESS) return KERN_FAILURE;
+  if (mi_zone_enum_remote_freelist(task, reader, rpage, &lpage, pstart, bsize, xtf,              free_map, cap) != KERN_SUCCESS) return KERN_FAILURE;
+
+  for (size_t w = 0; w < mapw; w++) {
+    uintptr_t used = ~free_map[w];
+    while (used != 0) {
+      size_t bit = mi_ctz(used);
+      size_t idx = w*MI_INTPTR_BITS + bit;
+      if (idx >= cap) break;
+      mi_zone_enum_push(e, MALLOC_PTR_IN_USE_RANGE_TYPE, (void*)(pstart + idx*bsize), ubsize);
+      used &= used - 1;
+    }
+  }
+  return KERN_SUCCESS;
+}
+
+static kern_return_t mi_zone_enum_remote_bitmap(task_t task, memory_reader_t reader,
+                                                mi_zone_enum_t* e, vm_address_t rarena,
+                                                vm_address_t rpages_meta, vm_address_t rbitmap)
+{
+  size_t chunk_count;
+  MI_ZR(&chunk_count, rbitmap + offsetof(mi_bitmap_t, chunk_count), sizeof(chunk_count));
+  if (chunk_count > MI_BITMAP_MAX_CHUNK_COUNT) return KERN_FAILURE;   // torn / hostile header
+  for (size_t c = 0; c < chunk_count; c++) {
+    mi_bchunk_t chunk;
+    MI_ZR(&chunk, rbitmap + offsetof(mi_bitmap_t, chunks) + c*sizeof(mi_bchunk_t), sizeof(chunk));
+    for (size_t f = 0; f < MI_BCHUNK_FIELDS; f++) {
+      mi_bfield_t b = mi_atomic_load_relaxed(&chunk.bfields[f]);
+      while (b != 0) {
+        size_t bit = mi_ctz(b);
+        size_t slice_index = c*MI_BCHUNK_BITS + f*MI_BFIELD_BITS + bit;
+        // mirror `mi_arena_page_at_slice`: with separated metadata, small-block
+        // pages still keep the page struct at the slice start (block_size==0 in
+        // pages_meta marks that case).
+        vm_address_t rpage = rarena + slice_index * MI_ARENA_SLICE_SIZE;
+        if (rpages_meta != 0) {
+          vm_address_t rmeta = rpages_meta + slice_index * sizeof(mi_page_t);
+          size_t bs; MI_ZR(&bs, rmeta + offsetof(mi_page_t, block_size), sizeof(bs));
+          if (bs > 0) rpage = rmeta;
+        }
+        if (mi_zone_enum_remote_page(task, reader, e, rpage) != KERN_SUCCESS) return KERN_FAILURE;
+        b &= b - 1;
+      }
+    }
+  }
+  return KERN_SUCCESS;
+}
+
+static kern_return_t intro_enumerator(task_t task, void* context,
                             unsigned type_mask, vm_address_t zone_address,
                             memory_reader_t reader,
                             vm_range_recorder_t recorder)
 {
-  // todo: enumerate all memory
-  MI_UNUSED(task); MI_UNUSED(p); MI_UNUSED(type_mask); MI_UNUSED(zone_address);
-  MI_UNUSED(reader); MI_UNUSED(recorder);
+  if (recorder == NULL) return KERN_SUCCESS;
+  if (reader == NULL) reader = &mi_zr_identity;
+
+  mi_zone_enum_t e = { task, context, type_mask, recorder, 0, {{0,0}} };
+
+  // root: zone->reserved1 holds the main subproc (set at zone registration)
+  vm_address_t rsubproc;
+  MI_ZR(&rsubproc, zone_address + offsetof(malloc_zone_t, reserved1), sizeof(rsubproc));
+  if (rsubproc == 0) return KERN_SUCCESS;
+  mi_subproc_t lsubproc;
+  MI_ZR(&lsubproc, rsubproc, sizeof(lsubproc));
+
+  if (type_mask & MALLOC_ADMIN_REGION_RANGE_TYPE) {
+    for (size_t i = 0; i < MI_MAX_ARENAS; i++) {
+      mi_arena_t* ra = mi_atomic_load_ptr_relaxed(mi_arena_t, &lsubproc.arenas[i]);
+      if (ra == NULL) continue;
+      mi_arena_t la; MI_ZR(&la, ra, sizeof(la));
+      mi_zone_enum_push(&e, MALLOC_ADMIN_REGION_RANGE_TYPE, ra, la.slice_count * MI_ARENA_SLICE_SIZE);
+    }
+    mi_zone_enum_flush(&e, MALLOC_ADMIN_REGION_RANGE_TYPE);
+  }
+
+  if (!(type_mask & (MALLOC_PTR_IN_USE_RANGE_TYPE | MALLOC_PTR_REGION_RANGE_TYPE))) {
+    return KERN_SUCCESS;
+  }
+
+  // walk every heap -> arena_pages[i]->pages bitmap -> page -> blocks
+  vm_address_t rheap = (vm_address_t)lsubproc.heaps;
+  size_t heap_guard = 0;
+  while (rheap != 0 && heap_guard++ < 100000) {
+    mi_heap_t lheap; MI_ZR(&lheap, rheap, sizeof(lheap));
+    for (size_t i = 0; i < MI_MAX_ARENAS; i++) {
+      mi_arena_pages_t* rap = mi_atomic_load_ptr_relaxed(mi_arena_pages_t, &lheap.arena_pages[i]);
+      mi_arena_t*       ra  = mi_atomic_load_ptr_relaxed(mi_arena_t, &lsubproc.arenas[i]);
+      if (rap == NULL || ra == NULL) continue;
+      mi_arena_t la; MI_ZR(&la, ra, sizeof(la));
+      mi_arena_pages_t lap; MI_ZR(&lap, rap, sizeof(lap));
+      kern_return_t kr = mi_zone_enum_remote_bitmap(task, reader, &e,
+                            (vm_address_t)ra, (vm_address_t)la.pages_meta, (vm_address_t)lap.pages);
+      if (kr != KERN_SUCCESS) return kr;
+    }
+    // OS-allocated abandoned pages (not in any arena bitmap)
+    vm_address_t rosp = (vm_address_t)lheap.os_abandoned_pages;
+    size_t page_guard = 0;
+    while (rosp != 0 && page_guard++ < 1000000) {
+      mi_page_t lp; MI_ZR(&lp, rosp, sizeof(lp));
+      if (mi_zone_enum_remote_page(task, reader, &e, rosp) != KERN_SUCCESS) return KERN_FAILURE;
+      rosp = (vm_address_t)lp.next;
+    }
+    rheap = (vm_address_t)lheap.next;
+  }
+  mi_zone_enum_flush(&e, MALLOC_PTR_IN_USE_RANGE_TYPE);
   return KERN_SUCCESS;
 }
 
@@ -197,11 +412,18 @@ static void intro_force_unlock(malloc_zone_t* zone) {
 
 static void intro_statistics(malloc_zone_t* zone, malloc_statistics_t* stats) {
   MI_UNUSED(zone);
-  // todo...
-  stats->blocks_in_use = 0;
-  stats->size_in_use = 0;
-  stats->max_size_in_use = 0;
-  stats->size_allocated = 0;
+  // #339 (Bun parity): subproc stats are a lower bound -- per-theap counters merge up
+  // lazily (on collect/thread-done). For exact numbers use the enumerator.
+  mi_stats_t_decl(mst);
+  if (mi_stats_get(&mst)) {
+    stats->blocks_in_use   = (unsigned)(mst.malloc_normal_count.total + mst.malloc_huge_count.total);
+    stats->size_in_use     = (size_t)(mst.malloc_normal.current + mst.malloc_huge.current);
+    stats->max_size_in_use = (size_t)(mst.malloc_normal.peak + mst.malloc_huge.peak);
+    stats->size_allocated  = (size_t)(mst.reserved.current);
+  }
+  else {
+    stats->blocks_in_use = 0; stats->size_in_use = 0; stats->max_size_in_use = 0; stats->size_allocated = 0;
+  }
 }
 
 static boolean_t intro_zone_locked(malloc_zone_t* zone) {
@@ -246,6 +468,14 @@ static malloc_introspection_t mi_introspect = {
 #if defined(MAC_OS_X_VERSION_10_6) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_6) && !defined(__ppc__)
   .statistics = &intro_statistics,
   .zone_locked = &intro_zone_locked,
+  .enable_discharge_checking = NULL,
+  .disable_discharge_checking = NULL,
+  .discharge = NULL,
+  #ifdef __BLOCKS__
+  .enumerate_discharged_pointers = NULL,
+  #else
+  .enumerate_unavailable_without_blocks = NULL,
+  #endif
 #endif  
 #if defined(MAC_OS_X_VERSION_10_12) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_12) && !defined(__ppc__)
   .reinit_lock = &intro_reinit_lock,
@@ -309,6 +539,7 @@ static bool is_mimalloc_zone( malloc_zone_t* zone ) {
 
 static inline malloc_zone_t* mi_get_default_zone(void) {
   mi_atomic_do_once {
+    mi_malloc_zone.reserved1 = _mi_subproc_main();   // #339: root for (out-of-process) introspection
     malloc_zone_register(&mi_malloc_zone);  // by calling register we avoid a zone error on free (see <http://eatmyrandom.blogspot.com/2010/03/mallocfree-interception-on-mac-os-x.html>)
   }
   return &mi_malloc_zone;
@@ -493,6 +724,7 @@ static void _mi_macos_override_malloc(void) {
 
   // Register our zone.
   // thomcc: I think this is still needed to put us in the zone list.
+  mi_malloc_zone.reserved1 = _mi_subproc_main();   // #339: root for (out-of-process) introspection
   malloc_zone_register(&mi_malloc_zone);
   // Unregister the default zone, this makes our zone the new default
   // as that was the last registered.

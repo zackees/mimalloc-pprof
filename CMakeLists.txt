@@ -1569,6 +1569,26 @@ if (MI_BUILD_TESTS)
   endif()
   add_test(NAME test-heap-dump-json COMMAND mimalloc-test-heap-dump-json)
 
+  # #339: macOS malloc-zone introspection (what `leaks`/`heap`/`vmmap` call). Darwin-only:
+  # the zone exists only with MI_OVERRIDE + MI_OSX_ZONE. Both are `test-osx-*`, so
+  # ci/check_macos_labels.py requires the `macos` label (applied below with the others).
+  # The remote one forks and takes the child's task port -- RUN_SERIAL keeps a wave of
+  # other tests from sharing the machine while it does.
+  if(APPLE AND MI_OVERRIDE AND MI_OSX_ZONE)
+    foreach(mi_osx_test test-osx-zone-introspect test-osx-zone-introspect-remote)
+      add_executable(mimalloc-${mi_osx_test} test/${mi_osx_test}.c)
+      target_compile_definitions(mimalloc-${mi_osx_test} PRIVATE ${mi_defines})
+      target_compile_options(mimalloc-${mi_osx_test} PRIVATE ${mi_cflags})
+      target_include_directories(mimalloc-${mi_osx_test} PRIVATE include)
+      if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+        target_link_libraries(mimalloc-${mi_osx_test} PRIVATE mimalloc-static ${mi_libraries})
+      else()
+        target_link_libraries(mimalloc-${mi_osx_test} PRIVATE mimalloc ${mi_libraries})
+      endif()
+      add_test(NAME ${mi_osx_test} COMMAND mimalloc-${mi_osx_test})
+    endforeach()
+  endif()
+
   # thread-local slot array provenance (issue #128 B3): the array must not be
   # allocated from whatever heap the application happens to have set as its default,
   # or mi_heap_destroy on that heap frees it while it is still live.
@@ -1916,6 +1936,7 @@ endif()
 # (MI_PPROF, non-Windows, ...), and set_tests_properties() on a test that was never
 # registered is a hard CMake error.
 set(mi_serial_tests
+  test-osx-zone-introspect-remote
   test-memory-gate
   test-degenerate
   test-process-rss
@@ -1948,6 +1969,8 @@ endforeach()
 # worth re-running on Darwin (the TLS-slot probes: pthread TSD slots are a macOS-only
 # mechanism) may be added too. Appended, so RUN_SERIAL's `serial` label survives.
 set(mi_macos_tests
+  test-osx-zone-introspect
+  test-osx-zone-introspect-remote
   test-tls-slots-heap
   test-threadlocal-growth
 )

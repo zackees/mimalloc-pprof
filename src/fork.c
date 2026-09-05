@@ -135,18 +135,10 @@ terms of the MIT license. A copy of the license can be found in the file
                                     -> `mi_theap_free_mem` -> `_mi_meta_free` (theap.c:363)
                                     ... and, for a page owned by `theap_meta`, `mi_free`
                                     -> `mi_stat_free` (free.c:768) takes `theap_meta_lock`
-                                    ... and (Bun parity P10b, #317): `mi_heap_detach_theaps`
-                                    (heap.c) holds `theaps_lock` across its `_mi_theap_abandon`
-                                    loop -> `_mi_page_abandon` -> `_mi_arenas_page_abandon`
-                                    (arena.c) -> `mi_arena_pages_abandoned_ensure` (arena.c) ->
-                                    `_mi_meta_zalloc_aligned`, which takes `theap_meta_lock`.
-                                    Live only for a MAIN heap: a releasing (non-main) heap sets
-                                    `heap->releasing` just before this loop, which makes
-                                    `_mi_arenas_page_abandon` skip the `..._ensure` call
-                                    entirely (see the `heap->releasing` comment in
-                                    `mi_heap_detach_theaps`, heap.c). Same target level as the
-                                    edge above, no reordering needed (MI_FORK_LOCK_THEAPS=3
-                                    already precedes MI_FORK_LOCK_THEAP_META=7 below).
+                                    (#350 removed the P10b/#317 edge that used to be listed
+                                    here: `mi_arena_pages_abandoned_ensure` now allocates the
+                                    per-bin abandoned bitmap from raw OS memory and takes no
+                                    `theap_meta_lock` at all.)
       -> tld->theaps_lock           `_mi_heap_detach_theaps` -- but `mi_lock_TRY_acquire`
                                     with a back-off retry (theap.c:412), so NOT a blocking
                                     edge; see the Phase 7 gap note below
@@ -194,10 +186,11 @@ terms of the MIT license. A copy of the license can be found in the file
                                     `mi_subproc_new` now sets `theap_meta->allow_page_abandon
                                     = false` (matching `init.c`'s process theap_meta), so
                                     `mi_page_to_full` never abandons one of `theap_meta`'s own
-                                    pages in the first place; `_mi_arenas_page_abandon` also
-                                    checks `_mi_meta_is_meta_page_safe(page)` and skips the
-                                    lazy-bitmap allocation for a meta page regardless (falls
-                                    through to the unmapped-abandon path), belt and braces.
+                                    pages in the first place. (The second guard --
+                                    `_mi_meta_is_meta_page_safe` in `_mi_arenas_page_abandon`
+                                    -- went with #350: the lazy bitmap is raw OS memory now
+                                    and takes no `theap_meta_lock`, so there is no self-edge
+                                    left to guard.)
 
     heap_main->arena_pages_lock     arena.c:685      LEAF. For the main heap
                                     `mi_heap_ensure_arena_pages` only stores

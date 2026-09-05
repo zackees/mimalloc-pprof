@@ -61,6 +61,14 @@ int _mi_prim_commit(void* addr, size_t size, bool* is_zero);
 // pre: needs_recommit != NULL
 int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit);
 
+// Zero-tracking (#337, restored from #79/#67; mechanism as in oven-sh/mimalloc @ b20b60d9, MIT).
+// Like `_mi_prim_decommit`, but also reports whether the range is GUARANTEED to read back
+// zero on its next use (`is_zero`): true only when the primitive used an operation the OS
+// documents as zero-filling (Linux MADV_DONTNEED on private anonymous memory, Darwin
+// MADV_ZERO). Windows/wasi/emscripten never claim it -- their zero-on-reuse, if any, is
+// delivered by the recommit path instead. pre: needs_recommit != NULL, is_zero != NULL
+int _mi_prim_decommit_zero(void* addr, size_t size, bool* needs_recommit, bool* is_zero);
+
 // Reset memory. The range keeps being accessible but the content might be reset to zero at any moment.
 // Returns error code or 0 on success.
 int _mi_prim_reset(void* addr, size_t size);

@@ -340,6 +340,7 @@ mi_decl_nodiscard bool _mi_os_protect(void* addr, size_t size);
 bool          _mi_os_unprotect(void* addr, size_t size);
 bool          _mi_os_purge(mi_subproc_t* subproc, void* p, size_t size);
 bool          _mi_os_purge_ex(mi_subproc_t* subproc, void* p, size_t size, bool allow_reset, size_t stats_size, mi_commit_fun_t* commit_fun, void* commit_fun_arg);
+bool          _mi_os_purge_zero(mi_subproc_t* subproc, void* p, size_t size, size_t stat_size, bool* is_zero);   // zero-tracking (#337)
 
 size_t        _mi_os_secure_guard_page_size(void);
 bool          _mi_os_secure_guard_page_set_at(mi_subproc_t* subproc, void* addr, mi_memid_t memid);

@@ -185,7 +185,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(prof_seed) }
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(prof_max_bytes) }        // budget for profiler-internal arena memory; 0 = unbudgeted
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(memory_events) }         // opt-in allocation-change accounting/callbacks; read lazily by memory-events.c, not at startup
-  ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_zeroes) }           // experimental (#67): treat decommit-purged slices as zeroed so mi_zalloc can skip its memset
+  ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_zeroes) }           // zero-tracking (#67, restored by #337): treat OS-zero-filled decommit-purged slices as zeroed so mi_zalloc can skip its memset
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(scavenger) }              // background thread that purges scheduled arena memory (MIMALLOC_SCAVENGER)
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)

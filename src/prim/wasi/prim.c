@@ -143,6 +143,13 @@ int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
   return 0;
 }
 
+// Zero-tracking (#337): this platform never claims zero on purge; zero-on-reuse, if any,
+// is delivered by the recommit path. See prim.h.
+int _mi_prim_decommit_zero(void* addr, size_t size, bool* needs_recommit, bool* is_zero) {
+  *is_zero = false;
+  return _mi_prim_decommit(addr, size, needs_recommit);
+}
+
 int _mi_prim_reset(void* addr, size_t size) {
   MI_UNUSED(addr); MI_UNUSED(size);
   return 0;

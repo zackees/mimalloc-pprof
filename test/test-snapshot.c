@@ -75,5 +75,8 @@ int main(int argc, char** argv) {
   }
 
   for (size_t i = 0; i < nk; i++) mi_free(keep[i]);
+  // mimalloc-pprof: as a ctest this must leave nothing behind (the viewer is exercised on
+  // committed fixtures instead, see ci/tests/test_heap_snapshot_example.py).
+  if (argc <= 3 || strcmp(argv[3], "--keep") != 0) { remove(out); if (out2 != NULL) remove(out2); }
   return 0;
 }

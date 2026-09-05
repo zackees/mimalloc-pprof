@@ -1585,7 +1585,10 @@ if (MI_BUILD_TESTS)
   else()
     target_link_libraries(mimalloc-test-snapshot PRIVATE mimalloc ${mi_libraries})
   endif()
-  add_test(NAME test-snapshot COMMAND mimalloc-test-snapshot ${CMAKE_CURRENT_BINARY_DIR}/test-snapshot.bin)
+  # Relative output names: the test writes into its working directory (the build tree under
+  # ctest, the bundle root under ci/run_test_bundle.py) and deletes the file when done, so
+  # ci/bundle_tests.py never mistakes the output for an input asset and nothing is left behind.
+  add_test(NAME test-snapshot COMMAND mimalloc-test-snapshot test-snapshot.bin)
   # The exit-time path (option 2 + path env), verified by an independent C reader.
   add_executable(mimalloc-test-snapshot-exit test/test-snapshot-exit.c)
   target_compile_definitions(mimalloc-test-snapshot-exit PRIVATE ${mi_defines})
@@ -1596,7 +1599,7 @@ if (MI_BUILD_TESTS)
   else()
     target_link_libraries(mimalloc-test-snapshot-exit PRIVATE mimalloc ${mi_libraries})
   endif()
-  add_test(NAME test-snapshot-exit COMMAND mimalloc-test-snapshot-exit ${CMAKE_CURRENT_BINARY_DIR}/test-snapshot-exit.bin)
+  add_test(NAME test-snapshot-exit COMMAND mimalloc-test-snapshot-exit test-snapshot-exit.bin)
 
   # #339: macOS malloc-zone introspection (what `leaks`/`heap`/`vmmap` call). Darwin-only:
   # the zone exists only with MI_OVERRIDE + MI_OSX_ZONE. Both are `test-osx-*`, so

@@ -149,5 +149,7 @@ int main(int argc, char** argv) {
   int status = 0; waitpid(pid, &status, 0);
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) { fprintf(stderr, "FAIL: child status %d\n", status); return 1; }
   #endif
-  return parent_check(path);
+  const int rc = parent_check(path);
+  remove(path);   /* leave nothing behind */
+  return rc;
 }

@@ -548,9 +548,9 @@
 <path d="M 1098.7 1228.0 l 6.0 6.0 M 1104.7 1228.0 l -6.0 6.0" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linecap="round"/>
 <text x="1112.7" y="1235.0" font-size="11" fill="#8b949e">pthread_getspecific</text>
 <text x="24" y="1259.0" font-size="12" fill="#e6edf3">Purged memory tracked as still-zero</text>
-<circle cx="460.9" cy="1255.0" r="7.0" fill="#f85149"/>
-<path d="M 457.9 1252.0 l 6.0 6.0 M 463.9 1252.0 l -6.0 6.0" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linecap="round"/>
-<text x="471.9" y="1259.0" font-size="11" fill="#8b949e">lost in a rebase — #337</text>
+<circle cx="436.6" cy="1255.0" r="7.0" fill="#3fb950"/>
+<path d="M 433.2 1255.2 l 2.2 2.4 l 4.2 -5.0" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="447.6" y="1259.0" font-size="11" fill="#8b949e">_mi_os_purge_zero, opt-in — #337</text>
 <circle cx="660.1" cy="1255.0" r="7.0" fill="#f85149"/>
 <path d="M 657.1 1252.0 l 6.0 6.0 M 663.1 1252.0 l -6.0 6.0" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linecap="round"/>
 <text x="671.1" y="1259.0" font-size="11" fill="#8b949e">_mi_os_purge has no is_zero</text>

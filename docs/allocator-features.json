@@ -1052,7 +1052,7 @@
           "cells": {
             "mimalloc-pprof": {
               "status": "yes",
-              "note": "_mi_os_purge_zero behind mi_option_purge_zeroes — #337",
+              "note": "_mi_os_purge_zero, opt-in — #337",
               "source": "https://github.com/zackees/mimalloc-pprof/issues/337"
             },
             "upstream": {

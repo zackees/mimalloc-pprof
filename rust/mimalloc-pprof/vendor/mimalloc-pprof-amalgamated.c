@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit cdc3a1ec of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit bc2b3a25 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -11625,22 +11625,11 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
       // and abandon the page unmapped, like a full page: it stays reachable through `pages`
       // and is reclaimed once a block in it is freed.
       //
-      // Defensive guard (Opus review of #319): never call `mi_arena_pages_abandoned_ensure`
-      // -> `_mi_meta_zalloc_aligned` for a page belonging to the subproc's own meta theap.
-      // That would re-enter `subproc->theap_meta_lock` non-recursively: `_mi_meta_zalloc_aligned`
-      // (subproc.c) holds the lock across a full `mi_theap_zalloc_aligned` on `theap_meta`,
-      // whose slow path can retire a full page of `theap_meta` itself (`mi_page_to_full`,
-      // page.c) into `_mi_page_abandon` -> here -> `..._ensure` -> the same lock again.
-      // `subproc.c`'s `mi_subproc_new` now sets `theap_meta->allow_page_abandon = false` (like
-      // `init.c`'s process theap_meta) to close the live path -- a meta theap's pages are
-      // never abandoned at all, so `_mi_page_abandon` should never reach here for one -- but a
-      // self-edge like this cannot be resolved by the MI_FORK_LOCK_* ordering (that orders
-      // acquisition across DIFFERENT call sites, not a lock against itself on one stack), so
-      // keep this check as belt and braces against a future option/call-graph change.
-      mi_bitmap_t* bitmap = NULL;
-      if (!_mi_meta_is_meta_page_safe(page)) {
-        bitmap = mi_arena_pages_abandoned_ensure(arena, arena_pages, bin);
-      }
+      // The bitmap comes from raw OS memory (`_mi_os_zalloc`, see `..._ensure`), so this path
+      // takes no allocator lock and is safe to reach for any page, a meta-theap page
+      // included -- the `subproc->theap_meta_lock` self-edge that #319's review guarded
+      // against (`_mi_meta_is_meta_page_safe`) no longer exists (#350).
+      mi_bitmap_t* const bitmap = mi_arena_pages_abandoned_ensure(arena, arena_pages, bin);
       if mi_likely(bitmap != NULL) {
         mi_page_set_abandoned_mapped(page);
         const bool was_clear = mi_bitmap_set(bitmap, slice_index);
@@ -12164,26 +12153,56 @@ static mi_bitmap_t* mi_arena_pages_abandoned(mi_arena_pages_t* arena_pages, size
 mi_decl_export _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;  // test hook (test-abandoned-lazy.c): per-bin abandoned maps published so far (Bun parity P10b, #317)
 #endif
 
-// The abandoned-pages bitmap of `bin`, allocated on first use. Allocated from the subproc
-// meta-data heap (`_mi_meta_zalloc_aligned`) so this is safe on the abandon paths (a thread
-// tearing down its theaps, a foreign free re-abandoning a page), where allocating from a
-// regular heap is not -- see CLAUDE.md rule 4 and issue #317 (2.3): this is allocator
-// metadata, not profiler-internal memory, and the meta theap is the same allocator
-// `_mi_thread_local_create` (threadlocal.c) already uses for the thread-local slot bitmap.
-// Publishing is a CAS so no lock is needed: a loser frees its copy with
-// `_mi_free_subproc_safe` and uses the winner's. Returns NULL only if the allocation failed.
+// The abandoned-pages bitmap of `bin`, allocated on first use (Bun parity P10b, #317, ported
+// from oven-sh/mimalloc @ 787be2a8, MIT) -- but from raw OS memory (`_mi_os_zalloc`), NOT
+// from the subproc meta theap as Bun does. Issue #350: allocating it through
+// `_mi_meta_zalloc_aligned` on the abandon path -- i.e. under `subproc->theap_meta_lock`,
+// from inside a thread's teardown, for up to N exiting threads at once -- made the Linux
+// memory gate bimodal (peak RSS 58 MB or 66 MB, +32 MB of transient commit, nothing in
+// between; reproduced 8/8 vs 0/8 with the meta-theap allocation swapped for this one, and
+// only with the scavenger running). Raw OS memory takes no allocator lock at all, which also
+// removes the `heap->theaps_lock` -> `subproc->theap_meta_lock` edge #319 had to document in
+// src/fork.c and the meta-page reentrancy guard it had to add in `_mi_arenas_page_abandon`.
 //
-// New lock order edge: `heap->theaps_lock` -> `subproc->theap_meta_lock`. Already consistent
-// with src/fork.c's documented order (MI_FORK_LOCK_THEAPS=3 precedes MI_FORK_LOCK_THEAP_META=7);
-// see the comment added there for the new call chain.
-// Bun parity P10b, #317, ported from oven-sh/mimalloc @ 787be2a8, MIT.
+// Cost: one OS page (typically 4 KiB) per (heap, arena, bin) that ever abandons a page,
+// instead of a ~2 KiB meta block -- still lazy, so a heap that abandons nothing pays nothing,
+// which is what P10b was for. Layout: a small header (memid + size, for `_mi_os_free`) in the
+// first MI_BCHUNK_SIZE bytes, the MI_BCHUNK_SIZE-aligned bitmap right after it.
+//
+// Publishing is a CAS so no lock is needed: a loser frees its copy and uses the winner's.
+// Returns NULL only if the allocation failed (the caller then abandons the page unmapped).
+typedef struct mi_arena_abandoned_map_hdr_s {
+  mi_subproc_t* subproc;
+  size_t        total;     // bytes handed to _mi_os_zalloc (header + bitmap, page-rounded)
+  mi_memid_t    memid;
+} mi_arena_abandoned_map_hdr_t;
+
+static mi_arena_abandoned_map_hdr_t* mi_arena_abandoned_map_hdr(mi_bitmap_t* bitmap) {
+  return (mi_arena_abandoned_map_hdr_t*)((uint8_t*)bitmap - MI_BCHUNK_SIZE);
+}
+
+static void mi_arena_abandoned_map_free(mi_bitmap_t* bitmap) {
+  mi_arena_abandoned_map_hdr_t* const hdr = mi_arena_abandoned_map_hdr(bitmap);
+  _mi_os_free(hdr->subproc, hdr, hdr->total, hdr->memid);
+}
+
 static mi_bitmap_t* mi_arena_pages_abandoned_ensure(mi_arena_t* arena, mi_arena_pages_t* arena_pages, size_t bin) {
   mi_bitmap_t* bitmap = mi_arena_pages_abandoned(arena_pages, bin);
   if mi_likely(bitmap != NULL) return bitmap;
+  typedef char mi_arena_abandoned_map_hdr_fits[(sizeof(mi_arena_abandoned_map_hdr_t) <= MI_BCHUNK_SIZE) ? 1 : -1];  // compile-time: header must fit in front of the bitmap
+  MI_UNUSED(sizeof(mi_arena_abandoned_map_hdr_fits));
   const size_t slice_count = arena->slice_count;
-  const size_t size = mi_bitmap_size(slice_count, NULL);
-  mi_bitmap_t* fresh = (mi_bitmap_t*)_mi_meta_zalloc_aligned(arena->subproc, size, MI_BCHUNK_SIZE, NULL);
-  if (fresh == NULL) return NULL;
+  const size_t size  = mi_bitmap_size(slice_count, NULL);
+  const size_t total = _mi_align_up(MI_BCHUNK_SIZE + size, _mi_os_page_size());
+  mi_memid_t memid;
+  uint8_t* block = (uint8_t*)_mi_os_zalloc(arena->subproc, total, &memid);
+  if (block == NULL) return NULL;
+  mi_assert_internal(_mi_is_aligned(block, MI_BCHUNK_SIZE));
+  mi_arena_abandoned_map_hdr_t* const hdr = (mi_arena_abandoned_map_hdr_t*)block;
+  hdr->subproc = arena->subproc;
+  hdr->total   = total;
+  hdr->memid   = memid;
+  mi_bitmap_t* fresh = (mi_bitmap_t*)(block + MI_BCHUNK_SIZE);
   mi_bitmap_init(fresh, slice_count, true /* already zero */);
   mi_bitmap_t* expected = NULL;
   if (mi_atomic_cas_ptr_strong_acq_rel(mi_bitmap_t, &arena_pages->pages_abandoned[bin], &expected, fresh)) {
@@ -12193,7 +12212,7 @@ static mi_bitmap_t* mi_arena_pages_abandoned_ensure(mi_arena_t* arena, mi_arena_
     return fresh;
   }
   // another thread published one first
-  _mi_free_subproc_safe(fresh);
+  mi_arena_abandoned_map_free(fresh);
   mi_assert_internal(expected != NULL);
   return expected;
 }
@@ -12215,7 +12234,7 @@ static void mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages) {
   for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
     if (mi_atomic_load_ptr_relaxed(mi_bitmap_t, &arena_pages->pages_abandoned[bin]) == NULL) continue;  // the common case
     mi_bitmap_t* bitmap = mi_atomic_exchange_ptr_acq_rel(mi_bitmap_t, &arena_pages->pages_abandoned[bin], NULL);
-    if (bitmap != NULL) { _mi_free_subproc_safe(bitmap); }
+    if (bitmap != NULL) { mi_arena_abandoned_map_free(bitmap); }
   }
 }
 
@@ -16335,18 +16354,10 @@ terms of the MIT license. A copy of the license can be found in the file
                                     -> `mi_theap_free_mem` -> `_mi_meta_free` (theap.c:363)
                                     ... and, for a page owned by `theap_meta`, `mi_free`
                                     -> `mi_stat_free` (free.c:768) takes `theap_meta_lock`
-                                    ... and (Bun parity P10b, #317): `mi_heap_detach_theaps`
-                                    (heap.c) holds `theaps_lock` across its `_mi_theap_abandon`
-                                    loop -> `_mi_page_abandon` -> `_mi_arenas_page_abandon`
-                                    (arena.c) -> `mi_arena_pages_abandoned_ensure` (arena.c) ->
-                                    `_mi_meta_zalloc_aligned`, which takes `theap_meta_lock`.
-                                    Live only for a MAIN heap: a releasing (non-main) heap sets
-                                    `heap->releasing` just before this loop, which makes
-                                    `_mi_arenas_page_abandon` skip the `..._ensure` call
-                                    entirely (see the `heap->releasing` comment in
-                                    `mi_heap_detach_theaps`, heap.c). Same target level as the
-                                    edge above, no reordering needed (MI_FORK_LOCK_THEAPS=3
-                                    already precedes MI_FORK_LOCK_THEAP_META=7 below).
+                                    (#350 removed the P10b/#317 edge that used to be listed
+                                    here: `mi_arena_pages_abandoned_ensure` now allocates the
+                                    per-bin abandoned bitmap from raw OS memory and takes no
+                                    `theap_meta_lock` at all.)
       -> tld->theaps_lock           `_mi_heap_detach_theaps` -- but `mi_lock_TRY_acquire`
                                     with a back-off retry (theap.c:412), so NOT a blocking
                                     edge; see the Phase 7 gap note below
@@ -16394,10 +16405,11 @@ terms of the MIT license. A copy of the license can be found in the file
                                     `mi_subproc_new` now sets `theap_meta->allow_page_abandon
                                     = false` (matching `init.c`'s process theap_meta), so
                                     `mi_page_to_full` never abandons one of `theap_meta`'s own
-                                    pages in the first place; `_mi_arenas_page_abandon` also
-                                    checks `_mi_meta_is_meta_page_safe(page)` and skips the
-                                    lazy-bitmap allocation for a meta page regardless (falls
-                                    through to the unmapped-abandon path), belt and braces.
+                                    pages in the first place. (The second guard --
+                                    `_mi_meta_is_meta_page_safe` in `_mi_arenas_page_abandon`
+                                    -- went with #350: the lazy bitmap is raw OS memory now
+                                    and takes no `theap_meta_lock`, so there is no self-edge
+                                    left to guard.)
 
     heap_main->arena_pages_lock     arena.c:685      LEAF. For the main heap
                                     `mi_heap_ensure_arena_pages` only stores
@@ -28876,8 +28888,9 @@ mi_subproc_id_t mi_subproc_new(void) {
   // `mi_theap_zalloc_aligned` call that lock is already held across (subproc.c, above) -- an
   // MI_DEBUG>2 reentrant-lock abort, or a Release-build hang. Setting this false means a meta
   // page is never abandoned in the first place, so `_mi_page_abandon` never reaches that path
-  // for one; `_mi_arenas_page_abandon` also carries its own belt-and-braces
-  // `_mi_meta_is_meta_page_safe` guard (arena.c) in case this ever regresses.
+  // for one. (Since #350 the lazy bitmap is raw OS memory and takes no `theap_meta_lock`, so
+  // the self-edge itself is gone; this line stays because a meta theap abandoning its own
+  // pages is still pointless work, and it keeps parity with init.c.)
   theap_meta->allow_page_abandon = false;
   #if MI_GUARDED
   // See the matching comment in init.c's process-main theap_meta bootstrap (#266):

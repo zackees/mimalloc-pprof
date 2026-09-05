@@ -62,6 +62,14 @@ it. `macos-bundles.yml` has two more jobs:
   `CMakeLists.txt`, the lane's own files — or whether the PR carries the `needs-macos`
   label. It always completes, so it is the job branch protection requires; a
   conditional job cannot be.
+- **Branch protection (#352)** requires `decide` plus 13 other checks on `main`. Known
+  hole: `c-unit.yml`, `macos-bundles.yml`, `windows-bundles.yml` and `python-lint.yml`
+  are all `pull_request.paths`-filtered, so a PR that touches none of those paths
+  (docs-only, for instance) never gets its required checks reported and stays BLOCKED.
+  Such PRs are merged with `gh pr merge --admin` (`enforce_admins` is off for exactly
+  this); the proper fix — an always-running workflow that reports the required
+  contexts as success when the filtered paths are untouched — is tracked as a
+  follow-up on #351.
 - **`run-macos-x64-selective`** runs when `decide` says so: the same Recovery guest,
   but `run_test_bundle.py --label macos` on the release and debug-full bundles, judged
   by the same `ci/recovery_expected_failures.py` (a waiver for a test that did not run
@@ -78,8 +86,10 @@ Out-of-process zone enumeration (`test-osx-zone-introspect-remote`) needs `task_
 which Recovery — root, SIP not enforced — may grant. If the guest cannot, the test's
 exit 3 is waived **by name** in `ci/recovery_expected_failures.py`, and that waiver goes
 red the day it starts passing. The `leaks`/`vmmap` CLIs themselves are absent from
-Recovery and are not exercised anywhere automated; the tests drive the `enumerator`
-entry point those tools call.
+Recovery (measured; they are base-OS binaries, not part of the Command Line Tools) and
+are not exercised anywhere automated; the tests drive the `enumerator` entry point those
+tools call, and running the tools once on a real Mac is a release-checklist step in
+[docs/maintainers.md](maintainers.md#manual-macos-check-before-a-release-real-mac-required).
 
 ## `bun-surface` is a hard gate
 

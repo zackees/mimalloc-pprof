@@ -166,8 +166,15 @@ int main(void) {
     zone->introspect->statistics(zone, &st);
     printf("statistics: blocks_in_use=%u size_in_use=%zu max_size_in_use=%zu size_allocated=%zu\n",
            st.blocks_in_use, st.size_in_use, st.max_size_in_use, st.size_allocated);
-    CHECK(st.size_in_use > 0, "statistics.size_in_use is 0 with live blocks");
     CHECK(st.size_allocated > 0, "statistics.size_allocated is 0");
+    // size_in_use comes from the malloc_normal/malloc_huge counters, which mimalloc only
+    // maintains with MI_STAT >= 1 -- i.e. in MI_DEBUG builds (types.h: MI_STAT defaults
+    // to 2 when MI_DEBUG>0, else 0). A release build reports 0 here, same as Bun; the
+    // Recovery lane measured exactly that (release 0, debug-full non-zero, PR #349).
+#if defined(MI_DEBUG) && (MI_DEBUG > 0)
+    CHECK(st.size_in_use > 0, "statistics.size_in_use is 0 with live blocks (MI_DEBUG build tracks it)");
+#endif
+    CHECK(st.size_in_use <= st.size_allocated, "size_in_use %zu > size_allocated %zu", st.size_in_use, st.size_allocated);
   }
 
   for (size_t i = 0; i < NBLOCKS; i++) { if (blocks[i]) mi_free(blocks[i]); }

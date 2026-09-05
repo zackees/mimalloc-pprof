@@ -32,7 +32,13 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    a macOS Recovery guest on a Linux runner (`run-macos-x64-recovery`) is **manual-only**
    (`workflow_dispatch`; owner decision 2026-09-03: ~25–90 min per run cannot gate PRs).
    Run it with `gh workflow run macos-bundles.yml --ref <branch>` before merging changes
-   to macOS-specific allocator paths (prim/osx, interpose, TLS slots), and on demand. Never add a `macos-*` runner label to a workflow or
+   to macOS-specific allocator paths (prim/osx, interpose, TLS slots), and on demand.
+   Since #348 (#339) there is also a **selective** lane on PRs: `decide` runs on every PR
+   and, when the diff touches a Darwin path (`ci/macos_lane_decide.py` lists them) or the
+   PR carries the `needs-macos` label, `run-macos-x64-selective` boots the same Recovery
+   guest and executes only the tests labelled `macos` (~10 min). `decide` is the check
+   to require; every `test-osx-*` must carry `LABELS macos` (`ci/check_macos_labels.py`).
+   Never add a `macos-*` runner label to a workflow or
    to `azure-pipelines.yml`; `ci/lint_no_macos_runners.py` fails `python-lint` if you do.
    The guest boots macOS **Recovery** straight off the image every run via the
    `zackees/docker-mac-x64` action — no golden disk, no Actions cache, nothing to expire

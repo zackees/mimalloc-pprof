@@ -51,6 +51,36 @@ and coverage assertions, so a macOS build break is caught immediately; only the 
 is on demand. Run it before merging changes to macOS-specific paths (`src/prim/osx`,
 interpose, TLS slots) and when a Linux-green change touches the arena/heap lifecycle.
 
+### Selective macOS execution on PRs (#339, PR #348)
+
+The full run stays manual, but a PR no longer depends on someone remembering to trigger
+it. `macos-bundles.yml` has two more jobs:
+
+- **`decide`** runs on every `pull_request` (also on `labeled`) and asks
+  `ci/macos_lane_decide.py` whether the diff touches a Darwin path — `src/prim/osx/**`,
+  `test/test-osx-*`, `include/mimalloc/prim-tls.h`, the zone/interpose block of
+  `CMakeLists.txt`, the lane's own files — or whether the PR carries the `needs-macos`
+  label. It always completes, so it is the job branch protection requires; a
+  conditional job cannot be.
+- **`run-macos-x64-selective`** runs when `decide` says so: the same Recovery guest,
+  but `run_test_bundle.py --label macos` on the release and debug-full bundles, judged
+  by the same `ci/recovery_expected_failures.py` (a waiver for a test that did not run
+  says nothing, so the three profiler waivers do not misfire). Boot-to-shell is ~6 min;
+  the job is capped at 30.
+
+What makes the label trustworthy: `ci/check_macos_labels.py` runs on every cross-built
+bundle's `tests.json` and fails the *build* if a `test-osx-*` lacks `LABELS macos` or if
+nothing carries the label at all, and `run_test_bundle.py --label` refuses to report a
+green run on an empty selection. A Darwin-only test cannot ship in the bundle and quietly
+never execute.
+
+Out-of-process zone enumeration (`test-osx-zone-introspect-remote`) needs `task_for_pid`,
+which Recovery — root, SIP not enforced — may grant. If the guest cannot, the test's
+exit 3 is waived **by name** in `ci/recovery_expected_failures.py`, and that waiver goes
+red the day it starts passing. The `leaks`/`vmmap` CLIs themselves are absent from
+Recovery and are not exercised anywhere automated; the tests drive the `enumerator`
+entry point those tools call.
+
 ## `bun-surface` is a hard gate
 
 Issue #274 (Bun parity P9a). `mi_on_thread_idle` is part of Bun's linked surface

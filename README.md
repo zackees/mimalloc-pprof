@@ -211,7 +211,7 @@ image and the table below are rendered from.
 | Windows malloc override via a redirect DLL | ✅ mimalloc-redirect.dll | ✅ mimalloc-redirect.dll | ✅ mimalloc-redirect.dll | ❌ link-time replacement only |
 | MinGW / win-gnu covered in CI | ✅ cross-built, then run | ✅ mingw-ucrt64 | ✅ mingw-ucrt64 | ✅ MSYS2 mingw32-make |
 | macOS malloc-zone interpose | ✅ | ✅ | ✅ | ✅ |
-| macOS zone introspection (leaks, vmmap) | ❌ stub enumerator — [#339](https://github.com/zackees/mimalloc-pprof/issues/339) | ❌ stub enumerator | ✅ in- and out-of-process | ❌ stub enumerator |
+| macOS zone introspection (leaks, vmmap) | ✅ in- and out-of-process — #349 | ❌ stub enumerator | ✅ in- and out-of-process | ❌ stub enumerator |
 | First-party Rust crate, full C API | ✅ mimalloc-pprof on crates.io | ❌ third-party crates only | ❌ no crate | ❌ third-party crates only |
 | Release targets cross-built on Linux | ✅ 5 targets through soldr | ❌ native runner per OS | ❌ native runner per OS | ❌ native runner per OS |
 | macOS covered with no Apple hardware | ✅ cross-built; guest run manual | ❌ hosted macOS runners | ❌ hosted macOS runners | ❌ hosted macOS runners |
@@ -940,7 +940,6 @@ handful of hook calls). More detail, including the options reference, is in
 
 ### Not imported (yet)
 
-- **macOS malloc-zone introspection** — in-/out-of-process `memory_reader_t` support for `leaks`/`heap`/`vmmap`. Open, unscheduled (rated 3 in `MIMALLOC_FORKS.md`).
 - **Heap snapshot + `mi-heapview`** — Bun's live heap snapshot format and CLI viewer (`src/heap-snapshot.c`, `tools/mi-heapview.c`). Not called by Bun itself by default; a debug tool, not a shipped feature (rated 2).
 - **Bun's `<linux/futex.h>` include** — deliberately not carried over: it is a kernel uapi header that breaks the musl/Alpine build. `src/scavenger.c` documents the deviation and uses a portable alternative instead ([fix](https://github.com/zackees/mimalloc-pprof/commit/bc228369)).
 

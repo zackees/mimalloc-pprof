@@ -525,6 +525,10 @@ jobs:
           test -f "$C/sel-release.xml" || { echo "::error::no JUnit came back from the guest"; exit 1; }
           test -f "$C/sel-debug-full.xml" || { echo "::error::debug-full JUnit missing"; exit 1; }
           python3 ci/recovery_expected_failures.py "$C/sel-release.xml" "$C/sel-debug-full.xml"
+      - name: Apple malloc-introspection CLIs present in Recovery? (#353, informational)
+        run: |
+          C="${{ steps.macos.outputs.workdir }}/collected"
+          cat "$C/tools.txt" 2>/dev/null || echo "(no tools.txt came back)"
 
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4

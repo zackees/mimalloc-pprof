@@ -54,15 +54,46 @@ reviewer can check the obvious objections without re-running anything:
 it?) and `upstream-mimalloc` calling `mi_collect(false)` on the same tick (is
 upstream's flat line just a missing API?).
 
+The sizing run (`--busy-threads N`, #365 §6 / #366)
+----------------------------------------------------
+
+Everything above is single-threaded: the one worker calls the idle mechanism from
+inside its own idle loop, so it says nothing about the case that matters for a
+process-wide purge -- N threads that are BUSY and never idle, and a purge issued by a
+thread that is not one of them. `--busy-threads N` (default 4 when given) runs the same
+churn workload split across N worker threads which then stay in a hot-set
+`malloc`/`free` loop for the whole 10 s window, never calling any idle hook, while the
+main thread -- which allocates nothing -- issues the purge every 100 ms tick and
+samples RSS. One row per (allocator, purge call):
+
+    mimalloc-pprof                    mi_collect(true)            caller-only, by design
+    mimalloc-pprof                    mi_purge_all(true)          default build: arenas + parked
+    mimalloc-pprof, MI_OWNER_GATE=ON  mi_purge_all(true)          gated build: every thread
+    Bun mimalloc / upstream mimalloc  mi_collect(true)
+    jemalloc                          mallctl("arena.<all>.purge")
+    glibc                             malloc_trim(0)              no allocator linked at all
+
+plus a "nothing" control per fork build (does the background scavenger alone reach a
+busy thread?). The gated fork is this tree built a second time with
+`-DMI_OWNER_GATE=ON`; glibc is the driver linked against nothing. For the `mi_purge_all`
+rows the driver also reports the last return status and the largest `theaps_pending`
+the call ever returned, so an ungated `PARTIAL, 4 pending` is on the table next to its
+number rather than hidden behind it. These are the numbers the README feature-table
+cell "Process-wide eager purge, from any thread" cites.
+
 Usage:
     bench_hole_purging_allocators.py --build-root <scratch dir> [--jobs N] [--table]
     bench_hole_purging_allocators.py --check      # re-render committed data, no runs
+    bench_hole_purging_allocators.py --build-root <dir> --busy-threads 4   # sizing run
+    bench_hole_purging_allocators.py --check --busy-threads 4              # its --check
 
 Outputs (under --out-dir, default .github/assets):
     allocator-idle-rss.csv                   the charted run's (series, t, rss_mb) samples
     allocator-idle-report.json               every run's numbers + machine/pins/idle hooks
     allocator-idle-rss-{light,dark}.svg      the RSS-over-idle line chart (default action)
     allocator-idle-table-{light,dark}.svg    peak / after-idle / % returned (--table)
+    allocator-purge-any-thread-report.json   the sizing run (--busy-threads)
+    allocator-purge-any-thread-table-{light,dark}.svg   its table
 """
 
 from __future__ import annotations
@@ -307,6 +338,251 @@ int main(int argc, char** argv) {
 
 
 # ---------------------------------------------------------------------------
+# The sizing-run driver (#365 §6): N busy worker threads, purge from main.
+#
+# A second source rather than more #ifs in the first: the single-thread driver is
+# what the committed chart was measured with, and its bytes stay put. The build
+# supplies:
+#   BENCH_FAMILY        0 jemalloc (je_ prefix), 1 mimalloc, 2 glibc (nothing linked)
+#   BENCH_PURGE_MODE    what the main thread calls every tick (PURGE_* below)
+#   BENCH_THREADS       N
+# Same fairness rules as above: mmap'ed tables, /proc read into a stack buffer,
+# write(2) output. The only allocator traffic on the main thread is the purge call.
+# ---------------------------------------------------------------------------
+BUSY_C_SOURCE = r"""
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+#if BENCH_FAMILY == 1
+#include <mimalloc.h>
+#define BENCH_MALLOC(n) mi_malloc(n)
+#define BENCH_FREE(p)   mi_free(p)
+#elif BENCH_FAMILY == 0
+#include <jemalloc/jemalloc.h>
+#define BENCH_MALLOC(n) je_malloc(n)
+#define BENCH_FREE(p)   je_free(p)
+#else
+#include <malloc.h>
+#include <stdlib.h>
+#define BENCH_MALLOC(n) malloc(n)
+#define BENCH_FREE(p)   free(p)
+#endif
+
+#define BENCH_STRINGIFY2(x) #x
+#define BENCH_STRINGIFY(x) BENCH_STRINGIFY2(x)
+
+#define BENCH_PURGE_NOTHING          0
+#define BENCH_PURGE_MI_COLLECT_FORCE 1
+#define BENCH_PURGE_MI_PURGE_ALL     2
+#define BENCH_PURGE_JE_PURGE         3
+#define BENCH_PURGE_MALLOC_TRIM      4
+
+/* What the purge reported back, for the row's own cell: the last status and the
+   largest pending count any tick returned. Only the mi_purge_all mode fills them. */
+static long purge_last_status = -1;
+static long purge_max_pending = 0;
+
+static void bench_purge_from_main(void) {
+#if BENCH_PURGE_MODE == BENCH_PURGE_MI_COLLECT_FORCE
+  mi_collect(true);
+#elif BENCH_PURGE_MODE == BENCH_PURGE_MI_PURGE_ALL
+  mi_purge_all_report_t r;
+  purge_last_status = mi_purge_all_ex(MI_PURGE_FORCE, 100, &r);
+  if ((long)r.theaps_pending > purge_max_pending) purge_max_pending = (long)r.theaps_pending;
+#elif BENCH_PURGE_MODE == BENCH_PURGE_JE_PURGE
+  (void)je_mallctl("arena." BENCH_STRINGIFY(MALLCTL_ARENAS_ALL) ".purge",
+                   NULL, NULL, NULL, 0);
+#elif BENCH_PURGE_MODE == BENCH_PURGE_MALLOC_TRIM
+  (void)malloc_trim(0);
+#else
+  /* BENCH_PURGE_NOTHING: deliberately empty. */
+#endif
+}
+
+/* ---- allocation-free process instrumentation (as in the single-thread driver) */
+
+static long status_kb(const char* key, size_t key_len) {
+  const int fd = open("/proc/self/status", O_RDONLY);
+  if (fd < 0) return -1;
+  char buf[8192];
+  const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) return -1;
+  buf[n] = '\0';
+  const char* p = buf;
+  while (*p != '\0') {
+    if (strncmp(p, key, key_len) == 0) {
+      p += key_len;
+      while (*p == ' ' || *p == '\t') p++;
+      long kb = 0;
+      while (*p >= '0' && *p <= '9') { kb = kb * 10 + (*p - '0'); p++; }
+      return kb;
+    }
+    while (*p != '\0' && *p != '\n') p++;
+    if (*p == '\n') p++;
+  }
+  return -1;
+}
+
+static size_t fmt_long(char* out, long v) {
+  char tmp[24];
+  size_t n = 0;
+  size_t o = 0;
+  if (v < 0) { out[o++] = '-'; v = -v; }
+  if (v == 0) tmp[n++] = '0';
+  while (v > 0) { tmp[n++] = (char)('0' + (v % 10)); v /= 10; }
+  while (n > 0) out[o++] = tmp[--n];
+  return o;
+}
+
+static void emit_row(const char* tag, long a, long b, int two) {
+  char line[96];
+  size_t o = 0;
+  while (*tag != '\0') line[o++] = *tag++;
+  line[o++] = ',';
+  o += fmt_long(line + o, a);
+  if (two) { line[o++] = ','; o += fmt_long(line + o, b); }
+  line[o++] = '\n';
+  ssize_t written = write(1, line, o);
+  (void)written;
+}
+
+static void sleep_ms(long ms) {
+  struct timespec ts;
+  ts.tv_sec = ms / 1000;
+  ts.tv_nsec = (ms % 1000) * 1000000L;
+  nanosleep(&ts, NULL);
+}
+
+/* ---- the workers ---------------------------------------------------------- */
+
+typedef struct { size_t size; size_t count; } size_class_t;
+
+/* The single-thread workload, split evenly: every worker gets 1/N of each class,
+   so the process-wide peak is the same 300k blocks the chart above measured. */
+static const size_class_t classes[] = {
+  { 512,  150000 / BENCH_THREADS },
+  { 1024, 100000 / BENCH_THREADS },
+  { 2048,  50000 / BENCH_THREADS },
+};
+#define N_CLASSES (sizeof(classes) / sizeof(classes[0]))
+
+/* The hot set: a small ring the busy loop keeps re-allocating. Sizes cycle through
+   the same classes as the churn so the loop draws from the pages that hold the
+   survivors -- a thread that is genuinely using its heap, not one spinning on a
+   cache. 64 slots x <= 2 KiB is ~100 KiB per thread: noise against a 280 MB peak. */
+#define HOT_SLOTS 64
+static const size_t hot_sizes[] = { 64, 128, 256, 512, 1024, 2048 };
+#define N_HOT_SIZES (sizeof(hot_sizes) / sizeof(hot_sizes[0]))
+
+static atomic_int churned;    /* workers that have finished their churn phase */
+static atomic_int stop_flag;  /* main sets it at the end of the window */
+
+static void* worker(void* arg) {
+  (void)arg;
+  size_t total = 0;
+  for (size_t c = 0; c < N_CLASSES; c++) total += classes[c].count;
+  const size_t table_bytes = total * sizeof(void*);
+  void** blocks = (void**)mmap(NULL, table_bytes, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (blocks == MAP_FAILED) return NULL;
+
+  size_t idx = 0;
+  size_t remaining[N_CLASSES];
+  for (size_t c = 0; c < N_CLASSES; c++) remaining[c] = classes[c].count;
+  size_t class_cursor = 0;
+  while (idx < total) {
+    size_t tries = 0;
+    while (remaining[class_cursor] == 0 && tries < N_CLASSES) {
+      class_cursor = (class_cursor + 1) % N_CLASSES;
+      tries++;
+    }
+    blocks[idx] = BENCH_MALLOC(classes[class_cursor].size);
+    if (blocks[idx] != NULL) memset(blocks[idx], 0xAB, classes[class_cursor].size);
+    remaining[class_cursor]--;
+    class_cursor = (class_cursor + 1) % N_CLASSES;
+    idx++;
+  }
+  for (size_t i = 0; i < total; i++) {
+    if (i % 20 != 0) {
+      BENCH_FREE(blocks[i]);
+      blocks[i] = NULL;
+    }
+  }
+  atomic_fetch_add(&churned, 1);
+
+  /* Busy for the whole window: no idle hook, no sleep, no yield -- just
+     malloc/free/touch. In a gated build the owner gate is released between every
+     one of these calls; in the default build this thread is RUNNING throughout. */
+  void* ring[HOT_SLOTS];
+  memset(ring, 0, sizeof(ring));
+  size_t slot = 0;
+  size_t size_cursor = 0;
+  while (!atomic_load_explicit(&stop_flag, memory_order_relaxed)) {
+    if (ring[slot] != NULL) BENCH_FREE(ring[slot]);
+    const size_t size = hot_sizes[size_cursor];
+    ring[slot] = BENCH_MALLOC(size);
+    if (ring[slot] != NULL) memset(ring[slot], 0xCD, size);
+    slot = (slot + 1) % HOT_SLOTS;
+    size_cursor = (size_cursor + 1) % N_HOT_SIZES;
+  }
+  for (size_t i = 0; i < HOT_SLOTS; i++) if (ring[i] != NULL) BENCH_FREE(ring[i]);
+  for (size_t i = 0; i < total; i += 20) BENCH_FREE(blocks[i]);
+  munmap(blocks, table_bytes);
+  return NULL;
+}
+
+int main(int argc, char** argv) {
+  int seconds = 10;
+  if (argc > 1) {
+    seconds = 0;
+    for (const char* p = argv[1]; *p >= '0' && *p <= '9'; p++) seconds = seconds * 10 + (*p - '0');
+    if (seconds <= 0) seconds = 10;
+  }
+  const long tick_ms = 100;
+
+  pthread_t threads[BENCH_THREADS];
+  for (int i = 0; i < BENCH_THREADS; i++) {
+    if (pthread_create(&threads[i], NULL, worker, NULL) != 0) return 1;
+  }
+  while (atomic_load(&churned) < BENCH_THREADS) sleep_ms(1);
+
+  /* The window. The main thread has allocated nothing so far and allocates nothing
+     here either: RSS read, sleep, the purge call under test, repeat. */
+  long elapsed_ms = 0;
+  while (elapsed_ms <= (long)seconds * 1000) {
+    emit_row("CSV", elapsed_ms, status_kb("VmRSS:", 6), 1);
+    sleep_ms(tick_ms);
+    bench_purge_from_main();
+    elapsed_ms += tick_ms;
+  }
+  emit_row("HWM", status_kb("VmHWM:", 6), 0, 0);
+  emit_row("PURGE", purge_last_status, purge_max_pending, 1);
+
+  atomic_store(&stop_flag, 1);
+  for (int i = 0; i < BENCH_THREADS; i++) pthread_join(threads[i], NULL);
+
+#if BENCH_FAMILY == 0
+  {
+    bool background_thread = false;
+    size_t size = sizeof(background_thread);
+    (void)je_mallctl("background_thread", &background_thread, &size, NULL, 0);
+    emit_row("BACKGROUND_THREAD", (long)background_thread, 0, 0);
+  }
+#endif
+  return 0;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
 # Series definitions
 # ---------------------------------------------------------------------------
 
@@ -458,6 +734,115 @@ CHARTED: tuple[SeriesSpec, ...] = tuple(s for s in SERIES if s.charted)
 
 
 # ---------------------------------------------------------------------------
+# Sizing-run series (#365 §6): what the non-allocating main thread calls every tick
+# while N workers stay busy. Mirrors BENCH_PURGE_* in BUSY_C_SOURCE.
+# ---------------------------------------------------------------------------
+
+PURGE_NOTHING = 0
+PURGE_MI_COLLECT_FORCE = 1
+PURGE_MI_PURGE_ALL = 2
+PURGE_JE_PURGE = 3
+PURGE_MALLOC_TRIM = 4
+
+PURGE_DESCRIPTIONS = {
+    PURGE_NOTHING: "nothing (scavenger only)",
+    PURGE_MI_COLLECT_FORCE: "mi_collect(true) every 100 ms",
+    PURGE_MI_PURGE_ALL: "mi_purge_all(true) every 100 ms",
+    PURGE_JE_PURGE: 'mallctl("arena.<all>.purge") every 100 ms',
+    PURGE_MALLOC_TRIM: "malloc_trim(0) every 100 ms",
+}
+
+#: This tree built a second time with the owner gate on. Not a lockfile record: it is
+#: the same source and the same recipe as `mimalloc-pprof` plus one CMake option, and
+#: it exists only for the sizing run.
+GATED_ALLOCATOR = "mimalloc-pprof-gated"
+GATED_CMAKE_ARGS = ("-DMI_OWNER_GATE=ON",)
+GATED_BASE = "mimalloc-pprof"
+
+#: The driver linked against nothing: the C library's own malloc. Not a build at all.
+GLIBC_ALLOCATOR = "glibc"
+
+#: BENCH_FAMILY for BUSY_C_SOURCE, by allocator id; everything else is a mimalloc.
+BUSY_FAMILY = {"jemalloc": 0, GLIBC_ALLOCATOR: 2}
+
+
+@dataclass(frozen=True)
+class BusySeriesSpec:
+    """One sizing-run row: an allocator build plus what the main thread calls."""
+
+    key: str
+    allocator_id: str
+    label: str
+    purge: int
+    note: str = ""
+
+
+BUSY_SERIES: tuple[BusySeriesSpec, ...] = (
+    BusySeriesSpec(
+        key="mimalloc-pprof-busy-collect",
+        allocator_id="mimalloc-pprof",
+        label="mimalloc-pprof",
+        purge=PURGE_MI_COLLECT_FORCE,
+        note="mi_collect is caller-only by design; this is the ceiling of the pre-#366 API",
+    ),
+    BusySeriesSpec(
+        key="mimalloc-pprof-busy-purge-all",
+        allocator_id="mimalloc-pprof",
+        label="mimalloc-pprof",
+        purge=PURGE_MI_PURGE_ALL,
+        note="default build: arenas, abandoned pages and parked threads; busy owners pending",
+    ),
+    BusySeriesSpec(
+        key="mimalloc-pprof-gated-busy-purge-all",
+        allocator_id=GATED_ALLOCATOR,
+        label="mimalloc-pprof, MI_OWNER_GATE=ON",
+        purge=PURGE_MI_PURGE_ALL,
+        note="gated build: every registered thread is claimed between its allocator calls",
+    ),
+    BusySeriesSpec(
+        key="bun-mimalloc-busy-collect",
+        allocator_id="bun-mimalloc",
+        label="Bun mimalloc",
+        purge=PURGE_MI_COLLECT_FORCE,
+    ),
+    BusySeriesSpec(
+        key="upstream-mimalloc-busy-collect",
+        allocator_id="upstream-mimalloc",
+        label="upstream mimalloc",
+        purge=PURGE_MI_COLLECT_FORCE,
+    ),
+    BusySeriesSpec(
+        key="jemalloc-busy-purge",
+        allocator_id="jemalloc",
+        label="jemalloc",
+        purge=PURGE_JE_PURGE,
+        note="the measurement behind its documented any-thread purge",
+    ),
+    BusySeriesSpec(
+        key="glibc-busy-trim",
+        allocator_id=GLIBC_ALLOCATOR,
+        label="glibc malloc",
+        purge=PURGE_MALLOC_TRIM,
+        note="the second any-thread reference: malloc_trim walks every arena",
+    ),
+    BusySeriesSpec(
+        key="mimalloc-pprof-busy-nothing",
+        allocator_id="mimalloc-pprof",
+        label="mimalloc-pprof",
+        purge=PURGE_NOTHING,
+        note="control: the background scavenger alone, default build",
+    ),
+    BusySeriesSpec(
+        key="mimalloc-pprof-gated-busy-nothing",
+        allocator_id=GATED_ALLOCATOR,
+        label="mimalloc-pprof, MI_OWNER_GATE=ON",
+        purge=PURGE_NOTHING,
+        note="control: in a gated build the scavenger's timed sweep reaches busy threads too",
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
 # Report shapes
 # ---------------------------------------------------------------------------
 
@@ -513,6 +898,32 @@ class ReportJson(TypedDict):
     series: dict[str, SeriesSummary]
 
 
+class BusySeriesSummary(SeriesSummary):
+    """One sizing-run row. A `SeriesSummary` (so the table renderer draws it unchanged)
+    plus what the purge call itself reported back."""
+
+    #: Extra CMake arguments over the lockfile recipe; empty for a lockfile build.
+    build_flags: list[str]
+    #: The last `mi_purge_all_ex` status the picked run saw (0 OK, 1 PARTIAL, 2 BUSY);
+    #: -1 for every other purge mechanism, which has no status to report.
+    purge_status: int
+    #: The largest `theaps_pending` any tick of the picked run returned.
+    purge_max_pending: int
+
+
+class BusyReportJson(TypedDict):
+    """The full shape of allocator-purge-any-thread-report.json."""
+
+    commit: str
+    cpu: str
+    kernel: str
+    runs_per_series: int
+    idle_seconds: int
+    busy_threads: int
+    selection_rule: str
+    series: dict[str, BusySeriesSummary]
+
+
 @dataclass
 class RunResult:
     samples: list[Sample]
@@ -520,6 +931,9 @@ class RunResult:
     #: jemalloc's live `background_thread` setting; `None` for the mimalloc children,
     #: which have no such knob to read back.
     background_thread: bool | None = None
+    #: The busy driver's PURGE row: last status and max pending (see BusySeriesSummary).
+    purge_status: int = -1
+    purge_max_pending: int = 0
 
     @property
     def after_idle_rss_kb(self) -> int:
@@ -603,6 +1017,82 @@ def build_allocators(
     return builds
 
 
+def build_gated_fork(
+    records: Sequence[Mapping[str, object]],
+    builds: Mapping[str, AllocatorBuild],
+    build_root: Path,
+    jobs: int,
+) -> AllocatorBuild:
+    """Build this tree a second time with `-DMI_OWNER_GATE=ON`.
+
+    The lockfile's own `mimalloc-pprof` recipe, verbatim, with the option appended to
+    its configure command and a build directory of its own -- so the gated row differs
+    from the default row by exactly that one option and nothing else.
+    """
+    record = next(r for r in records if builder.require_string(r.get("id"), "id") == GATED_BASE)
+    base = builds[GATED_BASE]
+    source_dir = builder.repository_root()
+    build_dir = build_root / "build" / GATED_ALLOCATOR
+    build_dir.mkdir(parents=True, exist_ok=True)
+    build = builder.require_mapping(record.get("build"), f"{GATED_BASE}.build")
+    commands = builder.require_commands(build.get("commands"), f"{GATED_BASE}.build.commands")
+    logs = build_root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    with (logs / f"{GATED_ALLOCATOR}.log").open("w", encoding="utf-8") as log:
+        for command in commands:
+            resolved = builder.expand_command(command, source_dir, build_dir, jobs)
+            if resolved[:1] == ["cmake"] and "-S" in resolved:
+                resolved = [*resolved, *GATED_CMAKE_ARGS]
+            log.write("$ " + " ".join(resolved) + "\n")
+            log.flush()
+            subprocess.run(
+                resolved,
+                cwd=source_dir,
+                env=builder.command_environment(),
+                check=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+    cache = (build_dir / "CMakeCache.txt").read_text(encoding="utf-8")
+    if "MI_OWNER_GATE:BOOL=ON" not in cache:
+        raise SystemExit(f"{GATED_ALLOCATOR}: MI_OWNER_GATE did not reach the CMake cache")
+    library = builder.find_primary_library(record, source_dir, build_dir)
+    print(f"built {GATED_ALLOCATOR}: {library}", flush=True)
+    return AllocatorBuild(
+        allocator_id=GATED_ALLOCATOR,
+        pin=base.pin,
+        library=library,
+        include_dirs=base.include_dirs,
+        has_on_thread_idle=base.has_on_thread_idle,
+    )
+
+
+def glibc_pseudo_build() -> AllocatorBuild:
+    """The C library's malloc: nothing to build, nothing to link, no header of ours."""
+    return AllocatorBuild(
+        allocator_id=GLIBC_ALLOCATOR,
+        pin=glibc_version(),
+        library=Path("/dev/null"),  # never linked; see compile_busy_driver
+        include_dirs=[],
+        has_on_thread_idle=False,
+    )
+
+
+def glibc_version() -> str:
+    try:
+        return "glibc " + platform.libc_ver()[1]
+    except (OSError, ValueError):
+        return "glibc"
+
+
+def header_declares(include_dirs: Sequence[Path], name: str) -> bool:
+    for directory in include_dirs:
+        header = directory / "mimalloc.h"
+        if header.is_file() and name in header.read_text(encoding="utf-8"):
+            return True
+    return False
+
+
 def header_declares_on_thread_idle(include_dirs: Sequence[Path]) -> bool:
     """Is `mi_on_thread_idle` actually in this allocator's public header?
 
@@ -652,6 +1142,41 @@ def compile_driver(spec: SeriesSpec, build: AllocatorBuild, idle: int, work_dir:
     return exe
 
 
+def compile_busy_driver(
+    spec: BusySeriesSpec, build: AllocatorBuild, threads: int, work_dir: Path
+) -> Path:
+    """Build BUSY_C_SOURCE for one sizing-run row. Refuses, rather than degrades, a
+    purge call the allocator's header does not declare: a row that silently fell back
+    to "nothing" would be reported as that allocator returning nothing."""
+    if spec.purge == PURGE_MI_PURGE_ALL and not header_declares(build.include_dirs, "mi_purge_all"):
+        raise SystemExit(f"{spec.key}: {build.allocator_id} declares no mi_purge_all")
+    if spec.purge == PURGE_MI_COLLECT_FORCE and not header_declares(
+        build.include_dirs, "mi_collect"
+    ):
+        raise SystemExit(f"{spec.key}: {build.allocator_id} declares no mi_collect")
+    src = work_dir / f"busy_{spec.key}.c"
+    src.write_text(BUSY_C_SOURCE, encoding="utf-8")
+    exe = work_dir / f"busy_{spec.key}"
+    family = BUSY_FAMILY.get(build.allocator_id, 1)
+    cmd = [
+        "cc",
+        "-O2",
+        "-g",
+        "-pthread",
+        f"-DBENCH_FAMILY={family}",
+        f"-DBENCH_PURGE_MODE={spec.purge}",
+        f"-DBENCH_THREADS={threads}",
+    ]
+    for directory in build.include_dirs:
+        cmd += ["-I", str(directory)]
+    cmd.append(str(src))
+    if build.allocator_id != GLIBC_ALLOCATOR:
+        cmd.append(str(build.library))
+    cmd += ["-lpthread", "-ldl", "-lm", "-lrt", "-latomic", "-o", str(exe)]
+    subprocess.run(cmd, check=True)
+    return exe
+
+
 def child_environment(extra: Sequence[tuple[str, str]] = ()) -> dict[str, str]:
     """A clean environment: no inherited MIMALLOC_*/MALLOC_CONF can retune a child.
 
@@ -676,6 +1201,8 @@ def run_once(exe: Path, seconds: int, extra_env: Sequence[tuple[str, str]] = ())
     samples: list[Sample] = []
     peak_kb = 0
     background_thread: bool | None = None
+    purge_status = -1
+    purge_max_pending = 0
     for line in proc.stdout.splitlines():
         if line.startswith("CSV,"):
             _, t_ms, rss_kb = line.split(",")
@@ -684,6 +1211,9 @@ def run_once(exe: Path, seconds: int, extra_env: Sequence[tuple[str, str]] = ())
             peak_kb = int(line.split(",")[1])
         elif line.startswith("BACKGROUND_THREAD,"):
             background_thread = line.split(",")[1] == "1"
+        elif line.startswith("PURGE,"):
+            _, status, pending = line.split(",")
+            purge_status, purge_max_pending = int(status), int(pending)
     if not samples:
         raise SystemExit(f"{exe} produced no samples")
     if peak_kb <= 0:
@@ -694,7 +1224,13 @@ def run_once(exe: Path, seconds: int, extra_env: Sequence[tuple[str, str]] = ())
     # this was being written. A "peak" under the first post-free sample is nonsense to a
     # reader, so the peak is the larger of the two.
     peak_kb = max(peak_kb, samples[0].rss_kb)
-    return RunResult(samples=samples, peak_rss_kb=peak_kb, background_thread=background_thread)
+    return RunResult(
+        samples=samples,
+        peak_rss_kb=peak_kb,
+        background_thread=background_thread,
+        purge_status=purge_status,
+        purge_max_pending=purge_max_pending,
+    )
 
 
 def assert_env_took_effect(spec: SeriesSpec, attempts: Sequence[RunResult]) -> None:
@@ -730,6 +1266,24 @@ def measure_series(
     # allocator managed, so no arm is charted at its worst.
     picked = min(attempts, key=lambda r: r.after_idle_rss_kb)
     return picked, attempts, idle
+
+
+def measure_busy_series(
+    spec: BusySeriesSpec,
+    build: AllocatorBuild,
+    work_dir: Path,
+    seconds: int,
+    runs: int,
+    threads: int,
+) -> tuple[RunResult, list[RunResult]]:
+    exe = compile_busy_driver(spec, build, threads, work_dir)
+    attempts = [run_once(exe, seconds) for _ in range(runs)]
+    for run in attempts:
+        # A jemalloc child must be running its compiled-in default here too.
+        if run.background_thread:
+            raise SystemExit(f"{spec.key}: jemalloc reports background_thread=True")
+    picked = min(attempts, key=lambda r: r.after_idle_rss_kb)
+    return picked, attempts
 
 
 # ---------------------------------------------------------------------------
@@ -817,8 +1371,9 @@ def inconsistent_series(
     would on the next measurement.
     """
     out: list[tuple[SeriesSummary, int, int]] = []
-    for spec in SERIES:
-        summary = summaries.get(spec.key)
+    keys = [s.key for s in SERIES] + [s.key for s in BUSY_SERIES]
+    for key in keys:
+        summary = summaries.get(key)
         if summary is None:
             continue
         returned, total = runs_returned(summary)
@@ -1061,9 +1616,58 @@ def approx_text_width(text: str, font_px: int = TABLE_FONT_PX) -> float:
     return len(text) * CHAR_WIDTH_PX * font_px / TABLE_FONT_PX
 
 
-def render_table_svg(summaries: Mapping[str, SeriesSummary], theme: Theme, source_line: str) -> str:
-    rows = [summaries[s.key] for s in SERIES if s.key in summaries]
-    n_charted = sum(1 for s in SERIES if s.charted and s.key in summaries)
+@dataclass(frozen=True)
+class TableText:
+    """The words on a table SVG that differ between the idle table and the sizing-run
+    table. The defaults are the idle table's, byte for byte."""
+
+    aria: str = "Peak RSS, RSS after 10 s idle, and percent returned, per allocator"
+    title: str = "Memory returned after idle, by allocator"
+    subtitle: str = (
+        "Peak is VmHWM; after-idle is VmRSS at the end of the idle window (10 s unless the "
+        "row says otherwise). Both are kernel counters, good to a few hundred kB."
+    )
+    mechanism_header: str = "what runs during idle"
+    after_header: str = "after idle"
+    footnote: str = "Rows below the dashed rule are diagnostics, not part of the chart."
+
+
+IDLE_TABLE_TEXT = TableText()
+
+
+def busy_table_text(threads: int) -> TableText:
+    return TableText(
+        aria=(
+            f"Peak RSS, RSS after 10 s with {threads} busy threads and a purge from another "
+            "thread, and percent returned, per allocator"
+        ),
+        title=f"Memory returned with {threads} busy threads, purge from another thread",
+        subtitle=(
+            f"{threads} workers churn, then stay in a malloc/free loop and never idle; the "
+            "main thread allocates nothing and calls the purge every 100 ms for 10 s."
+        ),
+        mechanism_header="what the purging thread calls",
+        after_header="after 10 s",
+        footnote=(
+            "Same workload split across the workers. Rows below the dashed rule are "
+            "controls: nobody calls anything, only the background scavenger runs."
+        ),
+    )
+
+
+def render_table_svg(
+    summaries: Mapping[str, SeriesSummary],
+    theme: Theme,
+    source_line: str,
+    order: Sequence[tuple[str, bool]] = (),
+    text_: TableText = IDLE_TABLE_TEXT,
+) -> str:
+    """One row per series. `order` is (key, charted) pairs; charted rows come first,
+    the rest sit below a dashed rule in muted ink. Empty means the idle table's order."""
+    if not order:
+        order = [(s.key, s.charted) for s in SERIES]
+    rows = [summaries[key] for key, _ in order if key in summaries]
+    n_charted = sum(1 for key, charted in order if charted and key in summaries)
     sep_gap = ROW_H // 2
     footnote_count = 1 + len(inconsistent_series(summaries))
     height = TITLE_H + HEADER_H + ROW_H * len(rows) + sep_gap + 25 + 15 * footnote_count
@@ -1071,24 +1675,23 @@ def render_table_svg(summaries: Mapping[str, SeriesSummary], theme: Theme, sourc
     parts: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {TABLE_WIDTH} {height}" '
         f'width="{TABLE_WIDTH}" height="{height}" role="img" '
-        f'aria-label="Peak RSS, RSS after 10 s idle, and percent returned, per allocator">',
+        f'aria-label="{escape(text_.aria)}">',
         f'<rect width="{TABLE_WIDTH}" height="{height}" fill="{theme.background}"/>',
         '<g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">',
         f'<text x="{COL_LABEL_X}" y="26" font-size="17" font-weight="600" fill="{theme.text}">'
-        "Memory returned after idle, by allocator</text>",
+        f"{escape(text_.title)}</text>",
         f'<text x="{COL_LABEL_X}" y="44" font-size="12" fill="{theme.muted}">'
         f"{escape(source_line)}</text>",
         f'<text x="{COL_LABEL_X}" y="61" font-size="12" fill="{theme.muted}">'
-        "Peak is VmHWM; after-idle is VmRSS at the end of the idle window (10 s unless the "
-        "row says otherwise). Both are kernel counters, good to a few hundred kB.</text>",
+        f"{escape(text_.subtitle)}</text>",
     ]
 
     header_y = TITLE_H + 14
     for x, text, anchor in (
         (COL_LABEL_X, "allocator", "start"),
-        (COL_IDLE_X, "what runs during idle", "start"),
+        (COL_IDLE_X, text_.mechanism_header, "start"),
         (COL_PEAK_X, "peak RSS", "end"),
-        (COL_AFTER_X, "after idle", "end"),
+        (COL_AFTER_X, text_.after_header, "end"),
         (COL_PCT_X, "returned", "end"),
     ):
         parts.append(
@@ -1133,12 +1736,17 @@ def render_table_svg(summaries: Mapping[str, SeriesSummary], theme: Theme, sourc
             )
         top = bottom
 
-    footnotes = ["Rows below the dashed rule are diagnostics, not part of the chart."]
+    footnotes = [text_.footnote]
     # A series whose repetitions disagree is reported by its best run like every other
     # series, so the disagreement itself has to be on the image.
     for summary, returned, total in inconsistent_series(summaries):
+        # The sizing run has two rows per fork build, so a shared label names the row by
+        # its mechanism as well; the idle table's labels are unique and read as before.
+        name = summary["label"]
+        if sum(1 for row in rows if row["label"] == name) > 1:
+            name = f"{name}, {summary['idle_mechanism']}"
         footnotes.append(
-            f"{summary['label']} returned memory in only {returned} of {total} runs; "
+            f"{name} returned memory in only {returned} of {total} runs; "
             "the figure above is the best of them, as it is for every row."
         )
     for index, footnote in enumerate(footnotes):
@@ -1269,6 +1877,57 @@ def summarize(
     }
 
 
+PURGE_STATUS_NAMES = {0: "OK", 1: "PARTIAL", 2: "BUSY"}
+
+
+def purge_mechanism_text(spec: BusySeriesSpec, picked: RunResult) -> str:
+    """The "what the purging thread calls" cell: the call, then -- for mi_purge_all --
+    what it reported, so an ungated `PARTIAL, 4 pending` sits beside its number."""
+    text = PURGE_DESCRIPTIONS[spec.purge]
+    if spec.purge == PURGE_MI_PURGE_ALL and picked.purge_status >= 0:
+        status = PURGE_STATUS_NAMES.get(picked.purge_status, str(picked.purge_status))
+        text += f" -> {status}, {picked.purge_max_pending} pending"
+    return text
+
+
+def summarize_busy(
+    spec: BusySeriesSpec,
+    build: AllocatorBuild,
+    picked: RunResult,
+    attempts: list[RunResult],
+    window: int,
+) -> BusySeriesSummary:
+    peak_mb = picked.peak_rss_kb / 1024.0
+    after_mb = picked.after_idle_rss_kb / 1024.0
+    return {
+        "label": spec.label,
+        "allocator_id": spec.allocator_id,
+        "pin": build.pin,
+        "build_flags": list(GATED_CMAKE_ARGS) if spec.allocator_id == GATED_ALLOCATOR else [],
+        "idle_mechanism": purge_mechanism_text(spec, picked),
+        "idle_seconds": window,
+        "env": {},
+        "charted": spec.purge != PURGE_NOTHING,
+        "note": spec.note,
+        "runs": [record_run(run) for run in attempts],
+        "peak_rss_mb": peak_mb,
+        "idle_start_rss_mb": picked.idle_start_rss_kb / 1024.0,
+        "after_idle_rss_mb": after_mb,
+        "percent_returned": percent_returned(peak_mb, after_mb),
+        "purge_status": picked.purge_status,
+        "purge_max_pending": picked.purge_max_pending,
+    }
+
+
+def busy_order() -> list[tuple[str, bool]]:
+    return [(s.key, s.purge != PURGE_NOTHING) for s in BUSY_SERIES]
+
+
+def load_busy_report_json(path: Path) -> BusyReportJson:
+    result: BusyReportJson = json.loads(path.read_text(encoding="utf-8"))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1301,6 +1960,101 @@ def measure_all(
     return series, summaries
 
 
+def measure_all_busy(
+    build_root: Path, jobs: int, seconds: int, runs: int, threads: int, lockfile: Path
+) -> dict[str, BusySeriesSummary]:
+    records = select_records(lockfile)
+    builds = dict(build_allocators(records, build_root, jobs))
+    builds[GATED_ALLOCATOR] = build_gated_fork(records, builds, build_root, jobs)
+    builds[GLIBC_ALLOCATOR] = glibc_pseudo_build()
+    summaries: dict[str, BusySeriesSummary] = {}
+    with tempfile.TemporaryDirectory(prefix="allocator-purge-any-thread-") as tmp:
+        work_dir = Path(tmp)
+        for spec in BUSY_SERIES:
+            build = builds[spec.allocator_id]
+            picked, attempts = measure_busy_series(spec, build, work_dir, seconds, runs, threads)
+            summaries[spec.key] = summarize_busy(spec, build, picked, attempts, seconds)
+            summary = summaries[spec.key]
+            print(
+                f"{spec.key}: peak {summary['peak_rss_mb']:.1f} MB, "
+                f"after {seconds} s {summary['after_idle_rss_mb']:.1f} MB "
+                f"({summary['percent_returned']:.0f}% returned; "
+                f"purge = {summary['idle_mechanism']})",
+                flush=True,
+            )
+    return summaries
+
+
+def format_busy_source_line(commit: str, cpu: str, kernel: str, runs: int, threads: int) -> str:
+    return (
+        f"measured at {commit}, {cpu}, {kernel}, taskset -c 0-3, {threads} busy threads, "
+        f"best of {runs} runs"
+    )
+
+
+def main_busy(args: argparse.Namespace, out_dir: Path) -> int:
+    """The sizing run: JSON + table SVGs, or --check against the committed ones."""
+    threads: int = args.busy_threads
+    json_path = out_dir / "allocator-purge-any-thread-report.json"
+    if args.check or args.from_data:
+        if not json_path.exists():
+            print(f"error: {json_path} missing; run without --check first", file=sys.stderr)
+            return 1
+        report = load_busy_report_json(json_path)
+        threads = report["busy_threads"]
+        source_line = format_busy_source_line(
+            report["commit"], report["cpu"], report["kernel"], report["runs_per_series"], threads
+        )
+        summaries = report["series"]
+    else:
+        if args.build_root is None:
+            print("error: --build-root is required unless --check/--from-data", file=sys.stderr)
+            return 1
+        if shutil.which("taskset") is None:
+            print("error: taskset is required to pin the workload", file=sys.stderr)
+            return 1
+        commit = git_commit(REPO_ROOT)
+        cpu, kernel = probe_machine()
+        source_line = format_busy_source_line(commit, cpu, kernel, args.runs, threads)
+        summaries = measure_all_busy(
+            args.build_root.resolve(), args.jobs, args.seconds, args.runs, threads, args.lockfile
+        )
+        payload: BusyReportJson = {
+            "commit": commit,
+            "cpu": cpu,
+            "kernel": kernel,
+            "runs_per_series": args.runs,
+            "idle_seconds": args.seconds,
+            "busy_threads": threads,
+            "selection_rule": selection_rule(args.runs),
+            "series": summaries,
+        }
+        json_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    text_ = busy_table_text(threads)
+    outputs = {
+        out_dir / f"allocator-purge-any-thread-table-{theme.name}.svg": render_table_svg(
+            summaries, theme, source_line, busy_order(), text_
+        )
+        for theme in (LIGHT, DARK)
+    }
+    if args.check:
+        stale = [
+            path
+            for path, body in outputs.items()
+            if not path.exists() or path.read_text(encoding="utf-8") != body
+        ]
+        if stale:
+            print("error: stale: " + ", ".join(str(path) for path in stale), file=sys.stderr)
+            return 1
+        print("allocator-purge-any-thread artifacts are current")
+        return 0
+    for path, body in outputs.items():
+        path.write_text(body, encoding="utf-8")
+    print("wrote " + " and ".join(str(path) for path in outputs))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1326,10 +2080,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="render from the already-committed CSV/JSON instead of re-measuring",
     )
+    parser.add_argument(
+        "--busy-threads",
+        type=int,
+        nargs="?",
+        const=4,
+        default=0,
+        metavar="N",
+        help="the sizing run instead: N busy worker threads, purge from the main thread "
+        "(default N=4 when given); writes/checks the allocator-purge-any-thread-* outputs",
+    )
     args = parser.parse_args(argv)
 
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.busy_threads:
+        return main_busy(args, out_dir)
     csv_path = out_dir / "allocator-idle-rss.csv"
     json_path = out_dir / "allocator-idle-report.json"
 

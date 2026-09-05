@@ -31,9 +31,9 @@
           "feature": "Process-wide eager purge, from any thread",
           "cells": {
             "mimalloc-pprof": {
-              "status": "no",
-              "note": "not yet — #335",
-              "source": "https://github.com/zackees/mimalloc-pprof/issues/335"
+              "status": "partial",
+              "note": "gated 72 %; default parked — #366",
+              "source": "https://github.com/zackees/mimalloc-pprof/issues/366"
             },
             "upstream": {
               "status": "no",
@@ -47,8 +47,8 @@
             },
             "jemalloc": {
               "status": "yes",
-              "note": "MALLCTL_ARENAS_ALL",
-              "source": "https://jemalloc.net/jemalloc.3.html#arena.i.purge"
+              "note": "MALLCTL_ARENAS_ALL, 74 %",
+              "source": "https://jemalloc.net/jemalloc.3.html#arena.i.purge (measured: 4 busy threads, purge from another thread, 74 %)"
             }
           }
         },
@@ -82,8 +82,8 @@
           "cells": {
             "mimalloc-pprof": {
               "status": "partial",
-              "note": "parked threads — #335",
-              "source": "https://github.com/zackees/mimalloc-pprof/issues/335"
+              "note": "parked; all if gated — #366",
+              "source": "https://github.com/zackees/mimalloc-pprof/issues/366"
             },
             "upstream": {
               "status": "no",

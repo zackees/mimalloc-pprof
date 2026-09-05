@@ -68,6 +68,7 @@ on the flag and the Rust layout probe stays single); only the gated build reads 
 
 ## 4. Public API
 
+<!-- doc-snippet: skip (mirrors the declarations in include/mimalloc.h) -->
 ```c
 typedef enum mi_purge_flags_e {
   MI_PURGE_FORCE = 1,   // ignore purge_delay / hole-purge pacing; a claimed sweep ignores park_reclaim

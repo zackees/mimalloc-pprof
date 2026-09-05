@@ -27,6 +27,7 @@ busy threads too (paced by `purge_holes_min_interval`, bounded per visit by
 
 ## API
 
+<!-- doc-snippet: skip (mirrors the declarations in include/mimalloc.h; redefining them next to the header does not compile) -->
 ```c
 typedef enum mi_purge_flags_e {
   MI_PURGE_FORCE = 1,   // ignore purge_delay / hole-purge pacing; a claimed sweep runs to completion
@@ -89,8 +90,11 @@ Under load some thread is always inside the allocator when the walk looks. A cli
 that wants everyone should loop, not treat `PARTIAL` as an error:
 
 ```c
+#include <mimalloc.h>
+
 mi_purge_all_report_t r;
 int status;
+int attempts = 8;
 do {
   status = mi_purge_all_ex(MI_PURGE_FORCE, 20, &r);
 } while (status == MI_PURGE_PARTIAL && r.theaps_pending > 0 && --attempts > 0);

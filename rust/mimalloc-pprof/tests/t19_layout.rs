@@ -237,6 +237,26 @@ fn purge_holes_struct_matches_c() {
 }
 
 #[test]
+fn purge_all_report_matches_c() {
+    let c = c_layout();
+    check(
+        &c,
+        layout!(
+            "mi_purge_all_report_t",
+            sys::mi_purge_all_report_t,
+            arena_bytes,
+            hole_bytes,
+            theaps_swept,
+            theaps_pending,
+            theaps_orphaned,
+            gated,
+            complete,
+        ),
+    );
+    check(&c, layout!("mi_purge_flags_t", sys::mi_purge_flags_t));
+}
+
+#[test]
 fn stats_struct_matches_c() {
     let c = c_layout();
     check(
@@ -417,6 +437,10 @@ fn versions_and_constants_match_c() {
         ("const:MI_MEMORY_FREE", sys::MI_MEMORY_FREE as usize),
         ("const:MI_MEMORY_RESIZE", sys::MI_MEMORY_RESIZE as usize),
         ("const:MI_MEMORY_CHANGE_COUNT", sys::MI_MEMORY_CHANGE_COUNT),
+        ("const:MI_PURGE_FORCE", sys::MI_PURGE_FORCE as usize),
+        ("const:MI_PURGE_OK", sys::MI_PURGE_OK as usize),
+        ("const:MI_PURGE_PARTIAL", sys::MI_PURGE_PARTIAL as usize),
+        ("const:MI_PURGE_BUSY", sys::MI_PURGE_BUSY as usize),
         ("const:MI_STAT_VERSION", sys::MI_STAT_VERSION),
         ("const:MI_BIN_HUGE", sys::MI_BIN_HUGE),
         ("const:MI_CBIN_COUNT", sys::MI_CBIN_COUNT),

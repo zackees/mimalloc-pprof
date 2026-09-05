@@ -159,6 +159,46 @@ pub struct MiPurgeHolesStats {
     pub full_sweeps: usize,
 }
 
+/// Mirrors `mi_purge_flags_t` (include/mimalloc.h, issue #366). A plain C enum: the
+/// underlying type is `int` on every ABI mimalloc targets.
+#[allow(non_camel_case_types)]
+pub type mi_purge_flags_t = c_int;
+/// `MI_PURGE_FORCE` (`mi_purge_flags_t`, issue #366): ignore `purge_delay` / hole-purge
+/// pacing, and let a claimed sweep run to completion (ignoring `park_reclaim`).
+pub const MI_PURGE_FORCE: mi_purge_flags_t = 1;
+
+/// `MI_PURGE_OK` (issue #366): every registered thread was reached.
+pub const MI_PURGE_OK: c_int = 0;
+/// `MI_PURGE_PARTIAL` (issue #366): some owners pending (see the report); everything
+/// reachable was purged.
+pub const MI_PURGE_PARTIAL: c_int = 1;
+/// `MI_PURGE_BUSY` (issue #366): another purge is in flight, or this is a re-entrant call;
+/// nothing was done.
+pub const MI_PURGE_BUSY: c_int = 2;
+
+/// Mirrors `mi_purge_all_report_t` (include/mimalloc.h, issue #366): what `mi_purge_all_ex`
+/// returned to the OS and which threads it could not reach. Field order and types must
+/// match `mimalloc.h` exactly (checked by tests/t19_layout.rs).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct mi_purge_all_report_t {
+    /// Bytes returned to the OS by the arena passes.
+    pub arena_bytes: usize,
+    /// Bytes returned by hole purging (every swept theap + abandoned pages).
+    pub hole_bytes: usize,
+    /// tlds claimed and swept by this call (the caller included).
+    pub theaps_swept: usize,
+    /// Registered tlds not reached within `wait_ms`.
+    pub theaps_pending: usize,
+    /// Pre-fork tlds of vanished threads, never touched.
+    pub theaps_orphaned: usize,
+    /// Built with `MI_OWNER_GATE` (configuration, not completion).
+    pub gated: bool,
+    /// `theaps_pending == 0 && theaps_orphaned == 0`.
+    pub complete: bool,
+}
+
 // ---------------------------------------------------------------------------------------
 // include/mimalloc-stats.h -- exact allocator statistics (upstream API)
 // ---------------------------------------------------------------------------------------
@@ -693,6 +733,19 @@ unsafe extern "C" {
     /// Mirrors `mi_purge_holes_report` (issue #272, Bun parity P7b): prints, per size
     /// class, the free bytes hole purging could NOT discard. Read-only; purges nothing.
     pub fn mi_purge_holes_report();
+
+    /// Mirrors `mi_purge_all_ex` (include/mimalloc.h, issue #366): process-wide eager purge
+    /// from any thread. Returns `MI_PURGE_OK`, `MI_PURGE_PARTIAL` or `MI_PURGE_BUSY`.
+    /// `wait_ms` bounds owner-acquisition waiting ONLY -- not a claimed thread's sweep and
+    /// not its purge syscalls. `report` may be NULL.
+    pub fn mi_purge_all_ex(
+        flags: mi_purge_flags_t,
+        wait_ms: usize,
+        report: *mut mi_purge_all_report_t,
+    ) -> c_int;
+    /// Mirrors `mi_purge_all` (issue #366):
+    /// `mi_purge_all_ex(force ? MI_PURGE_FORCE : 0, 100, NULL)`.
+    pub fn mi_purge_all(force: bool);
 
     // ---- include/mimalloc.h: options ----
     /// Mirrors `mi_option_is_enabled`.

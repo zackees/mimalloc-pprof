@@ -79,6 +79,9 @@ FORK_ADDITIONS_IN_UPSTREAM_HEADERS = {
     # issue #269 / Bun parity P4 -- the heap dump
     "mi_heap_dump_json",
     "mi_heap_get_seq",
+    # issue #366 -- process-wide eager purge
+    "mi_purge_all_ex",
+    "mi_purge_all",
 }
 
 #: C functions with no `sys.rs` declaration, and why that is deliberate. Empty today:
@@ -98,6 +101,11 @@ SYS_ONLY_WITH_REASON = {
         "needs a `mi_heap_t*`, and mimalloc v3 removed `mi_heap_get_default`, so Rust has "
         "no safe way to name a heap to ask about. The sequence numbers it returns are "
         "already visible in the JSON from `heap_dump_json`, which is the wrapped route."
+    ),
+    "mi_purge_all": (
+        "a one-line C convenience, `mi_purge_all_ex(force ? MI_PURGE_FORCE : 0, 100, NULL)`, "
+        "that throws the report away. The safe `purge_all(force)` keeps the report, so it "
+        "goes through `sys::mi_purge_all_ex` with the same flags and wait."
     ),
     "mi_prof_visit": (
         "prof::samples() deliberately wraps mi_prof_snapshot_new/_visit/_free instead. "

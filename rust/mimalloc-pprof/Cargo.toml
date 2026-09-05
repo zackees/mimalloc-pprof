@@ -20,6 +20,10 @@ build = "build.rs"
 # need the allocator can compile the profiler out with `default-features = false`.
 default = ["pprof"]
 pprof = []
+# Build the allocator with the per-thread owner gate (C `MI_OWNER_GATE=1`, issue #366):
+# every allocator call takes a gate so `purge_all` can sweep EVERY thread's heap, not only
+# parked ones. Costs a few percent on the malloc/free fast path; off by default.
+owner-gate = []
 
 [[test]]
 name = "t1_smoke"
@@ -68,6 +72,8 @@ required-features = ["pprof"]
 name = "t18_heap_snapshot"
 [[test]]
 name = "feature_contract"
+[[test]]
+name = "t24_purge_all"
 
 [build-dependencies]
 cc = "1.2"

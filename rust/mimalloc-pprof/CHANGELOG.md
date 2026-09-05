@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Process-wide eager purge** ([#366](https://github.com/zackees/mimalloc-pprof/issues/366)):
+  `purge_all(force) -> PurgeAllReport` and `purge_all_ex(PurgeFlags, wait_ms) ->
+  (PurgeStatus, PurgeAllReport)` wrap `mi_purge_all_ex`; `sys::mi_purge_all_report_t`,
+  `MI_PURGE_FORCE`, `MI_PURGE_OK/PARTIAL/BUSY`. New cargo feature `owner-gate`
+  (C `MI_OWNER_GATE=1`, default off) lets the purge reach every thread instead of only
+  parked ones. `wait_ms` bounds owner-acquisition waiting only; `Partial` is a normal
+  outcome.
 - **Live heap snapshot + viewer** ([#338](https://github.com/zackees/mimalloc-pprof/issues/338),
   Bun parity): `mi_heap_snapshot` / `mi_heap_snapshot_to_file` write Bun's binary heap
   snapshot (format version 1, byte-identical), `MIMALLOC_SNAPSHOT_ON_EXIT=1|2` writes one

@@ -203,6 +203,35 @@ mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
 mi_decl_export bool mi_on_thread_idle_start(void) mi_attr_noexcept;
 // The other half of `mi_on_thread_idle_start`: take the theaps back before allocating again.
 mi_decl_export void mi_on_thread_idle_end(void) mi_attr_noexcept;
+
+// #366: process-wide eager purge from any thread (docs/purge-all-implementation.md §4).
+// Returns as much memory as the allocator's invariants allow across ALL threads' heaps --
+// arenas, abandoned pages, the caller's own pages and holes, and (in a build with
+// `MI_OWNER_GATE=1`, or for threads parked in `mi_on_thread_idle_start`) every other
+// registered thread's pages and holes -- and reports exactly what it could not reach.
+typedef enum mi_purge_flags_e {
+  MI_PURGE_FORCE = 1,   // ignore purge_delay / hole-purge pacing; a claimed sweep runs to completion (ignores park_reclaim)
+} mi_purge_flags_t;
+
+typedef struct mi_purge_all_report_s {
+  size_t arena_bytes;        // returned to the OS by the arena passes
+  size_t hole_bytes;         // returned by hole purging (every swept theap + abandoned pages)
+  size_t theaps_swept;       // tlds claimed and swept by this call (the caller included)
+  size_t theaps_pending;     // registered tlds not reached within `wait_ms`
+  size_t theaps_orphaned;    // pre-fork tlds of vanished threads, never touched
+  bool   gated;              // built with MI_OWNER_GATE (configuration, not completion)
+  bool   complete;           // theaps_pending == 0 && theaps_orphaned == 0
+} mi_purge_all_report_t;
+
+#define MI_PURGE_OK       0   // every registered thread was reached
+#define MI_PURGE_PARTIAL  1   // some owners pending (see the report); everything reachable was purged
+#define MI_PURGE_BUSY     2   // another purge is in flight, or this is a re-entrant call: nothing was done
+
+// `wait_ms` bounds owner-acquisition waiting ONLY -- not a claimed thread's sweep and not its
+// purge syscalls. `report` may be NULL; the status is the return value either way.
+mi_decl_export int  mi_purge_all_ex(mi_purge_flags_t flags, size_t wait_ms, mi_purge_all_report_t* report) mi_attr_noexcept;
+// == mi_purge_all_ex(force ? MI_PURGE_FORCE : 0, 100, NULL)
+mi_decl_export void mi_purge_all(bool force) mi_attr_noexcept;
 // Stop the background scavenger thread (it restarts on demand; see `mi_option_scavenger`).
 mi_decl_export void mi_scavenger_stop(void)     mi_attr_noexcept;
 

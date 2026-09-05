@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit d21ee2ff of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 90941fc3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -5395,6 +5395,22 @@ static inline bool _mi_gate_held_theap(const mi_theap_t* theap) {
 #define MI_GATE_ASSERT_HELD(theap)  mi_assert_internal(_mi_gate_held_theap(theap))
 
 #else  // !MI_OWNER_GATE
+
+// Ungated, "may touch this theap's pages" is simply owner-or-claim-holder: the owner (no gate,
+// it is RUNNING unless it parked itself in `mi_on_thread_idle_start`), or the thread holding
+// the tld's MI_PARK_SWEEPING claim. Used by `_mi_page_free_collect_no_unpurge` so a foreign
+// reader never folds a page's thread frees (same rule in both builds); the gated build's
+// version above additionally requires the owner to be inside the gate.
+static inline bool _mi_gate_held_theap(const mi_theap_t* theap) {
+  if (theap == NULL) return false;
+  if (_mi_theap_heap_peek(theap) == NULL) return true;   // detached by heap teardown: the deleter's
+  const mi_tld_t* const tld = theap->tld;
+  if (tld == NULL) return false;
+  if (tld->thread_id == MI_THREADID_DETACHED) return true;
+  const mi_threadid_t me = _mi_thread_id();
+  return (tld->thread_id == me ||
+          mi_atomic_load_acquire((_Atomic(uintptr_t)*)&tld->sweeper) == (uintptr_t)me);
+}
 
 #define MI_GATE_ENTER(theap)      ((void)0)
 #define MI_GATE_LEAVE(tld)        ((void)0)
@@ -13608,12 +13624,28 @@ bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_bloc
   return mi_heap_visit_os_pages(heap, &visit_info);
 }
 
+// #366: owner-gate site (see `mi_theap_visit_blocks` in theap.c for why a block visit is a
+// write on the caller's own pages). Gated on the CALLER's own tld; one enter, one leave.
+static bool mi_heap_visit_blocks_gated(mi_heap_t* heap, bool abandoned_only, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
+  mi_theap_t* self = _mi_theap_default();
+  #if MI_OWNER_GATE
+  if (!mi_theap_is_initialized(self)) { return _mi_heap_visit_blocks(heap, abandoned_only, visit_blocks, false, visitor, arg); }
+  #endif
+  MI_GATE_ENTER(self);
+  const bool ok = _mi_heap_visit_blocks(heap, abandoned_only, visit_blocks, false, visitor, arg);
+  MI_GATE_LEAVE(self->tld);
+  #if !MI_OWNER_GATE
+  MI_UNUSED(self);
+  #endif
+  return ok;
+}
+
 bool mi_heap_visit_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
-  return _mi_heap_visit_blocks(heap, false, visit_blocks, false, visitor, arg);
+  return mi_heap_visit_blocks_gated(heap, false, visit_blocks, visitor, arg);
 }
 
 bool mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
-  return _mi_heap_visit_blocks(heap, true, visit_blocks, false, visitor, arg);
+  return mi_heap_visit_blocks_gated(heap, true, visit_blocks, visitor, arg);
 }
 
 
@@ -18008,7 +18040,28 @@ static void mi_snap_walk_own_theaps(mi_snap_ctx_t* ctx) {
 // Public entry point
 // ---------------------------------------------------------------------------
 
+static int mi_heap_snapshot_inner(int fd, unsigned flags);
+
+// #366: owner-gate site -- the walk folds the thread frees of this thread's OWN pages
+// (`mi_snap_emit_page_freemap` -> `_mi_page_free_collect_no_unpurge`), an owner-private write;
+// in a gated build a caller between allocator calls is PARKED and could be swept under the
+// walk. Other threads' pages are read as they are (see `_mi_page_free_collect_no_unpurge`).
+// A thread with no theap (process exit on some platforms) has nothing of its own to protect.
 int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
+  mi_theap_t* self = _mi_theap_default();
+  #if MI_OWNER_GATE
+  if (!mi_theap_is_initialized(self)) { return mi_heap_snapshot_inner(fd, flags); }
+  #endif
+  MI_GATE_ENTER(self);
+  const int rc = mi_heap_snapshot_inner(fd, flags);
+  MI_GATE_LEAVE(self->tld);
+  #if !MI_OWNER_GATE
+  MI_UNUSED(self);
+  #endif
+  return rc;
+}
+
+static int mi_heap_snapshot_inner(int fd, unsigned flags) {
   if (fd < 0) return -1;
   // Use the main subproc (and walk siblings) rather than `_mi_subproc()`: at
   // process-exit time on some platforms TLS may already point at an empty theap,
@@ -19966,10 +20019,22 @@ static bool mi_cdecl memevt_visit_adapter(const mi_heap_t* heap, const mi_heap_a
   return ctx->visitor(block, block_size, ctx->arg);
 }
 
+static bool mi_memory_visit_live_allocations_inner(mi_theap_t* theap, mi_memory_allocation_visit_fun* visitor, void* arg);
+
+// #366: owner-gate site -- `_mi_theap_area_visit_blocks` folds each page's thread frees, an
+// owner-private write on this thread's own theaps; be RUNNING for the walk (see theap.c
+// `mi_theap_visit_blocks`). One enter, exactly one leave.
 bool mi_memory_visit_live_allocations(mi_memory_allocation_visit_fun* visitor, void* arg) mi_attr_noexcept {
   if (visitor == NULL) return false;
-  mi_theap_t* const theap = _mi_theap_default();
+  mi_theap_t* theap = _mi_theap_default();
   if (!mi_theap_is_initialized(theap)) return true; // nothing to visit yet on this thread.
+  MI_GATE_ENTER(theap);
+  const bool ok = mi_memory_visit_live_allocations_inner(theap, visitor, arg);
+  MI_GATE_LEAVE(theap->tld);
+  return ok;
+}
+
+static bool mi_memory_visit_live_allocations_inner(mi_theap_t* theap, mi_memory_allocation_visit_fun* visitor, void* arg) {
   if (theap->tld->hooks.memevt_suppress_depth > 0) return false; // do not reenter while a callback/internal-op is in flight on this thread.
   memevt_visit_ctx_t ctx = { visitor, arg };
   // Walk every theap on this thread (tld->theaps, via tnext), and for each, walk its own
@@ -23293,6 +23358,10 @@ static inline bool mi_page_free_quick_collect(mi_page_t* page) {
 
 static void mi_page_free_collect_ex(mi_page_t* page, bool force, bool allow_unpurge) {
   mi_assert_internal(page!=NULL);
+  // #366: owner-private leaf (docs/purge-all-implementation.md §5.2) -- asserted HERE, at the
+  // body, because `_mi_theap_area_visit_blocks` (the block visitors) reaches it through
+  // `_mi_page_free_collect_no_unpurge`, not through `_mi_page_free_collect`.
+  if (!mi_page_is_abandoned(page)) { MI_GATE_ASSERT_HELD(mi_page_theap(page)); }
 
   // collect the thread free list
   mi_page_thread_free_collect(page);
@@ -23346,6 +23415,12 @@ void _mi_page_free_collect(mi_page_t* page, bool force) {
 // as free, see `_mi_theap_area_visit_blocks`). Also used by the sweep itself, which is about to
 // discard and would only un-purge what it re-discards a moment later.
 void _mi_page_free_collect_no_unpurge(mi_page_t* page, bool force) {
+  // #366: the block visitors and the heap snapshot reach here for pages of OTHER threads too
+  // (`mi_heap_visit_blocks`, `mi_heap_snapshot` walk every page of a heap/arena). Folding a
+  // page's thread frees is an owner-private write: a foreign reader that holds neither the
+  // page's ownership nor the tld's MI_PARK_SWEEPING claim must not do it -- it reads the lists
+  // as they are (stale but consistent) instead of racing the owner. Same rule in both builds.
+  if (!mi_page_is_abandoned(page) && !_mi_gate_held_theap(mi_page_theap(page))) return;
   mi_page_free_collect_ex(page, force, false);
 }
 
@@ -31231,7 +31306,10 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
   // visiting must not un-purge a hole -- inspection may not mutate the heap, and a discarded
   // block is reported as free here either way (see the `purged` marking below).
   _mi_page_free_collect_no_unpurge(page,true);   // collect both thread_delayed and local_free
-  mi_assert_internal(page->local_free == NULL);
+  // #366: that collect is a no-op for a page of ANOTHER thread that we neither own nor hold the
+  // claim for (see `_mi_page_free_collect_no_unpurge`): its `local_free` then still holds
+  // blocks, and they are walked below as free alongside `page->free`. Held ⇒ collected.
+  mi_assert_internal(page->local_free == NULL || !_mi_gate_held_theap(mi_page_theap(page)));
   if (page->used == 0) return true;
 
   size_t psize;
@@ -31277,7 +31355,9 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
   #if MI_DEBUG>1
   size_t free_count = 0;
   #endif
-  for (mi_block_t* block = page->free; block != NULL; block = mi_block_next(page, block)) {
+  mi_block_t* const free_heads[2] = { page->free, page->local_free };   // #366: `local_free` is empty on an owned page
+  for (size_t li = 0; li < 2; li++)
+  for (mi_block_t* block = free_heads[li]; block != NULL; block = mi_block_next(page, block)) {
     #if MI_DEBUG>1
     free_count++;
     #endif
@@ -31394,9 +31474,29 @@ static bool mi_theap_area_visitor(const mi_theap_t* theap, const mi_theap_area_e
 }
 
 // Visit all blocks in a theap
-bool mi_theap_visit_blocks(const mi_theap_t* theap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
+static bool mi_theap_visit_blocks_inner(const mi_theap_t* theap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
   mi_visit_blocks_args_t args = { visit_blocks, visitor, arg };
   return mi_theap_visit_areas(theap, &mi_theap_area_visitor, &args);
+}
+
+// #366: owner-gate site. The block visitor is not a pure reader: `_mi_theap_area_visit_blocks`
+// folds the page's thread frees (`_mi_page_free_collect_no_unpurge`), which is an owner-private
+// write. In a gated build a caller that is between allocator calls is PARKED, and a sweeper
+// could claim its tld and sweep the very pages it is walking -- so the caller must be RUNNING
+// for the walk. Gated on the CALLER's own tld: visiting another thread's theap is the
+// documented-unsafe case and is left as it was. One enter, exactly one leave.
+bool mi_theap_visit_blocks(const mi_theap_t* theap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
+  mi_theap_t* self = _mi_theap_default();
+  #if MI_OWNER_GATE
+  if (!mi_theap_is_initialized(self)) { return mi_theap_visit_blocks_inner(theap, visit_blocks, visitor, arg); }   // never initialise a thread from a visit
+  #endif
+  MI_GATE_ENTER(self);
+  const bool ok = mi_theap_visit_blocks_inner(theap, visit_blocks, visitor, arg);
+  MI_GATE_LEAVE(self->tld);
+  #if !MI_OWNER_GATE
+  MI_UNUSED(self);
+  #endif
+  return ok;
 }
 
 /* ---- end inlined: src/theap.c ---- */

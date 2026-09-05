@@ -855,12 +855,12 @@ static void test_g8_scavenger_pacing(void) {
 // ---------------------------------------------------------------------------------------------
 
 static void test_c1_coverage(void) {
-  worker_t small, heap, aligned, mixed, spawn;
+  worker_t w_small, heap, aligned, mixed, spawn;
   g_output_swallow.store(1); g_output_allocate.store(1);
   g_output_allocs.store(0); g_errors_seen.store(0);
   mi_option_set_enabled(mi_option_verbose, true);   // the oversized-request error is printed unconditionally
   bool started = true;
-  started = thread_start(&small.thread, &c1_small, &small) && started;
+  started = thread_start(&w_small.thread, &c1_small, &w_small) && started;
   started = thread_start(&heap.thread, &c1_heap, &heap) && started;
   started = thread_start(&aligned.thread, &c1_aligned, &aligned) && started;
   started = thread_start(&mixed.thread, &c1_mixed, &mixed) && started;
@@ -872,16 +872,16 @@ static void test_c1_coverage(void) {
     const int rc = purge(MI_PURGE_FORCE, 20, &r, &ms);
     calls++; if (rc == MI_PURGE_BUSY) busy++; if (ms > worst) worst = ms;
   }
-  small.stop.store(1); heap.stop.store(1); aligned.stop.store(1); mixed.stop.store(1); spawn.stop.store(1);
-  if (started) { thread_join(small.thread); thread_join(heap.thread); thread_join(aligned.thread); thread_join(mixed.thread); thread_join(spawn.thread); }
+  w_small.stop.store(1); heap.stop.store(1); aligned.stop.store(1); mixed.stop.store(1); spawn.stop.store(1);
+  if (started) { thread_join(w_small.thread); thread_join(heap.thread); thread_join(aligned.thread); thread_join(mixed.thread); thread_join(spawn.thread); }
   mi_option_set_enabled(mi_option_verbose, false);
   g_output_allocate.store(0); g_output_swallow.store(0);
   fprintf(stderr, "  C1: %d claims (%d BUSY), worst %.1f ms; small %ld, heap %ld, aligned %ld, mixed %ld iterations; %ld first-call threads; "
                   "%zu error messages, %zu allocations from inside the output hook\n",
-          calls, busy, worst, small.iterations.load(), heap.iterations.load(), aligned.iterations.load(), mixed.iterations.load(),
+          calls, busy, worst, w_small.iterations.load(), heap.iterations.load(), aligned.iterations.load(), mixed.iterations.load(),
           spawn.iterations.load(), g_errors_seen.load(), g_output_allocs.load());
   check("C1: workers started", started);
-  check("C1: every path made progress under a claimant loop", small.iterations.load() > 0 && heap.iterations.load() > 0 && aligned.iterations.load() > 0 && mixed.iterations.load() > 0 && spawn.iterations.load() > 0);
+  check("C1: every path made progress under a claimant loop", w_small.iterations.load() > 0 && heap.iterations.load() > 0 && aligned.iterations.load() > 0 && mixed.iterations.load() > 0 && spawn.iterations.load() > 0);
   check("C1: the output hook recursed into the allocator on a thread's first allocator call", g_errors_seen.load() > 0 && g_output_allocs.load() > 0);
   check("C1: no claim was BUSY and each returned promptly", busy == 0 && worst < 5000.0);
 }

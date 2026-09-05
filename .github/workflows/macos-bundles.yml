@@ -49,17 +49,10 @@ on:
   push:
     branches: [main, v4]
   pull_request:
+    # No `paths` filter (#360): every job here is a required status check on `main`, and a
+    # filtered workflow never reports on a PR outside its paths, leaving that PR BLOCKED.
     # `labeled` so adding `needs-macos` to an open PR re-runs `decide` (#339).
     types: [opened, synchronize, reopened, labeled]
-    paths:
-      - 'src/**'
-      - 'include/**'
-      - 'test/**'
-      - 'rust/**'
-      - 'CMakeLists.txt'
-      - 'cmake/toolchains/**'
-      - 'ci/**'
-      - '.github/workflows/macos-bundles.yml'
 
 concurrency:
   # The macOS pool is the scarce one this whole workflow exists to stop wasting (#277).

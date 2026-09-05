@@ -1,0 +1,6 @@
+snapshot   version=1  ptr=8  slice=65536  flags=0x1
+arenas     1   reserved=1073741824   committed=1073741824   purgeable=74973184
+heaps      1
+pages      88   (abandoned=74 full=75)
+page-mem   committed=93714368   used=88970848   reserved=93714368
+waste      internal-frag=4743520   (5.1% of committed pages)

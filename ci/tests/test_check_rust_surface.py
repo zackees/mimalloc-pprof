@@ -46,6 +46,7 @@ class CheckRustSurfaceTests(unittest.TestCase):
             "mi_option_purge_holes_eager_zero",
             "mi_option_purge_holes_min_interval",
             "mi_option_purge_holes_full_every",
+            "mi_option_snapshot_on_exit",
         ]
         self.assertEqual(options[-len(fork_block) - 1 : -1], fork_block)
 

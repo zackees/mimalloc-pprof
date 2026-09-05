@@ -515,6 +515,13 @@ jobs:
             ./python/bin/python3 run_test_bundle.py macos-x64-debug-full \
               --label macos --junit /tmp/w/out/sel-debug-full.xml
             echo $? > /tmp/w/out/debug-full.rc
+            # #353: which of Apple's malloc-introspection CLIs does Recovery actually ship?
+            # Printed to the console (the guest's stdout reaches the job log) rather than a
+            # collected file, so the answer cannot go missing with the collection.
+            for t in leaks vmmap heap malloc_history xcrun; do
+              if command -v "$t" >/dev/null 2>&1; then echo "TOOLS: $t present at $(command -v "$t")"; else echo "TOOLS: $t absent"; fi
+            done
+            echo "TOOLS: $(uname -a)"
             echo "guest script complete"
 
       - name: Test results -- exactly the waived Recovery failures, no others

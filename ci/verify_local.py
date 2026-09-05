@@ -1003,7 +1003,7 @@ BUNDLE_OUT_ROOT = OUT_ROOT / "bundles"
 # find_link_library() falls back to find_library() and hands the host's ELF librt.so to a
 # Mach-O link.
 DARWIN_LINK_LIBRARIES = "pthread"
-WINDOWS_LINK_LIBRARIES = "psapi;shell32;user32;advapi32;bcrypt"
+WINDOWS_LINK_LIBRARIES = "psapi;shell32;user32;advapi32;bcrypt;synchronization"  # synchronization: WaitOnAddress for the scavenger park protocol (#299); matches windows-bundles.yml
 
 
 @dataclasses.dataclass(frozen=True)

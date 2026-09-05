@@ -78,8 +78,10 @@ Out-of-process zone enumeration (`test-osx-zone-introspect-remote`) needs `task_
 which Recovery — root, SIP not enforced — may grant. If the guest cannot, the test's
 exit 3 is waived **by name** in `ci/recovery_expected_failures.py`, and that waiver goes
 red the day it starts passing. The `leaks`/`vmmap` CLIs themselves are absent from
-Recovery and are not exercised anywhere automated; the tests drive the `enumerator`
-entry point those tools call.
+Recovery (measured; they are base-OS binaries, not part of the Command Line Tools) and
+are not exercised anywhere automated; the tests drive the `enumerator` entry point those
+tools call, and running the tools once on a real Mac is a release-checklist step in
+[docs/maintainers.md](maintainers.md#manual-macos-check-before-a-release-real-mac-required).
 
 ## `bun-surface` is a hard gate
 

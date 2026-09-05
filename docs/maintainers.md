@@ -38,6 +38,28 @@ soldr cargo run -p xtask -- check
 soldr cargo test --workspace --locked
 ```
 
+## Manual macOS check before a release (real Mac required)
+
+Apple's `leaks`, `vmmap`, `heap` and `malloc_history` are base-OS binaries that the
+macOS Recovery guest CI uses does not carry (measured on #353: none of the five is
+present in a 13.0 Recovery image, and they are not in the Command Line Tools package
+either). CI drives the same `enumerator` entry point those tools call
+(`test-osx-zone-introspect`, `test-osx-zone-introspect-remote`, both in the selective
+Recovery lane), so the residual risk is the tools' own plumbing. Before tagging a
+release that touched `src/prim/osx/**`, run this once on any Mac with a full macOS
+install and paste both outputs in the release PR:
+
+```sh
+cmake -B build -DMI_OVERRIDE=ON -DMI_OSX_ZONE=ON && cmake --build build
+leaks --atExit -- ./build/mimalloc-test-osx-zone-introspect
+./build/mimalloc-test-osx-zone-introspect-remote & vmmap $!
+```
+
+Expected: `leaks` lists a zone named `mimalloc` with non-zero nodes and reports the
+384 live blocks the in-process test still holds at exit; `vmmap` shows the arena as a
+`MALLOC` region attributed to that zone. A zone that reports zero nodes means the
+enumerator regressed to upstream's empty stub.
+
 ## Repository layout
 
 ```text

@@ -708,7 +708,10 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
   // visiting must not un-purge a hole -- inspection may not mutate the heap, and a discarded
   // block is reported as free here either way (see the `purged` marking below).
   _mi_page_free_collect_no_unpurge(page,true);   // collect both thread_delayed and local_free
-  mi_assert_internal(page->local_free == NULL);
+  // #366: that collect is a no-op for a page of ANOTHER thread that we neither own nor hold the
+  // claim for (see `_mi_page_free_collect_no_unpurge`): its `local_free` then still holds
+  // blocks, and they are walked below as free alongside `page->free`. Held ⇒ collected.
+  mi_assert_internal(page->local_free == NULL || !_mi_gate_held_theap(mi_page_theap(page)));
   if (page->used == 0) return true;
 
   size_t psize;
@@ -754,7 +757,9 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
   #if MI_DEBUG>1
   size_t free_count = 0;
   #endif
-  for (mi_block_t* block = page->free; block != NULL; block = mi_block_next(page, block)) {
+  mi_block_t* const free_heads[2] = { page->free, page->local_free };   // #366: `local_free` is empty on an owned page
+  for (size_t li = 0; li < 2; li++)
+  for (mi_block_t* block = free_heads[li]; block != NULL; block = mi_block_next(page, block)) {
     #if MI_DEBUG>1
     free_count++;
     #endif
@@ -871,8 +876,28 @@ static bool mi_theap_area_visitor(const mi_theap_t* theap, const mi_theap_area_e
 }
 
 // Visit all blocks in a theap
-bool mi_theap_visit_blocks(const mi_theap_t* theap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
+static bool mi_theap_visit_blocks_inner(const mi_theap_t* theap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
   mi_visit_blocks_args_t args = { visit_blocks, visitor, arg };
   return mi_theap_visit_areas(theap, &mi_theap_area_visitor, &args);
+}
+
+// #366: owner-gate site. The block visitor is not a pure reader: `_mi_theap_area_visit_blocks`
+// folds the page's thread frees (`_mi_page_free_collect_no_unpurge`), which is an owner-private
+// write. In a gated build a caller that is between allocator calls is PARKED, and a sweeper
+// could claim its tld and sweep the very pages it is walking -- so the caller must be RUNNING
+// for the walk. Gated on the CALLER's own tld: visiting another thread's theap is the
+// documented-unsafe case and is left as it was. One enter, exactly one leave.
+bool mi_theap_visit_blocks(const mi_theap_t* theap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
+  mi_theap_t* self = _mi_theap_default();
+  #if MI_OWNER_GATE
+  if (!mi_theap_is_initialized(self)) { return mi_theap_visit_blocks_inner(theap, visit_blocks, visitor, arg); }   // never initialise a thread from a visit
+  #endif
+  MI_GATE_ENTER(self);
+  const bool ok = mi_theap_visit_blocks_inner(theap, visit_blocks, visitor, arg);
+  MI_GATE_LEAVE(self->tld);
+  #if !MI_OWNER_GATE
+  MI_UNUSED(self);
+  #endif
+  return ok;
 }
 

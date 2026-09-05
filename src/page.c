@@ -236,6 +236,10 @@ static inline bool mi_page_free_quick_collect(mi_page_t* page) {
 
 static void mi_page_free_collect_ex(mi_page_t* page, bool force, bool allow_unpurge) {
   mi_assert_internal(page!=NULL);
+  // #366: owner-private leaf (docs/purge-all-implementation.md §5.2) -- asserted HERE, at the
+  // body, because `_mi_theap_area_visit_blocks` (the block visitors) reaches it through
+  // `_mi_page_free_collect_no_unpurge`, not through `_mi_page_free_collect`.
+  if (!mi_page_is_abandoned(page)) { MI_GATE_ASSERT_HELD(mi_page_theap(page)); }
 
   // collect the thread free list
   mi_page_thread_free_collect(page);
@@ -289,6 +293,12 @@ void _mi_page_free_collect(mi_page_t* page, bool force) {
 // as free, see `_mi_theap_area_visit_blocks`). Also used by the sweep itself, which is about to
 // discard and would only un-purge what it re-discards a moment later.
 void _mi_page_free_collect_no_unpurge(mi_page_t* page, bool force) {
+  // #366: the block visitors and the heap snapshot reach here for pages of OTHER threads too
+  // (`mi_heap_visit_blocks`, `mi_heap_snapshot` walk every page of a heap/arena). Folding a
+  // page's thread frees is an owner-private write: a foreign reader that holds neither the
+  // page's ownership nor the tld's MI_PARK_SWEEPING claim must not do it -- it reads the lists
+  // as they are (stale but consistent) instead of racing the owner. Same rule in both builds.
+  if (!mi_page_is_abandoned(page) && !_mi_gate_held_theap(mi_page_theap(page))) return;
   mi_page_free_collect_ex(page, force, false);
 }
 

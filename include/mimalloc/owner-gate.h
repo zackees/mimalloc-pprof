@@ -84,6 +84,22 @@ static inline bool _mi_gate_held_theap(const mi_theap_t* theap) {
 
 #else  // !MI_OWNER_GATE
 
+// Ungated, "may touch this theap's pages" is simply owner-or-claim-holder: the owner (no gate,
+// it is RUNNING unless it parked itself in `mi_on_thread_idle_start`), or the thread holding
+// the tld's MI_PARK_SWEEPING claim. Used by `_mi_page_free_collect_no_unpurge` so a foreign
+// reader never folds a page's thread frees (same rule in both builds); the gated build's
+// version above additionally requires the owner to be inside the gate.
+static inline bool _mi_gate_held_theap(const mi_theap_t* theap) {
+  if (theap == NULL) return false;
+  if (_mi_theap_heap_peek(theap) == NULL) return true;   // detached by heap teardown: the deleter's
+  const mi_tld_t* const tld = theap->tld;
+  if (tld == NULL) return false;
+  if (tld->thread_id == MI_THREADID_DETACHED) return true;
+  const mi_threadid_t me = _mi_thread_id();
+  return (tld->thread_id == me ||
+          mi_atomic_load_acquire((_Atomic(uintptr_t)*)&tld->sweeper) == (uintptr_t)me);
+}
+
 #define MI_GATE_ENTER(theap)      ((void)0)
 #define MI_GATE_LEAVE(tld)        ((void)0)
 #define MI_GATE_ASSERT_HELD(theap)  ((void)0)

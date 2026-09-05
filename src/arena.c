@@ -3044,12 +3044,28 @@ bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_bloc
   return mi_heap_visit_os_pages(heap, &visit_info);
 }
 
+// #366: owner-gate site (see `mi_theap_visit_blocks` in theap.c for why a block visit is a
+// write on the caller's own pages). Gated on the CALLER's own tld; one enter, one leave.
+static bool mi_heap_visit_blocks_gated(mi_heap_t* heap, bool abandoned_only, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
+  mi_theap_t* self = _mi_theap_default();
+  #if MI_OWNER_GATE
+  if (!mi_theap_is_initialized(self)) { return _mi_heap_visit_blocks(heap, abandoned_only, visit_blocks, false, visitor, arg); }
+  #endif
+  MI_GATE_ENTER(self);
+  const bool ok = _mi_heap_visit_blocks(heap, abandoned_only, visit_blocks, false, visitor, arg);
+  MI_GATE_LEAVE(self->tld);
+  #if !MI_OWNER_GATE
+  MI_UNUSED(self);
+  #endif
+  return ok;
+}
+
 bool mi_heap_visit_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
-  return _mi_heap_visit_blocks(heap, false, visit_blocks, false, visitor, arg);
+  return mi_heap_visit_blocks_gated(heap, false, visit_blocks, visitor, arg);
 }
 
 bool mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
-  return _mi_heap_visit_blocks(heap, true, visit_blocks, false, visitor, arg);
+  return mi_heap_visit_blocks_gated(heap, true, visit_blocks, visitor, arg);
 }
 
 

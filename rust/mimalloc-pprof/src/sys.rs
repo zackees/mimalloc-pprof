@@ -2,6 +2,7 @@
 
 use core::ffi::c_char;
 use core::ffi::c_int;
+use core::ffi::c_uint;
 use core::ffi::c_void;
 
 pub type MiProfWriteFun = unsafe extern "C" fn(*mut c_void, *const c_char, usize);
@@ -547,12 +548,20 @@ mi_options! {
     /// **Fork addition (Bun).** Every N-th sweep walks every page, ignoring the per-page
     /// skip check; 0 disables.
     mi_option_purge_holes_full_every = 59;
+    /// **Fork addition (Bun parity, #338).** Write a heap snapshot on process exit: 0 = off,
+    /// 1 = pages, 2 = pages + per-block free maps. Path from `MIMALLOC_SNAPSHOT_PATH`, else
+    /// `mimalloc-snapshot.<pid>.bin`.
+    mi_option_snapshot_on_exit = 60;
     /// Sentinel: one past the last real option.
-    _mi_option_last = 60;
+    _mi_option_last = 61;
 }
 
 /// Deprecated upstream alias for [`mi_option_allow_large_os_pages`].
 #[allow(non_upper_case_globals)]
+/// `MI_SNAPSHOT_BLOCKS` (include/mimalloc.h, #338): include per-block free bitmaps for the
+/// pages the calling thread owns.
+pub const MI_SNAPSHOT_BLOCKS: c_uint = 0x01;
+
 pub const mi_option_large_os_pages: mi_option_t = mi_option_allow_large_os_pages;
 /// Deprecated upstream alias for [`mi_option_arena_eager_commit`].
 #[allow(non_upper_case_globals)]
@@ -658,6 +667,16 @@ unsafe extern "C" {
     /// Mirrors `mi_heap_get_seq` (include/mimalloc-stats.h): the monotonic sequence
     /// number assigned to `heap` at creation, or 0 for a NULL heap.
     pub fn mi_heap_get_seq(heap: *mut mi_heap_t) -> usize;
+
+    /// Mirrors `mi_heap_snapshot` (include/mimalloc.h; issue #338, Bun parity): write a
+    /// binary heap snapshot (format version 1, byte-identical to oven-sh/mimalloc's) to a
+    /// CRT file descriptor. `flags` is 0 or `MI_SNAPSHOT_BLOCKS`. Returns 0, or -1 on a write
+    /// error. sys-only: on Windows the fd is a CRT descriptor, not a HANDLE -- use
+    /// `heap::snapshot_to_file` from safe code.
+    pub fn mi_heap_snapshot(fd: c_int, flags: c_uint) -> c_int;
+    /// Mirrors `mi_heap_snapshot_to_file` (include/mimalloc.h; issue #338): open `path`
+    /// (create/truncate), write the snapshot, close. Returns 0, or -1 on open/write error.
+    pub fn mi_heap_snapshot_to_file(path: *const c_char, flags: c_uint) -> c_int;
 
     /// Mirrors `mi_on_thread_idle` (issue #272, Bun parity P7a).
     pub fn mi_on_thread_idle();

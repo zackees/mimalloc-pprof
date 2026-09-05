@@ -228,6 +228,35 @@ pub fn heap_dump_json(include_blocks: bool, hash_addresses: bool) -> Option<Stri
     Some(json)
 }
 
+/// Write a binary heap snapshot to `path` (issue #338, Bun parity).
+///
+/// A compact description of every arena and page -- and, with `blocks`, per-block free
+/// maps for the pages this thread owns -- in a format byte-identical to oven-sh/mimalloc's
+/// (version 1). Read it with `mi-heapview` (built with the C library) or the Python
+/// reference reader in `examples/heap-snapshot/`. Point-in-time and best-effort: other
+/// threads keep allocating while it is written, so their pages' counts may be slightly
+/// stale. Allocation-free on the writer's side, so it is safe to call from anywhere.
+///
+/// Errors: the file could not be created or written. The same snapshot can be produced
+/// without code by setting `MIMALLOC_SNAPSHOT_ON_EXIT=1|2` (and `MIMALLOC_SNAPSHOT_PATH`).
+pub fn heap_snapshot_to_file(path: impl AsRef<std::path::Path>, blocks: bool) -> std::io::Result<()> {
+    use std::ffi::CString;
+    let path = path.as_ref();
+    let c_path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains an interior NUL byte")
+    })?;
+    let flags = if blocks { sys::MI_SNAPSHOT_BLOCKS } else { 0 };
+    let rc = unsafe { sys::mi_heap_snapshot_to_file(c_path.as_ptr(), flags) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("mi_heap_snapshot_to_file({}) failed", path.display()),
+        ))
+    }
+}
+
 /// Tell mimalloc this thread is idle (issue #272, Bun parity P7a).
 ///
 /// Collects this thread's pending frees, discards the free blocks inside its still-used
@@ -958,6 +987,9 @@ pub mod options {
         pub const PURGE_HOLES_MIN_INTERVAL: Self = Self(sys::mi_option_purge_holes_min_interval);
         /// **Fork addition (Bun).** Every N-th sweep walks every page; 0 disables.
         pub const PURGE_HOLES_FULL_EVERY: Self = Self(sys::mi_option_purge_holes_full_every);
+        /// **Fork addition (Bun parity, #338).** Write a heap snapshot at process exit: 0 = off,
+        /// 1 = pages, 2 = pages + per-block free maps (`MIMALLOC_SNAPSHOT_PATH` names the file).
+        pub const SNAPSHOT_ON_EXIT: Self = Self(sys::mi_option_snapshot_on_exit);
 
         /// Upstream: milliseconds to delay purging, which the scavenger also honours.
         pub const PURGE_DELAY: Self = Self(sys::mi_option_purge_delay);

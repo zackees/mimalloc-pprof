@@ -86,6 +86,7 @@ set(mi_sources
     src/bitmap.c
     src/heap.c
     src/heap-dump.c
+    src/heap-snapshot.c
     src/init.c
     src/libc.c
     src/memory-events.c
@@ -1568,6 +1569,37 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-heap-dump-json PRIVATE Threads::Threads)
   endif()
   add_test(NAME test-heap-dump-json COMMAND mimalloc-test-heap-dump-json)
+
+  # #338 (Bun parity): binary heap snapshot writer + its CLI viewer. Both imported from
+  # oven-sh/mimalloc @ b20b60d9 (MIT). The viewer is a plain-libc tool, not a test; it is
+  # built here so every gate proves it compiles, and the snapshot test hands its output to
+  # it (`summary`) so the writer and the reader are pinned to each other on every run.
+  add_executable(mi-heapview tools/mi-heapview.c)
+  target_include_directories(mi-heapview PRIVATE include)
+  add_executable(mimalloc-test-snapshot test/test-snapshot.c)
+  target_compile_definitions(mimalloc-test-snapshot PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-snapshot PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-snapshot PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-snapshot PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-snapshot PRIVATE mimalloc ${mi_libraries})
+  endif()
+  # Relative output names: the test writes into its working directory (the build tree under
+  # ctest, the bundle root under ci/run_test_bundle.py) and deletes the file when done, so
+  # ci/bundle_tests.py never mistakes the output for an input asset and nothing is left behind.
+  add_test(NAME test-snapshot COMMAND mimalloc-test-snapshot test-snapshot.bin)
+  # The exit-time path (option 2 + path env), verified by an independent C reader.
+  add_executable(mimalloc-test-snapshot-exit test/test-snapshot-exit.c)
+  target_compile_definitions(mimalloc-test-snapshot-exit PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-snapshot-exit PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-snapshot-exit PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-snapshot-exit PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-snapshot-exit PRIVATE mimalloc ${mi_libraries})
+  endif()
+  add_test(NAME test-snapshot-exit COMMAND mimalloc-test-snapshot-exit test-snapshot-exit.bin)
 
   # #339: macOS malloc-zone introspection (what `leaks`/`heap`/`vmmap` call). Darwin-only:
   # the zone exists only with MI_OVERRIDE + MI_OSX_ZONE. Both are `test-osx-*`, so

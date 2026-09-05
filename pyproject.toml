@@ -10,12 +10,12 @@
 # `import benchmark_report`), not as `ci.benchmark_report` -- add ci/ to
 # sys.path via pytest config instead of each test hand-rolling
 # sys.path.insert(0, ...).
-pythonpath = ["ci"]
+pythonpath = ["ci", "examples/heap-snapshot"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py39"          # oldest Python the CI runners are guaranteed to have
-src = ["ci"]
+src = ["ci", "examples/heap-snapshot"]
 
 [tool.ruff.lint]
 select = [
@@ -40,7 +40,8 @@ ignore = [
 quote-style = "double"
 
 [tool.pyright]
-include = ["ci"]
+include = ["ci", "examples/heap-snapshot"]
+extraPaths = ["examples/heap-snapshot"]
 pythonVersion = "3.9"
 typeCheckingMode = "strict"
 # These scripts run standalone from the repo root, not as an installed package.

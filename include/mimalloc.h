@@ -421,6 +421,13 @@ mi_decl_export bool   mi_manage_os_memory(void* start, size_t size, bool is_comm
 
 mi_decl_export void   mi_debug_show_arenas(void) mi_attr_noexcept;
 mi_decl_export void   mi_arenas_print(void) mi_attr_noexcept;
+
+// Write a binary heap snapshot to `fd` for offline analysis (see tools/mi-heapview.c and
+// examples/heap-snapshot/). Returns 0 on success, -1 on write error. Bun parity (#338):
+// format version 1 is byte-identical to oven-sh/mimalloc's.
+#define MI_SNAPSHOT_BLOCKS  0x01    // include per-block free bitmaps for pages owned by the calling thread
+mi_decl_export int    mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept;
+mi_decl_export int    mi_heap_snapshot_to_file(const char* path, unsigned flags) mi_attr_noexcept;
 mi_decl_export size_t mi_arena_min_alignment(void);
 mi_decl_export size_t mi_arena_min_size(void);
 
@@ -616,6 +623,7 @@ typedef enum mi_option_e {
   mi_option_purge_holes_eager_zero,     // zero a range before discarding it, so a mis-scoped discard corrupts visibly (=0; forced on in debug builds). NOT zero-tracking -- see mi_option_purge_zeroes
   mi_option_purge_holes_min_interval,   // do not sweep one thread's heaps more often than every N milli-seconds (=100)
   mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=64); 0 disables
+  mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin". Bun parity (#338)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

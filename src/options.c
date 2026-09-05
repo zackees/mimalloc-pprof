@@ -193,6 +193,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_holes_eager_zero) } // zero a range before discarding it so a mis-scoped discard corrupts visibly (debug builds force it on)
   ,{ 100,    MI_OPTION_UNINIT, MI_OPTION(purge_holes_min_interval) } // min milli-seconds between two sweeps of the same thread's heaps
   ,{ 64,     MI_OPTION_UNINIT, MI_OPTION(purge_holes_full_every) }   // every N'th sweep walks every page regardless of the skip check; 0 disables (Bun's default)
+  ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(snapshot_on_exit) }       // write a heap snapshot on process exit (=0). 1=on, 2=on+blocks. Bun parity (#338)
 };
 
 static void mi_option_init(mi_option_desc_t* desc);

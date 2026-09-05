@@ -33,6 +33,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "fork.c"           // #270: pthread_atfork handlers (POSIX only; CMake guards the standalone build the same way)
 #endif
 #include "heap-dump.c"
+#include "heap-snapshot.c"   // #338: binary heap snapshot (Bun parity)
 #include "init.c"
 #include "libc.c"
 #include "memory-events.c"

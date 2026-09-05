@@ -197,7 +197,7 @@ image and the table below are rendered from.
 | DHAT exact profiling (Valgrind format) | ✅ mi_dhat_start | ❌ | ❌ | ❌ |
 | Allocation-event callbacks | ✅ mi_memory_set_callbacks | ❌ | ❌ | ⚠️ experimental.hooks.install |
 | Walk every live block in a heap | ✅ mi_heap_visit_blocks | ✅ mi_heap_visit_blocks | ✅ mi_heap_visit_blocks | ❌ no iteration mallctl |
-| Live heap snapshot with a viewer | ❌ not imported — [#338](https://github.com/zackees/mimalloc-pprof/issues/338) | ❌ | ✅ + tools/mi-heapview | ❌ |
+| Live heap snapshot with a viewer | ✅ mi_heap_snapshot — [#338](https://github.com/zackees/mimalloc-pprof/issues/338) | ❌ | ✅ + tools/mi-heapview | ❌ |
 | No fast-path cost while profiling is off | ✅ malloc path byte-identical | ✅ nothing to cost | ✅ sample rate 0 by default | ⚠️ build-time opt-in |
 | **Robustness** | | | | |
 | fork() handlers (pthread_atfork) | ✅ documented lock order | ❌ none registered | ✅ | ✅ jemalloc_prefork |
@@ -572,6 +572,8 @@ block limit).
 |---|---|---|
 | `mi_heap_dump_json` | ✅ | `heap_dump_json(include_blocks, hash_addresses)` |
 | `mi_heap_get_seq` | ✅ | **sys only** — needs a `mi_heap_t*` (see above); the seq numbers are already in `heap_dump_json`'s output |
+| `mi_heap_snapshot_to_file` | ✅ | `heap_snapshot_to_file(path, blocks) -> io::Result<()>` |
+| `mi_heap_snapshot` | ✅ | **sys only** — takes a CRT file descriptor (not a `HANDLE` on Windows); the safe API takes a path |
 
 #### Thread idle, scavenger and hole purging
 
@@ -940,7 +942,6 @@ handful of hook calls). More detail, including the options reference, is in
 
 ### Not imported (yet)
 
-- **Heap snapshot + `mi-heapview`** — Bun's live heap snapshot format and CLI viewer (`src/heap-snapshot.c`, `tools/mi-heapview.c`). Not called by Bun itself by default; a debug tool, not a shipped feature (rated 2).
 - **Bun's `<linux/futex.h>` include** — deliberately not carried over: it is a kernel uapi header that breaks the musl/Alpine build. `src/scavenger.c` documents the deviation and uses a portable alternative instead ([fix](https://github.com/zackees/mimalloc-pprof/commit/bc228369)).
 
 ---

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Live heap snapshot + viewer** ([#338](https://github.com/zackees/mimalloc-pprof/issues/338),
+  Bun parity): `mi_heap_snapshot` / `mi_heap_snapshot_to_file` write Bun's binary heap
+  snapshot (format version 1, byte-identical), `MIMALLOC_SNAPSHOT_ON_EXIT=1|2` writes one
+  at exit, the `mi-heapview` C viewer builds with the library, and
+  `examples/heap-snapshot/` carries a Python reference reader and viewer. Rust:
+  `heap_snapshot_to_file(path, blocks)`, `sys::mi_heap_snapshot`, `Option::SNAPSHOT_ON_EXIT`.
 - **Zero-tracking restored** ([#337](https://github.com/zackees/mimalloc-pprof/issues/337)):
   `MIMALLOC_PURGE_ZEROES=1` / `mi_option_purge_zeroes` is live again — after a purge the
   OS documents as zero-filling (Linux, macOS), `mi_zalloc` skips its memset and pages the

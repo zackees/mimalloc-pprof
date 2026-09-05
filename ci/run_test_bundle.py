@@ -560,11 +560,26 @@ def parse_variants(raw: Sequence[Sequence[str]]) -> list[Variant]:
     return variants
 
 
-def select(specs: Sequence[TestSpec], only: Sequence[str] | None) -> list[TestSpec]:
-    if only is None:
-        return list(specs)
-    wanted = set(only)
-    return [spec for spec in specs if spec.name in wanted]
+def select(
+    specs: Sequence[TestSpec],
+    only: Sequence[str] | None,
+    labels: Sequence[str] | None = None,
+) -> list[TestSpec]:
+    """The tests `--only` / `--label` ask for; both given means both must match.
+
+    `--label` selects by the ctest LABELS the manifest carries (`ci/bundle_tests.py`
+    lowers them verbatim). It exists for the selective macOS lane (#339): a PR that
+    touches a Darwin-only path executes just the tests labelled `macos` inside the
+    Recovery guest instead of the full ~25-minute bundle.
+    """
+    chosen = list(specs)
+    if only is not None:
+        wanted = set(only)
+        chosen = [spec for spec in chosen if spec.name in wanted]
+    if labels is not None:
+        needed = set(labels)
+        chosen = [spec for spec in chosen if needed & set(spec.labels)]
+    return chosen
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -590,6 +605,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "manifest marks `serial` always run alone, after the parallel wave.",
     )
     parser.add_argument("--only", nargs="+", default=None, metavar="NAME", help="run these tests")
+    parser.add_argument(
+        "--label",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help="run only tests carrying at least one of these ctest labels (e.g. `macos`, "
+        "the selective macOS lane of #339). A bundle in which nothing carries the label "
+        "is an error, not an empty green run.",
+    )
     parser.add_argument(
         "--env", nargs="+", default=None, metavar="K=V", help="extra environment for every test"
     )
@@ -657,6 +681,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     only = cast("list[str] | None", args.only)
+    labels = cast("list[str] | None", args.label)
     loaded: list[tuple[str, Path, Sequence[TestSpec]]] = []
     for raw_path in paths:
         bundle = Path(raw_path).resolve()
@@ -670,7 +695,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             if missing and not multi:
                 print(f"no such test(s) in the bundle: {missing}", file=sys.stderr)
                 return 1
-        loaded.append((bundle.name, bundle, select(specs, only)))
+        chosen = select(specs, only, labels)
+        if labels is not None and not chosen and not multi:
+            # `--label macos` against a bundle where no test carries the label would
+            # otherwise fall through to "no tests selected" -- true, but the useful
+            # fact is that the label is unknown to this bundle (a typo, or a test that
+            # forgot its LABELS), so say that.
+            print(
+                f"no test in {bundle.name} carries any of the labels {sorted(labels)}",
+                file=sys.stderr,
+            )
+            return 1
+        loaded.append((bundle.name, bundle, chosen))
 
     # A `--env-variant guarded:...` whose bundle name is a typo would silently drop the
     # second pass and still report green -- the "gate that verifies nothing" shape. Refuse.

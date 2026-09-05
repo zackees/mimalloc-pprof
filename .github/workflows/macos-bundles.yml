@@ -49,6 +49,8 @@ on:
   push:
     branches: [main, v4]
   pull_request:
+    # `labeled` so adding `needs-macos` to an open PR re-runs `decide` (#339).
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'src/**'
       - 'include/**'
@@ -265,6 +267,10 @@ jobs:
           fi
       - name: Bundle the tests
         run: python3 ci/bundle_tests.py build bundle
+      - name: Every Darwin-only test carries the `macos` label (#339)
+        # The selective lane runs `--label macos`; a `test-osx-*` without the label
+        # would ship in the bundle and never execute anywhere. Red here, on Linux.
+        run: python3 ci/check_macos_labels.py bundle/tests.json
       - name: The manifest must carry no absolute path
         # bundle_tests.py already refuses these; this is the independent check, because
         # the whole portability claim rests on it and this is the first phase where the
@@ -426,6 +432,114 @@ jobs:
   # new failure is red AND one of them starting to pass is also red. 42 of 45 tests in
   # the release bundle execute for real (measured).
   # ---------------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------------
+  # Selective lane (#339). A PR that touches a Darwin-only path, or carries the
+  # `needs-macos` label, boots the same Recovery guest but executes ONLY the tests
+  # labelled `macos` (ci/run_test_bundle.py --label). Boot-to-shell is ~6 min, so this
+  # is a ~10-12 min job and CAN gate a PR; the full run above stays manual.
+  # `decide` always runs and is the required check -- a conditional job cannot be
+  # required by branch protection, so the *decision* is what the rule names.
+  # ---------------------------------------------------------------------------------
+  decide:
+    name: decide (selective macOS lane)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: decide
+        run: |
+          set -euo pipefail
+          python3 ci/macos_lane_decide.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --labels "${{ join(github.event.pull_request.labels.*.name, ',') }}"
+      - run: |
+          echo "### selective macOS lane: run=${{ steps.decide.outputs.run }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.decide.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
+
+  run-macos-x64-selective:
+    name: run-macos-x64-selective (tests labelled macos, in Recovery)
+    needs: [decide, build-macos]
+    if: needs.decide.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-macos-x64-*
+          path: artifacts
+      - name: Build the guest payload (x86_64 bundles + relocatable CPython)
+        run: |
+          set -euo pipefail
+          mkdir -p payload share
+          for archive in artifacts/*/*.tar.gz; do
+            name=$(basename "$archive" .tar.gz)
+            mkdir -p "payload/$name"
+            tar -C "payload/$name" -xzf "$archive"
+          done
+          cp ci/run_test_bundle.py payload/
+          # Prove on the runner that the label selects something in BOTH bundles, so a
+          # guest boot is never spent on a run that would refuse to start.
+          python3 ci/check_macos_labels.py payload/macos-x64-release/tests.json payload/macos-x64-debug-full/tests.json
+          curl -fsSL -o cpython.tar.gz \
+            "https://github.com/astral-sh/python-build-standalone/releases/download/20250612/cpython-3.12.11+20250612-x86_64-apple-darwin-install_only.tar.gz"
+          tar -xzf cpython.tar.gz -C payload
+          python3 ci/patch_recovery_python.py payload/python/lib/libpython3.12.dylib
+          tar -czf share/payload.tar.gz -C payload .
+          ls -lh share/payload.tar.gz
+
+      - name: Boot macOS Recovery and run the macos-labelled tests
+        id: macos
+        uses: zackees/docker-mac-x64@main
+        with:
+          share-dir: share
+          collect: /tmp/w/out
+          ram: '8'
+          run-timeout: '1200'
+          run: |
+            set -x
+            mkdir -p /tmp/w/out && cd /tmp/w
+            curl -s -o payload.tar.gz http://10.0.2.2:8000/payload.tar.gz
+            mkdir -p payload && tar -xzf payload.tar.gz -C payload
+            cd payload
+            ./python/bin/python3 -VV || exit 91
+            ./python/bin/python3 run_test_bundle.py macos-x64-release \
+              --label macos --junit /tmp/w/out/sel-release.xml
+            echo $? > /tmp/w/out/release.rc
+            ./python/bin/python3 run_test_bundle.py macos-x64-debug-full \
+              --label macos --junit /tmp/w/out/sel-debug-full.xml
+            echo $? > /tmp/w/out/debug-full.rc
+            echo "guest script complete"
+
+      - name: Test results -- exactly the waived Recovery failures, no others
+        run: |
+          set -euo pipefail
+          C="${{ steps.macos.outputs.workdir }}/collected"
+          ls -l "$C"
+          test -f "$C/sel-release.xml" || { echo "::error::no JUnit came back from the guest"; exit 1; }
+          test -f "$C/sel-debug-full.xml" || { echo "::error::debug-full JUnit missing"; exit 1; }
+          python3 ci/recovery_expected_failures.py "$C/sel-release.xml" "$C/sel-debug-full.xml"
+
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-selective-results
+          path: ${{ steps.macos.outputs.workdir }}/collected/
+          if-no-files-found: warn
+          retention-days: 7
+      - if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-selective-guest-screens
+          path: ${{ steps.macos.outputs.workdir }}/results/*.ppm
+          if-no-files-found: warn
+
   run-macos-x64-recovery:
     name: run-macos-x64 (macOS Recovery on Linux)
     needs: [build-macos, build-rust-apple]

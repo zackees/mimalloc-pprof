@@ -1942,6 +1942,21 @@ foreach(mi_serial_test IN LISTS mi_serial_tests)
   endif()
 endforeach()
 
+# `macos` label (#339): the tests the selective macOS lane executes inside the Recovery
+# guest (`ci/run_test_bundle.py --label macos`). Every `test-osx-*` MUST be here --
+# ci/check_macos_labels.py fails the build otherwise -- and a portable test that is
+# worth re-running on Darwin (the TLS-slot probes: pthread TSD slots are a macOS-only
+# mechanism) may be added too. Appended, so RUN_SERIAL's `serial` label survives.
+set(mi_macos_tests
+  test-tls-slots-heap
+  test-threadlocal-growth
+)
+foreach(mi_macos_test IN LISTS mi_macos_tests)
+  if(mi_macos_test IN_LIST mi_registered_tests)
+    set_property(TEST ${mi_macos_test} APPEND PROPERTY LABELS macos)
+  endif()
+endforeach()
+
 # -----------------------------------------------------------------------------
 # Set override properties
 # -----------------------------------------------------------------------------

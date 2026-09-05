@@ -1051,8 +1051,8 @@
           "feature": "Purged memory tracked as still-zero",
           "cells": {
             "mimalloc-pprof": {
-              "status": "no",
-              "note": "lost in a rebase — #337",
+              "status": "yes",
+              "note": "_mi_os_purge_zero behind mi_option_purge_zeroes — #337",
               "source": "https://github.com/zackees/mimalloc-pprof/issues/337"
             },
             "upstream": {

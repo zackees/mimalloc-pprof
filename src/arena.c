@@ -2507,7 +2507,39 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
   size_t already_committed;
   mi_bitmap_setN(arena->slices_committed, slice_index, slice_count, &already_committed); // pretend all committed.. (as we lack a clearN call that counts the already set bits..)
   const bool all_committed = (already_committed == slice_count);
-  const bool needs_recommit = _mi_os_purge_ex(arena->subproc, p, size, all_committed /* allow reset? */, mi_size_of_slices(already_committed), arena->commit_fun, arena->commit_fun_arg);
+  // Zero-tracking (#337; restored from #79/#67, mechanism as in oven-sh/mimalloc @ b20b60d9,
+  // MIT; this fork gates it on `mi_option_purge_zeroes`, Bun has no knob). The zero-claim is
+  // only sound for memory WE mapped: `mi_manage_os_memory` / `mi_arena_reload` hand us
+  // external regions (MI_MEM_EXTERNAL) that may be MAP_SHARED or file-backed, where
+  // MADV_DONTNEED does NOT zero-fill -- it refaults the file's contents. A custom commit
+  // callback is likewise opaque to us. And an arena that is not itself `initially_zero`
+  // never sets `memid->initially_zero` on allocation (see the dirty-bit block in
+  // `mi_arena_try_alloc_at`), so clearing its dirty bits buys nothing and would only
+  // corrupt the bitmap.
+  const bool can_claim_zero = (mi_option_is_enabled(mi_option_purge_zeroes)
+                               && arena->commit_fun == NULL
+                               && mi_memkind_is_os(arena->memid.memkind)
+                               && arena->memid.initially_zero);
+  bool needs_recommit;
+  if (!can_claim_zero) {
+    needs_recommit = _mi_os_purge_ex(arena->subproc, p, size, all_committed /* allow reset? */, mi_size_of_slices(already_committed), arena->commit_fun, arena->commit_fun_arg);
+  }
+  else {
+    bool is_zero = false;
+    needs_recommit = _mi_os_purge_zero(arena->subproc, p, size, mi_size_of_slices(already_committed), &is_zero);
+    if (is_zero) {
+      // The OS guarantees this range reads back zero, so forget that it was ever dirty: the
+      // next `mi_arenas_alloc` hands it out with `initially_zero`, `mi_zalloc` skips the
+      // memset, and pages the caller never writes are never made resident again.
+      mi_bitmap_clearN(arena->slices_dirty, slice_index, slice_count);
+      // Do NOT touch the `committed` stat here. `committed` is keyed on the COMMIT bits, not the
+      // dirty bits: it is credited in `mi_arena_try_alloc_at` only for slices whose commit bit was
+      // clear, and the whole block is skipped when the range is already fully committed. A
+      // zero-claim purge deliberately KEEPS the commit bits set, so the next allocation credits
+      // nothing -- and debiting here would be an unmatched debit that walks `committed` down
+      // without bound. The real ratchet is the partial-commit branch below, which clears them.
+    }
+  }
 
   if (needs_recommit) {
     // no longer committed

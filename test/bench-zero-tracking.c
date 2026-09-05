@@ -19,7 +19,26 @@
                 "stale but happens to be zero", and getting this wrong is silent heap
                 corruption rather than a visible failure.
 
+     guard   -- regression guard (#337). The feature regressed out of the tree once (#80)
+                and nobody noticed, because `verify` passes whether or not the memset is
+                skipped. This mode makes "the feature does nothing" a FAILURE: with the
+                option on, a fresh mi_zalloc of memory that was purged must NOT make its
+                pages resident (nothing wrote to them), so RSS must not grow by the block
+                size. Linux only (it reads /proc/self/statm), release-only (the MI_DEBUG
+                decommit path mprotects and never claims zero), and skipped under ASan,
+                MI_GUARDED and MI_SECURE>2, where the exact-range claim cannot hold.
+                Everywhere else it prints why it was skipped and passes.
+
    Prints one JSON object so ci/ can consume it. Exits non-zero on any corruption. */
+
+/* Captured BEFORE the #undef below: CMake defines NDEBUG for Release-type builds on every
+   target, so this mirrors the build type the library was compiled with. */
+#if defined(NDEBUG) && !(defined(MI_DEBUG) && MI_DEBUG > 0) && !defined(MI_TRACK_ASAN) \
+    && !defined(MI_GUARDED) && !(defined(MI_SECURE) && MI_SECURE > 2) && defined(__linux__)
+#define ZT_GUARD_ACTIVE 1
+#else
+#define ZT_GUARD_ACTIVE 0
+#endif
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -101,9 +120,78 @@ static int verify_zeroed(void) {
   return 0;
 }
 
+#if ZT_GUARD_ACTIVE
+static size_t rss_bytes(void) {
+  FILE* f = fopen("/proc/self/statm", "r");
+  if (f == NULL) return 0;
+  unsigned long total = 0, resident = 0;
+  const int n = fscanf(f, "%lu %lu", &total, &resident);
+  fclose(f);
+  return (n == 2 ? (size_t)resident * 4096u : 0);
+}
+
+/* With zero-tracking ON: purged-then-zalloc'd memory that nobody writes must stay
+   non-resident. With it OFF this would read ~BLOCKS MiB, because mi_zalloc's memset
+   faults every page in -- which is exactly the observable that went missing in #80. */
+static int guard_untouched_pages_stay_nonresident(void) {
+  if (!mi_option_is_enabled(mi_option_purge_zeroes)) {
+    printf("guard: skipped (MIMALLOC_PURGE_ZEROES is off)\n");
+    return 0;
+  }
+  mi_option_set(mi_option_purge_delay, 0);   /* purge at free time, so the next zalloc reuses purged slices */
+  for (int i = 0; i < BLOCKS; i++) {
+    unsigned char* b = (unsigned char*)mi_malloc(BLOCKSZ);
+    if (b == NULL) { fprintf(stderr, "oom\n"); return 1; }
+    memset(b, 0x5A, BLOCKSZ);                /* make every page resident and dirty */
+    keep[i] = b;
+  }
+  for (int i = 0; i < BLOCKS; i++) mi_free(keep[i]);
+  mi_collect(true);                          /* decommit-purge: the OS now owes us zero pages */
+  const size_t before = rss_bytes();
+  for (int i = 0; i < BLOCKS; i++) {
+    keep[i] = mi_zalloc(BLOCKSZ);            /* must be handed out as already-zero: no memset */
+    if (keep[i] == NULL) { fprintf(stderr, "oom\n"); return 1; }
+  }
+  const size_t after = rss_bytes();
+  const size_t grew = (after > before ? after - before : 0);
+  const size_t limit = (size_t)BLOCKS * BLOCKSZ / 4;   /* 25% of the block bytes: generous for metadata + noise */
+  int rc = 0;
+  if (before == 0) {
+    printf("guard: skipped (cannot read /proc/self/statm)\n");
+  }
+  else if (grew > limit) {
+    fprintf(stderr,
+            "REGRESSION: zero-tracking is on but mi_zalloc of purged memory made %zu KiB resident "
+            "(limit %zu KiB) -- the memset is not being skipped, i.e. the feature does nothing (#337)\n",
+            grew / 1024, limit / 1024);
+    rc = 3;
+  }
+  else {
+    printf("guard: ok (RSS grew %zu KiB across %d untouched %u-byte zallocs, limit %zu KiB)\n",
+           grew / 1024, BLOCKS, (unsigned)BLOCKSZ, limit / 1024);
+  }
+  /* and the memory must actually BE zero, or skipping the memset would be heap corruption */
+  for (int i = 0; i < BLOCKS && rc == 0; i++) {
+    const unsigned char* b = (const unsigned char*)keep[i];
+    for (size_t k = 0; k < BLOCKSZ; k += 4093) {
+      if (b[k] != 0) { fprintf(stderr, "CORRUPTION: purged-zero block %d offset %zu = 0x%02x\n", i, k, b[k]); rc = 2; break; }
+    }
+  }
+  for (int i = 0; i < BLOCKS; i++) mi_free(keep[i]);
+  return rc;
+}
+#else
+static int guard_untouched_pages_stay_nonresident(void) {
+  printf("guard: skipped (not a release Linux build without ASan/guarded/secure)\n");
+  return 0;
+}
+#endif
+
 int main(void) {
   const int rc = verify_zeroed();
   if (rc != 0) return rc;
+  const int grc = guard_untouched_pages_stay_nonresident();
+  if (grc != 0) return grc;
   const double sparse = bench_sparse();
   const double dense = bench_dense();
   printf("{ \"purge_zeroes\": %d, \"sparse_s\": %.4f, \"dense_s\": %.4f, \"verify\": \"ok\" }\n",

@@ -1332,7 +1332,7 @@ if (MI_BUILD_TESTS)
     # Bun parity P7b). The purge path may hand a recycled slice back as "reads zero";
     # this poisons everything, churns until slices are purged and recycled, and verifies
     # every byte of every recycled mi_zalloc/mi_calloc allocation is zero. (Distinct from
-    # test-zero-tracking, which covers the -- since #80 dead -- `purge_zeroes` option.)
+    # test-zero-tracking, which covers the `purge_zeroes` option, restored by #337.)
     add_executable(mimalloc-test-purge-zero test/test-purge-zero.c)
     target_compile_definitions(mimalloc-test-purge-zero PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-purge-zero PRIVATE ${mi_cflags})

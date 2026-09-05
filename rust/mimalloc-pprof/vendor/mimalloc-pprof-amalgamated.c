@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit bc2b3a25 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 1e2be6f8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -625,10 +625,9 @@ typedef enum mi_option_e {
   mi_option_prof_seed,                  // profiler sampling PRNG seed; 0 = nondeterministic (=0)
   mi_option_prof_max_bytes,             // budget (in bytes) for profiler-internal arena memory; 0 = unbudgeted (=0)
   mi_option_memory_events,              // enable opt-in allocation-change accounting/callbacks (MIMALLOC_MEMORY_EVENTS) (=0)
-  mi_option_purge_zeroes,               // DEAD since #80: the implementation added by #79 went away with the v3 pin bump and was never
-                                        // restored (see issue #67). The option slot is kept -- never renumber -- and setting
-                                        // MIMALLOC_PURGE_ZEROES still parses, it just has no effect. NOT related to
-                                        // `purge_holes_eager_zero` below, which is the opposite knob (it zeroes MORE, for testing).
+  mi_option_purge_zeroes,               // zero-tracking (=0, #67/#337): after a decommit-purge that the OS documents as zero-filling, forget the slices were dirty so the next
+                                        // mi_zalloc skips its memset and untouched pages never become resident again. Linux + macOS; Windows never claims zero.
+                                        // Not to be confused with `purge_holes_eager_zero` below, the opposite knob (it zeroes MORE, for testing).
   mi_option_scavenger,                  // run a background thread that purges scheduled arena memory (=1). imported from oven-sh/mimalloc @ 942b8342, MIT (#272)
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b). Appended
   // after `scavenger`, NOT at Bun's slot numbers 50-53: slots 47+ diverged long ago (#264).
@@ -4657,6 +4656,7 @@ mi_decl_nodiscard bool _mi_os_protect(void* addr, size_t size);
 bool          _mi_os_unprotect(void* addr, size_t size);
 bool          _mi_os_purge(mi_subproc_t* subproc, void* p, size_t size);
 bool          _mi_os_purge_ex(mi_subproc_t* subproc, void* p, size_t size, bool allow_reset, size_t stats_size, mi_commit_fun_t* commit_fun, void* commit_fun_arg);
+bool          _mi_os_purge_zero(mi_subproc_t* subproc, void* p, size_t size, size_t stat_size, bool* is_zero);   // zero-tracking (#337)
 
 size_t        _mi_os_secure_guard_page_size(void);
 bool          _mi_os_secure_guard_page_set_at(mi_subproc_t* subproc, void* addr, mi_memid_t memid);
@@ -9885,6 +9885,14 @@ int _mi_prim_commit(void* addr, size_t size, bool* is_zero);
 // pre: needs_recommit != NULL
 int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit);
 
+// Zero-tracking (#337, restored from #79/#67; mechanism as in oven-sh/mimalloc @ b20b60d9, MIT).
+// Like `_mi_prim_decommit`, but also reports whether the range is GUARANTEED to read back
+// zero on its next use (`is_zero`): true only when the primitive used an operation the OS
+// documents as zero-filling (Linux MADV_DONTNEED on private anonymous memory, Darwin
+// MADV_ZERO). Windows/wasi/emscripten never claim it -- their zero-on-reuse, if any, is
+// delivered by the recommit path instead. pre: needs_recommit != NULL, is_zero != NULL
+int _mi_prim_decommit_zero(void* addr, size_t size, bool* needs_recommit, bool* is_zero);
+
 // Reset memory. The range keeps being accessible but the content might be reset to zero at any moment.
 // Returns error code or 0 on success.
 int _mi_prim_reset(void* addr, size_t size);
@@ -12830,7 +12838,39 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
   size_t already_committed;
   mi_bitmap_setN(arena->slices_committed, slice_index, slice_count, &already_committed); // pretend all committed.. (as we lack a clearN call that counts the already set bits..)
   const bool all_committed = (already_committed == slice_count);
-  const bool needs_recommit = _mi_os_purge_ex(arena->subproc, p, size, all_committed /* allow reset? */, mi_size_of_slices(already_committed), arena->commit_fun, arena->commit_fun_arg);
+  // Zero-tracking (#337; restored from #79/#67, mechanism as in oven-sh/mimalloc @ b20b60d9,
+  // MIT; this fork gates it on `mi_option_purge_zeroes`, Bun has no knob). The zero-claim is
+  // only sound for memory WE mapped: `mi_manage_os_memory` / `mi_arena_reload` hand us
+  // external regions (MI_MEM_EXTERNAL) that may be MAP_SHARED or file-backed, where
+  // MADV_DONTNEED does NOT zero-fill -- it refaults the file's contents. A custom commit
+  // callback is likewise opaque to us. And an arena that is not itself `initially_zero`
+  // never sets `memid->initially_zero` on allocation (see the dirty-bit block in
+  // `mi_arena_try_alloc_at`), so clearing its dirty bits buys nothing and would only
+  // corrupt the bitmap.
+  const bool can_claim_zero = (mi_option_is_enabled(mi_option_purge_zeroes)
+                               && arena->commit_fun == NULL
+                               && mi_memkind_is_os(arena->memid.memkind)
+                               && arena->memid.initially_zero);
+  bool needs_recommit;
+  if (!can_claim_zero) {
+    needs_recommit = _mi_os_purge_ex(arena->subproc, p, size, all_committed /* allow reset? */, mi_size_of_slices(already_committed), arena->commit_fun, arena->commit_fun_arg);
+  }
+  else {
+    bool is_zero = false;
+    needs_recommit = _mi_os_purge_zero(arena->subproc, p, size, mi_size_of_slices(already_committed), &is_zero);
+    if (is_zero) {
+      // The OS guarantees this range reads back zero, so forget that it was ever dirty: the
+      // next `mi_arenas_alloc` hands it out with `initially_zero`, `mi_zalloc` skips the
+      // memset, and pages the caller never writes are never made resident again.
+      mi_bitmap_clearN(arena->slices_dirty, slice_index, slice_count);
+      // Do NOT touch the `committed` stat here. `committed` is keyed on the COMMIT bits, not the
+      // dirty bits: it is credited in `mi_arena_try_alloc_at` only for slices whose commit bit was
+      // clear, and the whole block is skipped when the range is already fully committed. A
+      // zero-claim purge deliberately KEEPS the commit bits set, so the next allocation credits
+      // nothing -- and debiting here would be an unmatched debit that walks `committed` down
+      // without bound. The real ratchet is the partial-commit branch below, which clears them.
+    }
+  }
 
   if (needs_recommit) {
     // no longer committed
@@ -20051,7 +20091,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(prof_seed) }
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(prof_max_bytes) }        // budget for profiler-internal arena memory; 0 = unbudgeted
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(memory_events) }         // opt-in allocation-change accounting/callbacks; read lazily by memory-events.c, not at startup
-  ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_zeroes) }           // experimental (#67): treat decommit-purged slices as zeroed so mi_zalloc can skip its memset
+  ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_zeroes) }           // zero-tracking (#67, restored by #337): treat OS-zero-filled decommit-purged slices as zeroed so mi_zalloc can skip its memset
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(scavenger) }              // background thread that purges scheduled arena memory (MIMALLOC_SCAVENGER)
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
@@ -21349,6 +21389,37 @@ bool _mi_os_discard(mi_subproc_t* subproc, void* addr, size_t size) {
   mi_subproc_stat_counter_increase(subproc, purged, csize);
   return true;
   #endif
+}
+
+// Zero-tracking (#337, restored from #79/#67; mechanism as in oven-sh/mimalloc @ b20b60d9, MIT).
+// Like the plain-decommit case of `_mi_os_purge_ex`, but also reports whether the purged range
+// is guaranteed to read back zero on next use (see `_mi_prim_decommit_zero`). Never claims zero
+// for a range we had to page-align away from -- the caller's exact range is what it will reuse.
+bool _mi_os_purge_zero(mi_subproc_t* subproc, void* p, size_t size, size_t stat_size, bool* is_zero) {
+  *is_zero = false;
+  if (mi_option_get(mi_option_purge_delay) < 0) return false;  // purging not allowed
+  mi_subproc_stat_counter_increase(subproc, purge_calls, 1);
+  mi_subproc_stat_counter_increase(subproc, purged, size);
+
+  size_t csize;
+  void* const start = mi_os_page_align_area_conservative(p, size, &csize);
+  if (csize == 0) return false;
+
+  bool needs_recommit = true;   // on error the primitive leaves this true: assume decommitted
+  bool zero = false;
+  const int err = _mi_prim_decommit_zero(start, csize, &needs_recommit, &zero);
+  if (err != 0) {
+    _mi_warning_message("cannot purge OS memory (error: %d (0x%x), address: %p, size: 0x%zx bytes)\n", err, err, start, csize);
+    // Do NOT swallow `needs_recommit` here: the range may have been made inaccessible even
+    // though the call reported an error (`_mi_prim_decommit` mprotects on the debug path).
+    // Returning false would leave the arena believing those slices are still committed, and
+    // the next allocation from them would fault. `*is_zero` stays false.
+    return needs_recommit;
+  }
+  // only the exact range was zeroed; a conservatively page-aligned subrange leaves the edges untouched
+  if (zero && start == p && csize == size) { *is_zero = true; }
+  if (needs_recommit) { mi_subproc_stat_decrease(subproc, committed, stat_size); }
+  return needs_recommit;
 }
 
 // either resets or decommits memory, returns true if the memory needs
@@ -30769,6 +30840,13 @@ int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
   return (ok ? 0 : (int)GetLastError());
 }
 
+// Zero-tracking (#337): this platform never claims zero on purge; zero-on-reuse, if any,
+// is delivered by the recommit path. See prim.h.
+int _mi_prim_decommit_zero(void* addr, size_t size, bool* needs_recommit, bool* is_zero) {
+  *is_zero = false;
+  return _mi_prim_decommit(addr, size, needs_recommit);
+}
+
 int _mi_prim_reset(void* addr, size_t size) {
   void* p = VirtualAlloc(addr, size, MEM_RESET, PAGE_READWRITE);
   mi_assert_internal(p == addr);
@@ -32228,6 +32306,62 @@ int _mi_prim_decommit(void* start, size_t size, bool* needs_recommit) {
   return err;
 }
 
+#if defined(__APPLE__) && defined(MADV_ZERO)
+// MADV_ZERO may be defined but unsupported by the running kernel (ENOTSUP), and can fail
+// per-call (e.g. on CoW ranges after fork). Probe once, then fall back per-call on failure.
+// (Same approach as WebKit's pas_page_malloc / bmalloc VMAllocate.)
+static bool unix_madv_zero_supported(void) {
+  static _Atomic(int) supported;  // 0 = unknown, 1 = yes, -1 = no
+  int s = mi_atomic_load_relaxed(&supported);
+  if (s == 0) {
+    void* probe = mmap(NULL, _mi_os_page_size(), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, unix_mmap_fd(), 0);
+    if (probe == MAP_FAILED) return false;  // transient: do not latch
+    // Only latch on a definitive answer: success means supported; ENOTSUP means the kernel
+    // does not implement it. Any other errno is about THIS probe mapping (it is PROT_NONE),
+    // not about support, so leave it unknown and re-probe rather than latching "supported"
+    // and then failing every real call.
+    const int rc = madvise(probe, _mi_os_page_size(), MADV_ZERO);
+    const int perrno = errno;
+    if (rc == 0) { s = 1; }
+    else if (perrno == ENOTSUP) { s = -1; }
+    else { munmap(probe, _mi_os_page_size()); return false; }   // unknown: do not latch
+    munmap(probe, _mi_os_page_size());
+    mi_atomic_store_release(&supported, s);
+  }
+  return (s > 0);
+}
+#endif
+
+// Zero-tracking (#337; mechanism as in oven-sh/mimalloc @ b20b60d9, MIT). See prim.h.
+int _mi_prim_decommit_zero(void* start, size_t size, bool* needs_recommit, bool* is_zero) {
+  *is_zero = false;
+  #if !MI_DEBUG && MI_SECURE<=2
+  #if defined(__linux__)
+    // MADV_DONTNEED on a private anonymous mapping is documented to zero-fill on refault.
+    // Arena memory is always our own MAP_PRIVATE|MAP_ANONYMOUS mmap; externally managed
+    // memory goes through commit callbacks and never reaches this primitive (the arena
+    // call site checks `mi_memkind_is_os` and `commit_fun == NULL` before calling us).
+    const int err = unix_madvise(start, size, MADV_DONTNEED);
+    if (err == 0) { *is_zero = true; }
+    *needs_recommit = false;
+    return err;
+  #elif defined(__APPLE__) && defined(MADV_ZERO)
+    // MADV_ZERO zeroes in place (no accounting change); MADV_FREE_REUSABLE then releases the
+    // pages with immediate footprint accounting. Reclaimed pages refault as zero and pages the
+    // kernel keeps were just zeroed, so BOTH outcomes read back zero. Only claim zero if the
+    // MADV_ZERO itself succeeded -- the REUSABLE/DONTNEED fallbacks below do not zero on Darwin.
+    if (unix_madv_zero_supported() && unix_madvise(start, size, MADV_ZERO) == 0) {
+      *is_zero = true;
+    }
+    *needs_recommit = false;
+    int err = unix_madvise(start, size, MADV_FREE_REUSABLE);
+    if (err) { err = unix_madvise(start, size, MADV_DONTNEED); }
+    return err;
+  #endif
+  #endif
+  return _mi_prim_decommit(start, size, needs_recommit);
+}
+
 int _mi_prim_reset(void* start, size_t size) {
   int err = 0;
 
@@ -32944,6 +33078,13 @@ int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
   return 0;
 }
 
+// Zero-tracking (#337): this platform never claims zero on purge; zero-on-reuse, if any,
+// is delivered by the recommit path. See prim.h.
+int _mi_prim_decommit_zero(void* addr, size_t size, bool* needs_recommit, bool* is_zero) {
+  *is_zero = false;
+  return _mi_prim_decommit(addr, size, needs_recommit);
+}
+
 int _mi_prim_reset(void* addr, size_t size) {
   MI_UNUSED(addr); MI_UNUSED(size);
   return 0;
@@ -33214,6 +33355,13 @@ int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
   MI_UNUSED(addr); MI_UNUSED(size);
   *needs_recommit = false;
   return 0;
+}
+
+// Zero-tracking (#337): this platform never claims zero on purge; zero-on-reuse, if any,
+// is delivered by the recommit path. See prim.h.
+int _mi_prim_decommit_zero(void* addr, size_t size, bool* needs_recommit, bool* is_zero) {
+  *is_zero = false;
+  return _mi_prim_decommit(addr, size, needs_recommit);
 }
 
 int _mi_prim_reset(void* addr, size_t size) {
@@ -33943,6 +34091,62 @@ int _mi_prim_decommit(void* start, size_t size, bool* needs_recommit) {
     if (p != start) { err = errno; }
   #endif
   return err;
+}
+
+#if defined(__APPLE__) && defined(MADV_ZERO)
+// MADV_ZERO may be defined but unsupported by the running kernel (ENOTSUP), and can fail
+// per-call (e.g. on CoW ranges after fork). Probe once, then fall back per-call on failure.
+// (Same approach as WebKit's pas_page_malloc / bmalloc VMAllocate.)
+static bool unix_madv_zero_supported(void) {
+  static _Atomic(int) supported;  // 0 = unknown, 1 = yes, -1 = no
+  int s = mi_atomic_load_relaxed(&supported);
+  if (s == 0) {
+    void* probe = mmap(NULL, _mi_os_page_size(), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, unix_mmap_fd(), 0);
+    if (probe == MAP_FAILED) return false;  // transient: do not latch
+    // Only latch on a definitive answer: success means supported; ENOTSUP means the kernel
+    // does not implement it. Any other errno is about THIS probe mapping (it is PROT_NONE),
+    // not about support, so leave it unknown and re-probe rather than latching "supported"
+    // and then failing every real call.
+    const int rc = madvise(probe, _mi_os_page_size(), MADV_ZERO);
+    const int perrno = errno;
+    if (rc == 0) { s = 1; }
+    else if (perrno == ENOTSUP) { s = -1; }
+    else { munmap(probe, _mi_os_page_size()); return false; }   // unknown: do not latch
+    munmap(probe, _mi_os_page_size());
+    mi_atomic_store_release(&supported, s);
+  }
+  return (s > 0);
+}
+#endif
+
+// Zero-tracking (#337; mechanism as in oven-sh/mimalloc @ b20b60d9, MIT). See prim.h.
+int _mi_prim_decommit_zero(void* start, size_t size, bool* needs_recommit, bool* is_zero) {
+  *is_zero = false;
+  #if !MI_DEBUG && MI_SECURE<=2
+  #if defined(__linux__)
+    // MADV_DONTNEED on a private anonymous mapping is documented to zero-fill on refault.
+    // Arena memory is always our own MAP_PRIVATE|MAP_ANONYMOUS mmap; externally managed
+    // memory goes through commit callbacks and never reaches this primitive (the arena
+    // call site checks `mi_memkind_is_os` and `commit_fun == NULL` before calling us).
+    const int err = unix_madvise(start, size, MADV_DONTNEED);
+    if (err == 0) { *is_zero = true; }
+    *needs_recommit = false;
+    return err;
+  #elif defined(__APPLE__) && defined(MADV_ZERO)
+    // MADV_ZERO zeroes in place (no accounting change); MADV_FREE_REUSABLE then releases the
+    // pages with immediate footprint accounting. Reclaimed pages refault as zero and pages the
+    // kernel keeps were just zeroed, so BOTH outcomes read back zero. Only claim zero if the
+    // MADV_ZERO itself succeeded -- the REUSABLE/DONTNEED fallbacks below do not zero on Darwin.
+    if (unix_madv_zero_supported() && unix_madvise(start, size, MADV_ZERO) == 0) {
+      *is_zero = true;
+    }
+    *needs_recommit = false;
+    int err = unix_madvise(start, size, MADV_FREE_REUSABLE);
+    if (err) { err = unix_madvise(start, size, MADV_DONTNEED); }
+    return err;
+  #endif
+  #endif
+  return _mi_prim_decommit(start, size, needs_recommit);
 }
 
 int _mi_prim_reset(void* start, size_t size) {

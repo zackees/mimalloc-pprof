@@ -703,6 +703,37 @@ bool _mi_os_discard(mi_subproc_t* subproc, void* addr, size_t size) {
   #endif
 }
 
+// Zero-tracking (#337, restored from #79/#67; mechanism as in oven-sh/mimalloc @ b20b60d9, MIT).
+// Like the plain-decommit case of `_mi_os_purge_ex`, but also reports whether the purged range
+// is guaranteed to read back zero on next use (see `_mi_prim_decommit_zero`). Never claims zero
+// for a range we had to page-align away from -- the caller's exact range is what it will reuse.
+bool _mi_os_purge_zero(mi_subproc_t* subproc, void* p, size_t size, size_t stat_size, bool* is_zero) {
+  *is_zero = false;
+  if (mi_option_get(mi_option_purge_delay) < 0) return false;  // purging not allowed
+  mi_subproc_stat_counter_increase(subproc, purge_calls, 1);
+  mi_subproc_stat_counter_increase(subproc, purged, size);
+
+  size_t csize;
+  void* const start = mi_os_page_align_area_conservative(p, size, &csize);
+  if (csize == 0) return false;
+
+  bool needs_recommit = true;   // on error the primitive leaves this true: assume decommitted
+  bool zero = false;
+  const int err = _mi_prim_decommit_zero(start, csize, &needs_recommit, &zero);
+  if (err != 0) {
+    _mi_warning_message("cannot purge OS memory (error: %d (0x%x), address: %p, size: 0x%zx bytes)\n", err, err, start, csize);
+    // Do NOT swallow `needs_recommit` here: the range may have been made inaccessible even
+    // though the call reported an error (`_mi_prim_decommit` mprotects on the debug path).
+    // Returning false would leave the arena believing those slices are still committed, and
+    // the next allocation from them would fault. `*is_zero` stays false.
+    return needs_recommit;
+  }
+  // only the exact range was zeroed; a conservatively page-aligned subrange leaves the edges untouched
+  if (zero && start == p && csize == size) { *is_zero = true; }
+  if (needs_recommit) { mi_subproc_stat_decrease(subproc, committed, stat_size); }
+  return needs_recommit;
+}
+
 // either resets or decommits memory, returns true if the memory needs
 // to be recommitted if it is to be re-used later on.
 bool _mi_os_purge_ex(mi_subproc_t* subproc, void* p, size_t size, bool allow_reset, size_t stat_size, mi_commit_fun_t* commit_fun, void* commit_fun_arg)

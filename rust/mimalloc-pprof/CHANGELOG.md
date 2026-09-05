@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Zero-tracking restored** ([#337](https://github.com/zackees/mimalloc-pprof/issues/337)):
+  `MIMALLOC_PURGE_ZEROES=1` / `mi_option_purge_zeroes` is live again — after a purge the
+  OS documents as zero-filling (Linux, macOS), `mi_zalloc` skips its memset and pages the
+  caller never writes stay non-resident. Added by #79, silently lost in the #80 pin bump;
+  now with a regression guard that fails when the feature is a no-op. Off by default.
 - **macOS: `leaks`, `vmmap`, `heap` and `malloc_history` now see mimalloc's memory**
   ([#339](https://github.com/zackees/mimalloc-pprof/issues/339),
   [#349](https://github.com/zackees/mimalloc-pprof/pull/349)): the malloc zone's

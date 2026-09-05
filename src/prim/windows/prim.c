@@ -430,6 +430,13 @@ int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
   return (ok ? 0 : (int)GetLastError());
 }
 
+// Zero-tracking (#337): this platform never claims zero on purge; zero-on-reuse, if any,
+// is delivered by the recommit path. See prim.h.
+int _mi_prim_decommit_zero(void* addr, size_t size, bool* needs_recommit, bool* is_zero) {
+  *is_zero = false;
+  return _mi_prim_decommit(addr, size, needs_recommit);
+}
+
 int _mi_prim_reset(void* addr, size_t size) {
   void* p = VirtualAlloc(addr, size, MEM_RESET, PAGE_READWRITE);
   mi_assert_internal(p == addr);

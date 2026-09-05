@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **macOS: `leaks`, `vmmap`, `heap` and `malloc_history` now see mimalloc's memory**
+  ([#339](https://github.com/zackees/mimalloc-pprof/issues/339),
+  [#349](https://github.com/zackees/mimalloc-pprof/pull/349)): the malloc zone's
+  `enumerator` was upstream's empty stub; it is now a real in- and out-of-process walk
+  through the caller's `memory_reader_t` (ported from Bun), and `statistics` reports
+  live numbers. No crate API change; the zone file rides in the vendored amalgamation.
+- **CI**: a selective macOS lane runs the `macos`-labelled tests in the Recovery guest on
+  PRs that touch a Darwin path or carry `needs-macos`
+  ([#348](https://github.com/zackees/mimalloc-pprof/pull/348)).
+
 ## 0.10.0
 
 The v3 line catches up with everything merged since 0.9.5: full Bun parity through

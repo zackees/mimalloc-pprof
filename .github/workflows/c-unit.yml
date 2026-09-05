@@ -114,6 +114,17 @@ jobs:
             cmake: -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
             build_config: Release
             kind: bundle
+          - config: gated
+            container: ''
+            python: uv run
+            # #366: the owner gate (docs/purge-all-implementation.md §10). The WHOLE suite
+            # runs under it, not just test-purge-all: every allocator entry is a gate site,
+            # so every test is a test of the gate. Asserted on the resolved defines like
+            # `guarded`, and for the same reason.
+            cmake: -DMI_PPROF=ON -DMI_OWNER_GATE=ON
+            build_config: Release
+            assert_defines: MI_OWNER_GATE=1
+            kind: bundle
           - config: musl
             # Bun ships musl builds (`MI_LIBC_MUSL=1`, `-ftls-model=local-dynamic`);
             # our CMake option compiled but nothing ran it, so "compiles" was not
@@ -341,6 +352,26 @@ jobs:
         # this bundle is the machine that runs it, so "can it load somewhere else" is not
         # the question this job answers.
         run: uv run ci/bundle_tests.py build bundle --config Release
+      # #366: the owner-gate configuration, compiled by the same `cl` and run by the same
+      # runner. A second tree inside this job rather than a matrix: the job names
+      # `build-windows-native` / `ctest (windows-latest)` are load-bearing (CLAUDE.md rule
+      # 3, branch protection), and a matrix would rename them. The gate touches every
+      # allocator entry and cl's codegen/TLS lowering are its own, so "clang-cl ran the
+      # gated suite" (windows-bundles.yml) does not stand in for this.
+      - name: Configure and build the owner-gate tree (MI_OWNER_GATE=ON)
+        run: |
+          set -euo pipefail
+          cmake -B build-gated -DMI_PPROF=ON -DMI_OWNER_GATE=ON | tee configure-gated.log
+          if ! grep -qE "Compiler defines *:.*MI_OWNER_GATE=1" configure-gated.log; then
+            echo "::error::MI_OWNER_GATE=1 did not reach mi_defines"
+            exit 1
+          fi
+          cmake --build build-gated --config Release
+      - name: Enumerate and bundle the owner-gate suite
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-gated --show-only=json-v1 -C Release > show-only-windows-native-gated.json
+          uv run ci/bundle_tests.py build-gated bundle-gated --config Release
       - name: The bundle must carry the DLLs its executables load
         # `build_tests.py` copies these by glob rather than because a test names them on
         # its command line, so a layout change would drop them silently and the tests
@@ -355,14 +386,22 @@ jobs:
           ls bundle | grep -q '^mimalloc\.dll$'
           ls bundle | grep -q '^mimalloc-redirect\.dll$'
           uv run python -c "import json; d=json.load(open('bundle/tests.json')); print(len(d['tests']), 'tests')"
-      - name: Pack the bundle
-        run: tar -C bundle -czf windows-native.tar.gz .
+          ls bundle-gated | grep -q '^mimalloc\.dll$'
+          ls bundle-gated | grep -q '^mimalloc-redirect\.dll$'
+          uv run python -c "import json; d=json.load(open('bundle-gated/tests.json')); print(len(d['tests']), 'gated tests')"
+      - name: Pack the bundles
+        run: |
+          set -euo pipefail
+          tar -C bundle -czf windows-native.tar.gz .
+          tar -C bundle-gated -czf windows-native-gated.tar.gz .
       - uses: actions/upload-artifact@v4
         with:
           name: c-unit-bundle-windows-native
           path: |
             windows-native.tar.gz
+            windows-native-gated.tar.gz
             show-only-windows-native.json
+            show-only-windows-native-gated.json
           if-no-files-found: error
           retention-days: 1
 
@@ -401,7 +440,7 @@ jobs:
           # A download that silently produced fewer bundles would otherwise surface as a
           # confusing `No such file` in the middle of a gate, or -- worse -- as a green
           # run over less.
-          for expected in release pprof-off debug-full guarded shared musl musl-pprof-off \
+          for expected in release pprof-off debug-full guarded shared gated musl musl-pprof-off \
                           memory-gate-leak; do
             if [ ! -d "bundle/$expected" ]; then
               echo "::error::bundle/$expected was not downloaded"
@@ -428,7 +467,7 @@ jobs:
         run: |
           set -euo pipefail
           uv run ci/run_test_bundle.py \
-            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared \
+            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared bundle/gated \
             --jobs 4 --select parallel \
             --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
             --junit-dir results
@@ -575,7 +614,7 @@ jobs:
             mkdir -p "bundle/$name"
             tar -C "bundle/$name" -xzf "$archive"
           done
-          for expected in release pprof-off debug-full guarded shared musl musl-pprof-off; do
+          for expected in release pprof-off debug-full guarded shared gated musl musl-pprof-off; do
             if [ ! -d "bundle/$expected" ]; then
               echo "::error::bundle/$expected was not downloaded"
               ls bundle
@@ -587,7 +626,7 @@ jobs:
         run: |
           set -euo pipefail
           uv run ci/run_test_bundle.py \
-            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared \
+            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared bundle/gated \
             --jobs 1 --select serial \
             --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
             --junit-dir results
@@ -650,7 +689,7 @@ jobs:
           # with several lands as `<dest>/results/<file>`. Locating the file makes this
           # step independent of that, and a missing half is a named error rather than a
           # bare `cp: No such file`.
-          for config in release pprof-off debug-full guarded shared musl musl-pprof-off; do
+          for config in release pprof-off debug-full guarded shared gated musl musl-pprof-off; do
             mkdir -p "executed/$config"
             for half in parallel serial; do
               found=$(find "$half" -type f -name "$config.xml" | head -1)
@@ -674,6 +713,7 @@ jobs:
             --compare debug-full manifests/show-only-debug-full.json executed/debug-full \
             --compare guarded manifests/show-only-guarded.json executed/guarded \
             --compare shared manifests/show-only-shared.json executed/shared \
+            --compare gated manifests/show-only-gated.json executed/gated \
             --compare musl manifests/show-only-musl.json executed/musl \
             --compare musl-pprof-off manifests/show-only-musl-pprof-off.json executed/musl-pprof-off \
             --heading "Coverage: registered by ctest vs executed by the run stage" \
@@ -698,19 +738,26 @@ jobs:
         with:
           name: c-unit-bundle-windows-native
           path: artifacts
-      - name: Unpack the bundle
+      - name: Unpack the bundles
         run: |
           set -euo pipefail
-          mkdir -p bundle/windows-native
+          mkdir -p bundle/windows-native bundle/windows-native-gated
           tar -C bundle/windows-native -xzf artifacts/windows-native.tar.gz
+          tar -C bundle/windows-native-gated -xzf artifacts/windows-native-gated.tar.gz
           ls bundle/windows-native | head -40
       - name: Run the suite
         run: uv run ci/run_test_bundle.py --bundles bundle/windows-native --jobs 4 --junit-dir results
+      - name: Run the owner-gate suite (#366)
+        # Its own step, after the default suite: test-purge-all's G2 bound and the RSS tests
+        # are RUN_SERIAL either way, and the report for "the gate broke X" should not be
+        # interleaved with the default configuration's.
+        run: uv run ci/run_test_bundle.py --bundles bundle/windows-native-gated --jobs 4 --junit-dir results
       - name: Coverage -- every registered test was really executed
         run: |
           set -euo pipefail
           uv run ci/bundle_coverage.py \
             --compare windows-native artifacts/show-only-windows-native.json results/windows-native.xml \
+            --compare windows-native-gated artifacts/show-only-windows-native-gated.json results/windows-native-gated.xml \
             --heading "Coverage: registered by native cl ctest vs executed" \
             --names "ctest --show-only" executed \
             --summary "$GITHUB_STEP_SUMMARY"
@@ -721,6 +768,29 @@ jobs:
           path: results
           if-no-files-found: warn
           retention-days: 1
+
+  # #366: the default build's fast path must be byte-identical to the base revision
+  # (docs/purge-all-implementation.md §10). A self-contained job like isa-baseline-arm64
+  # below, because it needs a compiler: it builds `mimalloc-static` three times (base
+  # default, HEAD default, HEAD gated) and diffs the address-normalised disassembly of
+  # mi_malloc / mi_zalloc / mi_free / mi_heap_malloc_small / mi_malloc_small. The third
+  # build is the positive control -- the gate MUST change those bytes -- so a normaliser
+  # that had gone blind fails here rather than reporting "identical" forever.
+  fastpath-identity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # the base revision must be reachable for the worktree the script builds
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v3
+      - name: Normaliser and slicer self-test
+        run: uv run ci/check_fastpath_identity.py --selftest
+      - name: Default build byte-identical to the base; gated build differs
+        # On a PR the base is the PR's base commit; on a push to main it is the previous
+        # main (the merge commit's first parent).
+        run: uv run ci/check_fastpath_identity.py --base "${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
 
   # Debian's arm64 baseline is armv8.0-a and CMakeLists.txt force-enables MI_OPT_ARCH on
   # arm64, so this is the case that actually bites. It stays a self-contained build+scan

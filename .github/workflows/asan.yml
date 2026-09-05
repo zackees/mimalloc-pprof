@@ -34,7 +34,7 @@ jobs:
     # because gcc is what the bug was reported against, and clang stays because the bug is
     # compiler-independent -- if a row ever goes red on one compiler only, that asymmetry is
     # itself the finding.
-    name: address sanitizer (${{ matrix.cc }}, ${{ matrix.build_type }})
+    name: address sanitizer (${{ matrix.cc }}, ${{ matrix.build_type }}${{ matrix.label }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -44,14 +44,28 @@ jobs:
             cxx: clang++
             build_type: Debug
             extra: -DMI_DEBUG_FULL=ON
+            label: ''
           - cc: gcc
             cxx: g++
             build_type: RelWithDebInfo
             extra: ''
+            label: ''
           - cc: clang
             cxx: clang++
             build_type: RelWithDebInfo
             extra: ''
+            label: ''
+          # #366: the owner gate under ASan, Debug with MI_DEBUG=3 (MI_DEBUG_FULL). This is
+          # the row that proves the gate's COVERAGE: in a gated MI_DEBUG build every
+          # owner-private leaf accessor asserts `_mi_gate_held`, so the whole suite running
+          # here is the proof that no path reads owner-private state outside the gate --
+          # now and after every upstream sync -- and ASan is the oracle for a foreign sweep
+          # touching a tld that is going away (docs/purge-all-implementation.md §5.2).
+          - cc: clang
+            cxx: clang++
+            build_type: Debug
+            extra: -DMI_DEBUG_FULL=ON -DMI_OWNER_GATE=ON
+            label: ', owner-gate'
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}

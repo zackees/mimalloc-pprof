@@ -103,6 +103,12 @@ jobs:
           - bundle: windows-gnu-x64-shared
             # `ctest-shared-win-gnu`.
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
+          - bundle: windows-gnu-x64-gated
+            # #366: the owner gate (docs/purge-all-implementation.md §10), whole suite --
+            # win-gnu is a priority platform (CLAUDE.md rule 3), and the gate's
+            # `_mi_park_leave_gate` spin and TLS reads are exactly the kind of thing that
+            # differs between a UCRT mingw build and MSVC.
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_OWNER_GATE=ON
           - bundle: windows-gnu-x64-leak
             # The memory gate's positive control. It is a separate *build*
             # (MI_BENCH_INJECT_LEAK), not a separate run, so it cannot be an entry in
@@ -381,6 +387,10 @@ jobs:
           - bundle: windows-msvc-x64-shared
             # `ctest-shared (windows-latest)`.
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
+          - bundle: windows-msvc-x64-gated
+            # #366: the owner gate, whole suite, on the clang-cl arm. The native `cl` half
+            # is the second tree inside c-unit.yml's `build-windows-native`.
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_OWNER_GATE=ON
           - bundle: windows-msvc-x64-leak
             # The memory gate's positive control, replacing the second half of
             # `memory-gate (windows-latest)`. A separate BUILD (MI_BENCH_INJECT_LEAK), so
@@ -826,13 +836,13 @@ jobs:
           uv --version
           ls -l bundle/windows-gnu-x64-release | head -40
           ls -l bundle/windows-msvc-x64-release | head -40
-          # Seven bundles are expected: three win-gnu + a leak control, three MSVC + a
-          # leak control. A download that silently produced fewer would otherwise show up
+          # Ten bundles are expected: four win-gnu (+ a leak control), four MSVC (+ a
+          # leak control). A download that silently produced fewer would otherwise show up
           # as a confusing `No such file` in the middle of a gate.
           for expected in windows-gnu-x64-release windows-gnu-x64-debug-full \
-                          windows-gnu-x64-shared windows-gnu-x64-leak \
+                          windows-gnu-x64-shared windows-gnu-x64-gated windows-gnu-x64-leak \
                           windows-msvc-x64-release windows-msvc-x64-debug-full \
-                          windows-msvc-x64-shared windows-msvc-x64-leak; do
+                          windows-msvc-x64-shared windows-msvc-x64-gated windows-msvc-x64-leak; do
             if [ ! -d "bundle/$expected" ]; then
               echo "::error::bundle/$expected was not downloaded"
               ls bundle
@@ -849,7 +859,7 @@ jobs:
         # file `./…` on this target to fix that; assert the result rather than the flag.
         run: |
           set -euo pipefail
-          for bundle in bundle/windows-gnu-x64-release bundle/windows-gnu-x64-debug-full bundle/windows-gnu-x64-shared; do
+          for bundle in bundle/windows-gnu-x64-release bundle/windows-gnu-x64-debug-full bundle/windows-gnu-x64-shared bundle/windows-gnu-x64-gated; do
             exe="$bundle/mimalloc-test-stress-dynamic.exe"
             dll=$(basename "$(ls "$bundle"/mimalloc*.dll | grep -v 'redirect' | head -1)")
             echo "::group::$bundle"
@@ -922,6 +932,7 @@ jobs:
           gate "UCRT release bundle   " bundle/windows-gnu-x64-release
           gate "UCRT shared bundle    " bundle/windows-gnu-x64-shared
           gate "UCRT debug-full bundle" bundle/windows-gnu-x64-debug-full
+          gate "UCRT gated bundle     " bundle/windows-gnu-x64-gated
           exit $failed
 
       - name: ctest-win-gnu equivalent -- windows-gnu-x64-release
@@ -938,6 +949,10 @@ jobs:
         run: |
           uv run ci/run_test_bundle.py bundle/windows-gnu-x64-shared \
             --junit "$GITHUB_WORKSPACE/bundle-shared.xml"
+      - name: owner-gate suite (win-gnu, #366) -- windows-gnu-x64-gated
+        run: |
+          uv run ci/run_test_bundle.py bundle/windows-gnu-x64-gated \
+            --junit "$GITHUB_WORKSPACE/bundle-gated.xml"
 
       - name: Run the cross-built Rust test binaries
         # Replaces cross.yml's `test (x86_64-pc-windows-gnu)` and rust-native.yml's
@@ -1120,7 +1135,7 @@ jobs:
         # comparison that shows the layout is MSVC's and not this lane's invention.
         run: |
           set -euo pipefail
-          for bundle in bundle/windows-msvc-x64-release bundle/windows-msvc-x64-debug-full bundle/windows-msvc-x64-shared; do
+          for bundle in bundle/windows-msvc-x64-release bundle/windows-msvc-x64-debug-full bundle/windows-msvc-x64-shared bundle/windows-msvc-x64-gated; do
             exe="$bundle/mimalloc-test-stress-dynamic.exe"
             dll=$(basename "$(ls "$bundle"/mimalloc*.dll | grep -v 'redirect' | head -1)")
             echo "::group::$bundle"
@@ -1171,6 +1186,7 @@ jobs:
           gate "MSVC release bundle   " bundle/windows-msvc-x64-release
           gate "MSVC shared bundle    " bundle/windows-msvc-x64-shared
           gate "MSVC debug-full bundle" bundle/windows-msvc-x64-debug-full
+          gate "MSVC gated bundle     " bundle/windows-msvc-x64-gated
           exit $failed
 
       - name: ctest (windows-latest) equivalent -- windows-msvc-x64-release
@@ -1190,6 +1206,11 @@ jobs:
         run: |
           uv run ci/run_test_bundle.py bundle/windows-msvc-x64-shared \
             --junit "$GITHUB_WORKSPACE/bundle-msvc-shared.xml"
+      - name: owner-gate suite (clang-cl, #366) -- windows-msvc-x64-gated
+        # The comparison arm of c-unit.yml's native `cl` gated tree.
+        run: |
+          uv run ci/run_test_bundle.py bundle/windows-msvc-x64-gated \
+            --junit "$GITHUB_WORKSPACE/bundle-msvc-gated.xml"
 
       - name: Run the cross-built MSVC Rust test binaries
         # Replaces cross.yml's `test (x86_64-pc-windows-msvc)` AND the `cargo test` half of
@@ -1464,9 +1485,12 @@ jobs:
           cmake -B native-debug-full -G Ninja -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DCMAKE_BUILD_TYPE=Debug
           # `ctest-shared-win-gnu`
           cmake -B native-shared -G Ninja -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
+          # the owner-gate bundle (#366)
+          cmake -B native-gated -G Ninja -DMI_PPROF=ON -DMI_OWNER_GATE=ON
           ctest --test-dir native-release --show-only=json-v1 > native-release.json
           ctest --test-dir native-debug-full --show-only=json-v1 > native-debug-full.json
           ctest --test-dir native-shared --show-only=json-v1 > native-shared.json
+          ctest --test-dir native-gated --show-only=json-v1 > native-gated.json
           # Recorded, not gated: the native lane's own import order, so the claim that
           # this is a link-order property and not a CRT property is measured on both
           # sides rather than asserted on one. The gate is on the bundle, above.
@@ -1532,9 +1556,13 @@ jobs:
           # `ctest-shared (windows-latest)`
           cmake -B native-msvc-shared -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
           if ($LASTEXITCODE -ne 0) { throw 'native MSVC shared configure failed' }
+          # the owner-gate tree c-unit.yml's build-windows-native also builds (#366)
+          cmake -B native-msvc-gated -DMI_PPROF=ON -DMI_OWNER_GATE=ON
+          if ($LASTEXITCODE -ne 0) { throw 'native MSVC gated configure failed' }
           ctest --test-dir native-msvc-release -C Release --show-only=json-v1 > native-msvc-release.json
           ctest --test-dir native-msvc-debug-full -C Debug --show-only=json-v1 > native-msvc-debug-full.json
           ctest --test-dir native-msvc-shared -C Release --show-only=json-v1 > native-msvc-shared.json
+          ctest --test-dir native-msvc-gated -C Release --show-only=json-v1 > native-msvc-gated.json
       - name: Native cl vs cross clang-cl -- import order and the override, side by side
         # The comparison that makes the import-order claim measured rather than argued.
         # #277 phase D asked for `mimalloc-redirect.dll` at import #0 of `mimalloc.dll`.
@@ -1576,9 +1604,11 @@ jobs:
             --compare "ctest-win-gnu" native-release.json bundle/windows-gnu-x64-release/tests.json \
             --compare "ctest-debug-full-win-gnu" native-debug-full.json bundle/windows-gnu-x64-debug-full/tests.json \
             --compare "ctest-shared-win-gnu" native-shared.json bundle/windows-gnu-x64-shared/tests.json \
+            --compare "owner-gate-win-gnu" native-gated.json bundle/windows-gnu-x64-gated/tests.json \
             --compare "ctest (windows-latest)" native-msvc-release.json bundle/windows-msvc-x64-release/tests.json \
             --compare "ctest-debug-full (windows-latest)" native-msvc-debug-full.json bundle/windows-msvc-x64-debug-full/tests.json \
             --compare "ctest-shared (windows-latest)" native-msvc-shared.json bundle/windows-msvc-x64-shared/tests.json \
+            --compare "owner-gate (windows-latest)" native-msvc-gated.json bundle/windows-msvc-x64-gated/tests.json \
             --summary "$GITHUB_STEP_SUMMARY"
       - name: Summary -- the flag, the behaviour, and why they differ
         # `ctest-win-gnu` (what this lane replaces) only ever looked at
@@ -1604,12 +1634,12 @@ jobs:
             echo
             echo "| lane | behavioural | \`mi_is_redirected()\` |"
             echo "|---|---|---|"
-            for b in release shared debug-full; do
+            for b in release shared debug-full gated; do
               f="bundle/windows-gnu-x64-$b/redirect-probe.txt"
               echo "| soldr mingw-w64 (**UCRT**) $b bundle | $(behavioural "$f") | $(flag "$f") |"
             done
             echo "| MSYS2 MINGW64 (**msvcrt**), built by this job | $(behavioural msvcrt-probe.txt) | $(flag msvcrt-probe.txt) |"
-            for b in release shared debug-full; do
+            for b in release shared debug-full gated; do
               f="bundle/windows-msvc-x64-$b/redirect-probe.txt"
               echo "| soldr clang-cl (**MSVC ABI, /MD**) $b bundle | $(behavioural "$f") | $(flag "$f") |"
             done
@@ -1654,15 +1684,19 @@ jobs:
             bundle-release.xml
             bundle-debug-full.xml
             bundle-shared.xml
+            bundle-gated.xml
             bundle-msvc-release.xml
             bundle-msvc-debug-full.xml
             bundle-msvc-shared.xml
+            bundle-msvc-gated.xml
             native-release.json
             native-debug-full.json
             native-shared.json
+            native-gated.json
             native-msvc-release.json
             native-msvc-debug-full.json
             native-msvc-shared.json
+            native-msvc-gated.json
             native-msvc-imports-dll.txt
             native-msvc-probe.txt
             bundle/windows-msvc-x64-release/redirect-probe.txt
@@ -1674,6 +1708,9 @@ jobs:
             bundle/windows-msvc-x64-debug-full/imports-dll.txt
             bundle/windows-msvc-x64-shared/imports.txt
             bundle/windows-msvc-x64-shared/imports-dll.txt
+            bundle/windows-msvc-x64-gated/redirect-probe.txt
+            bundle/windows-msvc-x64-gated/imports.txt
+            bundle/windows-msvc-x64-gated/imports-dll.txt
             bundle/windows-gnu-x64-release/redirect-probe.txt
             bundle/windows-gnu-x64-shared/redirect-probe.txt
             bundle/windows-gnu-x64-debug-full/redirect-probe.txt
@@ -1687,5 +1724,8 @@ jobs:
             bundle/windows-gnu-x64-debug-full/imports-dll.txt
             bundle/windows-gnu-x64-shared/imports.txt
             bundle/windows-gnu-x64-shared/imports-dll.txt
+            bundle/windows-gnu-x64-gated/redirect-probe.txt
+            bundle/windows-gnu-x64-gated/imports.txt
+            bundle/windows-gnu-x64-gated/imports-dll.txt
           if-no-files-found: warn
           retention-days: 7

@@ -451,6 +451,41 @@ def run_shared(ctx: RunCtx) -> bool:
     return ctest_run(ctx, build, config="Release") == 0
 
 
+def run_gated(ctx: RunCtx) -> bool:
+    """c-unit.yml `build (gated)` + its slice of `run-linux` (#366): Release,
+    -DMI_PPROF=ON -DMI_OWNER_GATE=ON, the WHOLE suite -- the owner gate touches every
+    allocator entry, so every test is a test of it. The configure output is asserted on the
+    resolved defines, since a flag that never reaches the compiler is this repository's
+    most-repeated CI bug (docs/ci-gates.md)."""
+    build = ctx.dir / "build"
+    rc, configure_out = cmake_configure(ctx, build, ["-DMI_PPROF=ON", "-DMI_OWNER_GATE=ON"])
+    if rc:
+        return False
+    if not re.search(r"Compiler defines\s*:.*MI_OWNER_GATE=1", configure_out):
+        log_write(ctx.log, "\n[verify_local] FAIL: MI_OWNER_GATE=1 did not reach mi_defines\n")
+        return False
+    if cmake_build(ctx, build, config="Release"):
+        return False
+    return ctest_run(ctx, build, config="Release") == 0
+
+
+def run_fastpath(ctx: RunCtx) -> bool:
+    """c-unit.yml `fastpath-identity` (#366): the default build's `mi_malloc`/`mi_zalloc`/
+    `mi_free`/`mi_heap_malloc_small`/`mi_malloc_small` must disassemble byte-identically
+    (addresses normalised) at HEAD and at the base revision, and the MI_OWNER_GATE=ON build
+    must differ -- the always-available positive control. The script builds its three
+    `mimalloc-static` trees itself; `--out` keeps them under this config's directory."""
+
+    def py(*args: str) -> bool:
+        rc, _ = run_logged(
+            ["uv", "run", "ci/check_fastpath_identity.py", *args], cwd=ROOT, log=ctx.log
+        )
+        return rc == 0
+
+    ok = py("--selftest")
+    return py("--out", str(ctx.dir / "identity")) and ok
+
+
 def run_gate_binary_pinned(ctx: RunCtx, binary: Path, out_dir: Path, runs: int = 8) -> list[str]:
     """Run `binary` `runs` times, each writing MI_BENCH_JSON to its own file under
     `out_dir`, pinned via the external `taskset` command to <= memory_gate.MAX_GATE_CPUS
@@ -882,7 +917,23 @@ def run_asan(ctx: RunCtx) -> bool:
         "relwithdebinfo",
         ["-DCMAKE_BUILD_TYPE=RelWithDebInfo", "-DMI_PPROF=ON", "-DMI_TRACK_ASAN=ON"],
     )
-    return release_ok and debug_ok
+    # #366: the gated Debug row. MI_DEBUG_FULL (MI_DEBUG=3) is what arms the `_mi_gate_held`
+    # leaf assertions -- the proof that no path reads owner-private state outside the gate --
+    # and ASan is the oracle for a foreign sweep touching a tld that is going away.
+    gated_ok = _run_asan_one(
+        ctx,
+        cc,
+        cxx,
+        "debug-gated",
+        [
+            "-DCMAKE_BUILD_TYPE=Debug",
+            "-DMI_PPROF=ON",
+            "-DMI_DEBUG_FULL=ON",
+            "-DMI_OWNER_GATE=ON",
+            "-DMI_TRACK_ASAN=ON",
+        ],
+    )
+    return release_ok and debug_ok and gated_ok
 
 
 @dataclasses.dataclass(frozen=True)
@@ -939,6 +990,19 @@ CONFIGS: list[ConfigSpec] = [
         "c-unit.yml: build(shared)+run-linux",
         "shared lib only, no static/object",
         run_shared,
+    ),
+    ConfigSpec(
+        "gated",
+        "c-unit.yml: build(gated)+run-linux",
+        "Release, MI_OWNER_GATE=ON, full ctest (#366)",
+        run_gated,
+    ),
+    ConfigSpec(
+        "fastpath",
+        "c-unit.yml: fastpath-identity",
+        "default fast path byte-identical to base; gated control",
+        run_fastpath,
+        _need_uv,
     ),
     ConfigSpec(
         "bundle",
@@ -1132,6 +1196,20 @@ BUNDLES: list[BundleSpec] = [
             "$MINGW_W64_CROSS_ROOT/x86_64-w64-mingw32/lib",
         ),
     ),
+    BundleSpec(
+        "windows-gnu-x64-gated",
+        "windows-bundles.yml",
+        "build-windows-gnu",
+        "x86_64-pc-windows-gnu",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_OWNER_GATE=ON",
+        WINDOWS_LINK_LIBRARIES,
+        (
+            "--objdump",
+            "$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump",
+            "--dll-search-dir",
+            "$MINGW_W64_CROSS_ROOT/x86_64-w64-mingw32/lib",
+        ),
+    ),
     # --- windows-bundles.yml: build-windows-msvc ----------------------------------
     # No --dll-search-dir: soldr's xwin splat is import libraries only. --check-dll-closure
     # runs the same scan anyway, and --allow-msvc-runtime is the one assumption this lane
@@ -1160,6 +1238,15 @@ BUNDLES: list[BundleSpec] = [
         "build-windows-msvc",
         "x86_64-pc-windows-msvc",
         "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF",
+        WINDOWS_LINK_LIBRARIES,
+        ("--objdump", "llvm-objdump", "--check-dll-closure", "--allow-msvc-runtime"),
+    ),
+    BundleSpec(
+        "windows-msvc-x64-gated",
+        "windows-bundles.yml",
+        "build-windows-msvc",
+        "x86_64-pc-windows-msvc",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_OWNER_GATE=ON",
         WINDOWS_LINK_LIBRARIES,
         ("--objdump", "llvm-objdump", "--check-dll-closure", "--allow-msvc-runtime"),
     ),
@@ -1399,6 +1486,8 @@ LIKE_CI_BUILDS: list[LikeCiBuild] = [
         ),
         "Release",
     ),
+    # #366: the owner gate, whole suite (every allocator entry is a gate site).
+    LikeCiBuild("gated", ("-DMI_PPROF=ON", "-DMI_OWNER_GATE=ON"), "Release"),
     LikeCiBuild(
         "memory-gate-leak",
         # See c-unit.yml's memory-gate-leak row for why 600000 rather than 200000.

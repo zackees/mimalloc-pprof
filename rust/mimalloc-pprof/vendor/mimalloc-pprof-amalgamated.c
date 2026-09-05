@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit e828bce8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit d21ee2ff of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -17439,6 +17439,8 @@ bool _mi_test_heaps_lock_poison_observed(void) {
    not something either side corrects for.
 */
 
+static char* mi_heap_dump_json_gated(bool include_blocks, bool hash_addresses);
+
 // -----------------------------------------------------------
 // small growable buffer for building the JSON string.
 // mirrors (does not share) stats.c's private mi_json_buf_t.
@@ -17539,9 +17541,77 @@ static bool mi_cdecl mi_dump_block_visit(const mi_heap_t* heap, const mi_heap_ar
   return true;
 }
 
+/* #366: exclude FOREIGN SWEEPERS while a heap is walked.
+
+   `mi_heap_visit_blocks` is documented as not thread-safe (include/mimalloc.h, #78): it reads
+   pages through the arena page bitmap with no lock, and the dump accepts torn content as
+   best-effort. What it cannot accept is a page being FREED and PURGED under the walk: in v3 the
+   `mi_page_t` header lives inside the page memory, and a purge decommits on Windows
+   (`purge_decommits=1`, `VirtualFree(MEM_DECOMMIT)`), so reading `page->next` of a page that
+   left between the bitmap read and the dereference is an access violation, not a torn value.
+   Ungated, only a page's OWNER frees it (a thread parked in `mi_on_thread_idle_start` is the
+   one exception); in a gated build the scavenger and `mi_purge_all` sweep every thread that is
+   between allocator calls, so a steady thread's all-free pages leave all the time.
+
+   So for the duration of a heap's walk this thread holds the sweepers' own ownership token on
+   each of the heap's theaps: the tld's MI_PARK_SWEEPING claim (`park_state` CAS + `sweeper`),
+   exactly as `_mi_theap_sweep_parked` and `mi_purge_all` take it. A claim excludes both of
+   them; an in-flight sweep is waited out (bounded: a sweeper never waits on us); a RUNNING
+   owner -- inside an allocator call -- is left alone and raced as before (the documented,
+   pre-existing contract). A claimed owner that wants to allocate waits in `_mi_park_leave*`
+   until the walk ends. The dumper's OWN tld is not claimed but gated (`mi_heap_dump_json`):
+   it must be RUNNING, not PARKED, while it reads its own pages, or a sweeper could claim it.
+
+   Lock order: `mi_subproc_visit_heaps` holds `sp->heaps_lock` (2); `heap->theaps_lock` (3) is
+   taken under it as `_mi_subproc_prof_sync_force_slow` does; the claim is a CAS, not a lock.
+   Waiting out a sweep under those locks is safe because a sweep takes neither (page-holes.c
+   "LOCK ORDER"), and `mi_purge_all` holds no claim while it holds `heaps_lock` (phase B). */
+#define MI_DUMP_MAX_CLAIMS  (64)   // theaps beyond this are walked unclaimed (documented best-effort)
+
+typedef struct mi_dump_claims_s {
+  mi_tld_t* tlds[MI_DUMP_MAX_CLAIMS];
+  size_t    count;
+} mi_dump_claims_t;
+
+static void mi_dump_claim_theaps(mi_heap_t* heap, mi_dump_claims_t* c) {
+  c->count = 0;
+  const mi_threadid_t me = _mi_thread_id();
+  mi_lock(&heap->theaps_lock) {
+    for (mi_theap_t* theap = heap->theaps; theap != NULL && c->count < MI_DUMP_MAX_CLAIMS; theap = theap->hnext) {
+      mi_tld_t* const tld = theap->tld;
+      if (tld == NULL || tld->thread_id == me || tld->thread_id == MI_THREADID_DETACHED) continue;
+      bool seen = false;
+      for (size_t i = 0; i < c->count; i++) { if (c->tlds[i] == tld) { seen = true; break; } }
+      if (seen) continue;
+      size_t spin = 0;
+      for (;;) {
+        size_t expected = MI_PARK_PARKED;   // word-width local: the MSVC-C atomics wrapper (see scavenger.c)
+        if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, (size_t)MI_PARK_SWEEPING)) {
+          mi_atomic_store_release(&tld->sweeper, (uintptr_t)me);
+          c->tlds[c->count++] = tld;
+          break;
+        }
+        if (expected != MI_PARK_SWEEPING) break;   // RUNNING: the owner is inside the allocator; walk unclaimed
+        if (spin < 256) { mi_atomic_pause(); spin++; } else { _mi_prim_thread_yield(); }   // a sweep in flight: it ends on its own
+      }
+    }
+  }
+}
+
+static void mi_dump_release_claims(mi_dump_claims_t* c) {
+  for (size_t i = 0; i < c->count; i++) {
+    mi_tld_t* const tld = c->tlds[i];
+    mi_atomic_store_release(&tld->sweeper, (uintptr_t)0);
+    mi_atomic_store_release(&tld->park_state, (size_t)MI_PARK_PARKED);   // back to PARKED: the owner owns the transition out
+  }
+  c->count = 0;
+}
+
 static bool mi_cdecl mi_dump_heap_visit(mi_heap_t* heap, void* arg) {
   mi_dump_ctx_t* ctx = (mi_dump_ctx_t*)arg;
   char tmp[64];
+  mi_dump_claims_t claims;
+  mi_dump_claim_theaps(heap, &claims);
   if (!ctx->first_heap) { mi_hdump_buf_print(&ctx->hbuf, ",\n"); }
   ctx->first_heap = false;
   _mi_snprintf(tmp, sizeof(tmp), "  { \"seq\": %zu,\n    \"pages\": [\n", heap->heap_seq);
@@ -17555,11 +17625,25 @@ static bool mi_cdecl mi_dump_heap_visit(mi_heap_t* heap, void* arg) {
     mi_heap_visit_blocks(heap, true, &mi_dump_block_visit, ctx);
     mi_hdump_buf_print(&ctx->hbuf, "]");
   }
+  mi_dump_release_claims(&claims);
   mi_hdump_buf_print(&ctx->hbuf, " }");
   return true;
 }
 
 char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept {
+  // #366: be RUNNING for the whole dump (see `mi_dump_claim_theaps`): our own theaps are read
+  // below too, and a PARKED dumper could have them swept from under the walk.
+  mi_theap_t* self = _mi_theap_default();
+  MI_GATE_ENTER(self);
+  char* const result = mi_heap_dump_json_gated(include_blocks, hash_addresses);
+  MI_GATE_LEAVE(self->tld);
+  #if !MI_OWNER_GATE
+  MI_UNUSED(self);
+  #endif
+  return result;
+}
+
+static char* mi_heap_dump_json_gated(bool include_blocks, bool hash_addresses) {
   mi_dump_ctx_t ctx;
   _mi_memzero(&ctx, sizeof(ctx));
   ctx.include_blocks = include_blocks;

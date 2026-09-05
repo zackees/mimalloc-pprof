@@ -1394,3 +1394,5 @@ The fourteen names are exactly the two workflows' matrices
 `ci/tests/test_verify_local.py` parses those matrices and fails if a name, triple, cmake
 flag or `bundle_tests.py` argument drifts out of sync — the same contract the
 `--only` config table has had since phase A.
+
+<!-- #360 verification: a docs-only change must satisfy every required check without --admin. -->

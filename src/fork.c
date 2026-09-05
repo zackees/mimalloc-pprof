@@ -251,6 +251,31 @@ terms of the MIT license. A copy of the license can be found in the file
   is irrelevant -- only ACQUIRE order can deadlock -- so each release pass walks its
   list forward rather than reconstructing a reverse walk.
 
+  ---- Non-`mi_lock_t` state with child resets (#272, #366) ----
+
+  Not locks, so not in the order above -- but each is a plain atomic that a vanished parent
+  thread may have left "held", and each gets an explicit reset in `_mi_process_fork_child`:
+
+    _mi_arenas_try_purge's one-purger flag    arena.c        `_mi_arenas_fork_child`
+    _mi_purge_admission (#366)                purge-all.c    `_mi_purge_all_fork_child`: holder
+                                              thread id of the one `mi_purge_all` allowed in
+                                              flight; a purge in flight in the parent must not
+                                              leave the child permanently MI_PURGE_BUSY.
+    mi_tld_t::sweeper (#366)                  types.h        the per-tld loop below: thread id of
+                                              the sweeper holding a MI_PARK_SWEEPING claim; the
+                                              claim itself is reset to RUNNING with `park_state`.
+    mi_tld_t::purge_epoch / gate_flags (#366) types.h        same loop: epoch to 0, RECLAIM_IGNORED
+                                              cleared, ORPHAN set on every tld but the survivor's.
+
+  Cross-tld ordering (#366, not a `mi_lock_t` edge but an acquisition order all the same):
+  a thread holds its OWN tld RUNNING (the owner gate, gate_depth >= 1) before it claims
+  another tld PARKED -> SWEEPING (`mi_purge_all`'s walk, the scavenger's parked sweep), and a
+  sweeper never waits on the owner of the tld it holds -- the owner waits for it
+  (`_mi_park_leave`/`_mi_park_leave_gate`), and its wait is bounded by `park_reclaim`. So:
+  "self RUNNING -> other SWEEPING", never the reverse, and never two SWEEPING claims on one
+  stack. `tlds_lock` (step 4) is taken only to find and claim a tld and is released before the
+  sweep body runs, so prepare's acquisition of it cannot deadlock against a claimant.
+
   ---- `mi_tld_t::theaps_lock`: re-initialized in the child, never acquired here (#272) ----
 
   P5 left this lock as a documented KNOWN GAP because there was no way to enumerate live
@@ -723,6 +748,9 @@ void _mi_process_fork_child(void) {
   // inside the guarded section leaves the child with a flag no thread will ever clear, i.e. a
   // child that never purges again. Not a `mi_lock_t`, so it gets its own reset here.
   _mi_arenas_fork_child();
+  // #366: same class -- `_mi_purge_admission` is a plain atomic (holder thread id), and a
+  // `mi_purge_all` in flight in the parent must not leave the child permanently MI_PURGE_BUSY.
+  _mi_purge_all_fork_child();
   mi_fork_depth = 0;
   mi_atomic_store_relaxed(&mi_fork_owner, (mi_threadid_t)0);
   mi_lock_init(&mi_fork_serialize_lock);  // fresh for this child's own future forks
@@ -750,11 +778,26 @@ void _mi_process_fork_child(void) {
     mi_lock_init(&sp->tlds_lock);
     mi_atomic_store_relaxed(&sp->scavenger_wake, (mi_scav_word_t)0);
     mi_atomic_store_relaxed(&sp->parked_count, (size_t)0);
+    // #366 (docs/purge-all-implementation.md §8): the forking thread's own tld is the SURVIVOR --
+    // the only registered tld whose thread exists in the child. Every other one is an ORPHAN:
+    // `mi_purge_all`'s walk counts it and never waits on it, never claims it, never sweeps it (its
+    // pages are reclaimed by the #271 `_mi_process_is_forked_child` mechanisms instead). The
+    // survivor's `gate_depth` is deliberately NOT reset: `prepare` may run inside an allocator
+    // hook (depth live), and the matching leave happens when that enclosing operation returns.
+    // `_mi_theap_default()` may still be uninitialised here (tld == &mi_tld_detached, never
+    // registered) -- then every registered tld is an orphan, which is right.
+    mi_theap_t* const self_theap = _mi_theap_default();
+    mi_tld_t* const survivor_tld = (self_theap != NULL ? self_theap->tld : NULL);   // NULL under MI_THEAP_INITASNULL
     for (mi_tld_t* t = sp->tlds; t != NULL; t = t->subproc_next) {
       mi_lock_init(&t->theaps_lock);
       mi_atomic_store_relaxed(&t->park_state, (size_t)MI_PARK_RUNNING);
       mi_atomic_store_relaxed(&t->park_reclaim, (size_t)0);
       mi_atomic_store_relaxed(&t->park_swept, (size_t)0);
+      mi_atomic_store_relaxed(&t->sweeper, (uintptr_t)0);       // #366: the claimant, if any, is gone
+      mi_atomic_store_relaxed(&t->purge_epoch, (size_t)0);      // #366: no walk is in progress in the child
+      size_t gflags = mi_atomic_load_relaxed(&t->gate_flags) & ~(size_t)MI_GATE_FLAG_RECLAIM_IGNORED;
+      if (t != survivor_tld) { gflags |= MI_GATE_FLAG_ORPHAN; }
+      mi_atomic_store_relaxed(&t->gate_flags, gflags);
     }
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       mi_lock_init(&h->theaps_lock);

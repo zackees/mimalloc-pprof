@@ -56,7 +56,22 @@
    A final extra fork (`check_dump_in_child`) exercises #270 step 5's requirement that
    `mi_prof_dump`/`mi_dhat_dump` keep working in the child under the profiler/DHAT
    "continue" child-side policy (see profile.c's/dhat.c's `_mi_prof_fork_child`/
-   `_mi_dhat_fork_child` comments). */
+   `_mi_dhat_fork_child` comments).
+
+   4. `purge_all_fork_cases` (#366 row F1, docs/purge-all-implementation.md §8/§11): the
+      `mi_purge_all` driver and the owner gate across fork(). Four forks: with a live
+      registered sibling thread, a forced purge in the child before any new thread exists
+      (the sibling's inherited tld is an ORPHAN: `theaps_orphaned == 1`, `theaps_pending == 0`,
+      never swept, never waited for) and again after the child has started a worker of its
+      own (that worker is swept in a gated build, reported pending in a default one); a fork
+      landing DURING a purge (the sibling is blocked inside its deferred-free handler while it
+      holds the purge admission -- the child's reset must clear it, or the child is BUSY
+      forever); and a fork from INSIDE an allocator hook on the forking thread (the
+      deferred-free handler of a `mi_collect`), which in a gated build is a fork with the
+      forking thread's `gate_depth` live -- the child must still purge, and the parent's
+      depth must balance so it can keep allocating and purging afterwards. Runs in both
+      builds; the MI_DEBUG>2 observed-edge checker in src/fork.c covers the walk's lock
+      edges while these run. */
 
 #ifdef _WIN32
 #include <stdio.h>
@@ -321,6 +336,228 @@ static int deterministic_hold_repro(void) {
 }
 #endif // MI_DEBUG>0
 
+// ---------------------------------------------------------------------------------------------
+// Workload 4 (#366, row F1): `mi_purge_all` across fork() -- see the file header comment.
+// ---------------------------------------------------------------------------------------------
+
+#if MI_OWNER_GATE
+#define F1_GATED 1
+#else
+#define F1_GATED 0
+#endif
+
+enum { F1_MODE_NONE = 0, F1_MODE_BLOCK = 1, F1_MODE_FORK = 2 };
+
+static volatile int       f1_mode = F1_MODE_NONE;   // what the deferred-free handler does...
+static pthread_t          f1_mode_thread;           // ...when it runs on THIS thread
+static pthread_mutex_t    f1_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int       f1_in_handler = 0;
+static volatile pid_t     f1_forked_pid = -1;       // F1_MODE_FORK: the child's pid, as seen by the parent
+static volatile int       f1_sibling_ready = 0;
+static volatile int       f1_sibling_stop = 0;
+static volatile int       f1_sibling_purge_rc = -1;
+
+static void f1_print_report(const char* label, int rc, const mi_purge_all_report_t* r) {
+  fprintf(stderr, "  F1 %s: rc=%d swept=%zu pending=%zu orphaned=%zu hole_bytes=%zu arena_bytes=%zu gated=%d complete=%d\n",
+          label, rc, r->theaps_swept, r->theaps_pending, r->theaps_orphaned, r->hole_bytes, r->arena_bytes,
+          (int)r->gated, (int)r->complete);
+}
+
+// child side of the "fork inside an allocator hook" case: a purge from inside the handler
+// (the child is still inside `mi_collect`'s deferred-free callback, with the gate held in
+// a gated build) must run, not be BUSY, and see no orphan (no sibling was alive)
+static void f1_child_purge_in_hook(void) {
+  mi_purge_all_report_t r;
+  const int rc = mi_purge_all_ex(MI_PURGE_FORCE, 100, &r);
+  f1_print_report("child (forked inside the deferred-free hook)", rc, &r);
+  if (rc == MI_PURGE_BUSY) { _exit(21); }
+  if (r.theaps_orphaned != 0 || r.theaps_pending != 0) { _exit(22); }
+  void* p = mi_malloc(200);   // and the child can still allocate from inside the hook
+  if (p == NULL) { _exit(23); }
+  mi_free(p);
+  _exit(0);
+}
+
+static void f1_deferred_free(bool force, unsigned long long heartbeat, void* arg) {
+  (void)force; (void)heartbeat; (void)arg;
+  if (f1_mode == F1_MODE_NONE || !pthread_equal(pthread_self(), f1_mode_thread)) return;
+  const int mode = f1_mode;
+  f1_mode = F1_MODE_NONE;
+  if (mode == F1_MODE_BLOCK) {
+    f1_in_handler = 1;
+    pthread_mutex_lock(&f1_mutex);    // main holds it: this thread is stuck inside the allocator
+    pthread_mutex_unlock(&f1_mutex);
+  }
+  else if (mode == F1_MODE_FORK) {
+    const pid_t pid = fork();
+    if (pid == 0) { f1_child_purge_in_hook(); }
+    f1_forked_pid = pid;
+  }
+}
+
+// a registered sibling: allocates (so it has a tld with pages) and stays alive until told to stop
+static void* f1_sibling(void* arg) {
+  (void)arg;
+  void* keep[64];
+  for (int i = 0; i < 64; i++) { keep[i] = mi_malloc(96 + (size_t)i); }
+  f1_sibling_ready = 1;
+  while (!f1_sibling_stop) { usleep(500); }
+  for (int i = 0; i < 64; i++) { mi_free(keep[i]); }
+  return NULL;
+}
+
+// a sibling that is INSIDE a purge when main forks: its own phase-C collect runs the handler,
+// which blocks on `f1_mutex` while the purge admission is held
+static void* f1_sibling_purging(void* arg) {
+  (void)arg;
+  void* q = mi_malloc(64); mi_free(q);
+  f1_mode_thread = pthread_self();
+  f1_mode = F1_MODE_BLOCK;
+  mi_purge_all_report_t r;
+  f1_sibling_purge_rc = mi_purge_all_ex(MI_PURGE_FORCE, 5000, &r);
+  f1_print_report("sibling's purge (the one the fork landed in)", f1_sibling_purge_rc, &r);
+  return NULL;
+}
+
+// the child's own worker (case B): allocates, then stays out of the allocator until stopped
+static volatile int f1_child_worker_ready = 0;
+static volatile int f1_child_worker_stop = 0;
+static void* f1_child_worker(void* arg) {
+  (void)arg;
+  void* keep[32];
+  for (int i = 0; i < 32; i++) { keep[i] = mi_malloc(80); }
+  f1_child_worker_ready = 1;
+  while (!f1_child_worker_stop) { usleep(500); }
+  for (int i = 0; i < 32; i++) { mi_free(keep[i]); }
+  return NULL;
+}
+
+// Child of the "live registered sibling" fork: case A then case B, exit codes name the failure.
+static void f1_child_with_orphan(void) {
+  mi_purge_all_report_t r;
+  // A. before any new thread: the sibling's tld is an orphan -- counted, never touched
+  int rc = mi_purge_all_ex(MI_PURGE_FORCE, 100, &r);
+  f1_print_report("child A (no new thread yet)", rc, &r);
+  if (rc == MI_PURGE_BUSY) { _exit(11); }
+  if (r.theaps_orphaned != 1) { _exit(12); }
+  if (r.theaps_pending != 0 || rc != MI_PURGE_OK) { _exit(13); }
+  if (r.complete) { _exit(14); }   // an orphan means the report is not complete
+  // B. after the child has a worker of its own
+  pthread_t w;
+  if (pthread_create(&w, NULL, f1_child_worker, NULL) != 0) { _exit(15); }
+  for (int i = 0; i < 20000 && !f1_child_worker_ready; i++) { usleep(100); }
+  usleep(2000);   // let the worker's last allocator call return (gated: it parks on return)
+  rc = mi_purge_all_ex(MI_PURGE_FORCE, 1000, &r);
+  f1_print_report("child B (with a child worker)", rc, &r);
+  f1_child_worker_stop = 1;
+  pthread_join(w, NULL);
+  if (rc == MI_PURGE_BUSY) { _exit(16); }
+  if (r.theaps_orphaned != 1) { _exit(17); }
+  #if F1_GATED
+  if (!(r.theaps_swept == 2 && r.theaps_pending == 0 && rc == MI_PURGE_OK)) { _exit(18); }
+  #else
+  if (!(r.theaps_swept == 1 && r.theaps_pending == 1 && rc == MI_PURGE_PARTIAL)) { _exit(18); }
+  #endif
+  _exit(0);
+}
+
+static void f1_child_during_purge(void) {
+  mi_purge_all_report_t r;
+  const int rc = mi_purge_all_ex(MI_PURGE_FORCE, 100, &r);
+  f1_print_report("child C (forked while the sibling held the purge admission)", rc, &r);
+  if (rc == MI_PURGE_BUSY) { _exit(31); }      // the child inherited a held admission
+  if (r.theaps_orphaned != 1) { _exit(32); }   // the purging sibling is the one orphan
+  if (r.theaps_pending != 0) { _exit(33); }
+  _exit(0);
+}
+
+static int purge_all_fork_cases(void) {
+  int failures = 0;
+  fprintf(stderr, "purge_all_fork_cases (F1, gated=%d):\n", F1_GATED);
+  mi_register_deferred_free(&f1_deferred_free, NULL);
+
+  // ---- A + B: fork with a live registered sibling ------------------------------------
+  pthread_t sib;
+  f1_sibling_ready = 0; f1_sibling_stop = 0;
+  if (pthread_create(&sib, NULL, f1_sibling, NULL) != 0) {
+    fprintf(stderr, "FAIL: F1: could not start the sibling thread\n");
+    mi_register_deferred_free(NULL, NULL);
+    return 1;
+  }
+  for (int i = 0; i < 20000 && !f1_sibling_ready; i++) { usleep(100); }
+  usleep(2000);
+  pid_t pid = fork();
+  if (pid < 0) { fprintf(stderr, "FAIL: F1: fork failed: %s\n", strerror(errno)); failures++; }
+  else if (pid == 0) { f1_child_with_orphan(); }
+  else {
+    int code = -1;
+    const int rc = wait_child_with_timeout(pid, "F1 child A/B (orphaned sibling)", &code);
+    if (rc != 0) { fprintf(stderr, "FAIL: F1 A/B child (exit code %d: 1x orphan count, 13 pending/status, 14 complete flag, 18 child-worker reach)\n", code); failures++; }
+    else { fprintf(stderr, "  F1 A/B: ok (orphaned == 1, pending == 0 before a new thread; child worker %s)\n", F1_GATED ? "swept" : "reported pending (default build)"); }
+  }
+  f1_sibling_stop = 1;
+  pthread_join(sib, NULL);
+
+  // ---- C: fork DURING a purge --------------------------------------------------------
+  f1_in_handler = 0; f1_sibling_purge_rc = -1;
+  pthread_mutex_lock(&f1_mutex);
+  pthread_t purger;
+  if (pthread_create(&purger, NULL, f1_sibling_purging, NULL) != 0) {
+    pthread_mutex_unlock(&f1_mutex);
+    fprintf(stderr, "FAIL: F1: could not start the purging sibling\n");
+    failures++;
+  }
+  else {
+    for (int i = 0; i < 20000 && !f1_in_handler; i++) { usleep(100); }
+    if (!f1_in_handler) { fprintf(stderr, "FAIL: F1 C: the sibling never reached its deferred-free handler\n"); failures++; }
+    pid = fork();
+    if (pid < 0) { fprintf(stderr, "FAIL: F1 C: fork failed: %s\n", strerror(errno)); failures++; }
+    else if (pid == 0) { f1_child_during_purge(); }
+    else {
+      int code = -1;
+      const int rc = wait_child_with_timeout(pid, "F1 child C (fork during a purge)", &code);
+      if (rc != 0) { fprintf(stderr, "FAIL: F1 C child (exit code %d: 31 BUSY -- admission not reset in the child, 32 orphan count, 33 pending)\n", code); failures++; }
+      else { fprintf(stderr, "  F1 C: ok (child admission clear, orphaned == 1)\n"); }
+    }
+    pthread_mutex_unlock(&f1_mutex);
+    pthread_join(purger, NULL);
+    if (f1_sibling_purge_rc == MI_PURGE_BUSY || f1_sibling_purge_rc < 0) {
+      fprintf(stderr, "FAIL: F1 C: the parent's in-flight purge did not complete normally (rc=%d)\n", f1_sibling_purge_rc);
+      failures++;
+    }
+  }
+
+  // ---- D: fork from INSIDE an allocator hook -----------------------------------------
+  f1_forked_pid = -1;
+  f1_mode_thread = pthread_self();
+  f1_mode = F1_MODE_FORK;
+  mi_collect(false);   // -> handler on this thread -> fork() inside it
+  f1_mode = F1_MODE_NONE;
+  if (f1_forked_pid < 0) { fprintf(stderr, "FAIL: F1 D: the handler did not run / fork failed\n"); failures++; }
+  else {
+    int code = -1;
+    const int rc = wait_child_with_timeout(f1_forked_pid, "F1 child D (fork inside the deferred-free hook)", &code);
+    if (rc != 0) { fprintf(stderr, "FAIL: F1 D child (exit code %d: 21 BUSY, 22 orphan/pending, 23 cannot allocate)\n", code); failures++; }
+  }
+  // survivor depth balanced: the parent left the hook, and can allocate and purge as usual
+  {
+    void* p = mi_malloc(300);
+    mi_purge_all_report_t r;
+    const int rc = mi_purge_all_ex(MI_PURGE_FORCE, 1000, &r);
+    f1_print_report("parent after the in-hook fork", rc, &r);
+    mi_free(p);
+    if (p == NULL || rc != MI_PURGE_OK || r.theaps_pending != 0 || r.theaps_orphaned != 0) {
+      fprintf(stderr, "FAIL: F1 D: the parent is not balanced after forking inside the hook\n");
+      failures++;
+    }
+    else { fprintf(stderr, "  F1 D: ok (child purged from inside the hook; parent balanced)\n"); }
+  }
+
+  mi_register_deferred_free(NULL, NULL);
+  fprintf(stderr, "purge_all_fork_cases: %d failure(s)\n", failures);
+  return failures;
+}
+
 int main(void) {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
@@ -336,6 +573,10 @@ int main(void) {
   #else
   fprintf(stderr, "deterministic_hold_repro: skipped (needs MI_DEBUG>0 -- this is a Release build)\n");
   #endif
+
+  // #366 row F1 -- before the churn/spawn workload below, so the only registered threads
+  // are the ones each case creates (the orphan counts are exact).
+  const int f1_rc = purge_all_fork_cases();
 
   // Spawn mode replaces the heap-churn thread rather than running alongside it: heap
   // create/destroy churn CONCURRENT with sustained thread starts trips a pre-existing,
@@ -380,16 +621,16 @@ int main(void) {
 
   const int dump_rc = check_dump_in_child();
 
-  fprintf(stderr, "test-fork-locks: %d/%d forks failed, %d/%d hung, spawn-mode %s, dump-in-child %s, deterministic-hold %s\n",
+  fprintf(stderr, "test-fork-locks: %d/%d forks failed, %d/%d hung, spawn-mode %s, dump-in-child %s, deterministic-hold %s, purge-all-fork %s\n",
           failures, N_FORKS, hangs, N_FORKS, spawn_mode ? "on" : "off",
-          dump_rc == 0 ? "ok" : "FAILED", det_rc == 0 ? "ok" : "FAILED");
+          dump_rc == 0 ? "ok" : "FAILED", det_rc == 0 ? "ok" : "FAILED", f1_rc == 0 ? "ok" : "FAILED");
 
-  if (failures > 0 || hangs > 0 || dump_rc != 0 || det_rc != 0) {
-    fprintf(stderr, "FAIL: test-fork-locks saw %d failures and %d hangs across %d forks (dump-in-child %s, deterministic-hold %s)\n",
-            failures, hangs, N_FORKS, dump_rc == 0 ? "ok" : "failed", det_rc == 0 ? "ok" : "failed");
+  if (failures > 0 || hangs > 0 || dump_rc != 0 || det_rc != 0 || f1_rc != 0) {
+    fprintf(stderr, "FAIL: test-fork-locks saw %d failures and %d hangs across %d forks (dump-in-child %s, deterministic-hold %s, purge-all-fork %s)\n",
+            failures, hangs, N_FORKS, dump_rc == 0 ? "ok" : "failed", det_rc == 0 ? "ok" : "failed", f1_rc == 0 ? "ok" : "failed");
     return 1;
   }
-  printf("ok: test-fork-locks: %d forks, 0 failures, 0 hangs, spawn-mode %s, dump-in-child ok, deterministic-hold ok\n",
+  printf("ok: test-fork-locks: %d forks, 0 failures, 0 hangs, spawn-mode %s, dump-in-child ok, deterministic-hold ok, purge-all-fork ok\n",
          N_FORKS, spawn_mode ? "on" : "off");
   return 0;
 }

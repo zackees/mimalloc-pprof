@@ -25,6 +25,8 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 | **memory-gate** (`ci/memory_gate.py`) | peak memory or thread-count regressions vs a committed per-platform/arch/compiler baseline | builds a copy with an injected leak; the gate must fail — verified at +212% / +98% / +27% on linux/windows/macos. The macOS lane now measures inside the `dockurr/macos` guest and bootstraps its own `macos-x86_64-soldr-clang-21-pprof1.json` |
 | **isa-baseline** (`ci/check_isa_baseline.py`) | binaries containing instructions above the CPU baseline, which SIGILL on older hardware | builds with `MI_OPT_ARCH=ON`; the scanner must fire. The parser also self-tests against x86 and arm64 fixtures on every run |
 | **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW. **macOS uses no Apple hardware** (#277 phase B2): both arches are cross-built on Linux, x86_64 is executed under `dockurr/macos` on a Linux runner, arm64 is compile-only. **windows-MinGW is gated from Linux-built bundles run on one Windows runner** (`windows-bundles.yml`, #277 phase C — which also moves that lane from msvcrt to UCRT); the native MSYS2 MinGW jobs are informational during the comparison window | `ci/bundle_coverage.py` fails if any test a build job's `ctest --show-only` listed was not executed by the run stage (#307), if a test in the arm64 bundle is missing from the executed x86_64 one, or if any test the native MinGW `ctest` would run is missing from a bundle; `ci/lint_no_macos_runners.py` fails if any workflow names a macOS runner |
+| **owner-gate** (`gated` `build` row in `run-linux`/`run-linux-serial`; a second `cl` tree inside `build-windows-native`/`ctest (windows-latest)`; `windows-gnu-x64-gated` + `windows-msvc-x64-gated` in `windows-bundles.yml`; the `address sanitizer (clang, Debug, owner-gate)` row) | the **whole suite** with `MI_OWNER_GATE=ON` (#366): every allocator entry is a gate site, so every test is a test of the gate. The Debug ASan row arms the `_mi_gate_held` leaf assertions, which prove no path reads owner-private state outside the gate. `test-purge-all` (T1–T3, G1–G8, C1–C2 of docs/purge-all-implementation.md §11) and `test-fork-locks`' F1 run in **both** builds | the same binary's ungated half: G1 must report the 4 busy workers `pending` with `MI_PURGE_PARTIAL` in the default build (a walk that claimed to reach what it cannot reach fails there); configure steps grep the resolved defines for `MI_OWNER_GATE=1` |
+| **fastpath-identity** (`ci/check_fastpath_identity.py`) | a change to the DEFAULT build's `mi_malloc`/`mi_zalloc`/`mi_free`/`mi_heap_malloc_small`/`mi_malloc_small` machine code vs the base revision (address-normalised disassembly of `libmimalloc.a`, Release, `MI_PPROF=ON`, `MI_OWNER_GATE=OFF`) — the plan's "byte-identical fast path" contract, checked on bytes | a third build with `MI_OWNER_GATE=ON` must differ in at least one symbol (it changes all five: measured 46→93 instructions for `mi_malloc`); symbols are resolved with `nm` and sliced by address because objdump's `--disassemble=SYM` prints nothing for an alias (`mi_malloc` is `malloc`) — an empty result is an error, never "identical"; `--selftest` runs fixtures for the normaliser |
 | **guarded** (a `build` row + its scoped env variant in `run-linux`) | the `MI_GUARDED` guard-page path, run twice: at the default sample rate and again with `MIMALLOC_GUARDED_SAMPLE_RATE=1` so every eligible allocation is guarded | configure step greps the resolved compiler defines for `MI_GUARDED=1`, since the original bug was the flag never reaching the compiler |
 | **asan** | use-after-free, overflow and leaks under AddressSanitizer, across **two build types** — see below | the `mimalloc-test-asan-control` binary reads freed memory through `mi_free` and must abort with an AddressSanitizer report; the configure step also greps its own output for `MI_TRACK_ASAN=ON`, since the option silently self-disables when its header is missing |
 | **fuzz** (`test/fuzz/`) | crashes from structured random allocator-API sequences, with ASan as the oracle | builds with a planted use-after-free and requires an anchored `(ERROR\|SUMMARY): AddressSanitizer:` report naming it |
@@ -230,7 +232,7 @@ runs no tests. `kind` says what it produces:
 
 | kind | rows | artifact |
 |---|---|---|
-| `bundle` | `release`, `pprof-off`, `debug-full`, `guarded`, `shared`, `musl`, `musl-pprof-off` | a `ci/bundle_tests.py` bundle, tarred, **plus** `show-only-<config>.json` straight from `ctest --show-only=json-v1` |
+| `bundle` | `release`, `pprof-off`, `debug-full`, `guarded`, `shared`, `gated` (#366, `MI_OWNER_GATE=ON`), `musl`, `musl-pprof-off` | a `ci/bundle_tests.py` bundle, tarred, **plus** `show-only-<config>.json` straight from `ctest --show-only=json-v1` |
 | `control` | `memory-gate-leak` (`MI_BENCH_INJECT_LEAK=600000`) | a bundle that is never executed — only its `mimalloc-test-memory-gate` binary is, as the memory gate's positive control |
 | `lib` | `isa-portable`, `isa-arch`, `diag-pprof-on`, `diag-pprof-off`, `debug3-extra` (#312: `MI_EXTRA_CPPDEFS=MI_DEBUG=3` must link `mimalloc-test-api`) | `libmimalloc*.a` (+ `compile_commands.json`) for the run stage to scan |
 
@@ -249,7 +251,7 @@ runs the five glibc ones in a single wave:
 
 ```
 uv run ci/run_test_bundle.py \
-  --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared \
+  --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared bundle/gated \
   --jobs 4 --select parallel \
   --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
   --junit-dir results
@@ -294,6 +296,8 @@ just themselves:
   for a hole sweep to land, and `test-profile-race{,-scavenger}` are oversubscribed thread
   races whose windows close on time rather than on work. On an oversubscribed 4-vCPU runner
   a missed deadline is indistinguishable from the regression the test exists to catch.
+  `test-purge-all{,-no-scavenger}` (#366) bound a worker's worst allocator-call stall during
+  a foreign sweep (G2) and wait a bounded time for the scavenger's paced sweep (G8).
 - **a subprocess lifecycle** — `test-subproc-lifecycle`.
 
 Those carry `RUN_SERIAL TRUE` in `CMakeLists.txt` — ctest's own word for "run this with
@@ -320,7 +324,10 @@ does not become correct by being run alongside something else.
 
 `build-windows-native` compiles the tree with Microsoft's `cl` (Release, `MI_PPROF=ON`) and
 bundles it; `run-windows-native` — still named **`ctest (windows-latest)`** — executes that
-bundle and checks its coverage. Same toolchain, same runner OS, same hard gate as before
+bundle and checks its coverage. Since #366 the same two jobs also build, run and cover a
+second tree, `MI_OWNER_GATE=ON` (`windows-native-gated`): extra steps rather than a matrix,
+because the job names are load-bearing (rule 3, branch protection) and a matrix would rename
+them. Same toolchain, same runner OS, same hard gate as before
 (CLAUDE.md rule 3); the only change is that the compile and the run are separate jobs, and
 that this is the first bundle produced from a native Visual Studio multi-config tree. All
 win-gnu work, and the cross-built MSVC-ABI comparison arms, stay in `windows-bundles.yml`.
@@ -594,6 +601,7 @@ moves to Linux (`cross.yml`'s `build-win-gnu` ran on `windows-latest`).
 | `build-windows-gnu (windows-gnu-x64-release)` | `bundle-windows-gnu-x64-release` | `ctest-win-gnu` |
 | `build-windows-gnu (windows-gnu-x64-debug-full)` | `bundle-windows-gnu-x64-debug-full` | `ctest-debug-full-win-gnu` |
 | `build-windows-gnu (windows-gnu-x64-shared)` | `bundle-windows-gnu-x64-shared` | `ctest-shared-win-gnu` |
+| `build-windows-gnu (windows-gnu-x64-gated)` | `bundle-windows-gnu-x64-gated` | *(#366: the whole suite with `MI_OWNER_GATE=ON` on win-gnu; no native predecessor)* |
 | `build-windows-gnu (windows-gnu-x64-leak)` | `bundle-windows-gnu-x64-leak` | *(new)* the memory gate's positive control |
 | `build-rust (x86_64-pc-windows-gnu)` | `rust-test-bins-…` | `cross.yml` `build-win-gnu` + `test (x86_64-pc-windows-gnu)`, and `rust-native.yml` `test-win-gnu` |
 
@@ -815,6 +823,7 @@ Windows SDK — and the single `windows-latest` job (`run-windows-gnu` is now
 | `build-windows-msvc (windows-msvc-x64-release)` | `bundle-windows-msvc-x64-release` | *(comparison arm for the retained native `ctest`)* |
 | `build-windows-msvc (windows-msvc-x64-debug-full)` | `bundle-windows-msvc-x64-debug-full` | `ctest-debug-full (windows-latest)` |
 | `build-windows-msvc (windows-msvc-x64-shared)` | `bundle-windows-msvc-x64-shared` | `ctest-shared (windows-latest)` |
+| `build-windows-msvc (windows-msvc-x64-gated)` | `bundle-windows-msvc-x64-gated` | *(#366: the clang-cl comparison arm of `build-windows-native`'s gated `cl` tree)* |
 | `build-windows-msvc (windows-msvc-x64-leak)` | `bundle-windows-msvc-x64-leak` | the positive control half of `memory-gate (windows-latest)` |
 | `build-rust (x86_64-pc-windows-msvc)` | `rust-test-bins-…`, `rust-sentinel-…` | `cross.yml` `test (x86_64-pc-windows-msvc)`, `rust-native.yml` `test (windows-latest)`, `benchmark-sentinel.yml` `benchmark-sentinel (windows-latest)` |
 

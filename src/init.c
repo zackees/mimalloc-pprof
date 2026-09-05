@@ -257,6 +257,14 @@ static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc) 
   tld->subproc = subproc;
   tld->theaps = NULL;
   mi_lock_init(&tld->theaps_lock);
+  // #366: a fresh tld starts RUNNING at gate_depth 0 with no sweeper and no flags (the memory
+  // is zeroed, but say so): in a gated build `_mi_gate_enter` runs `mi_thread_init` BEFORE its
+  // own `gate_depth++`, so the tld is registered RUNNING and the outer enter treats that as
+  // "mine" (`_mi_park_leave_gate`). `purge_epoch` is stamped by `mi_tld_register` under `tlds_lock`.
+  tld->gate_depth = 0;
+  mi_atomic_store_relaxed(&tld->park_state, (size_t)MI_PARK_RUNNING);
+  mi_atomic_store_relaxed(&tld->sweeper, (uintptr_t)0);
+  mi_atomic_store_relaxed(&tld->gate_flags, (size_t)0);
   if (tld->thread_id == MI_THREADID_DETACHED) {
     tld->numa_node = -1;
   }
@@ -310,6 +318,10 @@ static void mi_tld_register(mi_tld_t* tld) {
       tld->subproc_next = subproc->tlds;
       subproc->tlds = tld;
     }
+    // #366: registry cutoff (docs/purge-all-implementation.md §7.1). Stamped under `tlds_lock`,
+    // the same lock the `mi_purge_all` walk reads it under, so a thread created during a walk is
+    // already "done" for that epoch and thread churn cannot extend the walk.
+    mi_atomic_store_relaxed(&tld->purge_epoch, mi_atomic_load_relaxed(&_mi_purge_seq));
   }
 }
 
@@ -566,7 +578,18 @@ void _mi_thread_done(mi_theap_t* _theap_main)
   // not ours to leave (the thread-id check further down guards the rest of the teardown the
   // same way, but the dynamic thread_local release below is the CALLING thread's own and must
   // still happen).
-  if (tld->thread_id == _mi_prim_thread_id()) { _mi_park_leave(tld); }
+  if (tld->thread_id == _mi_prim_thread_id()) {
+    #if MI_OWNER_GATE
+    // #366: owner-gate site (docs/purge-all-implementation.md §5.1) -- the owner acquire (it also
+    // waits out an in-flight foreign sweep, like `_mi_park_leave`, but without the
+    // `parked_count` decrement, which is `mi_on_thread_idle_start`'s). Deliberately NEVER left:
+    // `mi_tld_free` unregisters the tld below and an unregistered RUNNING tld can never be found
+    // or claimed, and nothing may dereference the freed tld afterwards.
+    MI_GATE_ENTER(_theap_main);
+    #else
+    _mi_park_leave(tld);
+    #endif
+  }
 
   // release dynamic thread_local's
   _mi_thread_locals_thread_done();

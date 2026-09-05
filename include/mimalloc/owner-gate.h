@@ -40,6 +40,10 @@ static inline mi_theap_t* _mi_gate_enter(mi_theap_t* theap) {
   }
   mi_tld_t* const tld = theap->tld;
   mi_assert_internal(tld != NULL);
+  // The detached tld (`mi_tld_detached`, thread_id MI_THREADID_DETACHED) backs every subproc's
+  // `theap_meta` and is shared by all threads: those theaps are protected by `theap_meta_lock`,
+  // not by the park protocol, and it is never registered -- so it is never gated.
+  if mi_unlikely(tld->thread_id == MI_THREADID_DETACHED) return theap;
   if (tld->gate_depth++ == 0) {
     _mi_park_leave_gate(tld);
   }
@@ -48,6 +52,7 @@ static inline mi_theap_t* _mi_gate_enter(mi_theap_t* theap) {
 
 // Release for the owner: the outermost leave parks the thread.
 static inline void _mi_gate_leave(mi_tld_t* tld) {
+  if mi_unlikely(tld->thread_id == MI_THREADID_DETACHED) return;   // see `_mi_gate_enter`
   mi_assert_internal(tld != NULL && tld->gate_depth > 0);
   if (--tld->gate_depth == 0) {
     mi_atomic_store_release(&tld->park_state, (size_t)MI_PARK_PARKED);
@@ -57,6 +62,7 @@ static inline void _mi_gate_leave(mi_tld_t* tld) {
 // MI_DEBUG leaf assertion predicate (§5.2): the calling thread may touch `tld`'s theaps.
 static inline bool _mi_gate_held(const mi_tld_t* tld) {
   if (tld == NULL) return false;
+  if (tld->thread_id == MI_THREADID_DETACHED) return true;   // `theap_meta`: guarded by theap_meta_lock, never gated
   const mi_threadid_t me = _mi_thread_id();
   if (tld->gate_depth > 0 && tld->thread_id == me) return true;
   return (mi_atomic_load_acquire((_Atomic(size_t)*)&tld->park_state) == MI_PARK_SWEEPING &&
@@ -65,13 +71,22 @@ static inline bool _mi_gate_held(const mi_tld_t* tld) {
 
 #define MI_GATE_ENTER(theap)      ((theap) = _mi_gate_enter(theap))
 #define MI_GATE_LEAVE(tld)        _mi_gate_leave(tld)
-#define MI_GATE_ASSERT_HELD(tld)  mi_assert_internal(_mi_gate_held(tld))
+// Leaf form: a theap that has been DETACHED from its heap (`theap->heap == NULL`, the heap
+// teardown ABA claim protocol in `mi_heap_detach_theaps`) is mutated by the deleting thread,
+// never again by its owner -- that protocol is its exclusivity, not the gate.
+static inline bool _mi_gate_held_theap(const mi_theap_t* theap) {
+  if (theap == NULL) return false;
+  if (_mi_theap_heap_peek(theap) == NULL) return true;
+  return _mi_gate_held(theap->tld);
+}
+
+#define MI_GATE_ASSERT_HELD(theap)  mi_assert_internal(_mi_gate_held_theap(theap))
 
 #else  // !MI_OWNER_GATE
 
 #define MI_GATE_ENTER(theap)      ((void)0)
 #define MI_GATE_LEAVE(tld)        ((void)0)
-#define MI_GATE_ASSERT_HELD(tld)  ((void)0)
+#define MI_GATE_ASSERT_HELD(theap)  ((void)0)
 
 #endif
 

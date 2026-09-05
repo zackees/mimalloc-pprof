@@ -937,7 +937,10 @@ static inline mi_subproc_t* _mi_theap_subproc(const mi_theap_t* theap) {
   return subproc;
 }
 
+#include "mimalloc/owner-gate.h"   // #366: MI_GATE_ENTER/LEAVE/ASSERT_HELD (expands to nothing unless MI_OWNER_GATE)
+
 static inline mi_page_t* _mi_theap_get_free_small_page(mi_theap_t* theap, size_t size) {
+  MI_GATE_ASSERT_HELD(theap);   // #366 leaf assert (docs/purge-all-implementation.md §5.2)
   mi_assert_internal(size <= (MI_SMALL_SIZE_MAX + MI_PADDING_SIZE));
   const size_t idx = _mi_wsize_from_size(size);
   mi_assert_internal(idx < MI_PAGES_DIRECT);
@@ -2013,7 +2016,5 @@ static inline void _mi_memzero_aligned(void* dst, size_t n) {
 }
 
 
-
-#include "mimalloc/owner-gate.h"   // #366: MI_GATE_ENTER/LEAVE/ASSERT_HELD (expands to nothing unless MI_OWNER_GATE)
 
 #endif  // MI_INTERNAL_H

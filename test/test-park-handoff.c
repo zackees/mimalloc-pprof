@@ -171,6 +171,24 @@ static bool wait_for_discard_after(size_t before) {
   return discards() > before;
 }
 
+// #366 (MI_OWNER_GATE): the park protocol's default is inverted -- a thread is PARKED whenever it
+// is outside the allocator, so there is nothing for `mi_on_thread_idle_start` to hand off (it
+// returns false, after still starting the scavenger lazily) and the scavenger's timed sweep
+// reaches the thread anyway, paced by `purge_holes_min_interval`. The cases below whose contract
+// is specifically "a park hands the theaps off" assert THAT contract in a gated build instead:
+// `_start` returns false, the thread stays usable, and a thread that merely sits outside the
+// allocator (usleep, no allocator call) still gets swept by the scavenger. `gated_scavenger()` is
+// "a sweep will come without a hand-off": gated, and a scavenger can exist at all (the
+// `-no-scavenger` variant has none in either build).
+#if defined(MI_OWNER_GATE) && MI_OWNER_GATE
+#define GATED  1
+#else
+#define GATED  0
+#endif
+static bool gated_scavenger(void) {
+  return GATED && mi_option_is_enabled(mi_option_scavenger) && mi_option_get(mi_option_purge_delay) > 0;
+}
+
 // ---------------------------------------------------------------------------
 // The scavenger thread exists only once there is something for it to do (a second thread, or a
 // park), and it must not block the signals a fault on it raises, or a crash during a sweep it does
@@ -237,12 +255,22 @@ static void test_handoff_sweeps(void) {
   churn(p);
   const size_t before = discards();
   const bool parked = mi_on_thread_idle_start();
+  if (GATED) { check("gated: _start hands nothing off", !parked); }
   if (parked) {
     // Stand in for a blocking syscall: the sweep is asynchronous, so wait for it rather than
     // assuming it happened. Bounded so a broken handoff fails instead of hanging.
     for (int i = 0; i < 20000 && discards() == before; i++) { usleep(100); }
     mi_on_thread_idle_end();
     check("handoff sweeps the parked thread's heaps", discards() > before);
+  }
+  else if (gated_scavenger()) {
+    // #366: no hand-off, but this thread is PARKED right now (it is outside the allocator), and
+    // the scavenger sweeps it on its own clock. Sit here without touching the allocator.
+    for (int i = 0; i < 30000 && discards() == before; i++) { usleep(100); }
+    check("gated: the scavenger sweeps a thread that sits outside the allocator", discards() > before);
+    void* q = mi_malloc(64);   // ...and the thread takes itself back on its next allocator call
+    check("gated: the thread stays usable", q != NULL);
+    mi_free(q);
   }
   else {
     // No scavenger: `_start` must be a no-op, NOT an inline sweep. A caller parks far more often
@@ -385,7 +413,8 @@ static void test_survivors_intact(void) {
   churn_pattern(p);
   const size_t before = discards();
   const bool parked = mi_on_thread_idle_start();
-  if (parked) { wait_for_discard_after(before); }
+  if (GATED) { check("gated: _start hands nothing off", !parked); }
+  if (parked || gated_scavenger()) { wait_for_discard_after(before); }   // #366: gated, swept without a hand-off
   mi_on_thread_idle_end();
   if (!parked) { mi_on_thread_idle(); }   // no scavenger: do the sweep ourselves so it is not vacuous
   // a sweep that never ran would leave the survivors trivially intact -- assert it did run
@@ -467,8 +496,8 @@ static void test_parks_get_swept(void) {
     if (interval_ms > 0) { usleep((useconds_t)(interval_ms * 1000 + 5000)); }   // clear the rate window
     const size_t before = discards();
     const bool parked = mi_on_thread_idle_start();
-    if (parked) {
-      handed_off++;
+    if (parked || gated_scavenger()) {   // #366: gated, the spaced idle window is swept without a hand-off
+      if (parked) handed_off++;
       bool swept = false;
       for (int i = 0; i < 3000 && !swept; i++) { swept = (discards() > before); if (!swept) usleep(1000); }
       if (!swept) missed++;
@@ -480,6 +509,7 @@ static void test_parks_get_swept(void) {
   free(p);
   fprintf(stderr, "  parks handed off: %d, unswept: %d (min_interval=%ldms)\n", handed_off, missed, interval_ms);
   check("every spaced park gets swept promptly", missed == 0);
+  if (GATED) { check("gated: no park was handed off", handed_off == 0); }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,9 +527,11 @@ static void test_park_inside_window_gets_swept(void) {
   usleep((useconds_t)(interval_ms * 1000 + 5000));
   size_t before = discards();
   bool parked = mi_on_thread_idle_start();
-  bool first_swept = parked && wait_for_discard_after(before);
+  if (GATED) { check("gated: _start hands nothing off", !parked); }
+  const bool sweep_expected = parked || gated_scavenger();   // #366: gated, swept without a hand-off
+  bool first_swept = sweep_expected && wait_for_discard_after(before);
   mi_on_thread_idle_end();
-  if (!parked) { for (int i = 0; i < LIVE; i++) { mi_free(p[i]); } free(p); return; }   // nobody to hand off to (no scavenger)
+  if (!sweep_expected) { for (int i = 0; i < LIVE; i++) { mi_free(p[i]); } free(p); return; }   // nobody to hand off to (no scavenger)
   if (!first_swept) { free(p); check("park inside the rate window is swept when the window ends", false); return; }
   // second park: straight away, inside the window, with fresh holes
   for (int i = 0; i < LIVE; i++) { if (p[i] == NULL) { p[i] = mi_malloc(BSZ); memset(p[i], 3, BSZ); } }
@@ -509,7 +541,7 @@ static void test_park_inside_window_gets_swept(void) {
   clock_gettime(CLOCK_MONOTONIC, &t0);
   parked = mi_on_thread_idle_start();
   long waited_ms = -1;
-  if (parked) {
+  if (parked || gated_scavenger()) {
     const long deadline_ms = interval_ms * 10 + 1000;   // far under 30s, generous over `interval_ms`
     for (;;) {
       clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -523,7 +555,7 @@ static void test_park_inside_window_gets_swept(void) {
   for (int i = 0; i < LIVE; i++) { if (p[i] != NULL) mi_free(p[i]); }
   free(p);
   fprintf(stderr, "  in-window park swept after %ldms (min_interval=%ldms)\n", waited_ms, interval_ms);
-  check("park inside the rate window is swept when the window ends", parked && waited_ms >= 0);
+  check("park inside the rate window is swept when the window ends", (parked || gated_scavenger()) && waited_ms >= 0);
 }
 
 
@@ -829,8 +861,12 @@ static void test_exit_while_hole_swept_stress(void) {
   // off to, so `mi_on_thread_idle_start` reports false everywhere and there is no sweep to race
   // -- the threads still exit through the same allocating destructor, which is worth running,
   // but the discard check has no subject.
+  // #366 (gated): nothing is handed off, but every one of those threads is PARKED whenever it is
+  // outside the allocator and `min_interval` is 0, so the scavenger sweeps them all the same --
+  // the discard check keeps its subject.
+  if (GATED) { check("gated: no park was handed off", handoffs == 0); }
   check("... and the parks it raced really did discard holes",
-        !mi_option_is_enabled(mi_option_purge_holes) || handoffs == 0 ||
+        !mi_option_is_enabled(mi_option_purge_holes) || (handoffs == 0 && !gated_scavenger()) ||
         after.discard_calls > before.discard_calls);
 }
 

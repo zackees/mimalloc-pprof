@@ -268,6 +268,12 @@ static void mi_page_free_collect_ex(mi_page_t* page, bool force, bool allow_unpu
 }
 
 void _mi_page_free_collect(mi_page_t* page, bool force) {
+  #if MI_OWNER_GATE
+  // #366: owner-private leaf (docs/purge-all-implementation.md §5.2) -- for an OWNED page. The
+  // mt free path and the arena reclaim also collect ABANDONED pages they hold through the page's
+  // own ownership bit, which belong to no theap; those have no tld to assert against.
+  if (!mi_page_is_abandoned(page)) { MI_GATE_ASSERT_HELD(mi_page_theap(page)); }
+  #endif
   mi_page_free_collect_ex(page, force, true);
 }
 
@@ -464,6 +470,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   mi_assert_internal(page != NULL);
   mi_assert_expensive(_mi_page_is_valid(page));
   mi_assert_internal(mi_page_all_free(page));
+  MI_GATE_ASSERT_HELD(mi_page_theap(page));   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2)
 
   if (page->retire_expire!=0) return;  // already retired, just keep it retired
   mi_page_set_has_interior_pointers(page, false);
@@ -1156,7 +1163,9 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   #if !MI_THEAP_INITASNULL
   mi_assert_internal(theap != NULL);
   #endif
+  #if !MI_OWNER_GATE   // #366: in a gated build every caller is inside the gate (RUNNING at gate_depth>=1), and `_mi_park_leave` would wrongly decrement `parked_count`
   _mi_park_leave_if_parked(theap);   // #272: an owner-side alloc while parked (e.g. from a TLS destructor)
+  #endif
   const bool zero = ((zero_huge_alignment & 1) != 0);
   const size_t huge_alignment = (zero_huge_alignment & ~1);
   mi_page_t* page = NULL;

@@ -2747,16 +2747,22 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
   // skipping.
   //
   // Why that wait cannot deadlock, spelled out because it turns a non-blocking guard into a
-  // blocking one: the ONLY caller that passes `force` is `_mi_arenas_collect(force_purge=true)`
-  // from `mi_theap_collect_ex(MI_FORCE)`, i.e. an ordinary thread inside `mi_collect(true)`.
-  // The scavenger never does -- it reaches here through `mi_theap_collect(theap0, false)`
-  // (MI_NORMAL) and through `_mi_arenas_purge_now`, both `force == false`, and
-  // `mi_theap_collect_ex` skips `_mi_arenas_collect` outright while `park_state ==
-  // MI_PARK_SWEEPING`. So a waiter is always a user thread and a holder is always someone
-  // running a bounded pass over the arenas that acquires no mimalloc lock the waiter could
-  // be holding (the guarded body takes only arena bitmaps and the OS). The wait is therefore
-  // bounded by one purge pass, and in particular a holder is never itself blocked on
-  // `_mi_park_leave` waiting for a SWEEPING state the waiter would have to clear.
+  // blocking one: there are exactly TWO callers that pass `force`, and both are user threads
+  // holding no mimalloc lock: `_mi_arenas_collect(force_purge=true)` from
+  // `mi_theap_collect_ex(MI_FORCE)`, i.e. an ordinary thread inside `mi_collect(true)`, and
+  // (#366) `mi_purge_all_ex(MI_PURGE_FORCE)` in src/purge-all.c, phases A and E, which calls
+  // `_mi_arenas_try_purge(force=true, visit_all=true, sp, 0)` per subproc from an ordinary
+  // thread under no lock (the walk's `tlds_lock` is released before, and never held across,
+  // an arena purge; a claimed tld's sweep runs through `_mi_thread_idle_work_ex`, which has
+  // no arena purge at all). The scavenger never does -- it reaches here through the sweep's
+  // `_mi_theap_collect_foreign` (MI_NORMAL) and through `_mi_arenas_purge_now`, both
+  // `force == false`, and `mi_theap_collect_ex` skips `_mi_arenas_collect` outright while
+  // `park_state == MI_PARK_SWEEPING`. So a waiter is always a user thread and a holder is
+  // always someone running a bounded pass over the arenas that acquires no mimalloc lock the
+  // waiter could be holding (the guarded body takes only arena bitmaps and the OS). The wait
+  // is therefore bounded by one purge pass, and in particular a holder is never itself blocked
+  // on `_mi_park_leave` waiting for a SWEEPING state the waiter would have to clear -- and a
+  // `mi_purge_all` caller holding a SWEEPING claim never enters here while it holds one.
   //
   // And it is bounded in wall-clock time regardless, because "the holder no longer exists" is
   // not hypothetical on Windows: `ExitProcess` terminates every other thread BEFORE the

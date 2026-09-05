@@ -116,7 +116,11 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   NULL,                   // subproc_next (unregistered)
   0, 0,                   // holes_sweep_seq / holes_sweep_last (#272 P7b)
   false, false,           // holes_sweeping / holes_sweep_full
-  0, 0                    // holes_sweep_skipped / holes_sweep_visited
+  0, 0,                   // holes_sweep_skipped / holes_sweep_visited
+  0,                      // gate_depth (#366)
+  MI_ATOMIC_VAR_INIT(0),  // sweeper
+  MI_ATOMIC_VAR_INIT(0),  // purge_epoch
+  MI_ATOMIC_VAR_INIT(0)   // gate_flags
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {

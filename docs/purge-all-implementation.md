@@ -87,7 +87,7 @@ typedef struct mi_purge_all_report_s {
 #define MI_PURGE_PARTIAL  1   // some owners pending; see report
 #define MI_PURGE_BUSY     2   // another purge in flight, or re-entrant call; nothing was done
 
-mi_decl_export int  mi_purge_all_ex(mi_purge_flags_t flags, uint32_t wait_ms,
+mi_decl_export int  mi_purge_all_ex(mi_purge_flags_t flags, size_t wait_ms,
                                     mi_purge_all_report_t* report /* may be NULL */) mi_attr_noexcept;
 mi_decl_export void mi_purge_all(bool force) mi_attr_noexcept;   // == _ex(force ? MI_PURGE_FORCE : 0, 100, NULL)
 ```

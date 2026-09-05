@@ -46,6 +46,9 @@ typedef char mi_scav_atomic_widths_assert_t[
    sizeof(((mi_tld_t*)0)->park_state)      == sizeof(uintptr_t) &&
    sizeof(((mi_tld_t*)0)->park_reclaim)    == sizeof(uintptr_t) &&
    sizeof(((mi_tld_t*)0)->park_swept)      == sizeof(uintptr_t) &&
+   sizeof(((mi_tld_t*)0)->sweeper)         == sizeof(uintptr_t) &&   // #366
+   sizeof(((mi_tld_t*)0)->purge_epoch)     == sizeof(uintptr_t) &&
+   sizeof(((mi_tld_t*)0)->gate_flags)      == sizeof(uintptr_t) &&
    sizeof(((mi_subproc_t*)0)->parked_count)== sizeof(uintptr_t)
    #if defined(_WIN32)
    && sizeof(((mi_subproc_t*)0)->scavenger_wake) == sizeof(uintptr_t)
@@ -92,7 +95,7 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) {
     mi_theap_collect(theap0, false /* not forced */);
   }
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
-  _mi_purge_holes_of(tld);   // #272 (P7b): every theap of this thread + its heaps' abandoned pages
+  _mi_purge_holes_of(tld, false);   // #272 (P7b): every theap of this thread + its heaps' abandoned pages
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
   _mi_arenas_purge_now(tld->subproc);
   mi_atomic_increment_relaxed(&mi_idle_work_count);   // #272 test observable, see above

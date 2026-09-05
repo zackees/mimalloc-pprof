@@ -13,6 +13,13 @@ terms of the MIT license. A copy of the license can be found in the file
 // CMake default (`option(MI_PPROF ... ON)`, CMakeLists.txt). CMake keeps passing
 // -DMI_PPROF=0/1 explicitly, which wins over this default since that's a command-line
 // define, not a re-definition. See README's C build section.
+// #366: compile-time owner gate. When 1, every allocator operation takes the thread's own
+// `park_state` lock (the park protocol with its default inverted), so `mi_purge_all` can
+// sweep every registered thread. Off by default: the default build's fast path is byte-identical.
+#ifndef MI_OWNER_GATE
+#define MI_OWNER_GATE 0
+#endif
+
 #ifndef MI_PPROF
 #define MI_PPROF 1
 #endif
@@ -844,7 +851,19 @@ struct mi_tld_s {
   bool                  holes_sweep_full;     // ... and it ignores `page->swept_state` (every N'th sweep)
   size_t                holes_sweep_skipped;  // per-pass counters, folded into the process-wide ones by
   size_t                holes_sweep_visited;  // `_mi_page_purge_holes_end` (a per-page atomic would cost real time)
+
+  // #366: owner gate / `mi_purge_all` state (docs/purge-all-implementation.md §3). Present in
+  // every build so the layout does not depend on MI_OWNER_GATE; only a gated build reads
+  // `gate_depth`. All at the tail (positional initialisers, see above); every atomic is
+  // word-width (MSVC-C atomics wrapper, see `mi_scav_atomic_widths_assert_t`).
+  size_t                gate_depth;           // owner-private recursion count: acquire on 0->1, release on 1->0
+  _Atomic(uintptr_t)    sweeper;              // thread id holding the MI_PARK_SWEEPING claim (authorises the foreign door)
+  _Atomic(size_t)       purge_epoch;          // `mi_purge_all` walk progress / registry cutoff
+  _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
 };
+
+#define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept
+#define MI_GATE_FLAG_RECLAIM_IGNORED (2)   // this claimed sweep ignores `park_reclaim` (MI_PURGE_FORCE)
 
 
 /* ----------------------------------------------------------------------------

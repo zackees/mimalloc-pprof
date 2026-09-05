@@ -72,6 +72,7 @@ option(MI_WIN_USE_FLS       "Use Fiber local storage on Windows to detect thread
 option(MI_CHECK_FULL        "Use full internal invariant checking in DEBUG mode (deprecated, use MI_DEBUG_FULL instead)" OFF)
 option(MI_USE_LIBATOMIC     "Explicitly link with -latomic (on older systems) (deprecated and detected automatically)" OFF)
 option(MI_PPROF             "Enable the allocation sampling profiler" ON)
+option(MI_OWNER_GATE        "Take a per-thread owner gate on every allocator call so mi_purge_all can sweep every thread (#366; slower fast path)" OFF)
 
 include(CheckLinkerFlag)    # requires cmake 3.18
 include(CheckIncludeFiles)
@@ -97,6 +98,7 @@ set(mi_sources
     src/page.c
     src/page-map.c
     src/page-holes.c
+    src/purge-all.c
     src/profile.c
     src/random.c
     src/scavenger.c
@@ -480,6 +482,11 @@ endif()
 if(MI_SHOW_ERRORS)
   message(STATUS "Enable printing of error and warning messages by default (MI_SHOW_ERRORS=ON)")
   list(APPEND mi_defines MI_SHOW_ERRORS=1)
+endif()
+
+if(MI_OWNER_GATE)
+  message(STATUS "Enable the per-thread owner gate for mi_purge_all (MI_OWNER_GATE=ON)")
+  list(APPEND mi_defines MI_OWNER_GATE=1)
 endif()
 
 if(MI_PPROF)

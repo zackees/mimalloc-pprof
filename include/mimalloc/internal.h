@@ -402,6 +402,11 @@ bool          _mi_scavenger_is_running(void);
 void          _mi_scavenger_forked_child(void);
 void          _mi_park_leave(mi_tld_t* tld);
 void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0);
+// #366: the sweep body without the trailing arena purge; callable only by the thread holding
+// `tld`'s MI_PARK_SWEEPING claim (`tld->sweeper == _mi_thread_id()`). `force` reaches the
+// per-page loops (collect MI_FORCE, hole pacing ignored).
+void          _mi_thread_idle_work_ex(mi_tld_t* tld, mi_theap_t* theap0, bool force);
+void          _mi_park_leave_gate(mi_tld_t* tld);   // #366: `_mi_park_leave` without the parked_count decrement (owner-gate acquire)
 mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);
 // #272 test observable (test/test-park-handoff.c). `mi_decl_export` because the
 // `ctest-shared` job links that test against the shared library, where the default
@@ -466,6 +471,14 @@ void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 
 void          _mi_heap_detach_theaps( mi_heap_t* heap );
 void          _mi_theap_abandon(mi_theap_t* theap);  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271)
+// #366: the un-gated collect body ("foreign door", docs/purge-all-implementation.md §6). Never
+// takes the owner gate, never touches `gate_depth`; `_mi_deferred_free` stays owner-only
+// through its own thread_id guard. The owner door is the public `mi_theap_collect`.
+void          _mi_theap_collect_foreign(mi_theap_t* theap, bool force);
+// #366: src/purge-all.c
+extern mi_decl_hidden _Atomic(uintptr_t) _mi_purge_admission;   // holder thread id, 0 = free
+extern mi_decl_hidden _Atomic(size_t)    _mi_purge_seq;         // current/last walk epoch; `mi_tld_register` stamps it (registry cutoff)
+void          _mi_purge_all_fork_child(void);                    // reset admission in the child
 void          _mi_tld_detach_theaps( mi_tld_t* tld );
 void          _mi_theap_incref(mi_theap_t* theap);
 void          _mi_theap_decref(mi_theap_t* theap);
@@ -1211,7 +1224,7 @@ void          _mi_page_holes_reset_ineligible(void);
 void          _mi_page_purge_holes_begin(mi_tld_t* tld);         // around each pass of a sweep; `tld` is the thread being swept
 void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
-void          _mi_purge_holes_of(mi_tld_t* tld);                 // the sweep itself (src/page-holes.c)
+void          _mi_purge_holes_of(mi_tld_t* tld, bool force);     // the sweep itself (src/page-holes.c); #366: `force` skips the interval pacing and reads MI_GATE_FLAG_RECLAIM_IGNORED
 void          _mi_page_holes_assert_valid(const mi_page_t* page);   // MI_DEBUG hole invariants, called from `_mi_page_is_valid`
 
 /* ------------------------------------------------------
@@ -2000,5 +2013,7 @@ static inline void _mi_memzero_aligned(void* dst, size_t n) {
 }
 
 
+
+#include "mimalloc/owner-gate.h"   // #366: MI_GATE_ENTER/LEAVE/ASSERT_HELD (expands to nothing unless MI_OWNER_GATE)
 
 #endif  // MI_INTERNAL_H

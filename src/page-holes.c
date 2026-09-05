@@ -821,7 +821,8 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
 // number first; the array is `8 * sizeof(void*)` = 64 bytes of stack.
 #define MI_PURGE_HOLES_MAX_HEAPS  (8)
 
-void _mi_purge_holes_of(mi_tld_t* tld) {
+void _mi_purge_holes_of(mi_tld_t* tld, bool force) {
+  MI_UNUSED(force);   // #366 TODO(purge-all workstream): skip interval pacing, read MI_GATE_FLAG_RECLAIM_IGNORED
   if (tld == NULL) return;
   // `purge_holes_min_interval` pacing, for BOTH callers. It used to be applied only in
   // `_mi_theap_sweep_parked`'s pre-claim loop, which left a thread calling `mi_on_thread_idle()`

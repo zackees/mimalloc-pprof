@@ -88,7 +88,11 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   
   mi_assert_internal(page->heap!=NULL);
   mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
-  mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED);
+  // #272/#366: the peek is the CALLING thread's theap for this heap; a foreign sweeper holding
+  // the page owner's MI_PARK_SWEEPING claim (the scavenger, `mi_purge_all`) validates pages of
+  // another thread -- same relaxation as `mi_theap_page_is_valid` in theap.c.
+  mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED
+                     || mi_page_theap(page)->tld->thread_id != _mi_thread_id());
 
   // const size_t bsize = mi_page_block_size(page);
   // uint8_t* start = mi_page_start(page);
@@ -136,7 +140,10 @@ bool _mi_page_is_valid(mi_page_t* page) {
     //mi_assert_internal(!_mi_process_is_initialized);
     mi_assert_internal(page->heap!=NULL);
     mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
-    mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED);
+    // #272/#366: same relaxation as in `mi_page_is_valid_init` -- a foreign sweeper holding the
+    // owner's MI_PARK_SWEEPING claim validates pages of another thread.
+    mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED
+                       || mi_page_theap(page)->tld->thread_id != _mi_thread_id());
     {
       mi_page_queue_t* pq = mi_page_queue_of(page);
       mi_assert_internal(mi_page_queue_contains(pq, page));

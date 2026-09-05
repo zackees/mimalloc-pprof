@@ -212,13 +212,23 @@ void _mi_park_leave_gate(mi_tld_t* tld) {
 // #366 (gated build): every thread outside the allocator is PARKED, so this is the timed sweep
 // of BUSY threads too, paced by `purge_holes_min_interval` (`holes_sweep_last`) and bounded per
 // visit by `park_reclaim` (the owner's next allocator call). `parked_count` and `park_swept`
-// are `mi_on_thread_idle_start` bookkeeping that a gated park never writes, so neither is
-// consulted there: a gated tld would otherwise be skipped forever (`parked_count == 0`) or
-// swept exactly once (`park_swept` is only cleared by `_start`).
+// are `mi_on_thread_idle_start` bookkeeping that a gated park never writes, so `parked_count`
+// is not consulted there (a gated tld would be skipped forever), and `park_swept` -- which
+// `_start` alone clears -- is used as a per-CALL round stamp instead: each tld is swept at
+// most once per call, so a call always terminates and the scavenger gets back to its wait
+// (and its stop flag) even with `purge_holes_min_interval=0`, when every PARKED tld is
+// always due. Ungated, `park_swept` keeps its 0/1 "done for this park" meaning.
+#if MI_OWNER_GATE
+static size_t mi_sweep_round;   // scavenger thread only (the sole caller of `_mi_theap_sweep_parked`)
+#endif
 mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
   if (subproc == NULL) return 0;
   #if !MI_OWNER_GATE
   if (mi_atomic_load_relaxed(&subproc->parked_count) == 0) return 0;
+  const size_t swept_mark = 1;
+  #else
+  if (++mi_sweep_round == 0) { mi_sweep_round = 1; }   // 0 is "never swept" (`_start` clears to it)
+  const size_t swept_mark = mi_sweep_round;
   #endif
   for (;;) {
     mi_tld_t* claimed = NULL;
@@ -232,6 +242,8 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
         #if !MI_OWNER_GATE
         if (mi_atomic_load_acquire(&tld->park_swept) != 0) continue;   // already done for this park
+        #else
+        if (mi_atomic_load_acquire(&tld->park_swept) == swept_mark) continue;   // already swept this round (#366)
         #endif
         // Read `park_state` BEFORE `holes_sweep_last`. That field is a PLAIN `mi_msecs_t` written
         // by whoever last swept this tld -- including the OWNER while it is RUNNING, from its own
@@ -277,8 +289,8 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     // Mark BEFORE releasing: a `park_swept` set after the store could land on the thread's *next*
     // park and silently skip that sweep. Cleared by `mi_on_thread_idle_start`. If we bailed out
     // early on `park_reclaim`, the owner is leaving the park anyway, so the rest is its next park's.
-    // (#366 gated build: harmless and unread -- see the function comment.)
-    mi_atomic_store_release(&claimed->park_swept, 1);
+    // (#366 gated build: the round stamp -- see the function comment.)
+    mi_atomic_store_release(&claimed->park_swept, swept_mark);
     // #366: drop the claim's holder BEFORE the state goes back: a `_mi_gate_held` that reads
     // PARKED never consults `sweeper`, and a later claimant overwrites it under its own CAS.
     mi_atomic_store_release(&claimed->sweeper, (uintptr_t)0);

@@ -740,6 +740,11 @@ jobs:
               excluded_crates="$excluded_crates $crate"
             else
               cp "$bin" "dist/msvc-tests/$profile/"
+              # #294: the runner used to glob *.exe. It cannot any more -- the companions
+              # staged below are executables too, and running `stress-child.exe` directly
+              # makes it read a request from stdin, hit EOF and exit 1. So say which files
+              # are tests, here, where it is known, instead of guessing there.
+              basename "$bin" >> "dist/msvc-tests/$profile/tests.list"
             fi
           done < "bins-$label.txt"
           # #294: companions are staged unconditionally -- a test that needs one and does
@@ -797,8 +802,8 @@ jobs:
             fi
           done
           built=$(cat bins-workspace-debug.txt bins-pprof-release.txt | wc -l)
-          staged=$(( $(ls -1 dist/msvc-tests/debug | wc -l) + $(ls -1 dist/msvc-tests/release | wc -l) ))
-          echo "staged $staged of $built test binaries ($(ls -1 dist/msvc-tests/debug | wc -l) debug + $(ls -1 dist/msvc-tests/release | wc -l) release)"
+          staged=$(( $(wc -l < dist/msvc-tests/debug/tests.list) + $(wc -l < dist/msvc-tests/release/tests.list) ))
+          echo "staged $staged of $built test binaries ($(wc -l < dist/msvc-tests/debug/tests.list) debug + $(wc -l < dist/msvc-tests/release/tests.list) release)"
       - name: Build the PR benchmark sentinel
         # NOT gated on the `benchmark` label even though running it is (see run-windows):
         # this is a cross-build on the Linux builder that already builds the whole Rust
@@ -1269,13 +1274,24 @@ jobs:
           count=0
           for profile in debug release; do
             echo "== $profile =="
-            for test_binary in "rust-bins-msvc/$profile"/*.exe; do
-              [ -e "$test_binary" ] || continue
-              echo "::group::$profile/$(basename "$test_binary")"
+            # #294: the staged set now also contains the companion binaries the
+            # relocatable tests spawn, which are executables but not tests. The build job
+            # wrote tests.list saying which is which; globbing *.exe here would run
+            # `stress-child.exe` as if it were a test suite.
+            manifest="rust-bins-msvc/$profile/tests.list"
+            if [ ! -s "$manifest" ]; then
+              echo "::error::$manifest is missing or empty; the staging job did not say which binaries are tests"
+              ls -1 "rust-bins-msvc/$profile" || true
+              exit 1
+            fi
+            while read -r test_name; do
+              [ -n "$test_name" ] || continue
+              test_binary="rust-bins-msvc/$profile/$test_name"
+              echo "::group::$profile/$test_name"
               "$test_binary" --test-threads=4
               echo "::endgroup::"
               count=$((count + 1))
-            done
+            done < "$manifest"
           done
           echo "ran $count MSVC test binaries"
           # A silently-empty artifact would make this step pass having run nothing.

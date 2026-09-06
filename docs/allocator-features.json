@@ -9,7 +9,7 @@
     },
     {
       "key": "upstream",
-      "label": "upstream mimalloc",
+      "label": "Microsoft MiMalloc-V3",
       "version": "v3 dev3 @ 6def7be9"
     },
     {

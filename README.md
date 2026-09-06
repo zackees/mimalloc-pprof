@@ -162,7 +162,7 @@ re-verified under this tree's stress suite. → [Bun features](#bun-features)
 ### Feature comparison
 
 Everything the four allocators in the
-[memory-return chart](#memory-returned-after-idle) do, side by side: this fork, upstream mimalloc v3, [Bun's fork](https://github.com/oven-sh/mimalloc),
+[memory-return chart](#memory-returned-after-idle) do, side by side: this fork, Microsoft MiMalloc-V3 (upstream `dev3`), [Bun's fork](https://github.com/oven-sh/mimalloc),
 and [jemalloc](https://jemalloc.net/). Every cell is sourced — a `path:line` in this
 tree, a path in the pinned upstream commit, or an official doc anchor — in
 [`docs/allocator-features.json`](docs/allocator-features.json), which is what both the
@@ -173,10 +173,10 @@ image and the table below are rendered from.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-features-dark.svg" />
   <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-features-light.svg" />
-  <img alt="Feature comparison of mimalloc-pprof, upstream mimalloc v3, Bun's mimalloc and jemalloc across memory return, profiling, robustness, platform support and allocator design" src=".github/assets/allocator-features-light.svg" width="100%" />
+  <img alt="Feature comparison of mimalloc-pprof, Microsoft MiMalloc-V3, Bun's mimalloc and jemalloc across memory return, profiling, robustness, platform support and allocator design" src=".github/assets/allocator-features-light.svg" width="100%" />
 </picture>
 
-| Feature | **mimalloc-pprof** | upstream mimalloc | Bun mimalloc | jemalloc |
+| Feature | **mimalloc-pprof** | Microsoft MiMalloc-V3 | Bun mimalloc | jemalloc |
 |---|:--|:--|:--|:--|
 |  | this fork, 0.9.x | v3 dev3 @ 6def7be9 | oven-sh @ b20b60d9 | 5.3.1 @ 81034ce1 |
 | **Memory return** | | | | |

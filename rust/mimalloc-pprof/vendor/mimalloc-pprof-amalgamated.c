@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit b2bb9ff0 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit c82a677d of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -3221,6 +3221,7 @@ struct mi_tld_s {
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept
 #define MI_GATE_FLAG_RECLAIM_IGNORED (2)   // this claimed sweep ignores `park_reclaim` (MI_PURGE_FORCE)
+#define MI_GATE_FLAG_EXITING         (4)   // the owner is inside `_mi_thread_done`: no live owner, never waited for
 
 
 /* ----------------------------------------------------------------------------
@@ -17349,7 +17350,8 @@ void _mi_process_fork_child(void) {
       mi_atomic_store_relaxed(&t->park_reclaim, (size_t)0);
       mi_atomic_store_relaxed(&t->park_swept, (size_t)0);
       mi_atomic_store_relaxed(&t->sweeper, (uintptr_t)0);       // #366: the claimant, if any, is gone
-      mi_atomic_store_relaxed(&t->purge_epoch, (size_t)0);      // #366: no walk is in progress in the child
+      mi_atomic_store_relaxed(&t->purge_epoch, (size_t)0);
+      // #366: EXITING belonged to a thread of the parent; in the child that tld is an orphan (below)      // #366: no walk is in progress in the child
       size_t gflags = mi_atomic_load_relaxed(&t->gate_flags) & ~(size_t)MI_GATE_FLAG_RECLAIM_IGNORED;
       if (t != survivor_tld) { gflags |= MI_GATE_FLAG_ORPHAN; }
       mi_atomic_store_relaxed(&t->gate_flags, gflags);
@@ -18480,6 +18482,9 @@ static void mi_tld_register(mi_tld_t* tld) {
       tld->subproc_next = subproc->tlds;
       subproc->tlds = tld;
     }
+    // #366: a thread may re-initialise after `_mi_thread_done` (see the note above), and the tld
+    // it gets back is a live owner again.
+    mi_atomic_and_acq_rel(&tld->gate_flags, ~(size_t)MI_GATE_FLAG_EXITING);
     // #366: registry cutoff (docs/purge-all-implementation.md §7.1). Stamped under `tlds_lock`,
     // the same lock the `mi_purge_all` walk reads it under, so a thread created during a walk is
     // already "done" for that epoch and thread churn cannot extend the walk.
@@ -18754,8 +18759,18 @@ void _mi_thread_done(mi_theap_t* _theap_main)
   // same way, but the dynamic thread_local release below is the CALLING thread's own and must
   // still happen).
   if (tld->thread_id == _mi_prim_thread_id()) {
+    // #366: this thread is leaving. Mark the tld as having no live owner BEFORE the teardown
+    // below: from here on `mi_purge_all` never waits for it and never reports it (both builds).
+    // `mi_tld_free` unregisters it a few lines down, so the flag is normally set for
+    // microseconds -- but on Windows a joined thread's teardown can outlive the join (the loader
+    // runs it from the TLS detach callback, and it can stall behind a lock or never complete at
+    // process teardown), and without this such a tld stays registered and RUNNING: reported
+    // `pending` by every later purge, so `complete` is never true again and a client looping on
+    // MI_PURGE_PARTIAL never terminates. Observed on the win-gnu gated lane as one tld stuck at
+    // `RUNNING depth 1, theaps yes` for the rest of the process (#366).
+    mi_atomic_or_acq_rel(&tld->gate_flags, (size_t)MI_GATE_FLAG_EXITING);
     #if MI_OWNER_GATE
-    // #366: owner-gate site (docs/purge-all-implementation.md §5.1) -- the owner acquire (it also
+    // the owner acquire (it also
     // waits out an in-flight foreign sweep, like `_mi_park_leave`, but without the
     // `parked_count` decrement, which is `mi_on_thread_idle_start`'s). Deliberately NEVER left:
     // `mi_tld_free` unregisters the tld below and an unregistered RUNNING tld can never be found
@@ -26331,6 +26346,15 @@ static mi_tld_t* mi_purge_walk_claim(mi_subproc_t* sp, mi_tld_t* my_tld, mi_purg
       }
       if (scav_tld != NULL && tld == scav_tld) {                           // the scavenger's own tld (Windows DLL build):
         mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);                // it owns nothing and never parks -- neither swept nor pending
+        continue;
+      }
+      // #366: a thread inside `_mi_thread_done` has no live owner to wait for and owns nothing a
+      // purge could return -- its pages are abandoned by the teardown itself and are reached by
+      // phase B afterwards. Neither swept nor reported: reporting it `pending` would make
+      // `complete` unreachable for the rest of the process if that teardown never finishes
+      // (Windows: a joined thread's TLS-callback teardown can outlive the join).
+      if ((mi_atomic_load_relaxed(&tld->gate_flags) & MI_GATE_FLAG_EXITING) != 0) {
+        mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);
         continue;
       }
       if ((mi_atomic_load_relaxed(&tld->gate_flags) & MI_GATE_FLAG_ORPHAN) != 0) {

@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.11.0
+
+Process-wide eager purge, Bun's heap-snapshot format, zero-tracking back on, and a macOS
+malloc zone the platform's own tools can walk.
 
 - **Process-wide eager purge** ([#366](https://github.com/zackees/mimalloc-pprof/issues/366)):
   `purge_all(force) -> PurgeAllReport` and `purge_all_ex(PurgeFlags, wait_ms) ->

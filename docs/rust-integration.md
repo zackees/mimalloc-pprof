@@ -4,7 +4,7 @@
 
 ```toml
 [dependencies]
-mimalloc-pprof = "0.9"          # v3 engine (current)
+mimalloc-pprof = "0.11"         # v3 engine (current)
 # mimalloc-pprof = "0.8"        # v2 engine
 
 [profile.release]

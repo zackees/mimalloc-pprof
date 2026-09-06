@@ -666,6 +666,20 @@ jobs:
             # segment when it is not.
             jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | [((.package_id | if test("#[^@/]+@") then (split("#")[1] | split("@")[0]) else (split("#")[0] | split("/") | last) end)), .executable] | @tsv' \
               "cargo-$label.json" > "bins-$label.txt"
+            # #294: the companion BINARIES the relocatable tests spawn.
+            # `stress_harness::sibling_bin` looks for them right next to the test
+            # executable, which is what a flat bundle directory gives it -- but only if
+            # they are staged too. They are not test artifacts, so the filter above does
+            # not see them, and before #294 nothing needed them here because the tests
+            # that spawn them were dropped from the bundle entirely.
+            #
+            # Named, not "every bin in the workspace": the workspace's debug binaries come
+            # to 339 MB, almost all of it benchmark-suite runners no test spawns. A test
+            # that starts spawning something else fails loudly on the runner with a bare
+            # "cannot find the file specified", so the assertion below names them here
+            # instead, next to the compiler output.
+            jq -r 'select(.reason == "compiler-artifact" and .executable != null and (.profile.test | not) and (.target.kind | index("bin")) and (.target.name as $n | ["stress-child", "dashboard"] | index($n) != null)) | .executable' \
+              "cargo-$label.json" | sort -u > "companions-$label.txt"
             if [ "$rc" -ne 0 ]; then
               jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' "cargo-$label.json" >&2
               exit "$rc"
@@ -728,9 +742,25 @@ jobs:
               cp "$bin" "dist/msvc-tests/$profile/"
             fi
           done < "bins-$label.txt"
+          # #294: companions are staged unconditionally -- a test that needs one and does
+          # not find it fails with a bare "cannot find the file specified", far from here.
+          while read -r bin; do
+            [ -n "$bin" ] && cp "$bin" "dist/msvc-tests/$profile/"
+          done < "companions-$label.txt"
           }
           stage workspace-debug debug
           stage pprof-release release
+          # #294: a missing companion surfaces on the runner as a bare "cannot find the
+          # file specified" from inside a test, with nothing naming the cause. Say it here
+          # instead, next to the compiler output, the same way the required-test check
+          # below does.
+          for companion in stress-child dashboard; do
+            if [ ! -f "dist/msvc-tests/debug/$companion.exe" ]; then
+              echo "::error::$companion.exe was not staged; the relocatable bench-harness/dashboard tests spawn it as a sibling and would fail on the runner with no explanation"
+              ls dist/msvc-tests/debug
+              exit 1
+            fi
+          done
           if [ -n "$excluded" ]; then
             echo "::warning::not staged (they embed the builder's absolute path via CARGO_BIN_EXE_*, so they cannot run on another machine):$excluded"
             {

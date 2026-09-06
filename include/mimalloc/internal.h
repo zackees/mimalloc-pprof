@@ -604,14 +604,18 @@ void        _mi_memevt_fork_child(void);
 // "dhat.c": exact heap/lifetime observer, independent of MI_PPROF. The event
 // bracketing deliberately captures before the public callback and commits after it.
 bool        _mi_dhat_is_active(void);
-void        _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size);
 void        _mi_dhat_forget_heap(mi_heap_t* heap);
+// #371: the per-allocation hooks exist only when the observer is compiled in, so an
+// unguarded call site fails to compile instead of quietly costing the hot path.
+#if MI_DHAT
+void        _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size);
 void        _mi_dhat_begin_free(void* p);
 void        _mi_dhat_begin_resize(void* oldp, void* newp, size_t request_size);
 void        _mi_dhat_finish_event(void);
+size_t      _mi_dhat_stack_capture(void** pcs, size_t capacity);
+#endif
 void        _mi_dhat_process_init(void);
 void        _mi_dhat_process_done(void);
-size_t      _mi_dhat_stack_capture(void** pcs, size_t capacity);
 // #270: fork-safety -- quiesce/reset `dhat_lock` around fork(). Child-side policy:
 // continue (the live/pp tables are ordinary process memory, safe copy-on-write across
 // fork; only the lock itself needs resetting; `mi_dhat_dump` must keep working in the

@@ -3,6 +3,9 @@
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 
+// #371: only built (and only declared) when the observer is compiled in.
+#if MI_DHAT
+
 #define MI_DHAT_STACK_MAX 128
 
 #ifdef _WIN32
@@ -40,3 +43,5 @@ size_t _mi_dhat_stack_capture(void** pcs, size_t capacity) {
   return n;
 }
 #endif
+
+#endif // MI_DHAT

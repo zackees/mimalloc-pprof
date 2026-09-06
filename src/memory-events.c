@@ -250,14 +250,18 @@ void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
   // under/overflow them) -- DHAT's own free path needs no matching check since it looks
   // up the pointer in its own record table and no-ops when the alloc was never recorded.
   if (_mi_meta_is_meta_page_safe(page)) return;  // adapted for issue #271: was _mi_meta_is_meta_page(mi_page_subproc(page), page)
+  #if MI_DHAT
   _mi_dhat_begin_alloc(page, p, request_size);
+  #endif
   size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
     memevt_dispatch(hooks, MI_MEMORY_ALLOCATE, (int64_t)usable, (uint64_t)request_size);
   }
+  #if MI_DHAT
   _mi_dhat_finish_event();
+  #endif
 }
 
 // #266: unlike _mi_memevt_on_alloc above, the free/resize hooks are never reachable
@@ -287,13 +291,17 @@ void _mi_memevt_on_free(mi_page_t* page, void* p) {
   // question from page->memid's arena instead, which never touches page->heap.
   // #266: symmetric with the _mi_memevt_on_alloc check above -- see its comment.
   if (_mi_meta_is_meta_page_safe(page)) return;
+  #if MI_DHAT
   _mi_dhat_begin_free(p);
+  #endif
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
     memevt_dispatch(hooks, MI_MEMORY_FREE, -(int64_t)usable, 0);
   }
+  #if MI_DHAT
   _mi_dhat_finish_event();
+  #endif
 }
 
 void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size) {
@@ -301,14 +309,18 @@ void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_siz
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
   if (hooks->memevt_suppress_depth > 0) return;
+  #if MI_DHAT
   _mi_dhat_begin_resize(p, p, request_size);
+  #endif
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     // Same page => same block-size class => usable size is identical before and after.
     MI_UNUSED(page);
     memevt_dispatch(hooks, MI_MEMORY_RESIZE, 0, (uint64_t)request_size);
   }
+  #if MI_DHAT
   _mi_dhat_finish_event();
+  #endif
 }
 
 void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
@@ -316,13 +328,17 @@ void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usab
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
   if (hooks->memevt_suppress_depth > 0) return;
+  #if MI_DHAT
   _mi_dhat_begin_resize(oldp, newp, request_size);
+  #endif
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const int64_t delta = (int64_t)usable_post - (int64_t)usable_pre;
     memevt_dispatch(hooks, MI_MEMORY_RESIZE, delta, (uint64_t)request_size);
   }
+  #if MI_DHAT
   _mi_dhat_finish_event();
+  #endif
 }
 
 // ---------------------------------------------------------------------------------------

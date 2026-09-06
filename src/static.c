@@ -38,7 +38,9 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "libc.c"
 #include "memory-events.c"
 #include "dhat.c"
-#include "dhat-stack.c"
+#if MI_DHAT
+#include "dhat-stack.c"   // #371: stack capture exists only with the observer
+#endif
 #include "options.c"
 #include "os.c"
 #include "page.c"           // includes page-queue.c

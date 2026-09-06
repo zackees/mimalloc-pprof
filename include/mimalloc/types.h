@@ -24,6 +24,14 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_PPROF 1
 #endif
 
+// #371: compile-time switch for the exact DHAT v2 observer (src/dhat.c). When 0 the
+// per-allocation hook sites compile away entirely -- no call, no flag load -- and only the
+// public `mi_dhat_*` API survives, as stubs. Defaults to 1 to match CMake's `MI_DHAT=ON`
+// and so a build system that does not set it keeps today's behavior.
+#ifndef MI_DHAT
+#define MI_DHAT 1
+#endif
+
 // --------------------------------------------------------------------------
 // This file contains the main type definitions for mimalloc:
 // mi_heap_t      : all data for a heap; usually there is just one main default heap.

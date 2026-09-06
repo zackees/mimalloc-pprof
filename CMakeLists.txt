@@ -72,6 +72,7 @@ option(MI_WIN_USE_FLS       "Use Fiber local storage on Windows to detect thread
 option(MI_CHECK_FULL        "Use full internal invariant checking in DEBUG mode (deprecated, use MI_DEBUG_FULL instead)" OFF)
 option(MI_USE_LIBATOMIC     "Explicitly link with -latomic (on older systems) (deprecated and detected automatically)" OFF)
 option(MI_PPROF             "Enable the allocation sampling profiler" ON)
+option(MI_DHAT              "Enable the exact DHAT v2 heap observer (#371: hooks cost nothing when OFF)" ON)
 option(MI_OWNER_GATE        "Take a per-thread owner gate on every allocator call so mi_purge_all can sweep every thread (#366; slower fast path)" OFF)
 
 include(CheckLinkerFlag)    # requires cmake 3.18
@@ -92,7 +93,6 @@ set(mi_sources
     src/libc.c
     src/memory-events.c
     src/dhat.c
-    src/dhat-stack.c
     src/options.c
     src/os.c
     src/page.c
@@ -113,6 +113,11 @@ if(MI_PPROF)
   list(APPEND mi_sources
     src/profile-stack.c
     src/profile-maps.c)
+endif()
+
+if(MI_DHAT)
+  list(APPEND mi_sources
+    src/dhat-stack.c)
 endif()
 
 set(mi_cflags "")
@@ -497,6 +502,16 @@ if(MI_PPROF)
   endif()
 else()
   list(APPEND mi_defines MI_PPROF=0)
+endif()
+
+if(MI_DHAT)
+  message(STATUS "Enable the exact DHAT v2 heap observer (MI_DHAT=ON)")
+  list(APPEND mi_defines MI_DHAT=1)
+else()
+  # #371: with MI_DHAT=OFF the alloc/free hook sites compile away entirely -- no call,
+  # no flag load, no instruction -- and dhat.c keeps only stubs for the public API.
+  message(STATUS "Compile out the DHAT observer (MI_DHAT=OFF)")
+  list(APPEND mi_defines MI_DHAT=0)
 endif()
 
 if(MI_DEBUG_TSAN)
@@ -1234,8 +1249,10 @@ if (MI_BUILD_TESTS)
     # registered so a future reordering regresses loudly in CI instead of silently.
     add_test(NAME test-fork-locks-prof-env COMMAND mimalloc-test-fork-locks)
     set_tests_properties(test-fork-locks-prof-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_PROF=1")
-    add_test(NAME test-fork-locks-dhat-env COMMAND mimalloc-test-fork-locks)
-    set_tests_properties(test-fork-locks-dhat-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_DHAT=1")
+    if(MI_DHAT)
+      add_test(NAME test-fork-locks-dhat-env COMMAND mimalloc-test-fork-locks)
+      set_tests_properties(test-fork-locks-dhat-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_DHAT=1")
+    endif()
     add_test(NAME test-fork-locks-memevt-env COMMAND mimalloc-test-fork-locks)
     set_tests_properties(test-fork-locks-memevt-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
 
@@ -1548,6 +1565,8 @@ if (MI_BUILD_TESTS)
   set_tests_properties(test-memory-events-env-enabled PROPERTIES ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
 
   # Exact DHAT v2 observer (issue #238): intentionally independent of MI_PPROF.
+  # #371: but not of MI_DHAT -- with the observer compiled out the public API is stubs.
+  if(MI_DHAT)
   add_executable(mimalloc-test-dhat test/test-dhat.c)
   target_compile_definitions(mimalloc-test-dhat PRIVATE ${mi_defines})
   target_compile_options(mimalloc-test-dhat PRIVATE ${mi_cflags})
@@ -1558,6 +1577,7 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-dhat PRIVATE mimalloc ${mi_libraries})
   endif()
   add_test(NAME test-dhat COMMAND mimalloc-test-dhat)
+  endif()
 
   # mi_heap_dump_json / mi_heap_get_seq (issue #269, Bun parity P4): backs bun:jsc
   # heapStats({dump:true|"blocks"}).mimallocDump. Independent of MI_PPROF, same as

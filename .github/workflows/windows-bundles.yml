@@ -653,7 +653,18 @@ jobs:
             rc=0
             cargo test --no-run --target x86_64-pc-windows-msvc "$@" \
               --message-format=json > "cargo-$label.json" || rc=$?
-            jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' \
+            # #294: the CRATE NAME travels with each path. The guard below has to know
+            # which crate an unstageable binary belongs to, and a basename cannot say --
+            # the profiler crate's integration tests are named after their source files
+            # (t3_stats, t12_proto, ...), so a `*mimalloc_pprof*` basename match would
+            # never fire for the very crate it exists to protect. The raw package id is
+            # no good either: it embeds the checkout path, and this repository is itself
+            # called mimalloc-pprof, so every id on a GitHub runner contains that string.
+            # Cargo writes `path+file:///...#name@version`, collapsing to
+            # `path+file:///...#version` when the crate name equals its directory, so take
+            # the name from between `#` and `@` when it is there and from the last path
+            # segment when it is not.
+            jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | [((.package_id | if test("#[^@/]+@") then (split("#")[1] | split("@")[0]) else (split("#")[0] | split("/") | last) end)), .executable] | @tsv' \
               "cargo-$label.json" > "bins-$label.txt"
             if [ "$rc" -ne 0 ]; then
               jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' "cargo-$label.json" >&2
@@ -671,20 +682,22 @@ jobs:
           # picking a profile by hash ordering.
           mkdir -p dist/msvc-tests/debug dist/msvc-tests/release
           excluded=""
+          excluded_crates=""
           stage() {
           local label="$1" profile="$2"
           # NOT every workspace test binary can be moved to another machine, and the ones
           # that cannot say so in their own bytes.
           #
           # `env!("CARGO_BIN_EXE_<name>")` is expanded by cargo AT COMPILE TIME into the
-          # absolute path of the companion binary in the builder's target directory. Four
-          # tests here spawn `stress-child` that way (bench-harness's planted_control,
-          # rejections and throughput; dashboard's stress_child), so their binaries carry
-          # a literal `/home/runner/work/.../target/.../<profile>/stress-child.exe`. There
-          # is no env override -- the string is frozen into the image -- and a Linux path
-          # cannot be reconstructed on a Windows runner, so shipping `stress-child.exe`
-          # alongside them would not help either. Cross-built, they can only run on the
-          # machine that built them.
+          # absolute path of the companion binary in the builder's target directory, so a
+          # test using it carries a literal
+          # `/home/runner/work/.../target/.../<profile>/stress-child.exe` and can only run
+          # on the machine that built it. Four tests did that (bench-harness's
+          # planted_control, rejections and throughput; dashboard's stress_child) and were
+          # dropped here; #294 moved them to `stress_harness::sibling_bin`, which resolves
+          # the companion at run time relative to the test executable, so they stage and
+          # run like everything else. The scan stays: it is what makes a future
+          # reintroduction visible instead of silent.
           #
           # So detect them by the thing that makes them unrelocatable -- the builder's own
           # target path appearing inside the executable -- rather than by a hardcoded list
@@ -707,9 +720,10 @@ jobs:
             exit 1
           fi
           rm -f scanner-control.bin
-          while read -r bin; do
+          while IFS="$(printf '\t')" read -r crate bin; do
             if grep -aqF "$target_root/" "$bin" 2>/dev/null; then
               excluded="$excluded $(basename "$bin")"
+              excluded_crates="$excluded_crates $crate"
             else
               cp "$bin" "dist/msvc-tests/$profile/"
             fi
@@ -732,7 +746,10 @@ jobs:
           # The profiler's own crate must NEVER land in that set -- it is the reason this
           # lane exists, and losing it silently is exactly the failure this whole phase is
           # supposed to make impossible.
-          case "$excluded" in *mimalloc_pprof*)
+          # #294: matched on the cargo CRATE NAME, which every artifact line now carries,
+          # rather than on a basename the crate's tests never have. Whole-token match:
+          # a substring test would also fire on a crate merely named after this one.
+          case " $excluded_crates " in *" mimalloc-pprof "*)
             echo "::error::a mimalloc-pprof test binary embeds the builder's absolute path; the MSVC lane would silently stop testing the profiler"
             exit 1;; esac
           # cross.yml's `test (x86_64-pc-windows-msvc)` has `pprof: true`, so run-windows

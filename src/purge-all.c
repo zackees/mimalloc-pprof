@@ -156,6 +156,15 @@ static mi_tld_t* mi_purge_walk_claim(mi_subproc_t* sp, mi_tld_t* my_tld, mi_purg
         mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);                // it owns nothing and never parks -- neither swept nor pending
         continue;
       }
+      // #366: a thread inside `_mi_thread_done` has no live owner to wait for and owns nothing a
+      // purge could return -- its pages are abandoned by the teardown itself and are reached by
+      // phase B afterwards. Neither swept nor reported: reporting it `pending` would make
+      // `complete` unreachable for the rest of the process if that teardown never finishes
+      // (Windows: a joined thread's TLS-callback teardown can outlive the join).
+      if ((mi_atomic_load_relaxed(&tld->gate_flags) & MI_GATE_FLAG_EXITING) != 0) {
+        mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);
+        continue;
+      }
       if ((mi_atomic_load_relaxed(&tld->gate_flags) & MI_GATE_FLAG_ORPHAN) != 0) {
         mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);
         w->orphaned++;
@@ -336,6 +345,40 @@ int mi_purge_all_ex(mi_purge_flags_t flags, size_t wait_ms, mi_purge_all_report_
   // the single exit path
   mi_atomic_store_release(&_mi_purge_admission, (uintptr_t)0);
   return status;
+}
+
+// #366 test observable (test/test-purge-all.cpp declares it, like `mi_idle_work_count`; it is
+// not part of the public header): describe every registered tld of the main
+// subproc that is NOT parked -- what a `mi_purge_all` would report pending. Writes one line per
+// tld into `buf`; returns the count. Reads plain owner-private words (`gate_depth`) without
+// ownership, for diagnostics only: the values are a hint, never a decision.
+#ifdef __cplusplus
+extern "C"   // the native MSVC gate compiles the library as C++; the test references the C name
+#endif
+mi_decl_export size_t mi_purge_debug_unparked(char* buf, size_t buf_size) mi_attr_noexcept {
+  size_t n = 0, used = 0;
+  if (buf != NULL && buf_size > 0) { buf[0] = 0; }
+  mi_subproc_t* const sp = _mi_subproc_main();
+  if (sp == NULL) return 0;
+  const mi_threadid_t me = _mi_thread_id();
+  mi_lock(&sp->tlds_lock) {
+    for (mi_tld_t* tld = sp->tlds; tld != NULL; tld = tld->subproc_next) {
+      const size_t st = mi_atomic_load_acquire(&tld->park_state);
+      if (st == MI_PARK_PARKED) continue;
+      n++;
+      if (buf != NULL && used + 1 < buf_size) {
+        char line[192];
+        _mi_snprintf(line, sizeof(line), "  tld %p: thread %zx%s state %s depth %zu epoch %zu flags %zx sweeper %zx theaps %s seq %zu\n",
+                     (void*)tld, (size_t)tld->thread_id, (tld->thread_id == me ? " (caller)" : ""),
+                     (st == MI_PARK_RUNNING ? "RUNNING" : st == MI_PARK_SWEEPING ? "SWEEPING" : "?"),
+                     tld->gate_depth, mi_atomic_load_relaxed(&tld->purge_epoch), mi_atomic_load_relaxed(&tld->gate_flags),
+                     (size_t)mi_atomic_load_relaxed(&tld->sweeper), (tld->theaps != NULL ? "yes" : "none"), tld->thread_seq);
+        size_t len = 0; while (line[len] != 0) len++;
+        if (used + len < buf_size) { for (size_t i = 0; i < len; i++) buf[used + i] = line[i]; used += len; buf[used] = 0; }
+      }
+    }
+  }
+  return n;
 }
 
 void mi_purge_all(bool force) mi_attr_noexcept {

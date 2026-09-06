@@ -50,6 +50,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 INCLUDE_DIR = REPO_ROOT / "include"
 CRATE_DIR = REPO_ROOT / "rust" / "mimalloc-pprof"
 SYS_RS = CRATE_DIR / "src" / "sys.rs"
+#: #322: the C-side signature probe. Every function `sys.rs` declares must be
+#: redeclared here, so the C compiler compares the assumed prototype against the real one.
+LAYOUT_PROBE = CRATE_DIR / "layout_probe.c"
 LIB_RS = CRATE_DIR / "src" / "lib.rs"
 
 #: Headers whose every `mi_decl_export` is a fork addition: these three files do not
@@ -172,9 +175,27 @@ def option_enumerators(header: str) -> list[str]:
     return names
 
 
+#: `void* mi_malloc(size_t size);` -> `mi_malloc`. Definitions (`... ) {`) are not
+#: prototypes and must not match, or the probe's own table would count as a redeclaration.
+_PROBE_PROTOTYPE_RE = re.compile(r"^[A-Za-z_][\w \t*]*?\b(mi_\w+)\s*\([^;{]*\)\s*;", re.M)
+
+
 def sys_declared_functions(source: str) -> set[str]:
     """Every function `sys.rs` declares in its `unsafe extern "C"` block."""
     return set(_SYS_EXTERN_FN_RE.findall(source))
+
+
+def probe_redeclared_functions(source: str) -> set[str]:
+    """Every function `layout_probe.c` redeclares (#322).
+
+    A prototype there is a whole statement ending in `);` whose declarator names an
+    `mi_*` function; the probe's own exports and its entry table are not `mi_`-prefixed
+    API and never match.
+    """
+    names: set[str] = set()
+    for match in _PROBE_PROTOTYPE_RE.finditer(strip_comments(source)):
+        names.add(match.group(1))
+    return names
 
 
 def sys_option_mirror(source: str) -> list[tuple[str, int]]:
@@ -355,6 +376,18 @@ def check(*, verbose: bool = True) -> int:
                 f"{name} is on SYS_ONLY_WITH_REASON but IS called from lib.rs. Remove the "
                 "allowlist entry.",
             )
+
+    # #322: a declaration in sys.rs whose signature nothing compares against C is exactly
+    # the silent-argument-corruption hazard the probe exists to close, so a binding added
+    # without a matching redeclaration is a gap, not a style question.
+    probe_source = LAYOUT_PROBE.read_text(encoding="utf-8")
+    redeclared = probe_redeclared_functions(probe_source)
+    for name in sorted(declared - redeclared):
+        _fail(
+            problems,
+            f"{name} is declared in sys.rs but not redeclared in layout_probe.c, so no "
+            "compiler ever compares its signature against the real C prototype (#322).",
+        )
 
     if problems:
         print("\ncheck_rust_surface: the Rust binding surface does not cover C.\n", file=sys.stderr)

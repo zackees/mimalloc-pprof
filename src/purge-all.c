@@ -343,6 +343,9 @@ int mi_purge_all_ex(mi_purge_flags_t flags, size_t wait_ms, mi_purge_all_report_
 // subproc that is NOT parked -- what a `mi_purge_all` would report pending. Writes one line per
 // tld into `buf`; returns the count. Reads plain owner-private words (`gate_depth`) without
 // ownership, for diagnostics only: the values are a hint, never a decision.
+#ifdef __cplusplus
+extern "C"   // the native MSVC gate compiles the library as C++; the test references the C name
+#endif
 mi_decl_export size_t mi_purge_debug_unparked(char* buf, size_t buf_size) mi_attr_noexcept {
   size_t n = 0, used = 0;
   if (buf != NULL && buf_size > 0) { buf[0] = 0; }

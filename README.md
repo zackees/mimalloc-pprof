@@ -180,9 +180,9 @@ image and the table below are rendered from.
 |---|:--|:--|:--|:--|
 |  | this fork, 0.9.x | v3 dev3 @ 6def7be9 | oven-sh @ b20b60d9 | 5.3.1 @ 81034ce1 |
 | **Memory return** | | | | |
-| Process-wide eager purge, from any thread | ⚠️ gated 72 %; default parked — [#366](https://github.com/zackees/mimalloc-pprof/issues/366) | ❌ mi_collect is caller-only | ❌ mi_collect is caller-only | ✅ MALLCTL_ARENAS_ALL, 74 % |
+| Process-wide eager purge, from any thread | ✅ gated 72 %, default parked | ❌ mi_collect is caller-only | ❌ mi_collect is caller-only | ✅ MALLCTL_ARENAS_ALL, 74 % |
 | Purge the calling thread's own memory | ✅ mi_collect, idle hook | ✅ mi_collect | ✅ mi_collect, idle hook | ✅ tcache.flush + arena.i.purge |
-| Sweep another thread's heap for it | ⚠️ parked; all if gated — [#366](https://github.com/zackees/mimalloc-pprof/issues/366) | ❌ no scavenger at all | ⚠️ parked threads only | ⚠️ arena purge, not their tcache |
+| Sweep another thread's heap for it | ✅ all gated; parked default | ❌ no scavenger at all | ⚠️ parked threads only | ⚠️ arena purge, not their tcache |
 | Sub-page return inside a still-used page | ✅ hole purging, on by default | ❌ whole pages only | ✅ hole purging, on by default | ❌ extent-granular purge |
 | Background purge thread | ✅ on by default | ❌ purge waits for a malloc | ✅ on by default | ⚠️ off by default |
 | Time-delayed / decaying purge | ✅ purge_delay 100 ms | ✅ purge_delay 1000 ms | ✅ purge_delay 100 ms | ✅ dirty_decay_ms 10 s |

@@ -59,6 +59,27 @@ LEGACY_ALLOCATOR_IDS = ("tcmalloc", "jemalloc", "upstream-mimalloc", "mimalloc-p
 # it declares, not against the current one. This mirrors
 # SCALING_THREAD_POINT_LINEAGES below.
 ALLOCATOR_ID_LINEAGES = (LEGACY_ALLOCATOR_IDS, ALLOCATOR_IDS)
+# #375: the ONLY place an allocator's reader-facing name is decided. The ids above are
+# frozen wire identifiers -- they key every schema, the lockfile pin and every published
+# row -- so charts and prose look a name up here instead of printing the id. "upstream" is
+# a statement about *this repo's* git topology and means nothing to a reader who arrives at
+# a chart from a search result; the series is microsoft/mimalloc. TCMalloc and jemalloc are
+# each spelled the way their own project spells them.
+ALLOCATOR_LABELS = {
+    "tcmalloc": "TCMalloc",
+    "jemalloc": "jemalloc",
+    "upstream-mimalloc": "Microsoft mimalloc",
+    "bun-mimalloc": "Bun mimalloc",
+    "mimalloc-pprof": "mimalloc-pprof",
+}
+
+
+def allocator_label(allocator_id: str) -> str:
+    """Reader-facing name for an allocator id (the id itself if it has no label)."""
+
+    return ALLOCATOR_LABELS.get(allocator_id, allocator_id)
+
+
 VALIDATION_CHECKS = (
     "schema-and-versions",
     "run-identity",
@@ -2725,9 +2746,10 @@ def draw_allocator_legend(canvas: Canvas, x: int, y: int, swatch: int = 18, scal
     """Header legend with one fixed swatch per allocator, in allocator order."""
 
     for allocator in ALLOCATOR_IDS:
+        label = allocator_label(allocator)
         canvas.rectangle(x, y, swatch, swatch, COLORS[ALLOCATOR_IDS.index(allocator)])
-        canvas.text(x + swatch + 8, y, allocator, (232, 238, 247), scale)
-        x += swatch + 8 + text_width(allocator, scale) + 30
+        canvas.text(x + swatch + 8, y, label, (232, 238, 247), scale)
+        x += swatch + 8 + text_width(label, scale) + 30
 
 
 def memory_bar_cells(
@@ -2856,7 +2878,7 @@ def memory_png(memory: Mapping[str, object]) -> bytes:
         MEMORY_PANEL_WIDTH,
         MEMORY_PANEL_HEIGHT,
         canvas.pixels,
-        "Sampled peak RSS relative to upstream-mimalloc; 1.0 = upstream; lower is better",
+        "Sampled peak RSS relative to Microsoft mimalloc; 1.0 = Microsoft mimalloc; lower is better",
     )
 
 
@@ -3376,7 +3398,7 @@ def draw_rss_timeline(canvas: Canvas, cells: Sequence[Mapping[str, object]]) -> 
     for row, allocator in enumerate(ALLOCATOR_IDS):
         swatch_y = legend_y + 22 + row * 20
         canvas.rectangle(legend_x, swatch_y, 14, 14, COLORS[ALLOCATOR_IDS.index(allocator)])
-        canvas.text(legend_x + 20, swatch_y + 2, allocator, label_color, 1)
+        canvas.text(legend_x + 20, swatch_y + 2, allocator_label(allocator), label_color, 1)
     notes = [
         "line: external RSS over time,",
         "5 ms smaps_rollup sampling,",
@@ -4006,10 +4028,9 @@ def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
         parts.append(
             f'<rect x="{legend_x:.1f}" y="{height - 54}" width="22" height="4" rx="2" fill="{color}"/>'
         )
-        parts.append(
-            svg_text(legend_x + 30, height - 47, allocator, fill=SCALING_INK["axis"], size=12)
-        )
-        legend_x += 34 + 7.4 * len(allocator)
+        label = allocator_label(allocator)
+        parts.append(svg_text(legend_x + 30, height - 47, label, fill=SCALING_INK["axis"], size=12))
+        legend_x += 34 + 7.4 * len(label)
     parts.append(
         svg_text(
             SCALING_LEFT - 12,
@@ -4178,7 +4199,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             if memory_run["run_origin"] == "github-actions"
             else "https://github.com/zackees/mimalloc-pprof/actions"
         )
-        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Sampled peak RSS normalized to upstream-mimalloc; 1.0 equals upstream; lower is better"><img src="benchmark-pareto.png" alt="Speed-memory Pareto scatter: fragmentation proxy versus median throughput; upper-left is better"><img src="benchmark-rss-timeline.png" alt="Linux process RSS over time with workload-drained marker and post-drain return-to-OS points; lower is better"><img src="benchmark-fragmentation.png" alt="Fragmentation proxy ratio bars with a 1.0 reference line; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. The bar chart normalizes sampled peak RSS to <code>upstream-mimalloc</code> = 1.0 (matching the throughput panel), with absolute MiB in the table below. The Pareto scatter pairs each allocator's fragmentation proxy with its median throughput on the matching scenario/thread cell; upper-left is better. The timeline shows RSS growth, the workload-drained marker, and the 100 ms / 1 s / 5 s post-drain points so return-to-OS behavior is visible. The fragmentation proxy is reported only where the live set is the measured quantity; <code>thread-churn</code> reads n/a by design, and any cell whose peak RSS never rose above its baseline records no ratio rather than a fabricated one. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th><th>vs upstream</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
+        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Sampled peak RSS normalized to Microsoft mimalloc; 1.0 equals Microsoft mimalloc; lower is better"><img src="benchmark-pareto.png" alt="Speed-memory Pareto scatter: fragmentation proxy versus median throughput; upper-left is better"><img src="benchmark-rss-timeline.png" alt="Linux process RSS over time with workload-drained marker and post-drain return-to-OS points; lower is better"><img src="benchmark-fragmentation.png" alt="Fragmentation proxy ratio bars with a 1.0 reference line; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. The bar chart normalizes sampled peak RSS to Microsoft mimalloc (<code>upstream-mimalloc</code>) = 1.0 (matching the throughput panel), with absolute MiB in the table below. The Pareto scatter pairs each allocator's fragmentation proxy with its median throughput on the matching scenario/thread cell; upper-left is better. The timeline shows RSS growth, the workload-drained marker, and the 100 ms / 1 s / 5 s post-drain points so return-to-OS behavior is visible. The fragmentation proxy is reported only where the live set is the measured quantity; <code>thread-churn</code> reads n/a by design, and any cell whose peak RSS never rose above its baseline records no ratio rather than a fabricated one. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a>; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th><th>vs Microsoft mimalloc</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
     latency_html = ""
     if "latency" in latest:
         latency = validate_latency_report(latest["latency"], "latest.latency")
@@ -4218,7 +4239,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             )
             for value in list_value(latency["paired_summaries"], "latency paired summaries")
         )
-        latency_html = f"""<section><h2 id="latency">Transaction latency</h2><img src="benchmark-latency.png" alt="End-to-end transaction latency p99 for all five allocators; lower is better"><p><strong>Lower is better; informational hosted-runner measurements.</strong> These are transaction latencies, never allocator-call latencies and never throughput reciprocals. Local: {escaped(definitions["local"])}. Cross-thread: {escaped(definitions["cross-thread"])}. Large object: {escaped(definitions["large-object"])}.</p><p>Each allocator/cell has at least 10,000 raw samples across {escaped(block_count)} paired blocks. Controls are reported without subtraction. Runner: {escaped(latency_runner["runner_class"])}; affinity: {escaped(scheduling["affinity_policy"])}; upstream reference: <code>upstream-mimalloc</code>. Latency run <a href="{latency_actions}">{escaped(latency_run["run_id"])}/{escaped(latency_run["run_attempt"])}</a>; metric key <code>{escaped(latency["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>p50 ns</th><th>p95 ns</th><th>p99 ns</th><th>Overhead</th><th>Samples</th></tr></thead><tbody>{latency_rows}</tbody></table></section>"""
+        latency_html = f"""<section><h2 id="latency">Transaction latency</h2><img src="benchmark-latency.png" alt="End-to-end transaction latency p99 for all five allocators; lower is better"><p><strong>Lower is better; informational hosted-runner measurements.</strong> These are transaction latencies, never allocator-call latencies and never throughput reciprocals. Local: {escaped(definitions["local"])}. Cross-thread: {escaped(definitions["cross-thread"])}. Large object: {escaped(definitions["large-object"])}.</p><p>Each allocator/cell has at least 10,000 raw samples across {escaped(block_count)} paired blocks. Controls are reported without subtraction. Runner: {escaped(latency_runner["runner_class"])}; affinity: {escaped(scheduling["affinity_policy"])}; reference allocator: Microsoft mimalloc (<code>upstream-mimalloc</code>). Latency run <a href="{latency_actions}">{escaped(latency_run["run_id"])}/{escaped(latency_run["run_attempt"])}</a>; metric key <code>{escaped(latency["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>p50 ns</th><th>p95 ns</th><th>p99 ns</th><th>Overhead</th><th>Samples</th></tr></thead><tbody>{latency_rows}</tbody></table></section>"""
     scaling_html = ""
     if "scaling" in latest:
         scaling = validate_scaling_report(latest["scaling"], "latest.scaling")

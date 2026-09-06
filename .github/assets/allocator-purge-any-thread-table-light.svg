@@ -32,7 +32,7 @@
 <text x="740" y="204" font-size="12" text-anchor="end" fill="#1f2328">267.0 MB</text>
 <text x="880" y="204" font-size="12" text-anchor="end" fill="#1f2328">230.4 MB</text>
 <text x="976" y="204" font-size="12" text-anchor="end" fill="#1f2328">14%</text>
-<text x="24" y="230" font-size="12" text-anchor="start" fill="#1f2328">upstream mimalloc</text>
+<text x="24" y="230" font-size="12" text-anchor="start" fill="#1f2328">Microsoft mimalloc</text>
 <text x="290" y="230" font-size="12" text-anchor="start" fill="#1f2328">mi_collect(true) every 100 ms</text>
 <text x="740" y="230" font-size="12" text-anchor="end" fill="#1f2328">264.9 MB</text>
 <text x="880" y="230" font-size="12" text-anchor="end" fill="#1f2328">228.9 MB</text>

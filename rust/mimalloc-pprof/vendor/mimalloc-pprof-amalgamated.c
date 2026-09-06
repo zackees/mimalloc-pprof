@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 76d45bd7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit e07a7d5a of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -17350,8 +17350,9 @@ void _mi_process_fork_child(void) {
       mi_atomic_store_relaxed(&t->park_reclaim, (size_t)0);
       mi_atomic_store_relaxed(&t->park_swept, (size_t)0);
       mi_atomic_store_relaxed(&t->sweeper, (uintptr_t)0);       // #366: the claimant, if any, is gone
+      // #366: no walk is in progress in the child, and EXITING belonged to a thread of the
+      // parent -- in the child that tld is an orphan (marked below), not a thread mid-teardown.
       mi_atomic_store_relaxed(&t->purge_epoch, (size_t)0);
-      // #366: EXITING belonged to a thread of the parent; in the child that tld is an orphan (below)      // #366: no walk is in progress in the child
       size_t gflags = mi_atomic_load_relaxed(&t->gate_flags) & ~(size_t)MI_GATE_FLAG_RECLAIM_IGNORED;
       if (t != survivor_tld) { gflags |= MI_GATE_FLAG_ORPHAN; }
       mi_atomic_store_relaxed(&t->gate_flags, gflags);

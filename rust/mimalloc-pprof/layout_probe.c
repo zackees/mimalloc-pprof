@@ -26,6 +26,112 @@
 #include "mimalloc-pprof-amalgamated.h"
 #include "mimalloc-stats.h"
 
+/* ---------------------------------------------------------------------------------------
+   #322: SIGNATURES, not just layouts.
+
+   The layout table below proves every `#[repr(C)]` mirror in src/sys.rs agrees with the C
+   compiler about sizes and offsets, and ci/check_rust_surface.py proves every fork export
+   exists in sys.rs and is called from lib.rs. Neither looks at a function's SIGNATURE:
+   sys.rs declares each prototype by hand, the crate links against a bare symbol name, and
+   the Rust declaration is simply believed. A parameter added, a `size_t` widened, a `bool`
+   become `int`, two arguments swapped -- nothing here would have noticed, and on most ABIs
+   the result is silent argument corruption. That is exactly the failure class the layout
+   probe was added to eliminate for structs, and this fork re-pins its overlay to newer
+   upstream/dev3 commits, which is the door such a change arrives through.
+
+   So each line below is the signature src/sys.rs assumes, spelled in C, AFTER the real
+   headers are included above. If a real prototype disagrees, this file stops the build
+   with a redeclaration conflict that names the offending function -- rather than passing
+   arguments through a wrong ABI at run time. Nothing calls these; they exist to be
+   compared by the compiler.
+
+   Generated from the `unsafe extern "C"` block in src/sys.rs; keep them in step when that
+   block changes (a declaration removed here is a gap, not a fix). */
+
+void* mi_malloc(size_t size);
+void* mi_zalloc(size_t size);
+void* mi_calloc(size_t count, size_t size);
+void* mi_realloc(void* p, size_t newsize);
+void mi_free(void* p);
+void* mi_malloc_aligned(size_t size, size_t alignment);
+void* mi_zalloc_aligned(size_t size, size_t alignment);
+void* mi_realloc_aligned(void* p, size_t newsize, size_t alignment);
+void* mi_rezalloc(void* p, size_t newsize);
+void* mi_recalloc(void* p, size_t newcount, size_t size);
+void* mi_rezalloc_aligned(void* p, size_t newsize, size_t alignment);
+void* mi_recalloc_aligned(void* p, size_t newcount, size_t size, size_t alignment);
+void* mi_expand(void* p, size_t newsize);
+size_t mi_usable_size(const void* p);
+bool mi_dhat_start(void);
+void mi_dhat_stop(void);
+bool mi_dhat_is_enabled(void);
+bool mi_dhat_stats_get(mi_dhat_stats_t* stats);
+bool mi_dhat_dump(const char* path);
+bool mi_prof_start(size_t sample_rate);
+bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed);
+bool mi_prof_start_ex(const mi_prof_config_t* config);
+void mi_prof_stop(void);
+bool mi_prof_is_enabled(void);
+bool mi_prof_dump(const char* path);
+bool mi_prof_dump_writer(mi_prof_write_fun* write, void* arg);
+bool mi_prof_dump_proto(const char* path);
+bool mi_prof_dump_proto_writer(mi_prof_write_fun* write, void* arg);
+void mi_prof_reset(void);
+void mi_prof_debug_stats(size_t* records, size_t* bytes, size_t* unique_stacks);
+bool mi_prof_stats_get(mi_prof_stats_t* stats);
+bool mi_prof_visit(mi_prof_visit_fun* visitor, void* arg);
+mi_prof_snapshot_t* mi_prof_snapshot_new(void);
+bool mi_prof_snapshot_visit(const mi_prof_snapshot_t* snap, mi_prof_visit_fun* visitor, void* arg);
+void mi_prof_snapshot_free(mi_prof_snapshot_t* snap);
+bool mi_prof_modules_visit(mi_prof_module_visit_fun* visitor, void* arg);
+void* mi_unwrapped_malloc(size_t size, size_t alignment);
+void mi_unwrapped_free(void* p);
+void* mi_unwrapped_realloc(void* p, size_t new_size, size_t alignment);
+char* mi_heap_dump_json(bool include_blocks, bool hash_addresses);
+size_t mi_heap_get_seq(mi_heap_t* heap);
+int mi_heap_snapshot(int fd, unsigned int flags);
+int mi_heap_snapshot_to_file(const char* path, unsigned int flags);
+void mi_on_thread_idle(void);
+bool mi_on_thread_idle_start(void);
+void mi_on_thread_idle_end(void);
+void mi_scavenger_stop(void);
+void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats);
+void mi_purge_holes_report(void);
+int mi_purge_all_ex(mi_purge_flags_t flags, size_t wait_ms, mi_purge_all_report_t* report);
+void mi_purge_all(bool force);
+bool mi_option_is_enabled(mi_option_t option);
+void mi_option_enable(mi_option_t option);
+void mi_option_disable(mi_option_t option);
+void mi_option_set_enabled(mi_option_t option, bool enable);
+void mi_option_set_enabled_default(mi_option_t option, bool enable);
+long mi_option_get(mi_option_t option);
+long mi_option_get_clamp(mi_option_t option, long min, long max);
+size_t mi_option_get_size(mi_option_t option);
+void mi_option_set(mi_option_t option, long value);
+void mi_option_set_default(mi_option_t option, long value);
+void mi_options_print_out(mi_output_fun* out, void* arg);
+bool mi_stats_get(mi_stats_t* stats);
+char* mi_stats_get_json(size_t buf_size, char* buf);
+char* mi_stats_as_json(mi_stats_t* stats, size_t buf_size, char* buf);
+void mi_stats_print_out(mi_output_fun* out, void* arg);
+size_t mi_stats_get_bin_size(size_t bin);
+bool mi_heap_stats_get(mi_heap_t* heap, mi_stats_t* stats);
+char* mi_heap_stats_get_json(mi_heap_t* heap, size_t buf_size, char* buf);
+void mi_heap_stats_print_out(mi_heap_t* heap, mi_output_fun* out, void* arg);
+void mi_heap_stats_merge_to_subproc(mi_heap_t* heap);
+bool mi_subproc_stats_get(mi_subproc_id_t subproc_id, mi_stats_t* stats);
+bool mi_subproc_stats_get_exclusive(mi_subproc_id_t subproc_id, mi_stats_t* stats);
+char* mi_subproc_stats_get_json(mi_subproc_id_t subproc_id, size_t buf_size, char* buf);
+void mi_subproc_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, void* arg);
+void mi_subproc_heap_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, void* arg);
+mi_subproc_id_t mi_subproc_main(void);
+mi_subproc_id_t mi_subproc_current(void);
+bool mi_memory_tracking_set_enabled(bool enabled);
+bool mi_memory_tracking_is_enabled(void);
+bool mi_memory_snapshot(mi_memory_snapshot_t* out);
+bool mi_memory_set_callbacks(const mi_memory_callbacks_t* callbacks);
+bool mi_memory_visit_live_allocations(mi_memory_allocation_visit_fun* visitor, void* arg);
+
 typedef struct mi_rs_layout_entry_s {
   const char* name;
   size_t      value;
@@ -277,6 +383,11 @@ static const mi_rs_layout_entry_t mi_rs_layout_entries[] = {
 
 /* Returns the entry table and writes its length to `*count`. The table is static
    `const` data with static-string names; the caller never frees anything. */
+/* #322: this probe's own export gets the same treatment as the API it checks -- the
+   prototype src/sys.rs assumes, so the definition below is compared against it. It sits
+   here rather than in the block above because it needs the entry typedef. */
+const mi_rs_layout_entry_t* mi_rs_layout_table(size_t* count);
+
 mi_decl_export const mi_rs_layout_entry_t* mi_rs_layout_table(size_t* count) mi_attr_noexcept {
   if (count != NULL) { *count = sizeof(mi_rs_layout_entries) / sizeof(mi_rs_layout_entries[0]); }
   return mi_rs_layout_entries;

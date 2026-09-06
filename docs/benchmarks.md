@@ -2,7 +2,7 @@
 
 *Part of the [mimalloc-pprof](../README.md) documentation.*
 
-mimalloc-pprof is continuously benchmarked against **upstream mimalloc**,
+mimalloc-pprof is continuously benchmarked against **Microsoft mimalloc**,
 **Bun's mimalloc fork** (`oven-sh/mimalloc`), **TCMalloc**, and **jemalloc** on a
 dedicated Linux x86-64 runner.  Every result
 is **GitHub-hosted and informational** — no self-hosted hardware, no hand-picked
@@ -16,7 +16,7 @@ runs, no unpublished baselines.
 
 ## Methodology summary
 
-- **5 allocators** — mimalloc-pprof, upstream mimalloc (pinned `dev3@bcee5a88`,
+- **5 allocators** — mimalloc-pprof, Microsoft mimalloc (pinned `dev3@bcee5a88`,
   v3.4.3), Bun's mimalloc fork, TCMalloc, and jemalloc — pinned to immutable
   commits with SHA-256-verified source archives.
 - **Paired balanced blocks** — every block runs all five allocators in
@@ -24,7 +24,7 @@ runs, no unpublished baselines.
   cell.
 - **Type-7 quantile bootstrap** — 10,000 resamples, splitmix64-rejection PRNG,
   percentile-block confidence intervals at 95%.  Paired effects are expressed
-  relative to upstream mimalloc.
+  relative to Microsoft mimalloc.
 - **No profiling during measurement** — `MIMALLOC_PROF=0` and
   `MIMALLOC_MEMORY_EVENTS=0` are set on every child process; the allocator runs
   in its natural configuration.
@@ -57,11 +57,12 @@ the fork itself is the workflow checkout.  The lockfile is
 [`rust/benchmark-suite/allocators/allocator-lock.json`](../rust/benchmark-suite/allocators/allocator-lock.json).
 
 | Row | Legend label | Pin | Build |
+<!-- #375: the Legend label column is ci/benchmark_report.py's ALLOCATOR_LABELS; a test asserts the charts render these. -->
 |---|---|---|---|
-| `tcmalloc` | tcmalloc | `google/tcmalloc@c316de3e` | bazel `-c opt` |
+| `tcmalloc` | TCMalloc | `google/tcmalloc@c316de3e` | bazel `-c opt` |
 | `jemalloc` | jemalloc | `jemalloc/jemalloc` 5.3.1 `@81034ce1` | autoconf/make, static only |
-| `upstream-mimalloc` | upstream-mimalloc | `microsoft/mimalloc` `dev3@bcee5a88` | cmake-ninja, `MI_PPROF=OFF` |
-| `bun-mimalloc` | Bun mimalloc (oven-sh @ `b20b60d9`) | `oven-sh/mimalloc` `bun-dev3-v2@b20b60d9` | cmake-ninja, no `MI_PPROF` option |
+| `upstream-mimalloc` | Microsoft mimalloc | `microsoft/mimalloc` `dev3@bcee5a88` | cmake-ninja, `MI_PPROF=OFF` |
+| `bun-mimalloc` | Bun mimalloc | `oven-sh/mimalloc` `bun-dev3-v2@b20b60d9` | cmake-ninja, no `MI_PPROF` option |
 | `mimalloc-pprof` | mimalloc-pprof | workflow checkout | cmake-ninja, `MI_PPROF=ON` |
 
 The Bun row's pin moves in the same PR as each future Bun-parity ingest, so the
@@ -77,7 +78,7 @@ Full protocol details, JSON schemas, and reproduction commands are in
 
 Per-scenario throughput and the compatible history for the current comparison
 key are rendered live on the dashboard — with full per-scenario tables and
-paired effects expressed relative to upstream mimalloc:
+paired effects expressed relative to Microsoft mimalloc:
 
 - **[Per-scenario throughput →](https://zackees.github.io/mimalloc-pprof/#throughput)**
 - **[Comparison history →](https://zackees.github.io/mimalloc-pprof/#history)**
@@ -140,7 +141,7 @@ the rest freed, then a 10 s idle window) run once per allocator.  Its rules:
   one.
 - **"Idle" is realised per allocator, and named in the chart and table.**  The
   mimalloc children call `mi_on_thread_idle()` every 100 ms — Bun's fork carries the
-  same API, and upstream mimalloc at its pin has none, which the script detects by
+  same API, and Microsoft mimalloc at its pin has none, which the script detects by
   reading the extracted header rather than assuming.  jemalloc is given nothing
   beyond a normal idle process, plus a second series that calls
   `mallctl("arena.<all>.purge")` on the same tick, so the chart states what jemalloc
@@ -208,7 +209,7 @@ and thread scaling ([#203](https://github.com/zackees/mimalloc-pprof/issues/203)
 have landed; their panels populate on each metric's next scheduled run. The
 memory section renders four views over the same sealed envelope
 ([#211](https://github.com/zackees/mimalloc-pprof/issues/211)): sampled-peak RSS
-bars normalized to upstream mimalloc (1.0 = upstream, matching the throughput
+bars normalized to Microsoft mimalloc (1.0 = Microsoft mimalloc, matching the throughput
 panel), a fragmentation-proxy panel with its own 1.0 reference line, an
 RSS-over-time timeline with the workload-drained marker and the 100 ms / 1 s /
 5 s return-to-OS points annotated, and a speed–memory Pareto scatter (upper-left

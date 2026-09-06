@@ -295,7 +295,7 @@
       "idle_mechanism": "mi_collect(true) every 100 ms",
       "idle_seconds": 10,
       "idle_start_rss_mb": 264.859375,
-      "label": "upstream mimalloc",
+      "label": "Microsoft mimalloc",
       "note": "",
       "peak_rss_mb": 264.859375,
       "percent_returned": 13.59211845908796,

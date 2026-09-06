@@ -15,7 +15,7 @@ Series (five charted):
 
     mimalloc-pprof              this tree, default config (scavenger + hole purging on)
     Bun mimalloc                oven-sh/mimalloc at the lockfile pin, default config
-    upstream mimalloc           microsoft/mimalloc at the lockfile pin, default config
+    Microsoft mimalloc          microsoft/mimalloc at the lockfile pin, default config
     jemalloc                    default config -- nothing is called during idle
     jemalloc + explicit purge   the same jemalloc, with an explicit
                                 `mallctl("arena.<all>.purge")` every 100 ms
@@ -69,7 +69,7 @@ samples RSS. One row per (allocator, purge call):
     mimalloc-pprof                    mi_collect(true)            caller-only, by design
     mimalloc-pprof                    mi_purge_all(true)          default build: arenas + parked
     mimalloc-pprof, MI_OWNER_GATE=ON  mi_purge_all(true)          gated build: every thread
-    Bun mimalloc / upstream mimalloc  mi_collect(true)
+    Bun mimalloc / Microsoft mimalloc  mi_collect(true)
     jemalloc                          mallctl("arena.<all>.purge")
     glibc                             malloc_trim(0)              no allocator linked at all
 
@@ -675,7 +675,7 @@ SERIES: tuple[SeriesSpec, ...] = (
     SeriesSpec(
         key="upstream-mimalloc",
         allocator_id="upstream-mimalloc",
-        label="upstream mimalloc",
+        label="Microsoft mimalloc",
         idle=IDLE_ON_THREAD_IDLE,
         charted=True,
         slot=3,
@@ -693,7 +693,7 @@ SERIES: tuple[SeriesSpec, ...] = (
     SeriesSpec(
         key="upstream-mimalloc-collect",
         allocator_id="upstream-mimalloc",
-        label="upstream mimalloc, mi_collect(false)",
+        label="Microsoft mimalloc, mi_collect(false)",
         idle=IDLE_MI_COLLECT,
         charted=False,
         note="is upstream's flat line only a missing API, or a missing mechanism?",
@@ -701,7 +701,7 @@ SERIES: tuple[SeriesSpec, ...] = (
     SeriesSpec(
         key="upstream-mimalloc-collect-force",
         allocator_id="upstream-mimalloc",
-        label="upstream mimalloc, mi_collect(true)",
+        label="Microsoft mimalloc, mi_collect(true)",
         idle=IDLE_MI_COLLECT_FORCE,
         charted=False,
         note="did upstream only lose to its own 1000 ms purge_delay, rather than to page "
@@ -808,7 +808,7 @@ BUSY_SERIES: tuple[BusySeriesSpec, ...] = (
     BusySeriesSpec(
         key="upstream-mimalloc-busy-collect",
         allocator_id="upstream-mimalloc",
-        label="upstream mimalloc",
+        label="Microsoft mimalloc",
         purge=PURGE_MI_COLLECT_FORCE,
     ),
     BusySeriesSpec(

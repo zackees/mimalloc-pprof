@@ -572,7 +572,7 @@ class BenchmarkReportTests(unittest.TestCase):
             self.assertIn('<h2 id="memory">Linux process memory</h2>', page)
             self.assertNotIn("memory: pending", page)
             self.assertIn(
-                b"Sampled peak RSS relative to upstream-mimalloc",
+                b"Sampled peak RSS relative to Microsoft mimalloc",
                 (site / "benchmark-memory.png").read_bytes(),
             )
             self.assertIn(
@@ -857,7 +857,9 @@ class BenchmarkReportTests(unittest.TestCase):
             self.assertGreater(throughput, -1)
             self.assertLess(throughput, memory)
             self.assertLess(memory, paired, "memory must pair with throughput, not history")
-            self.assertIn("vs upstream", page)
+            # #375: the reader-facing column names the project, not our git topology.
+            self.assertIn("vs Microsoft mimalloc", page)
+            self.assertNotIn("vs upstream<", page)
             self.assertIn("1.00x", page, "the upstream allocator row must read 1.00x")
 
     def test_rss_timeline_sawtooth_rises_falls_and_decay_markers_at_offsets(self) -> None:
@@ -1594,8 +1596,9 @@ class BenchmarkReportTests(unittest.TestCase):
                 self.assertIn(report.SCALING_INK["background"], panel)
                 self.assertIn(report.SCALING_PANEL_TITLES[pattern], panel)
                 self.assertIn(report.SCALING_RIGOR_LABEL, panel)
+                # #375: the legend carries the reader-facing label, not the wire id.
                 for allocator in report.ALLOCATOR_IDS:
-                    self.assertIn(allocator, panel)
+                    self.assertIn(report.allocator_label(allocator), panel)
                 self.assertIn("oversubscribed", panel)
                 # The RSS side-car must render its own side-by-side panel.
                 self.assertIn("peak RSS by worker count", panel)
@@ -1707,6 +1710,41 @@ class BenchmarkReportTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(report.ReportError, "pending_metrics"):
             report.validate_latest(still_pending, "still pending")
+
+    def test_chart_legends_use_display_labels_not_allocator_ids(self) -> None:
+        """#375: `upstream-mimalloc` is a statement about this repo's git topology. A
+        reader arriving at the chart from a search result needs the project's name, so
+        every human-facing rendering goes through ALLOCATOR_LABELS while the ids stay
+        frozen wire identifiers."""
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        self.assertIn("Microsoft mimalloc", panel)
+        self.assertIn("Bun mimalloc", panel)
+        self.assertNotIn("upstream-mimalloc", panel)
+        self.assertNotIn("bun-mimalloc", panel)
+
+    def test_every_allocator_id_has_a_display_label(self) -> None:
+        for allocator in report.ALLOCATOR_IDS + report.LEGACY_ALLOCATOR_IDS:
+            self.assertIn(allocator, report.ALLOCATOR_LABELS)
+            self.assertTrue(report.allocator_label(allocator))
+
+    def test_scaling_legend_row_fits_the_canvas(self) -> None:
+        """Wider labels must not push the legend past the panel edge."""
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        svg_width = re.search(r'<svg[^>]*width="(\d+)"', panel)
+        assert svg_width is not None
+        width = int(svg_width.group(1))
+        legend_end = (
+            report.SCALING_LEFT
+            - 12
+            + sum(34 + 7.4 * len(report.allocator_label(a)) for a in report.ALLOCATOR_IDS)
+        )
+        self.assertLess(legend_end, width)
 
     def test_scaling_rss_panel_places_known_points_at_expected_coordinates(self) -> None:
         latest = self.with_complete_scaling(self.load_latest())

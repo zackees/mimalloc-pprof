@@ -40,7 +40,7 @@
 <line x1="798.00" y1="379.59" x2="816.00" y2="379.59" stroke="#d95926" stroke-width="2" stroke-dasharray="5,3"/>
 <text x="823.00" y="383.59" font-size="12" fill="#e6edf3">jemalloc + explicit purge</text>
 <line x1="798.00" y1="193.89" x2="816.00" y2="193.89" stroke="#c98500" stroke-width="2"/>
-<text x="823.00" y="197.89" font-size="12" fill="#e6edf3">upstream mimalloc</text>
+<text x="823.00" y="197.89" font-size="12" fill="#e6edf3">Microsoft mimalloc</text>
 <line x1="798.00" y1="171.68" x2="816.00" y2="171.68" stroke="#d95926" stroke-width="2"/>
 <text x="823.00" y="175.68" font-size="12" fill="#e6edf3">jemalloc</text>
 </g></svg>

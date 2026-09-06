@@ -313,12 +313,13 @@ def run_debug3_extra(ctx: RunCtx) -> bool:
     this local config additionally runs a small ctest subset.
 
     Only `test-fork-locks*` and `test-api*` run here (ctest -R 'lock|api'), not the full
-    suite `debug-full` covers -- and notably not #167's `test-lock-reentrancy` /
+    suite `debug-full` covers -- plus, since #314, #167's `test-lock-reentrancy` /
     `-uncleared-owner` / `-nonowner-release` / `-destroy-owned` positive controls, which
-    are separately registered under `if(MI_DEBUG_FULL)` in CMakeLists.txt (the same
-    option-vs-effective-value gap this issue is about, but for *test* registration rather
-    than the *source* compiled -- there's no CMake-side way to see a MI_DEBUG=N smuggled
-    into CMAKE_C_FLAGS at the point those tests get registered, so left out of #312's fix).
+    the `lock` half of that filter already matched by name but which CMakeLists.txt used
+    to register under the MI_DEBUG_FULL *option* rather than `mi_need_diagnostic_c` (the
+    effective MI_DEBUG > 2 that #313 computes), so this route compiled src/diagnostic.c
+    and then ran none of its controls. Their registration is asserted below: a filter that
+    silently matches nothing is how that gap stayed invisible in the first place.
     """
     build = ctx.dir / "build"
     rc, configure_out = cmake_configure(
@@ -334,6 +335,30 @@ def run_debug3_extra(ctx: RunCtx) -> bool:
         log_write(ctx.log, "\n[verify_local] FAIL: MI_DEBUG=3 did not reach mi_defines\n")
         return False
     if cmake_build(ctx, build, config="Debug"):
+        return False
+    # #314: the four #167 controls must be REGISTERED on this route, not just matched by a
+    # regex that would happily match nothing.
+    rc, listed = run_logged(
+        ["ctest", "--test-dir", str(build), "-C", "Debug", "-N"], cwd=ROOT, log=ctx.log
+    )
+    if rc:
+        return False
+    missing = [
+        name
+        for name in (
+            "test-lock-reentrancy",
+            "test-lock-uncleared-owner",
+            "test-lock-nonowner-release",
+            "test-lock-destroy-owned",
+        )
+        if name not in listed
+    ]
+    if missing:
+        log_write(
+            ctx.log,
+            f"\n[verify_local] FAIL: #167 lock controls not registered under "
+            f"MI_EXTRA_CPPDEFS=MI_DEBUG=3: {', '.join(missing)}\n",
+        )
         return False
     return ctest_run(ctx, build, config="Debug", filter_regex="lock|api") == 0
 

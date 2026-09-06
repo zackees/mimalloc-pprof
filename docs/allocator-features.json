@@ -9,7 +9,7 @@
     },
     {
       "key": "upstream",
-      "label": "upstream mimalloc",
+      "label": "Microsoft MiMalloc-V3",
       "version": "v3 dev3 @ 6def7be9"
     },
     {
@@ -31,9 +31,9 @@
           "feature": "Process-wide eager purge, from any thread",
           "cells": {
             "mimalloc-pprof": {
-              "status": "partial",
-              "note": "gated 72 %; default parked — #366",
-              "source": "https://github.com/zackees/mimalloc-pprof/issues/366"
+              "status": "yes",
+              "note": "gated 72 %, default parked",
+              "source": "src/purge-all.c, include/mimalloc/owner-gate.h; https://github.com/zackees/mimalloc-pprof/issues/366 (measured: 4 busy threads, purge from another thread, 72 % gated / 12 % default)"
             },
             "upstream": {
               "status": "no",
@@ -81,9 +81,9 @@
           "feature": "Sweep another thread's heap for it",
           "cells": {
             "mimalloc-pprof": {
-              "status": "partial",
-              "note": "parked; all if gated — #366",
-              "source": "https://github.com/zackees/mimalloc-pprof/issues/366"
+              "status": "yes",
+              "note": "all gated; parked default",
+              "source": "src/purge-all.c; https://github.com/zackees/mimalloc-pprof/issues/366"
             },
             "upstream": {
               "status": "no",

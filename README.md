@@ -162,7 +162,7 @@ re-verified under this tree's stress suite. → [Bun features](#bun-features)
 ### Feature comparison
 
 Everything the four allocators in the
-[memory-return chart](#memory-returned-after-idle) do, side by side: this fork, upstream mimalloc v3, [Bun's fork](https://github.com/oven-sh/mimalloc),
+[memory-return chart](#memory-returned-after-idle) do, side by side: this fork, Microsoft MiMalloc-V3 (upstream `dev3`), [Bun's fork](https://github.com/oven-sh/mimalloc),
 and [jemalloc](https://jemalloc.net/). Every cell is sourced — a `path:line` in this
 tree, a path in the pinned upstream commit, or an official doc anchor — in
 [`docs/allocator-features.json`](docs/allocator-features.json), which is what both the
@@ -173,16 +173,16 @@ image and the table below are rendered from.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-features-dark.svg" />
   <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-features-light.svg" />
-  <img alt="Feature comparison of mimalloc-pprof, upstream mimalloc v3, Bun's mimalloc and jemalloc across memory return, profiling, robustness, platform support and allocator design" src=".github/assets/allocator-features-light.svg" width="100%" />
+  <img alt="Feature comparison of mimalloc-pprof, Microsoft MiMalloc-V3, Bun's mimalloc and jemalloc across memory return, profiling, robustness, platform support and allocator design" src=".github/assets/allocator-features-light.svg" width="100%" />
 </picture>
 
-| Feature | **mimalloc-pprof** | upstream mimalloc | Bun mimalloc | jemalloc |
+| Feature | **mimalloc-pprof** | Microsoft MiMalloc-V3 | Bun mimalloc | jemalloc |
 |---|:--|:--|:--|:--|
 |  | this fork, 0.9.x | v3 dev3 @ 6def7be9 | oven-sh @ b20b60d9 | 5.3.1 @ 81034ce1 |
 | **Memory return** | | | | |
-| Process-wide eager purge, from any thread | ⚠️ gated 72 %; default parked — [#366](https://github.com/zackees/mimalloc-pprof/issues/366) | ❌ mi_collect is caller-only | ❌ mi_collect is caller-only | ✅ MALLCTL_ARENAS_ALL, 74 % |
+| Process-wide eager purge, from any thread | ✅ gated 72 %, default parked | ❌ mi_collect is caller-only | ❌ mi_collect is caller-only | ✅ MALLCTL_ARENAS_ALL, 74 % |
 | Purge the calling thread's own memory | ✅ mi_collect, idle hook | ✅ mi_collect | ✅ mi_collect, idle hook | ✅ tcache.flush + arena.i.purge |
-| Sweep another thread's heap for it | ⚠️ parked; all if gated — [#366](https://github.com/zackees/mimalloc-pprof/issues/366) | ❌ no scavenger at all | ⚠️ parked threads only | ⚠️ arena purge, not their tcache |
+| Sweep another thread's heap for it | ✅ all gated; parked default | ❌ no scavenger at all | ⚠️ parked threads only | ⚠️ arena purge, not their tcache |
 | Sub-page return inside a still-used page | ✅ hole purging, on by default | ❌ whole pages only | ✅ hole purging, on by default | ❌ extent-granular purge |
 | Background purge thread | ✅ on by default | ❌ purge waits for a malloc | ✅ on by default | ⚠️ off by default |
 | Time-delayed / decaying purge | ✅ purge_delay 100 ms | ✅ purge_delay 1000 ms | ✅ purge_delay 100 ms | ✅ dirty_decay_ms 10 s |

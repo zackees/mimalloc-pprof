@@ -278,7 +278,7 @@ def render_readme_region(doc: FeatureDoc) -> str:
     """Everything between the markers: the highlighted image, then the Markdown table
     (searchable, screen-readable, diffable), then the legend."""
     alt = (
-        "Feature comparison of mimalloc-pprof, upstream mimalloc v3, Bun's mimalloc and "
+        "Feature comparison of mimalloc-pprof, Microsoft MiMalloc-V3, Bun's mimalloc and "
         "jemalloc across memory return, profiling, robustness, platform support and "
         "allocator design"
     )

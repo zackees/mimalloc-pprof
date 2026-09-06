@@ -864,6 +864,7 @@ struct mi_tld_s {
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept
 #define MI_GATE_FLAG_RECLAIM_IGNORED (2)   // this claimed sweep ignores `park_reclaim` (MI_PURGE_FORCE)
+#define MI_GATE_FLAG_EXITING         (4)   // the owner is inside `_mi_thread_done`: no live owner, never waited for
 
 
 /* ----------------------------------------------------------------------------

@@ -105,6 +105,16 @@ Each iteration re-walks the registry; threads swept last time are cheap to sweep
 `wait_ms`. Threads created *during* a walk are excluded from that walk (registry
 cutoff), so thread churn cannot extend a call; the next iteration sees them.
 
+### A thread that is exiting
+
+From the moment a thread enters its teardown (`_mi_thread_done`) until its per-thread data is
+unregistered, it has no live owner: `mi_purge_all` never waits for it and never reports it,
+in either build. Its pages are abandoned by the teardown itself and are reached by the
+abandoned-page phase of the next purge. This matters because a teardown can outlive the
+thread's `join` — on Windows the loader runs it from the TLS detach callback — and a purge
+that treated such a thread as a pending owner would make `complete` unreachable for the rest
+of the process, so a client looping on `MI_PURGE_PARTIAL` would never terminate.
+
 ### `MI_PURGE_FORCE`
 
 - The arena passes ignore `purge_delay` and purge now.

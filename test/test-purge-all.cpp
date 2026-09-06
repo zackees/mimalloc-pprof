@@ -681,13 +681,19 @@ static void test_g3_owner_inside(void) {
   for (int i = 0; i < 20000 && !(stalled = (mi_debug_stall_in_thread_theaps_done.load() == 2)); i++) sleep_ms(1);
   const int rc1 = purge((mi_purge_flags_t)0, 20, &r, &ms);
   print_report("G3 _ex(0, 20ms) with a thread stalled in _mi_thread_done", rc1, &r, ms);
-  check("G3: the stalled owner is reported pending (PARTIAL, pending == 1)", stalled && rc1 == MI_PURGE_PARTIAL && r.theaps_pending == 1);
+  // #366: a thread inside `_mi_thread_done` is NOT a live owner: it is neither waited for nor
+  // reported. Its theaps are being abandoned by the teardown itself, and phase B reaches those
+  // pages afterwards. Reporting it pending is what made `complete` unreachable for the rest of
+  // a process whose teardown never finished (the win-gnu gated lane, where a joined thread's
+  // TLS-callback teardown outlived the join).
+  check("G3: a thread stalled in _mi_thread_done is not reported pending", stalled && rc1 == MI_PURGE_OK && r.theaps_pending == 0);
   check("G3: returned within wait_ms + one sweep", ms < 20.0 + 1500.0);
   mi_debug_stall_in_thread_theaps_done.store(0);   // release
   thread_join(w.thread);
   const int rc2 = purge((mi_purge_flags_t)0, 2000, &r, &ms);
   print_report("G3 retry after release", rc2, &r, ms);
   check("G3: retry after the hook releases -> OK", rc2 == MI_PURGE_OK && r.theaps_pending == 0);
+  check("G3: the stalled teardown never made the report incomplete", r.theaps_orphaned == 0 && r.complete);
   fprintf(stderr, "  G3: used the MI_DEBUG stall hook (mi_debug_stall_in_thread_theaps_done)\n");
 #else
   // fallback (see the file comment): a worker blocked inside its deferred-free handler

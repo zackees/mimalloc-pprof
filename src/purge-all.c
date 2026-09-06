@@ -156,6 +156,15 @@ static mi_tld_t* mi_purge_walk_claim(mi_subproc_t* sp, mi_tld_t* my_tld, mi_purg
         mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);                // it owns nothing and never parks -- neither swept nor pending
         continue;
       }
+      // #366: a thread inside `_mi_thread_done` has no live owner to wait for and owns nothing a
+      // purge could return -- its pages are abandoned by the teardown itself and are reached by
+      // phase B afterwards. Neither swept nor reported: reporting it `pending` would make
+      // `complete` unreachable for the rest of the process if that teardown never finishes
+      // (Windows: a joined thread's TLS-callback teardown can outlive the join).
+      if ((mi_atomic_load_relaxed(&tld->gate_flags) & MI_GATE_FLAG_EXITING) != 0) {
+        mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);
+        continue;
+      }
       if ((mi_atomic_load_relaxed(&tld->gate_flags) & MI_GATE_FLAG_ORPHAN) != 0) {
         mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);
         w->orphaned++;

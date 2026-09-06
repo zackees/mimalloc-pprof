@@ -313,6 +313,7 @@ static void mi_page_queue_remove(mi_page_queue_t* queue, mi_page_t* page) {
                       (mi_page_is_huge(page) && mi_page_queue_is_huge(queue)) ||
                         (mi_page_is_in_full(page) && mi_page_queue_is_full(queue)));
   mi_theap_t* theap = mi_page_theap(page);
+  MI_GATE_ASSERT_HELD(theap);   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2)
   if (page->prev != NULL) page->prev->next = page->next;
   if (page->next != NULL) page->next->prev = page->prev;
   if (page == queue->last)  queue->last = page->prev;
@@ -331,6 +332,7 @@ static void mi_page_queue_remove(mi_page_queue_t* queue, mi_page_t* page) {
 
 
 static void mi_page_queue_push(mi_theap_t* theap, mi_page_queue_t* queue, mi_page_t* page) {
+  MI_GATE_ASSERT_HELD(theap);   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2)
   mi_assert_internal(mi_page_theap(page) == theap);
   mi_assert_internal(!mi_page_queue_contains(queue, page));
   #if MI_HUGE_PAGE_ABANDON
@@ -411,6 +413,7 @@ static void mi_page_queue_enqueue_from_ex(mi_page_queue_t* to, mi_page_queue_t* 
                      (mi_page_is_huge(page) && mi_page_queue_is_full(to)));
 
   mi_theap_t* theap = mi_page_theap(page);
+  MI_GATE_ASSERT_HELD(theap);   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2); covers enqueue_from and enqueue_from_full
 
   // delete from `from`
   if (page->prev != NULL) page->prev->next = page->next;

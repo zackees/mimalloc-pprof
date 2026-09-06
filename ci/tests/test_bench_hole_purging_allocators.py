@@ -317,6 +317,73 @@ class BenchHolePurgingAllocatorsTests(unittest.TestCase):
         self.assertAlmostEqual(bench.percent_returned(200.0, 50.0), 75.0)
         self.assertEqual(bench.percent_returned(0.0, 0.0), 0.0)
 
+    def test_sizing_run_table_reproduces_from_the_committed_report(self) -> None:
+        """The --busy-threads outputs follow the same rule as the idle ones: JSON in,
+        the committed SVGs out, byte for byte, in both themes."""
+        json_path = ASSETS / "allocator-purge-any-thread-report.json"
+        if not json_path.exists():
+            self.skipTest("no committed sizing-run report in this checkout")
+        report = bench.load_busy_report_json(json_path)
+        threads = report["busy_threads"]
+        source_line = bench.format_busy_source_line(
+            report["commit"], report["cpu"], report["kernel"], report["runs_per_series"], threads
+        )
+        for theme in (bench.LIGHT, bench.DARK):
+            with self.subTest(theme=theme.name):
+                svg = bench.render_table_svg(
+                    report["series"],
+                    theme,
+                    source_line,
+                    bench.busy_order(),
+                    bench.busy_table_text(threads),
+                )
+                self.assertEqual(
+                    (ASSETS / f"allocator-purge-any-thread-table-{theme.name}.svg").read_text(
+                        encoding="utf-8"
+                    ),
+                    svg,
+                )
+                ET.fromstring(svg)
+                for spec in bench.BUSY_SERIES:
+                    self.assertIn(spec.label, svg)
+
+    def test_sizing_run_rows_state_what_the_purge_reported(self) -> None:
+        """An ungated `mi_purge_all` that leaves every worker pending must say so in the
+        same cell as its number; a row with no status to report says nothing extra."""
+        spec = next(s for s in bench.BUSY_SERIES if s.purge == bench.PURGE_MI_PURGE_ALL)
+        partial = bench.RunResult(
+            samples=[bench.Sample(0, 1024)], peak_rss_kb=1024, purge_status=1, purge_max_pending=4
+        )
+        self.assertIn("-> PARTIAL, 4 pending", bench.purge_mechanism_text(spec, partial))
+        plain = next(s for s in bench.BUSY_SERIES if s.purge == bench.PURGE_JE_PURGE)
+        self.assertEqual(
+            bench.purge_mechanism_text(plain, partial), bench.PURGE_DESCRIPTIONS[plain.purge]
+        )
+        for key, summary in bench.load_busy_report_json(
+            ASSETS / "allocator-purge-any-thread-report.json"
+        )["series"].items():
+            self.assertLessEqual(
+                bench.approx_text_width(summary["idle_mechanism"]),
+                bench.MAX_IDLE_TEXT_PX,
+                f"{key}'s mechanism cell is too wide: {summary['idle_mechanism']!r}",
+            )
+
+    def test_busy_driver_refuses_a_purge_call_the_header_lacks(self) -> None:
+        """Upstream has no mi_purge_all; the driver must fail to be built for it rather
+        than quietly measuring "nothing" under that row's name."""
+        spec = next(s for s in bench.BUSY_SERIES if s.purge == bench.PURGE_MI_PURGE_ALL)
+        build = bench.AllocatorBuild(
+            allocator_id="upstream-mimalloc",
+            pin="pin",
+            library=Path("/nonexistent/libmimalloc.a"),
+            include_dirs=[],
+            has_on_thread_idle=False,
+        )
+        with self.assertRaises(SystemExit):
+            bench.compile_busy_driver(spec, build, 4, Path("/nonexistent"))
+        include = Path(__file__).parent.parent.parent / "include"
+        self.assertTrue(bench.header_declares([include], "mi_purge_all"))
+
 
 if __name__ == "__main__":
     unittest.main()

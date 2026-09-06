@@ -224,7 +224,7 @@ static mi_decl_cold mi_decl_noinline void* mi_error_bad_alignment(size_t size, s
 }
 
 // Primitive aligned allocation
-static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, const size_t size, const size_t alignment, const size_t offset, const bool zero, mi_page_t** ppage) mi_attr_noexcept
+static inline void* mi_theap_malloc_zero_aligned_at_inner(mi_theap_t* const theap, const size_t size, const size_t alignment, const size_t offset, const bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
   // note: we don't require `size > offset`, we just guarantee that the address at offset is aligned regardless of the allocated size.
   if mi_unlikely(!mi_alignment_is_valid(alignment)) { // require power-of-two and multiple of void* (see <https://en.cppreference.com/w/c/memory/aligned_alloc#Notes>)
@@ -268,6 +268,18 @@ static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, con
 
   // fallback to generic aligned allocation
   return mi_theap_malloc_zero_aligned_at_generic(theap, size, alignment, offset, zero, ppage);
+}
+
+// #366: owner-gate site (docs/purge-all-implementation.md §5.1): the aligned fast path above
+// reads `page->free` and calls `_mi_page_malloc_zero` itself, so the gate is taken before its
+// `_mi_theap_get_free_small_page`. One enter, exactly one leave; `theap` is not `const` here
+// because `MI_GATE_ENTER` may replace it with the just-initialised one.
+static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* theap, const size_t size, const size_t alignment, const size_t offset, const bool zero, mi_page_t** ppage) mi_attr_noexcept
+{
+  MI_GATE_ENTER(theap);
+  void* const p = mi_theap_malloc_zero_aligned_at_inner(theap, size, alignment, offset, zero, ppage);
+  MI_GATE_LEAVE(theap->tld);
+  return p;
 }
 
 

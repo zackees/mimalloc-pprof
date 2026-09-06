@@ -31,6 +31,7 @@ terms of the MIT license. A copy of the license can be found in the file
 // Note: in release mode the (inlined) routine is about 7 instructions with a single test.
 static mi_decl_forceinline void* mi_page_malloc_zero(mi_theap_t* theap, mi_page_t* page, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
+  MI_GATE_ASSERT_HELD(theap);   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2)
   if (page->block_size != 0) { // not the empty theap
     mi_assert_internal(mi_page_block_size(page) >= size);
     mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
@@ -126,6 +127,7 @@ static mi_decl_forceinline void* mi_page_malloc_zero(mi_theap_t* theap, mi_page_
 
 // extra entries for improved efficiency in `alloc-aligned.c` (and in `page.c:mi_malloc_generic`.
 extern void* _mi_page_malloc_zero(mi_theap_t* theap, mi_page_t* page, size_t size, bool zero) mi_attr_noexcept {
+  MI_GATE_ASSERT_HELD(theap);   // #366: owner-private leaf (also asserted by the inlined body; kept here as the out-of-line entry)
   return mi_page_malloc_zero(theap, page, size, zero, NULL);
 }
 
@@ -144,7 +146,7 @@ extern void* _mi_page_malloc_zero(mi_theap_t* theap, mi_page_t* page, size_t siz
 // _mi_page_ptr_unalign(gpage, gp) recovers that. Get this wrong and every guarded
 // allocation leaks its DHAT/profiler record forever (never found on free, since free
 // looks it up by a different pointer than the one it was recorded under).
-static mi_decl_noinline void* mi_theap_malloc_guarded_hooked(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept {
+static mi_decl_forceinline void* mi_theap_malloc_guarded_hooked_inner(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept {
   _mi_memevt_suppress_begin();
   #if MI_PPROF
   _mi_prof_suppress_begin();
@@ -164,10 +166,18 @@ static mi_decl_noinline void* mi_theap_malloc_guarded_hooked(mi_theap_t* theap, 
   }
   return gp;
 }
+
+// #366: owner-gate site (docs/purge-all-implementation.md §5.1); one enter, exactly one leave.
+static mi_decl_noinline void* mi_theap_malloc_guarded_hooked(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept {
+  MI_GATE_ENTER(theap);
+  void* const gp = mi_theap_malloc_guarded_hooked_inner(theap, size, zero, ppage);
+  MI_GATE_LEAVE(theap->tld);
+  return gp;
+}
 #endif
 
 // internal small size allocation
-static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_nonnull(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept
+static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_nonnull_inner(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
   mi_assert(theap != NULL);
   mi_assert(size <= MI_SMALL_SIZE_MAX);
@@ -196,8 +206,19 @@ static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_non
   return p;
 }
 
+// #366: owner-gate site (docs/purge-all-implementation.md §5.1) -- the small-path choke point.
+// `MI_GATE_ENTER` may replace `theap` with the just-initialised one, so `theap->tld` is read
+// after it. One enter, exactly one leave; expands to the plain body when MI_OWNER_GATE is 0.
+static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_nonnull(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept
+{
+  MI_GATE_ENTER(theap);
+  void* const p = mi_theap_malloc_small_zero_nonnull_inner(theap, size, zero, ppage);
+  MI_GATE_LEAVE(theap->tld);
+  return p;
+}
+
 // internal generic allocation
-static mi_decl_forceinline void* mi_theap_malloc_generic(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) mi_attr_noexcept
+static mi_decl_forceinline void* mi_theap_malloc_generic_inner(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) mi_attr_noexcept
 {
   #if MI_GUARDED
   #if MI_THEAP_INITASNULL
@@ -220,6 +241,15 @@ static mi_decl_forceinline void* mi_theap_malloc_generic(mi_theap_t* theap, size
     mi_assert_expensive(mi_mem_is_zero(p, size));
   }
   #endif
+  return p;
+}
+
+// #366: owner-gate site (docs/purge-all-implementation.md §5.1) -- every non-small allocation.
+static mi_decl_forceinline void* mi_theap_malloc_generic(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) mi_attr_noexcept
+{
+  MI_GATE_ENTER(theap);
+  void* const p = mi_theap_malloc_generic_inner(theap, size, zero, huge_alignment, ppage);
+  MI_GATE_LEAVE(theap->tld);
   return p;
 }
 

@@ -180,9 +180,9 @@ image and the table below are rendered from.
 |---|:--|:--|:--|:--|
 |  | this fork, 0.9.x | v3 dev3 @ 6def7be9 | oven-sh @ b20b60d9 | 5.3.1 @ 81034ce1 |
 | **Memory return** | | | | |
-| Process-wide eager purge, from any thread | ❌ not yet — [#335](https://github.com/zackees/mimalloc-pprof/issues/335) | ❌ mi_collect is caller-only | ❌ mi_collect is caller-only | ✅ MALLCTL_ARENAS_ALL |
+| Process-wide eager purge, from any thread | ⚠️ gated 72 %; default parked — [#366](https://github.com/zackees/mimalloc-pprof/issues/366) | ❌ mi_collect is caller-only | ❌ mi_collect is caller-only | ✅ MALLCTL_ARENAS_ALL, 74 % |
 | Purge the calling thread's own memory | ✅ mi_collect, idle hook | ✅ mi_collect | ✅ mi_collect, idle hook | ✅ tcache.flush + arena.i.purge |
-| Sweep another thread's heap for it | ⚠️ parked threads — [#335](https://github.com/zackees/mimalloc-pprof/issues/335) | ❌ no scavenger at all | ⚠️ parked threads only | ⚠️ arena purge, not their tcache |
+| Sweep another thread's heap for it | ⚠️ parked; all if gated — [#366](https://github.com/zackees/mimalloc-pprof/issues/366) | ❌ no scavenger at all | ⚠️ parked threads only | ⚠️ arena purge, not their tcache |
 | Sub-page return inside a still-used page | ✅ hole purging, on by default | ❌ whole pages only | ✅ hole purging, on by default | ❌ extent-granular purge |
 | Background purge thread | ✅ on by default | ❌ purge waits for a malloc | ✅ on by default | ⚠️ off by default |
 | Time-delayed / decaying purge | ✅ purge_delay 100 ms | ✅ purge_delay 1000 ms | ✅ purge_delay 100 ms | ✅ dirty_decay_ms 10 s |
@@ -587,6 +587,8 @@ and the `mi_purge_holes_stats_t` gauges.
 | `mi_on_thread_idle` | ✅ | `on_thread_idle()` |
 | `mi_on_thread_idle_start` / `_end` | ✅ | `park_while_idle() -> Option<IdlePark>` (ends on drop) |
 | `mi_scavenger_stop` | ✅ | `scavenger_stop()` |
+| `mi_purge_all` | ✅ | `purge_all(force) -> PurgeAllReport` (keeps the report the C convenience discards) |
+| `mi_purge_all_ex`, `mi_purge_all_report_t`, `mi_purge_flags_t` | ✅ | `purge_all_ex(flags, wait_ms) -> (PurgeStatus, PurgeAllReport)`, `PurgeFlags`, `PurgeStatus` |
 | `mi_purge_holes_stats_get`, `mi_purge_holes_stats_t` | ✅ | `purge_holes_stats() -> MiPurgeHolesStats` |
 | `mi_purge_holes_report` | ✅ | `purge_holes_report()` |
 
@@ -1047,10 +1049,14 @@ a still-used page, one OS page at a time, so a scattered survivor no longer pins
 64 KiB–512 KiB page — the thing jemalloc's page-granular purge structurally cannot do.
 The price is that the sweep runs on the *owning* thread, at its `mi_on_thread_idle()`
 point. The background scavenger covers arena-level memory process-wide, and the heaps
-of threads that parked via `mi_on_thread_idle_start()`; a thread that is busy and never
-reaches an idle point keeps its pages until it does. **Upstream mimalloc has neither
-half**: no sub-page return, and no cross-thread purge at all — `mi_collect()` reaches
-only the calling thread's heaps.
+of threads that parked via `mi_on_thread_idle_start()`; in the default build a thread
+that is busy and never reaches an idle point keeps its pages until it does.
+`mi_purge_all()` ([docs/purge-all.md](docs/purge-all.md)) closes that gap on request:
+in the default build it reaches arenas, abandoned pages, the caller and parked threads
+and reports the busy ones as pending; built with `MI_OWNER_GATE=ON` it reaches every
+thread, busy or not, for a measured cost on the allocation fast path. **Upstream
+mimalloc has neither half**: no sub-page return, and no cross-thread purge at all —
+`mi_collect()` reaches only the calling thread's heaps.
 
 The [measured chart](#memory-returned-after-idle) is exactly that trade-off: **74 %** of
 peak RSS returned for this fork and for Bun at the first idle tick, **74 %** for
@@ -1059,10 +1065,29 @@ jemalloc *if you ask it explicitly* (**0 %** in its default configuration inside
 time), and **0 %** for upstream — 18 % if you call `mi_collect` yourself, which is what
 whole-page return alone is worth.
 
-So the one memory-return primitive jemalloc has and this fork does not is the
-process-wide, any-thread, right-now purge — and it is the reason the memory-return
-group of the [feature table](#feature-comparison) is not a clean sweep. It is filed as
-[#335](https://github.com/zackees/mimalloc-pprof/issues/335).
+The one memory-return primitive jemalloc has that this fork's *default* build does
+not is the process-wide, any-thread, right-now purge. That case was measured too —
+the same workload split across **4 worker threads that stay busy** in a `malloc`/`free`
+loop and never idle, with the purge issued every 100 ms by a fifth thread that
+allocates nothing:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-purge-any-thread-table-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-purge-any-thread-table-light.svg" />
+  <img alt="Memory returned with 4 busy threads, purge from another thread: mimalloc-pprof default build 12-14%, MI_OWNER_GATE=ON 72%, jemalloc 74%, glibc 72%" src=".github/assets/allocator-purge-any-thread-table-light.svg" width="100%" />
+</picture>
+
+jemalloc's `arena.<all>.purge` returns **74 %** and glibc's `malloc_trim(0)` **72 %**
+from the other thread; every mimalloc's `mi_collect(true)` returns **14 %** (the
+caller's own heaps and the arenas). This fork's `mi_purge_all(true)` returns **12 %**
+in the default build — it reports `PARTIAL` with all 4 workers pending, because
+nothing will ever park a thread that never idles — and **72 %** in a build with
+`MI_OWNER_GATE=ON`, where every allocator call takes a per-thread owner gate so a
+purging thread can claim a busy thread between two of its calls. That is the
+⚠️ in the [feature table](#feature-comparison): the reach is there, behind a build
+option with a measured fast-path cost. Contract and numbers:
+[docs/purge-all.md](docs/purge-all.md); implementation:
+[#366](https://github.com/zackees/mimalloc-pprof/issues/366).
 
 ---
 
@@ -1074,6 +1099,7 @@ group of the [feature table](#feature-comparison) is not a clean sweep. It is fi
 | [docs/rust-integration.md](docs/rust-integration.md) | Crate setup, stats API, cargo config, cross-compilation |
 | [docs/profiler.md](docs/profiler.md) | Profiler reference: cost, env vars, seeding, embedded-mimalloc concerns, exact stats |
 | [docs/dhat-and-memory-events.md](docs/dhat-and-memory-events.md) | Exact DHAT profiling and the memory-events API |
+| [docs/purge-all.md](docs/purge-all.md) | `mi_purge_all` / `MI_OWNER_GATE`: process-wide purge from any thread — contract, return codes, measured reach and cost |
 | [docs/benchmarks.md](docs/benchmarks.md) | Benchmark methodology, thread-scaling panels, metric roadmap |
 | [docs/upstream-bugs.md](docs/upstream-bugs.md) | The upstream bugs in depth, and how they are kept fixed |
 | [docs/ci-gates.md](docs/ci-gates.md) | Every CI gate, what it catches, and its positive control |

@@ -349,7 +349,28 @@ static void mi_snap_walk_own_theaps(mi_snap_ctx_t* ctx) {
 // Public entry point
 // ---------------------------------------------------------------------------
 
+static int mi_heap_snapshot_inner(int fd, unsigned flags);
+
+// #366: owner-gate site -- the walk folds the thread frees of this thread's OWN pages
+// (`mi_snap_emit_page_freemap` -> `_mi_page_free_collect_no_unpurge`), an owner-private write;
+// in a gated build a caller between allocator calls is PARKED and could be swept under the
+// walk. Other threads' pages are read as they are (see `_mi_page_free_collect_no_unpurge`).
+// A thread with no theap (process exit on some platforms) has nothing of its own to protect.
 int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
+  mi_theap_t* self = _mi_theap_default();
+  #if MI_OWNER_GATE
+  if (!mi_theap_is_initialized(self)) { return mi_heap_snapshot_inner(fd, flags); }
+  #endif
+  MI_GATE_ENTER(self);
+  const int rc = mi_heap_snapshot_inner(fd, flags);
+  MI_GATE_LEAVE(self->tld);
+  #if !MI_OWNER_GATE
+  MI_UNUSED(self);
+  #endif
+  return rc;
+}
+
+static int mi_heap_snapshot_inner(int fd, unsigned flags) {
   if (fd < 0) return -1;
   // Use the main subproc (and walk siblings) rather than `_mi_subproc()`: at
   // process-exit time on some platforms TLS may already point at an empty theap,

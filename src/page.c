@@ -88,7 +88,11 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   
   mi_assert_internal(page->heap!=NULL);
   mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
-  mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED);
+  // #272/#366: the peek is the CALLING thread's theap for this heap; a foreign sweeper holding
+  // the page owner's MI_PARK_SWEEPING claim (the scavenger, `mi_purge_all`) validates pages of
+  // another thread -- same relaxation as `mi_theap_page_is_valid` in theap.c.
+  mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED
+                     || mi_page_theap(page)->tld->thread_id != _mi_thread_id());
 
   // const size_t bsize = mi_page_block_size(page);
   // uint8_t* start = mi_page_start(page);
@@ -136,7 +140,10 @@ bool _mi_page_is_valid(mi_page_t* page) {
     //mi_assert_internal(!_mi_process_is_initialized);
     mi_assert_internal(page->heap!=NULL);
     mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
-    mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED);
+    // #272/#366: same relaxation as in `mi_page_is_valid_init` -- a foreign sweeper holding the
+    // owner's MI_PARK_SWEEPING claim validates pages of another thread.
+    mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap || mi_page_theap(page)->tld->thread_id == MI_THREADID_DETACHED
+                       || mi_page_theap(page)->tld->thread_id != _mi_thread_id());
     {
       mi_page_queue_t* pq = mi_page_queue_of(page);
       mi_assert_internal(mi_page_queue_contains(pq, page));
@@ -229,6 +236,10 @@ static inline bool mi_page_free_quick_collect(mi_page_t* page) {
 
 static void mi_page_free_collect_ex(mi_page_t* page, bool force, bool allow_unpurge) {
   mi_assert_internal(page!=NULL);
+  // #366: owner-private leaf (docs/purge-all-implementation.md §5.2) -- asserted HERE, at the
+  // body, because `_mi_theap_area_visit_blocks` (the block visitors) reaches it through
+  // `_mi_page_free_collect_no_unpurge`, not through `_mi_page_free_collect`.
+  if (!mi_page_is_abandoned(page)) { MI_GATE_ASSERT_HELD(mi_page_theap(page)); }
 
   // collect the thread free list
   mi_page_thread_free_collect(page);
@@ -268,6 +279,12 @@ static void mi_page_free_collect_ex(mi_page_t* page, bool force, bool allow_unpu
 }
 
 void _mi_page_free_collect(mi_page_t* page, bool force) {
+  #if MI_OWNER_GATE
+  // #366: owner-private leaf (docs/purge-all-implementation.md §5.2) -- for an OWNED page. The
+  // mt free path and the arena reclaim also collect ABANDONED pages they hold through the page's
+  // own ownership bit, which belong to no theap; those have no tld to assert against.
+  if (!mi_page_is_abandoned(page)) { MI_GATE_ASSERT_HELD(mi_page_theap(page)); }
+  #endif
   mi_page_free_collect_ex(page, force, true);
 }
 
@@ -276,6 +293,12 @@ void _mi_page_free_collect(mi_page_t* page, bool force) {
 // as free, see `_mi_theap_area_visit_blocks`). Also used by the sweep itself, which is about to
 // discard and would only un-purge what it re-discards a moment later.
 void _mi_page_free_collect_no_unpurge(mi_page_t* page, bool force) {
+  // #366: the block visitors and the heap snapshot reach here for pages of OTHER threads too
+  // (`mi_heap_visit_blocks`, `mi_heap_snapshot` walk every page of a heap/arena). Folding a
+  // page's thread frees is an owner-private write: a foreign reader that holds neither the
+  // page's ownership nor the tld's MI_PARK_SWEEPING claim must not do it -- it reads the lists
+  // as they are (stale but consistent) instead of racing the owner. Same rule in both builds.
+  if (!mi_page_is_abandoned(page) && !_mi_gate_held_theap(mi_page_theap(page))) return;
   mi_page_free_collect_ex(page, force, false);
 }
 
@@ -367,8 +390,19 @@ static mi_page_t* mi_page_fresh_alloc(mi_theap_t* theap, mi_page_queue_t* pq, si
         };
       }
       else {
-        mi_assert(false); // should not happen?
-        return NULL;
+        // #272/#366: in this fork a reclaimed abandoned page can have EVERY free block purged
+        // (a hole, off every free list -- `src/page-holes.c`), and the collect above does not
+        // un-purge while the calling thread is inside its own hole sweep (a nested allocation
+        // from the sweep; gated builds sweep the owner inline far more often). This page is
+        // about to serve an allocation, so its holes must come back regardless; the sweep can
+        // discard them again later. Only if it is STILL unavailable is it upstream's
+        // "should not happen".
+        if (mi_page_has_purged(page)) { _mi_page_unpurge_run(page); }
+        if (!mi_page_immediate_available(page)) {
+          mi_assert(false); // should not happen?
+          _mi_page_abandon(page,pq);
+          return NULL;
+        }
       }
     }
   }
@@ -464,6 +498,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   mi_assert_internal(page != NULL);
   mi_assert_expensive(_mi_page_is_valid(page));
   mi_assert_internal(mi_page_all_free(page));
+  MI_GATE_ASSERT_HELD(mi_page_theap(page));   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2)
 
   if (page->retire_expire!=0) return;  // already retired, just keep it retired
   mi_page_set_has_interior_pointers(page, false);
@@ -1156,7 +1191,9 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   #if !MI_THEAP_INITASNULL
   mi_assert_internal(theap != NULL);
   #endif
+  #if !MI_OWNER_GATE   // #366: in a gated build every caller is inside the gate (RUNNING at gate_depth>=1), and `_mi_park_leave` would wrongly decrement `parked_count`
   _mi_park_leave_if_parked(theap);   // #272: an owner-side alloc while parked (e.g. from a TLS destructor)
+  #endif
   const bool zero = ((zero_huge_alignment & 1) != 0);
   const size_t huge_alignment = (zero_huge_alignment & ~1);
   mi_page_t* page = NULL;

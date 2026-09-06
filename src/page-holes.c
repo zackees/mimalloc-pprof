@@ -337,6 +337,12 @@ static void mi_holes_count_reuse(size_t bytes, size_t blocks, bool reused) {
 // own theaps, so it is its own tld that matters here: on the owner that is the tld being swept;
 // the scavenger has no theaps of its own being swept (it sweeps a parked thread's theaps, and the
 // abandoned pages it touches are claimed), so un-purging there is harmless.
+//
+// #366: deliberately the CALLER's tld, not the tld being swept (docs/purge-all-implementation.md
+// §6). A `mi_purge_all` caller sweeping a claimed foreign tld has theaps of its own, and a
+// nested allocation on the sweep path comes out of THOSE; the swept tld's `holes_sweeping` is
+// the wrong question for it. Consequence: a nested allocation during a foreign sweep may un-purge
+// a hole in the caller's own pages, which is harmless (the caller is not being swept).
 bool _mi_page_purge_holes_in_progress(void) {
   mi_theap_t* const theap = _mi_theap_default();
   if (theap == NULL || theap->tld == NULL) return false;
@@ -758,13 +764,21 @@ void _mi_page_unpurge_all(mi_page_t* page) {
   DEVIATION from Bun (CLAUDE.md rule 6): these drivers are `src/theap.c` statics there.
 ----------------------------------------------------------- */
 
+// #366: the owner's reclaim request (`_mi_park_leave`), unless the claimant asked for the sweep
+// to run to completion (MI_GATE_FLAG_RECLAIM_IGNORED, set by `mi_purge_all` under MI_PURGE_FORCE:
+// the owner stalls in `_mi_park_leave_gate` for the rest of the walk, and that is the product).
+static inline bool mi_tld_reclaim_requested(const mi_tld_t* tld) {
+  if ((mi_atomic_load_relaxed((_Atomic(size_t)*)&tld->gate_flags) & MI_GATE_FLAG_RECLAIM_IGNORED) != 0) return false;
+  return (mi_atomic_load_relaxed((_Atomic(size_t)*)&tld->park_reclaim) != 0);
+}
+
 static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg_tld, void* arg2) {
   MI_UNUSED(arg2);
   mi_tld_t* const tld = (mi_tld_t*)arg_tld;   // the tld being swept (== theap->tld)
   // When the scavenger is doing this for a parked thread, the owner may wake at any moment and
   // has to wait for us. Stopping between pages bounds that wait to one page's walk; the pages we
   // skip are simply swept at the next park (`swept_state` makes the re-walk cheap).
-  if (theap->tld != NULL && mi_atomic_load_relaxed(&theap->tld->park_reclaim) != 0) return false;
+  if (theap->tld != NULL && mi_tld_reclaim_requested(theap->tld)) return false;
   // force: fold local_free (and thread_free) into `free` first. Never un-purge here: we are about
   // to purge, and a run brought back now would be discarded again right away (see `mi_theap_page_collect`).
   _mi_page_free_collect_no_unpurge(page, true);
@@ -821,7 +835,7 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
 // number first; the array is `8 * sizeof(void*)` = 64 bytes of stack.
 #define MI_PURGE_HOLES_MAX_HEAPS  (8)
 
-void _mi_purge_holes_of(mi_tld_t* tld) {
+void _mi_purge_holes_of(mi_tld_t* tld, bool force) {
   if (tld == NULL) return;
   // `purge_holes_min_interval` pacing, for BOTH callers. It used to be applied only in
   // `_mi_theap_sweep_parked`'s pre-claim loop, which left a thread calling `mi_on_thread_idle()`
@@ -841,13 +855,17 @@ void _mi_purge_holes_of(mi_tld_t* tld) {
   // phase to pace, but the scavenger's pre-claim check reads this same field, and leaving it at
   // 0 forever would make the `-off` build claim and re-sweep every park at full rate -- a
   // behavioural difference between the two builds that has nothing to do with holes.
+  //
+  // #366: `force` (`mi_purge_all(true)`, `MI_PURGE_FORCE`) skips the pacing check but still
+  // stamps: a forced sweep is a real sweep and the next paced one measures from it.
   const mi_msecs_t now = _mi_clock_now();
   const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
-  if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) return;
+  if (!force && interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) return;
   tld->holes_sweep_last = now;
 
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   _mi_page_purge_holes_sweep_begin(tld);  // decides whether this sweep skips unchanged pages
+  if (force) { tld->holes_sweep_full = true; }   // #366: a forced pass ignores `page->swept_state`
   _mi_page_holes_reset_ineligible();      // the ineligible counters are a gauge over this sweep
 
   mi_heap_t* heaps[MI_PURGE_HOLES_MAX_HEAPS];
@@ -861,6 +879,9 @@ void _mi_purge_holes_of(mi_tld_t* tld) {
   //    `heaps[i]` outside the lock is a use-after-free (`heap->subproc`).
   mi_lock(&tld->theaps_lock) {
     for (mi_theap_t* theap = tld->theaps; theap != NULL; theap = theap->tnext) {
+      // #366: a theap DETACHED by `mi_heap_delete` (heap == NULL) stays linked here until the
+      // owner's teardown; it belongs to the deleter's claim protocol, not to this sweep.
+      if (!mi_theap_is_initialized(theap)) continue;
       mi_theap_purge_holes(theap);
       mi_heap_t* const heap = _mi_theap_heap(theap);
       if (heap != NULL && heap_count < MI_PURGE_HOLES_MAX_HEAPS) {
@@ -870,7 +891,7 @@ void _mi_purge_holes_of(mi_tld_t* tld) {
       }
     }
     for (size_t i = 0; i < heap_count; i++) {
-      if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) break;
+      if (mi_tld_reclaim_requested(tld)) break;   // #366: unless the claimant asked for completion
       _mi_arenas_purge_abandoned_holes(heaps[i], tld);
     }
   }

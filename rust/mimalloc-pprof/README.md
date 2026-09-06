@@ -38,6 +38,13 @@ With `default-features = false`, the allocator remains available and the
 profiling API is retained for source compatibility, but profiling cannot be
 started (`prof::start` and `enable_heap_profiling` return `false`).
 
+The `owner-gate` feature builds the C code with `MI_OWNER_GATE=1`
+([#366](https://github.com/zackees/mimalloc-pprof/issues/366)): every allocator call takes a
+per-thread gate so `purge_all` can sweep *every* thread's heap, not only threads parked in
+`park_while_idle`. It costs a few percent on the malloc/free fast path and is off by default;
+without it `purge_all` reports running threads as pending (`PurgeStatus::Partial`), which is
+a normal outcome, not an error.
+
 ```rust
 use mimalloc_pprof::{prof, MiMalloc};
 use std::path::Path;
@@ -116,7 +123,7 @@ The short version. Safe wrappers, all at the crate root unless noted:
 | `stats` | the allocator's **exact** counters: `get()`, `json()`, `print()`, `bin_size()`, and the subprocess-scoped forms |
 | `memory_events` | opt-in allocation-change accounting: `set_enabled`, `snapshot`, `set_callbacks`, `visit_live_allocations` |
 | `options` | every `mi_option_t`, including the thirteen this fork adds (`Opt::PROF`, `Opt::SCAVENGER`, `Opt::PURGE_HOLES`, …) |
-| crate root | `MiMalloc`, `heap_dump_json`, `on_thread_idle`, `park_while_idle`, `scavenger_stop`, `purge_holes_stats`, `purge_holes_report`, `rezalloc`/`recalloc`/`expand`, `unwrapped_malloc`/`_free`/`_realloc` |
+| crate root | `MiMalloc`, `heap_dump_json`, `on_thread_idle`, `park_while_idle`, `scavenger_stop`, `purge_all`/`purge_all_ex`, `purge_holes_stats`, `purge_holes_report`, `rezalloc`/`recalloc`/`expand`, `unwrapped_malloc`/`_free`/`_realloc` |
 
 `mimalloc_pprof::sys` holds the raw `unsafe extern "C"` declarations and the `#[repr(C)]`
 struct mirrors behind all of the above. The mirrors are checked field-by-field against

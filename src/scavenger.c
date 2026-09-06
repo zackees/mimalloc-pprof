@@ -12,7 +12,8 @@ terms of the MIT license. A copy of the license can be found in the file
 // arena memory returns to the OS without waiting for the next allocation.
 //
 // This file also holds the idle-handoff protocol (`mi_on_thread_idle*`, `_mi_park_leave`,
-// `_mi_theap_sweep_parked`, `_mi_thread_idle_work`). Bun keeps those in `src/theap.c`;
+// `_mi_theap_sweep_parked`, `_mi_thread_idle_work`) and, since #366, the owner-gate acquire
+// (`_mi_park_leave_gate`) and the foreign door (`_mi_thread_idle_work_ex`). Bun keeps those in `src/theap.c`;
 // this fork keeps `src/theap.c` an upstream file with only a few guarded lines in it
 // (CLAUDE.md rule 6), and none of them need theap file statics.
 //
@@ -46,6 +47,9 @@ typedef char mi_scav_atomic_widths_assert_t[
    sizeof(((mi_tld_t*)0)->park_state)      == sizeof(uintptr_t) &&
    sizeof(((mi_tld_t*)0)->park_reclaim)    == sizeof(uintptr_t) &&
    sizeof(((mi_tld_t*)0)->park_swept)      == sizeof(uintptr_t) &&
+   sizeof(((mi_tld_t*)0)->sweeper)         == sizeof(uintptr_t) &&   // #366
+   sizeof(((mi_tld_t*)0)->purge_epoch)     == sizeof(uintptr_t) &&
+   sizeof(((mi_tld_t*)0)->gate_flags)      == sizeof(uintptr_t) &&
    sizeof(((mi_subproc_t*)0)->parked_count)== sizeof(uintptr_t)
    #if defined(_WIN32)
    && sizeof(((mi_subproc_t*)0)->scavenger_wake) == sizeof(uintptr_t)
@@ -81,33 +85,90 @@ mi_decl_externc mi_decl_export size_t _mi_test_idle_work_count(void) {
   return mi_atomic_load_relaxed(&mi_idle_work_count);
 }
 
+// #366: pick the theap the sweep collects first for a claimed tld. The scavenger has no TLS of
+// the owner's to find its default theap with; `mi_on_thread_idle_start` leaves it in
+// `park_theap0`, but in a gated build the owner is PARKED by the gate, not by `_start`, and
+// the field is NULL. Fall back to the tld's theap of the subproc's main heap (the one
+// `mi_thread_init` creates and `mi_heap_delete` refuses to delete, so it outlives the claim),
+// or, failing that, the head of the list. Taken under `tld->theaps_lock` because another
+// thread's `mi_heap_delete` may be unlinking theaps from it right now.
+static mi_theap_t* mi_tld_sweep_theap0(mi_tld_t* tld) {
+  mi_theap_t* theap0 = tld->park_theap0;
+  if (theap0 != NULL) return theap0;
+  mi_heap_t* const heap_main = (tld->subproc != NULL ? mi_atomic_load_ptr_acquire(mi_heap_t, &tld->subproc->heap_main) : NULL);
+  mi_lock(&tld->theaps_lock) {
+    for (mi_theap_t* theap = tld->theaps; theap != NULL; theap = theap->tnext) {
+      if (theap0 == NULL) { theap0 = theap; }
+      if (heap_main != NULL && _mi_theap_heap_peek(theap) == heap_main) { theap0 = theap; break; }
+    }
+  }
+  return theap0;
+}
+
+// #366: the "foreign door" into the collect body (docs/purge-all-implementation.md §6): the
+// sweep of `tld`'s theaps without the trailing arena purge (the driver purges arenas once,
+// process-wide). Runs on the owner (`mi_on_thread_idle`) or on whichever thread holds `tld`'s
+// MI_PARK_SWEEPING claim -- the scavenger for a parked thread, or `mi_purge_all` for a gated
+// one; both require that the owner is not allocating while we rewrite its free lists, and the
+// claim is what authorises it (asserted below through `tld->sweeper`). Never touches
+// `gate_depth`: that is the owner's, and the owner may be spinning in `_mi_park_leave_gate`
+// for the whole of this with its depth already incremented.
+//
+// `force` reaches both per-page loops: `MI_FORCE` for the collect, and for the hole sweep it
+// skips the `purge_holes_min_interval` pacing and (MI_GATE_FLAG_RECLAIM_IGNORED, set by the
+// claimant) lets the sweep run to completion instead of stopping at the owner's reclaim.
+void _mi_thread_idle_work_ex(mi_tld_t* tld, mi_theap_t* theap0, bool force) {
+  if (tld == NULL) return;
+  const bool foreign = (tld->thread_id != _mi_thread_id());
+  #if MI_DEBUG
+  // the claim authorises the foreign door: nobody else may be here for a tld that is not its own
+  mi_assert_internal(!foreign || (mi_atomic_load_acquire(&tld->park_state) == MI_PARK_SWEEPING &&
+                                  mi_atomic_load_acquire(&tld->sweeper) == (uintptr_t)_mi_thread_id()));
+  // #272 profiler-interaction invariant (3): the swept thread's own sampling countdown is its
+  // own. Nothing in the sweep may advance or reset it -- the profiler decides when to sample
+  // from the OWNER's allocation stream, and a sweep that touched these would make a thread's
+  // next sample depend on how often a sweeper happened to visit it. Here, and not in
+  // `_mi_theap_sweep_parked`, so it covers the `mi_purge_all` caller as well (#366).
+  const mi_profiler_tld_t prof_before = tld->profiler;
+  #endif
+  // each phase is a full walk: an owner waiting in `_mi_park_leave` cannot allocate until we stop
+  // (unless the claimant asked for completion, see `mi_tld_reclaim_requested`)
+  const bool reclaim_ignored = ((mi_atomic_load_relaxed(&tld->gate_flags) & MI_GATE_FLAG_RECLAIM_IGNORED) != 0);
+  if (!reclaim_ignored && mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
+  if (theap0 != NULL && mi_theap_is_initialized(theap0)) {
+    if (foreign) { _mi_theap_collect_foreign(theap0, force); }
+    else         { mi_theap_collect(theap0, force); }   // the owner door (gated build: ordinary recursion)
+  }
+  if (!reclaim_ignored && mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
+  _mi_purge_holes_of(tld, force);   // #272 (P7b): every theap of this thread + its heaps' abandoned pages
+  #if MI_DEBUG
+  mi_assert_internal(tld->profiler.bytes_since_sample == prof_before.bytes_since_sample &&
+                     tld->profiler.next_threshold    == prof_before.next_threshold &&
+                     tld->profiler.random            == prof_before.random &&
+                     tld->profiler.generation        == prof_before.generation);
+  #endif
+}
+
 // Fold in pending frees and drain the arena purge queue. Runs on the owner
 // (`mi_on_thread_idle`) or on the scavenger for a parked thread; both require that the owner
 // of `tld` is not allocating while we rewrite its free lists.
 void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) {
   if (tld == NULL) return;
-  // each phase is a full walk: an owner waiting in `_mi_park_leave` cannot allocate until we stop
-  if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
-  if (theap0 != NULL && mi_theap_is_initialized(theap0)) {
-    mi_theap_collect(theap0, false /* not forced */);
-  }
-  if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
-  _mi_purge_holes_of(tld);   // #272 (P7b): every theap of this thread + its heaps' abandoned pages
+  _mi_thread_idle_work_ex(tld, theap0, false /* not forced */);
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
   _mi_arenas_purge_now(tld->subproc);
   mi_atomic_increment_relaxed(&mi_idle_work_count);   // #272 test observable, see above
 }
 
-// Take the theaps of `tld` back from the scavenger. Also called from teardown and from
-// `_mi_process_fork_prepare`: a thread can leave a park without reaching
-// `mi_on_thread_idle_end` (`epoll_wait` is a cancellation point), and freeing the tld while
-// the sweeper walks it is a use-after-free.
-void _mi_park_leave(mi_tld_t* tld) {
-  if (tld == NULL) return;
+// The common loop of `_mi_park_leave` and `_mi_park_leave_gate` (#366): take `tld` from PARKED
+// to RUNNING, waiting out a sweeper. Returns false when the tld was already RUNNING (nothing to
+// take back: an initial RUNNING is "mine" -- the park protocol's default, and in a gated build
+// the state a tld is registered in).
+static bool mi_park_leave_loop(mi_tld_t* tld) {
   for (;;) {
     mi_park_state_t expected = MI_PARK_PARKED;   // width-pinned to the field, see the assert above
     if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_RUNNING)) break;
-    if (expected == MI_PARK_RUNNING) return;   // not parked: nothing to take back
+    if (expected == MI_PARK_RUNNING) return false;   // not parked: nothing to take back
     // it may re-claim the moment it releases, so re-race rather than store: only a CAS from
     // PARKED may reach RUNNING
     mi_assert_internal(expected == MI_PARK_SWEEPING);
@@ -121,19 +182,56 @@ void _mi_park_leave(mi_tld_t* tld) {
     }
   }
   mi_atomic_store_release(&tld->park_reclaim, 0);
+  return true;
+}
+
+// Take the theaps of `tld` back from the scavenger. Also called from teardown and from
+// `_mi_process_fork_prepare`: a thread can leave a park without reaching
+// `mi_on_thread_idle_end` (`epoll_wait` is a cancellation point), and freeing the tld while
+// the sweeper walks it is a use-after-free.
+void _mi_park_leave(mi_tld_t* tld) {
+  if (tld == NULL) return;
+  if (!mi_park_leave_loop(tld)) return;
   mi_atomic_decrement_relaxed(&tld->subproc->parked_count);
+}
+
+// #366: the owner-gate acquire (`_mi_gate_enter`, mimalloc/owner-gate.h): `_mi_park_leave`
+// without the `parked_count` decrement -- a gated park is not a `mi_on_thread_idle_start` park
+// and was never counted. The matching release is a plain release-store of PARKED in
+// `_mi_gate_leave`. Defined in both builds (the header only calls it when MI_OWNER_GATE).
+void _mi_park_leave_gate(mi_tld_t* tld) {
+  if (tld == NULL) return;
+  (void)mi_park_leave_loop(tld);
 }
 
 // Sweep the theaps of every parked thread of `subproc`; scavenger only.
 //
 // Returns in how many msecs a park that was passed over for `purge_holes_min_interval` becomes
 // due (0: none was), so the scavenger can wake for it instead of leaving it to its safety timeout.
+//
+// #366 (gated build): every thread outside the allocator is PARKED, so this is the timed sweep
+// of BUSY threads too, paced by `purge_holes_min_interval` (`holes_sweep_last`) and bounded per
+// visit by `park_reclaim` (the owner's next allocator call). `parked_count` and `park_swept`
+// are `mi_on_thread_idle_start` bookkeeping that a gated park never writes, so `parked_count`
+// is not consulted there (a gated tld would be skipped forever), and `park_swept` -- which
+// `_start` alone clears -- is used as a per-CALL round stamp instead: each tld is swept at
+// most once per call, so a call always terminates and the scavenger gets back to its wait
+// (and its stop flag) even with `purge_holes_min_interval=0`, when every PARKED tld is
+// always due. Ungated, `park_swept` keeps its 0/1 "done for this park" meaning.
+#if MI_OWNER_GATE
+static size_t mi_sweep_round;   // scavenger thread only (the sole caller of `_mi_theap_sweep_parked`)
+#endif
 mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
   if (subproc == NULL) return 0;
+  #if !MI_OWNER_GATE
   if (mi_atomic_load_relaxed(&subproc->parked_count) == 0) return 0;
+  const size_t swept_mark = 1;
+  #else
+  if (++mi_sweep_round == 0) { mi_sweep_round = 1; }   // 0 is "never swept" (`_start` clears to it)
+  const size_t swept_mark = mi_sweep_round;
+  #endif
   for (;;) {
     mi_tld_t* claimed = NULL;
-    mi_theap_t* theap0 = NULL;
     mi_msecs_t due_in = 0;
     mi_lock(&subproc->tlds_lock) {
       // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b):
@@ -142,15 +240,19 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
       const mi_msecs_t now = _mi_clock_now();
       const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
+        #if !MI_OWNER_GATE
         if (mi_atomic_load_acquire(&tld->park_swept) != 0) continue;   // already done for this park
+        #else
+        if (mi_atomic_load_acquire(&tld->park_swept) == swept_mark) continue;   // already swept this round (#366)
+        #endif
         // Read `park_state` BEFORE `holes_sweep_last`. That field is a PLAIN `mi_msecs_t` written
         // by whoever last swept this tld -- including the OWNER while it is RUNNING, from its own
         // `mi_on_thread_idle()` (see `_mi_purge_holes_of`). What makes reading it here race-free
         // is not this lock (the owner takes no lock to write it) but the acquire below pairing
-        // with the owner's release-store of MI_PARK_PARKED in `mi_on_thread_idle_start`: a tld
-        // that reads PARKED has published every write it made before parking, and it cannot
-        // write the field again until it leaves the park. A tld that is not parked is skipped
-        // without the field ever being read.
+        // with the owner's release-store of MI_PARK_PARKED in `mi_on_thread_idle_start` (or in
+        // `_mi_gate_leave`, #366): a tld that reads PARKED has published every write it made
+        // before parking, and it cannot write the field again until it leaves the park. A tld
+        // that is not parked is skipped without the field ever being read.
         if (mi_atomic_load_acquire(&tld->park_state) != MI_PARK_PARKED) continue;
         if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
           const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
@@ -159,29 +261,22 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
         }
         mi_park_state_t expected = MI_PARK_PARKED;   // width-pinned to the field, see the assert above
         if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_SWEEPING)) {
-          claimed = tld; theap0 = tld->park_theap0; break;
+          // #366: the claim names its holder; that is what authorises the foreign door
+          // (`_mi_thread_idle_work_ex` asserts it) and what `_mi_gate_held` checks for the
+          // sweeper's own accesses in a gated debug build.
+          mi_atomic_store_release(&tld->sweeper, (uintptr_t)_mi_thread_id());
+          claimed = tld; break;
         }
       }
     }
     if (claimed == NULL) return due_in;   // nothing parked (any more) that is due yet
-    #if MI_DEBUG
-    // #272 profiler-interaction invariant (3): the parked thread's own sampling countdown is
-    // its own. Nothing in the sweep may advance or reset it -- the profiler decides when to
-    // sample from the OWNER's allocation stream, and a sweep that touched these would make a
-    // parked thread's next sample depend on how often the scavenger happened to visit it.
-    const mi_profiler_tld_t prof_before = claimed->profiler;
-    #endif
+    mi_theap_t* const theap0 = mi_tld_sweep_theap0(claimed);   // #366: NULL `park_theap0` in a gated build
     // NOTE: `holes_sweep_last` is stamped by `_mi_purge_holes_of` itself, not here -- it is the
     // one path both the scavenger and a direct `mi_on_thread_idle()` go through, so the owner's
     // own sweeps are paced by, and visible to, the same clock. Stamping here as well would make
     // the interval check inside it see `now - last == 0` and skip every scavenger-driven sweep.
+    // (The #272 profiler-invariant asserts around the sweep live in `_mi_thread_idle_work_ex`.)
     _mi_thread_idle_work(claimed, theap0);
-    #if MI_DEBUG
-    mi_assert_internal(claimed->profiler.bytes_since_sample == prof_before.bytes_since_sample &&
-                       claimed->profiler.next_threshold    == prof_before.next_threshold &&
-                       claimed->profiler.random            == prof_before.random &&
-                       claimed->profiler.generation        == prof_before.generation);
-    #endif
     // #272 profiler-interaction invariant (3): the sweep must leave this thread without a theap
     // of its own. If any hook or stat on the sweep path forced `_mi_theap_default()` into
     // existence here, the scavenger would (a) acquire this fork's per-thread profiler/hook
@@ -194,7 +289,11 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     // Mark BEFORE releasing: a `park_swept` set after the store could land on the thread's *next*
     // park and silently skip that sweep. Cleared by `mi_on_thread_idle_start`. If we bailed out
     // early on `park_reclaim`, the owner is leaving the park anyway, so the rest is its next park's.
-    mi_atomic_store_release(&claimed->park_swept, 1);
+    // (#366 gated build: the round stamp -- see the function comment.)
+    mi_atomic_store_release(&claimed->park_swept, swept_mark);
+    // #366: drop the claim's holder BEFORE the state goes back: a `_mi_gate_held` that reads
+    // PARKED never consults `sweeper`, and a later claimant overwrites it under its own CAS.
+    mi_atomic_store_release(&claimed->sweeper, (uintptr_t)0);
     // Back to PARKED, not RUNNING: the owner is still blocked and still owns the transition out.
     mi_atomic_store_release(&claimed->park_state, MI_PARK_PARKED);
   }
@@ -208,7 +307,8 @@ void _mi_scavenger_start(void) { }
 void _mi_scavenger_stop(void)  { }
 void _mi_scavenger_wake(mi_subproc_t* subproc) { MI_UNUSED(subproc); }
 bool _mi_scavenger_is_running(void) { return false; }
-void _mi_scavenger_forked_child(void) { }
+void _mi_scavenger_forked_child(void) {
+  mi_atomic_store_release(&_mi_scavenger_tld, (uintptr_t)0); }   // #366: that thread did not survive the fork
 void _mi_scavenger_start_lazy(void) { _mi_scavenger_start(); }
 
 #else
@@ -220,6 +320,16 @@ static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = runnin
 // thread any more. Without it `_mi_scavenger_start_lazy` -- reachable from a thread that parks
 // while the process is tearing down -- can spawn a scavenger AFTER the stop that was supposed
 // to join it, leaving a thread walking a subproc that is being dismantled.
+// #366: the scavenger's own thread id. In a Windows DLL build the loader's TLS callback runs
+// `mi_win_main(DLL_THREAD_ATTACH)` -> `mi_thread_init` for EVERY new thread, this one included,
+// so the scavenger owns a registered tld it never allocates from and never parks -- a thread
+// that would sit RUNNING forever and be reported "pending" by every `mi_purge_all`. The walk
+// skips it (src/purge-all.c) -- by POINTER, never by thread id: a fork child's first new thread
+// reuses the dead sibling's TLS base, i.e. its id, and an id match would alias that orphan.
+// NULL until the thread runs, or when it has no tld (every non-DLL build); reset in the child.
+static _Atomic(uintptr_t) _mi_scavenger_tld;
+mi_tld_t* _mi_scavenger_tld_ptr(void) { return (mi_tld_t*)mi_atomic_load_acquire(&_mi_scavenger_tld); }
+
 static _Atomic(uintptr_t) _mi_scavenger_shutdown;
 
 // -----------------------------------------------------------------------------
@@ -410,6 +520,10 @@ static void mi_scav_init(void) { }
 // -----------------------------------------------------------------------------
 
 static void mi_scavenger_run(void) {
+  {   // #366: see `_mi_scavenger_tld`
+    mi_theap_t* const own = _mi_theap_default();
+    mi_atomic_store_release(&_mi_scavenger_tld, (uintptr_t)(mi_theap_is_initialized(own) ? own->tld : NULL));
+  }
   // Use the main subproc directly: this thread never allocates, so don't
   // initialise a theap/tld via _mi_subproc()'s TLS path.
   mi_subproc_t* const subproc = _mi_subproc_main();
@@ -563,7 +677,8 @@ void _mi_scavenger_stop(void) {
   }
 }
 
-void _mi_scavenger_forked_child(void) { }    // no fork on Windows
+void _mi_scavenger_forked_child(void) {
+  mi_atomic_store_release(&_mi_scavenger_tld, (uintptr_t)0); }   // #366: that thread did not survive the fork    // no fork on Windows
 void _mi_scavenger_start_lazy(void) {        // see the POSIX one
   if (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0) return;
   static _Atomic(uintptr_t) started;
@@ -652,6 +767,7 @@ void _mi_scavenger_stop(void) {
 // child would: take the wake path in `_mi_arenas_purge_now` and signal nobody (so never purge at
 // all), and `pthread_join` a `pthread_t` that names no thread at exit.
 void _mi_scavenger_forked_child(void) {
+  mi_atomic_store_release(&_mi_scavenger_tld, (uintptr_t)0);   // #366: that thread did not survive the fork
   mi_atomic_store_release(&_mi_scavenger_shutdown, (uintptr_t)0);   // a fresh image, not a teardown
   mi_atomic_store_release(&_mi_scavenger_joinable, (uintptr_t)0);
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
@@ -685,10 +801,15 @@ void _mi_scavenger_start_lazy(void) {
 // The original entry point: do the work inline, on the calling thread. Kept for callers that
 // have no wake-up side to pair with (and as the fallback when no scavenger is running).
 void mi_on_thread_idle(void) mi_attr_noexcept {
-  mi_theap_t* const theap0 = _mi_theap_default();
+  mi_theap_t* theap0 = _mi_theap_default();
   if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
   if (theap0->tld->thread_id != _mi_thread_id()) return;
+  // #366: an allocator call, so it takes the owner door: in a gated build this thread is PARKED
+  // on entry and the scavenger may be sweeping it; the hole sweep below rewrites free lists
+  // outside any gated entry point, so the whole body is one enter / one leave.
+  MI_GATE_ENTER(theap0);
   _mi_thread_idle_work(theap0->tld, theap0);
+  MI_GATE_LEAVE(theap0->tld);
 }
 
 // Declare that this thread will not allocate or free until `mi_on_thread_idle_end` -- the sweep's
@@ -707,6 +828,16 @@ bool mi_on_thread_idle_start(void) mi_attr_noexcept {
   if (tld->subproc != _mi_subproc_main()) return false;
   _mi_scavenger_start_lazy();
   if (!_mi_scavenger_is_running()) return false;
+  #if MI_OWNER_GATE
+  // #366: in a gated build this thread is already PARKED whenever it is outside the allocator
+  // (`_mi_gate_leave`), and the scavenger's timed sweep reaches it without a hand-off -- which
+  // is why the lazy start above still runs: the plan (§2) needs the scavenger running to pace
+  // busy threads. Report "nothing handed off" so callers keep their documented fallback;
+  // `mi_on_thread_idle()` still works (it is an allocator call). Nudge the scavenger anyway:
+  // a caller that announces idleness is exactly the thread whose park is due.
+  _mi_scavenger_wake(tld->subproc);
+  return false;
+  #else
 
   // Already parked (a second `_start` without an `_end`): the scavenger may be reading the fields
   // below right now. Only this thread takes the state out of RUNNING, so past this check they are ours.
@@ -720,17 +851,22 @@ bool mi_on_thread_idle_start(void) mi_attr_noexcept {
   mi_atomic_increment_relaxed(&tld->subproc->parked_count);
   _mi_scavenger_wake(tld->subproc);
   return true;
+  #endif
 }
 
 // The other half: we are awake and about to allocate again, so take the theaps back. Usually an
 // uncontended CAS. If the scavenger is mid-sweep we ask it to stop (it checks between phases) and
 // spin until it does -- normally a syscall-free wait.
 void mi_on_thread_idle_end(void) mi_attr_noexcept {
+  #if MI_OWNER_GATE
+  // #366: no-op -- `_start` handed nothing off, and the next allocator call is the acquire.
+  #else
   mi_theap_t* const theap0 = _mi_theap_default();
   if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
   mi_tld_t* const tld = theap0->tld;
   if (tld->thread_id != _mi_thread_id()) return;
   _mi_park_leave(tld);
+  #endif
 }
 
 void mi_scavenger_stop(void) mi_attr_noexcept {

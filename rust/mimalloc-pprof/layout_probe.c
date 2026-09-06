@@ -154,6 +154,21 @@ static const mi_rs_layout_entry_t mi_rs_layout_entries[] = {
   MI_RS_OFFSET(mi_purge_holes_stats_t, blocks_visited)
   MI_RS_OFFSET(mi_purge_holes_stats_t, full_sweeps)
 
+  /* ---- include/mimalloc.h: mi_purge_all (issue #366) ---- */
+  MI_RS_SIZEOF(mi_purge_all_report_t)
+  MI_RS_OFFSET(mi_purge_all_report_t, arena_bytes)
+  MI_RS_OFFSET(mi_purge_all_report_t, hole_bytes)
+  MI_RS_OFFSET(mi_purge_all_report_t, theaps_swept)
+  MI_RS_OFFSET(mi_purge_all_report_t, theaps_pending)
+  MI_RS_OFFSET(mi_purge_all_report_t, theaps_orphaned)
+  MI_RS_OFFSET(mi_purge_all_report_t, gated)
+  MI_RS_OFFSET(mi_purge_all_report_t, complete)
+  MI_RS_SIZEOF(mi_purge_flags_t)
+  MI_RS_CONST(MI_PURGE_FORCE)
+  MI_RS_CONST(MI_PURGE_OK)
+  MI_RS_CONST(MI_PURGE_PARTIAL)
+  MI_RS_CONST(MI_PURGE_BUSY)
+
   /* ---- include/mimalloc-stats.h ---- */
   MI_RS_SIZEOF(mi_stat_count_t)
   MI_RS_OFFSET(mi_stat_count_t, total)

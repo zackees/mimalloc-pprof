@@ -355,7 +355,7 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
   }
 }
 
-void mi_heap_delete(mi_heap_t* heap) {
+static mi_decl_forceinline void mi_heap_delete_inner(mi_heap_t* heap) {
   if (heap==NULL) return;
   mi_heap_t* heap_main = mi_heap_get_heap_main(heap);
   if (heap == heap_main) {
@@ -366,6 +366,19 @@ void mi_heap_delete(mi_heap_t* heap) {
   _mi_heap_move_pages(heap, heap_main);
   mi_heap_free_theaps(heap);
   mi_heap_free(heap,true /* acquire subproc->heaps_lock */);
+}
+
+// #366: owner-gate site (docs/purge-all-implementation.md §5.1): mutates theap ownership (the
+// caller's theap of `heap` is detached and its pages move to the main heap). Gated on the
+// caller's own tld. One enter, exactly one leave.
+void mi_heap_delete(mi_heap_t* heap) {
+  mi_theap_t* self = _mi_theap_default();
+  MI_GATE_ENTER(self);
+  mi_heap_delete_inner(heap);
+  MI_GATE_LEAVE(self->tld);
+  #if !MI_OWNER_GATE
+  MI_UNUSED(self);
+  #endif
 }
 
 void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
@@ -385,13 +398,24 @@ void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   }
 }
 
-void mi_heap_destroy(mi_heap_t* heap) {
+static mi_decl_forceinline void mi_heap_destroy_inner(mi_heap_t* heap) {
   if (heap==NULL) return;
   if (_mi_is_heap_main(heap)) {
     _mi_warning_message("cannot destroy the main heap\n");
     return;
   }
   _mi_heap_force_destroy(heap,true /* acquire subproc->heaps_lock */);
+}
+
+// #366: owner-gate site (docs/purge-all-implementation.md §5.1); see `mi_heap_delete`.
+void mi_heap_destroy(mi_heap_t* heap) {
+  mi_theap_t* self = _mi_theap_default();
+  MI_GATE_ENTER(self);
+  mi_heap_destroy_inner(heap);
+  MI_GATE_LEAVE(self->tld);
+  #if !MI_OWNER_GATE
+  MI_UNUSED(self);
+  #endif
 }
 
 mi_heap_t* mi_heap_of(const void* p) {

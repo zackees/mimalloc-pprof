@@ -116,7 +116,11 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   NULL,                   // subproc_next (unregistered)
   0, 0,                   // holes_sweep_seq / holes_sweep_last (#272 P7b)
   false, false,           // holes_sweeping / holes_sweep_full
-  0, 0                    // holes_sweep_skipped / holes_sweep_visited
+  0, 0,                   // holes_sweep_skipped / holes_sweep_visited
+  0,                      // gate_depth (#366)
+  MI_ATOMIC_VAR_INIT(0),  // sweeper
+  MI_ATOMIC_VAR_INIT(0),  // purge_epoch
+  MI_ATOMIC_VAR_INIT(0)   // gate_flags
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -253,6 +257,14 @@ static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc) 
   tld->subproc = subproc;
   tld->theaps = NULL;
   mi_lock_init(&tld->theaps_lock);
+  // #366: a fresh tld starts RUNNING at gate_depth 0 with no sweeper and no flags (the memory
+  // is zeroed, but say so): in a gated build `_mi_gate_enter` runs `mi_thread_init` BEFORE its
+  // own `gate_depth++`, so the tld is registered RUNNING and the outer enter treats that as
+  // "mine" (`_mi_park_leave_gate`). `purge_epoch` is stamped by `mi_tld_register` under `tlds_lock`.
+  tld->gate_depth = 0;
+  mi_atomic_store_relaxed(&tld->park_state, (size_t)MI_PARK_RUNNING);
+  mi_atomic_store_relaxed(&tld->sweeper, (uintptr_t)0);
+  mi_atomic_store_relaxed(&tld->gate_flags, (size_t)0);
   if (tld->thread_id == MI_THREADID_DETACHED) {
     tld->numa_node = -1;
   }
@@ -306,6 +318,10 @@ static void mi_tld_register(mi_tld_t* tld) {
       tld->subproc_next = subproc->tlds;
       subproc->tlds = tld;
     }
+    // #366: registry cutoff (docs/purge-all-implementation.md §7.1). Stamped under `tlds_lock`,
+    // the same lock the `mi_purge_all` walk reads it under, so a thread created during a walk is
+    // already "done" for that epoch and thread churn cannot extend the walk.
+    mi_atomic_store_relaxed(&tld->purge_epoch, mi_atomic_load_relaxed(&_mi_purge_seq));
   }
 }
 
@@ -431,6 +447,19 @@ mi_theap_t* _mi_thread_init_with_heap(mi_heap_t* heap_main)
     // of another one -- so nothing is lost.
     _mi_scavenger_start_lazy();
   }
+  #if MI_OWNER_GATE
+  // #366: in a gated build a thread that is not inside an allocator call is PARKED, and a
+  // thread that has JUST initialised is outside one -- unless this init ran from inside a
+  // gated operation (depth >= 1: a `mi_heap_new` under the gate, say), which stays RUNNING.
+  // `_mi_gate_enter` initialises at depth 0 too and then acquires (PARKED -> RUNNING), so the
+  // store is right for it as well. Without this, a thread the platform initialises for us
+  // (the Windows loader's TLS callback runs `mi_thread_init` for every new thread) that
+  // never allocates would sit RUNNING forever and be "pending" to every `mi_purge_all`.
+  // Done LAST: the theap must be fully set up before a sweeper may claim the tld.
+  if (theap != NULL && theap->tld != NULL && theap->tld->thread_id == _mi_thread_id() && theap->tld->gate_depth == 0) {
+    mi_atomic_store_release(&theap->tld->park_state, (size_t)MI_PARK_PARKED);
+  }
+  #endif
   return theap;
 }
 
@@ -562,7 +591,18 @@ void _mi_thread_done(mi_theap_t* _theap_main)
   // not ours to leave (the thread-id check further down guards the rest of the teardown the
   // same way, but the dynamic thread_local release below is the CALLING thread's own and must
   // still happen).
-  if (tld->thread_id == _mi_prim_thread_id()) { _mi_park_leave(tld); }
+  if (tld->thread_id == _mi_prim_thread_id()) {
+    #if MI_OWNER_GATE
+    // #366: owner-gate site (docs/purge-all-implementation.md §5.1) -- the owner acquire (it also
+    // waits out an in-flight foreign sweep, like `_mi_park_leave`, but without the
+    // `parked_count` decrement, which is `mi_on_thread_idle_start`'s). Deliberately NEVER left:
+    // `mi_tld_free` unregisters the tld below and an unregistered RUNNING tld can never be found
+    // or claimed, and nothing may dereference the freed tld afterwards.
+    MI_GATE_ENTER(_theap_main);
+    #else
+    _mi_park_leave(tld);
+    #endif
+  }
 
   // release dynamic thread_local's
   _mi_thread_locals_thread_done();

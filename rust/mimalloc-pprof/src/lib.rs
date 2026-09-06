@@ -343,6 +343,150 @@ pub fn purge_holes_stats() -> sys::MiPurgeHolesStats {
     stats
 }
 
+/// Flags for [`purge_all_ex`] (issue #366).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PurgeFlags {
+    /// Ignore `purge_delay` and hole-purge pacing, and let a claimed sweep run to
+    /// completion (`MI_PURGE_FORCE`). [`purge_all`]`(true)` is this flag set.
+    pub force: bool,
+}
+
+impl PurgeFlags {
+    /// Every flag clear: honour the purge pacing options.
+    pub const NONE: PurgeFlags = PurgeFlags { force: false };
+    /// `MI_PURGE_FORCE`.
+    pub const FORCE: PurgeFlags = PurgeFlags { force: true };
+
+    fn to_c(self) -> sys::mi_purge_flags_t {
+        if self.force {
+            sys::MI_PURGE_FORCE
+        } else {
+            0
+        }
+    }
+}
+
+/// The outcome of a [`purge_all`] / [`purge_all_ex`] call (issue #366).
+///
+/// `Partial` is a **normal outcome**, not an error: in a default build only threads
+/// parked in [`park_while_idle`] can be swept from another thread, so every running
+/// thread is reported as pending. Only `Busy` means nothing happened at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PurgeStatus {
+    /// Every registered thread was reached (`MI_PURGE_OK`).
+    Ok,
+    /// Some owners were still pending when `wait_ms` ran out; everything reachable was
+    /// purged (`MI_PURGE_PARTIAL`). See [`PurgeAllReport::theaps_pending`].
+    Partial,
+    /// Another purge is in flight, or this is a re-entrant call: nothing was done
+    /// (`MI_PURGE_BUSY`).
+    Busy,
+}
+
+impl PurgeStatus {
+    fn from_c(rc: core::ffi::c_int) -> PurgeStatus {
+        match rc {
+            sys::MI_PURGE_OK => PurgeStatus::Ok,
+            sys::MI_PURGE_PARTIAL => PurgeStatus::Partial,
+            sys::MI_PURGE_BUSY => PurgeStatus::Busy,
+            other => unreachable!("mi_purge_all_ex returned an unknown status {other}"),
+        }
+    }
+}
+
+/// What a [`purge_all`] / [`purge_all_ex`] call returned to the OS and which threads it
+/// could not reach (issue #366). Mirrors `mi_purge_all_report_t`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PurgeAllReport {
+    /// Bytes returned to the OS by the arena passes.
+    pub arena_bytes: usize,
+    /// Bytes returned by hole purging (every swept thread plus abandoned pages).
+    pub hole_bytes: usize,
+    /// Threads claimed and swept by this call, the caller included.
+    pub theaps_swept: usize,
+    /// Registered threads not reached within `wait_ms`. Non-zero is the expected shape in
+    /// a default (ungated) build with running threads.
+    pub theaps_pending: usize,
+    /// Pre-fork threads of vanished threads, never touched.
+    pub theaps_orphaned: usize,
+    /// Whether the allocator was built with the owner gate (the crate's `owner-gate`
+    /// feature, C's `MI_OWNER_GATE=1`). Configuration, not completion.
+    pub gated: bool,
+    /// `theaps_pending == 0 && theaps_orphaned == 0`.
+    pub complete: bool,
+}
+
+impl From<sys::mi_purge_all_report_t> for PurgeAllReport {
+    fn from(r: sys::mi_purge_all_report_t) -> PurgeAllReport {
+        PurgeAllReport {
+            arena_bytes: r.arena_bytes,
+            hole_bytes: r.hole_bytes,
+            theaps_swept: r.theaps_swept,
+            theaps_pending: r.theaps_pending,
+            theaps_orphaned: r.theaps_orphaned,
+            gated: r.gated,
+            complete: r.complete,
+        }
+    }
+}
+
+/// Process-wide eager purge from any thread (issue #366): the full form of [`purge_all`].
+///
+/// Returns as much memory as the allocator's invariants allow across ALL threads' heaps --
+/// arenas, abandoned pages, the caller's own pages and holes, and every other registered
+/// thread's pages and holes that can be claimed: any thread parked in [`park_while_idle`],
+/// and, with the `owner-gate` feature (C `MI_OWNER_GATE=1`), any thread that is outside an
+/// allocator call for long enough to be caught. The report says exactly what was returned
+/// and what could not be reached.
+///
+/// `wait_ms` bounds **owner-acquisition waiting only** -- how long this call keeps trying
+/// to claim other threads' state. It does not bound a claimed thread's sweep, nor the
+/// `madvise`/`DiscardVirtualMemory` syscalls that sweep makes, so the call can take longer
+/// than `wait_ms` once it has something to purge.
+///
+/// [`PurgeStatus::Partial`] is a normal outcome, not a failure: everything reachable was
+/// purged and `theaps_pending` counts the threads that were not. In a default build with
+/// other threads running it is the *usual* outcome. Only [`PurgeStatus::Busy`] means
+/// nothing was done (another purge is in flight, or this call re-entered one), and the
+/// report is then all zeros apart from `gated`.
+///
+/// ```
+/// # use mimalloc_pprof as mi;
+/// let (status, report) = mi::purge_all_ex(mi::PurgeFlags::FORCE, 100);
+/// assert_ne!(status, mi::PurgeStatus::Busy);
+/// assert_eq!(report.complete, report.theaps_pending == 0 && report.theaps_orphaned == 0);
+/// ```
+pub fn purge_all_ex(flags: PurgeFlags, wait_ms: usize) -> (PurgeStatus, PurgeAllReport) {
+    let mut report = sys::mi_purge_all_report_t::default();
+    let rc = unsafe { sys::mi_purge_all_ex(flags.to_c(), wait_ms, &raw mut report) };
+    (PurgeStatus::from_c(rc), PurgeAllReport::from(report))
+}
+
+/// Process-wide eager purge from any thread (issue #366), with the C default of a 100 ms
+/// owner-acquisition wait: `mi_purge_all(force)`, but with the report kept.
+///
+/// `force` ignores the `purge_delay` / hole-purge pacing options and lets each claimed
+/// sweep run to completion. See [`purge_all_ex`] for what the wait bounds (owner
+/// acquisition only, never a sweep or its syscalls) and why a partial result -- some
+/// threads pending -- is the normal outcome in a build without the `owner-gate` feature.
+/// The status is [`PurgeAllReport::complete`]; a busy (nothing-done) call reports zero
+/// `theaps_swept`. Use [`purge_all_ex`] when the status itself is needed.
+///
+/// Goes through `mi_purge_all_ex` rather than C's `mi_purge_all`, which is the same call
+/// with the report thrown away.
+pub fn purge_all(force: bool) -> PurgeAllReport {
+    let flags = if force {
+        PurgeFlags::FORCE
+    } else {
+        PurgeFlags::NONE
+    };
+    purge_all_ex(flags, PURGE_ALL_DEFAULT_WAIT_MS).1
+}
+
+/// The `wait_ms` C's `mi_purge_all` passes to `mi_purge_all_ex`, and what [`purge_all`]
+/// uses.
+pub const PURGE_ALL_DEFAULT_WAIT_MS: usize = 100;
+
 /// Exact DHAT v2 heap/lifetime profiling controls.
 ///
 /// DHAT records every non-internal allocation from the moment [`start`] succeeds.

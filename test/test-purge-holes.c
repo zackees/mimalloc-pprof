@@ -1708,9 +1708,19 @@ static bool test_owner_sweep_pacing(void) {
 
   // (c) past the window: the very next `mi_on_thread_idle()` sweeps again. The deadline has
   // to EXPIRE, not merely be disabled -- so wait it out rather than setting the option to 0.
+  #if MI_OWNER_GATE
+  // #366: in a gated build this thread is PARKED for the whole wait, so the scavenger sweeps it
+  // as soon as the window expires -- which re-stamps `holes_sweep_last`, and the owner's own
+  // `mi_on_thread_idle()` below then lands INSIDE a fresh window and (correctly) does nothing.
+  // The contract "a sweep happens past the window" still holds; count from before the wait.
+  const int64_t before_out = pace_sweep_work();
+  pace_sleep_ms(PACE_INTERVAL_MS + (PACE_INTERVAL_MS / 2));
+  if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
+  #else
   pace_sleep_ms(PACE_INTERVAL_MS + (PACE_INTERVAL_MS / 2));
   if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
   const int64_t before_out = pace_sweep_work();
+  #endif
   mi_on_thread_idle();
   const int64_t after_out = pace_sweep_work();
   if (purging_enabled && after_out <= before_out) {

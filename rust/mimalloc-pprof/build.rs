@@ -33,6 +33,17 @@ fn main() {
             } else {
                 "0"
             },
+        )
+        // Issue #366: the per-thread owner gate behind `purge_all`. Mirrors CMake's
+        // `MI_OWNER_GATE` option; the C code tests `#if MI_OWNER_GATE`, so it is always
+        // defined, to 0 or 1.
+        .define(
+            "MI_OWNER_GATE",
+            if env::var_os("CARGO_FEATURE_OWNER_GATE").is_some() {
+                "1"
+            } else {
+                "0"
+            },
         );
     if env::var("PROFILE").as_deref() == Ok("release") {
         build.define("NDEBUG", None);

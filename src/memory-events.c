@@ -375,10 +375,22 @@ static bool mi_cdecl memevt_visit_adapter(const mi_heap_t* heap, const mi_heap_a
   return ctx->visitor(block, block_size, ctx->arg);
 }
 
+static bool mi_memory_visit_live_allocations_inner(mi_theap_t* theap, mi_memory_allocation_visit_fun* visitor, void* arg);
+
+// #366: owner-gate site -- `_mi_theap_area_visit_blocks` folds each page's thread frees, an
+// owner-private write on this thread's own theaps; be RUNNING for the walk (see theap.c
+// `mi_theap_visit_blocks`). One enter, exactly one leave.
 bool mi_memory_visit_live_allocations(mi_memory_allocation_visit_fun* visitor, void* arg) mi_attr_noexcept {
   if (visitor == NULL) return false;
-  mi_theap_t* const theap = _mi_theap_default();
+  mi_theap_t* theap = _mi_theap_default();
   if (!mi_theap_is_initialized(theap)) return true; // nothing to visit yet on this thread.
+  MI_GATE_ENTER(theap);
+  const bool ok = mi_memory_visit_live_allocations_inner(theap, visitor, arg);
+  MI_GATE_LEAVE(theap->tld);
+  return ok;
+}
+
+static bool mi_memory_visit_live_allocations_inner(mi_theap_t* theap, mi_memory_allocation_visit_fun* visitor, void* arg) {
   if (theap->tld->hooks.memevt_suppress_depth > 0) return false; // do not reenter while a callback/internal-op is in flight on this thread.
   memevt_visit_ctx_t ctx = { visitor, arg };
   // Walk every theap on this thread (tld->theaps, via tnext), and for each, walk its own

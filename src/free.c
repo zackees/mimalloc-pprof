@@ -33,6 +33,7 @@ static inline void mi_free_block_local(mi_page_t* page, mi_block_t* block, bool 
   // owner is here while its own theap is mid-sweep (MI_PARK_SWEEPING), this free races the
   // scavenger's walk. Zero cost in release builds; keep even if it stays quiet for a long time.
   mi_assert_internal(mi_atomic_load_relaxed(&mi_page_theap(page)->tld->park_state) != MI_PARK_SWEEPING);
+  MI_GATE_ASSERT_HELD(mi_page_theap(page));   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2)
   // checks
   if mi_unlikely(mi_check_is_double_free(page, block)) return;
   #if MI_PPROF
@@ -164,7 +165,9 @@ static inline bool mi_block_check_unguard(mi_page_t* page, mi_block_t* block, vo
 
 // free a local pointer  (page parameter comes first for better codegen)
 static void mi_decl_noinline mi_free_generic_local(mi_page_t* page, void* p) mi_attr_noexcept {
+  #if !MI_OWNER_GATE   // #366: in a gated build the owner is RUNNING at gate_depth>=1 here (`mi_free_ex`), and `_mi_park_leave` would wrongly decrement `parked_count`
   _mi_park_leave_if_parked(mi_page_theap(page));   // #272: an owner-side free while parked (e.g. from a TLS destructor)
+  #endif
   mi_assert_internal(p!=NULL && page != NULL);
   mi_block_t* const block = (mi_page_has_interior_pointers(page) ? _mi_page_ptr_unalign(page, p) : mi_validate_block_from_ptr(page,p));
   const bool was_guarded = mi_block_check_unguard(page, block, p);
@@ -208,7 +211,7 @@ static inline mi_page_t* mi_validate_ptr_page(const void* p, const char* msg)
 
 // Free a block
 // Fast path written carefully to prevent register spilling on the stack
-static mi_decl_forceinline void mi_free_ex(void* p, mi_page_t* page, size_t* pblock_size, bool allow_collect)  
+static mi_decl_forceinline void mi_free_ex_inner(void* p, mi_page_t* page, size_t* pblock_size, bool allow_collect)
 {
   if mi_unlikely(page==NULL) { // page will be NULL if p==NULL
     if (pblock_size!=NULL) { *pblock_size = 0; }
@@ -237,6 +240,27 @@ static mi_decl_forceinline void mi_free_ex(void* p, mi_page_t* page, size_t* pbl
     // page is full or contains (inner) aligned blocks; use generic multi-thread path
     mi_free_generic_mt(page, p, allow_collect);
   }
+}
+
+// #366: owner-gate site (docs/purge-all-implementation.md §5.1). Gated on the CALLER's tld
+// regardless of branch: the mt branch may reclaim an abandoned page into the caller's theap.
+// A thread with no theap owns no pages, so its free is not gated -- and a free must never
+// initialise a thread (that would be `MI_GATE_ENTER`'s `mi_theap_get_default`). One enter,
+// exactly one leave; expands to the plain body when MI_OWNER_GATE is 0.
+static mi_decl_forceinline void mi_free_ex(void* p, mi_page_t* page, size_t* pblock_size, bool allow_collect)
+{
+  #if MI_OWNER_GATE
+  mi_theap_t* theap = _mi_theap_default();
+  if mi_unlikely(!mi_theap_is_initialized(theap)) {
+    mi_free_ex_inner(p, page, pblock_size, allow_collect);
+    return;
+  }
+  MI_GATE_ENTER(theap);
+  mi_free_ex_inner(p, page, pblock_size, allow_collect);
+  MI_GATE_LEAVE(theap->tld);
+  #else
+  mi_free_ex_inner(p, page, pblock_size, allow_collect);
+  #endif
 }
 
 void _mi_free_in_page(void* p, mi_page_t* page) mi_attr_noexcept {

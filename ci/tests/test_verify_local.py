@@ -229,6 +229,8 @@ class VerifyLocalDriftTests(unittest.TestCase):
             "debug3-extra",
             "guarded",
             "shared",
+            "gated",
+            "fastpath",
             "bundle",
             "memory-gate",
             "diag",

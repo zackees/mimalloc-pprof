@@ -1,0 +1,324 @@
+{
+  "busy_threads": 4,
+  "commit": "c7d4810d",
+  "cpu": "AMD Ryzen 7 3700X 8-Core Processor",
+  "idle_seconds": 10,
+  "kernel": "6.18.48",
+  "runs_per_series": 3,
+  "selection_rule": "per series, the run with the lowest after-idle VmRSS of 3 repetitions; the same rule for every allocator",
+  "series": {
+    "bun-mimalloc-busy-collect": {
+      "after_idle_rss_mb": 230.41796875,
+      "allocator_id": "bun-mimalloc",
+      "build_flags": [],
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "mi_collect(true) every 100 ms",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 266.98046875,
+      "label": "Bun mimalloc",
+      "note": "",
+      "peak_rss_mb": 266.98046875,
+      "percent_returned": 13.694822011207513,
+      "pin": "bun-dev3-v2@b20b60d9",
+      "purge_max_pending": 0,
+      "purge_status": -1,
+      "runs": [
+        {
+          "after_idle_rss_mb": 230.41796875,
+          "idle_start_rss_mb": 266.98046875,
+          "peak_rss_mb": 266.98046875
+        },
+        {
+          "after_idle_rss_mb": 231.90234375,
+          "idle_start_rss_mb": 254.96484375,
+          "peak_rss_mb": 254.96484375
+        },
+        {
+          "after_idle_rss_mb": 231.55078125,
+          "idle_start_rss_mb": 264.98828125,
+          "peak_rss_mb": 264.98828125
+        }
+      ]
+    },
+    "glibc-busy-trim": {
+      "after_idle_rss_mb": 76.46875,
+      "allocator_id": "glibc",
+      "build_flags": [],
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "malloc_trim(0) every 100 ms",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 277.734375,
+      "label": "glibc malloc",
+      "note": "the second any-thread reference: malloc_trim walks every arena",
+      "peak_rss_mb": 277.734375,
+      "percent_returned": 72.46694796061884,
+      "pin": "glibc 2.42",
+      "purge_max_pending": 0,
+      "purge_status": -1,
+      "runs": [
+        {
+          "after_idle_rss_mb": 76.46875,
+          "idle_start_rss_mb": 277.734375,
+          "peak_rss_mb": 277.734375
+        },
+        {
+          "after_idle_rss_mb": 76.47265625,
+          "idle_start_rss_mb": 277.73828125,
+          "peak_rss_mb": 277.73828125
+        },
+        {
+          "after_idle_rss_mb": 76.46875,
+          "idle_start_rss_mb": 277.734375,
+          "peak_rss_mb": 277.734375
+        }
+      ]
+    },
+    "jemalloc-busy-purge": {
+      "after_idle_rss_mb": 73.2890625,
+      "allocator_id": "jemalloc",
+      "build_flags": [],
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "mallctl(\"arena.<all>.purge\") every 100 ms",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 283.0078125,
+      "label": "jemalloc",
+      "note": "the measurement behind its documented any-thread purge",
+      "peak_rss_mb": 283.0078125,
+      "percent_returned": 74.10351966873706,
+      "pin": "5.3.1@81034ce1f1373e37dc865038e1bc8eeecf559ce8",
+      "purge_max_pending": 0,
+      "purge_status": -1,
+      "runs": [
+        {
+          "after_idle_rss_mb": 73.3046875,
+          "background_thread": false,
+          "idle_start_rss_mb": 283.05078125,
+          "peak_rss_mb": 283.05078125
+        },
+        {
+          "after_idle_rss_mb": 73.34375,
+          "background_thread": false,
+          "idle_start_rss_mb": 283.08984375,
+          "peak_rss_mb": 283.08984375
+        },
+        {
+          "after_idle_rss_mb": 73.2890625,
+          "background_thread": false,
+          "idle_start_rss_mb": 283.0078125,
+          "peak_rss_mb": 283.0078125
+        }
+      ]
+    },
+    "mimalloc-pprof-busy-collect": {
+      "after_idle_rss_mb": 230.38671875,
+      "allocator_id": "mimalloc-pprof",
+      "build_flags": [],
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "mi_collect(true) every 100 ms",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 266.94921875,
+      "label": "mimalloc-pprof",
+      "note": "mi_collect is caller-only by design; this is the ceiling of the pre-#366 API",
+      "peak_rss_mb": 266.94921875,
+      "percent_returned": 13.696425174497726,
+      "pin": "workflow-source",
+      "purge_max_pending": 0,
+      "purge_status": -1,
+      "runs": [
+        {
+          "after_idle_rss_mb": 230.625,
+          "idle_start_rss_mb": 255.0,
+          "peak_rss_mb": 255.0
+        },
+        {
+          "after_idle_rss_mb": 230.38671875,
+          "idle_start_rss_mb": 266.94921875,
+          "peak_rss_mb": 266.94921875
+        },
+        {
+          "after_idle_rss_mb": 232.25390625,
+          "idle_start_rss_mb": 273.00390625,
+          "peak_rss_mb": 273.00390625
+        }
+      ]
+    },
+    "mimalloc-pprof-busy-nothing": {
+      "after_idle_rss_mb": 230.61328125,
+      "allocator_id": "mimalloc-pprof",
+      "build_flags": [],
+      "charted": false,
+      "env": {},
+      "idle_mechanism": "nothing (scavenger only)",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 254.98828125,
+      "label": "mimalloc-pprof",
+      "note": "control: the background scavenger alone, default build",
+      "peak_rss_mb": 254.98828125,
+      "percent_returned": 9.559262833769933,
+      "pin": "workflow-source",
+      "purge_max_pending": 0,
+      "purge_status": -1,
+      "runs": [
+        {
+          "after_idle_rss_mb": 232.24609375,
+          "idle_start_rss_mb": 258.99609375,
+          "peak_rss_mb": 258.99609375
+        },
+        {
+          "after_idle_rss_mb": 230.61328125,
+          "idle_start_rss_mb": 254.98828125,
+          "peak_rss_mb": 254.98828125
+        },
+        {
+          "after_idle_rss_mb": 232.2265625,
+          "idle_start_rss_mb": 250.9765625,
+          "peak_rss_mb": 250.9765625
+        }
+      ]
+    },
+    "mimalloc-pprof-busy-purge-all": {
+      "after_idle_rss_mb": 230.58984375,
+      "allocator_id": "mimalloc-pprof",
+      "build_flags": [],
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "mi_purge_all(true) every 100 ms -> PARTIAL, 4 pending",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 262.95703125,
+      "label": "mimalloc-pprof",
+      "note": "default build: arenas, abandoned pages and parked threads; busy owners pending",
+      "peak_rss_mb": 262.95703125,
+      "percent_returned": 12.308926422746111,
+      "pin": "workflow-source",
+      "purge_max_pending": 4,
+      "purge_status": 1,
+      "runs": [
+        {
+          "after_idle_rss_mb": 230.58984375,
+          "idle_start_rss_mb": 262.95703125,
+          "peak_rss_mb": 262.95703125
+        },
+        {
+          "after_idle_rss_mb": 232.0390625,
+          "idle_start_rss_mb": 270.96875,
+          "peak_rss_mb": 270.96875
+        },
+        {
+          "after_idle_rss_mb": 232.17578125,
+          "idle_start_rss_mb": 276.98046875,
+          "peak_rss_mb": 276.98046875
+        }
+      ]
+    },
+    "mimalloc-pprof-gated-busy-nothing": {
+      "after_idle_rss_mb": 126.93359375,
+      "allocator_id": "mimalloc-pprof-gated",
+      "build_flags": [
+        "-DMI_OWNER_GATE=ON"
+      ],
+      "charted": false,
+      "env": {},
+      "idle_mechanism": "nothing (scavenger only)",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 274.87890625,
+      "label": "mimalloc-pprof, MI_OWNER_GATE=ON",
+      "note": "control: in a gated build the scavenger's timed sweep reaches busy threads too",
+      "peak_rss_mb": 274.87890625,
+      "percent_returned": 53.821995480964624,
+      "pin": "workflow-source",
+      "purge_max_pending": 0,
+      "purge_status": -1,
+      "runs": [
+        {
+          "after_idle_rss_mb": 145.62109375,
+          "idle_start_rss_mb": 264.9296875,
+          "peak_rss_mb": 264.9296875
+        },
+        {
+          "after_idle_rss_mb": 147.515625,
+          "idle_start_rss_mb": 276.9453125,
+          "peak_rss_mb": 276.9453125
+        },
+        {
+          "after_idle_rss_mb": 126.93359375,
+          "idle_start_rss_mb": 274.87890625,
+          "peak_rss_mb": 274.87890625
+        }
+      ]
+    },
+    "mimalloc-pprof-gated-busy-purge-all": {
+      "after_idle_rss_mb": 72.16015625,
+      "allocator_id": "mimalloc-pprof-gated",
+      "build_flags": [
+        "-DMI_OWNER_GATE=ON"
+      ],
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "mi_purge_all(true) every 100 ms -> OK, 1 pending",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 254.91015625,
+      "label": "mimalloc-pprof, MI_OWNER_GATE=ON",
+      "note": "gated build: every registered thread is claimed between its allocator calls",
+      "peak_rss_mb": 254.91015625,
+      "percent_returned": 71.69192577041544,
+      "pin": "workflow-source",
+      "purge_max_pending": 1,
+      "purge_status": 0,
+      "runs": [
+        {
+          "after_idle_rss_mb": 72.16015625,
+          "idle_start_rss_mb": 254.91015625,
+          "peak_rss_mb": 254.91015625
+        },
+        {
+          "after_idle_rss_mb": 73.78515625,
+          "idle_start_rss_mb": 280.92578125,
+          "peak_rss_mb": 280.92578125
+        },
+        {
+          "after_idle_rss_mb": 73.76171875,
+          "idle_start_rss_mb": 280.91015625,
+          "peak_rss_mb": 280.91015625
+        }
+      ]
+    },
+    "upstream-mimalloc-busy-collect": {
+      "after_idle_rss_mb": 228.859375,
+      "allocator_id": "upstream-mimalloc",
+      "build_flags": [],
+      "charted": true,
+      "env": {},
+      "idle_mechanism": "mi_collect(true) every 100 ms",
+      "idle_seconds": 10,
+      "idle_start_rss_mb": 264.859375,
+      "label": "upstream mimalloc",
+      "note": "",
+      "peak_rss_mb": 264.859375,
+      "percent_returned": 13.59211845908796,
+      "pin": "dev3@bcee5a88",
+      "purge_max_pending": 0,
+      "purge_status": -1,
+      "runs": [
+        {
+          "after_idle_rss_mb": 229.58984375,
+          "idle_start_rss_mb": 264.83984375,
+          "peak_rss_mb": 264.83984375
+        },
+        {
+          "after_idle_rss_mb": 230.546875,
+          "idle_start_rss_mb": 260.859375,
+          "peak_rss_mb": 260.859375
+        },
+        {
+          "after_idle_rss_mb": 228.859375,
+          "idle_start_rss_mb": 264.859375,
+          "peak_rss_mb": 264.859375
+        }
+      ]
+    }
+  }
+}

@@ -72,6 +72,7 @@ option(MI_WIN_USE_FLS       "Use Fiber local storage on Windows to detect thread
 option(MI_CHECK_FULL        "Use full internal invariant checking in DEBUG mode (deprecated, use MI_DEBUG_FULL instead)" OFF)
 option(MI_USE_LIBATOMIC     "Explicitly link with -latomic (on older systems) (deprecated and detected automatically)" OFF)
 option(MI_PPROF             "Enable the allocation sampling profiler" ON)
+option(MI_OWNER_GATE        "Take a per-thread owner gate on every allocator call so mi_purge_all can sweep every thread (#366; slower fast path)" OFF)
 
 include(CheckLinkerFlag)    # requires cmake 3.18
 include(CheckIncludeFiles)
@@ -97,6 +98,7 @@ set(mi_sources
     src/page.c
     src/page-map.c
     src/page-holes.c
+    src/purge-all.c
     src/profile.c
     src/random.c
     src/scavenger.c
@@ -480,6 +482,11 @@ endif()
 if(MI_SHOW_ERRORS)
   message(STATUS "Enable printing of error and warning messages by default (MI_SHOW_ERRORS=ON)")
   list(APPEND mi_defines MI_SHOW_ERRORS=1)
+endif()
+
+if(MI_OWNER_GATE)
+  message(STATUS "Enable the per-thread owner gate for mi_purge_all (MI_OWNER_GATE=ON)")
+  list(APPEND mi_defines MI_OWNER_GATE=1)
 endif()
 
 if(MI_PPROF)
@@ -1801,6 +1808,37 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-thread-idle-rss PROPERTIES TIMEOUT 120)
   endif()
 
+  # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of
+  # docs/purge-all-implementation.md §11 (T1-T3, G1-G8, C1-C2) in one binary that is built for
+  # BOTH MI_PPROF and BOTH MI_OWNER_GATE settings and branches on `#if MI_OWNER_GATE` for its
+  # expectations -- the ungated half of G1 (`pending == 4`, PARTIAL) is the report's positive
+  # control, so this must never move under if(MI_PPROF) or if(MI_OWNER_GATE). C++ for the same
+  # reason as test-thread-idle-rss (platform threads, no <thread>: win32-threads mingw). Static
+  # when available, else the shared library, like the C tests above. G2 measures a wall-clock
+  # stall bound and G8 a scavenger cadence, so both variants are in the RUN_SERIAL group below.
+  if(mi_have_cxx_for_tests AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-purge-all test/test-purge-all.cpp)
+    target_compile_definitions(mimalloc-test-purge-all PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-purge-all PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-purge-all PRIVATE include)
+    if(MI_BUILD_STATIC)
+      target_link_libraries(mimalloc-test-purge-all PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-purge-all PRIVATE mimalloc ${mi_libraries})
+    endif()
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-purge-all PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-purge-all COMMAND mimalloc-test-purge-all)
+    set_tests_properties(test-purge-all PROPERTIES TIMEOUT 120)
+    # ... and with the scavenger disabled: G8 must then see NO timed sweep, and every other row
+    # must hold with nobody but the caller ever sweeping (same shape as test-park-handoff-no-scavenger).
+    add_test(NAME test-purge-all-no-scavenger COMMAND mimalloc-test-purge-all)
+    set_tests_properties(test-purge-all-no-scavenger PROPERTIES TIMEOUT 120
+                         ENVIRONMENT "MIMALLOC_SCAVENGER=0")
+  endif()
+
   # macOS VM tag must be application-specific (issue #78).
   add_executable(mimalloc-test-os-tag test/test-os-tag.c)
   target_compile_definitions(mimalloc-test-os-tag PRIVATE ${mi_defines})
@@ -1985,6 +2023,11 @@ set(mi_serial_tests
   test-abandoned-lazy
   test-heap-release-mt
   test-heap-release-mt-no-scavenger
+  # #366: G2 asserts a worker's worst allocator-call stall during a foreign sweep against a
+  # wall-clock bound, G8 waits a bounded time for the scavenger's paced timed sweep -- both
+  # "a wall-clock deadline" measurements that an oversubscribed wave would turn into noise.
+  test-purge-all
+  test-purge-all-no-scavenger
 )
 # Next candidate if the wave ever goes flaky: test-fork-user-heap. It is not here because
 # nothing has been observed to fail -- it forks, and a fork's cost and timing are the

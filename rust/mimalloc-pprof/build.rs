@@ -34,6 +34,11 @@ fn main() {
                 "0"
             },
         )
+        // #371: the exact DHAT observer. The crate keeps it compiled in so
+        // `sys::mi_dhat_*` and `dhat::` keep working; the C code tests `#if MI_DHAT`,
+        // so it is always defined, to 0 or 1. (A `dhat` cargo feature that lets
+        // consumers compile it out is tracked as tier-2 follow-up work on #371.)
+        .define("MI_DHAT", "1")
         // Issue #366: the per-thread owner gate behind `purge_all`. Mirrors CMake's
         // `MI_OWNER_GATE` option; the C code tests `#if MI_OWNER_GATE`, so it is always
         // defined, to 0 or 1.

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ee3d11c8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 1cba5cfe of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -1269,6 +1269,14 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #ifndef MI_PPROF
 #define MI_PPROF 1
+#endif
+
+// #371: compile-time switch for the exact DHAT v2 observer (src/dhat.c). When 0 the
+// per-allocation hook sites compile away entirely -- no call, no flag load -- and only the
+// public `mi_dhat_*` API survives, as stubs. Defaults to 1 to match CMake's `MI_DHAT=ON`
+// and so a build system that does not set it keeps today's behavior.
+#ifndef MI_DHAT
+#define MI_DHAT 1
 #endif
 
 // --------------------------------------------------------------------------
@@ -4976,14 +4984,18 @@ void        _mi_memevt_fork_child(void);
 // "dhat.c": exact heap/lifetime observer, independent of MI_PPROF. The event
 // bracketing deliberately captures before the public callback and commits after it.
 bool        _mi_dhat_is_active(void);
-void        _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size);
 void        _mi_dhat_forget_heap(mi_heap_t* heap);
+// #371: the per-allocation hooks exist only when the observer is compiled in, so an
+// unguarded call site fails to compile instead of quietly costing the hot path.
+#if MI_DHAT
+void        _mi_dhat_begin_alloc(mi_page_t* page, void* p, size_t request_size);
 void        _mi_dhat_begin_free(void* p);
 void        _mi_dhat_begin_resize(void* oldp, void* newp, size_t request_size);
 void        _mi_dhat_finish_event(void);
+size_t      _mi_dhat_stack_capture(void** pcs, size_t capacity);
+#endif
 void        _mi_dhat_process_init(void);
 void        _mi_dhat_process_done(void);
-size_t      _mi_dhat_stack_capture(void** pcs, size_t capacity);
 // #270: fork-safety -- quiesce/reset `dhat_lock` around fork(). Child-side policy:
 // continue (the live/pp tables are ordinary process memory, safe copy-on-write across
 // fork; only the lock itself needs resetting; `mi_dhat_dump` must keep working in the
@@ -19908,14 +19920,18 @@ void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
   // under/overflow them) -- DHAT's own free path needs no matching check since it looks
   // up the pointer in its own record table and no-ops when the alloc was never recorded.
   if (_mi_meta_is_meta_page_safe(page)) return;  // adapted for issue #271: was _mi_meta_is_meta_page(mi_page_subproc(page), page)
+  #if MI_DHAT
   _mi_dhat_begin_alloc(page, p, request_size);
+  #endif
   size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
     memevt_dispatch(hooks, MI_MEMORY_ALLOCATE, (int64_t)usable, (uint64_t)request_size);
   }
+  #if MI_DHAT
   _mi_dhat_finish_event();
+  #endif
 }
 
 // #266: unlike _mi_memevt_on_alloc above, the free/resize hooks are never reachable
@@ -19945,13 +19961,17 @@ void _mi_memevt_on_free(mi_page_t* page, void* p) {
   // question from page->memid's arena instead, which never touches page->heap.
   // #266: symmetric with the _mi_memevt_on_alloc check above -- see its comment.
   if (_mi_meta_is_meta_page_safe(page)) return;
+  #if MI_DHAT
   _mi_dhat_begin_free(p);
+  #endif
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
     memevt_dispatch(hooks, MI_MEMORY_FREE, -(int64_t)usable, 0);
   }
+  #if MI_DHAT
   _mi_dhat_finish_event();
+  #endif
 }
 
 void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size) {
@@ -19959,14 +19979,18 @@ void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_siz
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
   if (hooks->memevt_suppress_depth > 0) return;
+  #if MI_DHAT
   _mi_dhat_begin_resize(p, p, request_size);
+  #endif
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     // Same page => same block-size class => usable size is identical before and after.
     MI_UNUSED(page);
     memevt_dispatch(hooks, MI_MEMORY_RESIZE, 0, (uint64_t)request_size);
   }
+  #if MI_DHAT
   _mi_dhat_finish_event();
+  #endif
 }
 
 void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
@@ -19974,13 +19998,17 @@ void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usab
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
   if (hooks->memevt_suppress_depth > 0) return;
+  #if MI_DHAT
   _mi_dhat_begin_resize(oldp, newp, request_size);
+  #endif
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const int64_t delta = (int64_t)usable_post - (int64_t)usable_pre;
     memevt_dispatch(hooks, MI_MEMORY_RESIZE, delta, (uint64_t)request_size);
   }
+  #if MI_DHAT
   _mi_dhat_finish_event();
+  #endif
 }
 
 // ---------------------------------------------------------------------------------------
@@ -20229,6 +20257,10 @@ mi_decl_nodiscard mi_decl_export bool mi_dhat_dump(const char* path) mi_attr_noe
 #include <stdlib.h>
 #include <limits.h>
 #include <stddef.h>
+
+/* #371: the whole collector is compiled out with MI_DHAT=0; see the stub block at the
+   end of this file for what survives. */
+#if MI_DHAT
 
 #define DHAT_UNINIT 0
 #define DHAT_DISABLED 1
@@ -20808,10 +20840,38 @@ void _mi_dhat_process_done(void) { if (dhat_dump_at_exit[0] != 0) { const bool d
 void _mi_dhat_fork_prepare(void) { mi_lock_acquire(&dhat_lock); }
 void _mi_dhat_fork_parent(void)  { mi_lock_release(&dhat_lock); }
 void _mi_dhat_fork_child(void)   { mi_lock_init(&dhat_lock); _mi_atomic_once_fork_child_reset(&dhat_once); }
+
+#else
+/* #371: MI_DHAT=0 -- the observer is compiled out and costs nothing.
+   The per-allocation hook entry points (`_mi_dhat_begin_alloc` / `_mi_dhat_begin_free` /
+   `_mi_dhat_begin_resize` / `_mi_dhat_finish_event`) are deliberately NOT stubbed: their
+   call sites in memory-events.c are `#if MI_DHAT` guarded and their declarations are too,
+   so a future unguarded call is a compile error rather than a silent no-op on the hot path.
+   The lifecycle entry points reached from upstream files (init.c, heap.c, fork.c) do keep
+   stubs so those files need no guard of their own, and the public API keeps its symbols and
+   answers "not running" -- exactly what profile.c does for MI_PPROF=0. */
+bool mi_dhat_start(void) mi_attr_noexcept { return false; }
+void mi_dhat_stop(void) mi_attr_noexcept { }
+bool mi_dhat_is_enabled(void) mi_attr_noexcept { return false; }
+bool mi_dhat_stats_get(mi_dhat_stats_t* out) mi_attr_noexcept { MI_UNUSED(out); return false; }
+bool mi_dhat_dump(const char* path) mi_attr_noexcept { MI_UNUSED(path); return false; }
+bool _mi_dhat_is_active(void) { return false; }
+void _mi_dhat_forget_heap(mi_heap_t* heap) { MI_UNUSED(heap); }
+void _mi_dhat_process_init(void) { }
+void _mi_dhat_process_done(void) { }
+// #270: no `dhat_lock` exists when MI_DHAT is off -- nothing to quiesce.
+void _mi_dhat_fork_prepare(void) { }
+void _mi_dhat_fork_parent(void)  { }
+void _mi_dhat_fork_child(void)   { }
+#endif
 /* ---- end inlined: src/dhat.c ---- */
+#if MI_DHAT
 /* ---- begin inlined: src/dhat-stack.c ---- */
 /* Allocation-free stack capture for the exact DHAT observer. Kept separate from
    profile-stack.c because DHAT is deliberately available when MI_PPROF=OFF. */
+
+// #371: only built (and only declared) when the observer is compiled in.
+#if MI_DHAT
 
 #define MI_DHAT_STACK_MAX 128
 
@@ -20850,7 +20910,10 @@ size_t _mi_dhat_stack_capture(void** pcs, size_t capacity) {
   return n;
 }
 #endif
+
+#endif // MI_DHAT
 /* ---- end inlined: src/dhat-stack.c ---- */
+#endif
 /* ---- begin inlined: src/options.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2018-2026, Microsoft Research, Daan Leijen

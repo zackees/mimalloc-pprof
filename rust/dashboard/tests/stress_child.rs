@@ -19,7 +19,7 @@ fn dashboard_stress_child_accepts_one_request_and_emits_one_response() {
         scenario: ScenarioType::AllocFree,
         execution_mode: ExecutionMode::Normal,
     };
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dashboard"))
+    let mut child = Command::new(stress_harness::sibling_bin("dashboard"))
         .arg("--stress-child")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

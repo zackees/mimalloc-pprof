@@ -469,6 +469,23 @@ def run_gated(ctx: RunCtx) -> bool:
     return ctest_run(ctx, build, config="Release") == 0
 
 
+def run_dhat_off(ctx: RunCtx) -> bool:
+    """c-unit.yml `build (dhat-off)` + its slice of `run-linux` (#371): Release,
+    -DMI_PPROF=ON -DMI_DHAT=OFF, the WHOLE suite -- with the observer compiled out the
+    per-allocation hook sites disappear from the alloc/free path, so every test is a test
+    of that. Asserted on the resolved defines like `gated`, and for the same reason."""
+    build = ctx.dir / "build"
+    rc, configure_out = cmake_configure(ctx, build, ["-DMI_PPROF=ON", "-DMI_DHAT=OFF"])
+    if rc:
+        return False
+    if not re.search(r"Compiler defines\s*:.*MI_DHAT=0", configure_out):
+        log_write(ctx.log, "\n[verify_local] FAIL: MI_DHAT=0 did not reach mi_defines\n")
+        return False
+    if cmake_build(ctx, build, config="Release"):
+        return False
+    return ctest_run(ctx, build, config="Release") == 0
+
+
 def run_fastpath(ctx: RunCtx) -> bool:
     """c-unit.yml `fastpath-identity` (#366): the default build's `mi_malloc`/`mi_zalloc`/
     `mi_free`/`mi_heap_malloc_small`/`mi_malloc_small` must disassemble byte-identically
@@ -996,6 +1013,12 @@ CONFIGS: list[ConfigSpec] = [
         "c-unit.yml: build(gated)+run-linux",
         "Release, MI_OWNER_GATE=ON, full ctest (#366)",
         run_gated,
+    ),
+    ConfigSpec(
+        "dhat-off",
+        "c-unit.yml: build(dhat-off)+run-linux",
+        "Release, MI_DHAT=OFF, full ctest (#371)",
+        run_dhat_off,
     ),
     ConfigSpec(
         "fastpath",

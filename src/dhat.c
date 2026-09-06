@@ -12,6 +12,10 @@
 #include <limits.h>
 #include <stddef.h>
 
+/* #371: the whole collector is compiled out with MI_DHAT=0; see the stub block at the
+   end of this file for what survives. */
+#if MI_DHAT
+
 #define DHAT_UNINIT 0
 #define DHAT_DISABLED 1
 #define DHAT_ENABLED 2
@@ -590,3 +594,27 @@ void _mi_dhat_process_done(void) { if (dhat_dump_at_exit[0] != 0) { const bool d
 void _mi_dhat_fork_prepare(void) { mi_lock_acquire(&dhat_lock); }
 void _mi_dhat_fork_parent(void)  { mi_lock_release(&dhat_lock); }
 void _mi_dhat_fork_child(void)   { mi_lock_init(&dhat_lock); _mi_atomic_once_fork_child_reset(&dhat_once); }
+
+#else
+/* #371: MI_DHAT=0 -- the observer is compiled out and costs nothing.
+   The per-allocation hook entry points (`_mi_dhat_begin_alloc` / `_mi_dhat_begin_free` /
+   `_mi_dhat_begin_resize` / `_mi_dhat_finish_event`) are deliberately NOT stubbed: their
+   call sites in memory-events.c are `#if MI_DHAT` guarded and their declarations are too,
+   so a future unguarded call is a compile error rather than a silent no-op on the hot path.
+   The lifecycle entry points reached from upstream files (init.c, heap.c, fork.c) do keep
+   stubs so those files need no guard of their own, and the public API keeps its symbols and
+   answers "not running" -- exactly what profile.c does for MI_PPROF=0. */
+bool mi_dhat_start(void) mi_attr_noexcept { return false; }
+void mi_dhat_stop(void) mi_attr_noexcept { }
+bool mi_dhat_is_enabled(void) mi_attr_noexcept { return false; }
+bool mi_dhat_stats_get(mi_dhat_stats_t* out) mi_attr_noexcept { MI_UNUSED(out); return false; }
+bool mi_dhat_dump(const char* path) mi_attr_noexcept { MI_UNUSED(path); return false; }
+bool _mi_dhat_is_active(void) { return false; }
+void _mi_dhat_forget_heap(mi_heap_t* heap) { MI_UNUSED(heap); }
+void _mi_dhat_process_init(void) { }
+void _mi_dhat_process_done(void) { }
+// #270: no `dhat_lock` exists when MI_DHAT is off -- nothing to quiesce.
+void _mi_dhat_fork_prepare(void) { }
+void _mi_dhat_fork_parent(void)  { }
+void _mi_dhat_fork_child(void)   { }
+#endif

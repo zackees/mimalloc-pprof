@@ -183,7 +183,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: benchmark-raw-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-raw-${{ github.run_id }}
+          overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
           path: "${{ runner.temp }}/benchmark-output-${{ github.run_id }}/raw-run.json"
           retention-days: 30
           if-no-files-found: ignore
@@ -191,7 +192,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: benchmark-provenance-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-provenance-${{ github.run_id }}
+          overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
           path: |
             ${{ runner.temp }}/validation-report.json
             rust/benchmark-suite/allocators/allocator-lock.json
@@ -201,7 +203,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: benchmark-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-validation-${{ github.run_id }}
+          overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
           path: |
             ${{ runner.temp }}/validation-report.json
             ${{ runner.temp }}/manifest.sha256
@@ -211,7 +214,8 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-site-${{ github.run_id }}
+          overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
           path: ${{ runner.temp }}/site/
           include-hidden-files: true
           retention-days: 30
@@ -220,7 +224,8 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: benchmark-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-diagnostics-${{ github.run_id }}
+          overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
           path: |
             ${{ runner.temp }}/*.json
             ${{ runner.temp }}/*.sha256
@@ -240,12 +245,12 @@ jobs:
       - name: download site artifact
         uses: actions/download-artifact@v4.3.0
         with:
-          name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-site-${{ github.run_id }}
           path: audit/site/
       - name: download validation artifact
         uses: actions/download-artifact@v4.3.0
         with:
-          name: benchmark-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-validation-${{ github.run_id }}
           path: audit/validation/
       - name: audit site artifact
         run: |
@@ -271,7 +276,7 @@ jobs:
       - name: download site artifact
         uses: actions/download-artifact@v4.3.0
         with:
-          name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-site-${{ github.run_id }}
           path: site-temp/
       - name: validate site before push
         run: |
@@ -323,7 +328,7 @@ jobs:
       - name: download site artifact
         uses: actions/download-artifact@v4.3.0
         with:
-          name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-site-${{ github.run_id }}
           path: _site/
       - name: upload pages artifact
         uses: actions/upload-pages-artifact@v4.0.0
@@ -362,7 +367,7 @@ jobs:
       - name: download sealed site artifact
         uses: actions/download-artifact@v4.3.0
         with:
-          name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-site-${{ github.run_id }}
           path: audit/site/
       - name: audit publication
         run: |

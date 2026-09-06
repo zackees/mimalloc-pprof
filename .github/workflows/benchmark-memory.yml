@@ -154,7 +154,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: benchmark-memory-raw-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-memory-raw-${{ github.run_id }}
+          overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
           path: "${{ runner.temp }}/memory-output-${{ github.run_id }}/"
           include-hidden-files: true
           retention-days: 30
@@ -163,7 +164,8 @@ jobs:
         if: (inputs.mode || 'full') == 'full' && always()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: benchmark-memory-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-memory-validation-${{ github.run_id }}
+          overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
           path: |
             ${{ runner.temp }}/memory-report.json
             ${{ runner.temp }}/manifest.sha256
@@ -173,7 +175,8 @@ jobs:
         if: (inputs.mode || 'full') == 'full' && success()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: benchmark-memory-site-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-memory-site-${{ github.run_id }}
+          overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
           path: ${{ runner.temp }}/site/
           include-hidden-files: true
           retention-days: 30
@@ -192,11 +195,11 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4.3.0
         with:
-          name: benchmark-memory-site-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-memory-site-${{ github.run_id }}
           path: audit/site/
       - uses: actions/download-artifact@v4.3.0
         with:
-          name: benchmark-memory-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-memory-validation-${{ github.run_id }}
           path: audit/validation/
       - name: audit sealed memory site
         run: |
@@ -217,7 +220,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4.3.0
         with:
-          name: benchmark-memory-site-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-memory-site-${{ github.run_id }}
           path: site-temp/
       - name: publish exact memory site revision
         run: |
@@ -252,7 +255,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4.3.0
         with:
-          name: benchmark-memory-site-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-memory-site-${{ github.run_id }}
           path: _site/
       - uses: actions/upload-pages-artifact@v4.0.0
         with:
@@ -289,7 +292,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4.3.0
         with:
-          name: benchmark-memory-site-${{ github.run_id }}-${{ github.run_attempt }}
+          name: benchmark-memory-site-${{ github.run_id }}
           path: audit/site/
       - name: audit memory publication
         run: |

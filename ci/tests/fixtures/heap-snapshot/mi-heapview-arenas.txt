@@ -1,2 +1,0 @@
-idx  base                       size   slices    committed         free    purgeable  numa
-0    0x00000369fb000000   1073741824    16384   1073741824    972619776     74973184    -1

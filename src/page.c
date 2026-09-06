@@ -390,8 +390,19 @@ static mi_page_t* mi_page_fresh_alloc(mi_theap_t* theap, mi_page_queue_t* pq, si
         };
       }
       else {
-        mi_assert(false); // should not happen?
-        return NULL;
+        // #272/#366: in this fork a reclaimed abandoned page can have EVERY free block purged
+        // (a hole, off every free list -- `src/page-holes.c`), and the collect above does not
+        // un-purge while the calling thread is inside its own hole sweep (a nested allocation
+        // from the sweep; gated builds sweep the owner inline far more often). This page is
+        // about to serve an allocation, so its holes must come back regardless; the sweep can
+        // discard them again later. Only if it is STILL unavailable is it upstream's
+        // "should not happen".
+        if (mi_page_has_purged(page)) { _mi_page_unpurge_run(page); }
+        if (!mi_page_immediate_available(page)) {
+          mi_assert(false); // should not happen?
+          _mi_page_abandon(page,pq);
+          return NULL;
+        }
       }
     }
   }

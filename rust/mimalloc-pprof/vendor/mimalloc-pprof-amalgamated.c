@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit be4badf9 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ee3d11c8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -23526,8 +23526,19 @@ static mi_page_t* mi_page_fresh_alloc(mi_theap_t* theap, mi_page_queue_t* pq, si
         };
       }
       else {
-        mi_assert(false); // should not happen?
-        return NULL;
+        // #272/#366: in this fork a reclaimed abandoned page can have EVERY free block purged
+        // (a hole, off every free list -- `src/page-holes.c`), and the collect above does not
+        // un-purge while the calling thread is inside its own hole sweep (a nested allocation
+        // from the sweep; gated builds sweep the owner inline far more often). This page is
+        // about to serve an allocation, so its holes must come back regardless; the sweep can
+        // discard them again later. Only if it is STILL unavailable is it upstream's
+        // "should not happen".
+        if (mi_page_has_purged(page)) { _mi_page_unpurge_run(page); }
+        if (!mi_page_immediate_available(page)) {
+          mi_assert(false); // should not happen?
+          _mi_page_abandon(page,pq);
+          return NULL;
+        }
       }
     }
   }

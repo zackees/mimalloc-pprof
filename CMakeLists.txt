@@ -1695,11 +1695,16 @@ if (MI_BUILD_TESTS)
   add_test(NAME test-threadlocal-growth COMMAND mimalloc-test-threadlocal-growth)
   set_tests_properties(test-threadlocal-growth PROPERTIES TIMEOUT 60)
 
-  # MI_DEBUG_FULL-only positive control for the internal lock diagnostics (#167).
-  # The program deliberately reacquires a non-recursive lock. The CMake wrapper
-  # requires an immediate diagnostic failure with the expected message; a deadlock
-  # times out and fails the test instead of wedging the suite.
-  if(MI_DEBUG_FULL)
+  # Positive control for the internal lock diagnostics (#167). The program deliberately
+  # reacquires a non-recursive lock. The CMake wrapper requires an immediate diagnostic
+  # failure with the expected message; a deadlock times out and fails the test instead of
+  # wedging the suite.
+  # #314: gated on `mi_need_diagnostic_c`, NOT on the MI_DEBUG_FULL *option*. The
+  # diagnostics these controls exercise are compiled whenever the EFFECTIVE MI_DEBUG > 2
+  # (#312/#313 -- option, MI_EXTRA_CPPDEFS, or CMAKE_C_FLAGS), so registering them on the
+  # option alone left the `-DMI_EXTRA_CPPDEFS=MI_DEBUG=3` route compiling src/diagnostic.c
+  # with nothing ever running its controls. Same variable, same reason, one layer up.
+  if(mi_need_diagnostic_c)
     add_executable(mimalloc-test-lock-reentrancy test/test-lock-reentrancy.c)
     target_compile_definitions(mimalloc-test-lock-reentrancy PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-lock-reentrancy PRIVATE ${mi_cflags})
@@ -1741,7 +1746,9 @@ if (MI_BUILD_TESTS)
       test-lock-reentrancy test-lock-uncleared-owner
       test-lock-nonowner-release test-lock-destroy-owned
       PROPERTIES TIMEOUT 15)
+  endif()
 
+  if(MI_DEBUG_FULL)
     # Compile a private amalgamation with deterministic fault/poison controls.
     # MI_TEST_TLS_CONTROL is absent from all library targets and releases.
     add_executable(mimalloc-test-tls-controls src/static.c test/test-tls-controls.c)

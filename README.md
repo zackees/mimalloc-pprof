@@ -646,7 +646,7 @@ lineup, including the memory-events API, is in
 
 ## Performance
 
-mimalloc-pprof is continuously benchmarked against **upstream mimalloc**,
+mimalloc-pprof is continuously benchmarked against **Microsoft mimalloc**,
 **Bun's mimalloc fork** ([`oven-sh/mimalloc`](https://github.com/oven-sh/mimalloc)),
 **TCMalloc**, and **jemalloc** on a dedicated Linux x86-64 runner. Every *throughput*
 result is **GitHub-hosted and informational** — no self-hosted hardware, no
@@ -724,7 +724,7 @@ idles for 10 s and samples resident set size.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-idle-table-dark.svg" />
   <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-idle-table-light.svg" />
-  <img alt="Peak RSS, RSS after idle and percent returned, per allocator: mimalloc-pprof, jemalloc, Bun mimalloc and upstream mimalloc" src=".github/assets/allocator-idle-table-light.svg" width="100%" />
+  <img alt="Peak RSS, RSS after idle and percent returned, per allocator: mimalloc-pprof, jemalloc, Bun mimalloc and Microsoft mimalloc" src=".github/assets/allocator-idle-table-light.svg" width="100%" />
 </picture>
 
 Read it precisely — the first two points are caveats on the headline, and the

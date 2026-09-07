@@ -26,7 +26,7 @@ fn child(response: Option<&str>) -> ChildProgram {
         ));
     }
     ChildProgram {
-        program: env!("CARGO_BIN_EXE_stress-child").into(),
+        program: stress_harness::sibling_bin("stress-child"),
         arguments: Vec::new(),
         environment,
     }

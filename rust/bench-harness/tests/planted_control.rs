@@ -11,7 +11,7 @@ static ALLOCATOR: MiMalloc = MiMalloc;
 
 fn stress_child() -> ChildProgram {
     ChildProgram {
-        program: env!("CARGO_BIN_EXE_stress-child").into(),
+        program: stress_harness::sibling_bin("stress-child"),
         arguments: Vec::new(),
         environment: Vec::new(),
     }

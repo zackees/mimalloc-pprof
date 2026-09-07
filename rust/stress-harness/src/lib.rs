@@ -194,6 +194,42 @@ impl SeededRng {
 
 /// Run in-process without a hard timeout. Use a child process when a workload
 /// must be forcibly bounded.
+/// Locate a cargo-built binary that sits next to the running test executable.
+///
+/// #294: `env!("CARGO_BIN_EXE_<name>")` is expanded by cargo AT COMPILE TIME into the
+/// *builder's* absolute path, so a test using it carries a literal
+/// `/home/runner/work/.../target/<profile>/stress-child` in its image and cannot run on
+/// any other machine -- which is why windows-bundles.yml had to detect and drop those
+/// binaries instead of shipping them. Resolving the path at run time keeps the test
+/// relocatable: cargo puts integration-test executables in `<target>/<profile>/deps/`
+/// and binaries one level up in `<target>/<profile>/`, and a test staged into a flat
+/// bundle directory finds its companion right beside it.
+///
+/// `MIMALLOC_PPROF_BIN_DIR` overrides the search entirely, for a bundle that stages
+/// binaries somewhere else again.
+pub fn sibling_bin(name: &str) -> std::path::PathBuf {
+    let file_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    if let Some(dir) = std::env::var_os("MIMALLOC_PPROF_BIN_DIR") {
+        return std::path::PathBuf::from(dir).join(file_name);
+    }
+    let exe = std::env::current_exe().expect("the running test executable has a path");
+    let dir = exe
+        .parent()
+        .expect("the running test executable has a parent directory")
+        .to_path_buf();
+    // Prefer `<profile>/<name>` when we are in `<profile>/deps/`; fall back to a sibling,
+    // which is where a flat test bundle puts both.
+    if dir.file_name().is_some_and(|component| component == "deps") {
+        if let Some(parent) = dir.parent() {
+            let candidate = parent.join(&file_name);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    dir.join(file_name)
+}
+
 pub fn run_scenario(
     config: StressConfig,
     scenario: ScenarioType,

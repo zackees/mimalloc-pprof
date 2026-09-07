@@ -115,7 +115,8 @@ allocators replay one identical stream inside each paired block.
 | Large buffers | 64 KiB–4 MiB | large allocations with one-byte-per-page touching |
 | Cross-thread handoff | 16–512 B | remote-free pressure; blocks are freed by another worker |
 
-*Protocol `throughput-scaling-sparse-v1`, published weekly.  Full per-cell
+*Protocol `throughput-scaling-sparse-v1`, published daily (#208; it is the daily
+freshness signal, and `benchmark-stats` -- the rigorous suite -- is the weekly one).  Full per-cell
 tables, min/max spreads, and the metric comparison key are on the
 [dashboard](https://zackees.github.io/mimalloc-pprof/#scaling).*
 

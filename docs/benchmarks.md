@@ -16,8 +16,8 @@ runs, no unpublished baselines.
 
 ## Methodology summary
 
-- **5 allocators** — mimalloc-pprof, Microsoft mimalloc (pinned `dev3@bcee5a88`,
-  v3.4.3), Bun's mimalloc fork, TCMalloc, and jemalloc — pinned to immutable
+- **5 allocators** — mimalloc-pprof, Microsoft mimalloc (pinned `dev3@6def7be9`,
+  v3.5.0), Bun's mimalloc fork, TCMalloc, and jemalloc — pinned to immutable
   commits with SHA-256-verified source archives.
 - **Paired balanced blocks** — every block runs all five allocators in
   randomized order under one workload seed; ≥15 complete blocks per headline
@@ -35,17 +35,16 @@ runs, no unpublished baselines.
   intended difference is `MI_PPROF` (`OFF` upstream, `ON` for this fork); Bun's
   tree has no such option, so its row simply omits it.
   `ci/build_benchmark_allocators.py` fails the build if any other flag differs.
-- **The three mimalloc rows are not the same base.**  One recipe is not one
-  tree: the `upstream-mimalloc` row is pinned at `bcee5a88`, which is
-  `MI_MALLOC_VERSION 30403` (v3.4.3), while Bun's `b20b60d9` and this fork's
-  base `6def7be9` are both `30500` (v3.5.0).  Among other things,
-  `MI_OPT_FREE_SMALL` does not exist in v3.4.3 and auto-enables in the two
-  v3.5.0 trees, so the Bun and fork rows are compiled with `MI_OPT_FREE_SMALL=1`
-  and the upstream row is not.  Read upstream-vs-Bun and upstream-vs-fork
-  differences as *base plus fork*, never as fork alone; the Bun-vs-fork
-  comparison is the like-for-like one.  Bumping the upstream row to the fork's
-  own base is tracked in
-  [#332](https://github.com/zackees/mimalloc-pprof/issues/332).
+- **The three mimalloc rows share a base.**  Since
+  [#332](https://github.com/zackees/mimalloc-pprof/issues/332) the
+  `upstream-mimalloc` row is pinned at `6def7be9` -- the exact commit this fork's
+  overlay is based on -- so it, Bun's `b20b60d9` and this fork are all
+  `MI_MALLOC_VERSION 30500` (v3.5.0) and all three compile with
+  `MI_OPT_FREE_SMALL=1`.  Upstream-vs-fork therefore answers "our fork versus its
+  own base", which is what the charts say it does.  It was previously pinned at
+  `bcee5a88` (v3.4.3), where that comparison mixed base changes with fork changes;
+  history rows recorded under that pin carry the old comparison key and are a
+  separate lineage.
 - **Deterministic reproducibility** — every raw sample carries its exact command
   line and workload seed; the published site manifest carries a detached SHA-256
   digest of every file.
@@ -61,7 +60,7 @@ the fork itself is the workflow checkout.  The lockfile is
 |---|---|---|---|
 | `tcmalloc` | TCMalloc | `google/tcmalloc@c316de3e` | bazel `-c opt` |
 | `jemalloc` | jemalloc | `jemalloc/jemalloc` 5.3.1 `@81034ce1` | autoconf/make, static only |
-| `upstream-mimalloc` | Microsoft mimalloc | `microsoft/mimalloc` `dev3@bcee5a88` | cmake-ninja, `MI_PPROF=OFF` |
+| `upstream-mimalloc` | Microsoft mimalloc | `microsoft/mimalloc` `dev3@6def7be9` | cmake-ninja, `MI_PPROF=OFF` |
 | `bun-mimalloc` | Bun mimalloc | `oven-sh/mimalloc` `bun-dev3-v2@b20b60d9` | cmake-ninja, no `MI_PPROF` option |
 | `mimalloc-pprof` | mimalloc-pprof | workflow checkout | cmake-ninja, `MI_PPROF=ON` |
 

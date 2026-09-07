@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 1cba5cfe of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit e77bb668 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4959,15 +4959,71 @@ size_t      _mi_prof_debug_records_in(const mi_page_t* page, const void* addr, s
 size_t      _mi_prof_debug_records_compared(void);
 #endif
 
+/* ---------------------------------------------------------------------------------------
+   #371 tier 2: the observer fast path.
+
+   memory-events and DHAT are both opt-in and both OFF in a default process, yet every
+   allocation and every free used to enter them out of line and only consult their
+   activation flags at the END of a prologue: a TLS peek, a suppression-depth read, a
+   `_mi_meta_is_meta_page_safe` arena lookup, and -- until #372 -- two global atomic
+   read-modify-writes on DHAT's inflight counter, which serialised the allocator outright
+   (it measured 0.69x SCALING from 1 to 8 threads: slower with more cores).
+
+   So the flags come first, in one word, read inline at the call site. When nothing is
+   observing, an allocation pays one relaxed load and a not-taken branch; everything the
+   prologue used to do sits behind it, unchanged, in the `_slow` bodies.
+
+   The word is not just "on/off": memory-events documents its environment as read lazily,
+   exactly once, on the FIRST hook call and never during process startup (see
+   memory-events.h), and DHAT resolves the same way. An `unresolved` bit per observer keeps
+   that contract -- the word starts non-zero, so the first hook still takes the slow path
+   and still resolves the environment there -- while letting the steady state be zero.
+   Each observer owns its own two bits and publishes them when it resolves, is enabled, or
+   is stopped; neither module can clear the other's. */
+#define MI_OBSERVERS_MEMEVT_UNRESOLVED  ((size_t)1)
+#define MI_OBSERVERS_MEMEVT_ON          ((size_t)2)
+#if MI_DHAT
+#define MI_OBSERVERS_DHAT_UNRESOLVED    ((size_t)4)
+#define MI_OBSERVERS_DHAT_ON            ((size_t)8)
+#define MI_OBSERVERS_INITIAL  (MI_OBSERVERS_MEMEVT_UNRESOLVED | MI_OBSERVERS_DHAT_UNRESOLVED)
+#else
+// Compiled out (#372): DHAT never resolves, so it must not leave an `unresolved` bit set
+// or the fast path would take the slow branch forever.
+#define MI_OBSERVERS_INITIAL  (MI_OBSERVERS_MEMEVT_UNRESOLVED)
+#endif
+
+extern _Atomic(size_t) _mi_observers_armed;   // defined in memory-events.c
+
+static inline bool _mi_observers_idle(void) {
+  return (mi_atomic_load_relaxed(&_mi_observers_armed) == 0);
+}
+
 // "memory-events.c": opt-in allocation-change accounting/callbacks (issue #20). Independent of
 // MI_PPROF: always compiled in and hooked; the runtime activation flag gates all real work.
-void        _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size);
-void        _mi_memevt_on_free(mi_page_t* page, void* p);
-void        _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size);
+void        _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size);
+void        _mi_memevt_on_free_slow(mi_page_t* page, void* p);
+void        _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t request_size);
+
+static inline void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
+  if mi_likely(_mi_observers_idle()) return;
+  _mi_memevt_on_alloc_slow(page, p, request_size);
+}
+static inline void _mi_memevt_on_free(mi_page_t* page, void* p) {
+  if mi_likely(_mi_observers_idle()) return;
+  _mi_memevt_on_free_slow(page, p);
+}
+static inline void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size) {
+  if mi_likely(_mi_observers_idle()) return;
+  _mi_memevt_on_realloc_in_place_slow(page, p, request_size);
+}
 // Called after _mi_memevt_suppress_end, with suppression already lifted, to emit the single
 // synthesized RESIZE event for a moving realloc (see alloc.c's _mi_theap_realloc_zero).
 // oldp/newp retain the allocation identity needed by the internal DHAT observer.
-void        _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size);
+void        _mi_memevt_on_resize_slow(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size);
+static inline void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
+  if mi_likely(_mi_observers_idle()) return;
+  _mi_memevt_on_resize_slow(oldp, newp, usable_pre, usable_post, request_size);
+}
 // Suppress accounting/dispatch for internal allocate+free pairs that are really one resize
 // (e.g. a moving realloc's internal mi_theap_umalloc+mi_free), and for reentrant calls made
 // from inside a memory-change callback itself.
@@ -19716,6 +19772,30 @@ static inline mi_hooks_tld_t* _mi_hooks_tld_peek_or_local(mi_hooks_tld_t* local)
 #define MEMEVT_ENABLED   2
 
 static _Atomic(size_t) memevt_state;
+
+// #371 tier 2: the word the alloc/free fast path reads (see internal.h). Starts non-zero so
+// the first hook still resolves the environment lazily, exactly as documented; each observer
+// publishes its own bits into it and cannot clear the other's.
+//
+// Cache-line aligned on purpose. Every allocation and every free reads this word, so it must
+// not share a line with anything written in steady state -- the accounting counters below are
+// written on every event once tracking is on, and false sharing there would hand the enabled
+// path the very cache-line ping-pong this issue is about.
+mi_decl_cache_align _Atomic(size_t) _mi_observers_armed = MI_OBSERVERS_INITIAL;
+
+// Publish this module's two bits. Order matters when arming: ON is set before UNRESOLVED is
+// cleared, so the word is never transiently zero while tracking is on.
+static void memevt_publish_armed(size_t state) {
+  if (state == MEMEVT_ENABLED) {
+    mi_atomic_or_acq_rel(&_mi_observers_armed, MI_OBSERVERS_MEMEVT_ON);
+  }
+  else {
+    mi_atomic_and_acq_rel(&_mi_observers_armed, ~(size_t)MI_OBSERVERS_MEMEVT_ON);
+  }
+  if (state != MEMEVT_UNINIT) {
+    mi_atomic_and_acq_rel(&_mi_observers_armed, ~(size_t)MI_OBSERVERS_MEMEVT_UNRESOLVED);
+  }
+}
 static mi_atomic_once_t memevt_once = { MI_ATOMIC_VAR_INIT(0), MI_LOCK_INITIALIZER };
 
 // Counters (see mi_memory_snapshot_t). Maintained only while MEMEVT_ENABLED; never
@@ -19776,7 +19856,9 @@ void _mi_memevt_fork_child(void)   { mi_lock_init(&memevt_cb_lock); _mi_atomic_o
 static void memevt_resolve_env(void) {
   if (_mi_atomic_once_enter(&memevt_once)) {
     const bool enabled = mi_option_is_enabled(mi_option_memory_events);
-    mi_atomic_store_release(&memevt_state, (size_t)(enabled ? MEMEVT_ENABLED : MEMEVT_DISABLED));
+    const size_t resolved = (size_t)(enabled ? MEMEVT_ENABLED : MEMEVT_DISABLED);
+    mi_atomic_store_release(&memevt_state, resolved);
+    memevt_publish_armed(resolved);
     _mi_atomic_once_release(&memevt_once);
   }
   // else: either a concurrent thread is mid-resolution (we blocked until it finished, in
@@ -19791,6 +19873,7 @@ bool mi_memory_tracking_set_enabled(bool enabled) mi_attr_noexcept {
     // without ever reading the environment, so a later first-allocation lazy read is
     // permanently skipped (memevt_resolve_env's `else` branch above).
     mi_atomic_store_release(&memevt_state, new_state);
+    memevt_publish_armed(new_state);
     _mi_atomic_once_release(&memevt_once);
   }
   else {
@@ -19798,6 +19881,7 @@ bool mi_memory_tracking_set_enabled(bool enabled) mi_attr_noexcept {
     // call always overrides the cached flag, matching "tracking may also be enabled or
     // disabled by API" as an authoritative override, not merely a fallback default.
     mi_atomic_store_release(&memevt_state, new_state);
+    memevt_publish_armed(new_state);
   }
   return true;
 }
@@ -19900,7 +19984,7 @@ static void memevt_dispatch(mi_hooks_tld_t* hooks, mi_memory_change_kind_t kind,
    original pointers available; it is committed only after the user callback returns.
    The shared suppression depth excludes callback-internal and moving-realloc internals
    from both observers. */
-void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
+void _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size) {
   // #266: must be the very first thing touched -- see hooks-tld.h's file comment. A
   // thread mid-init (inside `_mi_thread_init_with_heap` -> `_mi_meta_zalloc`, allocating
   // its OWN tld/theap) reaches this hook too; peeking (rather than touching any TLS
@@ -19947,7 +20031,7 @@ void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
 // so nothing re-initializes it in that window) or after teardown already completed (see
 // free.c's "free'd after thread_done" comment). So: peek, and fall back to a local,
 // per-call scratch `mi_hooks_tld_t` instead of forcing -- see hooks-tld.h.
-void _mi_memevt_on_free(mi_page_t* page, void* p) {
+void _mi_memevt_on_free_slow(mi_page_t* page, void* p) {
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
   if (hooks->memevt_suppress_depth > 0) return;
@@ -19974,7 +20058,7 @@ void _mi_memevt_on_free(mi_page_t* page, void* p) {
   #endif
 }
 
-void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size) {
+void _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t request_size) {
   // #266: see _mi_memevt_on_free above.
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
@@ -19993,7 +20077,7 @@ void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_siz
   #endif
 }
 
-void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
+void _mi_memevt_on_resize_slow(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
   // #266: see _mi_memevt_on_free above.
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
@@ -20314,6 +20398,7 @@ typedef struct dhat_event_s {
 static mi_lock_t dhat_lock = MI_LOCK_INITIALIZER;
 static mi_atomic_once_t dhat_once = { MI_ATOMIC_VAR_INIT(0), MI_LOCK_INITIALIZER };
 static _Atomic(size_t) dhat_state;
+static void dhat_publish_armed(size_t state);
 static dhat_chunk_t* dhat_chunks;
 static dhat_record_t** dhat_live_table;
 static dhat_pp_t** dhat_pp_table;
@@ -20564,6 +20649,21 @@ static bool dhat_env_size(const char* name, size_t* out) {
   *out = (size_t)v;
   return true;
 }
+// #371 tier 2: publish this observer's bits into the word the alloc/free fast path reads
+// (internal.h). ON is set before UNRESOLVED is cleared, so the word is never transiently
+// zero while DHAT is running.
+static void dhat_publish_armed(size_t state) {
+  if (state == DHAT_ENABLED) {
+    mi_atomic_or_acq_rel(&_mi_observers_armed, MI_OBSERVERS_DHAT_ON);
+  }
+  else {
+    mi_atomic_and_acq_rel(&_mi_observers_armed, ~(size_t)MI_OBSERVERS_DHAT_ON);
+  }
+  if (state != DHAT_UNINIT) {
+    mi_atomic_and_acq_rel(&_mi_observers_armed, ~(size_t)MI_OBSERVERS_DHAT_UNRESOLVED);
+  }
+}
+
 static void dhat_resolve_env(void) {
   if (_mi_atomic_once_enter(&dhat_once)) {
     char value[8] = { 0 };
@@ -20579,7 +20679,9 @@ static void dhat_resolve_env(void) {
       dhat_generation++;
       mi_lock_release(&dhat_lock);
     }
-    mi_atomic_store_release(&dhat_state, (size_t)(env_enabled ? DHAT_ENABLED : DHAT_DISABLED));
+    const size_t resolved = (size_t)(env_enabled ? DHAT_ENABLED : DHAT_DISABLED);
+    mi_atomic_store_release(&dhat_state, resolved);
+    dhat_publish_armed(resolved);
     _mi_atomic_once_release(&dhat_once);
   }
 }
@@ -20690,6 +20792,7 @@ bool mi_dhat_start(void) mi_attr_noexcept {
   dhat_started = _mi_clock_now();
   dhat_generation++;
   mi_atomic_store_release(&dhat_state, DHAT_ENABLED);
+  dhat_publish_armed(DHAT_ENABLED);
   mi_lock_release(&dhat_lock); return true;
 }
 void mi_dhat_stop(void) mi_attr_noexcept {
@@ -20703,6 +20806,7 @@ void mi_dhat_stop(void) mi_attr_noexcept {
   /* Block a new start while we drain events that already observed this session. */
   mi_atomic_store_release(&dhat_stopping, (size_t)1);
   mi_atomic_store_release(&dhat_state, DHAT_DISABLED);
+  dhat_publish_armed(DHAT_DISABLED);
   mi_lock_release(&dhat_lock);
   while (mi_atomic_load_acquire(&dhat_inflight) != 0) _mi_prim_thread_yield();
   mi_lock_acquire(&dhat_lock);

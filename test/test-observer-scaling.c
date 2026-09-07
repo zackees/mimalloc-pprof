@@ -149,6 +149,16 @@ int main(void) {
   printf("test-observer-scaling: SKIP (MI_OWNER_GATE trades fast-path scaling by design)\n");
   return 0;
 #else
+  /* MI_GUARDED with a sample rate of 1 gives EVERY allocation its own guard page, so the
+     workload stops exercising the allocator's fast path and becomes a measurement of the
+     kernel's mmap/munmap, which serialises on the process's address-space lock. The
+     `guarded [sample-rate-1]` bundle measures 0.2 Mops/s and 0.70x here -- 1500x below a
+     fast-path rate -- which says nothing about #371 either way. */
+  if (mi_option_get(mi_option_guarded_sample_rate) == 1) {
+    printf("test-observer-scaling: SKIP (every allocation is guarded; this measures mmap, "
+           "not the allocator fast path)\n");
+    return 0;
+  }
   const int cpus = test_hardware_threads();
   if (cpus < 4) {
     printf("test-observer-scaling: SKIP (needs 4 hardware threads, found %d)\n", cpus);
@@ -161,6 +171,19 @@ int main(void) {
   if (one <= 0.0 || many <= 0.0) {
     printf("test-observer-scaling: FAILED -- a measured interval was not positive\n");
     return 1;
+  }
+  /* A general backstop for a configuration that is not exercising the allocator at all.
+     Deliberately LOW. A debug build runs this loop at ~4.5 Mops/s against release's ~370,
+     and its ratio is just as meaningful -- silencing every debug configuration would gut
+     the gate. What this excludes is the pathological case: guarded sampling measures
+     0.2 Mops/s because each allocation is an mmap, and no ratio over that says anything
+     about the allocator. The explicit guarded-sampling check above catches the known one;
+     this is the belt-and-braces for a future configuration nobody thought of. */
+  const double MIN_FASTPATH_RATE = 1e6;
+  if (one < MIN_FASTPATH_RATE) {
+    printf("test-observer-scaling: SKIP (%.2f Mops/s single-threaded is not a fast-path "
+           "rate; this configuration is not exercising it)\n", one / 1e6);
+    return 0;
   }
   const double speedup = many / one;
   printf("test-observer-scaling: 1 thread %.1f Mops/s, %d threads %.1f Mops/s, speedup %.2fx\n",

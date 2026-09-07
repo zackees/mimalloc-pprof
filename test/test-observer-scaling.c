@@ -69,7 +69,18 @@ static double test_now_seconds(void) {
 
 #define OPS_PER_THREAD   2000000
 #define LIVE_SLOTS       256
-#define MIN_SPEEDUP      2.0
+/* Chosen from measurement, not instinct. Observed aggregate speedup from 1 to 4 threads:
+     0.69x  the #371 regression, on a quiet 16-core box
+     1.76x  healthy, `pprof-off` bundle on a SHARED 4-vCPU GitHub runner (the worst honest
+            reading seen: four threads on four contended vCPUs, and this crude loop has
+            none of the published sweep's calibration or paired blocks)
+     3.82x  healthy, quiet 16-core box
+   The defining symptom of the regression is that adding threads does not help AT ALL --
+   it lands below 1.0 -- so a floor of 1.20x fails it with a wide margin while staying well
+   under the worst honest reading. This is the coarse, always-runnable canary; the sensitive
+   instrument is ci/check_scaling_parity.py, which compares the fork against the other
+   mimallocs in the same published run. */
+#define MIN_SPEEDUP      1.20
 
 typedef struct { long iterations; } worker_arg_t;
 
@@ -129,6 +140,15 @@ static void* tiny_hot_entry(void* argument) {
 }
 
 int main(void) {
+#if defined(MI_OWNER_GATE) && MI_OWNER_GATE
+  /* #366: with the owner gate compiled in, every allocator call takes the thread's own
+     gate so that `mi_purge_all` can sweep every thread rather than only parked ones. That
+     deliberately trades fast-path scaling away -- `windows-gnu-x64-gated` measures 0.91x
+     here, which is the gate working as designed, not #371 returning. Asserting scaling
+     against a build whose whole point is to serialise would make this test a liar. */
+  printf("test-observer-scaling: SKIP (MI_OWNER_GATE trades fast-path scaling by design)\n");
+  return 0;
+#else
   const int cpus = test_hardware_threads();
   if (cpus < 4) {
     printf("test-observer-scaling: SKIP (needs 4 hardware threads, found %d)\n", cpus);
@@ -157,4 +177,5 @@ int main(void) {
   }
   printf("test-observer-scaling: OK\n");
   return 0;
+#endif
 }

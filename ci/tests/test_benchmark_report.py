@@ -445,6 +445,68 @@ class BenchmarkReportTests(unittest.TestCase):
         )
         return site, digest
 
+    def test_a_section_measured_at_another_pin_is_left_pending(self) -> None:
+        """#376/#332: moving an allocator pin must not kill the pipeline.
+
+        `validate_carried_pins` refuses a carried section whose lock-pinned competitors
+        differ from the core run's -- correctly, since the two halves would then describe
+        different builds. But the carry-forward copied it anyway, so the whole render died
+        and NOTHING was published: the #332 bump of upstream-mimalloc to 6def7be9 took
+        `benchmark-stats` red on its first run. A section left behind is not lost data; it
+        stays `pending`, which the report already renders, and the next run of that metric
+        refills it at the new pin.
+        """
+        prior = self.with_complete_memory(self.load_latest())
+        fresh = copy.deepcopy(prior)
+        for metric in ("memory", "latency", "scaling"):
+            fresh.pop(metric, None)
+        allocators = fresh["allocators"]
+        assert isinstance(allocators, list)
+        for value in allocators:
+            assert isinstance(value, dict)
+            if value["allocator_id"] == "upstream-mimalloc":
+                value["source_sha"] = "6" * 40
+        fresh["pending_metrics"] = [
+            {
+                "metric_id": metric,
+                "status": "pending",
+                "reason": "not measured at this pin",
+                "phase_issue_url": "https://github.com/zackees/mimalloc-pprof/issues/332",
+            }
+            for metric in ("memory", "latency", "scaling", "pprof-tax")
+        ]
+        self.assertFalse(report.carry_forward_optional_metrics(fresh, prior))
+        self.assertNotIn("memory", fresh)
+        pending = fresh["pending_metrics"]
+        assert isinstance(pending, list)
+        self.assertIn("memory", [cast("dict[str, object]", p)["metric_id"] for p in pending])
+
+    def test_a_section_still_carries_when_only_the_fork_moved(self) -> None:
+        """The everyday case the carry-forward exists for: memory and latency are weekly,
+        the core run is not, so the fork's own commit is routinely newer in the core run
+        than in the section riding on it. That must keep working."""
+        prior = self.with_complete_memory(self.load_latest())
+        fresh = copy.deepcopy(prior)
+        for metric in ("memory", "latency", "scaling"):
+            fresh.pop(metric, None)
+        allocators = fresh["allocators"]
+        assert isinstance(allocators, list)
+        for value in allocators:
+            assert isinstance(value, dict)
+            if value["allocator_id"] == "mimalloc-pprof":
+                value["source_sha"] = "1" * 40
+        fresh["pending_metrics"] = [
+            {
+                "metric_id": metric,
+                "status": "pending",
+                "reason": "x",
+                "phase_issue_url": "https://github.com/zackees/mimalloc-pprof/issues/183",
+            }
+            for metric in ("memory", "latency", "scaling", "pprof-tax")
+        ]
+        self.assertTrue(report.carry_forward_optional_metrics(fresh, prior))
+        self.assertIn("memory", fresh)
+
     def test_a_round_tripped_legacy_sample_keeps_rendering(self) -> None:
         """#376: what stopped the pipeline publishing for three weeks.
 

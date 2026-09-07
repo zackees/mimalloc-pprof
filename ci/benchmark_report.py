@@ -4091,11 +4091,74 @@ def pending_scaling_svg(pattern: str, reason: str) -> bytes:
     return ("\n".join(parts) + "\n").encode("utf-8")
 
 
+#: Where each optional section records the allocator each of its samples was measured
+#: against. The shapes differ because the sections were written at different times.
+OPTIONAL_SECTION_SAMPLE_PINS = {
+    "memory": ("raw_samples", "allocator_id", "allocator_source_sha"),
+    "latency": ("raw_samples", "allocator_id", "allocator_source_sha"),
+    "scaling": ("raw_samples", "allocator_id", "allocator_source_sha"),
+}
+
+
+def _pinned_pairs(rows: object, id_key: str, sha_key: str) -> set[tuple[str, str]]:
+    """(allocator, source sha) pairs from a list of records, lock-pinned competitors only.
+
+    The fork's own commit legitimately differs between a carried section and the core run
+    (see `validate_carried_pins`), so it is never part of the comparison.
+    """
+    pairs: set[tuple[str, str]] = set()
+    if not isinstance(rows, list):
+        return pairs
+    for row in cast("list[object]", rows):
+        if not isinstance(row, dict):
+            continue
+        record = cast("dict[str, object]", row)
+        allocator = record.get(id_key)
+        sha = record.get(sha_key)
+        if (
+            isinstance(allocator, str)
+            and isinstance(sha, str)
+            and allocator in LOCK_PINNED_ALLOCATORS
+        ):
+            pairs.add((allocator, sha))
+    return pairs
+
+
+def section_pinned_pairs(section: object) -> set[tuple[str, str]]:
+    """The pins a carried optional section was measured at."""
+    if not isinstance(section, dict):
+        return set()
+    return _pinned_pairs(
+        cast("dict[str, object]", section).get("raw_samples"),
+        "allocator_id",
+        "allocator_source_sha",
+    )
+
+
+def core_pinned_pairs(latest: Mapping[str, object]) -> set[tuple[str, str]]:
+    """The same pins for the core run itself."""
+    return _pinned_pairs(latest.get("allocators"), "allocator_id", "source_sha")
+
+
 def carry_forward_optional_metrics(latest: dict[str, object], prior: dict[str, object]) -> bool:
     validate_latest(prior, "prior latest")
     carried = False
+    core = core_pinned_pairs(latest)
     for metric in ("memory", "latency", "scaling"):
         if metric not in latest and metric in prior:
+            # #376: a section measured against different allocator pins may not ride on this
+            # core envelope. `validate_carried_pins` rejects exactly that a few lines later,
+            # so carrying it anyway does not publish stale data -- it fails the whole render
+            # and publishes NOTHING, which is what a pin move used to do to this pipeline
+            # (the #332 bump to 6def7be9 took benchmark-stats red immediately).
+            #
+            # A section left behind is not lost data: it simply stays `pending`, which the
+            # report already knows how to render, and the next memory/latency/scaling run
+            # refills it at the new pin. Re-baselining one metric at a time is the normal
+            # consequence of moving a pin; a dead pipeline is not.
+            stale = section_pinned_pairs(prior[metric]) - core
+            if stale and core:
+                continue
             latest[metric] = copy.deepcopy(prior[metric])
             pending = list_value(latest["pending_metrics"], "latest.pending_metrics")
             latest["pending_metrics"] = [

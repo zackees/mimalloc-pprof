@@ -1564,6 +1564,25 @@ if (MI_BUILD_TESTS)
   add_test(NAME test-memory-events-env-enabled COMMAND mimalloc-test-memory-events --env-enabled-check)
   set_tests_properties(test-memory-events-env-enabled PROPERTIES ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
 
+  # #371 behavioural regression gate: the observer hooks must not serialise the allocator.
+  # Ratio-based, RUN_SERIAL, and skips itself below four hardware threads -- see the file
+  # comment for why a rate threshold would be a flake generator.
+  add_executable(mimalloc-test-observer-scaling test/test-observer-scaling.c)
+  target_compile_definitions(mimalloc-test-observer-scaling PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-observer-scaling PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-observer-scaling PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-observer-scaling PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-observer-scaling PRIVATE mimalloc ${mi_libraries})
+  endif()
+  if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(mimalloc-test-observer-scaling PRIVATE Threads::Threads)
+  endif()
+  add_test(NAME test-observer-scaling COMMAND mimalloc-test-observer-scaling)
+  set_tests_properties(test-observer-scaling PROPERTIES TIMEOUT 300)
+
   # Exact DHAT v2 observer (issue #238): intentionally independent of MI_PPROF.
   # #371: but not of MI_DHAT -- with the observer compiled out the public API is stubs.
   if(MI_DHAT)
@@ -2055,6 +2074,9 @@ set(mi_serial_tests
   # "a wall-clock deadline" measurements that an oversubscribed wave would turn into noise.
   test-purge-all
   test-purge-all-no-scavenger
+  # #371: a scaling RATIO is only meaningful with the machine to itself; an oversubscribed
+  # wave would turn it into noise and, worse, into a flaky gate.
+  test-observer-scaling
 )
 # Next candidate if the wave ever goes flaky: test-fork-user-heap. It is not here because
 # nothing has been observed to fail -- it forks, and a fork's cost and timing are the

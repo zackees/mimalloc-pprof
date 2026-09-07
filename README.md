@@ -176,13 +176,68 @@ Full methodology, per-cell tables and the other benchmark families are in
 
 ---
 
+## Memory returned after idle
+
+Throughput is half the question; the other half is whether the memory comes back when a
+burst of work drains. One churn workload — 150k × 512 B + 100k × 1 KiB + 50k × 2 KiB
+blocks, a scattered 1-in-20 kept alive, the rest freed — under four of the five pinned
+allocators, then 10 s of idle:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-idle-rss-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-idle-rss-light.svg" />
+  <img alt="At the first idle tick mimalloc-pprof returns 74% of peak RSS, Bun's mimalloc 74%, jemalloc 0% by default" src=".github/assets/allocator-idle-rss-light.svg" width="100%" />
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-idle-table-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-idle-table-light.svg" />
+  <img alt="Peak RSS, RSS after idle and percent returned, per allocator: mimalloc-pprof, jemalloc, Bun mimalloc and Microsoft mimalloc" src=".github/assets/allocator-idle-table-light.svg" width="100%" />
+</picture>
+
+**Hole purging's own contribution, isolated.** One binary, the scavenger on in both runs,
+`MIMALLOC_PURGE_HOLES` the only changed variable. Returning whole pages is worth 18 %;
+discarding the free runs *inside* still-used pages is worth 74 %.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-rss-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-rss-light.svg" />
+  <img alt="Hole purging returns 74% of peak RSS after idle; the scavenger alone returns 18%" src=".github/assets/hole-purging-rss-light.svg" width="100%" />
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-table-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-table-light.svg" />
+  <img alt="Hole purging characteristics of the churn workload" src=".github/assets/hole-purging-table-light.svg" width="100%" />
+</picture>
+
+**Purging from another thread while every worker stays busy.** The one memory-return
+primitive jemalloc has that this fork's *default* build does not — and what a build with
+`MI_OWNER_GATE=ON` buys.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-purge-any-thread-table-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-purge-any-thread-table-light.svg" />
+  <img alt="Memory returned with 4 busy threads, purge from another thread: mimalloc-pprof default build 12-14%, MI_OWNER_GATE=ON 72%, jemalloc 74%, glibc 72%" src=".github/assets/allocator-purge-any-thread-table-light.svg" width="100%" />
+</picture>
+
+The caveats behind these numbers (the 74 % is cooperative, not automatic; jemalloc returns
+the same memory if you ask it explicitly), the per-run methodology, and the pinned
+allocator provenance are in
+[Performance → reading the memory-return charts](#reading-the-memory-return-charts). The
+full jemalloc trade-off is in
+[the Q&A](#how-does-memory-return-compare-to-jemalloc).
+
+---
+
 **Contents**
 
 - [Feature comparison](#feature-comparison) — every feature of this fork, Microsoft mimalloc, Bun's mimalloc and jemalloc, side by side *(above)*
 - [Thread scaling](#thread-scaling-by-allocation-pattern) — how the five allocators scale from 1 to 16 threads *(above)*
+- [Memory returned after idle](#memory-returned-after-idle) — what each allocator hands back when a burst of work drains, and what hole purging is worth *(above)*
 - [At a glance](#at-a-glance--why-use-this-version) — what you get over upstream mimalloc, in one screen
 - [Integration](#integration) — pprof, exact stats and DHAT in Rust and C, plus the full API table
-- [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, Bun's fork, TCMalloc, and jemalloc, plus a measured memory-returned-after-idle chart
+- [Performance](#performance) — how every chart above was measured: continuous benchmarks vs. upstream mimalloc, Bun's fork, TCMalloc, and jemalloc, and the memory-return methodology
 - [Why use this fork](#why-use-this-fork) — the most tested mimalloc fork in existence
 - [Bun features](#bun-features) — every feature ported from oven-sh/mimalloc, and what was deliberately left out
 - [Profiling and observability](#profiling-and-observability) — sampled pprof, exact stats, DHAT, memory events
@@ -509,7 +564,7 @@ mi_purge_holes_report();        /* per size class: what could NOT be discarded, 
 ```
 
 For a measured chart of what this buys on a churn workload, see
-[Performance: memory returned after idle](#memory-returned-after-idle).
+[Memory returned after idle](#memory-returned-after-idle).
 
 ### API surface
 
@@ -683,8 +738,8 @@ mimalloc-pprof is continuously benchmarked against **Microsoft mimalloc**,
 **TCMalloc**, and **jemalloc** on a dedicated Linux x86-64 runner. Every *throughput*
 result is **GitHub-hosted and informational** — no self-hosted hardware, no
 hand-picked runs, no unpublished baselines. The
-[memory-returned-after-idle](#memory-returned-after-idle) charts that close this
-section are the exception, and are labelled as one: a separate, committed measurement
+[memory-returned-after-idle](#memory-returned-after-idle) charts at the top of this
+file are the exception, and are labelled as one: a separate, committed measurement
 that names its own machine, kernel and commit on the chart itself.
 
 | Resource | Description |
@@ -707,8 +762,9 @@ upstream-vs-fork is fork-versus-its-own-base
 ([methodology](docs/benchmarks.md)). The Bun pin moves in the same PR as each
 future Bun-parity ingest. The [throughput charts at the top of this
 file](#thread-scaling-by-allocation-pattern) are regenerated by the scheduled
-dashboard run, and a freshly added row appears there first; the memory charts
-that close this section are regenerated by hand, by the script they name.
+dashboard run, and a freshly added row appears there first; the
+[memory charts](#memory-returned-after-idle) beside them are regenerated by hand, by
+the script they name.
 
 ### What the four scaling patterns stress
 
@@ -726,27 +782,16 @@ allocators replay one identical stream inside each paired block.
 Full methodology, per-cell tables, and the pending metric roadmap:
 **[docs/benchmarks.md](docs/benchmarks.md)**.
 
-### Memory returned after idle
+### Reading the memory-return charts
 
 Throughput is not the only thing a long-running process wants from its allocator.
-When a burst of work drains, does the memory come back? The chart below runs **one
-churn workload under four of the five pinned allocators** — 150k × 512 B + 100k ×
-1 KiB + 50k × 2 KiB blocks, a scattered 1-in-20 kept alive, the rest freed — then
-idles for 10 s and samples resident set size.
+When a burst of work drains, does the memory come back? The
+[charts at the top of this file](#memory-returned-after-idle) run **one churn workload
+under four of the five pinned allocators** — 150k × 512 B + 100k × 1 KiB + 50k × 2 KiB
+blocks, a scattered 1-in-20 kept alive, the rest freed — then idle for 10 s and sample
+resident set size.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-idle-rss-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-idle-rss-light.svg" />
-  <img alt="At the first idle tick mimalloc-pprof returns 74% of peak RSS, Bun's mimalloc 74%, jemalloc 0% by default" src=".github/assets/allocator-idle-rss-light.svg" width="100%" />
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-idle-table-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-idle-table-light.svg" />
-  <img alt="Peak RSS, RSS after idle and percent returned, per allocator: mimalloc-pprof, jemalloc, Bun mimalloc and Microsoft mimalloc" src=".github/assets/allocator-idle-table-light.svg" width="100%" />
-</picture>
-
-Read it precisely — the first two points are caveats on the headline, and the
+Read them precisely — the first two points are caveats on the headline, and the
 third is what survives them:
 
 - **The 74 % is cooperative, not automatic.** With a survivor every 20 blocks,
@@ -773,7 +818,7 @@ third is what survives them:
   lost to its own 1000 ms `purge_delay`: `mi_collect(true)`, which forces the purge
   rather than honouring the delay, returns the same **18 %** on all three runs. Page
   granularity is the ceiling here, not the delay. That
-  independently reproduces the 18 % the off-vs-on chart below measures for this
+  independently reproduces the 18 % the off-vs-on chart above measures for this
   fork's scavenger with hole purging switched off. Whole-page return gets you 18 %;
   punching holes in still-used pages gets you 74 %. The Bun row lands on the same
   74 %.
@@ -804,25 +849,14 @@ uv run ci/bench_hole_purging_allocators.py --from-data --table
 
 #### Isolating this fork's own contribution
 
-The chart above cannot separate hole purging from the rest of what this fork does at
-an idle point, because no competitor has a `MIMALLOC_PURGE_HOLES` to turn off. This
-pair does: one binary, the scavenger on in both runs, hole purging the only changed
-variable. Note the two pairs do not share a selection rule — this one is the **median**
-of 3 runs, the cross-allocator pair above is the **best** of 3 (the rule that is most
-generous to every allocator, including the ones this fork is measured against). Each
-SVG names its own, and neither pair was rendered from the other's data.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-rss-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-rss-light.svg" />
-  <img alt="Hole purging returns 74% of peak RSS after idle; the scavenger alone returns 18%" src=".github/assets/hole-purging-rss-light.svg" width="100%" />
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-table-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset=".github/assets/hole-purging-table-light.svg" />
-  <img alt="Hole purging characteristics of the churn workload" src=".github/assets/hole-purging-table-light.svg" width="100%" />
-</picture>
+The cross-allocator chart cannot separate hole purging from the rest of what this fork
+does at an idle point, because no competitor has a `MIMALLOC_PURGE_HOLES` to turn off.
+The [off-vs-on pair](#memory-returned-after-idle) does: one binary, the scavenger on in
+both runs, hole purging the only changed variable. Note the two pairs do not share a
+selection rule — the off-vs-on pair is the **median** of 3 runs, the cross-allocator
+pair is the **best** of 3 (the rule that is most generous to every allocator, including
+the ones this fork is measured against). Each SVG names its own, and neither pair was
+rendered from the other's data.
 
 Both were measured at commit `be13eadf` with
 [`ci/bench_hole_purging.py`](ci/bench_hole_purging.py): 150k 512 B + 100k 1 KiB +
@@ -943,9 +977,10 @@ so a mis-scoped discard corrupts visibly rather than silently). Query it live wi
 runs of the off-vs-on chart; that pair isolates hole purging's own contribution.**
 
 **The chart and table this used to carry now live in
-[Performance → Memory returned after idle](#memory-returned-after-idle)**, next to the
-other benchmarks and alongside a second chart that puts the same churn workload
-through jemalloc, upstream mimalloc and Bun's mimalloc.
+[Memory returned after idle](#memory-returned-after-idle) at the top of this file**,
+alongside a second chart that puts the same churn workload through jemalloc, upstream
+mimalloc and Bun's mimalloc, and the methodology for both is in
+[Performance](#reading-the-memory-return-charts).
 
 For comparison, the PR #302 description measured Bun's own workload shape
 (400k blocks, min of 5 runs): peak RSS went **210.0 MB → 105.0 MB**, and
@@ -1087,13 +1122,8 @@ The one memory-return primitive jemalloc has that this fork's *default* build do
 not is the process-wide, any-thread, right-now purge. That case was measured too —
 the same workload split across **4 worker threads that stay busy** in a `malloc`/`free`
 loop and never idle, with the purge issued every 100 ms by a fifth thread that
-allocates nothing:
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-purge-any-thread-table-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-purge-any-thread-table-light.svg" />
-  <img alt="Memory returned with 4 busy threads, purge from another thread: mimalloc-pprof default build 12-14%, MI_OWNER_GATE=ON 72%, jemalloc 74%, glibc 72%" src=".github/assets/allocator-purge-any-thread-table-light.svg" width="100%" />
-</picture>
+allocates nothing. That table is the third one
+[at the top of this file](#memory-returned-after-idle):
 
 jemalloc's `arena.<all>.purge` returns **74 %** and glibc's `malloc_trim(0)` **72 %**
 from the other thread; every mimalloc's `mi_collect(true)` returns **14 %** (the

@@ -311,3 +311,19 @@ jobs:
             --site-dir audit/site/ \
             --page-url "${{ needs.deploy-pages.outputs.page_url }}"
           echo "Scaling publication branch and Pages bytes match." >> "$GITHUB_STEP_SUMMARY"
+      - name: The fork must scale like the mimallocs beside it
+        # #371 layer 3. The data to catch that regression was always being published --
+        # `speedup_vs_single_worker`, per allocator, per pattern, per thread point -- and
+        # nothing looked at it, so the fork sat at 1.30x against upstream's 2.60x for
+        # eleven days, through a release and a daily benchmark job.
+        #
+        # Deliberately AFTER publication: a parity failure means the fork got slower, not
+        # that the measurement is untrustworthy, and suppressing the chart would hide the
+        # very evidence someone needs. The site publishes; then this fails loudly.
+        #
+        # Compared against the other two mimallocs IN THE SAME RUN, which is what makes it
+        # gate-able on a hosted runner: absolute rates move with whatever else the machine
+        # is doing, but every row in one run met the same conditions.
+        run: |
+          set -euo pipefail
+          python ci/check_scaling_parity.py --latest audit/site/latest.json

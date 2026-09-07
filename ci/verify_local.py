@@ -790,6 +790,8 @@ def run_lint(ctx: RunCtx) -> bool:
         "ci/check_benchmark_memory_workflow.py",
         "ci/check_benchmark_latency_workflow.py",
         "ci/check_benchmark_scaling_workflow.py",
+        # #371 layer 3: the published-parity assertion's own parsers.
+        "ci/check_scaling_parity.py",
     ):
         rc, _ = run_logged(
             ["uv", "run", "--with", "pyyaml==6.0.2", script, "--selftest"],

@@ -81,7 +81,7 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
 
 ## Repo facts
 
-- Branch layout: `main` is the **v3** line (crate 0.9.x, overlay pinned to `upstream/dev3`
+- Branch layout: `main` is the **v3** line (crate 0.11.x, overlay pinned to `upstream/dev3`
   commit `6def7be9`; was `bcee5a88` before the #266 bump, and `579f8c0e` before that (#80)).
   The previous v2 line is preserved on the **`v2`** branch and is what
   crates.io still serves as 0.8.x. Do not move the v3 overlay to a newer `dev3` without

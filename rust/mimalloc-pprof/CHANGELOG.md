@@ -1,7 +1,27 @@
 # Changelog
 
-## Unreleased
+## 0.11.0
 
+Multithreaded allocation is fast again, process-wide eager purge, Bun's heap-snapshot
+format, zero-tracking back on, and a macOS malloc zone the platform's own tools can walk.
+
+- **Fast path: 4.5× single-thread and 35× at eight threads**
+  ([#371](https://github.com/zackees/mimalloc-pprof/issues/371),
+  [#372](https://github.com/zackees/mimalloc-pprof/pull/372),
+  [#387](https://github.com/zackees/mimalloc-pprof/pull/387)). memory-events and DHAT are
+  both opt-in and both off in a default process, yet every allocation and every free
+  entered them out of line, and DHAT's prologue took **two global atomic read-modify-writes
+  per alloc and per free** — which serialised the allocator so thoroughly that the fork got
+  *slower* with more threads. Both observers now publish one cache-line-aligned armed word
+  that the call site reads inline: with nothing observing, an allocation pays **one relaxed
+  load and a not-taken branch**, and the whole prologue moves, unchanged, behind it. The
+  lazy-activation contract is preserved exactly — each observer keeps an `unresolved` bit,
+  so the first hook call still resolves its environment there and never at startup.
+  Tiny-hot loop (16–64 B, 256 live), 16 cores, Release, Mops/s at 1 / 4 / 8 threads:
+  **83 / 53 / 56 → 373 / 1196 / 1985**. A new `MI_DHAT` compile option (default on, so
+  `dhat::` keeps working) can also leave the collector out of the build entirely. Guarded
+  from here by three gates: a fast-path instruction-identity check, a ratio-based scaling
+  test in `ctest`, and a published-chart parity audit against upstream and Bun's mimalloc.
 - **Process-wide eager purge** ([#366](https://github.com/zackees/mimalloc-pprof/issues/366)):
   `purge_all(force) -> PurgeAllReport` and `purge_all_ex(PurgeFlags, wait_ms) ->
   (PurgeStatus, PurgeAllReport)` wrap `mi_purge_all_ex`; `sys::mi_purge_all_report_t`,
@@ -26,9 +46,20 @@
   `enumerator` was upstream's empty stub; it is now a real in- and out-of-process walk
   through the caller's `memory_reader_t` (ported from Bun), and `statistics` reports
   live numbers. No crate API change; the zone file rides in the vendored amalgamation.
+- **Thread exit no longer allocates through the allocator**
+  ([#350](https://github.com/zackees/mimalloc-pprof/issues/350),
+  [#357](https://github.com/zackees/mimalloc-pprof/pull/357)): the per-heap abandoned-page
+  bitmaps introduced with the lazy-bitmap work were allocated on the meta path at thread
+  exit, which made the churn benchmark's resident set bimodal (58 or 66 MB from run to run).
+  They come from the OS layer now, and the memory gate is deterministic again.
 - **CI**: a selective macOS lane runs the `macos`-labelled tests in the Recovery guest on
   PRs that touch a Darwin path or carry `needs-macos`
-  ([#348](https://github.com/zackees/mimalloc-pprof/pull/348)).
+  ([#348](https://github.com/zackees/mimalloc-pprof/pull/348)); the allocator lockfile
+  controls the effective debug level ([#314](https://github.com/zackees/mimalloc-pprof/issues/314)),
+  test binaries are relocatable so bundles run anywhere
+  ([#294](https://github.com/zackees/mimalloc-pprof/issues/294)), and the benchmark
+  publication pipeline — stalled since 2026-08-14 — renders, validates and publishes again
+  ([#376](https://github.com/zackees/mimalloc-pprof/issues/376)).
 
 ## 0.10.0
 

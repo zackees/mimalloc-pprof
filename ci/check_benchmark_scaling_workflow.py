@@ -242,8 +242,14 @@ def _build_job(workflow: dict[str, Any]) -> dict[str, Any]:
     return cast(dict[str, Any], cast(dict[str, Any], workflow["jobs"])["build-and-measure"])
 
 
-def _step(workflow: dict[str, Any], name: str) -> dict[str, Any]:
-    for step in cast(list[dict[str, Any]], _build_job(workflow)["steps"]):
+def _step(workflow: dict[str, Any], name: str, job: str | None = None) -> dict[str, Any]:
+    """A step by name, from `build-and-measure` unless another job is named."""
+    steps = (
+        cast(list[dict[str, Any]], cast(dict[str, Any], workflow["jobs"])[job]["steps"])
+        if job is not None
+        else cast(list[dict[str, Any]], _build_job(workflow)["steps"])
+    )
+    for step in steps:
         if step.get("name") == name:
             return step
     raise KeyError(name)
@@ -299,9 +305,12 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
     "lease dropped": lambda wf: cast(
         list[dict[str, Any]], cast(dict[str, Any], wf["jobs"])["publish-branch"]["steps"]
     )[-1].__setitem__("run", "git push origin HEAD:$PUBLISH_REF"),
-    "publication audit weakened": lambda wf: cast(
-        list[dict[str, Any]], cast(dict[str, Any], wf["jobs"])["publication-audit"]["steps"]
-    )[-1].__setitem__("run", "echo ok"),
+    # #371: by NAME, not by position. This used to mutate `steps[-1]`, which silently
+    # stopped testing the audit step the moment another step was appended after it -- the
+    # parity assertion did exactly that, and the control failed to fail.
+    "publication audit weakened": lambda wf: _step(
+        wf, "audit scaling publication", "publication-audit"
+    ).__setitem__("run", "echo ok"),
 }
 
 

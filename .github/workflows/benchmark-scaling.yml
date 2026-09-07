@@ -28,7 +28,11 @@ on:
         default: 3
         required: false
   schedule:
-    - cron: "23 7 * * 0"
+    # #208: daily. This landed weekly-first so one live run could prove its budget before
+    # the daily signal depended on it; run 31759621920 did (3m01s measuring, 10m00s job,
+    # 20-minute timeout, `fits_limit: true`), so it takes over from benchmark-stats, which
+    # moves to weekly.
+    - cron: "23 7 * * *"
 
 concurrency:
   group: benchmark-stats-production

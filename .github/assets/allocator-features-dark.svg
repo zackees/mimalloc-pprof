@@ -7,7 +7,7 @@
 <text x="24" y="46" font-size="11" fill="#8b949e">Sourced cell by cell in docs/allocator-features.json. Upstream and Bun are the exact commits this fork pins to and ports from; jemalloc is the build in the benchmark lockfile. The measured row is the committed churn benchmark,</text>
 <text x="24" y="61" font-size="11" fill="#8b949e">whose upstream arm is v3.4.3 (bcee5a88).</text>
 <text x="432.0" y="93" font-size="12.5" font-weight="700" fill="#e6edf3">mimalloc-pprof</text>
-<text x="432.0" y="108" font-size="10" fill="#8b949e">this fork, 0.9.x</text>
+<text x="432.0" y="108" font-size="10" fill="#8b949e">this fork, 0.11.x</text>
 <text x="642.0" y="93" font-size="12.5" font-weight="600" fill="#8b949e">Microsoft MiMalloc-V3</text>
 <text x="642.0" y="108" font-size="10" fill="#8b949e">v3 dev3 @ 6def7be9</text>
 <text x="852.0" y="93" font-size="12.5" font-weight="600" fill="#8b949e">Bun mimalloc</text>

@@ -71,10 +71,116 @@ what that risk means and what was measured.
   <img alt="Star history for zackees/mimalloc-pprof" src=".github/assets/star-history-light.svg" width="100%" />
 </picture>
 
+## Feature comparison
+
+Everything the four allocators in the
+[memory-return chart](#memory-returned-after-idle) do, side by side: this fork, Microsoft MiMalloc-V3 (upstream `dev3`), [Bun's fork](https://github.com/oven-sh/mimalloc),
+and [jemalloc](https://jemalloc.net/). Every cell is sourced — a `path:line` in this
+tree, a path in the pinned upstream commit, or an official doc anchor — in
+[`docs/allocator-features.json`](docs/allocator-features.json), which is what both the
+image and the table below are rendered from.
+
+<!-- feature-table:start -->
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-features-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-features-light.svg" />
+  <img alt="Feature comparison of mimalloc-pprof, Microsoft MiMalloc-V3, Bun's mimalloc and jemalloc across memory return, profiling, robustness, platform support and allocator design" src=".github/assets/allocator-features-light.svg" width="100%" />
+</picture>
+
+<details>
+<summary><b>The same matrix as text</b> — searchable, screen-readable, and what an LLM reading this file will use</summary>
+
+| Feature | **mimalloc-pprof** | Microsoft MiMalloc-V3 | Bun mimalloc | jemalloc |
+|---|:--|:--|:--|:--|
+|  | this fork, 0.9.x | v3 dev3 @ 6def7be9 | oven-sh @ b20b60d9 | 5.3.1 @ 81034ce1 |
+| **Memory return** | | | | |
+| Process-wide eager purge, from any thread | ✅ gated 72 %, default parked | ❌ mi_collect is caller-only | ❌ mi_collect is caller-only | ✅ MALLCTL_ARENAS_ALL, 74 % |
+| Purge the calling thread's own memory | ✅ mi_collect, idle hook | ✅ mi_collect | ✅ mi_collect, idle hook | ✅ tcache.flush + arena.i.purge |
+| Sweep another thread's heap for it | ✅ all gated; parked default | ❌ no scavenger at all | ⚠️ parked threads only | ⚠️ arena purge, not their tcache |
+| Sub-page return inside a still-used page | ✅ hole purging, on by default | ❌ whole pages only | ✅ hole purging, on by default | ❌ extent-granular purge |
+| Background purge thread | ✅ on by default | ❌ purge waits for a malloc | ✅ on by default | ⚠️ off by default |
+| Time-delayed / decaying purge | ✅ purge_delay 100 ms | ✅ purge_delay 1000 ms | ✅ purge_delay 100 ms | ✅ dirty_decay_ms 10 s |
+| RSS returned after 10 s idle (churn) | 74 % | 0 % (18 % w/ mi_collect) | 74 % | 0 % (74 % if asked) |
+| **Profiling and observability** | | | | |
+| pprof-compatible sampled heap profiler | ✅ runtime opt-in | ❌ none at all | ✅ runtime opt-in | ✅ build-time --enable-prof |
+| Heap profiler on Windows | ✅ MSVC and MinGW | ❌ no profiler | ⚠️ frames, no module map | ⚠️ not MSVC; MinGW untested |
+| profile.proto (protobuf) output | ✅ and gperftools text | ❌ no profiler | ✅ | ❌ text format; jeprof reads |
+| Exact allocator statistics | ✅ mi_stats_get | ✅ mi_stats_get | ✅ mi_stats_get | ✅ mallctl / malloc_stats_print |
+| Statistics as JSON | ✅ mi_stats_get_json | ✅ mi_stats_get_json | ✅ mi_stats_get_json | ✅ the "J" opts flag |
+| Per-heap JSON dump | ✅ mi_heap_dump_json | ❌ process-wide stats only | ✅ mi_heap_dump_json | ❌ per-arena, not per-heap |
+| DHAT exact profiling (Valgrind format) | ✅ mi_dhat_start | ❌ | ❌ | ❌ |
+| Allocation-event callbacks | ✅ mi_memory_set_callbacks | ❌ | ❌ | ⚠️ experimental.hooks.install |
+| Walk every live block in a heap | ✅ mi_heap_visit_blocks | ✅ mi_heap_visit_blocks | ✅ mi_heap_visit_blocks | ❌ no iteration mallctl |
+| Live heap snapshot with a viewer | ✅ mi_heap_snapshot — [#338](https://github.com/zackees/mimalloc-pprof/issues/338) | ❌ | ✅ + tools/mi-heapview | ❌ |
+| No fast-path cost while profiling is off | ✅ malloc path byte-identical | ✅ nothing to cost | ✅ sample rate 0 by default | ⚠️ build-time opt-in |
+| **Robustness** | | | | |
+| fork() handlers (pthread_atfork) | ✅ documented lock order | ❌ none registered | ✅ | ✅ jemalloc_prefork |
+| Runtime lock-order checker | ✅ MI_DEBUG>2 | ❌ no fork handlers either | ❌ order kept by hand | ✅ witness ranks, --enable-debug |
+| Heap-teardown ABA claim protocol | ✅ + fault-injection tests | ❌ | ✅ | ❌ caller must flush first |
+| Guard-page (guarded) allocations | ✅ MI_GUARDED | ✅ MI_GUARDED | ✅ MI_GUARDED | ⚠️ opt.san_guard_small/large |
+| Hardened / secure build mode | ✅ MI_SECURE 1-4 | ✅ MI_SECURE 1-4 | ✅ MI_SECURE 1-4 | ❌ no equivalent mode |
+| ASan / Valgrind / ETW tracking | ✅ all three | ✅ all three | ✅ all three | ❌ no ASan, no ETW; Valgrind gone |
+| **Platform and integration** | | | | |
+| Windows MSVC as a first-class target | ✅ native cl gate per PR | ✅ in the test matrix | ✅ in the test matrix | ⚠️ no prof, no bg thread |
+| Windows malloc override via a redirect DLL | ✅ mimalloc-redirect.dll | ✅ mimalloc-redirect.dll | ✅ mimalloc-redirect.dll | ❌ link-time replacement only |
+| MinGW / win-gnu covered in CI | ✅ cross-built, then run | ✅ mingw-ucrt64 | ✅ mingw-ucrt64 | ✅ MSYS2 mingw32-make |
+| macOS malloc-zone interpose | ✅ | ✅ | ✅ | ✅ |
+| macOS zone introspection (leaks, vmmap) | ✅ in- and out-of-process — #349 | ❌ stub enumerator | ✅ in- and out-of-process | ❌ stub enumerator |
+| First-party Rust crate, full C API | ✅ mimalloc-pprof on crates.io | ❌ third-party crates only | ❌ no crate | ❌ third-party crates only |
+| Release targets cross-built on Linux | ✅ 5 targets through soldr | ❌ native runner per OS | ❌ native runner per OS | ❌ native runner per OS |
+| macOS covered with no Apple hardware | ✅ cross-built; guest run manual | ❌ hosted macOS runners | ❌ hosted macOS runners | ❌ hosted macOS runners |
+| **Allocator design** | | | | |
+| Per-thread heaps and caches | ✅ mi_theap_t per thread | ✅ mi_theap_t per thread | ✅ mi_theap_t per thread | ✅ tcache + per-thread arena |
+| Create and destroy your own heaps | ✅ mi_heap_new | ✅ mi_heap_new | ✅ mi_heap_new | ✅ arenas.create |
+| Shared arenas under the per-thread layer | ✅ arena-of-slices (v3) | ✅ arena-of-slices (v3) | ✅ arena-of-slices (v3) | ✅ per-CPU mode available |
+| Large / huge OS pages | ✅ allow_large_os_pages | ✅ allow_large_os_pages | ✅ allow_large_os_pages | ✅ opt.thp, opt.metadata_thp |
+| NUMA-aware reservation | ✅ use_numa_nodes | ✅ use_numa_nodes | ✅ use_numa_nodes | ❌ no NUMA option |
+| Bring your own memory region | ✅ mi_manage_os_memory | ✅ mi_manage_os_memory | ✅ mi_manage_os_memory | ✅ extent hooks |
+| Lazy abandoned-page bitmaps | ✅ ~110 KB saved per heap | ❌ allocated eagerly | ✅ ~110 KB saved per heap | ❌ no such structure |
+| Fixed TLS slots on macOS | ✅ slots 96/97 | ⚠️ slots 108/109 — collide | ✅ slots 96/97 | ❌ pthread_getspecific |
+| Purged memory tracked as still-zero | ✅ _mi_os_purge_zero, opt-in — [#337](https://github.com/zackees/mimalloc-pprof/issues/337) | ❌ _mi_os_purge has no is_zero | ✅ _mi_os_purge_zero | ✅ edata_zeroed after forced purge |
+| Opt out of the exit-time destructor | ✅ MI_NO_PROCESS_DETACH | ❌ | ✅ MI_NO_PROCESS_DETACH | ❌ |
+
+✅ has it &nbsp;·&nbsp; ⚠️ partly — see the note &nbsp;·&nbsp; ❌ does not. `mimalloc-pprof` is [this fork](https://github.com/zackees/mimalloc-pprof); *upstream* is [microsoft/mimalloc](https://github.com/microsoft/mimalloc) at the pinned `dev3` commit `6def7be9`; *Bun* is [oven-sh/mimalloc](https://github.com/oven-sh/mimalloc) at `b20b60d9`; *jemalloc* is 5.3.1 (`81034ce1`), the build in [`allocator-lock.json`](rust/benchmark-suite/allocators/allocator-lock.json). Every ❌ and ⚠️ in the `mimalloc-pprof` column links the issue tracking it. The per-cell sources — a `path:line` in this tree, a path in the pinned upstream or Bun commit, or a jemalloc doc anchor — are in [`docs/allocator-features.json`](docs/allocator-features.json), which this table and the image above are both rendered from by [`ci/render_feature_table.py`](ci/render_feature_table.py).
+
+</details>
+
+<!-- feature-table:end -->
+
+---
+
+## Thread scaling by allocation pattern
+
+Aggregate throughput as worker threads go from 1 to 4 to 16, for four allocation
+patterns. Each pattern is a seeded random operation stream, so all five
+allocators replay one identical stream inside each paired block.
+
+> **Coverage mode: reduced statistical rigor (3 blocks per cell).** These panels
+> trade statistical rigor for thread coverage — no confidence intervals, no noise
+> gating; read them for shape. The runner allows 4 logical CPUs, so the 16-thread
+> point is 4× oversubscribed and describes contention, not core scaling — it is
+> shaded on every chart.
+
+[![Tiny hot path: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-tiny-hot.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+[![General mix including realloc: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-mixed-general.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+[![Large page-touched buffers: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-buffers.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+[![Cross-thread producer/consumer handoff: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-cross-thread.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+Full methodology, per-cell tables and the other benchmark families are in
+[Performance](#performance) below and on the
+[dashboard](https://zackees.github.io/mimalloc-pprof/#scaling).
+
+---
+
 **Contents**
 
+- [Feature comparison](#feature-comparison) — every feature of this fork, Microsoft mimalloc, Bun's mimalloc and jemalloc, side by side *(above)*
+- [Thread scaling](#thread-scaling-by-allocation-pattern) — how the five allocators scale from 1 to 16 threads *(above)*
 - [At a glance](#at-a-glance--why-use-this-version) — what you get over upstream mimalloc, in one screen
-- [Feature comparison](#feature-comparison) — every feature of this fork, upstream mimalloc, Bun's mimalloc and jemalloc, side by side
 - [Integration](#integration) — pprof, exact stats and DHAT in Rust and C, plus the full API table
 - [Performance](#performance) — continuous benchmarks vs. upstream mimalloc, Bun's fork, TCMalloc, and jemalloc, plus a measured memory-returned-after-idle chart
 - [Why use this fork](#why-use-this-fork) — the most tested mimalloc fork in existence
@@ -158,80 +264,6 @@ re-verified under this tree's stress suite. → [Bun features](#bun-features)
 - **A Rust crate with full parity.** `mimalloc-pprof` on crates.io binds every fork C
   export and every `mi_option_t` enumerator, with layout and enum-value checks against
   the C compiler on every build. → [API surface](#api-surface)
-
-### Feature comparison
-
-Everything the four allocators in the
-[memory-return chart](#memory-returned-after-idle) do, side by side: this fork, Microsoft MiMalloc-V3 (upstream `dev3`), [Bun's fork](https://github.com/oven-sh/mimalloc),
-and [jemalloc](https://jemalloc.net/). Every cell is sourced — a `path:line` in this
-tree, a path in the pinned upstream commit, or an official doc anchor — in
-[`docs/allocator-features.json`](docs/allocator-features.json), which is what both the
-image and the table below are rendered from.
-
-<!-- feature-table:start -->
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-features-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset=".github/assets/allocator-features-light.svg" />
-  <img alt="Feature comparison of mimalloc-pprof, Microsoft MiMalloc-V3, Bun's mimalloc and jemalloc across memory return, profiling, robustness, platform support and allocator design" src=".github/assets/allocator-features-light.svg" width="100%" />
-</picture>
-
-| Feature | **mimalloc-pprof** | Microsoft MiMalloc-V3 | Bun mimalloc | jemalloc |
-|---|:--|:--|:--|:--|
-|  | this fork, 0.9.x | v3 dev3 @ 6def7be9 | oven-sh @ b20b60d9 | 5.3.1 @ 81034ce1 |
-| **Memory return** | | | | |
-| Process-wide eager purge, from any thread | ✅ gated 72 %, default parked | ❌ mi_collect is caller-only | ❌ mi_collect is caller-only | ✅ MALLCTL_ARENAS_ALL, 74 % |
-| Purge the calling thread's own memory | ✅ mi_collect, idle hook | ✅ mi_collect | ✅ mi_collect, idle hook | ✅ tcache.flush + arena.i.purge |
-| Sweep another thread's heap for it | ✅ all gated; parked default | ❌ no scavenger at all | ⚠️ parked threads only | ⚠️ arena purge, not their tcache |
-| Sub-page return inside a still-used page | ✅ hole purging, on by default | ❌ whole pages only | ✅ hole purging, on by default | ❌ extent-granular purge |
-| Background purge thread | ✅ on by default | ❌ purge waits for a malloc | ✅ on by default | ⚠️ off by default |
-| Time-delayed / decaying purge | ✅ purge_delay 100 ms | ✅ purge_delay 1000 ms | ✅ purge_delay 100 ms | ✅ dirty_decay_ms 10 s |
-| RSS returned after 10 s idle (churn) | 74 % | 0 % (18 % w/ mi_collect) | 74 % | 0 % (74 % if asked) |
-| **Profiling and observability** | | | | |
-| pprof-compatible sampled heap profiler | ✅ runtime opt-in | ❌ none at all | ✅ runtime opt-in | ✅ build-time --enable-prof |
-| Heap profiler on Windows | ✅ MSVC and MinGW | ❌ no profiler | ⚠️ frames, no module map | ⚠️ not MSVC; MinGW untested |
-| profile.proto (protobuf) output | ✅ and gperftools text | ❌ no profiler | ✅ | ❌ text format; jeprof reads |
-| Exact allocator statistics | ✅ mi_stats_get | ✅ mi_stats_get | ✅ mi_stats_get | ✅ mallctl / malloc_stats_print |
-| Statistics as JSON | ✅ mi_stats_get_json | ✅ mi_stats_get_json | ✅ mi_stats_get_json | ✅ the "J" opts flag |
-| Per-heap JSON dump | ✅ mi_heap_dump_json | ❌ process-wide stats only | ✅ mi_heap_dump_json | ❌ per-arena, not per-heap |
-| DHAT exact profiling (Valgrind format) | ✅ mi_dhat_start | ❌ | ❌ | ❌ |
-| Allocation-event callbacks | ✅ mi_memory_set_callbacks | ❌ | ❌ | ⚠️ experimental.hooks.install |
-| Walk every live block in a heap | ✅ mi_heap_visit_blocks | ✅ mi_heap_visit_blocks | ✅ mi_heap_visit_blocks | ❌ no iteration mallctl |
-| Live heap snapshot with a viewer | ✅ mi_heap_snapshot — [#338](https://github.com/zackees/mimalloc-pprof/issues/338) | ❌ | ✅ + tools/mi-heapview | ❌ |
-| No fast-path cost while profiling is off | ✅ malloc path byte-identical | ✅ nothing to cost | ✅ sample rate 0 by default | ⚠️ build-time opt-in |
-| **Robustness** | | | | |
-| fork() handlers (pthread_atfork) | ✅ documented lock order | ❌ none registered | ✅ | ✅ jemalloc_prefork |
-| Runtime lock-order checker | ✅ MI_DEBUG>2 | ❌ no fork handlers either | ❌ order kept by hand | ✅ witness ranks, --enable-debug |
-| Heap-teardown ABA claim protocol | ✅ + fault-injection tests | ❌ | ✅ | ❌ caller must flush first |
-| Guard-page (guarded) allocations | ✅ MI_GUARDED | ✅ MI_GUARDED | ✅ MI_GUARDED | ⚠️ opt.san_guard_small/large |
-| Hardened / secure build mode | ✅ MI_SECURE 1-4 | ✅ MI_SECURE 1-4 | ✅ MI_SECURE 1-4 | ❌ no equivalent mode |
-| ASan / Valgrind / ETW tracking | ✅ all three | ✅ all three | ✅ all three | ❌ no ASan, no ETW; Valgrind gone |
-| **Platform and integration** | | | | |
-| Windows MSVC as a first-class target | ✅ native cl gate per PR | ✅ in the test matrix | ✅ in the test matrix | ⚠️ no prof, no bg thread |
-| Windows malloc override via a redirect DLL | ✅ mimalloc-redirect.dll | ✅ mimalloc-redirect.dll | ✅ mimalloc-redirect.dll | ❌ link-time replacement only |
-| MinGW / win-gnu covered in CI | ✅ cross-built, then run | ✅ mingw-ucrt64 | ✅ mingw-ucrt64 | ✅ MSYS2 mingw32-make |
-| macOS malloc-zone interpose | ✅ | ✅ | ✅ | ✅ |
-| macOS zone introspection (leaks, vmmap) | ✅ in- and out-of-process — #349 | ❌ stub enumerator | ✅ in- and out-of-process | ❌ stub enumerator |
-| First-party Rust crate, full C API | ✅ mimalloc-pprof on crates.io | ❌ third-party crates only | ❌ no crate | ❌ third-party crates only |
-| Release targets cross-built on Linux | ✅ 5 targets through soldr | ❌ native runner per OS | ❌ native runner per OS | ❌ native runner per OS |
-| macOS covered with no Apple hardware | ✅ cross-built; guest run manual | ❌ hosted macOS runners | ❌ hosted macOS runners | ❌ hosted macOS runners |
-| **Allocator design** | | | | |
-| Per-thread heaps and caches | ✅ mi_theap_t per thread | ✅ mi_theap_t per thread | ✅ mi_theap_t per thread | ✅ tcache + per-thread arena |
-| Create and destroy your own heaps | ✅ mi_heap_new | ✅ mi_heap_new | ✅ mi_heap_new | ✅ arenas.create |
-| Shared arenas under the per-thread layer | ✅ arena-of-slices (v3) | ✅ arena-of-slices (v3) | ✅ arena-of-slices (v3) | ✅ per-CPU mode available |
-| Large / huge OS pages | ✅ allow_large_os_pages | ✅ allow_large_os_pages | ✅ allow_large_os_pages | ✅ opt.thp, opt.metadata_thp |
-| NUMA-aware reservation | ✅ use_numa_nodes | ✅ use_numa_nodes | ✅ use_numa_nodes | ❌ no NUMA option |
-| Bring your own memory region | ✅ mi_manage_os_memory | ✅ mi_manage_os_memory | ✅ mi_manage_os_memory | ✅ extent hooks |
-| Lazy abandoned-page bitmaps | ✅ ~110 KB saved per heap | ❌ allocated eagerly | ✅ ~110 KB saved per heap | ❌ no such structure |
-| Fixed TLS slots on macOS | ✅ slots 96/97 | ⚠️ slots 108/109 — collide | ✅ slots 96/97 | ❌ pthread_getspecific |
-| Purged memory tracked as still-zero | ✅ _mi_os_purge_zero, opt-in — [#337](https://github.com/zackees/mimalloc-pprof/issues/337) | ❌ _mi_os_purge has no is_zero | ✅ _mi_os_purge_zero | ✅ edata_zeroed after forced purge |
-| Opt out of the exit-time destructor | ✅ MI_NO_PROCESS_DETACH | ❌ | ✅ MI_NO_PROCESS_DETACH | ❌ |
-
-✅ has it &nbsp;·&nbsp; ⚠️ partly — see the note &nbsp;·&nbsp; ❌ does not. `mimalloc-pprof` is [this fork](https://github.com/zackees/mimalloc-pprof); *upstream* is [microsoft/mimalloc](https://github.com/microsoft/mimalloc) at the pinned `dev3` commit `6def7be9`; *Bun* is [oven-sh/mimalloc](https://github.com/oven-sh/mimalloc) at `b20b60d9`; *jemalloc* is 5.3.1 (`81034ce1`), the build in [`allocator-lock.json`](rust/benchmark-suite/allocators/allocator-lock.json). Every ❌ and ⚠️ in the `mimalloc-pprof` column links the issue tracking it. The per-cell sources — a `path:line` in this tree, a path in the pinned upstream or Bun commit, or a jemalloc doc anchor — are in [`docs/allocator-features.json`](docs/allocator-features.json), which this table and the image above are both rendered from by [`ci/render_feature_table.py`](ci/render_feature_table.py).
-
-<!-- feature-table:end -->
-
----
 
 ## Integration
 
@@ -673,29 +705,16 @@ recipe over one base: since [#332](https://github.com/zackees/mimalloc-pprof/iss
 commit this fork's overlay is based on, so all three rows are v3.5.0 and
 upstream-vs-fork is fork-versus-its-own-base
 ([methodology](docs/benchmarks.md)). The Bun pin moves in the same PR as each
-future Bun-parity ingest. The throughput charts below are regenerated by the
-scheduled dashboard run, and a freshly added row appears there first; the memory
-charts that close this section are regenerated by hand, by the script they name.
+future Bun-parity ingest. The [throughput charts at the top of this
+file](#thread-scaling-by-allocation-pattern) are regenerated by the scheduled
+dashboard run, and a freshly added row appears there first; the memory charts
+that close this section are regenerated by hand, by the script they name.
 
-### Thread scaling by allocation pattern
+### What the four scaling patterns stress
 
-Aggregate throughput as worker threads go from 1 to 4 to 16, for four allocation
-patterns. Each pattern is a seeded random operation stream, so all five
+The charts themselves are [at the top of this file](#thread-scaling-by-allocation-pattern);
+this is what each pattern is made of. Each is a seeded random operation stream, so all five
 allocators replay one identical stream inside each paired block.
-
-> **Coverage mode: reduced statistical rigor (3 blocks per cell).** These panels
-> trade statistical rigor for thread coverage — no confidence intervals, no noise
-> gating; read them for shape. The runner allows 4 logical CPUs, so the 16-thread
-> point is 4× oversubscribed and describes contention, not core scaling — it is
-> shaded on every chart.
-
-[![Tiny hot path: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-tiny-hot.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
-
-[![General mix including realloc: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-mixed-general.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
-
-[![Large page-touched buffers: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-buffers.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
-
-[![Cross-thread producer/consumer handoff: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-cross-thread.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
 | Pattern | Sizes | What it stresses |
 |---|---|---|

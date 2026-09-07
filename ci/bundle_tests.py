@@ -671,6 +671,10 @@ SYSTEM_DLLS = frozenset(
 #: (CMakeLists.txt turns that on by itself for `cl` and clang-cl alike). soldr's xwin splat
 #: carries import libraries only and no redistributable DLLs, so a cross build could not
 #: ship them even if it wanted to; the `windows-latest` image has them in System32.
+#: #296 (1): where a bundle records the redistributable DLLs it imports and was allowed
+#: not to carry. The consumer verifies these are present before running anything.
+MSVC_RUNTIME_MANIFEST = "msvc-runtime.txt"
+
 MSVC_RUNTIME_DLLS = frozenset(
     name.lower()
     for name in (
@@ -725,6 +729,7 @@ def resolve_runtime_dlls(
     search_dirs: Sequence[Path],
     objdump: str,
     allow_msvc_runtime: bool = False,
+    waived_out: set[str] | None = None,
 ) -> list[Path]:
     """Every non-system DLL the staged files import, transitively, found in `search_dirs`.
 
@@ -742,6 +747,7 @@ def resolve_runtime_dlls(
     """
     # Case-insensitive, because PE import names are (`KERNEL32.dll` vs `kernel32.dll`) and
     # the search directories live on a case-sensitive filesystem during a cross build.
+    waived_msvc_runtime: set[str] = set() if waived_out is None else waived_out
     available: dict[str, Path] = {}
     for directory in search_dirs:
         if not directory.is_dir():
@@ -757,6 +763,13 @@ def resolve_runtime_dlls(
         current = pending.pop(0)
         for imported in read_pe_imports(current, objdump):
             key = imported.lower()
+            # #296 (1): remember the redistributable DLLs this bundle actually leans on.
+            # `--allow-msvc-runtime` waives eight names; a bundle importing one of the six
+            # the runner did not happen to check (`vcruntime140_1.dll`, say) used to pass
+            # here and then fail on the runner as a dialog-free 0xC0000135. Recording the
+            # intersection lets the consumer verify exactly what was waived for it.
+            if allow_msvc_runtime and key in MSVC_RUNTIME_DLLS:
+                waived_msvc_runtime.add(imported)
             if key in carried or is_system_dll(imported, allow_msvc_runtime):
                 continue
             resolved = available.get(key)
@@ -908,15 +921,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seen[source.name] = source
                 unique.append(source)
         runtime_dlls: list[Path] = []
+        waived_msvc_runtime: set[str] = set()
         if search_dirs or bool(args.check_dll_closure):
             runtime_dlls = resolve_runtime_dlls(
-                unique, search_dirs, objdump, bool(args.allow_msvc_runtime)
+                unique,
+                search_dirs,
+                objdump,
+                bool(args.allow_msvc_runtime),
+                waived_msvc_runtime,
             )
             for dll in runtime_dlls:
                 if dll.name not in seen:
                     seen[dll.name] = dll
                     unique.append(dll)
         copied = copy_into(out_dir, unique)
+        # #296 (1): the bundle says which redistributable DLLs it was allowed to leave
+        # behind, so the runner checks exactly those instead of a hardcoded pair. Written
+        # whenever the waiver is in force -- an empty file is a real answer ("this bundle
+        # needs none of them") and is not the same as the file being absent.
+        if bool(args.allow_msvc_runtime):
+            (out_dir / MSVC_RUNTIME_MANIFEST).write_text(
+                "".join(f"{name}\n" for name in sorted(waived_msvc_runtime)),
+                encoding="utf-8",
+            )
         manifest_path = write_manifest(out_dir, tests, build_dir, config)
     except BundleError as exc:
         print(f"bundle_tests: {exc}", file=sys.stderr)

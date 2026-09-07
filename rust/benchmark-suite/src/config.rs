@@ -94,8 +94,8 @@ impl AllocatorLock {
                         && pin.source.commit == "81034ce1f1373e37dc865038e1bc8eeecf559ce8"
                 }
                 "upstream-mimalloc" => {
-                    pin.pin == "dev3@bcee5a88"
-                        && pin.source.commit == "bcee5a88e9311c08b8f93fbce3dcafe2f22a2d26"
+                    pin.pin == "dev3@6def7be9"
+                        && pin.source.commit == "6def7be9458fb8a97b8323af3fb0b0ae04387065"
                 }
                 "bun-mimalloc" => {
                     pin.pin == "bun-dev3-v2@b20b60d9"

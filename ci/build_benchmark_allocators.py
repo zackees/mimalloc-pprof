@@ -183,8 +183,8 @@ def validate_source(allocator_id: str, pin: str, source: Mapping[str, object]) -
         raise LockfileError(f"{allocator_id}.source.archive_url must name its source commit")
     if allocator_id == "jemalloc" and pin != f"5.3.1@{commit}":
         raise LockfileError("jemalloc must record release 5.3.1 and its peeled commit")
-    if allocator_id == "upstream-mimalloc" and pin != "dev3@bcee5a88":
-        raise LockfileError("upstream-mimalloc must remain at dev3@bcee5a88")
+    if allocator_id == "upstream-mimalloc" and pin != "dev3@6def7be9":
+        raise LockfileError("upstream-mimalloc must remain at dev3@6def7be9")
     if allocator_id == "bun-mimalloc" and pin != "bun-dev3-v2@b20b60d9":
         raise LockfileError("bun-mimalloc must remain at bun-dev3-v2@b20b60d9")
     if allocator_id == "tcmalloc" and pin != commit:

@@ -68,6 +68,7 @@ typedef struct dhat_event_s {
 static mi_lock_t dhat_lock = MI_LOCK_INITIALIZER;
 static mi_atomic_once_t dhat_once = { MI_ATOMIC_VAR_INIT(0), MI_LOCK_INITIALIZER };
 static _Atomic(size_t) dhat_state;
+static void dhat_publish_armed(size_t state);
 static dhat_chunk_t* dhat_chunks;
 static dhat_record_t** dhat_live_table;
 static dhat_pp_t** dhat_pp_table;
@@ -318,6 +319,21 @@ static bool dhat_env_size(const char* name, size_t* out) {
   *out = (size_t)v;
   return true;
 }
+// #371 tier 2: publish this observer's bits into the word the alloc/free fast path reads
+// (internal.h). ON is set before UNRESOLVED is cleared, so the word is never transiently
+// zero while DHAT is running.
+static void dhat_publish_armed(size_t state) {
+  if (state == DHAT_ENABLED) {
+    mi_atomic_or_acq_rel(&_mi_observers_armed, MI_OBSERVERS_DHAT_ON);
+  }
+  else {
+    mi_atomic_and_acq_rel(&_mi_observers_armed, ~(size_t)MI_OBSERVERS_DHAT_ON);
+  }
+  if (state != DHAT_UNINIT) {
+    mi_atomic_and_acq_rel(&_mi_observers_armed, ~(size_t)MI_OBSERVERS_DHAT_UNRESOLVED);
+  }
+}
+
 static void dhat_resolve_env(void) {
   if (_mi_atomic_once_enter(&dhat_once)) {
     char value[8] = { 0 };
@@ -333,7 +349,9 @@ static void dhat_resolve_env(void) {
       dhat_generation++;
       mi_lock_release(&dhat_lock);
     }
-    mi_atomic_store_release(&dhat_state, (size_t)(env_enabled ? DHAT_ENABLED : DHAT_DISABLED));
+    const size_t resolved = (size_t)(env_enabled ? DHAT_ENABLED : DHAT_DISABLED);
+    mi_atomic_store_release(&dhat_state, resolved);
+    dhat_publish_armed(resolved);
     _mi_atomic_once_release(&dhat_once);
   }
 }
@@ -444,6 +462,7 @@ bool mi_dhat_start(void) mi_attr_noexcept {
   dhat_started = _mi_clock_now();
   dhat_generation++;
   mi_atomic_store_release(&dhat_state, DHAT_ENABLED);
+  dhat_publish_armed(DHAT_ENABLED);
   mi_lock_release(&dhat_lock); return true;
 }
 void mi_dhat_stop(void) mi_attr_noexcept {
@@ -457,6 +476,7 @@ void mi_dhat_stop(void) mi_attr_noexcept {
   /* Block a new start while we drain events that already observed this session. */
   mi_atomic_store_release(&dhat_stopping, (size_t)1);
   mi_atomic_store_release(&dhat_state, DHAT_DISABLED);
+  dhat_publish_armed(DHAT_DISABLED);
   mi_lock_release(&dhat_lock);
   while (mi_atomic_load_acquire(&dhat_inflight) != 0) _mi_prim_thread_yield();
   mi_lock_acquire(&dhat_lock);

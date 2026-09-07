@@ -920,7 +920,19 @@ def fragmentation_reason(scenario_id: str, delta_bytes: int, peak_live_bytes: in
 def validate_memory_sample(value: object, label: str, *, legacy: bool = False) -> dict[str, object]:
     sample = object_value(value, label)
     if legacy:
-        exact_fields(sample, MEMORY_SAMPLE_FIELDS, label)
+        # #376: a legacy section that has been round-tripped through the Rust
+        # `LatestReport` structs comes back carrying `fragmentation_proxy_reason: null`.
+        # `benchmark-scaling-validate` does exactly that on every scaling run -- it reads
+        # the published latest.json, injects the fresh scaling section and writes the whole
+        # file back -- and serde writes the `Option<String>` field
+        # (rust/benchmark-suite/src/memory.rs:274) whether or not the artifact it read had
+        # the key. A null there is precisely the absence the legacy shape means, so it is
+        # accepted; a legacy sample carrying a real reason is still a contradiction between
+        # the methodology it declares and the data it holds, and still fails.
+        allowed = MEMORY_SAMPLE_FIELDS
+        if sample.get("fragmentation_proxy_reason", "absent") is None:
+            allowed = MEMORY_SAMPLE_FIELDS | {"fragmentation_proxy_reason"}
+        exact_fields(sample, allowed, label)
     else:
         exact_fields(sample, MEMORY_SAMPLE_FIELDS | {"fragmentation_proxy_reason"}, label)
     if sample.get("metric_schema_version") != MEMORY_SCHEMA:

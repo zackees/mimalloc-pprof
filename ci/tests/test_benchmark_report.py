@@ -445,6 +445,41 @@ class BenchmarkReportTests(unittest.TestCase):
         )
         return site, digest
 
+    def test_a_round_tripped_legacy_sample_keeps_rendering(self) -> None:
+        """#376: what stopped the pipeline publishing for three weeks.
+
+        `benchmark-scaling-validate` reads the published latest.json into the Rust
+        `LatestReport` structs, injects the fresh scaling section and writes the whole file
+        back. Serde writes `fragmentation_proxy_reason` (an `Option<String>`,
+        rust/benchmark-suite/src/memory.rs:274) whether or not the artifact it read had the
+        key, so every scaling run handed the renderer a legacy section carrying
+        `fragmentation_proxy_reason: null` -- and the renderer rejected it as an unexpected
+        field. A null there is exactly the absence the legacy shape means.
+        """
+        latest = self.with_complete_memory(self.load_latest(), legacy=True)
+        memory = latest["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list)
+        for sample in samples:
+            assert isinstance(sample, dict)
+            sample["fragmentation_proxy_reason"] = None
+        report.validate_latest(latest, "round-tripped legacy")
+
+    def test_a_legacy_sample_claiming_a_real_reason_is_still_rejected(self) -> None:
+        """The tolerance is for the null serde adds, not for a section whose methodology
+        says the proxy is unconditional while its samples explain why it is missing."""
+        latest = self.with_complete_memory(self.load_latest(), legacy=True)
+        memory = latest["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list)
+        first = samples[0]
+        assert isinstance(first, dict)
+        first["fragmentation_proxy_reason"] = "baseline-not-positive"
+        with self.assertRaisesRegex(report.ReportError, "fragmentation_proxy_reason"):
+            report.validate_latest(latest, "legacy with a reason")
+
     def test_fixture_renders_exact_allowlist_and_validates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             site, digest = self.render_fixture(Path(temporary))
@@ -2050,9 +2085,16 @@ class LegacyAllocatorLineageTests(unittest.TestCase):
             report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
             self.assertTrue((site / "benchmark-fragmentation.png").is_file())
 
-        # The tolerance is for the old shape exactly, not for a mixture: the old
-        # producer could not emit a non-positive delta, and the new one always
-        # writes the reason field.
+        # The tolerance is for the old shape, not for a genuine mixture: the old producer
+        # could not emit a non-positive delta, and a legacy section that *explains* a
+        # missing proxy contradicts the methodology it declares.
+        #
+        # #376 narrowed this. A legacy section carrying `fragmentation_proxy_reason: null`
+        # is NOT a mixture -- it is what serde writes when `benchmark-scaling-validate`
+        # round-trips the published latest.json through the Rust structs to inject a fresh
+        # scaling section, and rejecting it stopped the pipeline publishing for three
+        # weeks. A null is the absence the legacy shape means; only a real reason string is
+        # a contradiction, and that is what is asserted below now.
         degenerate = helper.with_complete_memory(helper.load_latest(), legacy=True)
         target = helper.plant_non_positive_delta(degenerate)
         del target["fragmentation_proxy_reason"]
@@ -2065,7 +2107,7 @@ class LegacyAllocatorLineageTests(unittest.TestCase):
         assert isinstance(memory, dict)
         samples = memory["raw_samples"]
         assert isinstance(samples, list) and isinstance(samples[0], dict)
-        samples[0]["fragmentation_proxy_reason"] = None
+        samples[0]["fragmentation_proxy_reason"] = "baseline-not-positive"
         with self.assertRaisesRegex(report.ReportError, "fields mismatch"):
             report.validate_latest(mixed, "mixed memory shape")
 

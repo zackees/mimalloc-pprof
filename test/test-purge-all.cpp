@@ -83,12 +83,14 @@ static bool thread_start(thread_t* t, thread_fun_t fn, void* arg) {
 }
 static void thread_join(thread_t t) {
   if (t != NULL) {
-    const DWORD id = GetThreadId(t);
     const DWORD waited = WaitForSingleObject(t, INFINITE);
     DWORD code = 0;
     const BOOL got_code = GetExitCodeThread(t, &code);
-    fprintf(stderr, "TRACE396 joined osid=%016llx wait=%08lx exit_valid=%d exit=%08lx\n",
-            (unsigned long long)id, (unsigned long)waited, (int)got_code, (unsigned long)code);
+    if (waited != WAIT_OBJECT_0 || !got_code || code != 0) {
+      fprintf(stderr, "thread join failed: wait=%08lx exit_valid=%d exit=%08lx\n",
+              (unsigned long)waited, (int)got_code, (unsigned long)code);
+      abort();
+    }
     CloseHandle(t);
   }
 }
@@ -985,43 +987,11 @@ static void test_d1_teardown(void) {
   }
 }
 
-#if defined(_WIN32) && defined(MI_TLD_TRACE)
-static LONG CALLBACK trace_exception(PEXCEPTION_POINTERS e) {
-  char buf[256] = "TRACE396 exception "; size_t n = strlen(buf);
-  const uintptr_t values[] = {GetCurrentThreadId(), (uintptr_t)e->ExceptionRecord->ExceptionCode,
-    (uintptr_t)e->ExceptionRecord->ExceptionAddress, (uintptr_t)GetModuleHandleW(NULL),
-    (uintptr_t)e->ExceptionRecord->ExceptionInformation[0], (uintptr_t)e->ExceptionRecord->ExceptionInformation[1]};
-  for (size_t i = 0; i < sizeof(values)/sizeof(values[0]); ++i) {
-    for (int k = (int)(sizeof(uintptr_t)*2)-1; k >= 0; --k) buf[n++] = "0123456789abcdef"[(values[i] >> (k*4)) & 15];
-    buf[n++] = ' ';
-  }
-  buf[n++] = '\n'; DWORD written;
-  WriteFile(GetStdHandle(STD_ERROR_HANDLE), buf, (DWORD)n, &written, NULL);
-  void* frames[40];
-  const USHORT count = CaptureStackBackTrace(0, 40, frames, NULL);
-  for (USHORT i = 0; i <= count; ++i) {
-    void* pc = (i == 0 ? e->ExceptionRecord->ExceptionAddress : frames[i-1]);
-    MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQuery(pc, &mbi, sizeof(mbi)) == 0) continue;
-    char module[MAX_PATH];
-    DWORD len = GetModuleFileNameA((HMODULE)mbi.AllocationBase, module, MAX_PATH);
-    char line[512];
-    int size = snprintf(line, sizeof(line), "TRACE396 frame %u pc=%p base=%p rva=%llx module=%.*s\n",
-      (unsigned)i, pc, mbi.AllocationBase,
-      (unsigned long long)((uintptr_t)pc - (uintptr_t)mbi.AllocationBase), (int)len, module);
-    if (size > 0 && size < (int)sizeof(line)) WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, (DWORD)size, &written, NULL);
-  }
-  return EXCEPTION_CONTINUE_SEARCH;
-}
-#endif
 
 int main(int argc, char** argv) {
 #if defined(_WIN32)
   hook_mode_slot = TlsAlloc();
   if (hook_mode_slot == TLS_OUT_OF_INDEXES) return 1;
-#endif
-#if defined(_WIN32) && defined(MI_TLD_TRACE)
-  AddVectoredExceptionHandler(1, trace_exception);
 #endif
   g_argc = argc; g_argv = argv;
   mutex_init(&g_mutex);

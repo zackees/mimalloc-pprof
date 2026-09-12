@@ -24,7 +24,6 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/internal.h"
 #include "mimalloc/prim.h"      // _mi_prim_thread_yield
 #include "mimalloc/prim-tls.h"  // _mi_theap_default
-#include "tld-trace.h"
 
 // Process-wide (§3). `_mi_purge_admission` is the holder's thread id (0 = free): two purges
 // cannot overlap, and a re-entrant call (a deferred-free handler or output hook calling
@@ -186,7 +185,6 @@ static void mi_purge_walk_stamp_rest(mi_subproc_t* sp, mi_purge_walk_t* w) {
       if (mi_atomic_load_relaxed(&tld->purge_epoch) == w->seq) continue;
       mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);
       w->pending++;
-      mi_tld_trace("pending", tld);
     }
   }
 }

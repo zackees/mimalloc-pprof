@@ -1,0 +1,100 @@
+name: purge-teardown-regression
+on:
+  push:
+    branches: [fix/396-pending-tld]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        gate: ['ON', 'OFF']
+    env:
+      SOLDR_GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - uses: zackees/setup-soldr@v0
+        with:
+          cache: false
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+      - name: Prepare MinGW
+        working-directory: rust
+        run: soldr prepare --target x86_64-pc-windows-gnu --github-env "$GITHUB_ENV"
+      - name: Build regression binary
+        run: |
+          cmake -S . -B regression -G Ninja --toolchain cmake/toolchains/soldr-x86_64-pc-windows-gnu.cmake \
+            -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_OWNER_GATE=${{ matrix.gate }}
+          cmake --build regression --target mimalloc-test-purge-all --parallel 4
+          find "$MINGW_W64_CROSS_ROOT" -name libgcc_s_seh-1.dll -exec cp '{}' regression/ \;
+          "$CC_x86_64_pc_windows_gnu" --version
+          sha256sum regression/mimalloc-test-purge-all.exe regression/libgcc_s_seh-1.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: purge-teardown-binary-${{ matrix.gate }}
+          path: |
+            regression/mimalloc-test-purge-all.exe
+            regression/libgcc_s_seh-1.dll
+  reproduce:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: ['ON', 'OFF']
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: purge-teardown-binary-${{ matrix.gate }}
+          path: regression
+      - name: Run every attempt and retain all outcomes
+        run: |
+          New-Item -ItemType Directory logs | Out-Null
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber, CsNumberOfLogicalProcessors | Out-File logs/environment.txt
+          Get-FileHash regression/mimalloc-test-purge-all.exe, regression/libgcc_s_seh-1.dll | Out-File logs/hashes.txt
+          $failed = 0
+          foreach ($scavenger in @('0', '1')) {
+            $env:MIMALLOC_SCAVENGER = $scavenger
+            for ($i = 1; $i -le 15; $i++) {
+              $tag = "scavenger-$scavenger-$i"
+              $p = Start-Process -FilePath "$PWD/regression/mimalloc-test-purge-all.exe" -WorkingDirectory "$PWD/regression" -RedirectStandardOutput "$PWD/logs/$tag.stdout" -RedirectStandardError "$PWD/logs/$tag.stderr" -PassThru
+              if (-not $p.WaitForExit(120000)) {
+                Stop-Process -Id $p.Id
+                "$tag timeout" | Out-File logs/outcomes.txt -Append
+                throw "$tag timed out"
+              }
+              $p.Refresh()
+              "$tag exit=$($p.ExitCode)" | Tee-Object -FilePath logs/outcomes.txt -Append
+              if ($p.ExitCode -ne 0) { $failed++ }
+            }
+          }
+          if ($failed -ne 0) { throw "$failed failed attempts (none discarded)" }
+      - name: Focused teardown with full page heap
+        if: ${{ !cancelled() }}
+        run: |
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\mimalloc-test-purge-all.exe'
+          if (Test-Path $key) { throw 'Refusing to overwrite existing image settings' }
+          New-Item $key | Out-Null
+          try {
+            New-ItemProperty $key -Name GlobalFlag -PropertyType String -Value '0x02000000' | Out-Null
+            New-ItemProperty $key -Name PageHeapFlags -PropertyType String -Value '0x00000003' | Out-Null
+            $env:MIMALLOC_SCAVENGER = '0'
+            $p = Start-Process -FilePath "$PWD/regression/mimalloc-test-purge-all.exe" -ArgumentList D1 -WorkingDirectory "$PWD/regression" -RedirectStandardOutput "$PWD/logs/pageheap.stdout" -RedirectStandardError "$PWD/logs/pageheap.stderr" -PassThru
+            if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id; throw 'Page heap run timed out' }
+            $p.Refresh()
+            "pageheap D1 exit=$($p.ExitCode)" | Tee-Object -FilePath logs/outcomes.txt -Append
+            if ($p.ExitCode -ne 0) { throw 'Focused page heap regression failed' }
+          } finally {
+            Remove-Item $key
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: purge-teardown-evidence-${{ matrix.gate }}
+          path: logs/

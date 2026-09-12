@@ -1,0 +1,86 @@
+name: issue396-diagnostic
+on:
+  push:
+    branches: [fix/396-pending-tld]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SOLDR_GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - uses: zackees/setup-soldr@v0
+        with:
+          cache: false
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+      - name: Prepare MinGW
+        working-directory: rust
+        run: soldr prepare --target x86_64-pc-windows-gnu --github-env "$GITHUB_ENV"
+      - name: Build trace binary
+        run: |
+          cmake -S . -B trace -G Ninja --toolchain cmake/toolchains/soldr-x86_64-pc-windows-gnu.cmake \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMI_PPROF=ON -DMI_OWNER_GATE=ON \
+            -DCMAKE_C_FLAGS=-DMI_TLD_TRACE=1 -DCMAKE_CXX_FLAGS=-DMI_TLD_TRACE=1
+          cmake --build trace --target mimalloc-test-purge-all --parallel 4
+          find "$MINGW_W64_CROSS_ROOT" -name libgcc_s_seh-1.dll -exec cp '{}' trace/ \;
+          "$CC_x86_64_pc_windows_gnu" --version
+          sha256sum trace/mimalloc-test-purge-all.exe trace/libgcc_s_seh-1.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issue396-trace-binary
+          path: |
+            trace/mimalloc-test-purge-all.exe
+            trace/libgcc_s_seh-1.dll
+  reproduce:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: issue396-trace-binary
+          path: trace
+      - name: Download original CI binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 34145299877 --repo zackees/mimalloc-pprof --name bundle-windows-gnu-x64-gated --dir baseline
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline download failed' }
+          tar -xzf baseline/windows-gnu-x64-gated.tar.gz -C baseline
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline extraction failed' }
+      - name: Reproduce and retain all outcomes
+        run: |
+          New-Item -ItemType Directory logs | Out-Null
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber, CsNumberOfLogicalProcessors | Out-File logs/environment.txt
+          $env:MIMALLOC_SCAVENGER = '0'
+          foreach ($variant in @('baseline', 'trace')) {
+            Get-FileHash "$variant/mimalloc-test-purge-all.exe", "$variant/libgcc_s_seh-1.dll" | Out-File "logs/$variant-hashes.txt"
+            for ($i = 1; $i -le 15; $i++) {
+              $stdout = Join-Path $PWD "logs/$variant-$i.stdout"
+              $stderr = Join-Path $PWD "logs/$variant-$i.stderr"
+              $p = Start-Process -FilePath "$PWD/$variant/mimalloc-test-purge-all.exe" -WorkingDirectory "$PWD/$variant" -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+              if (-not $p.WaitForExit(120000)) {
+                Stop-Process -Id $p.Id
+                throw "$variant run $i timed out"
+              }
+              $p.Refresh()
+              "$variant run=$i exit=$($p.ExitCode)" | Tee-Object -FilePath logs/outcomes.txt -Append
+              if ($p.ExitCode -ne 0) {
+                Get-Content $stderr -Tail 30
+                break
+              }
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue396-native-evidence
+          path: logs/

@@ -8,6 +8,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/internal.h"
 #include "mimalloc/prim.h"
 #include "mimalloc/prim-tls.h"
+#include "tld-trace.h"
 
 #include <string.h>  // memcpy, memset
 #include <stdlib.h>  // atexit
@@ -322,6 +323,7 @@ static void mi_tld_register(mi_tld_t* tld) {
     // the same lock the `mi_purge_all` walk reads it under, so a thread created during a walk is
     // already "done" for that epoch and thread churn cannot extend the walk.
     mi_atomic_store_relaxed(&tld->purge_epoch, mi_atomic_load_relaxed(&_mi_purge_seq));
+    mi_tld_trace("register", tld);
   }
 }
 
@@ -331,6 +333,7 @@ static void mi_tld_register(mi_tld_t* tld) {
 // calls `_mi_park_leave` first).
 static void mi_tld_unregister(mi_tld_t* tld) {
   if (tld == NULL) return;
+  mi_tld_trace("unregister", tld);
   mi_assert_internal(mi_atomic_load_acquire(&tld->park_state) != MI_PARK_SWEEPING);
   mi_subproc_t* const subproc = tld->subproc;
   mi_lock(&subproc->tlds_lock) {
@@ -419,6 +422,7 @@ mi_theap_t* _mi_thread_init_with_heap(mi_heap_t* heap_main)
   }
 
   // now initialize the thread
+  mi_tld_trace("publish", theap->tld);
   _mi_theap_default_set(theap);
   // and only then set the heap_theap field as that accesses thread locals
   _mi_heap_theap_set(heap_main, theap);  // todo: can fail!
@@ -581,6 +585,7 @@ void _mi_thread_done(mi_theap_t* _theap_main)
 
   // get the current tld
   mi_tld_t* const tld = _theap_main->tld;
+  mi_tld_trace("done-entry", tld);
 
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a, `init.c:531`):
   // a thread can reach teardown still parked (a park is left by `mi_on_thread_idle_end`, which
@@ -605,7 +610,9 @@ void _mi_thread_done(mi_theap_t* _theap_main)
   }
 
   // release dynamic thread_local's
+  mi_tld_trace("done-tls", tld);
   _mi_thread_locals_thread_done();
+  mi_tld_trace("done-tls-return", tld);
 
   // adjust stats
   mi_subproc_stat_decrease(tld->subproc, threads, 1);  // todo: or `_theap_main->heap`?
@@ -614,7 +621,9 @@ void _mi_thread_done(mi_theap_t* _theap_main)
   if (tld->thread_id != _mi_prim_thread_id()) return;
 
   // delete the thread local theaps
+  mi_tld_trace("done-theaps", tld);
   mi_thread_theaps_done(tld);
+  mi_tld_trace("done-theaps-return", tld);
 
   // free thread local data
   mi_tld_free(tld);

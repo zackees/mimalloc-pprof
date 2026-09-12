@@ -81,7 +81,17 @@ static bool thread_start(thread_t* t, thread_fun_t fn, void* arg) {
   *t = CreateThread(NULL, 0, fn, arg, 0, NULL);
   return (*t != NULL);
 }
-static void thread_join(thread_t t) { if (t != NULL) { WaitForSingleObject(t, INFINITE); CloseHandle(t); } }
+static void thread_join(thread_t t) {
+  if (t != NULL) {
+    const DWORD id = GetThreadId(t);
+    const DWORD waited = WaitForSingleObject(t, INFINITE);
+    DWORD code = 0;
+    const BOOL got_code = GetExitCodeThread(t, &code);
+    fprintf(stderr, "TRACE396 joined osid=%016llx wait=%08lx exit_valid=%d exit=%08lx\n",
+            (unsigned long long)id, (unsigned long)waited, (int)got_code, (unsigned long)code);
+    CloseHandle(t);
+  }
+}
 static void sleep_ms(unsigned ms) { Sleep(ms); }
 typedef CRITICAL_SECTION mutex_t;
 static void mutex_init(mutex_t* m) { InitializeCriticalSection(m); }
@@ -930,7 +940,26 @@ static bool row_selected(const char* id) {
 }
 #define RUN_ROW(id, fn) do { if (row_selected(id)) { fn(); } else { fprintf(stderr, "test: %s skipped (not selected)\n", id); } } while (0)
 
+#if defined(_WIN32) && defined(MI_TLD_TRACE)
+static LONG CALLBACK trace_exception(PEXCEPTION_POINTERS e) {
+  char buf[256] = "TRACE396 exception "; size_t n = strlen(buf);
+  const uintptr_t values[] = {GetCurrentThreadId(), (uintptr_t)e->ExceptionRecord->ExceptionCode,
+    (uintptr_t)e->ExceptionRecord->ExceptionAddress, (uintptr_t)GetModuleHandleW(NULL),
+    (uintptr_t)e->ExceptionRecord->ExceptionInformation[0], (uintptr_t)e->ExceptionRecord->ExceptionInformation[1]};
+  for (size_t i = 0; i < sizeof(values)/sizeof(values[0]); ++i) {
+    for (int k = (int)(sizeof(uintptr_t)*2)-1; k >= 0; --k) buf[n++] = "0123456789abcdef"[(values[i] >> (k*4)) & 15];
+    buf[n++] = ' ';
+  }
+  buf[n++] = '\n'; DWORD written;
+  WriteFile(GetStdHandle(STD_ERROR_HANDLE), buf, (DWORD)n, &written, NULL);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 int main(int argc, char** argv) {
+#if defined(_WIN32) && defined(MI_TLD_TRACE)
+  AddVectoredExceptionHandler(1, trace_exception);
+#endif
   g_argc = argc; g_argv = argv;
   mutex_init(&g_mutex);
   mi_register_deferred_free(&deferred_free_hook, NULL);

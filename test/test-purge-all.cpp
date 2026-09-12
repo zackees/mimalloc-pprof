@@ -235,6 +235,8 @@ static std::atomic<int> g_in_handler(0);          // a worker reports "I am insi
 static std::atomic<int> g_peer_done(0);
 static thread_t g_peer_thread;
 static std::atomic<int> g_handler_calls(0);
+static std::atomic<bool> g_exit_started(false);
+static std::atomic<int> g_exit_callbacks(0);
 
 static std::atomic<int> g_inner_rc(-1);           // T3: what the re-entrant call returned
 static mi_purge_all_report_t g_inner_report;
@@ -282,6 +284,7 @@ static void mi_cdecl deferred_free_hook(bool force, unsigned long long heartbeat
     }
     default: break;
   }
+  if (g_exit_started.load()) g_exit_callbacks.fetch_add(1);
 }
 
 static void mi_cdecl output_hook(const char* msg, void* arg) {
@@ -940,6 +943,35 @@ static bool row_selected(const char* id) {
 }
 #define RUN_ROW(id, fn) do { if (row_selected(id)) { fn(); } else { fprintf(stderr, "test: %s skipped (not selected)\n", id); } } while (0)
 
+// #396: exercise the deferred-free callback during automatic thread teardown,
+// after the worker body has returned. Full page heap on native Windows exposes
+// access to GCC emutls storage already freed by an earlier TLS detach callback.
+static THREAD_RET teardown_worker(void*) {
+  void* p = mi_malloc(64);
+  mi_free(p);
+  mi_collect(false);  // initialize the callback's per-thread state
+  g_exit_started.store(true);
+  return THREAD_OK;
+}
+
+static void test_d1_teardown(void) {
+  for (int i = 0; i < 16; ++i) {
+    g_exit_started.store(false);
+    const int before = g_exit_callbacks.load();
+    thread_t worker;
+    if (!thread_start(&worker, &teardown_worker, NULL)) { check("D1: start", false); return; }
+    thread_join(worker);
+    g_exit_started.store(false);
+    check("D1: automatic teardown callback completed", g_exit_callbacks.load() > before);
+    mi_purge_all_report_t r;
+    double elapsed;
+    const int rc = purge(MI_PURGE_FORCE, 1000, &r, &elapsed);
+    print_report("D1 after join", rc, &r, elapsed);
+    check("D1: joined owner unregistered (OK, pending == 0)", rc == MI_PURGE_OK && r.theaps_pending == 0);
+    if (failures != 0) return;
+  }
+}
+
 #if defined(_WIN32) && defined(MI_TLD_TRACE)
 static LONG CALLBACK trace_exception(PEXCEPTION_POINTERS e) {
   char buf[256] = "TRACE396 exception "; size_t n = strlen(buf);
@@ -992,6 +1024,12 @@ int main(int argc, char** argv) {
   { void* q = mi_malloc(64); mi_free(q); mi_on_thread_idle(); }
   pin_interval(3600000);
 
+  RUN_ROW("D1", test_d1_teardown);
+  if (argc == 2 && strcmp(argv[1], "D1") == 0) {
+    mi_register_deferred_free(NULL, NULL);
+    mutex_destroy(&g_mutex);
+    return failures == 0 ? 0 : 1;
+  }
   test_t1_reference();
   RUN_ROW("T2", test_t2_abandoned);
   RUN_ROW("T3", test_t3_reentrancy);

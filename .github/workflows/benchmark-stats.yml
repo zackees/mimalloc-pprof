@@ -1,6 +1,6 @@
 name: benchmark-stats
 
-# Phase 5 publication: manual + daily schedule, publication eligibility,
+# Phase 5 publication: manual + weekly schedule, publication eligibility,
 # lease-protected benchmark-stats branch push, GitHub Pages deployment,
 # and independent publication audit.
 # First-party actions (checkout, upload-/download-artifact, pages) use

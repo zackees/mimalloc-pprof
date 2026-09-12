@@ -75,6 +75,7 @@ jobs:
               "$variant run=$i exit=$($p.ExitCode)" | Tee-Object -FilePath logs/outcomes.txt -Append
               if ($p.ExitCode -ne 0) {
                 Get-Content $stderr -Tail 30
+                if ($variant -eq 'trace') { throw "Candidate failed on run $i" }
                 break
               }
             }
@@ -92,6 +93,7 @@ jobs:
             if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id; throw 'Page heap run timed out' }
             $p.Refresh()
             "pageheap D1 exit=$($p.ExitCode)" | Tee-Object -FilePath logs/outcomes.txt -Append
+            if ($p.ExitCode -ne 0) { throw 'Candidate failed focused page heap regression' }
           } finally {
             Remove-Item $key
           }

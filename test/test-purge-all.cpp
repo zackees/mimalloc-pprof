@@ -228,7 +228,20 @@ enum hook_mode_t {
   HOOK_WAIT_FOR_PEER,        // G5: wait until `g_peer_done`, join the peer, then return
 };
 
+#if defined(_WIN32)
+// Deferred callbacks also run during allocator TLS detach, after GCC emutls
+// storage may have been destroyed. Keep this value in a Windows TLS slot with
+// no destructor, allocated before registering the hook and freed after removal.
+static DWORD hook_mode_slot = TLS_OUT_OF_INDEXES;
+static int hook_mode_get() { return (int)(uintptr_t)TlsGetValue(hook_mode_slot); }
+static void hook_mode_set(int mode) {
+  if (!TlsSetValue(hook_mode_slot, (void*)(uintptr_t)mode)) abort();
+}
+#else
 static thread_local int tl_mode = HOOK_NONE;
+static int hook_mode_get() { return tl_mode; }
+static void hook_mode_set(int mode) { tl_mode = mode; }
+#endif
 
 static mutex_t g_mutex;
 static std::atomic<int> g_in_handler(0);          // a worker reports "I am inside the handler now"
@@ -252,15 +265,15 @@ static std::atomic<size_t> g_errors_seen(0);
 static void mi_cdecl deferred_free_hook(bool force, unsigned long long heartbeat, void* arg) {
   (void)force; (void)heartbeat; (void)arg;
   g_handler_calls.fetch_add(1);
-  switch (tl_mode) {
+  switch (hook_mode_get()) {
     case HOOK_PURGE_REENTRANT: {
-      tl_mode = HOOK_NONE;
+      hook_mode_set(HOOK_NONE);
       const int rc = mi_purge_all_ex((mi_purge_flags_t)0, 0, &g_inner_report);
       g_inner_rc.store(rc);
       break;
     }
     case HOOK_PRINT_REENTRANT: {
-      tl_mode = HOOK_NONE;
+      hook_mode_set(HOOK_NONE);
       g_output_should_purge.store(1);
       // one line through the output hook: an oversized request is refused with an error
       // message (`mi_option_verbose` is on for the row, so it is not rate limited)
@@ -269,14 +282,14 @@ static void mi_cdecl deferred_free_hook(bool force, unsigned long long heartbeat
       break;
     }
     case HOOK_BLOCK_ON_MUTEX: {
-      tl_mode = HOOK_NONE;
+      hook_mode_set(HOOK_NONE);
       g_in_handler.store(1);
       mutex_lock(&g_mutex);     // main holds it: this thread is now stuck INSIDE the allocator
       mutex_unlock(&g_mutex);
       break;
     }
     case HOOK_WAIT_FOR_PEER: {
-      tl_mode = HOOK_NONE;
+      hook_mode_set(HOOK_NONE);
       g_in_handler.store(1);
       for (int i = 0; i < 20000 && g_peer_done.load() == 0; i++) sleep_ms(1);   // bounded; the ctest TIMEOUT is the backstop
       thread_join(g_peer_thread);
@@ -380,7 +393,7 @@ static THREAD_RET abandon_worker(void* varg) {
 static THREAD_RET hook_worker(void* varg) {
   worker_t* w = (worker_t*)varg;
   void* q = mi_malloc(128); mi_free(q);
-  tl_mode = w->phase.load();     // the row's hook mode is passed in `phase`
+  hook_mode_set(w->phase.load()); // the row's hook mode is passed in `phase`
   w->phase.store(0);
   mi_collect(false);             // -> handler on this thread
   long n = 0;
@@ -588,9 +601,9 @@ static void test_t3_reentrancy(void) {
   // (a) deferred-free handler: phase C collects the caller's own theap through the owner door,
   // which runs the handler on this thread while the admission is held
   g_inner_rc.store(-1);
-  tl_mode = HOOK_PURGE_REENTRANT;
+  hook_mode_set(HOOK_PURGE_REENTRANT);
   int rc = purge(MI_PURGE_FORCE, 100, &r, &ms);
-  tl_mode = HOOK_NONE;
+  hook_mode_set(HOOK_NONE);
   print_report("T3(a) outer", rc, &r, ms);
   fprintf(stderr, "  T3(a): re-entrant call from the deferred-free handler returned %s (gated=%d)\n", status_name(g_inner_rc.load()), (int)g_inner_report.gated);
   check("T3(a): the handler's re-entrant mi_purge_all_ex is BUSY", g_inner_rc.load() == MI_PURGE_BUSY);
@@ -600,9 +613,9 @@ static void test_t3_reentrancy(void) {
   g_output_rc.store(-1);
   g_output_swallow.store(1);
   mi_option_set_enabled(mi_option_verbose, true);
-  tl_mode = HOOK_PRINT_REENTRANT;
+  hook_mode_set(HOOK_PRINT_REENTRANT);
   rc = purge(MI_PURGE_FORCE, 100, &r, &ms);
-  tl_mode = HOOK_NONE;
+  hook_mode_set(HOOK_NONE);
   mi_option_set_enabled(mi_option_verbose, false);
   g_output_swallow.store(0);
   print_report("T3(b) outer", rc, &r, ms);
@@ -762,9 +775,9 @@ static void test_g5_two_callers(void) {
   g_in_handler.store(0); g_peer_done.store(0);
   if (!thread_start(&g_peer_thread, &peer_caller, &peer)) { check("G5: start peer", false); return; }
   mi_purge_all_report_t r; double ms = 0;
-  tl_mode = HOOK_WAIT_FOR_PEER;
+  hook_mode_set(HOOK_WAIT_FOR_PEER);
   const int rc_main = purge(MI_PURGE_FORCE, 2000, &r, &ms);
-  tl_mode = HOOK_NONE;
+  hook_mode_set(HOOK_NONE);
   const int rc_peer = peer.phase.load() - 100;
   print_report("G5 main (held the admission while the peer called)", rc_main, &r, ms);
   fprintf(stderr, "  G5: peer's concurrent call returned %s in %.1f ms\n", status_name(rc_peer), peer.max_call_ms);
@@ -926,7 +939,7 @@ static void test_c2_foreign_collect(void) {
   check("C2: the owner allocates again after the sweep", it2 > it1);
   check("C2: the owner's survivors are intact across the foreign sweep", !w.corrupt);
 #if MI_OWNER_GATE
-  fprintf(stderr, "  C2 (gated): owner %s\n", (r.theaps_swept >= 2 && r.theaps_pending == 0) ? "swept" : "reported pending (starved)");
+  fprintf(stderr, "  C2 (gated): %s\n", r.theaps_pending == 0 ? "no owners pending" : "aggregate pending count is nonzero (owner identity unknown)");
 #endif
 }
 
@@ -1003,6 +1016,10 @@ static LONG CALLBACK trace_exception(PEXCEPTION_POINTERS e) {
 #endif
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+  hook_mode_slot = TlsAlloc();
+  if (hook_mode_slot == TLS_OUT_OF_INDEXES) return 1;
+#endif
 #if defined(_WIN32) && defined(MI_TLD_TRACE)
   AddVectoredExceptionHandler(1, trace_exception);
 #endif
@@ -1027,6 +1044,9 @@ int main(int argc, char** argv) {
   RUN_ROW("D1", test_d1_teardown);
   if (argc == 2 && strcmp(argv[1], "D1") == 0) {
     mi_register_deferred_free(NULL, NULL);
+#if defined(_WIN32)
+    TlsFree(hook_mode_slot);
+#endif
     mutex_destroy(&g_mutex);
     return failures == 0 ? 0 : 1;
   }
@@ -1045,6 +1065,9 @@ int main(int argc, char** argv) {
 
   pin_interval(interval_min_ms);
   mi_register_deferred_free(NULL, NULL);
+#if defined(_WIN32)
+  TlsFree(hook_mode_slot);
+#endif
   mutex_destroy(&g_mutex);
   fprintf(stderr, "test-purge-all: %d failure(s), %d deferred-free handler calls\n", failures, g_handler_calls.load());
   if (failures != 0) { fprintf(stderr, "test-purge-all: FAILED\n"); return 1; }

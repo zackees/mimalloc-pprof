@@ -952,6 +952,20 @@ static LONG CALLBACK trace_exception(PEXCEPTION_POINTERS e) {
   }
   buf[n++] = '\n'; DWORD written;
   WriteFile(GetStdHandle(STD_ERROR_HANDLE), buf, (DWORD)n, &written, NULL);
+  void* frames[40];
+  const USHORT count = CaptureStackBackTrace(0, 40, frames, NULL);
+  for (USHORT i = 0; i <= count; ++i) {
+    void* pc = (i == 0 ? e->ExceptionRecord->ExceptionAddress : frames[i-1]);
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(pc, &mbi, sizeof(mbi)) == 0) continue;
+    char module[MAX_PATH];
+    DWORD len = GetModuleFileNameA((HMODULE)mbi.AllocationBase, module, MAX_PATH);
+    char line[512];
+    int size = snprintf(line, sizeof(line), "TRACE396 frame %u pc=%p base=%p rva=%llx module=%.*s\n",
+      (unsigned)i, pc, mbi.AllocationBase,
+      (unsigned long long)((uintptr_t)pc - (uintptr_t)mbi.AllocationBase), (int)len, module);
+    if (size > 0 && size < (int)sizeof(line)) WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, (DWORD)size, &written, NULL);
+  }
   return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif

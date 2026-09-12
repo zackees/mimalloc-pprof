@@ -1,7 +1,14 @@
 name: purge-teardown-regression
 on:
   push:
-    branches: [fix/396-pending-tld]
+    branches: [main, v4]
+    paths:
+      - 'test/test-purge-all.cpp'
+      - '.github/workflows/purge-teardown-regression.yml'
+  pull_request:
+    paths:
+      - 'test/test-purge-all.cpp'
+      - '.github/workflows/purge-teardown-regression.yml'
   workflow_dispatch:
 permissions:
   contents: read
@@ -12,6 +19,10 @@ jobs:
     strategy:
       matrix:
         gate: ['ON', 'OFF']
+        control: [false]
+        include:
+          - gate: 'ON'
+            control: true
     env:
       SOLDR_GITHUB_TOKEN: ${{ github.token }}
     steps:
@@ -28,6 +39,19 @@ jobs:
         run: soldr prepare --target x86_64-pc-windows-gnu --github-env "$GITHUB_ENV"
       - name: Build regression binary
         run: |
+          # Revert only callback storage in the control; keep the D1 oracle and
+          # allocator identical. This must reproduce RED without diagnostic tracing.
+          if [ '${{ matrix.control }}' = 'true' ]; then
+            python - <<'PY'
+          from pathlib import Path
+          path = Path('test/test-purge-all.cpp')
+          source = path.read_text()
+          marker = '#if defined(_WIN32)\n// Deferred callbacks'
+          assert source.count(marker) == 1
+          path.write_text(source.replace(marker,
+              'static DWORD hook_mode_slot = TLS_OUT_OF_INDEXES;\n#if 0\n// Deferred callbacks'))
+          PY
+          fi
           cmake -S . -B regression -G Ninja --toolchain cmake/toolchains/soldr-x86_64-pc-windows-gnu.cmake \
             -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_OWNER_GATE=${{ matrix.gate }}
           cmake --build regression --target mimalloc-test-purge-all --parallel 4
@@ -36,7 +60,7 @@ jobs:
           sha256sum regression/mimalloc-test-purge-all.exe regression/libgcc_s_seh-1.dll
       - uses: actions/upload-artifact@v4
         with:
-          name: purge-teardown-binary-${{ matrix.gate }}
+          name: purge-teardown-binary-${{ matrix.gate }}-${{ matrix.control }}
           path: |
             regression/mimalloc-test-purge-all.exe
             regression/libgcc_s_seh-1.dll
@@ -48,16 +72,23 @@ jobs:
       fail-fast: false
       matrix:
         gate: ['ON', 'OFF']
+        control: [false]
+        include:
+          - gate: 'ON'
+            control: true
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: purge-teardown-binary-${{ matrix.gate }}
+          name: purge-teardown-binary-${{ matrix.gate }}-${{ matrix.control }}
           path: regression
-      - name: Run every attempt and retain all outcomes
+      - name: Record native environment
         run: |
           New-Item -ItemType Directory logs | Out-Null
           Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber, CsNumberOfLogicalProcessors | Out-File logs/environment.txt
           Get-FileHash regression/mimalloc-test-purge-all.exe, regression/libgcc_s_seh-1.dll | Out-File logs/hashes.txt
+      - name: Run every attempt and retain all outcomes
+        if: ${{ !matrix.control }}
+        run: |
           $failed = 0
           foreach ($scavenger in @('0', '1')) {
             $env:MIMALLOC_SCAVENGER = $scavenger
@@ -89,12 +120,19 @@ jobs:
             if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id; throw 'Page heap run timed out' }
             $p.Refresh()
             "pageheap D1 exit=$($p.ExitCode)" | Tee-Object -FilePath logs/outcomes.txt -Append
-            if ($p.ExitCode -ne 0) { throw 'Focused page heap regression failed' }
+            if ('${{ matrix.control }}' -eq 'true') {
+              $log = Get-Content logs/pageheap.stderr -Raw
+              if ($p.ExitCode -ne 1 -or
+                  $log -notmatch 'D1: automatic teardown callback completed\.\.\.  FAILED' -or
+                  $log -notmatch 'D1: joined owner unregistered \(OK, pending == 0\)\.\.\.  FAILED') {
+                throw 'Compiler-TLS control did not reproduce the expected teardown failure'
+              }
+            } elseif ($p.ExitCode -ne 0) { throw 'Focused page heap regression failed' }
           } finally {
             Remove-Item $key
           }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: purge-teardown-evidence-${{ matrix.gate }}
+          name: purge-teardown-evidence-${{ matrix.gate }}-${{ matrix.control }}
           path: logs/

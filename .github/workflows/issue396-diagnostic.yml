@@ -79,6 +79,22 @@ jobs:
               }
             }
           }
+      - name: Focused teardown with full page heap
+        run: |
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\mimalloc-test-purge-all.exe'
+          if (Test-Path $key) { throw 'Refusing to overwrite existing image settings' }
+          New-Item $key | Out-Null
+          try {
+            New-ItemProperty $key -Name GlobalFlag -PropertyType String -Value '0x02000000' | Out-Null
+            New-ItemProperty $key -Name PageHeapFlags -PropertyType String -Value '0x00000003' | Out-Null
+            $env:MIMALLOC_SCAVENGER = '0'
+            $p = Start-Process -FilePath "$PWD/trace/mimalloc-test-purge-all.exe" -ArgumentList D1 -WorkingDirectory "$PWD/trace" -RedirectStandardOutput "$PWD/logs/pageheap.stdout" -RedirectStandardError "$PWD/logs/pageheap.stderr" -PassThru
+            if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id; throw 'Page heap run timed out' }
+            $p.Refresh()
+            "pageheap D1 exit=$($p.ExitCode)" | Tee-Object -FilePath logs/outcomes.txt -Append
+          } finally {
+            Remove-Item $key
+          }
       - uses: actions/upload-artifact@v4
         if: always()
         with:

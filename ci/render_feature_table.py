@@ -275,8 +275,16 @@ def render_markdown(doc: FeatureDoc) -> str:
 
 
 def render_readme_region(doc: FeatureDoc) -> str:
-    """Everything between the markers: the highlighted image, then the Markdown table
-    (searchable, screen-readable, diffable), then the legend."""
+    """Everything between the markers: the image, then the same matrix as Markdown inside
+    a collapsed `<details>`, then the legend.
+
+    The table is not dropped even though the image says the same thing. It is what makes
+    the comparison searchable, screen-readable, diffable in review, and legible to a model
+    reading the raw file -- none of which an SVG offers. But repeating it open, directly
+    under the image, made a reader scroll past the same matrix twice before reaching
+    anything new, so it is collapsed: present for whoever wants it, out of the way of
+    whoever does not.
+    """
     alt = (
         "Feature comparison of mimalloc-pprof, Microsoft MiMalloc-V3, Bun's mimalloc and "
         "jemalloc across memory return, profiling, robustness, platform support and "
@@ -294,9 +302,15 @@ def render_readme_region(doc: FeatureDoc) -> str:
             f'  <img alt="{alt}" src=".github/assets/allocator-features-light.svg" width="100%" />',
             "</picture>",
             "",
+            "<details>",
+            "<summary><b>The same matrix as text</b> — searchable, screen-readable, and "
+            "what an LLM reading this file will use</summary>",
+            "",
             render_markdown(doc),
             "",
             doc.legend,
+            "",
+            "</details>",
             "",
             END_MARKER,
         ]
@@ -395,6 +409,17 @@ def column_center(index: int) -> float:
     return COL_START + COL_W * index + COL_W / 2
 
 
+#: Left inset of a column's content. Every glyph in a column starts here, so ticks,
+#: crosses and warnings line up in a vertical rule down the page instead of drifting with
+#: the length of the note beside them -- which is what centring the glyph-plus-note pair
+#: used to do, and it made the columns unreadable at a glance.
+COL_PAD = 12
+
+
+def column_left(index: int) -> float:
+    return COL_START + COL_W * index + COL_PAD
+
+
 def note_width(text: str) -> float:
     return len(text) * NOTE_CHAR_PX
 
@@ -427,24 +452,31 @@ def glyph_svg(cx: float, cy: float, status: str, theme: Theme) -> list[str]:
 
 
 def cell_svg(index: int, baseline: float, cell: Cell, theme: Theme) -> list[str]:
-    """Glyph, then the note to its right, the pair centred in the column."""
-    cx = column_center(index)
+    """Glyph at the column's left inset, then the note to its right.
+
+    Left-justified, not centred. A reader scanning one allocator's column wants to see
+    where the crosses are without reading a word; centring the glyph-plus-note pair moved
+    every glyph by half the length of its own note, so the marks wandered across the column
+    and the column could only be read cell by cell.
+    """
+    left = column_left(index)
     cy = baseline - 4
+    # Every note in the table starts here, past the glyph. A glyphless "value" cell uses
+    # the same x, so its text lines up with the notes above and below it instead of
+    # jutting out into the gutter where the glyphs are.
+    note_x = left + 2 * GLYPH_R + 4
     if cell.status == "value":
         return [
-            f'<text x="{cx:.1f}" y="{baseline:.1f}" font-size="11" text-anchor="middle" '
+            f'<text x="{note_x:.1f}" y="{baseline:.1f}" font-size="11" '
             f'fill="{theme.text}">{escape(cell.note or "—")}</text>'
         ]
-    note = cell.note
-    if not note:
-        return glyph_svg(cx, cy, cell.status, theme)
-    total = 2 * GLYPH_R + 4 + note_width(note)
-    left = cx - total / 2
     parts = glyph_svg(left + GLYPH_R, cy, cell.status, theme)
-    parts.append(
-        f'<text x="{left + 2 * GLYPH_R + 4:.1f}" y="{baseline:.1f}" font-size="11" '
-        f'fill="{theme.muted}">{escape(note)}</text>'
-    )
+    note = cell.note
+    if note:
+        parts.append(
+            f'<text x="{note_x:.1f}" y="{baseline:.1f}" font-size="11" '
+            f'fill="{theme.muted}">{escape(note)}</text>'
+        )
     return parts
 
 
@@ -513,15 +545,16 @@ def render_svg(doc: FeatureDoc, theme: Theme) -> str:
         )
 
     for index, allocator in enumerate(doc.allocators):
-        cx = column_center(index)
+        # Headers share the cells' left inset so each column reads as one flush edge.
+        left = column_left(index)
         weight = "700" if allocator.key == SUBJECT else "600"
         ink = theme.text if allocator.key == SUBJECT else theme.muted
         parts.append(
-            f'<text x="{cx:.1f}" y="{top_h + 6}" font-size="12.5" font-weight="{weight}" '
-            f'text-anchor="middle" fill="{ink}">{escape(allocator.label)}</text>'
+            f'<text x="{left:.1f}" y="{top_h + 6}" font-size="12.5" font-weight="{weight}" '
+            f'fill="{ink}">{escape(allocator.label)}</text>'
         )
         parts.append(
-            f'<text x="{cx:.1f}" y="{top_h + 21}" font-size="10" text-anchor="middle" '
+            f'<text x="{left:.1f}" y="{top_h + 21}" font-size="10" '
             f'fill="{theme.muted}">{escape(allocator.version)}</text>'
         )
     parts.append(

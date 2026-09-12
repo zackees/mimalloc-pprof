@@ -579,15 +579,71 @@ size_t      _mi_prof_debug_records_in(const mi_page_t* page, const void* addr, s
 size_t      _mi_prof_debug_records_compared(void);
 #endif
 
+/* ---------------------------------------------------------------------------------------
+   #371 tier 2: the observer fast path.
+
+   memory-events and DHAT are both opt-in and both OFF in a default process, yet every
+   allocation and every free used to enter them out of line and only consult their
+   activation flags at the END of a prologue: a TLS peek, a suppression-depth read, a
+   `_mi_meta_is_meta_page_safe` arena lookup, and -- until #372 -- two global atomic
+   read-modify-writes on DHAT's inflight counter, which serialised the allocator outright
+   (it measured 0.69x SCALING from 1 to 8 threads: slower with more cores).
+
+   So the flags come first, in one word, read inline at the call site. When nothing is
+   observing, an allocation pays one relaxed load and a not-taken branch; everything the
+   prologue used to do sits behind it, unchanged, in the `_slow` bodies.
+
+   The word is not just "on/off": memory-events documents its environment as read lazily,
+   exactly once, on the FIRST hook call and never during process startup (see
+   memory-events.h), and DHAT resolves the same way. An `unresolved` bit per observer keeps
+   that contract -- the word starts non-zero, so the first hook still takes the slow path
+   and still resolves the environment there -- while letting the steady state be zero.
+   Each observer owns its own two bits and publishes them when it resolves, is enabled, or
+   is stopped; neither module can clear the other's. */
+#define MI_OBSERVERS_MEMEVT_UNRESOLVED  ((size_t)1)
+#define MI_OBSERVERS_MEMEVT_ON          ((size_t)2)
+#if MI_DHAT
+#define MI_OBSERVERS_DHAT_UNRESOLVED    ((size_t)4)
+#define MI_OBSERVERS_DHAT_ON            ((size_t)8)
+#define MI_OBSERVERS_INITIAL  (MI_OBSERVERS_MEMEVT_UNRESOLVED | MI_OBSERVERS_DHAT_UNRESOLVED)
+#else
+// Compiled out (#372): DHAT never resolves, so it must not leave an `unresolved` bit set
+// or the fast path would take the slow branch forever.
+#define MI_OBSERVERS_INITIAL  (MI_OBSERVERS_MEMEVT_UNRESOLVED)
+#endif
+
+extern _Atomic(size_t) _mi_observers_armed;   // defined in memory-events.c
+
+static inline bool _mi_observers_idle(void) {
+  return (mi_atomic_load_relaxed(&_mi_observers_armed) == 0);
+}
+
 // "memory-events.c": opt-in allocation-change accounting/callbacks (issue #20). Independent of
 // MI_PPROF: always compiled in and hooked; the runtime activation flag gates all real work.
-void        _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size);
-void        _mi_memevt_on_free(mi_page_t* page, void* p);
-void        _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size);
+void        _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size);
+void        _mi_memevt_on_free_slow(mi_page_t* page, void* p);
+void        _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t request_size);
+
+static inline void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
+  if mi_likely(_mi_observers_idle()) return;
+  _mi_memevt_on_alloc_slow(page, p, request_size);
+}
+static inline void _mi_memevt_on_free(mi_page_t* page, void* p) {
+  if mi_likely(_mi_observers_idle()) return;
+  _mi_memevt_on_free_slow(page, p);
+}
+static inline void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size) {
+  if mi_likely(_mi_observers_idle()) return;
+  _mi_memevt_on_realloc_in_place_slow(page, p, request_size);
+}
 // Called after _mi_memevt_suppress_end, with suppression already lifted, to emit the single
 // synthesized RESIZE event for a moving realloc (see alloc.c's _mi_theap_realloc_zero).
 // oldp/newp retain the allocation identity needed by the internal DHAT observer.
-void        _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size);
+void        _mi_memevt_on_resize_slow(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size);
+static inline void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
+  if mi_likely(_mi_observers_idle()) return;
+  _mi_memevt_on_resize_slow(oldp, newp, usable_pre, usable_post, request_size);
+}
 // Suppress accounting/dispatch for internal allocate+free pairs that are really one resize
 // (e.g. a moving realloc's internal mi_theap_umalloc+mi_free), and for reentrant calls made
 // from inside a memory-change callback itself.

@@ -46,6 +46,30 @@
 #define MEMEVT_ENABLED   2
 
 static _Atomic(size_t) memevt_state;
+
+// #371 tier 2: the word the alloc/free fast path reads (see internal.h). Starts non-zero so
+// the first hook still resolves the environment lazily, exactly as documented; each observer
+// publishes its own bits into it and cannot clear the other's.
+//
+// Cache-line aligned on purpose. Every allocation and every free reads this word, so it must
+// not share a line with anything written in steady state -- the accounting counters below are
+// written on every event once tracking is on, and false sharing there would hand the enabled
+// path the very cache-line ping-pong this issue is about.
+mi_decl_cache_align _Atomic(size_t) _mi_observers_armed = MI_OBSERVERS_INITIAL;
+
+// Publish this module's two bits. Order matters when arming: ON is set before UNRESOLVED is
+// cleared, so the word is never transiently zero while tracking is on.
+static void memevt_publish_armed(size_t state) {
+  if (state == MEMEVT_ENABLED) {
+    mi_atomic_or_acq_rel(&_mi_observers_armed, MI_OBSERVERS_MEMEVT_ON);
+  }
+  else {
+    mi_atomic_and_acq_rel(&_mi_observers_armed, ~(size_t)MI_OBSERVERS_MEMEVT_ON);
+  }
+  if (state != MEMEVT_UNINIT) {
+    mi_atomic_and_acq_rel(&_mi_observers_armed, ~(size_t)MI_OBSERVERS_MEMEVT_UNRESOLVED);
+  }
+}
 static mi_atomic_once_t memevt_once = { MI_ATOMIC_VAR_INIT(0), MI_LOCK_INITIALIZER };
 
 // Counters (see mi_memory_snapshot_t). Maintained only while MEMEVT_ENABLED; never
@@ -106,7 +130,9 @@ void _mi_memevt_fork_child(void)   { mi_lock_init(&memevt_cb_lock); _mi_atomic_o
 static void memevt_resolve_env(void) {
   if (_mi_atomic_once_enter(&memevt_once)) {
     const bool enabled = mi_option_is_enabled(mi_option_memory_events);
-    mi_atomic_store_release(&memevt_state, (size_t)(enabled ? MEMEVT_ENABLED : MEMEVT_DISABLED));
+    const size_t resolved = (size_t)(enabled ? MEMEVT_ENABLED : MEMEVT_DISABLED);
+    mi_atomic_store_release(&memevt_state, resolved);
+    memevt_publish_armed(resolved);
     _mi_atomic_once_release(&memevt_once);
   }
   // else: either a concurrent thread is mid-resolution (we blocked until it finished, in
@@ -121,6 +147,7 @@ bool mi_memory_tracking_set_enabled(bool enabled) mi_attr_noexcept {
     // without ever reading the environment, so a later first-allocation lazy read is
     // permanently skipped (memevt_resolve_env's `else` branch above).
     mi_atomic_store_release(&memevt_state, new_state);
+    memevt_publish_armed(new_state);
     _mi_atomic_once_release(&memevt_once);
   }
   else {
@@ -128,6 +155,7 @@ bool mi_memory_tracking_set_enabled(bool enabled) mi_attr_noexcept {
     // call always overrides the cached flag, matching "tracking may also be enabled or
     // disabled by API" as an authoritative override, not merely a fallback default.
     mi_atomic_store_release(&memevt_state, new_state);
+    memevt_publish_armed(new_state);
   }
   return true;
 }
@@ -230,7 +258,7 @@ static void memevt_dispatch(mi_hooks_tld_t* hooks, mi_memory_change_kind_t kind,
    original pointers available; it is committed only after the user callback returns.
    The shared suppression depth excludes callback-internal and moving-realloc internals
    from both observers. */
-void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
+void _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size) {
   // #266: must be the very first thing touched -- see hooks-tld.h's file comment. A
   // thread mid-init (inside `_mi_thread_init_with_heap` -> `_mi_meta_zalloc`, allocating
   // its OWN tld/theap) reaches this hook too; peeking (rather than touching any TLS
@@ -277,7 +305,7 @@ void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
 // so nothing re-initializes it in that window) or after teardown already completed (see
 // free.c's "free'd after thread_done" comment). So: peek, and fall back to a local,
 // per-call scratch `mi_hooks_tld_t` instead of forcing -- see hooks-tld.h.
-void _mi_memevt_on_free(mi_page_t* page, void* p) {
+void _mi_memevt_on_free_slow(mi_page_t* page, void* p) {
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
   if (hooks->memevt_suppress_depth > 0) return;
@@ -304,7 +332,7 @@ void _mi_memevt_on_free(mi_page_t* page, void* p) {
   #endif
 }
 
-void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size) {
+void _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t request_size) {
   // #266: see _mi_memevt_on_free above.
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
@@ -323,7 +351,7 @@ void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_siz
   #endif
 }
 
-void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
+void _mi_memevt_on_resize_slow(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
   // #266: see _mi_memevt_on_free above.
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);

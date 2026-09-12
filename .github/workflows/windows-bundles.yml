@@ -445,8 +445,19 @@ jobs:
           # `cl`. The toolchain file deliberately does NOT pass it, so this is the check
           # that the detection still fires -- if it stopped, the whole library would
           # quietly switch from C++ atomics to C11 ones with no other symptom.
+          # #296 (2): assert the option itself, from the line CMakeLists.txt prints when it
+          # turns it on (`message(STATUS "Use the C++ compiler to compile (MI_USE_CXX=ON)")`,
+          # CMakeLists.txt:229). `/Zc:__cplusplus` is only a side effect of that decision and
+          # could in principle arrive from somewhere else; the flag check stays as the second
+          # half, because the option being ON and the flag reaching the compiler are two
+          # different claims and this lane depends on both.
+          if ! grep -qF 'Use the C++ compiler to compile (MI_USE_CXX=ON)' configure.log; then
+            echo "::error::MI_USE_CXX is not ON for clang-cl; the library would switch from C++ atomics to C11 ones"
+            grep -E 'Compiler flags|Use the C\+\+' configure.log || true
+            exit 1
+          fi
           if ! grep -qE '^-- Compiler flags .*(/|-)Zc:__cplusplus' configure.log; then
-            echo "::error::clang-cl was not detected as MSVC-like (MI_USE_CXX/Zc:__cplusplus missing)"
+            echo "::error::MI_USE_CXX is ON but /Zc:__cplusplus did not reach the compiler"
             grep -E 'Compiler flags|Use the C\+\+' configure.log || true
             exit 1
           fi
@@ -787,9 +798,6 @@ jobs:
           case " $excluded_crates " in *" mimalloc-pprof "*)
             echo "::error::a mimalloc-pprof test binary embeds the builder's absolute path; the MSVC lane would silently stop testing the profiler"
             exit 1;; esac
-          # cross.yml's `test (x86_64-pc-windows-msvc)` has `pprof: true`, so run-windows
-          # needs these two specifically. Assert it here, next to the compiler output,
-          # instead of letting the consumer fail without saying why.
           # cross.yml's `test (x86_64-pc-windows-msvc)` has `pprof: true`, and it is a
           # RELEASE row, so the dump checks must find these in the release set. Assert it
           # here, next to the compiler output, instead of letting the consumer fail
@@ -1161,7 +1169,27 @@ jobs:
         run: |
           set -uo pipefail
           missing=0
-          for dll in VCRUNTIME140.dll MSVCP140.dll; do
+          # #296 (1): the list comes from the bundle, not from this file. `--allow-msvc-runtime`
+          # waives eight names; hardcoding two here meant a bundle importing one of the other
+          # six (`vcruntime140_1.dll`, say) passed the closure check and then failed on the
+          # runner as a dialog-free 0xC0000135. bundle_tests.py now records the intersection
+          # of "what this bundle imports" and "what was waived" in msvc-runtime.txt.
+          # Union over every MSVC bundle this job runs: they are separate builds and need
+          # not import the same set.
+          dlls=""
+          for bundle in bundle/windows-msvc-x64-release bundle/windows-msvc-x64-debug-full \
+                        bundle/windows-msvc-x64-shared bundle/windows-msvc-x64-gated; do
+            if [ ! -f "$bundle/msvc-runtime.txt" ]; then
+              echo "::error::$bundle/msvc-runtime.txt is missing; the producer did not record which redistributable DLLs it left behind"
+              exit 1
+            fi
+            dlls="$dlls $(tr -d '\r' < "$bundle/msvc-runtime.txt")"
+          done
+          dlls=$(printf '%s\n' $dlls | sort -fu)
+          if [ -z "$dlls" ]; then
+            echo "  the MSVC bundles import no Visual C++ redistributable DLL; nothing to check"
+          fi
+          for dll in $dlls; do
             # `where` is the native lookup and searches the real PATH the loader will use.
             # The System32 fallback is not redundant: this step runs in Git Bash, and if
             # `where.exe` itself were unavailable the loop would otherwise report every
@@ -1650,15 +1678,29 @@ jobs:
           echo "::group::native cl: mimalloc.dll import order"
           cat native-msvc-imports-dll.txt
           echo "::endgroup::"
+          # #296 (3): GATE this, do not merely observe it. The cross MSVC bundles have
+          # asserted REDIRECT_BEHAVIOURAL=1 since phase D (see the gate step above); the
+          # retained native `cl` tree ran the same probe with `|| true` and only printed
+          # the answer, so a native build that stopped overriding would have been visible
+          # in the log and green in the checks. The probe itself always exits 0 by design
+          # (test/test-redirect-probe.c says so): whether a configuration is REQUIRED to
+          # redirect is a property of the configuration, so the requirement is asserted
+          # here, where it is known -- and this configuration is a full MSVC override
+          # build, the same claim the cross bundles already gate.
           native_probe=$(find native-msvc-release/Release -maxdepth 1 -name 'mimalloc-test-redirect-probe.exe' 2>/dev/null | head -1 || true)
-          if [ -n "$native_probe" ]; then
-            probe_dir=$(dirname "$native_probe")
-            PATH="$PWD/$probe_dir:$PATH" "$native_probe" > native-msvc-probe.txt 2>&1 || true
-            echo "native cl redirect probe:"
-            sed 's/^/  /' native-msvc-probe.txt
-          else
+          if [ -z "$native_probe" ]; then
             echo "REDIRECT_BEHAVIOURAL=?" > native-msvc-probe.txt
-            echo "::warning::the native cl tree built no redirect probe"
+            echo "::error::the native cl tree built no redirect probe, so the override claim for the cl build is unverified"
+            exit 1
+          fi
+          probe_dir=$(dirname "$native_probe")
+          probe_rc=0
+          PATH="$PWD/$probe_dir:$PATH" "$native_probe" > native-msvc-probe.txt 2>&1 || probe_rc=$?
+          echo "native cl redirect probe:"
+          sed 's/^/  /' native-msvc-probe.txt
+          if [ "$probe_rc" -ne 0 ] || ! grep -q '^REDIRECT_BEHAVIOURAL=1$' native-msvc-probe.txt; then
+            echo "::error::the native cl build did not prove the override (rc=$probe_rc); its own allocations did not come from mimalloc"
+            exit 1
           fi
       - name: Coverage -- the bundles must run every test the native runner would
         if: ${{ !cancelled() }}

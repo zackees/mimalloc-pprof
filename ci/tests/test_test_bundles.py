@@ -1237,11 +1237,36 @@ class RuntimeDllScanTest(unittest.TestCase):
             self._run_no_dirs({"t.exe": ["libgcc_s_seh-1.dll"]}, ["t.exe"], allow_msvc_runtime=True)
         self.assertIn("t.exe imports libgcc_s_seh-1.dll", str(caught.exception))
 
+    def test_waived_msvc_runtime_dlls_are_reported_to_the_consumer(self) -> None:
+        """#296 (1): the bundle has to say WHICH redistributable DLLs it leans on.
+
+        `--allow-msvc-runtime` waives eight names while the runner used to check two by
+        hand, so a bundle importing `vcruntime140_1.dll` passed here and then failed on
+        the runner as a dialog-free 0xC0000135. The waived set is the intersection of what
+        this bundle imports and what the waiver covers -- not the whole allowlist, and not
+        ordinary system DLLs.
+        """
+        waived: set[str] = set()
+        self._run_no_dirs(
+            {"t.exe": ["VCRUNTIME140_1.dll", "MSVCP140.dll", "KERNEL32.dll"]},
+            ["t.exe"],
+            allow_msvc_runtime=True,
+            waived_out=waived,
+        )
+        self.assertEqual(waived, {"VCRUNTIME140_1.dll", "MSVCP140.dll"})
+
+    def test_nothing_is_waived_when_the_lane_did_not_ask(self) -> None:
+        waived: set[str] = set()
+        with self.assertRaises(bundle_tests.BundleError):
+            self._run_no_dirs({"t.exe": ["VCRUNTIME140.dll"]}, ["t.exe"], waived_out=waived)
+        self.assertEqual(waived, set())
+
     def _run_no_dirs(
         self,
         imports: dict[str, list[str]],
         staged: list[str],
         allow_msvc_runtime: bool = False,
+        waived_out: set[str] | None = None,
     ) -> list[Path]:
         build = self.root / "build"
         build.mkdir(exist_ok=True)
@@ -1252,4 +1277,5 @@ class RuntimeDllScanTest(unittest.TestCase):
             [],
             self._launcher(imports),
             allow_msvc_runtime,
+            waived_out,
         )

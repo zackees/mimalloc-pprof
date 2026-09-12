@@ -13,6 +13,8 @@ on:
       # hand-written bindings do not mirror. Without these paths a C-only PR could add
       # an API (or shift the option enum) and this job would never look.
       - 'include/**'
+      # Purge regression repairs must also validate the Rust integration (#396).
+      - 'test/test-purge-all.cpp'
       - '.github/workflows/rust-native.yml'
 
 concurrency:

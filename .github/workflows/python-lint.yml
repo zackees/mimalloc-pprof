@@ -57,6 +57,7 @@ jobs:
           python3 ci/check_benchmark_memory_workflow.py --selftest
           python3 ci/check_benchmark_latency_workflow.py --selftest
           python3 ci/check_benchmark_scaling_workflow.py --selftest
+          python3 ci/check_scaling_parity.py --selftest
       # Issue #277 phase B2. Both Apple architectures are cross-built on Linux and the
       # x86_64 bundle runs under dockurr/macos, so a macOS runner label anywhere in
       # .github/workflows is a regression. This is the check that says so out loud --

@@ -445,6 +445,103 @@ class BenchmarkReportTests(unittest.TestCase):
         )
         return site, digest
 
+    def test_a_section_measured_at_another_pin_is_left_pending(self) -> None:
+        """#376/#332: moving an allocator pin must not kill the pipeline.
+
+        `validate_carried_pins` refuses a carried section whose lock-pinned competitors
+        differ from the core run's -- correctly, since the two halves would then describe
+        different builds. But the carry-forward copied it anyway, so the whole render died
+        and NOTHING was published: the #332 bump of upstream-mimalloc to 6def7be9 took
+        `benchmark-stats` red on its first run. A section left behind is not lost data; it
+        stays `pending`, which the report already renders, and the next run of that metric
+        refills it at the new pin.
+        """
+        prior = self.with_complete_memory(self.load_latest())
+        fresh = copy.deepcopy(prior)
+        for metric in ("memory", "latency", "scaling"):
+            fresh.pop(metric, None)
+        allocators = fresh["allocators"]
+        assert isinstance(allocators, list)
+        for value in allocators:
+            assert isinstance(value, dict)
+            if value["allocator_id"] == "upstream-mimalloc":
+                value["source_sha"] = "6" * 40
+        fresh["pending_metrics"] = [
+            {
+                "metric_id": metric,
+                "status": "pending",
+                "reason": "not measured at this pin",
+                "phase_issue_url": "https://github.com/zackees/mimalloc-pprof/issues/332",
+            }
+            for metric in ("memory", "latency", "scaling", "pprof-tax")
+        ]
+        self.assertFalse(report.carry_forward_optional_metrics(fresh, prior))
+        self.assertNotIn("memory", fresh)
+        pending = fresh["pending_metrics"]
+        assert isinstance(pending, list)
+        self.assertIn("memory", [cast("dict[str, object]", p)["metric_id"] for p in pending])
+
+    def test_a_section_still_carries_when_only_the_fork_moved(self) -> None:
+        """The everyday case the carry-forward exists for: memory and latency are weekly,
+        the core run is not, so the fork's own commit is routinely newer in the core run
+        than in the section riding on it. That must keep working."""
+        prior = self.with_complete_memory(self.load_latest())
+        fresh = copy.deepcopy(prior)
+        for metric in ("memory", "latency", "scaling"):
+            fresh.pop(metric, None)
+        allocators = fresh["allocators"]
+        assert isinstance(allocators, list)
+        for value in allocators:
+            assert isinstance(value, dict)
+            if value["allocator_id"] == "mimalloc-pprof":
+                value["source_sha"] = "1" * 40
+        fresh["pending_metrics"] = [
+            {
+                "metric_id": metric,
+                "status": "pending",
+                "reason": "x",
+                "phase_issue_url": "https://github.com/zackees/mimalloc-pprof/issues/183",
+            }
+            for metric in ("memory", "latency", "scaling", "pprof-tax")
+        ]
+        self.assertTrue(report.carry_forward_optional_metrics(fresh, prior))
+        self.assertIn("memory", fresh)
+
+    def test_a_round_tripped_legacy_sample_keeps_rendering(self) -> None:
+        """#376: what stopped the pipeline publishing for three weeks.
+
+        `benchmark-scaling-validate` reads the published latest.json into the Rust
+        `LatestReport` structs, injects the fresh scaling section and writes the whole file
+        back. Serde writes `fragmentation_proxy_reason` (an `Option<String>`,
+        rust/benchmark-suite/src/memory.rs:274) whether or not the artifact it read had the
+        key, so every scaling run handed the renderer a legacy section carrying
+        `fragmentation_proxy_reason: null` -- and the renderer rejected it as an unexpected
+        field. A null there is exactly the absence the legacy shape means.
+        """
+        latest = self.with_complete_memory(self.load_latest(), legacy=True)
+        memory = latest["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list)
+        for sample in samples:
+            assert isinstance(sample, dict)
+            sample["fragmentation_proxy_reason"] = None
+        report.validate_latest(latest, "round-tripped legacy")
+
+    def test_a_legacy_sample_claiming_a_real_reason_is_still_rejected(self) -> None:
+        """The tolerance is for the null serde adds, not for a section whose methodology
+        says the proxy is unconditional while its samples explain why it is missing."""
+        latest = self.with_complete_memory(self.load_latest(), legacy=True)
+        memory = latest["memory"]
+        assert isinstance(memory, dict)
+        samples = memory["raw_samples"]
+        assert isinstance(samples, list)
+        first = samples[0]
+        assert isinstance(first, dict)
+        first["fragmentation_proxy_reason"] = "baseline-not-positive"
+        with self.assertRaisesRegex(report.ReportError, "fragmentation_proxy_reason"):
+            report.validate_latest(latest, "legacy with a reason")
+
     def test_fixture_renders_exact_allowlist_and_validates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             site, digest = self.render_fixture(Path(temporary))
@@ -2050,9 +2147,16 @@ class LegacyAllocatorLineageTests(unittest.TestCase):
             report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
             self.assertTrue((site / "benchmark-fragmentation.png").is_file())
 
-        # The tolerance is for the old shape exactly, not for a mixture: the old
-        # producer could not emit a non-positive delta, and the new one always
-        # writes the reason field.
+        # The tolerance is for the old shape, not for a genuine mixture: the old producer
+        # could not emit a non-positive delta, and a legacy section that *explains* a
+        # missing proxy contradicts the methodology it declares.
+        #
+        # #376 narrowed this. A legacy section carrying `fragmentation_proxy_reason: null`
+        # is NOT a mixture -- it is what serde writes when `benchmark-scaling-validate`
+        # round-trips the published latest.json through the Rust structs to inject a fresh
+        # scaling section, and rejecting it stopped the pipeline publishing for three
+        # weeks. A null is the absence the legacy shape means; only a real reason string is
+        # a contradiction, and that is what is asserted below now.
         degenerate = helper.with_complete_memory(helper.load_latest(), legacy=True)
         target = helper.plant_non_positive_delta(degenerate)
         del target["fragmentation_proxy_reason"]
@@ -2065,7 +2169,7 @@ class LegacyAllocatorLineageTests(unittest.TestCase):
         assert isinstance(memory, dict)
         samples = memory["raw_samples"]
         assert isinstance(samples, list) and isinstance(samples[0], dict)
-        samples[0]["fragmentation_proxy_reason"] = None
+        samples[0]["fragmentation_proxy_reason"] = "baseline-not-positive"
         with self.assertRaisesRegex(report.ReportError, "fields mismatch"):
             report.validate_latest(mixed, "mixed memory shape")
 

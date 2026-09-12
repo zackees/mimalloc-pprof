@@ -198,6 +198,58 @@ def disassemble_symbols(
     return found
 
 
+#: #371: instructions that must never reach the fast path of a build where nothing is
+#: observing. A `lock` prefix there is the regression this gate exists for -- DHAT's
+#: disabled hook did two of them per alloc and per free, which serialised the allocator so
+#: thoroughly the fork got SLOWER with more threads (0.69x from 1 to 8). `xchg` on memory
+#: and `cmpxchg` are the same hazard spelled differently.
+#: `lock` covers every explicitly atomic RMW, including `lock cmpxchg`. Bare `xchg` is
+#: implicitly locked ONLY when one operand is memory -- `xchg %ax,%ax` is the two-byte nop
+#: compilers emit for alignment and must not be flagged, which the selftest checks.
+FORBIDDEN_FASTPATH_RE = re.compile(r"^\s*(lock\b|xchg\s+[^,]+,\s*[^%\s])")
+
+
+#: Atomic read-modify-writes the allocator legitimately performs in a fast-path symbol,
+#: per symbol. `mi_free` publishes a cross-thread free by CAS onto `page->xthread_free`
+#: (src/free.c) -- freeing a block owned by another thread cannot be done without one, and
+#: it sits on the branch a local free does not take. Everything else must be zero: an
+#: allocation that is not observed has no reason to touch a shared line at all.
+FASTPATH_ATOMIC_ALLOWANCE = {
+    "mi_malloc": 0,
+    "mi_zalloc": 0,
+    "mi_malloc_small": 0,
+    "mi_heap_malloc_small": 0,
+    "mi_free": 1,
+}
+
+
+def assert_fastpath_is_clean(bodies: dict[str, list[str]]) -> list[str]:
+    """Problems with a disabled-observer fast path, as human-readable lines (#371).
+
+    This is the timing-free half of the regression gate: a scaling measurement can only
+    fail on a machine quiet enough to measure it, whereas an atomic read-modify-write
+    inlined into `mi_malloc` is visible in the instruction stream on any runner, in
+    seconds, with no variance.
+
+    SCOPE, stated honestly. This catches an atomic that is *inlined into* one of the five
+    fast-path symbols. #371's own regression was not that shape: `dhat_prepare`'s two RMWs
+    lived in a separate function that the hook called unconditionally, so a scan of these
+    bodies alone would not have caught it -- the call was one instruction and the damage
+    was behind it. Catching THAT needs the behavioural layer (a scaling ratio asserted by a
+    test), which is why #371 asks for both. What this layer adds is that the cheap, always-
+    runnable half exists at all, and that the shape #387 replaced it with -- flags tested
+    inline, before any shared-memory traffic -- cannot quietly regrow an atomic in place.
+    """
+    problems: list[str] = []
+    for symbol in sorted(bodies):
+        offenders = [line for line in bodies[symbol] if FORBIDDEN_FASTPATH_RE.match(line)]
+        allowed = FASTPATH_ATOMIC_ALLOWANCE.get(symbol, 0)
+        if len(offenders) > allowed:
+            for line in offenders[allowed:]:
+                problems.append(f"{symbol}: {line.strip()}  (allowance for this symbol: {allowed})")
+    return problems
+
+
 def compare(
     left_name: str,
     left: dict[str, list[str]],
@@ -302,10 +354,49 @@ FIXTURE_SHIFTED = (
 )
 
 
+def _selftest_forbidden_instructions() -> bool:
+    """#371: the absolute check must catch the regression it exists for.
+
+    A gate that silently stops gating is worse than no gate, and this one is a regex over
+    disassembly -- exactly the kind that can quietly match nothing. So it is exercised on
+    the shape DHAT's disabled hook actually compiled to (a lock-prefixed increment of the
+    inflight counter, inline in the allocation fast path) and on a clean fast path.
+    """
+    ok = True
+    regressed = {"mi_malloc": ["    push %rbp", "    lock incq 0x2b41(%rip)", "    ret"]}
+    problems = assert_fastpath_is_clean(regressed)
+    if len(problems) != 1 or "lock incq" not in problems[0]:
+        print(f"FAIL: the fast-path check missed a lock-prefixed RMW: {problems}")
+        ok = False
+    # An allocation symbol has a zero allowance, so any atomic there must be caught.
+    for instruction in ("    xchg %rax,(%rdi)", "    lock cmpxchg %rcx,(%rdx)"):
+        if not assert_fastpath_is_clean({"mi_malloc": [instruction]}):
+            print(f"FAIL: the fast-path check missed {instruction.strip()!r}")
+            ok = False
+    # mi_free's one documented cross-thread CAS is allowed; a second is not.
+    if assert_fastpath_is_clean({"mi_free": ["    lock cmpxchg %rcx,(%rdx)"]}):
+        print("FAIL: the fast-path check flagged mi_free's documented cross-thread CAS")
+        ok = False
+    if not assert_fastpath_is_clean(
+        {"mi_free": ["    lock cmpxchg %rcx,(%rdx)", "    lock incq 0x10(%rip)"]}
+    ):
+        print("FAIL: the fast-path check missed a SECOND atomic in mi_free")
+        ok = False
+    clean = {"mi_malloc": ["    push %rbp", "    mov 0x2b41(%rip),%rax", "    test %rax,%rax"]}
+    if assert_fastpath_is_clean(clean):
+        print("FAIL: the fast-path check flagged an ordinary relaxed load")
+        ok = False
+    # `xchg %ax,%ax` is a two-byte nop, not shared-memory traffic.
+    if assert_fastpath_is_clean({"mi_malloc": ["    xchg %ax,%ax"]}):
+        print("FAIL: the fast-path check flagged a register-only xchg (a nop)")
+        ok = False
+    return ok
+
+
 def selftest() -> int:
+    ok = _selftest_forbidden_instructions()
     functions = slice_functions(FIXTURE)
     shifted = slice_functions(FIXTURE_SHIFTED)
-    ok = True
     body = functions.get("729a")
     if body is None or len(body) != 7:
         print(f"FAIL: expected 7 normalised lines for the fixture function, got {body}")
@@ -415,6 +506,27 @@ def main(argv: list[str] | None = None) -> int:
         head_off = disassemble_symbols(
             build_static(ROOT, out / "head-off", gate=False), FASTPATH_SYMBOLS, out / "x-head-off"
         )
+        # #371: the absolute check, before the drift comparison. Drift is relative to a
+        # base revision, so it says nothing if a regression was already there -- and this
+        # one WAS: DHAT's disabled hook did two global atomic RMWs per alloc and per free
+        # for eleven days, through a release and a daily benchmark job, without any gate
+        # noticing. This asks the instruction stream directly, and it is timing-free, so it
+        # cannot be flaky on a busy runner the way a scaling measurement can.
+        print("HEAD, default build -- no atomic RMW may reach a disabled-observer fast path:")
+        dirty_fastpath = assert_fastpath_is_clean(head_off)
+        if dirty_fastpath:
+            print("FAIL: an atomic read-modify-write reaches the fast path with nothing observing:")
+            for problem in dirty_fastpath:
+                print(f"  {problem}")
+            print(
+                "  This is #371's regression. The observer flags must be tested BEFORE any "
+                "shared-memory traffic; see the comment above MI_OBSERVERS_INITIAL in "
+                "include/mimalloc/internal.h."
+            )
+            rc = 1
+        else:
+            print("PASS: no lock-prefixed instruction in the default build's fast path")
+
         print("base vs HEAD, default build (must be identical):")
         differing = compare("base-off", base_off, "head-off", head_off, FASTPATH_SYMBOLS)
         if differing:

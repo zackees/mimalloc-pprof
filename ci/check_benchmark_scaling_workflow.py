@@ -90,6 +90,8 @@ def validate(workflow: Mapping[str, object]) -> None:
     schedule = triggers.get("schedule")
     if not isinstance(schedule, list) or len(cast(list[object], schedule)) != 1:
         fail("workflow.on.schedule: expected exactly one schedule entry")
+    if schedule != [{"cron": "23 7 * * *"}]:
+        fail("workflow.on.schedule: expected daily cron '23 7 * * *' (#208)")
     dispatch = mapping(triggers.get("workflow_dispatch"), "workflow.on.workflow_dispatch")
     inputs = mapping(dispatch.get("inputs"), "workflow.on.workflow_dispatch.inputs")
     if set(inputs) != {"mode", "run_seed", "blocks"}:
@@ -262,6 +264,9 @@ def _triggers(workflow: dict[str, Any]) -> dict[str, Any]:
 
 
 MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
+    "weekly scaling schedule": lambda wf: _triggers(wf).__setitem__(
+        "schedule", [{"cron": "23 7 * * 0"}]
+    ),
     "push trigger added": lambda wf: _triggers(wf).__setitem__("push", {"branches": ["main"]}),
     "shared concurrency group dropped": lambda wf: wf.__setitem__(
         "concurrency", {"group": "scaling-only", "cancel-in-progress": False}

@@ -21,7 +21,7 @@ def _phase5_workflow() -> dict[str, object]:
                     "blocks": {"type": "number", "default": 15, "required": False},
                 }
             },
-            "schedule": [{"cron": "17 9 * * *"}],
+            "schedule": [{"cron": "17 9 * * 3"}],
         },
         "concurrency": {"group": "benchmark-stats-production", "cancel-in-progress": False},
         "permissions": {"contents": "read"},
@@ -118,6 +118,14 @@ def _phase5_workflow() -> dict[str, object]:
 
 
 class TestPhase5Policy(unittest.TestCase):
+    def test_weekly_cadence_is_required(self) -> None:
+        for schedule in (None, [], [{"cron": "17 9 * * *"}], [{"cron": "17 9 * * 0"}]):
+            with self.subTest(schedule=schedule):
+                bad = _phase5_workflow()
+                bad["on"]["schedule"] = schedule
+                with self.assertRaisesRegex(PolicyError, "schedule"):
+                    check(bad)
+
     def test_valid_phase5_fixture_passes(self) -> None:
         check(_phase5_workflow())
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import unittest
+from typing import cast
 
 import benchmark_report as report
 import check_benchmark_scaling_workflow as policy
@@ -16,6 +17,17 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
 
     def test_production_workflow_passes(self) -> None:
         policy.validate(self.workflow())
+
+    def test_daily_cadence_is_required(self) -> None:
+        for schedule in ([], [{"cron": "23 7 * * 0"}], [{}]):
+            with self.subTest(schedule=schedule):
+                value = self.workflow()
+                raw = cast(dict[object, object], value)  # PyYAML 1.1 may use True for `on`.
+                triggers = raw.get("on", raw.get(True))
+                assert isinstance(triggers, dict)
+                triggers["schedule"] = schedule
+                with self.assertRaisesRegex(policy.ScalingWorkflowError, "schedule"):
+                    policy.validate(value)
 
     def test_selftest_negative_controls_all_fail_closed(self) -> None:
         # The selftest is the real guard against a checker that checks nothing.

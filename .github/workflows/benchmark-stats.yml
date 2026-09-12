@@ -1,6 +1,6 @@
 name: benchmark-stats
 
-# Phase 5 publication: manual + daily schedule, publication eligibility,
+# Phase 5 publication: manual + weekly schedule, publication eligibility,
 # lease-protected benchmark-stats branch push, GitHub Pages deployment,
 # and independent publication audit.
 # First-party actions (checkout, upload-/download-artifact, pages) use
@@ -25,7 +25,12 @@ on:
         default: 15
         required: false
   schedule:
-    - cron: "17 9 * * *"
+    # #208: weekly. The sparse scaling sweep (#204) is the daily freshness signal now;
+    # this is the rigorous suite and it costs ~40 minutes a run. Wednesday, deliberately
+    # away from the Sunday cluster (scaling was 07:23 Sun, memory and latency are 08:41
+    # Sun): all four share the `benchmark-stats-production` concurrency group, so
+    # same-day runs serialize into one long queue.
+    - cron: "17 9 * * 3"
 
 concurrency:
   group: benchmark-stats-production

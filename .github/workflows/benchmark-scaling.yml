@@ -1,6 +1,6 @@
 name: benchmark-scaling
 
-# Linux-only thread-scaling sweep. It serializes with the daily producer and
+# Linux-only thread-scaling sweep. It serializes with the other benchmark workflows and
 # publishes through the same sealed branch/Pages pipeline. Coverage mode:
 # 4 patterns x 6 thread points x 5 allocators x 3 blocks. The sweep doubled
 # with the dense thread points (issue #211 WP4) and grew another 25% with the
@@ -28,7 +28,11 @@ on:
         default: 3
         required: false
   schedule:
-    - cron: "23 7 * * 0"
+    # #208: daily. This landed weekly-first so one live run could prove its budget before
+    # the daily signal depended on it; run 31759621920 did (3m01s measuring, 10m00s job,
+    # 20-minute timeout, `fits_limit: true`), so it takes over from benchmark-stats, which
+    # moves to weekly.
+    - cron: "23 7 * * *"
 
 concurrency:
   group: benchmark-stats-production

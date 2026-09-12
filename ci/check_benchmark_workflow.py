@@ -139,6 +139,8 @@ def check_triggers(workflow: Mapping[str, object]) -> None:
                 fail(f"workflow.on.{key}: trigger not allowed in Phase 5")
         if "workflow_dispatch" not in on:
             fail("workflow.on: workflow_dispatch is required")
+        if on.get("schedule") != [{"cron": "17 9 * * 3"}]:
+            fail("workflow.on.schedule: expected weekly Wednesday cron '17 9 * * 3' (#208)")
         dispatch = object_value(on["workflow_dispatch"], "workflow.on.workflow_dispatch")
         inputs = object_value(dispatch.get("inputs", {}), "workflow.on.workflow_dispatch.inputs")
         if "publish" in inputs:
@@ -450,7 +452,7 @@ def selftest() -> int:
                     "blocks": {"type": "number", "default": 15, "required": False},
                 }
             },
-            "schedule": [{"cron": "17 9 * * *"}],
+            "schedule": [{"cron": "17 9 * * 3"}],
         },
         "concurrency": {"group": "benchmark-stats-production", "cancel-in-progress": False},
         "permissions": {"contents": "read"},
@@ -546,6 +548,10 @@ def selftest() -> int:
     }
     # valid Phase 5 fixture
     check(base)
+    # negative: the expensive suite must not silently become daily again (#208)
+    bad = cast(dict[str, object], _deep_copy(base))
+    bad["on"]["schedule"] = [{"cron": "17 9 * * *"}]  # type: ignore[index]
+    _expect_policy_error(lambda: check(bad), "daily stats schedule")
     # negative: write permission at workflow level
     bad = cast(dict[str, object], _deep_copy(base))
     bad["permissions"]["contents"] = "write"  # type: ignore[index]

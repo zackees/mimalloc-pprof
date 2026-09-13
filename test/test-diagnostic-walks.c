@@ -41,6 +41,7 @@ static void thread_join(thread_t t) { assert(pthread_join(t, NULL) == 0); }
 #if MI_OWNER_GATE && MI_DEBUG > 0
 static _Atomic(uintptr_t) report_phase;
 static mi_tld_t* reporter_tld;
+extern _Atomic(uintptr_t) mi_debug_dump_retrying;
 
 static THREAD_RET report_worker(void* arg) {
   MI_UNUSED(arg);
@@ -75,6 +76,77 @@ static void test_report_gate(void) {
   mi_atomic_store_release(&report_phase, (uintptr_t)2);
   thread_join(worker);
   puts("report-gate: excluded while reporting, foreign sweep completed afterward");
+}
+
+static _Atomic(uintptr_t) wait_phase;
+static mi_heap_t* wait_heap;
+static mi_heap_t* wait_attach_heap;
+
+static THREAD_RET wait_owner(void* arg) {
+  MI_UNUSED(arg);
+  mi_theap_t* self = _mi_theap_default();
+  MI_GATE_ENTER(self);
+  void* keep = mi_heap_malloc(wait_heap, 1024);
+  assert(keep != NULL);
+  mi_atomic_store_release(&wait_phase, (uintptr_t)1);
+  while (mi_atomic_load_acquire(&wait_phase) == 1) { _mi_prim_thread_yield(); }
+  MI_GATE_LEAVE(self->tld);
+  // The retry notification is published only after the failed attempt has
+  // dropped heap->theaps_lock. Prove it by attaching this thread to a heap it
+  // has never used before; theap creation needs that lock.
+  void* attached = mi_heap_malloc(wait_attach_heap, 128);
+  assert(attached != NULL);
+  mi_atomic_store_release(&wait_phase, (uintptr_t)3);
+  while (mi_atomic_load_acquire(&wait_phase) == 3) { _mi_prim_thread_yield(); }
+  mi_free(attached);
+  mi_free(keep);
+  return THREAD_OK;
+}
+
+static THREAD_RET wait_releaser(void* arg) {
+  MI_UNUSED(arg);
+  while (mi_atomic_load_acquire(&mi_debug_dump_retrying) == 0) { _mi_prim_thread_yield(); }
+  mi_atomic_store_release(&wait_phase, (uintptr_t)2);
+  return THREAD_OK;
+}
+
+static void test_dump_waits_from_clean_boundary(void) {
+  wait_heap = mi_heap_new();
+  wait_attach_heap = mi_heap_new();
+  assert(wait_heap != NULL);
+  assert(wait_attach_heap != NULL);
+  mi_atomic_store_relaxed(&wait_phase, (uintptr_t)0);
+  mi_atomic_store_relaxed(&mi_debug_dump_retrying, (uintptr_t)0);
+  thread_t owner;
+  thread_t releaser;
+  thread_start(&owner, &wait_owner, NULL);
+  while (mi_atomic_load_acquire(&wait_phase) != 1) { _mi_prim_thread_yield(); }
+  thread_start(&releaser, &wait_releaser, NULL);
+  char* json = mi_heap_dump_json_ex(true, false, 1000);
+  assert(json != NULL);
+  assert(mi_atomic_load_acquire(&mi_debug_dump_retrying) > 0);
+  assert(strstr(json, "\"complete\": true") != NULL);
+  char needle[64];
+  snprintf(needle, sizeof(needle), "\"seq\": %zu,", mi_heap_get_seq(wait_heap));
+  const char* begin = strstr(json, needle);
+  assert(begin != NULL);
+  const char* end = strstr(begin + strlen(needle), "\"seq\":");
+  if (end == NULL) end = json + strlen(json);
+  size_t used = 0;
+  for (const char* p = begin; (p = strstr(p, "\"used\": ")) != NULL && p < end; p++) {
+    size_t count = 0;
+    assert(sscanf(p, "\"used\": %zu", &count) == 1);
+    used += count;
+  }
+  assert(used == 1);
+  mi_free(json);
+  thread_join(releaser);
+  while (mi_atomic_load_acquire(&wait_phase) != 3) { _mi_prim_thread_yield(); }
+  mi_atomic_store_release(&wait_phase, (uintptr_t)4);
+  thread_join(owner);
+  mi_heap_destroy(wait_attach_heap);
+  mi_heap_destroy(wait_heap);
+  puts("dump-wait: incomplete attempt released all resources, then captured owner");
 }
 #endif
 
@@ -297,7 +369,9 @@ static void test_retirement_churn(void) {
   mi_atomic_store_release(&churn_phase, (uintptr_t)2);
   while (mi_atomic_load_acquire(&churn_count) < 128) _mi_prim_thread_yield();
   for (size_t i = 0; i < 100; i++) {
-    char* json = mi_heap_dump_json(true, false);
+    // This case stresses retirement safety, not acquisition waiting. A zero
+    // deadline keeps every iteration to one attempt under continuous churn.
+    char* json = mi_heap_dump_json_ex(true, false, 0);
     assert(json != NULL && strstr(json, "\"complete\":") != NULL);
     mi_free(json);
     _mi_prim_thread_yield();
@@ -313,6 +387,7 @@ int main(void) {
   mi_thread_init();
 #if MI_OWNER_GATE && MI_DEBUG > 0
   test_report_gate();
+  test_dump_waits_from_clean_boundary();
 #endif
   test_dump_coverage();
   test_dump_growth();

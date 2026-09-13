@@ -166,10 +166,16 @@ after that lock is dropped. The detached metadata theap uses a try-acquire of
 its existing `theap_meta_lock`, never the park protocol.
 
 There is no 64-owner limit or unclaimed fallback. Each arena page's owner claim
-lasts only for capture. RUNNING/SWEEPING owners and contended metadata pages are
-not waited for; `complete`, `skipped_pages`, and `busy_theaps` in the JSON expose
-observed incomplete coverage. Registry locks and the capture itself can still
-take time: this is not a lock-free or bounded-latency API. Ungated threads need a
+lasts only for capture. In an owner-gated build, `mi_heap_dump_json_ex` discards
+an incomplete attempt and retries it until its dump-wide acquisition deadline.
+Every attempt releases the caller gate, registry/heap locks, page pins, owner
+claims, and raw scratch before waiting; waiting inside `mi_diag_try_tld` would
+deadlock with an owner finishing page retirement, heap creation, or heap deletion.
+The legacy entry point supplies a 100 ms deadline. In ungated builds, waiting
+cannot make a RUNNING owner claimable, so capture stays one-shot. `complete`,
+`skipped_pages`, and `busy_theaps` expose the final attempt's coverage. Registry
+locks and the capture itself can still take time: this is not a lock-free or
+strictly bounded-latency API. Ungated threads need a
 successful cooperative idle handoff for capture; merely sleeping is insufficient.
 The coverage flag is not a claim that independently captured pages represent one
 global instant. Concurrent mutation can change coverage/counts between pages.

@@ -1215,6 +1215,27 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-heap-teardown PROPERTIES TIMEOUT 300)
   endif()
 
+  # #374 uses native threads on Windows and pthreads elsewhere. Keep these outside
+  # the POSIX-only tests: both MSVC and win-gnu must execute the ownership regressions.
+  # Internal page state requires the static library and its exact compilation defines.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-diagnostic-walks test/test-diagnostic-walks.c)
+    target_compile_definitions(mimalloc-test-diagnostic-walks PRIVATE ${mi_defines} MI_STATIC_LIB)
+    target_compile_options(mimalloc-test-diagnostic-walks PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-diagnostic-walks PRIVATE include)
+    target_link_libraries(mimalloc-test-diagnostic-walks PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-diagnostic-walks PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-diagnostic-walks COMMAND mimalloc-test-diagnostic-walks)
+    set_tests_properties(test-diagnostic-walks PROPERTIES TIMEOUT 120
+                         ENVIRONMENT "MIMALLOC_SCAVENGER=0")
+    add_test(NAME test-diagnostic-walks-os COMMAND mimalloc-test-diagnostic-walks)
+    set_tests_properties(test-diagnostic-walks-os PROPERTIES TIMEOUT 120
+                         ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_DISALLOW_ARENA_ALLOC=1")
+  endif()
+
   # pthread_atfork fork-safety handlers (issue #270, Bun parity P5). POSIX-only --
   # both sources compile to a Windows-skip stub via #ifdef _WIN32, but there is no
   # pthread/fork() to link against on MSVC/MinGW, so only build+register them off
@@ -1335,17 +1356,6 @@ if (MI_BUILD_TESTS)
     # (`MI_BUILD_STATIC=OFF`) skips it rather than failing to link.
     if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
       add_executable(mimalloc-test-purge-holes test/test-purge-holes.c)
-      add_executable(mimalloc-test-diagnostic-walks test/test-diagnostic-walks.c)
-      target_compile_definitions(mimalloc-test-diagnostic-walks PRIVATE ${mi_defines} MI_STATIC_LIB)
-      target_compile_options(mimalloc-test-diagnostic-walks PRIVATE ${mi_cflags})
-      target_include_directories(mimalloc-test-diagnostic-walks PRIVATE include)
-      target_link_libraries(mimalloc-test-diagnostic-walks PRIVATE mimalloc-static ${mi_libraries} Threads::Threads)
-      add_test(NAME test-diagnostic-walks COMMAND mimalloc-test-diagnostic-walks)
-      set_tests_properties(test-diagnostic-walks PROPERTIES TIMEOUT 120
-                           ENVIRONMENT "MIMALLOC_SCAVENGER=0")
-      add_test(NAME test-diagnostic-walks-os COMMAND mimalloc-test-diagnostic-walks)
-      set_tests_properties(test-diagnostic-walks-os PROPERTIES TIMEOUT 120
-                           ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_DISALLOW_ARENA_ALLOC=1")
       target_compile_definitions(mimalloc-test-purge-holes PRIVATE ${mi_defines})
       target_compile_options(mimalloc-test-purge-holes PRIVATE ${mi_cflags})
       target_include_directories(mimalloc-test-purge-holes PRIVATE include)

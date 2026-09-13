@@ -171,8 +171,10 @@ an incomplete attempt and retries it until its dump-wide acquisition deadline.
 Every attempt releases the caller gate, registry/heap locks, page pins, owner
 claims, and raw scratch before waiting; waiting inside `mi_diag_try_tld` would
 deadlock with an owner finishing page retirement, heap creation, or heap deletion.
-The legacy entry point supplies a 100 ms deadline. In ungated builds, waiting
-cannot make a RUNNING owner claimable, so capture stays one-shot. `complete`,
+The deadline uses an overflow-free elapsed-time comparison, including for `SIZE_MAX`.
+A call nested inside an allocator operation is one-shot because it cannot release
+the caller's outer gate. The legacy entry point supplies a 100 ms deadline. In
+ungated builds, waiting cannot make a RUNNING owner claimable, so capture stays one-shot. `complete`,
 `skipped_pages`, and `busy_theaps` expose the final attempt's coverage. Registry
 locks and the capture itself can still take time: this is not a lock-free or
 strictly bounded-latency API. Ungated threads need a

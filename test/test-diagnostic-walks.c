@@ -121,8 +121,22 @@ static void test_dump_waits_from_clean_boundary(void) {
   thread_t releaser;
   thread_start(&owner, &wait_owner, NULL);
   while (mi_atomic_load_acquire(&wait_phase) != 1) { _mi_prim_thread_yield(); }
+
+  // A nested diagnostic call cannot release its caller's outer gate, so it
+  // must remain one-shot even when given a nonzero wait.
+  mi_theap_t* self = _mi_theap_default();
+  MI_GATE_ENTER(self);
+  const uintptr_t retries_before = mi_atomic_load_relaxed(&mi_debug_dump_retrying);
+  char* nested = mi_heap_dump_json_ex(false, false, 10);
+  assert(nested != NULL && strstr(nested, "\"complete\": false") != NULL);
+  assert(mi_atomic_load_relaxed(&mi_debug_dump_retrying) == retries_before);
+  mi_free(nested);
+  MI_GATE_LEAVE(self->tld);
+
   thread_start(&releaser, &wait_releaser, NULL);
-  char* json = mi_heap_dump_json_ex(true, false, 1000);
+  // SIZE_MAX proves the elapsed-time test cannot overflow or expire a very
+  // large public size_t timeout immediately.
+  char* json = mi_heap_dump_json_ex(true, false, SIZE_MAX);
   assert(json != NULL);
   assert(mi_atomic_load_acquire(&mi_debug_dump_retrying) > 0);
   assert(strstr(json, "\"complete\": true") != NULL);

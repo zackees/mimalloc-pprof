@@ -251,7 +251,8 @@ char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait
   const uintptr_t key = _mi_os_random_weak((uintptr_t)&ctx) | 1;
   bool captured;
   #if MI_OWNER_GATE
-  const mi_msecs_t deadline = _mi_clock_now() + (mi_msecs_t)wait_ms;
+  const bool can_retry = (self->tld->gate_depth == 0);
+  const mi_msecs_t started = _mi_clock_now();
   size_t spin = 0;
   #else
   MI_UNUSED(wait_ms);
@@ -263,7 +264,9 @@ char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait
     MI_GATE_LEAVE(self->tld);
     if (!captured || mi_dump_complete(&ctx)) break;
     #if MI_OWNER_GATE
-    if (_mi_clock_now() >= deadline) break;
+    const mi_msecs_t now = _mi_clock_now();
+    const uintmax_t elapsed = (now > started ? (uintmax_t)now - (uintmax_t)started : 0);
+    if (!can_retry || elapsed >= (uintmax_t)wait_ms) break;
     // The just-finished attempt released the caller gate, subproc/heap locks,
     // page pins and owner claims. Discard it before waiting: retaining any while a RUNNING
     // owner finishes can deadlock with heap creation, deletion, or page retirement.

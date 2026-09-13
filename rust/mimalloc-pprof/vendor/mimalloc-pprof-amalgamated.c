@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2d88074e of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit b852cb91 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -4709,6 +4709,9 @@ extern mi_decl_export volatile long mi_debug_fail_os_commit_after;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
 // #374: reporter entry handshake (1 -> 2, test releases with 0).
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_holes_report;
+// #374: fail the Nth diagnostic scratch request (0 disables, UINTPTR_MAX fails
+// the first serialization request after all claims have been released).
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_dump_fail_after;
 // Bun parity P10b (#317), ported from oven-sh/mimalloc @ 1515c3c9 (C linkage) /
 // 787be2a8 (the counter itself). test-abandoned-lazy.c: per-bin abandoned bitmaps
 // (`mi_arena_pages_t::pages_abandoned[]`, arena.c) published so far via the CAS in
@@ -5447,7 +5450,7 @@ static inline bool _mi_gate_held(const mi_tld_t* tld) {
   if (tld == NULL) return false;
   if (tld->thread_id == MI_THREADID_DETACHED) return true;   // `theap_meta`: guarded by theap_meta_lock, never gated
   const mi_threadid_t me = _mi_thread_id();
-  if (tld->gate_depth > 0 && tld->thread_id == me) return true;
+  if (tld->thread_id == me && tld->gate_depth > 0) return true;
   return (mi_atomic_load_acquire((_Atomic(size_t)*)&tld->park_state) == MI_PARK_SWEEPING &&
           mi_atomic_load_acquire((_Atomic(uintptr_t)*)&tld->sweeper) == (uintptr_t)me);
 }
@@ -13732,11 +13735,12 @@ typedef struct mi_diag_coverage_s {
   size_t skipped_pages;
   size_t busy_theaps;
 } mi_diag_coverage_t;
+typedef void* (mi_diag_alloc_fun)(void* arg, size_t size);
 
 // Caller holds subproc->heaps_lock and its own owner gate. The callback must only
 // copy metadata to raw-OS storage: no user code, allocator reentry, or payload reads.
 bool _mi_heap_visit_diagnostic(mi_heap_t* heap, bool blocks, mi_block_visit_fun* visitor,
-                              void* arg, mi_diag_coverage_t* coverage);
+                              void* arg, mi_diag_coverage_t* coverage, mi_diag_alloc_fun* allocate);
 /* ---- end inlined: src/diagnostic-walk.h ---- */
 
 typedef struct mi_diag_walk_s {
@@ -13746,6 +13750,7 @@ typedef struct mi_diag_walk_s {
   void* arg;
   mi_diag_coverage_t* coverage;
   mi_arena_pages_t* arena_pages;
+  mi_diag_alloc_fun* allocate;
 } mi_diag_walk_t;
 
 // heap->theaps_lock pins the tld. Never wait while holding a page pin: the owner
@@ -13831,23 +13836,19 @@ static bool mi_diag_owned_os_page(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
 // the list lock: unown can free/unlink a page and would otherwise self-deadlock.
 typedef struct mi_diag_os_batch_s {
   struct mi_diag_os_batch_s* next;
-  mi_memid_t memid;
   size_t used;
   mi_page_t* pages[64];
 } mi_diag_os_batch_t;
 
 static bool mi_diag_abandoned_os(mi_diag_walk_t* walk) {
   mi_diag_os_batch_t* batches = NULL;
-  mi_subproc_t* subproc = walk->heap->subproc;
   bool ok = true;
   mi_lock(&walk->heap->os_abandoned_pages_lock) {
     for (mi_page_t* page = walk->heap->os_abandoned_pages; page != NULL; page = page->next) {
       if (batches == NULL || batches->used == 64) {
-        mi_memid_t memid;
-        mi_diag_os_batch_t* batch = (mi_diag_os_batch_t*)_mi_os_alloc(subproc, sizeof(*batch), &memid);
+        mi_diag_os_batch_t* batch = (mi_diag_os_batch_t*)walk->allocate(walk->arg, sizeof(*batch));
         if (batch == NULL) { ok = false; break; }
         batch->next = batches;
-        batch->memid = memid;
         batch->used = 0;
         batches = batch;
       }
@@ -13862,15 +13863,15 @@ static bool mi_diag_abandoned_os(mi_diag_walk_t* walk) {
       if (ok) { ok = mi_diag_visit_page(page, walk); }
       mi_abandoned_page_unown(page, NULL);
     }
-    _mi_os_free(subproc, batches, sizeof(*batches), batches->memid);
+    // Batch storage belongs to the capture arena and is released by its caller.
     batches = next;
   }
   return ok;
 }
 
 bool _mi_heap_visit_diagnostic(mi_heap_t* heap, bool blocks, mi_block_visit_fun* visitor,
-                              void* arg, mi_diag_coverage_t* coverage) {
-  mi_diag_walk_t walk = { heap, blocks, visitor, arg, coverage, NULL };
+                              void* arg, mi_diag_coverage_t* coverage, mi_diag_alloc_fun* allocate) {
+  mi_diag_walk_t walk = { heap, blocks, visitor, arg, coverage, NULL, allocate };
   bool ok = true;
   mi_lock(&heap->theaps_lock) {
     // Arena pins + individual owner claims keep claims short (one page capture)
@@ -17689,6 +17690,10 @@ bool _mi_test_heaps_lock_poison_observed(void) {
    pages are captured independently. Cooperatively park foreign owners for coverage.
    The generic mi_heap_visit_blocks API retains its existing concurrency contract. */
 
+#if MI_DEBUG > 0
+mi_decl_export _Atomic(uintptr_t) mi_debug_dump_fail_after;
+#endif
+
 // A bump arena amortizes raw OS allocation across thousands of block records.
 // It never installs profiler records or participates in memory-event accounting.
 typedef struct mi_dump_chunk_s {
@@ -17735,11 +17740,21 @@ typedef struct mi_dump_ctx_s {
   mi_subproc_t* subproc;
   mi_diag_coverage_t coverage;
   size_t text_size;
+  size_t alloc_count;
   uintptr_t key;
-  bool include_blocks, hash_addresses, failed;
+  bool include_blocks, hash_addresses, failed, formatting;
 } mi_dump_ctx_t;
 
-static void* mi_dump_alloc(mi_dump_ctx_t* ctx, size_t size) {
+static void* mi_dump_alloc(void* arg, size_t size) {
+  mi_dump_ctx_t* ctx = (mi_dump_ctx_t*)arg;
+  ctx->alloc_count++;
+  #if MI_DEBUG > 0
+  const uintptr_t fail = mi_atomic_load_relaxed(&mi_debug_dump_fail_after);
+  if (fail > 0 && (ctx->alloc_count == fail || (fail == UINTPTR_MAX && ctx->formatting))) {
+    ctx->failed = true;
+    return NULL;
+  }
+  #endif
   size = _mi_align_up(size, sizeof(void*));
   mi_assert_internal(size <= sizeof(ctx->chunks->data));
   if (ctx->failed) return NULL;
@@ -17792,7 +17807,9 @@ static bool mi_cdecl mi_dump_capture_block(const mi_heap_t* heap, const mi_heap_
     const mi_page_t* page = (const mi_page_t*)area->reserved1;
     p->id = (uintptr_t)area->blocks;
     p->block_size = area->block_size;
-    p->used = area->used;
+    // The block walker collects pending remote frees after its area callback.
+    // For block dumps count the captured records, not the pre-collect counter.
+    p->used = ctx->include_blocks ? 0 : area->used;
     p->reserved = area->reserved / (area->block_size > 0 ? area->block_size : 1);
     p->tid = mi_page_thread_id(page);
     if (out->last_page == NULL) { out->pages = p; }
@@ -17808,6 +17825,7 @@ static bool mi_cdecl mi_dump_capture_block(const mi_heap_t* heap, const mi_heap_
     if (p->last_block == NULL) { p->blocks = b; }
     else { p->last_block->next = b; }
     p->last_block = b;
+    p->used++;
   }
   return true;
 }
@@ -17820,12 +17838,15 @@ static bool mi_cdecl mi_dump_capture_heap(mi_heap_t* heap, void* arg) {
   if (ctx->last_heap == NULL) { ctx->heaps = out; }
   else { ctx->last_heap->next = out; }
   ctx->last_heap = out;
-  return _mi_heap_visit_diagnostic(heap, ctx->include_blocks, &mi_dump_capture_block, ctx, &ctx->coverage);
+  return _mi_heap_visit_diagnostic(heap, ctx->include_blocks, &mi_dump_capture_block, ctx, &ctx->coverage, &mi_dump_alloc);
 }
 
 static bool mi_dump_print(mi_dump_ctx_t* ctx, const char* msg) {
   if (ctx->failed) return false;
-  while (*msg != 0) {
+  size_t len = _mi_strlen(msg);
+  if (len > SIZE_MAX - 1 - ctx->text_size) { ctx->failed = true; return false; }
+  ctx->text_size += len;
+  while (len > 0) {
     if (ctx->last_text == NULL || ctx->last_text->used == sizeof(ctx->last_text->data)) {
       mi_dump_text_t* text = (mi_dump_text_t*)mi_dump_alloc(ctx, sizeof(*text));
       if (text == NULL) return false;
@@ -17833,9 +17854,12 @@ static bool mi_dump_print(mi_dump_ctx_t* ctx, const char* msg) {
       else { ctx->last_text->next = text; }
       ctx->last_text = text;
     }
-    if (ctx->text_size == SIZE_MAX - 1) { ctx->failed = true; return false; }
-    ctx->last_text->data[ctx->last_text->used++] = *msg++;
-    ctx->text_size++;
+    const size_t available = sizeof(ctx->last_text->data) - ctx->last_text->used;
+    const size_t take = len < available ? len : available;
+    _mi_memcpy(ctx->last_text->data + ctx->last_text->used, msg, take);
+    ctx->last_text->used += take;
+    msg += take;
+    len -= take;
   }
   return true;
 }
@@ -17882,7 +17906,9 @@ static bool mi_dump_serialize(mi_dump_ctx_t* ctx) {
 }
 
 char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept {
-  mi_theap_t* self = mi_theap_get_default();
+  mi_theap_t* self = _mi_theap_default();
+  if (!mi_theap_is_initialized(self)) { self = _mi_thread_init(); }
+  if (self == NULL) return NULL; // fresh-thread initialization can fail under OOM
   MI_GATE_ENTER(self);
   mi_dump_ctx_t ctx;
   _mi_memzero(&ctx, sizeof(ctx));
@@ -17892,6 +17918,7 @@ char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexce
   ctx.key = _mi_os_random_weak((uintptr_t)&ctx) | 1;
   const bool captured = mi_subproc_visit_heaps(mi_subproc_current(), &mi_dump_capture_heap, &ctx);
   MI_GATE_LEAVE(self->tld);
+  ctx.formatting = true;
   // No page/theap claims or registry locks remain. Format saved values only.
   char* result = NULL;
   if (captured && mi_dump_serialize(&ctx)) {

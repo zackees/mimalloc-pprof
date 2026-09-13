@@ -208,10 +208,12 @@ pub unsafe fn usable_size(p: *const u8) -> usize {
 /// Set `hash_addresses` to mix every reported address through a per-process key so a
 /// dump can be shared or diffed without exposing raw ASLR-derived pointers.
 ///
-/// Best-effort under concurrent frees on the heaps being walked (mimalloc's
-/// `mi_heap_visit_blocks`/`mi_subproc_visit_heaps` contract; see the caveat on
-/// `src/heap-dump.c` and issue #78) -- never `unsafe` to call, but a heap another
-/// thread is actively freeing into may be under- or over-reported in the returned JSON.
+/// Safe, best-effort capture under concurrent frees (#374). Mutable page state is
+/// copied only under ownership; busy foreign owners are omitted. Top-level JSON
+/// fields `complete`, `skipped_pages`, and `busy_theaps` expose observed coverage.
+/// Without the `owner-gate` feature, foreign threads generally remain uninspectable
+/// unless they cooperatively park. `complete: true` is not a process-wide atomic
+/// snapshot: individual pages are captured independently.
 ///
 /// Returns `None` only on allocation failure (out of memory building the JSON buffer),
 /// not for an empty subprocess.

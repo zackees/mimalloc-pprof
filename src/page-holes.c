@@ -126,6 +126,7 @@ terms of the MIT license. A copy of the license can be found in the file
 ----------------------------------------------------------- */
 
 #include "mimalloc.h"
+#include "mimalloc/prim.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/prim-tls.h"   // _mi_theap_default
 
@@ -906,8 +907,8 @@ void _mi_purge_holes_of(mi_tld_t* tld, bool force) {
   overlapping it is free, so a single live block pins the whole OS page. This accounts for
   that, per size class, and says how many live blocks each pinned OS page is holding.
 
-  Read-only: it does not purge, un-purge, collect, or touch a free list. It walks the three
-  free lists in place instead of collecting them.
+  Read-only: it does not purge, un-purge, or collect. It reads the three free lists
+  in place and never mutates them.
 
   A block is exactly one of:
    - free-listed: on `free`, `local_free`, or `xthread_free`;
@@ -1217,20 +1218,35 @@ void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
 // Report what hole punching leaves behind. Same traversal and same ownership rules as
 // `_mi_purge_holes_of` -- every theap of this thread, plus the abandoned pages of the heaps
 // behind them -- but read-only: it collects nothing, purges nothing, un-purges nothing, and
-// never touches a free list.
+// reads the three free lists in place and never mutates them.
 static bool mi_theap_page_holes_report(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2) {
   MI_UNUSED(theap); MI_UNUSED(pq); MI_UNUSED(arg2);
   _mi_page_holes_report_page(page, (mi_holes_report_t*)arg1);
   return true; // continue
 }
 
+#if MI_DEBUG > 0
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_holes_report;
+#endif
+
 void _mi_purge_holes_report_collect(mi_holes_report_t* rep) {
   if (rep == NULL) return;
   _mi_memzero(rep, sizeof(*rep));
-  mi_theap_t* const theap0 = _mi_theap_default();
+  mi_theap_t* theap0 = _mi_theap_default();
   if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
   mi_tld_t* const tld = theap0->tld;
   if (tld->thread_id != _mi_thread_id()) return;   // owner thread only, exactly as for the sweep
+
+  // #374: theaps_lock excludes the hole pass, not a claimed sweep's preceding collect.
+  // Be RUNNING before taking that lock so neither phase can race our free-list reads.
+  MI_GATE_ENTER(theap0);
+
+  #if MI_DEBUG > 0
+  if (mi_atomic_load_relaxed(&mi_debug_stall_in_holes_report) == 1) {
+    mi_atomic_store_release(&mi_debug_stall_in_holes_report, (uintptr_t)2);
+    while (mi_atomic_load_acquire(&mi_debug_stall_in_holes_report) == 2) { _mi_prim_thread_yield(); }
+  }
+  #endif
 
   mi_heap_t* heaps[MI_PURGE_HOLES_MAX_HEAPS];
   size_t heap_count = 0;
@@ -1254,6 +1270,7 @@ void _mi_purge_holes_report_collect(mi_holes_report_t* rep) {
     // once: every heap of this thread reaches the same arenas.
     if (heap_count > 0) { _mi_arenas_holes_committed(heaps[0], rep); }
   }
+  MI_GATE_LEAVE(tld);
 }
 
 void mi_purge_holes_report(void) mi_attr_noexcept {

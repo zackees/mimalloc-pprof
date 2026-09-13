@@ -162,8 +162,12 @@ mi_decl_export char*   mi_stats_as_json(mi_stats_t* stats, size_t buf_size, char
 mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 
 // per-heap -> per-page -> (optional) per-block live snapshot (issue #269, Bun parity).
-// Backs bun:jsc heapStats({ dump: true | "blocks" }).mimallocDump. Best-effort under
-// concurrent frees, same caveat as mi_heap_visit_blocks (#78) -- see src/heap-dump.c.
+// Backs bun:jsc heapStats({ dump: true | "blocks" }).mimallocDump. Safe, best-effort
+// capture under concurrent frees (#374); unlike mi_heap_visit_blocks, it never
+// reads mutable state of an unclaimed owner. Top-level complete/skipped_pages/
+// busy_theaps describe observed coverage. Busy owners are omitted, not waited for.
+// Ungated foreign owners must cooperatively park for coverage. A true complete
+// flag is not a process-wide atomic snapshot: pages are captured independently.
 // use mi_free to free the result.
 mi_decl_export char*   mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept;
 mi_decl_export size_t  mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept;

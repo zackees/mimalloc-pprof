@@ -47,6 +47,8 @@ fields.
 | `profiler-proto-modules` | raw OS -> dump-local modules | one protobuf dump | fixed module array / same cleanup expression | never global; every exit frees |
 | `profiler-proto-pc-table` | raw OS -> dump-local hash table | one protobuf dump | power-of-two table / same cleanup expression | zero before use; every exit frees |
 | `stats-json-buffer` | default heap -> stats caller | caller lifetime | requested capacity / allocator class | pointer/size update after successful growth; caller frees |
+| `heap-dump-capture-scratch` | raw OS -> private dump capture/serialization arena | one JSON dump; dispose on every exit | header + 64 KiB / exact retained size | initialize then link; capture may hold ownership/registry locks; no hooked allocation |
+| `heap-dump-json-buffer` | default heap -> dump caller | caller lifetime; `mi_free` | final text length + NUL / allocator class | allocate once after releasing all capture claims/locks; return complete JSON or NULL |
 | `thread-heap-object` | sub-process meta -> heap and TLD lists | refcounted thread/heap lifetime | theap size / meta slot | dual-list publication locks; refcount-zero frees |
 | `exclusive-arena-theap` | exclusive arena -> heap and TLD lists | refcounted thread/heap lifetime | rounded theap size / arena slice | arena + list locks; matching arena free |
 | `test-control-tls-slot-array-owner` | test default heap -> prospective TLS pointer | negative-control process only | TLS logical count / allocator class | owner check must reject before publication; test-only |

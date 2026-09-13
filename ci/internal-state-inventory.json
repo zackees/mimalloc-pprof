@@ -329,22 +329,42 @@
       ]
     },
     {
+      "id": "heap-dump-capture-scratch",
+      "path": "src/heap-dump.c",
+      "callee": "_mi_os_alloc",
+      "args": "ctx->subproc,sizeof(*chunk),&memid",
+      "occurrence": 1,
+      "owner": "operation-local mi_dump_ctx_t",
+      "initial_owner": "raw OS allocation; never a hooked allocator heap",
+      "owner_transitions": "initialized chunk is prepended to ctx->chunks; records and text borrow bump-allocated extents",
+      "destroyable_by": "mi_dump_dispose on every success or failure path",
+      "lifetime": "one mi_heap_dump_json call, including capture and serialization",
+      "logical_size": "sizeof(mi_dump_chunk_t), including 64 KiB of scratch data",
+      "usable_size": "only sizeof(*chunk) is used and passed with its memid to _mi_os_free",
+      "cleanup": "capture failure first releases page ownership and locks; mi_dump_dispose frees every chunk even when formatting or final result allocation fails",
+      "publication": "chunk memid, used and next initialized before private ctx->chunks update; never published to other threads",
+      "locks": [
+        "capture: subproc heaps_lock and heap theaps_lock; may also hold a page pin, owner claim, metadata lock, or OS abandoned-pages lock",
+        "serialization: no traversal lock or owner claim; raw OS allocation cannot reenter hooked allocation"
+      ]
+    },
+    {
       "id": "heap-dump-json-buffer",
       "path": "src/heap-dump.c",
-      "callee": "mi_rezalloc",
-      "args": "hbuf->buf,newsize",
+      "callee": "mi_malloc",
+      "args": "ctx.text_size+1",
       "occurrence": 1,
       "owner": "mi_heap_dump_json caller",
       "initial_owner": "calling thread's default heap",
-      "owner_transitions": "returned to the dump caller; moving growth preserves old buffer on failure, matching stats.c's mi_json_buf_expand this mirrors",
+      "owner_transitions": "allocated once after capture and serialization; copied from raw-OS scratch then returned to the dump caller",
       "destroyable_by": "caller via mi_free (Bun's BunJSCModule.h frees the same way after JSONParse)",
       "lifetime": "until caller invokes mi_free",
-      "logical_size": "initial good size near 12 KiB, then doubled",
-      "usable_size": "allocator size class; hbuf->size retains requested logical capacity",
-      "cleanup": "caller owns returned buffer and frees with mi_free; a growth failure mid-print leaves the buffer at its last successfully-written prefix (same discipline as src/stats.c's mi_json_buf_expand)",
-      "publication": "hbuf pointer and size update only after successful rezalloc",
+      "logical_size": "ctx.text_size + 1, with overflow checked while accumulating text",
+      "usable_size": "allocator size class; copy only ctx.text_size bytes and one NUL terminator",
+      "cleanup": "caller frees successful result with mi_free; any allocation failure returns NULL after freeing raw-OS scratch, never a truncated JSON prefix",
+      "publication": "returned only after every text chunk is copied and the NUL terminator is written",
       "locks": [
-        "none; buffer is operation-local"
+        "all diagnostic traversal locks and owner claims released before mi_malloc; ordinary allocation may acquire its usual allocator locks"
       ]
     },
     {

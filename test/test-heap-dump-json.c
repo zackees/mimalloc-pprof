@@ -4,11 +4,9 @@
    shape assertion it makes on `heapStats({ dump: true | "blocks" }).mimallocDump` is
    checked here at the C level -- `heaps[].seq`, `pages[].{id,block_size,used,reserved,
    thread_id}`, `blocks` present only when requested, `blocks[[id,size]]` -- with one
-   exception: Bun's JS test also asserts every `blocks[]` size matches some `pages[]`
-   entry's `block_size`. That is best-effort here rather than a hard assertion, because
-   src/heap-dump.c's own JSON-buffer growth can mutate the heap being walked between the
-   pages pass and the blocks pass (see the SELF-MUTATION note there) -- the same
-   best-effort Bun's own implementation has.
+   exception: Bun's JS test also compares block sizes with page block sizes; the
+   public visitor reports usable block size, which excludes debug padding. #374
+   captures pages and their blocks together using raw-OS scratch storage.
 
    Independent of MI_PPROF (src/heap-dump.c is unconditional), so this test is built and
    registered unconditionally too, like test-memory-events.c / test-dhat.c. */
@@ -249,9 +247,8 @@ int main(void) {
 
   mi_free(json_pages);
 
-  /* --- dump from a second thread while the first thread frees (no crash); pages stay
-     non-empty (only half of heap1's blocks are freed) so this does not exercise the
-     documented page-retirement race in #78, just the common "read while write" case. --- */
+  /* #374: preserve concurrent frees, including guarded sample-rate-1, where these
+     frees can retire pages. The safe dump reports unclaimable owners as incomplete. */
   thread_t t;
   thread_start(&t, dump_worker, NULL);
   for (int i = 0; i < N_ALLOC_HEAP1 / 2; i++) {

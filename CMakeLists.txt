@@ -754,6 +754,7 @@ endif()
 # set language for source files now
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
+  set_source_files_properties(test/test-diagnostic-walks.c PROPERTIES LANGUAGE CXX)
   # #272 (P7b): test-purge-holes.c and test-profile-race.c reach `mimalloc/internal.h`
   # (`_mi_ptr_page`, `mi_page_block_is_purged`, `_mi_os_page_size`, ...), which is NOT wrapped
   # in `extern "C"`. With MI_USE_CXX the library's symbols are C++-mangled, so a C test cannot
@@ -1334,6 +1335,17 @@ if (MI_BUILD_TESTS)
     # (`MI_BUILD_STATIC=OFF`) skips it rather than failing to link.
     if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
       add_executable(mimalloc-test-purge-holes test/test-purge-holes.c)
+      add_executable(mimalloc-test-diagnostic-walks test/test-diagnostic-walks.c)
+      target_compile_definitions(mimalloc-test-diagnostic-walks PRIVATE ${mi_defines} MI_STATIC_LIB)
+      target_compile_options(mimalloc-test-diagnostic-walks PRIVATE ${mi_cflags})
+      target_include_directories(mimalloc-test-diagnostic-walks PRIVATE include)
+      target_link_libraries(mimalloc-test-diagnostic-walks PRIVATE mimalloc-static ${mi_libraries} Threads::Threads)
+      add_test(NAME test-diagnostic-walks COMMAND mimalloc-test-diagnostic-walks)
+      set_tests_properties(test-diagnostic-walks PROPERTIES TIMEOUT 120
+                           ENVIRONMENT "MIMALLOC_SCAVENGER=0")
+      add_test(NAME test-diagnostic-walks-os COMMAND mimalloc-test-diagnostic-walks)
+      set_tests_properties(test-diagnostic-walks-os PROPERTIES TIMEOUT 120
+                           ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_DISALLOW_ARENA_ALLOC=1")
       target_compile_definitions(mimalloc-test-purge-holes PRIVATE ${mi_defines})
       target_compile_options(mimalloc-test-purge-holes PRIVATE ${mi_cflags})
       target_include_directories(mimalloc-test-purge-holes PRIVATE include)
@@ -2054,6 +2066,8 @@ endif()
 # (MI_PPROF, non-Windows, ...), and set_tests_properties() on a test that was never
 # registered is a hard CMake error.
 set(mi_serial_tests
+  test-diagnostic-walks
+  test-diagnostic-walks-os
   test-osx-zone-introspect-remote
   test-memory-gate
   test-degenerate

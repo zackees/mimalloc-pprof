@@ -327,6 +327,8 @@ extern mi_decl_export volatile long mi_debug_fail_os_commit_after;
 // `arena.c` (`mi_heap_visit_page_claim`) sets it to 2 once it has a page pinned but not yet
 // claimed, and stalls there until the test sets it back to 0.
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+// #374: reporter entry handshake (1 -> 2, test releases with 0).
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_holes_report;
 // Bun parity P10b (#317), ported from oven-sh/mimalloc @ 1515c3c9 (C linkage) /
 // 787be2a8 (the counter itself). test-abandoned-lazy.c: per-bin abandoned bitmaps
 // (`mi_arena_pages_t::pages_abandoned[]`, arena.c) published so far via the CAS in

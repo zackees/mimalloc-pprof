@@ -139,6 +139,7 @@ as "mine", as `_mi_park_leave` already does).
 | `mi_theap_collect`, `mi_collect`, `mi_heap_collect` | `src/theap.c` | the **public** collect entries — not `mi_theap_collect_ex` (§6) |
 | `_mi_thread_done` | `src/init.c` | teardown; enter, abandon theaps, `mi_tld_unregister`, free the tld — **no leave** (an unregistered `RUNNING` tld can never be found or claimed; nothing dereferences the freed tld) |
 | `mi_heap_delete`, `mi_heap_destroy`, `mi_theap_set_default` | `src/heap.c`, `src/theap.c` | mutate theap ownership |
+| `_mi_purge_holes_report_collect` | `src/page-holes.c` | #374: reads owner-private free lists; `theaps_lock` alone does not exclude a foreign collect |
 
 Every gated body has exactly one leave: `r = inner(...); MI_GATE_LEAVE(tld); return r;`
 with `inner` being the existing body. No leave on an early-return path.
@@ -147,6 +148,46 @@ Not gated: `mi_free_block_mt`'s atomic push onto `xthread_free`; arena, page-map
 layers; profiler and memory-events internals (rule 4 memory, never theap state).
 
 ### 5.2 Coverage is a tested property
+
+#### Diagnostic audit (#374)
+
+The holes reporter now takes the caller's owner gate before `theaps_lock`: a
+foreign sweep's collect phase does not take that lock. Its deterministic test
+holds the reporter at entry, proves a purge cannot claim it, then proves a
+foreign purge reaches it after the reporter leaves.
+
+The JSON dump uses a separate ownership-protected capture path in
+`src/diagnostic-walk.c` (included by `arena.c`, and transitively `static.c`).
+Arena storage pins are followed by an owner claim before mutable metadata or
+free-list reads. Pins alone do **not** prevent page-map unregistration.
+Abandoned pages require page ownership; live OS pages require the owner gate or
+park claim; abandoned OS pages are claimed under their list lock and released
+after that lock is dropped. The detached metadata theap uses a try-acquire of
+its existing `theap_meta_lock`, never the park protocol.
+
+There is no 64-owner limit or unclaimed fallback. Each arena page's owner claim
+lasts only for capture. RUNNING/SWEEPING owners and contended metadata pages are
+not waited for; `complete`, `skipped_pages`, and `busy_theaps` in the JSON expose
+observed incomplete coverage. Registry locks and the capture itself can still
+take time: this is not a lock-free or bounded-latency API. Ungated threads need a
+successful cooperative idle handoff for capture; merely sleeping is insufficient.
+The coverage flag is not a claim that independently captured pages represent one
+global instant. Concurrent mutation can change coverage/counts between pages.
+
+Captured records and formatting buffers are raw-OS-backed chunks. The final
+`mi_malloc`-allocated, `mi_free`-compatible string is created only after releasing
+all claims and registry locks. Allocation failure releases scratch storage and
+claims and returns NULL; truncated JSON is never returned as success.
+
+This does not change the documented concurrency precondition of the public
+`mi_heap_visit_blocks`/`mi_theap_visit_blocks` APIs or the binary snapshot format.
+Memory-events visitation still walks only the calling thread's gated theaps.
+The separate binary snapshot is not used as a purported safe JSON substitute.
+
+No allocation/free/retirement fast path is changed. Validate that boundary with
+`python ci/check_fastpath_identity.py --base 7d8e5e86` (five named hot-path entry
+points plus the positive gated control); diagnostic runtime/memory is a separate
+measurement and must report coverage along with timing.
 
 In `MI_DEBUG` gated builds every owner-private leaf accessor asserts `_mi_gate_held(theap->tld)`:
 `_mi_theap_get_free_small_page` (`internal.h`), `mi_page_malloc_zero` and

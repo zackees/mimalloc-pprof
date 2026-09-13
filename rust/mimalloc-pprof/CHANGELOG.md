@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.11.1
+
+Safe, bounded live-heap JSON capture under concurrent allocation.
+
+- **Heap JSON dumping no longer races a foreign thread's mutable allocator state**
+  ([#374](https://github.com/zackees/mimalloc-pprof/issues/374),
+  [#398](https://github.com/zackees/mimalloc-pprof/pull/398)). Capture now reads live pages
+  only while holding their existing per-thread owner gate or a cooperative park claim.
+  In owner-gated builds, incomplete top-level dumps retry from a completely clean boundary
+  for 100 ms by default; new C `mi_heap_dump_json_ex` and Rust `heap_dump_json_ex` APIs let
+  callers select that bound. Partial coverage remains explicit through `complete`,
+  `skipped_pages`, and `busy_theaps`. Capture and formatting scratch comes from the raw OS
+  arena, and the default gate-disabled allocation fast path remains byte-identical.
+
 ## 0.11.0
 
 Multithreaded allocation is fast again, process-wide eager purge, Bun's heap-snapshot

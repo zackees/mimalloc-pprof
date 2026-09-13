@@ -224,9 +224,11 @@ pub fn heap_dump_json(include_blocks: bool, hash_addresses: bool) -> Option<Stri
 /// Mutable page state is copied only under ownership. With the `owner-gate`
 /// feature, an incomplete attempt is discarded and retried from a clean
 /// boundary until `wait_ms` expires. No caller gate, page pin, owner claim, or
-/// heap traversal lock is retained between attempts. Without `owner-gate`,
-/// waiting cannot make an ordinary foreign owner claimable, so this always
-/// performs one attempt regardless of `wait_ms`.
+/// heap traversal lock is retained between attempts. A call nested inside an
+/// existing owner-gated allocator operation is one-shot because it cannot
+/// release its caller's outer gate. Without `owner-gate`, waiting cannot make
+/// an ordinary foreign owner claimable, so this always performs one attempt
+/// regardless of `wait_ms`.
 ///
 /// Top-level `complete`, `skipped_pages`, and `busy_theaps` describe the final
 /// attempt. `complete: true` is not a process-wide atomic snapshot: pages are

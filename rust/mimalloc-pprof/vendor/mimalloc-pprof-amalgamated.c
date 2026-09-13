@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 33c978e3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f507dff6 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -17931,7 +17931,8 @@ char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait
   const uintptr_t key = _mi_os_random_weak((uintptr_t)&ctx) | 1;
   bool captured;
   #if MI_OWNER_GATE
-  const mi_msecs_t deadline = _mi_clock_now() + (mi_msecs_t)wait_ms;
+  const bool can_retry = (self->tld->gate_depth == 0);
+  const mi_msecs_t started = _mi_clock_now();
   size_t spin = 0;
   #else
   MI_UNUSED(wait_ms);
@@ -17943,7 +17944,9 @@ char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait
     MI_GATE_LEAVE(self->tld);
     if (!captured || mi_dump_complete(&ctx)) break;
     #if MI_OWNER_GATE
-    if (_mi_clock_now() >= deadline) break;
+    const mi_msecs_t now = _mi_clock_now();
+    const uintmax_t elapsed = (now > started ? (uintmax_t)now - (uintmax_t)started : 0);
+    if (!can_retry || elapsed >= (uintmax_t)wait_ms) break;
     // The just-finished attempt released the caller gate, subproc/heap locks,
     // page pins and owner claims. Discard it before waiting: retaining any while a RUNNING
     // owner finishes can deadlock with heap creation, deletion, or page retirement.
@@ -27097,9 +27100,11 @@ mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 // busy_theaps describe observed coverage. In an MI_OWNER_GATE build, an incomplete
 // attempt is discarded and retried from a clean boundary for up to `wait_ms`;
 // otherwise busy owners are omitted immediately. The wait never retains page pins,
-// owner claims, or heap traversal locks. A true complete result still does not make
-// independently captured pages one global instant. Ungated foreign owners must
-// cooperatively park for coverage. Use mi_free to free the result.
+// owner claims, or heap traversal locks. A call nested inside an existing owner-gated
+// allocator operation is one-shot because it cannot release its caller's outer gate.
+// A true complete result still does not make independently captured pages one global
+// instant. Ungated foreign owners must cooperatively park for coverage. Use mi_free
+// to free the result.
 mi_decl_export char*   mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms) mi_attr_noexcept;
 // == mi_heap_dump_json_ex(include_blocks, hash_addresses, 100)
 mi_decl_export char*   mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept;

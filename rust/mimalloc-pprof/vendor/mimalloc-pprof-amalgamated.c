@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit b852cb91 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ec0d30a8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -13739,7 +13739,7 @@ typedef void* (mi_diag_alloc_fun)(void* arg, size_t size);
 
 // Caller holds subproc->heaps_lock and its own owner gate. The callback must only
 // copy metadata to raw-OS storage: no user code, allocator reentry, or payload reads.
-bool _mi_heap_visit_diagnostic(mi_heap_t* heap, bool blocks, mi_block_visit_fun* visitor,
+bool _mi_heap_visit_capture(mi_heap_t* heap, bool blocks, mi_block_visit_fun* visitor,
                               void* arg, mi_diag_coverage_t* coverage, mi_diag_alloc_fun* allocate);
 /* ---- end inlined: src/diagnostic-walk.h ---- */
 
@@ -13869,7 +13869,8 @@ static bool mi_diag_abandoned_os(mi_diag_walk_t* walk) {
   return ok;
 }
 
-bool _mi_heap_visit_diagnostic(mi_heap_t* heap, bool blocks, mi_block_visit_fun* visitor,
+// This is a production capture API, not an MI_DEBUG-only `_mi_*diagnostic` hook.
+bool _mi_heap_visit_capture(mi_heap_t* heap, bool blocks, mi_block_visit_fun* visitor,
                               void* arg, mi_diag_coverage_t* coverage, mi_diag_alloc_fun* allocate) {
   mi_diag_walk_t walk = { heap, blocks, visitor, arg, coverage, NULL, allocate };
   bool ok = true;
@@ -17838,7 +17839,7 @@ static bool mi_cdecl mi_dump_capture_heap(mi_heap_t* heap, void* arg) {
   if (ctx->last_heap == NULL) { ctx->heaps = out; }
   else { ctx->last_heap->next = out; }
   ctx->last_heap = out;
-  return _mi_heap_visit_diagnostic(heap, ctx->include_blocks, &mi_dump_capture_block, ctx, &ctx->coverage, &mi_dump_alloc);
+  return _mi_heap_visit_capture(heap, ctx->include_blocks, &mi_dump_capture_block, ctx, &ctx->coverage, &mi_dump_alloc);
 }
 
 static bool mi_dump_print(mi_dump_ctx_t* ctx, const char* msg) {

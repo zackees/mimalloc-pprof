@@ -165,10 +165,14 @@ mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 // Backs bun:jsc heapStats({ dump: true | "blocks" }).mimallocDump. Safe, best-effort
 // capture under concurrent frees (#374); unlike mi_heap_visit_blocks, it never
 // reads mutable state of an unclaimed owner. Top-level complete/skipped_pages/
-// busy_theaps describe observed coverage. Busy owners are omitted, not waited for.
-// Ungated foreign owners must cooperatively park for coverage. A true complete
-// flag is not a process-wide atomic snapshot: pages are captured independently.
-// use mi_free to free the result.
+// busy_theaps describe observed coverage. In an MI_OWNER_GATE build, an incomplete
+// attempt is discarded and retried from a clean boundary for up to `wait_ms`;
+// otherwise busy owners are omitted immediately. The wait never retains page pins,
+// owner claims, or heap traversal locks. A true complete result still does not make
+// independently captured pages one global instant. Ungated foreign owners must
+// cooperatively park for coverage. Use mi_free to free the result.
+mi_decl_export char*   mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms) mi_attr_noexcept;
+// == mi_heap_dump_json_ex(include_blocks, hash_addresses, 100)
 mi_decl_export char*   mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept;
 mi_decl_export size_t  mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept;
 

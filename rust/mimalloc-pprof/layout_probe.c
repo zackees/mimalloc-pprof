@@ -88,6 +88,7 @@ void* mi_unwrapped_malloc(size_t size, size_t alignment);
 void mi_unwrapped_free(void* p);
 void* mi_unwrapped_realloc(void* p, size_t new_size, size_t alignment);
 char* mi_heap_dump_json(bool include_blocks, bool hash_addresses);
+char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms);
 size_t mi_heap_get_seq(mi_heap_t* heap);
 int mi_heap_snapshot(int fd, unsigned int flags);
 int mi_heap_snapshot_to_file(const char* path, unsigned int flags);

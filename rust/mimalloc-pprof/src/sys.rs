@@ -704,6 +704,13 @@ unsafe extern "C" {
     /// NULL on allocation failure; a non-NULL result is `mi_malloc`-family memory the
     /// caller must free with `mi_free` (see `prof::heap_dump_json` for the safe wrapper).
     pub fn mi_heap_dump_json(include_blocks: bool, hash_addresses: bool) -> *mut c_char;
+    /// Mirrors `mi_heap_dump_json_ex`: in owner-gated builds, retry an incomplete
+    /// capture from a clean boundary for up to `wait_ms`.
+    pub fn mi_heap_dump_json_ex(
+        include_blocks: bool,
+        hash_addresses: bool,
+        wait_ms: usize,
+    ) -> *mut c_char;
     /// Mirrors `mi_heap_get_seq` (include/mimalloc-stats.h): the monotonic sequence
     /// number assigned to `heap` at creation, or 0 for a NULL heap.
     pub fn mi_heap_get_seq(heap: *mut mi_heap_t) -> usize;

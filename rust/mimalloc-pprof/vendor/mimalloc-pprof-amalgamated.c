@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ec0d30a8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 33c978e3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -17686,13 +17686,16 @@ bool _mi_test_heaps_lock_poison_observed(void) {
 /* Live heap JSON capture (#269, #374).
    The public result is still released with mi_free. Capture and serialization use
    raw-OS scratch storage; no hooked allocation or user callback runs while page
-   ownership is held. A busy owner is OMITTED, never read optimistically.
+   ownership is held. A busy owner is OMITTED, never read optimistically. In
+   an owner-gated build, an incomplete attempt is discarded and retried only
+   after every capture lock, page pin, and owner claim has been released.
    "complete" describes observed coverage, not a process-wide atomic instant:
    pages are captured independently. Cooperatively park foreign owners for coverage.
    The generic mi_heap_visit_blocks API retains its existing concurrency contract. */
 
 #if MI_DEBUG > 0
 mi_decl_export _Atomic(uintptr_t) mi_debug_dump_fail_after;
+mi_decl_export _Atomic(uintptr_t) mi_debug_dump_retrying;
 #endif
 
 // A bump arena amortizes raw OS allocation across thousands of block records.
@@ -17906,19 +17909,54 @@ static bool mi_dump_serialize(mi_dump_ctx_t* ctx) {
   return mi_dump_print(ctx, tmp);
 }
 
-char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept {
+static void mi_dump_ctx_init(mi_dump_ctx_t* ctx, mi_subproc_t* subproc,
+                             bool include_blocks, bool hash_addresses, uintptr_t key) {
+  _mi_memzero(ctx, sizeof(*ctx));
+  ctx->subproc = subproc;
+  ctx->include_blocks = include_blocks;
+  ctx->hash_addresses = hash_addresses;
+  ctx->key = key;
+}
+
+static bool mi_dump_complete(const mi_dump_ctx_t* ctx) {
+  return (ctx->coverage.skipped_pages == 0 && ctx->coverage.busy_theaps == 0);
+}
+
+char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms) mi_attr_noexcept {
   mi_theap_t* self = _mi_theap_default();
   if (!mi_theap_is_initialized(self)) { self = _mi_thread_init(); }
   if (self == NULL) return NULL; // fresh-thread initialization can fail under OOM
-  MI_GATE_ENTER(self);
   mi_dump_ctx_t ctx;
-  _mi_memzero(&ctx, sizeof(ctx));
-  ctx.subproc = self->tld->subproc;
-  ctx.include_blocks = include_blocks;
-  ctx.hash_addresses = hash_addresses;
-  ctx.key = _mi_os_random_weak((uintptr_t)&ctx) | 1;
-  const bool captured = mi_subproc_visit_heaps(mi_subproc_current(), &mi_dump_capture_heap, &ctx);
-  MI_GATE_LEAVE(self->tld);
+  mi_subproc_t* const subproc = self->tld->subproc;
+  const uintptr_t key = _mi_os_random_weak((uintptr_t)&ctx) | 1;
+  bool captured;
+  #if MI_OWNER_GATE
+  const mi_msecs_t deadline = _mi_clock_now() + (mi_msecs_t)wait_ms;
+  size_t spin = 0;
+  #else
+  MI_UNUSED(wait_ms);
+  #endif
+  for (;;) {
+    mi_dump_ctx_init(&ctx, subproc, include_blocks, hash_addresses, key);
+    MI_GATE_ENTER(self);
+    captured = mi_subproc_visit_heaps(mi_subproc_current(), &mi_dump_capture_heap, &ctx);
+    MI_GATE_LEAVE(self->tld);
+    if (!captured || mi_dump_complete(&ctx)) break;
+    #if MI_OWNER_GATE
+    if (_mi_clock_now() >= deadline) break;
+    // The just-finished attempt released the caller gate, subproc/heap locks,
+    // page pins and owner claims. Discard it before waiting: retaining any while a RUNNING
+    // owner finishes can deadlock with heap creation, deletion, or page retirement.
+    mi_dump_dispose(&ctx);
+    #if MI_DEBUG > 0
+    mi_atomic_increment_relaxed(&mi_debug_dump_retrying);
+    #endif
+    if (spin < 256) { mi_atomic_pause(); spin++; }
+    else { _mi_prim_thread_yield(); }
+    #else
+    break; // an ungated RUNNING owner will not become claimable by waiting
+    #endif
+  }
   ctx.formatting = true;
   // No page/theap claims or registry locks remain. Format saved values only.
   char* result = NULL;
@@ -17935,6 +17973,10 @@ char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexce
   }
   mi_dump_dispose(&ctx);
   return result;
+}
+
+char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept {
+  return mi_heap_dump_json_ex(include_blocks, hash_addresses, 100);
 }
 
 size_t mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept {
@@ -27052,10 +27094,14 @@ mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 // Backs bun:jsc heapStats({ dump: true | "blocks" }).mimallocDump. Safe, best-effort
 // capture under concurrent frees (#374); unlike mi_heap_visit_blocks, it never
 // reads mutable state of an unclaimed owner. Top-level complete/skipped_pages/
-// busy_theaps describe observed coverage. Busy owners are omitted, not waited for.
-// Ungated foreign owners must cooperatively park for coverage. A true complete
-// flag is not a process-wide atomic snapshot: pages are captured independently.
-// use mi_free to free the result.
+// busy_theaps describe observed coverage. In an MI_OWNER_GATE build, an incomplete
+// attempt is discarded and retried from a clean boundary for up to `wait_ms`;
+// otherwise busy owners are omitted immediately. The wait never retains page pins,
+// owner claims, or heap traversal locks. A true complete result still does not make
+// independently captured pages one global instant. Ungated foreign owners must
+// cooperatively park for coverage. Use mi_free to free the result.
+mi_decl_export char*   mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms) mi_attr_noexcept;
+// == mi_heap_dump_json_ex(include_blocks, hash_addresses, 100)
 mi_decl_export char*   mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept;
 mi_decl_export size_t  mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept;
 

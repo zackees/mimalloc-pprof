@@ -208,18 +208,42 @@ pub unsafe fn usable_size(p: *const u8) -> usize {
 /// Set `hash_addresses` to mix every reported address through a per-process key so a
 /// dump can be shared or diffed without exposing raw ASLR-derived pointers.
 ///
-/// Safe, best-effort capture under concurrent frees (#374). Mutable page state is
-/// copied only under ownership; busy foreign owners are omitted. Top-level JSON
-/// fields `complete`, `skipped_pages`, and `busy_theaps` expose observed coverage.
-/// Without the `owner-gate` feature, foreign threads generally remain uninspectable
-/// unless they cooperatively park. `complete: true` is not a process-wide atomic
-/// snapshot: individual pages are captured independently.
+/// Safe, best-effort capture under concurrent frees (#374), using
+/// [`HEAP_DUMP_JSON_DEFAULT_WAIT_MS`] as the owner-acquisition deadline. See
+/// [`heap_dump_json_ex`] for the complete waiting and coverage contract.
 ///
 /// Returns `None` only on allocation failure (out of memory building the JSON buffer),
 /// not for an empty subprocess.
 pub fn heap_dump_json(include_blocks: bool, hash_addresses: bool) -> Option<String> {
-    use std::ffi::CStr;
     let ptr = unsafe { sys::mi_heap_dump_json(include_blocks, hash_addresses) };
+    heap_dump_json_from_ptr(ptr)
+}
+
+/// Live heap JSON capture with an explicit owner-acquisition deadline.
+///
+/// Mutable page state is copied only under ownership. With the `owner-gate`
+/// feature, an incomplete attempt is discarded and retried from a clean
+/// boundary until `wait_ms` expires. No caller gate, page pin, owner claim, or
+/// heap traversal lock is retained between attempts. Without `owner-gate`,
+/// waiting cannot make an ordinary foreign owner claimable, so this always
+/// performs one attempt regardless of `wait_ms`.
+///
+/// Top-level `complete`, `skipped_pages`, and `busy_theaps` describe the final
+/// attempt. `complete: true` is not a process-wide atomic snapshot: pages are
+/// captured independently, and threads initialized concurrently need not share
+/// one global cutoff. The deadline bounds retries, not a capture already in
+/// progress, serialization, or the final result allocation.
+pub fn heap_dump_json_ex(
+    include_blocks: bool,
+    hash_addresses: bool,
+    wait_ms: usize,
+) -> Option<String> {
+    let ptr = unsafe { sys::mi_heap_dump_json_ex(include_blocks, hash_addresses, wait_ms) };
+    heap_dump_json_from_ptr(ptr)
+}
+
+fn heap_dump_json_from_ptr(ptr: *mut std::ffi::c_char) -> Option<String> {
+    use std::ffi::CStr;
     if ptr.is_null() {
         return None;
     }
@@ -229,6 +253,9 @@ pub fn heap_dump_json(include_blocks: bool, hash_addresses: bool) -> Option<Stri
     unsafe { sys::mi_free(ptr.cast()) };
     Some(json)
 }
+
+/// Default owner-acquisition deadline used by [`heap_dump_json`].
+pub const HEAP_DUMP_JSON_DEFAULT_WAIT_MS: usize = 100;
 
 /// Write a binary heap snapshot to `path` (issue #338, Bun parity).
 ///
@@ -1813,5 +1840,10 @@ mod tests {
 
         let with_blocks = heap_dump_json(true, true).expect("heap_dump_json should not fail");
         assert!(with_blocks.contains("\"blocks\""));
+
+        let one_attempt = heap_dump_json_ex(false, false, 0)
+            .expect("heap_dump_json_ex should not fail");
+        assert!(one_attempt.starts_with("{ \"heaps\": ["));
+        assert!(one_attempt.contains("\"complete\":"));
     }
 }

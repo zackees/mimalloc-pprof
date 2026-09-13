@@ -128,7 +128,8 @@ static bool mi_diag_abandoned_os(mi_diag_walk_t* walk) {
   return ok;
 }
 
-bool _mi_heap_visit_diagnostic(mi_heap_t* heap, bool blocks, mi_block_visit_fun* visitor,
+// This is a production capture API, not an MI_DEBUG-only `_mi_*diagnostic` hook.
+bool _mi_heap_visit_capture(mi_heap_t* heap, bool blocks, mi_block_visit_fun* visitor,
                               void* arg, mi_diag_coverage_t* coverage, mi_diag_alloc_fun* allocate) {
   mi_diag_walk_t walk = { heap, blocks, visitor, arg, coverage, NULL, allocate };
   bool ok = true;

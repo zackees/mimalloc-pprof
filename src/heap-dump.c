@@ -158,7 +158,7 @@ static bool mi_cdecl mi_dump_capture_heap(mi_heap_t* heap, void* arg) {
   if (ctx->last_heap == NULL) { ctx->heaps = out; }
   else { ctx->last_heap->next = out; }
   ctx->last_heap = out;
-  return _mi_heap_visit_diagnostic(heap, ctx->include_blocks, &mi_dump_capture_block, ctx, &ctx->coverage, &mi_dump_alloc);
+  return _mi_heap_visit_capture(heap, ctx->include_blocks, &mi_dump_capture_block, ctx, &ctx->coverage, &mi_dump_alloc);
 }
 
 static bool mi_dump_print(mi_dump_ctx_t* ctx, const char* msg) {

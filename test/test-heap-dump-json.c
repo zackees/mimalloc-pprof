@@ -3,10 +3,9 @@
    Spec is Bun's test/js/bun/jsc/heapStats-mimalloc.test.ts (oven-sh/bun): every JSON
    shape assertion it makes on `heapStats({ dump: true | "blocks" }).mimallocDump` is
    checked here at the C level -- `heaps[].seq`, `pages[].{id,block_size,used,reserved,
-   thread_id}`, `blocks` present only when requested, `blocks[[id,size]]` -- with one
-   exception: Bun's JS test also compares block sizes with page block sizes; the
-   public visitor reports usable block size, which excludes debug padding. #374
-   captures pages and their blocks together using raw-OS scratch storage.
+   thread_id}`, `blocks` present only when requested, `blocks[[id,size]]`, and each
+   block size matching a page size. #374 captures pages and their blocks together
+   using raw-OS scratch storage.
 
    Independent of MI_PPROF (src/heap-dump.c is unconditional), so this test is built and
    registered unconditionally too, like test-memory-events.c / test-dhat.c. */
@@ -137,6 +136,23 @@ static int check_field_min(const char* seg, size_t seg_len, const char* key, siz
 
 static void* heap1_blocks[N_ALLOC_HEAP1];
 
+static void check_block_page_sizes(const char* seg, size_t len) {
+  const char* p = find_bounded(seg, len, "\"blocks\": [");
+  assert(p != NULL);
+  p += strlen("\"blocks\": [");
+  while (p < seg + len && *p == '[') {
+    size_t id, size;
+    int consumed = 0;
+    assert(sscanf(p, "[%zu,%zu]%n", &id, &size, &consumed) == 2);
+    assert(consumed > 0 && p + consumed <= seg + len);
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"block_size\": %zu,", size);
+    assert(find_bounded(seg, len, needle) != NULL);
+    p += consumed;
+    if (*p == ',') p++;
+  }
+}
+
 static THREAD_RET dump_worker(void* arg) {
   (void)arg;
   for (int i = 0; i < DUMP_ITERATIONS; i++) {
@@ -228,6 +244,7 @@ int main(void) {
 
   const char* rseg1; size_t rseg1_len;
   assert(find_heap_segment(json_blocks_raw, seq1, &rseg1, &rseg1_len));
+  check_block_page_sizes(rseg1, rseg1_len);
   const char* blocks_prefix = "\"blocks\": [[";
   const char* blocks_at = find_bounded(rseg1, rseg1_len, blocks_prefix);
   assert(blocks_at != NULL);

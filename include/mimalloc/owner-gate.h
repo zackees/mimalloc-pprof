@@ -64,7 +64,7 @@ static inline bool _mi_gate_held(const mi_tld_t* tld) {
   if (tld == NULL) return false;
   if (tld->thread_id == MI_THREADID_DETACHED) return true;   // `theap_meta`: guarded by theap_meta_lock, never gated
   const mi_threadid_t me = _mi_thread_id();
-  if (tld->gate_depth > 0 && tld->thread_id == me) return true;
+  if (tld->thread_id == me && tld->gate_depth > 0) return true;
   return (mi_atomic_load_acquire((_Atomic(size_t)*)&tld->park_state) == MI_PARK_SWEEPING &&
           mi_atomic_load_acquire((_Atomic(uintptr_t)*)&tld->sweeper) == (uintptr_t)me);
 }

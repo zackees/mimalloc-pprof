@@ -9,6 +9,7 @@ typedef struct mi_diag_walk_s {
   void* arg;
   mi_diag_coverage_t* coverage;
   mi_arena_pages_t* arena_pages;
+  mi_diag_alloc_fun* allocate;
 } mi_diag_walk_t;
 
 // heap->theaps_lock pins the tld. Never wait while holding a page pin: the owner
@@ -94,23 +95,19 @@ static bool mi_diag_owned_os_page(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
 // the list lock: unown can free/unlink a page and would otherwise self-deadlock.
 typedef struct mi_diag_os_batch_s {
   struct mi_diag_os_batch_s* next;
-  mi_memid_t memid;
   size_t used;
   mi_page_t* pages[64];
 } mi_diag_os_batch_t;
 
 static bool mi_diag_abandoned_os(mi_diag_walk_t* walk) {
   mi_diag_os_batch_t* batches = NULL;
-  mi_subproc_t* subproc = walk->heap->subproc;
   bool ok = true;
   mi_lock(&walk->heap->os_abandoned_pages_lock) {
     for (mi_page_t* page = walk->heap->os_abandoned_pages; page != NULL; page = page->next) {
       if (batches == NULL || batches->used == 64) {
-        mi_memid_t memid;
-        mi_diag_os_batch_t* batch = (mi_diag_os_batch_t*)_mi_os_alloc(subproc, sizeof(*batch), &memid);
+        mi_diag_os_batch_t* batch = (mi_diag_os_batch_t*)walk->allocate(walk->arg, sizeof(*batch));
         if (batch == NULL) { ok = false; break; }
         batch->next = batches;
-        batch->memid = memid;
         batch->used = 0;
         batches = batch;
       }
@@ -125,15 +122,15 @@ static bool mi_diag_abandoned_os(mi_diag_walk_t* walk) {
       if (ok) { ok = mi_diag_visit_page(page, walk); }
       mi_abandoned_page_unown(page, NULL);
     }
-    _mi_os_free(subproc, batches, sizeof(*batches), batches->memid);
+    // Batch storage belongs to the capture arena and is released by its caller.
     batches = next;
   }
   return ok;
 }
 
 bool _mi_heap_visit_diagnostic(mi_heap_t* heap, bool blocks, mi_block_visit_fun* visitor,
-                              void* arg, mi_diag_coverage_t* coverage) {
-  mi_diag_walk_t walk = { heap, blocks, visitor, arg, coverage, NULL };
+                              void* arg, mi_diag_coverage_t* coverage, mi_diag_alloc_fun* allocate) {
+  mi_diag_walk_t walk = { heap, blocks, visitor, arg, coverage, NULL, allocate };
   bool ok = true;
   mi_lock(&heap->theaps_lock) {
     // Arena pins + individual owner claims keep claims short (one page capture)

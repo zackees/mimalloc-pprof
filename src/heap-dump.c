@@ -10,6 +10,10 @@
 #include "mimalloc/prim-tls.h"
 #include "diagnostic-walk.h"
 
+#if MI_DEBUG > 0
+mi_decl_export _Atomic(uintptr_t) mi_debug_dump_fail_after;
+#endif
+
 // A bump arena amortizes raw OS allocation across thousands of block records.
 // It never installs profiler records or participates in memory-event accounting.
 typedef struct mi_dump_chunk_s {
@@ -56,11 +60,21 @@ typedef struct mi_dump_ctx_s {
   mi_subproc_t* subproc;
   mi_diag_coverage_t coverage;
   size_t text_size;
+  size_t alloc_count;
   uintptr_t key;
-  bool include_blocks, hash_addresses, failed;
+  bool include_blocks, hash_addresses, failed, formatting;
 } mi_dump_ctx_t;
 
-static void* mi_dump_alloc(mi_dump_ctx_t* ctx, size_t size) {
+static void* mi_dump_alloc(void* arg, size_t size) {
+  mi_dump_ctx_t* ctx = (mi_dump_ctx_t*)arg;
+  ctx->alloc_count++;
+  #if MI_DEBUG > 0
+  const uintptr_t fail = mi_atomic_load_relaxed(&mi_debug_dump_fail_after);
+  if (fail > 0 && (ctx->alloc_count == fail || (fail == UINTPTR_MAX && ctx->formatting))) {
+    ctx->failed = true;
+    return NULL;
+  }
+  #endif
   size = _mi_align_up(size, sizeof(void*));
   mi_assert_internal(size <= sizeof(ctx->chunks->data));
   if (ctx->failed) return NULL;
@@ -113,7 +127,9 @@ static bool mi_cdecl mi_dump_capture_block(const mi_heap_t* heap, const mi_heap_
     const mi_page_t* page = (const mi_page_t*)area->reserved1;
     p->id = (uintptr_t)area->blocks;
     p->block_size = area->block_size;
-    p->used = area->used;
+    // The block walker collects pending remote frees after its area callback.
+    // For block dumps count the captured records, not the pre-collect counter.
+    p->used = ctx->include_blocks ? 0 : area->used;
     p->reserved = area->reserved / (area->block_size > 0 ? area->block_size : 1);
     p->tid = mi_page_thread_id(page);
     if (out->last_page == NULL) { out->pages = p; }
@@ -129,6 +145,7 @@ static bool mi_cdecl mi_dump_capture_block(const mi_heap_t* heap, const mi_heap_
     if (p->last_block == NULL) { p->blocks = b; }
     else { p->last_block->next = b; }
     p->last_block = b;
+    p->used++;
   }
   return true;
 }
@@ -141,12 +158,15 @@ static bool mi_cdecl mi_dump_capture_heap(mi_heap_t* heap, void* arg) {
   if (ctx->last_heap == NULL) { ctx->heaps = out; }
   else { ctx->last_heap->next = out; }
   ctx->last_heap = out;
-  return _mi_heap_visit_diagnostic(heap, ctx->include_blocks, &mi_dump_capture_block, ctx, &ctx->coverage);
+  return _mi_heap_visit_diagnostic(heap, ctx->include_blocks, &mi_dump_capture_block, ctx, &ctx->coverage, &mi_dump_alloc);
 }
 
 static bool mi_dump_print(mi_dump_ctx_t* ctx, const char* msg) {
   if (ctx->failed) return false;
-  while (*msg != 0) {
+  size_t len = _mi_strlen(msg);
+  if (len > SIZE_MAX - 1 - ctx->text_size) { ctx->failed = true; return false; }
+  ctx->text_size += len;
+  while (len > 0) {
     if (ctx->last_text == NULL || ctx->last_text->used == sizeof(ctx->last_text->data)) {
       mi_dump_text_t* text = (mi_dump_text_t*)mi_dump_alloc(ctx, sizeof(*text));
       if (text == NULL) return false;
@@ -154,9 +174,12 @@ static bool mi_dump_print(mi_dump_ctx_t* ctx, const char* msg) {
       else { ctx->last_text->next = text; }
       ctx->last_text = text;
     }
-    if (ctx->text_size == SIZE_MAX - 1) { ctx->failed = true; return false; }
-    ctx->last_text->data[ctx->last_text->used++] = *msg++;
-    ctx->text_size++;
+    const size_t available = sizeof(ctx->last_text->data) - ctx->last_text->used;
+    const size_t take = len < available ? len : available;
+    _mi_memcpy(ctx->last_text->data + ctx->last_text->used, msg, take);
+    ctx->last_text->used += take;
+    msg += take;
+    len -= take;
   }
   return true;
 }
@@ -203,7 +226,9 @@ static bool mi_dump_serialize(mi_dump_ctx_t* ctx) {
 }
 
 char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept {
-  mi_theap_t* self = mi_theap_get_default();
+  mi_theap_t* self = _mi_theap_default();
+  if (!mi_theap_is_initialized(self)) { self = _mi_thread_init(); }
+  if (self == NULL) return NULL; // fresh-thread initialization can fail under OOM
   MI_GATE_ENTER(self);
   mi_dump_ctx_t ctx;
   _mi_memzero(&ctx, sizeof(ctx));
@@ -213,6 +238,7 @@ char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexce
   ctx.key = _mi_os_random_weak((uintptr_t)&ctx) | 1;
   const bool captured = mi_subproc_visit_heaps(mi_subproc_current(), &mi_dump_capture_heap, &ctx);
   MI_GATE_LEAVE(self->tld);
+  ctx.formatting = true;
   // No page/theap claims or registry locks remain. Format saved values only.
   char* result = NULL;
   if (captured && mi_dump_serialize(&ctx)) {

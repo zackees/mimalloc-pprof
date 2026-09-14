@@ -19,8 +19,8 @@ on:
 
 concurrency:
   # Its only publish-shaped step is `cargo publish --dry-run`, which uploads nothing.
-  group: rust-native-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:

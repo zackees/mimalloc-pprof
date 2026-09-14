@@ -8,8 +8,8 @@ name: Close inactive issues
 concurrency:
   # Never cancel: it closes/labels issues and PRs, so a half-run leaves the repo in a
   # partially-swept state.
-  group: stale-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   close-issues:

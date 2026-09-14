@@ -24,8 +24,8 @@ concurrency:
   # event_name is in the group on purpose: a scheduled run carries ref=refs/heads/main,
   # so without it the nightly 2,000,000-iteration run and a main push would cancel each
   # other. Same-event runs on the same ref still supersede.
-  group: fuzz-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   fuzz:

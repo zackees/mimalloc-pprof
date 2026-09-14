@@ -20,8 +20,8 @@ on:
 
 concurrency:
   # Pure verification: a superseded push's answer is worthless.
-  group: asan-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   asan:

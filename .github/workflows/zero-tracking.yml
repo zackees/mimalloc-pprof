@@ -38,8 +38,8 @@ on:
 
 concurrency:
   # A/B timing report on a path-filtered PR; produces no artifact anyone waits on.
-  group: zero-tracking-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   ab:

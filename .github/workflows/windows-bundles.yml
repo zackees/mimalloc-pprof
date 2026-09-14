@@ -72,8 +72,8 @@ on:
     # filtered workflow never reports on a PR outside its paths, leaving that PR BLOCKED.
 
 concurrency:
-  group: windows-bundles-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build-windows-gnu:

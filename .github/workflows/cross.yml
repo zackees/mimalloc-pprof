@@ -20,8 +20,8 @@ on:
 
 concurrency:
   # Measured ~4 h / ~5.5 h queue waits on the Apple rows (#277).
-  group: cross-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build-linux:

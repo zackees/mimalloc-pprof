@@ -5,19 +5,15 @@
 <text x="976" y="28" font-size="13" text-anchor="end" fill="#59636e">zackees/mimalloc-pprof</text>
 <line x1="64" y1="312.00" x2="976" y2="312.00" stroke="#d8dee4" stroke-width="1"/>
 <text x="54" y="316.00" font-size="12" text-anchor="end" fill="#59636e">0</text>
-<line x1="64" y1="259.20" x2="976" y2="259.20" stroke="#d8dee4" stroke-width="1"/>
-<text x="54" y="263.20" font-size="12" text-anchor="end" fill="#59636e">5</text>
-<line x1="64" y1="206.40" x2="976" y2="206.40" stroke="#d8dee4" stroke-width="1"/>
-<text x="54" y="210.40" font-size="12" text-anchor="end" fill="#59636e">10</text>
-<line x1="64" y1="153.60" x2="976" y2="153.60" stroke="#d8dee4" stroke-width="1"/>
-<text x="54" y="157.60" font-size="12" text-anchor="end" fill="#59636e">15</text>
-<line x1="64" y1="100.80" x2="976" y2="100.80" stroke="#d8dee4" stroke-width="1"/>
-<text x="54" y="104.80" font-size="12" text-anchor="end" fill="#59636e">20</text>
+<line x1="64" y1="224.00" x2="976" y2="224.00" stroke="#d8dee4" stroke-width="1"/>
+<text x="54" y="228.00" font-size="12" text-anchor="end" fill="#59636e">10</text>
+<line x1="64" y1="136.00" x2="976" y2="136.00" stroke="#d8dee4" stroke-width="1"/>
+<text x="54" y="140.00" font-size="12" text-anchor="end" fill="#59636e">20</text>
 <line x1="64" y1="48.00" x2="976" y2="48.00" stroke="#d8dee4" stroke-width="1"/>
-<text x="54" y="52.00" font-size="12" text-anchor="end" fill="#59636e">25</text>
+<text x="54" y="52.00" font-size="12" text-anchor="end" fill="#59636e">30</text>
 <text x="64.00" y="334.00" font-size="12" text-anchor="start" fill="#59636e">2026-07-25</text>
-<text x="976.00" y="334.00" font-size="12" text-anchor="end" fill="#59636e">2026-09-02</text>
-<path d="M 64.00 301.44 L 64.00 290.88 L 64.00 280.32 L 87.38 269.76 L 110.77 259.20 L 110.77 248.64 L 134.15 238.08 L 134.15 227.52 L 157.54 216.96 L 180.92 206.40 L 180.92 195.84 L 251.08 185.28 L 274.46 174.72 L 297.85 164.16 L 297.85 153.60 L 414.77 143.04 L 438.15 132.48 L 461.54 121.92 L 601.85 111.36 L 952.62 100.80 L 952.62 90.24 L 952.62 79.68 L 952.62 69.12 L 976.00 58.56 L 976.00 312.00 L 64.00 312.00 Z" fill="rgba(9,105,218,0.12)" stroke="none"/>
-<path d="M 64.00 301.44 L 64.00 290.88 L 64.00 280.32 L 87.38 269.76 L 110.77 259.20 L 110.77 248.64 L 134.15 238.08 L 134.15 227.52 L 157.54 216.96 L 180.92 206.40 L 180.92 195.84 L 251.08 185.28 L 274.46 174.72 L 297.85 164.16 L 297.85 153.60 L 414.77 143.04 L 438.15 132.48 L 461.54 121.92 L 601.85 111.36 L 952.62 100.80 L 952.62 90.24 L 952.62 79.68 L 952.62 69.12 L 976.00 58.56" fill="none" stroke="#0969da" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="976.00" cy="58.56" r="3.5" fill="#0969da"/>
+<text x="976.00" y="334.00" font-size="12" text-anchor="end" fill="#59636e">2026-09-12</text>
+<path d="M 64.00 303.20 L 64.00 294.40 L 64.00 285.60 L 82.61 276.80 L 101.22 268.00 L 101.22 259.20 L 119.84 250.40 L 119.84 241.60 L 138.45 232.80 L 157.06 224.00 L 157.06 215.20 L 212.90 206.40 L 231.51 197.60 L 250.12 188.80 L 250.12 180.00 L 343.18 171.20 L 361.80 162.40 L 380.41 153.60 L 492.08 144.80 L 771.27 136.00 L 771.27 127.20 L 771.27 118.40 L 771.27 109.60 L 789.88 100.80 L 920.16 92.00 L 938.78 83.20 L 976.00 74.40 L 976.00 312.00 L 64.00 312.00 Z" fill="rgba(9,105,218,0.12)" stroke="none"/>
+<path d="M 64.00 303.20 L 64.00 294.40 L 64.00 285.60 L 82.61 276.80 L 101.22 268.00 L 101.22 259.20 L 119.84 250.40 L 119.84 241.60 L 138.45 232.80 L 157.06 224.00 L 157.06 215.20 L 212.90 206.40 L 231.51 197.60 L 250.12 188.80 L 250.12 180.00 L 343.18 171.20 L 361.80 162.40 L 380.41 153.60 L 492.08 144.80 L 771.27 136.00 L 771.27 127.20 L 771.27 118.40 L 771.27 109.60 L 789.88 100.80 L 920.16 92.00 L 938.78 83.20 L 976.00 74.40" fill="none" stroke="#0969da" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="976.00" cy="74.40" r="3.5" fill="#0969da"/>
 </g></svg>

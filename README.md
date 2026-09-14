@@ -66,9 +66,9 @@ pre-release branch with less field exposure than v2 — see
 what that risk means and what was measured.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/star-history-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset=".github/assets/star-history-light.svg" />
-  <img alt="Star history for zackees/mimalloc-pprof" src=".github/assets/star-history-light.svg" width="100%" />
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/zackees/mimalloc-pprof/star-history/star-history-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/zackees/mimalloc-pprof/star-history/star-history-light.svg" />
+  <img alt="Star history for zackees/mimalloc-pprof" src="https://raw.githubusercontent.com/zackees/mimalloc-pprof/star-history/star-history-light.svg" width="100%" />
 </picture>
 
 ## Feature comparison

@@ -1,9 +1,15 @@
-# Refresh the committed star-history chart.
+# Refresh the star-history chart on the `star-history` data branch.
 #
 # GitHub restricted the stargazers endpoint to a repo's own admins and collaborators
-# (changelog 2026-06-30), which is why the chart is generated here and committed as a
+# (changelog 2026-06-30), which is why the chart is generated here and published as a
 # static asset instead of being fetched live by a third party from the README. See
 # ci/star_history.py for how the series survives the endpoint's eventual removal.
+#
+# The chart lives on its own orphan branch, not on main, and the README hotlinks it
+# from raw.githubusercontent.com the same way it hotlinks the benchmark-stats charts.
+# main is branch-protected (#352) and rejects this job's direct push ("14 of 14
+# required status checks are expected"), which silently froze the chart from
+# 2026-09-10; a daily chore commit on main would also re-run the whole gate suite.
 #
 # GH_TOKEN prefers STAR_HISTORY_TOKEN if that secret exists, so that if the Actions
 # installation token is not honored as an "admin or collaborator" for the stargazers
@@ -14,7 +20,7 @@ name: star-history
 
 on:
   schedule:
-    - cron: "17 5 * * *" # daily, off the hour to dodge scheduler congestion
+    - cron: "17 5 * * *" # once a day, off the hour to dodge scheduler congestion
   workflow_dispatch: {} # manual trigger, used to verify token access after landing
 
 permissions:
@@ -24,11 +30,21 @@ concurrency:
   group: star-history
   cancel-in-progress: false
 
+env:
+  DATA_BRANCH: star-history
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the generator
+        uses: actions/checkout@v4
+
+      - name: Check out the data branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DATA_BRANCH }}
+          path: star-history-data
 
       - uses: actions/setup-python@v5
         with:
@@ -37,16 +53,17 @@ jobs:
       - name: Regenerate chart
         env:
           GH_TOKEN: ${{ secrets.STAR_HISTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: python ci/star_history.py
+        run: python ci/star_history.py --out-dir star-history-data
 
-      - name: Commit if the chart moved
+      - name: Publish if the chart moved
+        working-directory: star-history-data
         run: |
-          if git diff --quiet -- .github/assets; then
-            echo "No star movement; nothing to commit."
+          if git diff --quiet; then
+            echo "No star movement; nothing to publish."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/assets
+          git add star-history.json star-history-light.svg star-history-dark.svg
           git commit -m "chore: refresh star history chart"
-          git push
+          git push origin "HEAD:refs/heads/$DATA_BRANCH"

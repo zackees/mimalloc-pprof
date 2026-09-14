@@ -1114,7 +1114,8 @@ false`, because a half-finished publish is worse than a redundant one:
   `benchmark-scaling.yml` — push the sealed `benchmark-stats` branch and deploy Pages;
   these deliberately **share** one group (`benchmark-stats-production`) to serialise
   against each other, so their group is not per-workflow
-- `star-history.yml` — commits a regenerated chart
+- `star-history.yml` — pushes a regenerated chart to the unprotected `star-history`
+  data branch (main's protection rejects bot pushes)
 - `stale.yaml` — closes and labels issues; a half-run leaves the repo partly swept
 
 `fuzz.yml` is the one subtle case: it has a `schedule:` trigger, and a scheduled run

@@ -1319,9 +1319,114 @@ class BenchmarkReportTests(unittest.TestCase):
             self.assertIn("p95 ns", page)
             self.assertIn("p99 ns", page)
             self.assertNotIn("latency: pending", page)
+            self.assertIn('src="benchmark-latency-tail.png"', page)
             chart = (site / "benchmark-latency.png").read_bytes()
             self.assertIn(b"Transaction latency", chart)
             self.assertIn(b"through free", chart)
+            tail = (site / "benchmark-latency-tail.png").read_bytes()
+            self.assertTrue(tail.startswith(b"\x89PNG"))
+            self.assertIn(b"Transaction latency distribution", tail)
+
+    def test_pending_latency_still_renders_a_tail_panel(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            site, _digest = self.render_fixture(Path(temporary))
+            tail = (site / "benchmark-latency-tail.png").read_bytes()
+            self.assertTrue(tail.startswith(b"\x89PNG"))
+            self.assertIn(b"PENDING latency tail distribution", tail)
+
+    def test_latency_tail_markers_follow_a_known_percentile_ladder(self) -> None:
+        # Hand-computed: lo = min(p50 - MAD) = min(100-20, 150-10) = 80,
+        # hi = max(p99) = max(500, 260) = 500, span = 420. Every marker below
+        # is left=100 + floor(380*(value-80)/420 + 0.5), none landing on an
+        # exact .5 tie.
+        fast = {
+            "p50_ns": 100.0,
+            "p95_ns": 220.0,
+            "p99_ns": 500.0,
+            "median_absolute_deviation_ns": 20.0,
+            "iqr_ns": 60.0,
+        }
+        slow = {
+            "p50_ns": 150.0,
+            "p95_ns": 180.0,
+            "p99_ns": 260.0,
+            "median_absolute_deviation_ns": 10.0,
+            "iqr_ns": 30.0,
+        }
+        lo, hi = report.latency_tail_scale([fast, slow])
+        self.assertEqual(80.0, lo)
+        self.assertEqual(500.0, hi)
+        left, width = 100, 380
+        fast_markers = report.latency_tail_markers(fast, lo, hi, left, width)
+        self.assertEqual(
+            {
+                "p50": 118,
+                "p95": 227,
+                "p99": 480,
+                "mad_low": 100,
+                "mad_high": 136,
+                "iqr_low": 100,
+                "iqr_high": 145,
+            },
+            fast_markers,
+        )
+        slow_markers = report.latency_tail_markers(slow, lo, hi, left, width)
+        self.assertEqual(
+            {
+                "p50": 163,
+                "p95": 190,
+                "p99": 263,
+                "mad_low": 154,
+                "mad_high": 172,
+                "iqr_low": 150,
+                "iqr_high": 177,
+            },
+            slow_markers,
+        )
+        self.assertLess(fast_markers["p50"], fast_markers["p95"])
+        self.assertLess(fast_markers["p95"], fast_markers["p99"])
+        self.assertLess(slow_markers["p50"], slow_markers["p95"])
+        self.assertLess(slow_markers["p95"], slow_markers["p99"])
+
+    def test_degenerate_latency_cell_renders_flat(self) -> None:
+        # Every allocator's p50 equals its p99 with zero spread: the plot
+        # span collapses to zero, so every marker must sit at `left` rather
+        # than dividing by zero.
+        flat = {
+            "p50_ns": 100.0,
+            "p95_ns": 100.0,
+            "p99_ns": 100.0,
+            "min_ns": 100,
+            "max_ns": 100,
+            "median_absolute_deviation_ns": 0.0,
+            "iqr_ns": 0.0,
+        }
+        lo, hi = report.latency_tail_scale([flat])
+        self.assertEqual(lo, hi)
+        markers = report.latency_tail_markers(flat, lo, hi, 100, 380)
+        self.assertEqual({key: 100 for key in markers}, markers)
+
+        latest = self.with_complete_latency(self.load_latest())
+        latency = latest["latency"]
+        assert isinstance(latency, dict)
+        absolute = latency["absolute_summaries"]
+        assert isinstance(absolute, list)
+        for item in absolute:
+            assert isinstance(item, dict)
+            measured = item["measured"]
+            assert isinstance(measured, dict)
+            # Every allocator in every cell collapses to the same duration, so
+            # the per-cell scale itself is degenerate (lo == hi), not just an
+            # individual allocator's MAD/IQR band.
+            measured["p50_ns"] = 100.0
+            measured["p95_ns"] = 100.0
+            measured["p99_ns"] = 100.0
+            measured["min_ns"] = 100
+            measured["max_ns"] = 100
+            measured["median_absolute_deviation_ns"] = 0.0
+            measured["iqr_ns"] = 0.0
+        png = report.latency_tail_png(latency)
+        self.assertTrue(png.startswith(b"\x89PNG"))
 
     def test_latency_section_surfaces_the_commit_it_was_measured_at(self) -> None:
         latest = self.with_complete_latency(self.load_latest())
@@ -1408,6 +1513,7 @@ class BenchmarkReportTests(unittest.TestCase):
             "benchmark-history.png",
             "benchmark-memory.png",
             "benchmark-latency.png",
+            "benchmark-latency-tail.png",
             "benchmark-scaling.png",
             "benchmark-pprof-tax.png",
         ):
@@ -1671,7 +1777,7 @@ class BenchmarkReportTests(unittest.TestCase):
                     "min_size_bytes": 16,
                     "max_size_bytes": 4096,
                     "live_set_capacity": 256,
-                    "cross_thread": pattern == "sparse-cross-thread",
+                    "cross_thread": pattern in ("sparse-cross-thread", "larson", "xmalloc-test"),
                 }
                 for pattern in report.SCALING_PATTERN_IDS
             ],
@@ -1861,6 +1967,78 @@ class BenchmarkReportTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(report.ReportError, "pending_metrics"):
             report.validate_latest(still_pending, "still pending")
+
+    def test_legacy_four_pattern_scaling_lineage_still_validates_and_renders(self) -> None:
+        """The published branch carries rows recorded before the named
+        workloads (larson, xmalloc-test) landed (#216). A report that
+        declares only `LEGACY_SCALING_PATTERN_IDS` must keep validating and
+        rendering forever, with the two new patterns showing as pending
+        rather than the whole section being rejected."""
+
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        legacy = set(report.LEGACY_SCALING_PATTERN_IDS)
+
+        summaries = scaling["cell_summaries"]
+        assert isinstance(summaries, list)
+        scaling["cell_summaries"] = [
+            item for item in summaries if isinstance(item, dict) and item["pattern"] in legacy
+        ]
+        raw = scaling["raw_samples"]
+        assert isinstance(raw, list)
+        scaling["raw_samples"] = [
+            item for item in raw if isinstance(item, dict) and item["pattern"] in legacy
+        ]
+        patterns = scaling["patterns"]
+        assert isinstance(patterns, list)
+        scaling["patterns"] = [
+            item for item in patterns if isinstance(item, dict) and item["pattern"] in legacy
+        ]
+        rss = scaling["rss"]
+        assert isinstance(rss, dict)
+        rss_summaries = rss["cell_summaries"]
+        assert isinstance(rss_summaries, list)
+        rss["cell_summaries"] = [
+            item for item in rss_summaries if isinstance(item, dict) and item["pattern"] in legacy
+        ]
+
+        report.validate_latest(latest, "legacy four-pattern lineage")
+        self.assertEqual(legacy, set(report.scaling_patterns_of(scaling)))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            for pattern, name in report.SCALING_PANELS.items():
+                panel = (site / name).read_text(encoding="utf-8")
+                if pattern in legacy:
+                    self.assertTrue(panel.startswith("<svg"))
+                    self.assertIn(report.SCALING_PANEL_TITLES[pattern], panel)
+                    self.assertNotIn("pending", panel)
+                else:
+                    self.assertIn("pending", panel)
+                    self.assertIn(report.SCALING_INK["background"], panel)
+
+    def test_mixed_pattern_scaling_lineage_is_rejected(self) -> None:
+        """A pattern set that belongs to neither the legacy four nor the
+        current six -- e.g. the legacy four plus just one named workload --
+        is not a lineage anyone published under; it must be rejected outright
+        rather than silently accepted as a superset or subset."""
+
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        keep = set(report.LEGACY_SCALING_PATTERN_IDS) | {"larson"}
+        summaries = scaling["cell_summaries"]
+        assert isinstance(summaries, list)
+        scaling["cell_summaries"] = [
+            item for item in summaries if isinstance(item, dict) and item["pattern"] in keep
+        ]
+        with self.assertRaisesRegex(report.ReportError, "pattern lineage"):
+            report.validate_latest(latest, "mixed pattern lineage")
 
     def test_chart_legends_use_display_labels_not_allocator_ids(self) -> None:
         """#375: `upstream-mimalloc` is a statement about this repo's git topology. A

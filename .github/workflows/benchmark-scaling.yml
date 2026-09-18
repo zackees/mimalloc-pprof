@@ -2,14 +2,16 @@ name: benchmark-scaling
 
 # Linux-only thread-scaling sweep. It serializes with the other benchmark workflows and
 # publishes through the same sealed branch/Pages pipeline. Coverage mode:
-# 4 patterns x 6 thread points x 5 allocators x 3 blocks. The sweep doubled
-# with the dense thread points (issue #211 WP4) and grew another 25% with the
-# Bun row (#325), which also adds a fifth benchmark-child build: budget ~7.5 min
-# of sweep on top of a ~7.5 min fixed build against the 20-minute limit below.
-# That is now the tightest of the four benchmark budgets; if a run times out,
-# raise timeout-minutes rather than dropping a thread point or a row. ci/check_benchmark_scaling_workflow.py pins the thread
-# points in rust/benchmark-suite/src/scaling.rs to the ones ci/benchmark_report.py
-# validates, so the two halves of the contract cannot drift apart silently.
+# 6 patterns (4 sparse + larson + xmalloc-test, #216) x 6 thread points x 5 allocators x
+# 3 blocks. The sweep doubled with the dense thread points (issue #211 WP4), grew another
+# 25% with the Bun row (#325), which also adds a fifth benchmark-child build, and grew
+# another 50% with the two named workloads (#216). The 2026 live run measured 3m01s of
+# sweep in a 10m00s job against the 20-minute limit below, so ~4.5 min of sweep still
+# fits. That is now the tightest of the four benchmark budgets; if a run times out,
+# raise timeout-minutes rather than dropping a thread point, a pattern, or a row.
+# ci/check_benchmark_scaling_workflow.py pins the thread points and pattern ids in
+# rust/benchmark-suite/src/scaling.rs to the ones ci/benchmark_report.py validates, so
+# the two halves of the contract cannot drift apart silently.
 on:
   workflow_dispatch:
     inputs:

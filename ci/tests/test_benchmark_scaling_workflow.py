@@ -52,6 +52,36 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(policy.ScalingWorkflowError, "SCALING_THREAD_POINTS"):
             policy.validate_source_contract(drifted)
 
+    def test_rust_pattern_dropped_from_the_sweep_is_rejected(self) -> None:
+        # #216: Larson/xmalloc-test join the four sparse patterns. Dropping one
+        # from the array while trimming its length still leaves the name list
+        # short, so this must be caught by the name comparison, not the length
+        # check -- that is what distinguishes it from the length-lies control.
+        source = policy.SCALING_SOURCE.read_text(encoding="utf-8")
+        dropped = source.replace(
+            f"[ScalingPattern; {len(report.SCALING_PATTERN_IDS)}]",
+            f"[ScalingPattern; {len(report.SCALING_PATTERN_IDS) - 1}]",
+        ).replace("    ScalingPattern::XmallocTest,\n", "", 1)
+        self.assertNotEqual(dropped, source)
+        with self.assertRaisesRegex(policy.ScalingWorkflowError, "SCALING_PATTERNS"):
+            policy.validate_source_contract(dropped)
+
+    def test_rust_pattern_renamed_is_rejected(self) -> None:
+        source = policy.SCALING_SOURCE.read_text(encoding="utf-8")
+        renamed = source.replace('"larson"', '"larson-v2"')
+        self.assertNotEqual(renamed, source)
+        with self.assertRaisesRegex(policy.ScalingWorkflowError, "SCALING_PATTERNS"):
+            policy.validate_source_contract(renamed)
+
+    def test_rust_pattern_array_length_lying_is_rejected(self) -> None:
+        source = policy.SCALING_SOURCE.read_text(encoding="utf-8")
+        lied = source.replace(
+            f"[ScalingPattern; {len(report.SCALING_PATTERN_IDS)}]", "[ScalingPattern; 99]"
+        )
+        self.assertNotEqual(lied, source)
+        with self.assertRaisesRegex(policy.ScalingWorkflowError, "array length disagrees"):
+            policy.validate_source_contract(lied)
+
     def test_budget_over_twenty_minutes_is_rejected(self) -> None:
         value = self.workflow()
         jobs = value["jobs"]

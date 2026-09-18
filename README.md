@@ -153,7 +153,9 @@ image and the table below are rendered from.
 ## Thread scaling by allocation pattern
 
 Aggregate throughput as worker threads go from 1 to 4 to 16, for four allocation
-patterns. Each pattern is a seeded random operation stream, so all five
+patterns plus two named cross-project workloads, Larson and xmalloc-test
+(clean-room reimplementations of their published shapes, for comparison with
+mimalloc-bench). Each pattern is a seeded random operation stream, so all five
 allocators replay one identical stream inside each paired block.
 
 > **Coverage mode: reduced statistical rigor (3 blocks per cell).** These panels
@@ -169,6 +171,10 @@ allocators replay one identical stream inside each paired block.
 [![Large page-touched buffers: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-buffers.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
 [![Cross-thread producer/consumer handoff: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-cross-thread.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+[![Larson server workload with rotating block owners: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-larson.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+[![xmalloc-test producer/consumer: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-xmalloc-test.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
 Full methodology, per-cell tables and the other benchmark families are in
 [Performance](#performance) below and on the

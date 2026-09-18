@@ -20,6 +20,7 @@ import yaml
 
 from benchmark_report import (
     SCALING_BLOCKS,
+    SCALING_PATTERN_IDS,
     SCALING_RSS_SCHEMA,
     SCALING_SCHEMA,
     SCALING_THREAD_POINTS,
@@ -194,6 +195,15 @@ RUST_SCHEMA = re.compile(r'pub const SCALING_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<s
 RUST_RSS_SCHEMA = re.compile(
     r'pub const SCALING_RSS_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<schema>[^"]*)";'
 )
+RUST_PATTERNS = re.compile(
+    r"pub const SCALING_PATTERNS:\s*\[ScalingPattern;\s*(?P<length>\d+)\]\s*=\s*"
+    r"\[(?P<body>[^\]]*)\];"
+)
+RUST_PATTERN_NAMES = re.compile(
+    r"pub const fn as_str\(self\) -> &'static str \{\s*match self \{(?P<arms>.*?)\}\s*\}",
+    re.DOTALL,
+)
+RUST_PATTERN_ARM = re.compile(r'Self::(\w+)\s*=>\s*"([^"]+)"')
 
 
 def validate_source_contract(source: str) -> None:
@@ -232,6 +242,33 @@ def validate_source_contract(source: str) -> None:
     rss_match = RUST_RSS_SCHEMA.search(source)
     if rss_match is None or rss_match.group("schema") != SCALING_RSS_SCHEMA:
         fail(f"scaling.rs: SCALING_RSS_SCHEMA_VERSION must be {SCALING_RSS_SCHEMA!r}")
+
+    patterns_match = RUST_PATTERNS.search(source)
+    if patterns_match is None:
+        fail("scaling.rs: SCALING_PATTERNS is missing or no longer a [ScalingPattern; N] literal")
+    variants = [
+        item.strip().removeprefix("ScalingPattern::")
+        for item in patterns_match.group("body").split(",")
+        if item.strip()
+    ]
+    if int(patterns_match.group("length")) != len(variants):
+        fail("scaling.rs: SCALING_PATTERNS array length disagrees with its elements")
+    names_match = RUST_PATTERN_NAMES.search(source)
+    if names_match is None:
+        fail("scaling.rs: ScalingPattern::as_str is missing or no longer matches self by variant")
+    arm_map = dict(RUST_PATTERN_ARM.findall(names_match.group("arms")))
+    if not arm_map:
+        fail("scaling.rs: ScalingPattern::as_str is missing or no longer matches self by variant")
+    ordered_names: list[str] = []
+    for variant in variants:
+        if variant not in arm_map:
+            fail(f"scaling.rs: ScalingPattern::{variant} has no as_str arm")
+        ordered_names.append(arm_map[variant])
+    if tuple(ordered_names) != SCALING_PATTERN_IDS:
+        fail(
+            "scaling.rs: SCALING_PATTERNS is "
+            f"{ordered_names} but benchmark_report.py declares {list(SCALING_PATTERN_IDS)}"
+        )
 
 
 def load(path: Path) -> dict[str, object]:
@@ -347,6 +384,14 @@ SOURCE_MUTATIONS: dict[str, Callable[[str], str]] = {
     ),
     "constant deleted outright": lambda text: text.replace(
         "pub const SCALING_THREAD_POINTS", "const SCALING_THREAD_POINTS_UNUSED"
+    ),
+    "pattern dropped from the sweep": lambda text: text.replace(
+        f"[ScalingPattern; {len(SCALING_PATTERN_IDS)}]",
+        f"[ScalingPattern; {len(SCALING_PATTERN_IDS) - 1}]",
+    ).replace("    ScalingPattern::XmallocTest,\n", "", 1),
+    "pattern renamed": lambda text: text.replace('"larson"', '"larson-v2"'),
+    "pattern array length lies": lambda text: text.replace(
+        f"[ScalingPattern; {len(SCALING_PATTERN_IDS)}]", "[ScalingPattern; 99]"
     ),
 }
 

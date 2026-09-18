@@ -167,12 +167,32 @@ SCALING_THREAD_POINTS = (1, 2, 3, 4, 6, 8)
 # a lineage that has been silently rewritten. A report is checked against the
 # shape it declares, not against the current one.
 SCALING_THREAD_POINT_LINEAGES = ((1, 4, 16), SCALING_THREAD_POINTS)
-SCALING_PATTERN_IDS = (
+# The pattern set published before the named workloads (larson, xmalloc-test)
+# landed (#216).
+LEGACY_SCALING_PATTERN_IDS = (
     "sparse-tiny-hot",
     "sparse-mixed-general",
     "sparse-large-buffers",
     "sparse-cross-thread",
 )
+SCALING_PATTERN_IDS = (
+    "sparse-tiny-hot",
+    "sparse-mixed-general",
+    "sparse-large-buffers",
+    "sparse-cross-thread",
+    "larson",
+    "xmalloc-test",
+)
+# Every pattern set this validator will accept, oldest first. New production
+# runs carry SCALING_PATTERN_IDS, but the published branch still holds history
+# rows -- and a `latest.json` -- recorded before the named workloads existed,
+# and those must keep validating and rendering forever: a lineage that stops
+# parsing is a lineage that has been silently rewritten. A report is checked
+# against the pattern set it declares, not against the current one. Adding
+# patterns changed the metric comparison key, so it starts a new history
+# lineage instead of rewriting the sparse one. This mirrors
+# SCALING_THREAD_POINT_LINEAGES above.
+SCALING_PATTERN_LINEAGES = (LEGACY_SCALING_PATTERN_IDS, SCALING_PATTERN_IDS)
 # One panel per allocation pattern. Separate files (rather than one facet grid)
 # keep each chart legible in the README and on a phone.
 SCALING_PANELS = {
@@ -184,6 +204,8 @@ SCALING_PANEL_TITLES = {
     "sparse-mixed-general": "General mix (8 B-4 KiB, with realloc)",
     "sparse-large-buffers": "Large buffers (64 KiB-4 MiB, page-touched)",
     "sparse-cross-thread": "Cross-thread handoff (16-512 B, remote free)",
+    "larson": "Larson server workload (8-1000 B, rotating owners)",
+    "xmalloc-test": "xmalloc-test producer/consumer (8-128 B, remote free)",
 }
 SITE_FILES = {
     ".nojekyll",
@@ -198,6 +220,7 @@ SITE_FILES = {
     "benchmark-rss-timeline.png",
     "benchmark-fragmentation.png",
     "benchmark-latency.png",
+    "benchmark-latency-tail.png",
     "benchmark-pprof-tax.png",
     *SCALING_PANELS.values(),
 }
@@ -209,6 +232,7 @@ PNG_DIMENSIONS = {
     "benchmark-rss-timeline.png": (1280, 720),
     "benchmark-fragmentation.png": (960, 540),
     "benchmark-latency.png": (960, 540),
+    "benchmark-latency-tail.png": (960, 540),
     "benchmark-pprof-tax.png": (960, 540),
 }
 SVG_FILES = frozenset(SCALING_PANELS.values())
@@ -241,6 +265,7 @@ ROLES = {
     "benchmark-rss-timeline.png": "rss-timeline-panel",
     "benchmark-fragmentation.png": "fragmentation-panel",
     "benchmark-latency.png": "latency-panel",
+    "benchmark-latency-tail.png": "latency-tail-panel",
     "benchmark-pprof-tax.png": "pending-pprof-tax-panel",
     **dict.fromkeys(SCALING_PANELS.values(), "scaling-panel"),
 }
@@ -2955,6 +2980,132 @@ def latency_png(latency: Mapping[str, object]) -> bytes:
     )
 
 
+def latency_tail_scale(distributions: Sequence[Mapping[str, object]]) -> tuple[float, float]:
+    """The x-axis span for one latency cell: the low end backs off from the
+    fastest allocator's p50 by its own MAD, the high end reaches the slowest
+    allocator's p99, so a cliff from p50 to p99 is visible without clipping
+    and without every cell sharing one global scale."""
+
+    lows = [
+        float_value(distribution["p50_ns"], "latency tail p50", True)
+        - float_value(distribution["median_absolute_deviation_ns"], "latency tail MAD")
+        for distribution in distributions
+    ]
+    highs = [
+        float_value(distribution["p99_ns"], "latency tail p99", True)
+        for distribution in distributions
+    ]
+    return max(0.0, min(lows)), max(highs)
+
+
+def latency_tail_x(value: float, lo: float, hi: float, left: int, width: int) -> int:
+    """Map one duration onto the plot's x axis, clamped into the plot box.
+
+    A degenerate cell (every allocator's p50 equals its p99 with zero spread)
+    has hi == lo; dividing by that span would be a crash for a real
+    measurement, so it is drawn flat at `left` instead of raising. Rounding is
+    explicit half-up rather than Python's banker's `round`, so ties resolve
+    the same way on every platform this renders on."""
+
+    if hi - lo <= 0:
+        return left
+    x = left + math.floor(width * (value - lo) / (hi - lo) + 0.5)
+    return max(left, min(left + width, x))
+
+
+def latency_tail_markers(
+    distribution: Mapping[str, object], lo: float, hi: float, left: int, width: int
+) -> dict[str, int]:
+    """Pixel x coordinates for one allocator's row: the three percentile
+    ticks, plus the MAD band around p50 and the IQR band around p50, each
+    clamped so a wide spread never paints outside the plot it is drawn in."""
+
+    p50 = float_value(distribution["p50_ns"], "latency tail p50", True)
+    p95 = float_value(distribution["p95_ns"], "latency tail p95", True)
+    p99 = float_value(distribution["p99_ns"], "latency tail p99", True)
+    mad = float_value(distribution["median_absolute_deviation_ns"], "latency tail MAD")
+    iqr = float_value(distribution["iqr_ns"], "latency tail IQR")
+    mad_low = max(lo, p50 - mad)
+    mad_high = p50 + mad
+    iqr_low = max(lo, min(hi, p50 - iqr / 2))
+    iqr_high = max(lo, min(hi, p50 + iqr / 2))
+    return {
+        "p50": latency_tail_x(p50, lo, hi, left, width),
+        "p95": latency_tail_x(p95, lo, hi, left, width),
+        "p99": latency_tail_x(p99, lo, hi, left, width),
+        "mad_low": latency_tail_x(mad_low, lo, hi, left, width),
+        "mad_high": latency_tail_x(mad_high, lo, hi, left, width),
+        "iqr_low": latency_tail_x(iqr_low, lo, hi, left, width),
+        "iqr_high": latency_tail_x(iqr_high, lo, hi, left, width),
+    }
+
+
+def latency_tail_tint(color: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+    """`color` blended toward white by `factor`; used to pale the IQR/MAD
+    bands so the percentile ticks in the full allocator colour stay legible
+    on top of them."""
+
+    red, green, blue = color
+    return (
+        round(red + (255 - red) * factor),
+        round(green + (255 - green) * factor),
+        round(blue + (255 - blue) * factor),
+    )
+
+
+def latency_tail_png(latency: Mapping[str, object]) -> bytes:
+    """Per-cell p50/p95/p99 distribution with MAD and IQR spread: a cliff from
+    p50 to p99 (tail latency) looks different from a gentle slope, which the
+    single p99 bar in `latency_png` cannot show."""
+
+    canvas = Canvas(960, 540, (248, 250, 252))
+    canvas.rectangle(0, 0, 960, 62, (24, 35, 52))
+    records = [
+        object_value(value, "latency absolute summary")
+        for value in list_value(latency["absolute_summaries"], "latency absolute summaries")
+    ]
+    cells: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for record in records:
+        key = (cast(str, record["scenario_id"]), cast(str, record["thread_point"]))
+        cells.setdefault(key, []).append(record)
+    for ordinal, (_key, values) in enumerate(sorted(cells.items())):
+        column, row = ordinal % 2, ordinal // 2
+        left, top = 45 + column * 460, 85 + row * 145
+        canvas.rectangle(left, top, 420, 120, (235, 240, 246))
+        values.sort(key=lambda value: ALLOCATOR_IDS.index(cast(str, value["allocator_id"])))
+        distributions = [object_value(value["measured"], "latency measured") for value in values]
+        lo, hi = latency_tail_scale(distributions)
+        plot_left, plot_width = left + 14, 380
+        for index, (value, distribution) in enumerate(zip(values, distributions)):
+            color = COLORS[ALLOCATOR_IDS.index(cast(str, value["allocator_id"]))]
+            row_y = top + 13 + index * 20
+            markers = latency_tail_markers(distribution, lo, hi, plot_left, plot_width)
+            canvas.rectangle(
+                markers["iqr_low"],
+                row_y,
+                max(1, markers["iqr_high"] - markers["iqr_low"]),
+                12,
+                latency_tail_tint(color, 0.75),
+            )
+            canvas.rectangle(
+                markers["mad_low"],
+                row_y + 3,
+                max(1, markers["mad_high"] - markers["mad_low"]),
+                6,
+                latency_tail_tint(color, 0.35),
+            )
+            canvas.line(markers["p50"], row_y + 6, markers["p95"], row_y + 6, color, 2)
+            canvas.line(markers["p95"], row_y + 6, markers["p99"], row_y + 6, color, 2)
+            for tick in ("p50", "p95", "p99"):
+                canvas.rectangle(markers[tick] - 1, row_y, 3, 12, color)
+    return encode_png(
+        960,
+        540,
+        canvas.pixels,
+        "Transaction latency distribution: p50/p95/p99 with MAD and IQR spread; lower is better",
+    )
+
+
 PARETO_WIDTH = 960
 PARETO_HEIGHT = 540
 # Plot margins in pixels: left, top, right, bottom.
@@ -3491,15 +3642,38 @@ SCALING_SUMMARY_FIELDS = {
 }
 
 
+def scaling_patterns_of(scaling: Mapping[str, object]) -> tuple[str, ...]:
+    """The set of allocation patterns a scaling section actually measured,
+    read from its own cell summaries rather than the current pattern
+    contract. Used by the validator to check a report's pattern set against
+    the known lineages (`SCALING_PATTERN_LINEAGES`), and by the renderer to
+    tell an actually-measured panel from one this report's lineage does not
+    cover."""
+
+    summaries = [
+        object_value(item, "scaling cell summary")
+        for item in list_value(scaling.get("cell_summaries"), "scaling cell summaries")
+    ]
+    return tuple(
+        sorted(
+            {
+                string_value(summary.get("pattern"), "scaling cell summary pattern")
+                for summary in summaries
+            }
+        )
+    )
+
+
 def validate_scaling_rss(
-    value: object, label: str, thread_points: tuple[int, ...]
+    value: object, label: str, thread_points: tuple[int, ...], patterns: tuple[str, ...]
 ) -> dict[str, object]:
     """The RSS side-car is an optional object with its own schema version, so
     rows published before it existed stay valid history.
 
-    `thread_points` is the sweep shape its parent report declares, not the
-    current contract: a side-car must cover exactly the cells its own report
-    measured, whichever lineage that report belongs to.
+    `thread_points` is the sweep shape its parent report declares, and
+    `patterns` is the pattern lineage its parent report declares -- neither is
+    the current contract: a side-car must cover exactly the cells its own
+    report measured, whichever lineage that report belongs to.
     """
 
     rss = object_value(value, label)
@@ -3520,7 +3694,7 @@ def validate_scaling_rss(
     declared = declared_allocators(
         (summary.get("allocator_id") for summary in summaries), f"{label}.cell_summaries"
     )
-    expected_cells = len(SCALING_PATTERN_IDS) * len(thread_points) * len(declared)
+    expected_cells = len(patterns) * len(thread_points) * len(declared)
     if len(summaries) != expected_cells:
         fail(f"{label}.cell_summaries: expected exactly {expected_cells} cells")
     seen: set[tuple[str, int, str]] = set()
@@ -3547,7 +3721,7 @@ def validate_scaling_rss(
         )
         key = (pattern, threads, allocator)
         if (
-            pattern not in SCALING_PATTERN_IDS
+            pattern not in patterns
             or allocator not in declared
             or threads not in thread_points
             or key in seen
@@ -3604,10 +3778,23 @@ def validate_scaling_report(
             f"{label}.thread_points: {list(thread_points)} is not a known sweep lineage; "
             f"expected one of {[list(shape) for shape in SCALING_THREAD_POINT_LINEAGES]}"
         )
-    # After the shape is known, so the side-car is checked against the sweep
-    # its own report declares rather than against the current contract.
+    # The pattern set this report actually measured, not the current
+    # contract: a published row from an earlier pattern lineage keeps
+    # validating and rendering against its own set. Adding patterns changed
+    # the metric comparison key, so it is a distinct lineage rather than a
+    # superset check.
+    declared_patterns = scaling_patterns_of(report)
+    if not any(set(declared_patterns) == set(lineage) for lineage in SCALING_PATTERN_LINEAGES):
+        fail(
+            f"{label}.cell_summaries: pattern set {sorted(declared_patterns)} is not a known "
+            f"pattern lineage; expected one of "
+            f"{[sorted(lineage) for lineage in SCALING_PATTERN_LINEAGES]}"
+        )
+    # After the shape and pattern set are known, so the side-car is checked
+    # against the sweep its own report declares rather than against the
+    # current contract.
     if "rss" in report:
-        validate_scaling_rss(report.get("rss"), f"{label}.rss", thread_points)
+        validate_scaling_rss(report.get("rss"), f"{label}.rss", thread_points, declared_patterns)
     comparison_digest(report.get("metric_comparison_key"), f"{label}.metric_comparison_key")
     validate_run(report.get("run"), f"{label}.run")
     if compact:
@@ -3643,7 +3830,7 @@ def validate_scaling_report(
         ],
         f"{label}.cell_summaries",
     )
-    expected_cells = len(SCALING_PATTERN_IDS) * len(thread_points) * len(declared)
+    expected_cells = len(declared_patterns) * len(thread_points) * len(declared)
     if len(summaries) != expected_cells:
         fail(f"{label}.cell_summaries: expected exactly {expected_cells} cells")
     seen: set[tuple[str, int, str]] = set()
@@ -3658,7 +3845,7 @@ def validate_scaling_report(
             summary.get("thread_count"), f"{label}.cell_summaries[{index}].thread_count", 1
         )
         if (
-            pattern not in SCALING_PATTERN_IDS
+            pattern not in declared_patterns
             or allocator not in declared
             or threads not in thread_points
         ):
@@ -3956,7 +4143,9 @@ def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
     unit = axis_unit(ceiling)
     rss = scaling.get("rss")
     if rss is not None:
-        rss_report = validate_scaling_rss(rss, "scaling rss", thread_points)
+        rss_report = validate_scaling_rss(
+            rss, "scaling rss", thread_points, scaling_patterns_of(scaling)
+        )
         rss_series: dict[str, list[tuple[int, float]]] = {}
         for summary_value in list_value(rss_report["cell_summaries"], "scaling rss summaries"):
             summary = object_value(summary_value, "scaling rss summary")
@@ -4314,7 +4503,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             )
             for value in list_value(latency["paired_summaries"], "latency paired summaries")
         )
-        latency_html = f"""<section><h2 id="latency">Transaction latency</h2><img src="benchmark-latency.png" alt="End-to-end transaction latency p99 for all five allocators; lower is better"><p><strong>Lower is better; informational hosted-runner measurements.</strong> These are transaction latencies, never allocator-call latencies and never throughput reciprocals. Local: {escaped(definitions["local"])}. Cross-thread: {escaped(definitions["cross-thread"])}. Large object: {escaped(definitions["large-object"])}.</p><p>Each allocator/cell has at least 10,000 raw samples across {escaped(block_count)} paired blocks. Controls are reported without subtraction. Runner: {escaped(latency_runner["runner_class"])}; affinity: {escaped(scheduling["affinity_policy"])}; reference allocator: Microsoft mimalloc (<code>upstream-mimalloc</code>). Latency run <a href="{latency_actions}">{escaped(latency_run["run_id"])}/{escaped(latency_run["run_attempt"])}</a> measured mimalloc-pprof at source <code>{escaped(latency_run["source_sha"])}</code>, which is not necessarily the commit above; metric key <code>{escaped(latency["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>p50 ns</th><th>p95 ns</th><th>p99 ns</th><th>Overhead</th><th>Samples</th></tr></thead><tbody>{latency_rows}</tbody></table></section>"""
+        latency_html = f"""<section><h2 id="latency">Transaction latency</h2><img src="benchmark-latency.png" alt="End-to-end transaction latency p99 for all five allocators; lower is better"><img src="benchmark-latency-tail.png" alt="Transaction latency distribution p50/p95/p99 with MAD and IQR spread for all five allocators; lower is better"><p><strong>Lower is better; informational hosted-runner measurements.</strong> These are transaction latencies, never allocator-call latencies and never throughput reciprocals. Local: {escaped(definitions["local"])}. Cross-thread: {escaped(definitions["cross-thread"])}. Large object: {escaped(definitions["large-object"])}.</p><p>Each allocator/cell has at least 10,000 raw samples across {escaped(block_count)} paired blocks. Controls are reported without subtraction. Runner: {escaped(latency_runner["runner_class"])}; affinity: {escaped(scheduling["affinity_policy"])}; reference allocator: Microsoft mimalloc (<code>upstream-mimalloc</code>). Latency run <a href="{latency_actions}">{escaped(latency_run["run_id"])}/{escaped(latency_run["run_attempt"])}</a> measured mimalloc-pprof at source <code>{escaped(latency_run["source_sha"])}</code>, which is not necessarily the commit above; metric key <code>{escaped(latency["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>p50 ns</th><th>p95 ns</th><th>p99 ns</th><th>Overhead</th><th>Samples</th></tr></thead><tbody>{latency_rows}</tbody></table></section>"""
     scaling_html = ""
     if "scaling" in latest:
         scaling = validate_scaling_report(latest["scaling"], "latest.scaling")
@@ -4480,15 +4669,29 @@ def render(
     if "latency" in latest:
         latency = validate_latency_report(latest["latency"], "latest.latency")
         (output / image_names["latency"]).write_bytes(latency_png(latency))
+        (output / "benchmark-latency-tail.png").write_bytes(latency_tail_png(latency))
     else:
         item = pending["latency"]
         (output / image_names["latency"]).write_bytes(
             pending_png("latency", cast(str, item["reason"]))
         )
+        (output / "benchmark-latency-tail.png").write_bytes(
+            pending_png("latency tail distribution", cast(str, item["reason"]))
+        )
     if "scaling" in latest:
         scaling = validate_scaling_report(latest["scaling"], "latest.scaling")
+        measured_patterns = set(scaling_patterns_of(scaling))
         for pattern, name in SCALING_PANELS.items():
-            (output / name).write_bytes(scaling_svg(scaling, pattern))
+            if pattern in measured_patterns:
+                (output / name).write_bytes(scaling_svg(scaling, pattern))
+            else:
+                (output / name).write_bytes(
+                    pending_scaling_svg(
+                        pattern,
+                        "not measured by this scaling run; the named-workload lineage "
+                        "starts with the next scheduled sweep",
+                    )
+                )
     else:
         reason = cast(str, pending["scaling"]["reason"])
         for pattern, name in SCALING_PANELS.items():

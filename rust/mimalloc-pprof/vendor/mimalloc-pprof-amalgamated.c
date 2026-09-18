@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f507dff6 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit eaeb133a of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -20208,6 +20208,9 @@ static void memevt_dispatch(mi_hooks_tld_t* hooks, mi_memory_change_kind_t kind,
    The shared suppression depth excludes callback-internal and moving-realloc internals
    from both observers. */
 void _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size) {
+  #if !MI_DHAT
+  MI_UNUSED(p);  // only DHAT consumes the block address (#373)
+  #endif
   // #266: must be the very first thing touched -- see hooks-tld.h's file comment. A
   // thread mid-init (inside `_mi_thread_init_with_heap` -> `_mi_meta_zalloc`, allocating
   // its OWN tld/theap) reaches this hook too; peeking (rather than touching any TLS
@@ -20255,6 +20258,9 @@ void _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size) {
 // free.c's "free'd after thread_done" comment). So: peek, and fall back to a local,
 // per-call scratch `mi_hooks_tld_t` instead of forcing -- see hooks-tld.h.
 void _mi_memevt_on_free_slow(mi_page_t* page, void* p) {
+  #if !MI_DHAT
+  MI_UNUSED(p);  // only DHAT consumes the block address (#373)
+  #endif
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
   if (hooks->memevt_suppress_depth > 0) return;
@@ -20282,6 +20288,9 @@ void _mi_memevt_on_free_slow(mi_page_t* page, void* p) {
 }
 
 void _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t request_size) {
+  #if !MI_DHAT
+  MI_UNUSED(p);  // only DHAT consumes the block address (#373)
+  #endif
   // #266: see _mi_memevt_on_free above.
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
@@ -20301,6 +20310,9 @@ void _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t reques
 }
 
 void _mi_memevt_on_resize_slow(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
+  #if !MI_DHAT
+  MI_UNUSED(oldp); MI_UNUSED(newp);  // only DHAT consumes the block addresses (#373)
+  #endif
   // #266: see _mi_memevt_on_free above.
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
@@ -26682,15 +26694,21 @@ static void mi_purge_all_arenas(bool force) {
 // the sweeping thread's tld (the hole bookkeeping -- `holes_sweeping`, the per-pass counters --
 // lives on it). A heap that is being deleted (`releasing`) is abandoning its pages unmapped
 // right now and is skipped, as `_mi_subproc_prof_sync_force_slow` does.
+// Split out of the subprocs walk so the two `mi_lock` scopes do not nest in one function
+// (the macro's `_mi_go` would shadow itself under -Wshadow, #373).
+static void mi_purge_all_abandoned_subproc(mi_subproc_t* sp, mi_tld_t* my_tld) {
+  mi_lock(&sp->heaps_lock) {
+    for (mi_heap_t* heap = sp->heaps; heap != NULL; heap = heap->next) {
+      if (mi_atomic_load_acquire(&heap->releasing) != 0) continue;
+      _mi_arenas_purge_abandoned_holes(heap, my_tld);
+    }
+  }
+}
+
 static void mi_purge_all_abandoned(mi_tld_t* my_tld) {
   mi_lock(_mi_subprocs_lock()) {
     for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {
-      mi_lock(&sp->heaps_lock) {
-        for (mi_heap_t* heap = sp->heaps; heap != NULL; heap = heap->next) {
-          if (mi_atomic_load_acquire(&heap->releasing) != 0) continue;
-          _mi_arenas_purge_abandoned_holes(heap, my_tld);
-        }
-      }
+      mi_purge_all_abandoned_subproc(sp, my_tld);
     }
   }
 }
@@ -29410,10 +29428,12 @@ static void mi_scav_fork_child_reset(void) {
 
 #if !defined(MI_SCAV_HAS_FORK_RESET)
 // futex / __ulock / WaitOnAddress hold no state of ours across fork()
-static void mi_scav_fork_child_reset(void) { }
+// #373: correct no-ops; unused on platforms whose wait primitive needs no init/fork reset
+mi_decl_maybe_unused static void mi_scav_fork_child_reset(void) { }
 #endif
 #if !defined(MI_SCAV_HAS_INIT)
-static void mi_scav_init(void) { }
+// #373: correct no-ops; unused on platforms whose wait primitive needs no init/fork reset
+mi_decl_maybe_unused static void mi_scav_init(void) { }
 #endif
 
 

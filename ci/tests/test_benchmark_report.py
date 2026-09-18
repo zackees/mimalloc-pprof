@@ -1404,7 +1404,7 @@ class BenchmarkReportTests(unittest.TestCase):
         lo, hi = report.latency_tail_scale([flat])
         self.assertEqual(lo, hi)
         markers = report.latency_tail_markers(flat, lo, hi, 100, 380)
-        self.assertEqual({key: 100 for key in markers}, markers)
+        self.assertEqual(dict.fromkeys(markers, 100), markers)
 
         latest = self.with_complete_latency(self.load_latest())
         latency = latest["latency"]

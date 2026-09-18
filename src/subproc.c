@@ -30,8 +30,11 @@ mi_lock_t*    _mi_subprocs_lock(void) { return &mi_subprocs_lock; }
 // because `mi_heap_visit_page_claim` (arena.c) and `mi_heap_detach_theaps` (heap.c) read it
 // unconditionally on every platform -- a Windows/wasi build that never sets it still needs
 // the symbol to link. Only the setter (`_mi_process_fork_child`) lives in fork.c's
-// POSIX-only block; see its definition there for the sticky-flag limitation.
+// POSIX-only block; see its definition there. #293: the flag alone is no longer the whole
+// test -- call sites narrow it with `_mi_tld_predates_fork` (mimalloc/internal.h), see that
+// predicate for the per-tld generation check.
 mi_decl_hidden bool _mi_process_is_forked_child = false;
+mi_decl_hidden size_t _mi_fork_generation = 0;   // #293: bumped once per fork() in the child (src/fork.c); stamped into each new mi_tld_t::fork_gen
 
 
 /* -----------------------------------------------------------

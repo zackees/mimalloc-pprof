@@ -209,15 +209,17 @@ static void mi_heap_detach_theaps(mi_heap_t* heap) {
   // its `store(park_state, MI_PARK_PARKED)` on its own; `_mi_park_leave`'s wait is bounded by
   // that. `park_theap0` is published by the owner before it leaves MI_PARK_RUNNING, so it is
   // stable for exactly the states we read it in.
-  if (!_mi_process_is_forked_child) {   // a forked child's park_state may name a thread that is gone
-    mi_subproc_t* const subproc = heap->subproc;
-    mi_lock(&subproc->tlds_lock) {
-      for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
-        if (mi_atomic_load_acquire(&tld->park_state) == MI_PARK_RUNNING) continue;
-        mi_theap_t* const theap0 = tld->park_theap0;
-        if (theap0 != NULL && mi_atomic_load_ptr_acquire(mi_heap_t, &theap0->heap) == heap) {
-          _mi_park_leave(tld);
-        }
+  // #293: run this walk unconditionally -- under the old `if (!_mi_process_is_forked_child)`
+  // guard a forked child that later spawned its own threads never took a parked post-fork
+  // owner back before detaching, which is the use-after-free the comment above describes.
+  mi_subproc_t* const subproc = heap->subproc;
+  mi_lock(&subproc->tlds_lock) {
+    for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
+      if (_mi_tld_predates_fork(tld)) continue;   // #293: a thread that did not survive fork(); its park_state was reset to RUNNING in the child anyway
+      if (mi_atomic_load_acquire(&tld->park_state) == MI_PARK_RUNNING) continue;
+      mi_theap_t* const theap0 = tld->park_theap0;
+      if (theap0 != NULL && mi_atomic_load_ptr_acquire(mi_heap_t, &theap0->heap) == heap) {
+        _mi_park_leave(tld);
       }
     }
   }
@@ -256,7 +258,11 @@ static void mi_heap_detach_theaps(mi_heap_t* heap) {
       // get taken instead by `mi_heap_visit_page_claim`'s own forked-child branch
       // (arena.c), which re-derives ownership from the page/arena bitmaps rather than the
       // theap's queues.
-      if mi_unlikely(_mi_process_is_forked_child && theap->tld->thread_id != _mi_thread_id()) {
+      // #293: only theaps whose tld predates the latest fork are skipped now; skipping one
+      // (re)marks the heap so `mi_heap_visit_page_claim` takes its forked-child branch for it
+      // (src/fork.c already marks every heap that existed at the fork; this is the local proof).
+      if mi_unlikely(_mi_tld_predates_fork(theap->tld) && theap->tld->thread_id != _mi_thread_id()) {
+        heap->prefork_theaps = true;   // #293: arena.c's claim walk must force-seize this heap's pages
         continue;
       }
       _mi_theap_abandon(theap);

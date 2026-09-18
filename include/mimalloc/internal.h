@@ -217,10 +217,23 @@ void          _mi_process_fork_child(void);
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): defined
 // unconditionally in src/subproc.c (not src/fork.c, which compiles only on POSIX) so the
 // symbol links on every platform; set once by `_mi_process_fork_child` (src/fork.c, in its
-// POSIX-only block -- see there for the sticky-flag limitation), never cleared. Consulted by
-// `mi_heap_visit_page_claim` (arena.c) and `mi_heap_detach_theaps` (heap.c) to avoid waiting
-// on / walking pages of a theap whose owning thread did not survive a multi-threaded fork().
+// POSIX-only block), never cleared. #293: no longer consulted alone -- `mi_heap_visit_page_claim`
+// (arena.c) and `mi_heap_detach_theaps` (heap.c) narrow it with `_mi_tld_predates_fork` /
+// `heap->prefork_theaps` below, instead of treating every theap of a forked process as suspect.
 extern mi_decl_hidden bool _mi_process_is_forked_child;
+// #293: bumped once per fork() in the child (src/fork.c); see `_mi_tld_predates_fork` below.
+extern mi_decl_hidden size_t _mi_fork_generation;
+
+// #293: true iff `tld` belongs to a thread that existed before the most recent fork() and did not
+// survive it (every tld except the forking thread's, which src/fork.c restamps). Only such a
+// thread's theaps/pages can be torn mid-update; tlds created in the child after the fork, and
+// the fork survivor's, are ordinary live threads. The detached (meta) tld is never owned by a
+// thread, so it never predates a fork.
+static inline bool _mi_tld_predates_fork(const mi_tld_t* tld) {
+  return (_mi_process_is_forked_child && tld != NULL &&
+          tld->thread_id != MI_THREADID_DETACHED &&
+          tld->fork_gen != _mi_fork_generation);
+}
 
 // #270: runtime lock-order detector. Every internal lock acquire already goes through
 // diagnostic.c's reentrancy checker (MI_DEBUG>2), which records the owning thread in
@@ -337,6 +350,9 @@ extern mi_decl_export _Atomic(uintptr_t) mi_debug_dump_fail_after;
 // (`mi_arena_pages_t::pages_abandoned[]`, arena.c) published so far via the CAS in
 // `mi_arena_pages_abandoned_ensure`.
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;
+// #293 (test-fork-generation.c): number of pages `mi_heap_visit_page_claim` (arena.c) took via
+// its forked-child force-seize branch. Must stay flat for heaps created after the fork.
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_forked_claim_seized;
 #ifdef __cplusplus
 }
 #endif

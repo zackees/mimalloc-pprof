@@ -2859,6 +2859,7 @@ static bool mi_heap_visit_page(mi_page_t* page, mi_heap_visit_info_t* vinfo) {
 
 #if MI_DEBUG > 0
 mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271): test-heap-teardown.c's `pin` case
+mi_decl_export _Atomic(uintptr_t) mi_debug_forked_claim_seized;  // #293: test-fork-generation.c -- pages taken by the forked-child force-seize branch below
 #endif
 
 // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
@@ -2896,6 +2897,12 @@ mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;  // impor
 // reconciling its (possibly torn, mid-update) `used`/`local_free`/`xthread_free`
 // bookkeeping, which can trip `mi_page_is_valid_init` downstream
 // (test-fork-user-heap.c's `case_a`, found while merging P5's fork.c into this branch).
+// narrowed for #293: the branch now also requires `vinfo->heap->prefork_theaps`, which
+// `src/fork.c` sets in the child on every heap that existed at the fork (a vanished thread
+// may have left one of its pages torn mid-allocation, or OWNED mid cross-thread free -- the
+// latter would make the wait below spin forever), and `heap.c:mi_heap_detach_theaps` sets when
+// it skips a pre-fork theap. A heap created in the child after the fork runs the normal
+// pin/claim/wait protocol below.
 static void mi_heap_visit_page_seize(mi_page_t* page) {
   // the page sits in the queue of a theap whose thread is gone or misbehaving; leave that queue be
   page->next = page->prev = NULL;
@@ -2915,7 +2922,7 @@ static mi_page_t* mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_arena
       while (mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) == 2) { _mi_prim_thread_yield(); }
     }
     #endif
-    if mi_unlikely(_mi_process_is_forked_child) {
+    if mi_unlikely(_mi_process_is_forked_child && vinfo->heap->prefork_theaps) {   // #293: only a heap that existed at the fork can have torn/dead-owned pages
       // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6): after a
       // multi-threaded fork() the (single-threaded) child may inherit a torn snapshot of a
       // page that another thread was allocating or freeing when the fork happened -- the
@@ -2927,6 +2934,9 @@ static mi_page_t* mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_arena
       mi_page_claim_ownership(page);   // ours now, whether or not the dead thread held it
       mi_bitmap_set(pages, slice_index);
       if (!mi_page_is_abandoned(page)) { mi_heap_visit_page_seize(page); }
+      #if MI_DEBUG > 0
+      mi_atomic_increment_relaxed(&mi_debug_forked_claim_seized);
+      #endif
       break;
     }
     if mi_unlikely(!mi_page_is_abandoned(page)) {

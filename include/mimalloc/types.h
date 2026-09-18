@@ -678,6 +678,7 @@ typedef struct mi_heap_s {
 
   _Atomic(size_t)       abandoned_count[MI_BIN_COUNT];  // total count of abandoned pages in this heap
   _Atomic(uintptr_t)    releasing;                      // set when `mi_heap_delete`/`mi_heap_destroy` starts: its pages are abandoned unmapped (Bun parity P10b, #317)
+  bool                  prefork_theaps;                 // #293: set in a forked child on every heap that existed at fork() (src/fork.c) and by `mi_heap_detach_theaps` (heap.c) when it skips a pre-fork theap; `mi_heap_visit_page_claim` (arena.c) then re-derives page ownership from the bitmaps
   mi_page_t*            os_abandoned_pages;             // list of pages that are OS allocated and not in an arena
   mi_lock_t             os_abandoned_pages_lock;        // lock for the os abandoned pages list (this lock protects list operations)
 
@@ -868,6 +869,7 @@ struct mi_tld_s {
   _Atomic(uintptr_t)    sweeper;              // thread id holding the MI_PARK_SWEEPING claim (authorises the foreign door)
   _Atomic(size_t)       purge_epoch;          // `mi_purge_all` walk progress / registry cutoff
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
+  size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept

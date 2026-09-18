@@ -266,6 +266,9 @@ terms of the MIT license. A copy of the license can be found in the file
                                               claim itself is reset to RUNNING with `park_state`.
     mi_tld_t::purge_epoch / gate_flags (#366) types.h        same loop: epoch to 0, RECLAIM_IGNORED
                                               cleared, ORPHAN set on every tld but the survivor's.
+    _mi_fork_generation / mi_tld_t::fork_gen  subproc.c/types.h  bumped once per fork; survivor's
+    (#293)                                    tld restamped in the per-tld loop; every
+                                              pre-existing heap gets `prefork_theaps` set.
 
   Cross-tld ordering (#366, not a `mi_lock_t` edge but an acquisition order all the same):
   a thread holds its OWN tld RUNNING (the owner gate, gate_depth >= 1) before it claims
@@ -291,7 +294,9 @@ terms of the MIT license. A copy of the license can be found in the file
   (which is also what Bun does, `subproc.c:416-424`). That is correct rather than merely
   pragmatic: the thread that held it does not exist in the child, so nothing will ever
   release it, and every consumer of a pre-fork thread's theaps in the child is already gated
-  on `_mi_process_is_forked_child` (#271) into re-deriving ownership from the bitmaps.
+  on `_mi_process_is_forked_child` (#271) into re-deriving ownership from the bitmaps --
+  narrowed by `_mi_tld_predates_fork(tld)` / `heap->prefork_theaps` (#293) so a tld or heap
+  that postdates the fork is exempt from that gate again.
   Verified by case_b of `test-fork-user-heap`, re-enabled in #272.
 
   ---- Why Bun's stated rule does not transfer ----
@@ -611,8 +616,10 @@ void _mi_process_fork_prepare(void) {
   // which is strictly worse. Re-initializing it in the child is correct instead: the thread that
   // held it does not exist there, so nobody will ever release it, and every consumer of a
   // pre-fork thread's theaps in the child is already gated on `_mi_process_is_forked_child`
-  // (#271). This supersedes the P5 file comment's KNOWN GAP: the gap was "we cannot even reach
-  // those locks"; with the registry we can, and re-init is the right thing to do to them.
+  // (#271), narrowed by `_mi_tld_predates_fork(tld)` / `heap->prefork_theaps` (#293) so that
+  // gate relaxes again once the child's own threads and heaps take over. This supersedes the
+  // P5 file comment's KNOWN GAP: the gap was "we cannot even reach those locks"; with the
+  // registry we can, and re-init is the right thing to do to them.
   for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {     // 4
     if (sp == sp_main) { mi_fork_acquire(MI_FORK_LOCK_TLDS, &sp->tlds_lock); }
                   else { mi_fork_acquire_local(MI_FORK_LOCK_TLDS, &sp->tlds_lock); }
@@ -727,16 +734,23 @@ void _mi_process_fork_child(void) {
   // pages belonging to a thread that did not survive the fork, since they will never be
   // relinquished normally.
   //
-  // KNOWN LIMITATION (not fixed here, same as Bun): this flag is sticky -- set once, never
-  // cleared. A forked child that goes on to spawn its own new threads (#272) permanently
-  // keeps every later `mi_heap_delete`/`mi_heap_destroy` on the force-seize branch of
-  // `mi_heap_visit_page_claim`, and `mi_heap_detach_theaps` permanently skips abandon +
-  // stats-merge for any theap not owned by the calling thread -- both needlessly
-  // pessimistic (though still memory-safe) once the process is no longer "freshly forked".
-  // Clearing it correctly needs to know when the child's thread population has resynced
-  // with reality, which is exactly the child-side-thread-spawn-after-fork question #272
-  // is scoped to answer; tracked as a follow-up in #293 once #272 lands.
+  // #293: this flag is still sticky -- set once, never cleared -- but it is no longer the
+  // whole test. `mi_heap_detach_theaps` (heap.c) and `mi_heap_visit_page_claim` (arena.c)
+  // now narrow it per tld with `_mi_tld_predates_fork(tld)` and per heap with
+  // `heap->prefork_theaps`, both driven by the `_mi_fork_generation` bump above and the
+  // per-tld restamp in the walk below. So a forked child that spawns its own threads
+  // (#272) abandons their theaps normally again, and a heap created after the fork takes the
+  // normal claim protocol again -- only a heap that already existed at THIS fork (flagged in
+  // the per-heap walk below; a vanished thread may have left one of its pages torn or owned)
+  // stays on the conservative force-seize branch, and only a theap of a thread that did not
+  // survive the fork is skipped rather than abandoned. That is the intended, permanent
+  // behavior (not a limitation to lift later).
   _mi_process_is_forked_child = true;
+  // #293: this child's generation is now new -- every tld stamped by a `mi_tld_register`
+  // (init.c) that ran before this fork predates it, and the per-tld loop below restamps
+  // the survivor's own tld with the new value. Bump exactly once per fork here, NOT once
+  // per subproc in the walk below.
+  _mi_fork_generation++;
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a): the
   // scavenger thread did not survive the fork, but every flag saying it did was inherited.
   // Clear them first -- before anything below can schedule a purge and try to wake a thread
@@ -795,14 +809,25 @@ void _mi_process_fork_child(void) {
       mi_atomic_store_relaxed(&t->park_swept, (size_t)0);
       mi_atomic_store_relaxed(&t->sweeper, (uintptr_t)0);       // #366: the claimant, if any, is gone
       mi_atomic_store_relaxed(&t->purge_epoch, (size_t)0);      // #366: no walk is in progress in the child
+      if (t == survivor_tld) { t->fork_gen = _mi_fork_generation; }   // #293: the forking thread's own
+                                                                       // tld is current in this child
       size_t gflags = mi_atomic_load_relaxed(&t->gate_flags) & ~(size_t)MI_GATE_FLAG_RECLAIM_IGNORED;
       if (t != survivor_tld) { gflags |= MI_GATE_FLAG_ORPHAN; }
+      // #293: every ORPHAN predates this fork -- only the survivor was just restamped above.
+      mi_assert_internal((gflags & MI_GATE_FLAG_ORPHAN) == 0 || t->fork_gen != _mi_fork_generation);
       mi_atomic_store_relaxed(&t->gate_flags, gflags);
     }
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       mi_lock_init(&h->theaps_lock);
       mi_lock_init(&h->arena_pages_lock);
       mi_lock_init(&h->os_abandoned_pages_lock);
+      // #293: every heap that exists at fork() time may hold a page that a vanished thread
+      // left torn or OWNED -- not only through a theap of its own (which `mi_heap_detach_theaps`
+      // also flags), but through a cross-thread free: `mi_free_block_mt` claims ownership of an
+      // abandoned page of ANY heap to collect it, and a thread caught in that window leaves the
+      // page owned forever in the child, so the normal claim loop in `mi_heap_visit_page_claim`
+      // would spin on it without end. Heaps created in this child start clear (zero-allocated).
+      h->prefork_theaps = true;
     }
   }
   _mi_options_fork_child();

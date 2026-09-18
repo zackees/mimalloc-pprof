@@ -1388,6 +1388,22 @@ if (MI_BUILD_TESTS)
     add_test(NAME test-fork-user-heap COMMAND mimalloc-test-fork-user-heap)
     set_tests_properties(test-fork-user-heap PROPERTIES TIMEOUT 300)
 
+    # test-fork-generation: regression test for #293 -- see the file's header comment.
+    # Its counter checks need MI_DEBUG>0 (the debug-full / Debug rows); the release rows
+    # still build and run it, as a no-crash/no-hang smoke test of the same fork shapes.
+    add_executable(mimalloc-test-fork-generation test/test-fork-generation.c)
+    target_compile_definitions(mimalloc-test-fork-generation PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-fork-generation PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-fork-generation PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-fork-generation PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-fork-generation PRIVATE mimalloc ${mi_libraries})
+    endif()
+    target_link_libraries(mimalloc-test-fork-generation PRIVATE Threads::Threads)
+    add_test(NAME test-fork-generation COMMAND mimalloc-test-fork-generation)
+    set_tests_properties(test-fork-generation PROPERTIES TIMEOUT 120)
+
     # test-park-handoff: imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 /
     # Bun parity P7a). Exercises `mi_on_thread_idle_start`/`_end` -- the scavenger claiming
     # and sweeping a parked thread's theaps -- including park-then-exit, park-then-cancel,

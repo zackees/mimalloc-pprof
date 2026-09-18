@@ -120,7 +120,8 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   0,                      // gate_depth (#366)
   MI_ATOMIC_VAR_INIT(0),  // sweeper
   MI_ATOMIC_VAR_INIT(0),  // purge_epoch
-  MI_ATOMIC_VAR_INIT(0)   // gate_flags
+  MI_ATOMIC_VAR_INIT(0),  // gate_flags
+  0                       // fork_gen (#293)
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -265,6 +266,7 @@ static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc) 
   mi_atomic_store_relaxed(&tld->park_state, (size_t)MI_PARK_RUNNING);
   mi_atomic_store_relaxed(&tld->sweeper, (uintptr_t)0);
   mi_atomic_store_relaxed(&tld->gate_flags, (size_t)0);
+  tld->fork_gen = _mi_fork_generation;   // #293: every tld, detached included, starts current
   if (tld->thread_id == MI_THREADID_DETACHED) {
     tld->numa_node = -1;
   }

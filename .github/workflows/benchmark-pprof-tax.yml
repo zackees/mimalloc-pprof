@@ -1,0 +1,334 @@
+name: benchmark-pprof-tax
+
+# Phase 6D (#187): quantify the pprof profiler's own compilation and runtime tax, separate
+# from the fork's baseline allocator work already covered by benchmark-scaling.yml and
+# benchmark-memory.yml. Seven configurations (upstream-baseline, fork-pprof-off,
+# fork-pprof-on-stopped, fork-pprof-off-frame-pointers, fork-pprof-sparse [512 KiB],
+# fork-pprof-aggressive [4 KiB], fork-pprof-rate-1-stress) x five workloads x {1, physical
+# cores} threads x >=15 paired blocks, on the same hosted runner the other benchmark
+# workflows use. rate-1-stress samples every allocation, which is a stress probe rather than
+# a configuration anyone would run in production: it runs under its own wall-time budget,
+# its failures are recorded as invalid samples instead of failing the run, and it is badged
+# stress-only and can never be the headline. Raw profiles (the actual pprof sample dumps) and the run manifest
+# carry data nobody outside this job needs and never reach the public site/Pages artifacts;
+# they live only in the private raw artifact. Publishes through the same sealed
+# benchmark_report.py pipeline (render / validate-site / prepare-branch / validate-revision /
+# audit-pages) and the same benchmark-stats branch and Pages deployment as
+# benchmark-scaling.yml and benchmark-memory.yml -- there is no second publisher.
+# ci/check_benchmark_pprof_tax_workflow.py pins PPROF_TAX_MIN_BLOCKS in
+# rust/benchmark-suite/src/pprof_tax.rs to the same block count this workflow requires for a
+# publishable run, so the two halves of the contract cannot drift apart silently. The
+# critical path across every job in the publication chain is bounded at 60 minutes.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full (publishable, >=15 blocks) or smoke (<15 blocks, artifact only)"
+        type: choice
+        options: [full, smoke]
+        default: full
+      run_seed:
+        description: "Explicit seed (empty derives and records one)"
+        required: false
+        type: string
+      blocks:
+        description: "Blocks per cell (full must use >=15; smoke must use <15)"
+        type: number
+        default: 15
+        required: false
+  schedule:
+    - cron: "37 4 * * 0"
+
+concurrency:
+  group: benchmark-stats-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PUBLISH_REF: refs/heads/benchmark-stats
+
+jobs:
+  build-and-measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      publish_eligible: ${{ steps.eligibility.outputs.publish_eligible }}
+      mode: ${{ inputs.mode || 'full' }}
+      prior_branch_sha: ${{ steps.prior.outputs.prior_sha }}
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
+      - name: build pprof-tax configurations
+        run: |
+          set -euxo pipefail
+          python3 ci/build_pprof_tax_configurations.py --build-root rust/target/release --jobs "$(nproc)"
+      - name: resolve prior public site
+        id: prior
+        run: |
+          set -euxo pipefail
+          git ls-remote --exit-code origin "$PUBLISH_REF" >/dev/null
+          PRIOR_SHA=$(git ls-remote origin "$PUBLISH_REF" | awk '{print $1}')
+          test -n "$PRIOR_SHA"
+          echo "prior_sha=$PRIOR_SHA" >> "$GITHUB_OUTPUT"
+          git fetch origin "$PUBLISH_REF" --depth=1
+          git checkout FETCH_HEAD -- history.jsonl latest.json
+          test -s history.jsonl
+          test -s latest.json
+          cp history.jsonl "$RUNNER_TEMP/history-input.jsonl"
+          cp latest.json "$RUNNER_TEMP/base-latest.json"
+      - name: build benchmark suite
+        run: |
+          set -euxo pipefail
+          cd rust
+          soldr cargo build -p benchmark-suite --release --locked
+      - name: determine run seed
+        id: seed
+        env:
+          INPUT_RUN_SEED: ${{ inputs.run_seed }}
+        run: |
+          set -euo pipefail
+          SEED="$INPUT_RUN_SEED"
+          if [ -z "$SEED" ]; then
+            SEED=$(( RANDOM << 17 | RANDOM << 1 | RANDOM >> 14 ))
+          fi
+          case "$SEED" in
+            *[!0-9]*) echo "::error::run_seed must be a positive decimal integer"; exit 1 ;;
+          esac
+          test "$SEED" -gt 0
+          echo "seed=$SEED" >> "$GITHUB_OUTPUT"
+      - name: run pprof-tax matrix
+        env:
+          PPROF_TAX_MODE: ${{ inputs.mode || 'full' }}
+          PPROF_TAX_BLOCKS: ${{ inputs.blocks || 15 }}
+          PPROF_TAX_RUN_SEED: ${{ steps.seed.outputs.seed }}
+        run: |
+          set -euxo pipefail
+          cd rust
+          MODE="$PPROF_TAX_MODE"
+          BLOCKS="$PPROF_TAX_BLOCKS"
+          SMOKE_FLAG=""
+          if [ "$MODE" = "smoke" ]; then
+            test "$BLOCKS" -ge 1 && test "$BLOCKS" -lt 15
+            SMOKE_FLAG="--reduced-smoke"
+          else
+            test "$BLOCKS" -ge 15
+          fi
+          soldr cargo run -p benchmark-suite --bin benchmark-pprof-tax-run --release -- \
+            $SMOKE_FLAG \
+            --blocks "$BLOCKS" \
+            --run-seed "$PPROF_TAX_RUN_SEED" \
+            --manifest target/release/pprof-tax/pprof-tax-manifest.json \
+            --output-dir "$RUNNER_TEMP/pprof-tax-output-${{ github.run_id }}"
+      - name: digest raw artifact
+        id: raw
+        if: success()
+        run: |
+          set -euxo pipefail
+          DIGEST=$(sha256sum "$RUNNER_TEMP/pprof-tax-output-${{ github.run_id }}/pprof-tax-raw-run.json" | awk '{print $1}')
+          echo "sha256=$DIGEST" >> "$GITHUB_OUTPUT"
+      - name: validate and overlay complete pprof-tax report
+        if: (inputs.mode || 'full') == 'full'
+        run: |
+          set -euxo pipefail
+          cd rust
+          soldr cargo run -p benchmark-suite --bin benchmark-pprof-tax-validate --release -- \
+            --input "$RUNNER_TEMP/pprof-tax-output-${{ github.run_id }}/pprof-tax-raw-run.json" \
+            --manifest "$RUNNER_TEMP/pprof-tax-output-${{ github.run_id }}/pprof-tax-manifest.json" \
+            --raw-artifact-sha256 "${{ steps.raw.outputs.sha256 }}" \
+            --raw-artifact-name "benchmark-pprof-tax-raw-${{ github.run_id }}" \
+            --base-latest "$RUNNER_TEMP/base-latest.json" \
+            --report-out "$RUNNER_TEMP/pprof-tax-report.json" \
+            --latest-out "$RUNNER_TEMP/latest.json"
+      - name: render sealed site
+        if: (inputs.mode || 'full') == 'full'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/site"
+          python ci/benchmark_report.py render \
+            --input "$RUNNER_TEMP/latest.json" \
+            --history-in "$RUNNER_TEMP/history-input.jsonl" \
+            --output-dir "$RUNNER_TEMP/site" \
+            --detached-digest-out "$RUNNER_TEMP/manifest.sha256"
+          python ci/benchmark_report.py validate-site \
+            --site-dir "$RUNNER_TEMP/site" \
+            --detached-digest "$RUNNER_TEMP/manifest.sha256"
+      - name: compute publication eligibility
+        id: eligibility
+        if: success()
+        env:
+          PPROF_TAX_REPOSITORY: ${{ github.repository }}
+          PPROF_TAX_REF: ${{ github.ref }}
+          PPROF_TAX_MODE: ${{ inputs.mode || 'full' }}
+          PPROF_TAX_BLOCKS: ${{ inputs.blocks || 15 }}
+        run: |
+          set -euo pipefail
+          ELIGIBLE=false
+          if [ "$PPROF_TAX_REPOSITORY" = "zackees/mimalloc-pprof" ] && \
+             [ "$PPROF_TAX_REF" = "refs/heads/main" ] && \
+             [ "$PPROF_TAX_MODE" = "full" ] && \
+             [ "$PPROF_TAX_BLOCKS" -ge 15 ]; then
+            ELIGIBLE=true
+          fi
+          echo "publish_eligible=$ELIGIBLE" >> "$GITHUB_OUTPUT"
+      - name: upload raw pprof-tax artifact
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: benchmark-pprof-tax-raw-${{ github.run_id }}
+          overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
+          path: "${{ runner.temp }}/pprof-tax-output-${{ github.run_id }}/"
+          include-hidden-files: true
+          retention-days: 30
+          if-no-files-found: error
+      - name: upload validation artifact
+        if: (inputs.mode || 'full') == 'full' && always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: benchmark-pprof-tax-validation-${{ github.run_id }}
+          overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
+          path: |
+            ${{ runner.temp }}/pprof-tax-report.json
+            ${{ runner.temp }}/manifest.sha256
+          retention-days: 30
+          if-no-files-found: error
+      - name: upload site artifact
+        if: (inputs.mode || 'full') == 'full' && success()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: benchmark-pprof-tax-site-${{ github.run_id }}
+          overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
+          path: ${{ runner.temp }}/site/
+          include-hidden-files: true
+          retention-days: 30
+          if-no-files-found: error
+
+  artifact-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    needs: build-and-measure
+    if: needs.build-and-measure.outputs.mode == 'full'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-pprof-tax-site-${{ github.run_id }}
+          path: audit/site/
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-pprof-tax-validation-${{ github.run_id }}
+          path: audit/validation/
+      - name: audit sealed pprof-tax site
+        run: |
+          python ci/benchmark_report.py validate-site \
+            --site-dir audit/site/ \
+            --detached-digest audit/validation/manifest.sha256
+
+  publish-branch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    needs: [build-and-measure, artifact-audit]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-pprof-tax-site-${{ github.run_id }}
+          path: site-temp/
+      - name: publish exact pprof-tax site revision
+        run: |
+          set -euxo pipefail
+          MANIFEST_DIGEST=$(sha256sum site-temp/manifest.json | awk '{print $1}')
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          WORKTREE=$(mktemp -d)
+          git worktree add --detach "$WORKTREE" HEAD
+          python ci/benchmark_report.py prepare-branch \
+            --worktree "$WORKTREE" \
+            --site-dir "$GITHUB_WORKSPACE/site-temp"
+          cd "$WORKTREE"
+          git commit -m "benchmark-pprof-tax run=${{ github.run_id }}/${{ github.run_attempt }} src=${{ github.sha }} manifest=$MANIFEST_DIGEST"
+          python "$GITHUB_WORKSPACE/ci/benchmark_report.py" validate-revision \
+            --repository "$WORKTREE" \
+            --revision HEAD \
+            --site-dir "$GITHUB_WORKSPACE/site-temp"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push origin "HEAD:$PUBLISH_REF" --force-with-lease="refs/heads/benchmark-stats:${{ needs.build-and-measure.outputs.prior_branch_sha }}"
+          test "$(git ls-remote origin "$PUBLISH_REF" | awk '{print $1}')" = "$(git rev-parse HEAD)"
+          cd "$GITHUB_WORKSPACE"
+          git worktree remove --force "$WORKTREE"
+
+  package-pages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    needs: [build-and-measure, artifact-audit, publish-branch]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-pprof-tax-site-${{ github.run_id }}
+          path: _site/
+      - uses: actions/upload-pages-artifact@v4.0.0
+        with:
+          path: _site/
+          include-hidden-files: true
+
+  deploy-pages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    needs: [build-and-measure, artifact-audit, publish-branch, package-pages]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4.0.5
+        id: deployment
+
+  publication-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    needs: [build-and-measure, publish-branch, deploy-pages]
+    if: needs.build-and-measure.outputs.publish_eligible == 'true' && always()
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-pprof-tax-site-${{ github.run_id }}
+          path: audit/site/
+      - name: audit pprof-tax publication
+        run: |
+          set -euxo pipefail
+          git fetch origin refs/heads/benchmark-stats --depth=1
+          python ci/benchmark_report.py validate-revision \
+            --repository . \
+            --revision FETCH_HEAD \
+            --site-dir audit/site/
+          python ci/benchmark_report.py audit-pages \
+            --site-dir audit/site/ \
+            --page-url "${{ needs.deploy-pages.outputs.page_url }}"
+          echo "Pprof-tax publication branch and Pages bytes match." >> "$GITHUB_STEP_SUMMARY"

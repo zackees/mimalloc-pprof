@@ -112,7 +112,7 @@ TOP_LEVEL_FIELDS = {
     "reproduction_command",
     "actions_run_url",
 }
-OPTIONAL_TOP_LEVEL_FIELDS = {"memory", "latency", "scaling"}
+OPTIONAL_TOP_LEVEL_FIELDS = {"memory", "latency", "scaling", "pprof_tax"}
 HISTORY_FIELDS = {
     "history_schema_version",
     "statistics_version",
@@ -124,7 +124,7 @@ HISTORY_FIELDS = {
     "absolute_summaries",
     "paired_summaries",
 }
-OPTIONAL_HISTORY_FIELDS = {"memory", "latency", "scaling"}
+OPTIONAL_HISTORY_FIELDS = {"memory", "latency", "scaling", "pprof_tax"}
 RUN_FIELDS = {
     "source_repository",
     "source_sha",
@@ -266,7 +266,7 @@ ROLES = {
     "benchmark-fragmentation.png": "fragmentation-panel",
     "benchmark-latency.png": "latency-panel",
     "benchmark-latency-tail.png": "latency-tail-panel",
-    "benchmark-pprof-tax.png": "pending-pprof-tax-panel",
+    "benchmark-pprof-tax.png": "pprof-tax-panel",
     **dict.fromkeys(SCALING_PANELS.values(), "scaling-panel"),
 }
 
@@ -2249,6 +2249,16 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
         }
         if len(fork_sources) != 1:
             fail(f"{label}.scaling: exactly one mimalloc-pprof build must be measured")
+    pprof_tax = latest.get("pprof_tax")
+    if pprof_tax is not None:
+        pprof_tax_report = validate_pprof_tax_report(pprof_tax, f"{label}.pprof_tax")
+        # Fail closed on provenance: a pprof-tax section is only meaningful against the
+        # exact upstream-mimalloc commit the core run itself pins, never a stale one.
+        if ("upstream-mimalloc", str(pprof_tax_report["upstream_source_sha"])) not in core_pins:
+            fail(
+                f"{label}.pprof_tax.upstream_source_sha: does not match the core "
+                "upstream-mimalloc pin"
+            )
     pending = list_value(latest.get("pending_metrics"), f"{label}.pending_metrics")
     expected_pending = tuple(
         metric
@@ -2256,7 +2266,7 @@ def validate_latest(latest: dict[str, object], label: str) -> None:
             ("memory", memory is not None),
             ("latency", latency is not None),
             ("scaling", scaling is not None),
-            ("pprof-tax", False),
+            ("pprof-tax", pprof_tax is not None),
         )
         if not complete
     )
@@ -2360,6 +2370,14 @@ def history_row(
             for key, value in scaling.items()
             if key not in {"invalid_reason", "runner", "topology", "patterns", "raw_samples"}
         } | {"runner_fingerprint_sha256": runner["fingerprint_sha256"]}
+    if include_optional_metrics and "pprof_tax" in latest:
+        pprof_tax = validate_pprof_tax_report(latest["pprof_tax"], "latest.pprof_tax")
+        runner = object_value(pprof_tax["runner"], "latest.pprof_tax.runner")
+        row["pprof_tax"] = {
+            key: value
+            for key, value in pprof_tax.items()
+            if key not in PPROF_TAX_COMPACT_DROPPED_FIELDS
+        } | {"runner_fingerprint_sha256": runner["fingerprint_sha256"]}
     return row
 
 
@@ -2428,6 +2446,8 @@ def validate_history_row(value: object, label: str) -> dict[str, object]:
         validate_latency_report(row["latency"], f"{label}.latency", compact=True)
     if "scaling" in row:
         validate_scaling_report(row["scaling"], f"{label}.scaling", compact=True)
+    if "pprof_tax" in row:
+        validate_pprof_tax_report(row["pprof_tax"], f"{label}.pprof_tax", compact=True)
     return row
 
 
@@ -4280,6 +4300,697 @@ def pending_scaling_svg(pattern: str, reason: str) -> bytes:
     return ("\n".join(parts) + "\n").encode("utf-8")
 
 
+# #187: pprof compilation and runtime tax. Unlike memory/latency/scaling this section
+# carries no raw per-sample matrix -- it is a fixed comparison table computed and signed
+# off by the Rust validator `benchmark-pprof-tax-validate` from a private raw artifact --
+# so Python only validates structure and renders; it never recomputes a ratio.
+PPROF_TAX_SCHEMA = "pprof-tax-v1"
+PPROF_TAX_MIN_BLOCKS = 15
+# The `upstream/dev3` commit this repo is pinned to (see CLAUDE.md's Repo facts). Recorded
+# here for readers of this file; the section's own `upstream_source_sha` is checked against
+# the core run's `upstream-mimalloc` pin in `validate_latest`, not against this literal --
+# that pin moves on a documented, reviewed bump, and this constant is not re-verified on
+# every such bump.
+PPROF_TAX_UPSTREAM_COMMIT = "6def7be9458fb8a97b8323af3fb0b0ae04387065"
+# Canonical configuration order. The seven builds the tax comparisons are measured across,
+# fixed by protocol so a report can be checked against a table instead of trusting field
+# names alone.
+PPROF_TAX_CONFIGURATION_IDS = (
+    "upstream-baseline",
+    "fork-pprof-off",
+    "fork-pprof-on-stopped",
+    "fork-pprof-off-frame-pointers",
+    "fork-pprof-sparse",
+    "fork-pprof-aggressive",
+    "fork-pprof-rate-1-stress",
+)
+PPROF_TAX_ROLES = (
+    "context",
+    "control",
+    "production-oriented",
+    "aggressive",
+    "stress-only",
+)
+PPROF_TAX_FRAME_POINTER_POLICIES = ("omitted", "forced-flag", "cmake-mi-pprof-implicit")
+# (comparison_id, numerator_configuration_id, denominator_configuration_id, badge), in the
+# fixed order the section publishes `comparisons` and every cell's six `cell_comparisons`.
+PPROF_TAX_COMPARISONS = (
+    ("fork-overlay-tax", "fork-pprof-off", "upstream-baseline", "context"),
+    ("instrumentation-tax", "fork-pprof-on-stopped", "fork-pprof-off", "control"),
+    ("frame-pointer-tax", "fork-pprof-off-frame-pointers", "fork-pprof-off", "control"),
+    ("sparse-sampling-tax", "fork-pprof-sparse", "fork-pprof-on-stopped", "production-oriented"),
+    ("aggressive-sampling-tax", "fork-pprof-aggressive", "fork-pprof-on-stopped", "aggressive"),
+    ("rate-1-stress", "fork-pprof-rate-1-stress", "fork-pprof-on-stopped", "stress-only"),
+)
+# The headline is fixed by protocol, not chosen at render time: sparse is the only rate this
+# project recommends for production, so it is the only comparison a reader should see as
+# "the" pprof tax. rate-1-stress trades correctness for coverage and must never read as
+# steady-state overhead.
+PPROF_TAX_HEADLINE_INDEX = 3
+PPROF_TAX_COMPARISON_SUPPORT_STATUSES = (
+    "supported",
+    "unsupported",
+    "invalid",
+    "insufficient-paired-blocks",
+)
+# Display text for every badge/support-status value the section can carry. Deliberately one
+# shared table: a comparison row falls back to its support status when it has no measured
+# badge to show, so both vocabularies must render legibly side by side.
+PPROF_TAX_BADGE_TEXT = {
+    "context": "context",
+    "control": "control",
+    "production-oriented": "production-oriented",
+    "aggressive": "aggressive",
+    "stress-only": "stress-only",
+    "supported": "supported",
+    "unsupported": "unsupported",
+    "invalid": "invalid",
+    "insufficient-paired-blocks": "insufficient paired blocks",
+}
+PPROF_TAX_COMPARISON_METRIC = "throughput-operations-per-second"
+PPROF_TAX_CONFIGURATION_FIELDS = {
+    "configuration_id",
+    "compiled_configuration_id",
+    "role",
+    "pprof_compiled",
+    "pprof_active",
+    "sampling_interval_bytes",
+    "frame_pointer_policy",
+    "support_status",
+    "unsupported_reason",
+    "executable_sha256",
+    "valid_samples",
+    "invalid_samples",
+}
+PPROF_TAX_COMPARISON_FIELDS = {
+    "comparison_id",
+    "label",
+    "numerator_configuration_id",
+    "denominator_configuration_id",
+    "scenario_id",
+    "thread_point",
+    "metric_id",
+    "badge",
+    "support_status",
+    "valid_block_count",
+    "ratio",
+    "ratio_lower",
+    "ratio_upper",
+    "overhead",
+    "overhead_lower",
+    "overhead_upper",
+    "headline_eligible",
+    "reason",
+}
+PPROF_TAX_CELL_FIELDS = {"scenario_id", "thread_point", "thread_count", "operations_per_worker"}
+PPROF_TAX_TELEMETRY_FIELDS = {
+    "configuration_id",
+    "scenario_id",
+    "thread_point",
+    "valid_runs",
+    "invalid_runs",
+    "median_sample_count",
+    "median_sampled_bytes",
+    "max_dropped_records",
+    "max_profiler_arena_bytes",
+    "median_profile_size_bytes",
+    "validity_status",
+    "invalid_reasons",
+}
+PPROF_TAX_RSS_SUMMARY_FIELDS = {
+    "configuration_id",
+    "scenario_id",
+    "thread_point",
+    "median_peak_rss_bytes",
+    "median_end_rss_delta_bytes",
+}
+PPROF_TAX_REPORT_FIELDS = {
+    "metric_schema_version",
+    "status",
+    "mode",
+    "metric_comparison_key",
+    "run",
+    "runner",
+    "run_seed",
+    "blocks",
+    "minimum_paired_blocks",
+    "hosted_runner_scope",
+    "configuration_manifest_sha256",
+    "raw_artifact_sha256",
+    "raw_artifact_name",
+    "fork_source_sha",
+    "upstream_source_sha",
+    "intervals",
+    "configurations",
+    "cells",
+    "comparisons",
+    "cell_comparisons",
+    "headline",
+    "active_telemetry",
+    "rss_summaries",
+    "latency",
+}
+#: Fields a carried/history projection of the section drops, mirroring the shapes memory,
+#: latency, and scaling strip for their own compact forms (see `history_row`).
+PPROF_TAX_COMPACT_DROPPED_FIELDS = {
+    "runner",
+    "configurations",
+    "cells",
+    "cell_comparisons",
+    "active_telemetry",
+    "rss_summaries",
+}
+
+
+def validate_pprof_tax_configuration(
+    value: object, label: str, expected_id: str
+) -> dict[str, object]:
+    configuration = object_value(value, label)
+    exact_fields(configuration, PPROF_TAX_CONFIGURATION_FIELDS, label)
+    if configuration.get("configuration_id") != expected_id:
+        fail(f"{label}.configuration_id: expected {expected_id} in canonical order")
+    string_value(
+        configuration.get("compiled_configuration_id"), f"{label}.compiled_configuration_id"
+    )
+    if configuration.get("role") not in PPROF_TAX_ROLES:
+        fail(f"{label}.role: unsupported role")
+    compiled = configuration.get("pprof_compiled")
+    active = configuration.get("pprof_active")
+    if not isinstance(compiled, bool) or not isinstance(active, bool):
+        fail(f"{label}.pprof_compiled/pprof_active: expected boolean")
+    if active and not compiled:
+        fail(f"{label}: pprof_active is impossible with pprof_compiled false")
+    interval = configuration.get("sampling_interval_bytes")
+    if interval is None:
+        if active:
+            fail(f"{label}.sampling_interval_bytes: an active configuration needs an interval")
+    else:
+        int_value(interval, f"{label}.sampling_interval_bytes", 1)
+        if not active:
+            fail(f"{label}.sampling_interval_bytes: must be null unless pprof_active")
+    if expected_id == "upstream-baseline" and interval is not None:
+        fail(f"{label}.sampling_interval_bytes: upstream-baseline carries no interval")
+    if configuration.get("frame_pointer_policy") not in PPROF_TAX_FRAME_POINTER_POLICIES:
+        fail(f"{label}.frame_pointer_policy: unsupported policy")
+    support_status = configuration.get("support_status")
+    if support_status not in ("supported", "unsupported"):
+        fail(f"{label}.support_status: unsupported value")
+    reason = configuration.get("unsupported_reason")
+    digest = configuration.get("executable_sha256")
+    if support_status == "supported":
+        if reason is not None:
+            fail(f"{label}.unsupported_reason: a supported configuration carries no reason")
+        if not HEX_64.fullmatch(string_value(digest, f"{label}.executable_sha256")):
+            fail(f"{label}.executable_sha256: invalid digest")
+    else:
+        string_value(reason, f"{label}.unsupported_reason")
+        if digest is not None:
+            fail(f"{label}.executable_sha256: an unsupported configuration built no executable")
+    int_value(configuration.get("valid_samples"), f"{label}.valid_samples")
+    int_value(configuration.get("invalid_samples"), f"{label}.invalid_samples")
+    return configuration
+
+
+def validate_pprof_tax_comparison(
+    value: object,
+    label: str,
+    expected: tuple[str, str, str, str],
+    *,
+    cell: tuple[str, str] | None,
+) -> dict[str, object]:
+    comparison = object_value(value, label)
+    exact_fields(comparison, PPROF_TAX_COMPARISON_FIELDS, label)
+    comparison_id, numerator, denominator, badge = expected
+    if (
+        comparison.get("comparison_id") != comparison_id
+        or comparison.get("numerator_configuration_id") != numerator
+        or comparison.get("denominator_configuration_id") != denominator
+        or comparison.get("badge") != badge
+    ):
+        fail(f"{label}: does not match the fixed comparison table")
+    string_value(comparison.get("label"), f"{label}.label")
+    if comparison.get("metric_id") != PPROF_TAX_COMPARISON_METRIC:
+        fail(f"{label}.metric_id: unsupported metric")
+    if cell is None:
+        if comparison.get("scenario_id") is not None or comparison.get("thread_point") is not None:
+            fail(f"{label}: an aggregate comparison must not name a cell")
+    elif comparison.get("scenario_id") != cell[0] or comparison.get("thread_point") != cell[1]:
+        fail(f"{label}: cell comparison identity does not match its cell")
+    support_status = comparison.get("support_status")
+    if support_status not in PPROF_TAX_COMPARISON_SUPPORT_STATUSES:
+        fail(f"{label}.support_status: unsupported value")
+    valid_blocks = int_value(comparison.get("valid_block_count"), f"{label}.valid_block_count")
+    numeric_fields = (
+        "ratio",
+        "ratio_lower",
+        "ratio_upper",
+        "overhead",
+        "overhead_lower",
+        "overhead_upper",
+    )
+    reason = comparison.get("reason")
+    if support_status == "supported":
+        if valid_blocks < PPROF_TAX_MIN_BLOCKS:
+            fail(
+                f"{label}.valid_block_count: a supported comparison needs at least "
+                f"{PPROF_TAX_MIN_BLOCKS} blocks"
+            )
+        if reason is not None:
+            fail(f"{label}.reason: a supported comparison carries no reason")
+        ratio = float_value(comparison.get("ratio"), f"{label}.ratio", True)
+        ratio_lower = float_value(comparison.get("ratio_lower"), f"{label}.ratio_lower", True)
+        ratio_upper = float_value(comparison.get("ratio_upper"), f"{label}.ratio_upper", True)
+        overhead = float_value(comparison.get("overhead"), f"{label}.overhead")
+        overhead_lower = float_value(comparison.get("overhead_lower"), f"{label}.overhead_lower")
+        overhead_upper = float_value(comparison.get("overhead_upper"), f"{label}.overhead_upper")
+        if not ratio_lower <= ratio <= ratio_upper:
+            fail(f"{label}: ratio is outside its own confidence interval")
+        if abs(overhead - (1.0 - ratio)) > 1e-9:
+            fail(f"{label}.overhead: inconsistent with ratio")
+        if abs(overhead_lower - (1.0 - ratio_upper)) > 1e-9:
+            fail(f"{label}.overhead_lower: inconsistent with ratio_upper")
+        if abs(overhead_upper - (1.0 - ratio_lower)) > 1e-9:
+            fail(f"{label}.overhead_upper: inconsistent with ratio_lower")
+    else:
+        if support_status == "insufficient-paired-blocks" and valid_blocks >= PPROF_TAX_MIN_BLOCKS:
+            fail(
+                f"{label}.valid_block_count: insufficient-paired-blocks needs fewer than "
+                f"{PPROF_TAX_MIN_BLOCKS} blocks"
+            )
+        if any(comparison.get(field) is not None for field in numeric_fields):
+            fail(f"{label}: a non-supported comparison must carry no numbers")
+        string_value(reason, f"{label}.reason")
+    if not isinstance(comparison.get("headline_eligible"), bool):
+        fail(f"{label}.headline_eligible: expected boolean")
+    return comparison
+
+
+def validate_pprof_tax_interval_bytes(value: object, label: str, expected: int) -> None:
+    if int_value(value, label, 1) != expected:
+        fail(f"{label}: expected exactly {expected} bytes")
+
+
+def validate_pprof_tax_report(
+    value: object, label: str, *, compact: bool = False
+) -> dict[str, object]:
+    report = object_value(value, label)
+    required = PPROF_TAX_REPORT_FIELDS - (PPROF_TAX_COMPACT_DROPPED_FIELDS if compact else set())
+    if compact:
+        required = required | {"runner_fingerprint_sha256"}
+    exact_fields(report, required, label)
+    if report.get("metric_schema_version") != PPROF_TAX_SCHEMA or report.get("status") != "valid":
+        fail(f"{label}: a valid {PPROF_TAX_SCHEMA} report is required")
+    if report.get("mode") != "full":
+        fail(f"{label}.mode: only a full run may publish")
+    comparison_digest(report.get("metric_comparison_key"), f"{label}.metric_comparison_key")
+    validate_run(report.get("run"), f"{label}.run")
+    if compact:
+        digest = string_value(
+            report.get("runner_fingerprint_sha256"), f"{label}.runner_fingerprint_sha256"
+        )
+        if not HEX_64.fullmatch(digest):
+            fail(f"{label}.runner_fingerprint_sha256: invalid")
+    else:
+        validate_runner(report.get("runner"), f"{label}.runner")
+    int_value(report.get("run_seed"), f"{label}.run_seed", 1)
+    int_value(report.get("blocks"), f"{label}.blocks", PPROF_TAX_MIN_BLOCKS)
+    if (
+        int_value(
+            report.get("minimum_paired_blocks"),
+            f"{label}.minimum_paired_blocks",
+            PPROF_TAX_MIN_BLOCKS,
+        )
+        != PPROF_TAX_MIN_BLOCKS
+    ):
+        fail(f"{label}.minimum_paired_blocks: protocol fixes {PPROF_TAX_MIN_BLOCKS}")
+    string_value(report.get("hosted_runner_scope"), f"{label}.hosted_runner_scope")
+    for field in ("configuration_manifest_sha256", "raw_artifact_sha256"):
+        if not HEX_64.fullmatch(string_value(report.get(field), f"{label}.{field}")):
+            fail(f"{label}.{field}: invalid digest")
+    string_value(report.get("raw_artifact_name"), f"{label}.raw_artifact_name")
+    if not HEX_40.fullmatch(
+        string_value(report.get("fork_source_sha"), f"{label}.fork_source_sha")
+    ):
+        fail(f"{label}.fork_source_sha: invalid")
+    if not HEX_40.fullmatch(
+        string_value(report.get("upstream_source_sha"), f"{label}.upstream_source_sha")
+    ):
+        fail(f"{label}.upstream_source_sha: invalid")
+    intervals = object_value(report.get("intervals"), f"{label}.intervals")
+    exact_fields(
+        intervals,
+        {"sparse_bytes", "sparse_rationale", "aggressive_bytes", "stress_bytes"},
+        f"{label}.intervals",
+    )
+    validate_pprof_tax_interval_bytes(
+        intervals.get("sparse_bytes"), f"{label}.intervals.sparse_bytes", 524288
+    )
+    validate_pprof_tax_interval_bytes(
+        intervals.get("aggressive_bytes"), f"{label}.intervals.aggressive_bytes", 4096
+    )
+    validate_pprof_tax_interval_bytes(
+        intervals.get("stress_bytes"), f"{label}.intervals.stress_bytes", 1
+    )
+    string_value(intervals.get("sparse_rationale"), f"{label}.intervals.sparse_rationale")
+
+    cell_keys: tuple[tuple[str, str], ...] = ()
+    if not compact:
+        configurations = list_value(report.get("configurations"), f"{label}.configurations")
+        if len(configurations) != len(PPROF_TAX_CONFIGURATION_IDS):
+            fail(
+                f"{label}.configurations: expected exactly "
+                f"{len(PPROF_TAX_CONFIGURATION_IDS)} rows"
+            )
+        parsed_configurations = [
+            validate_pprof_tax_configuration(
+                item, f"{label}.configurations[{index}]", PPROF_TAX_CONFIGURATION_IDS[index]
+            )
+            for index, item in enumerate(configurations)
+        ]
+        active_ids = {
+            cast(str, item["configuration_id"])
+            for item in parsed_configurations
+            if item.get("pprof_active") is True
+        }
+        cells = [
+            object_value(item, f"{label}.cells[{index}]")
+            for index, item in enumerate(list_value(report.get("cells"), f"{label}.cells"))
+        ]
+        seen_cells: set[tuple[str, str]] = set()
+        for index, cell in enumerate(cells):
+            cell_label = f"{label}.cells[{index}]"
+            exact_fields(cell, PPROF_TAX_CELL_FIELDS, cell_label)
+            scenario = string_value(cell.get("scenario_id"), f"{cell_label}.scenario_id")
+            point = string_value(cell.get("thread_point"), f"{cell_label}.thread_point")
+            int_value(cell.get("thread_count"), f"{cell_label}.thread_count", 1)
+            int_value(cell.get("operations_per_worker"), f"{cell_label}.operations_per_worker", 1)
+            key = (scenario, point)
+            if key in seen_cells:
+                fail(f"{cell_label}: duplicate cell")
+            seen_cells.add(key)
+        if not seen_cells:
+            fail(f"{label}.cells: at least one cell is required")
+        cell_keys = tuple(sorted(seen_cells))
+
+    comparisons = [
+        object_value(item, f"{label}.comparisons[{index}]")
+        for index, item in enumerate(list_value(report.get("comparisons"), f"{label}.comparisons"))
+    ]
+    if len(comparisons) != len(PPROF_TAX_COMPARISONS):
+        fail(f"{label}.comparisons: expected exactly {len(PPROF_TAX_COMPARISONS)} entries")
+    for index, (item, expected) in enumerate(zip(comparisons, PPROF_TAX_COMPARISONS)):
+        parsed = validate_pprof_tax_comparison(
+            item, f"{label}.comparisons[{index}]", expected, cell=None
+        )
+        if expected[0] == "frame-pointer-tax" and parsed.get("support_status") not in (
+            "supported",
+            "unsupported",
+        ):
+            fail(
+                f"{label}.comparisons[{index}]: frame-pointer-tax must resolve supported or "
+                "unsupported"
+            )
+        is_headline_slot = index == PPROF_TAX_HEADLINE_INDEX
+        if parsed.get("headline_eligible") is True:
+            if not is_headline_slot:
+                fail(
+                    f"{label}.comparisons[{index}]: only "
+                    f"{PPROF_TAX_COMPARISONS[PPROF_TAX_HEADLINE_INDEX][0]} may be headline "
+                    "eligible"
+                )
+        elif is_headline_slot:
+            fail(f"{label}.comparisons[{index}]: the headline comparison must be headline eligible")
+        if is_headline_slot and (
+            parsed.get("support_status") != "supported"
+            or int_value(
+                parsed.get("valid_block_count"), f"{label}.comparisons[{index}].valid_block_count"
+            )
+            < PPROF_TAX_MIN_BLOCKS
+        ):
+            fail(
+                f"{label}.comparisons[{index}]: the headline comparison must be a supported "
+                f"result with at least {PPROF_TAX_MIN_BLOCKS} blocks"
+            )
+    headline = object_value(report.get("headline"), f"{label}.headline")
+    if headline != comparisons[PPROF_TAX_HEADLINE_INDEX]:
+        fail(f"{label}.headline: must equal comparisons[{PPROF_TAX_HEADLINE_INDEX}]")
+
+    if not compact:
+        raw_cell_comparisons = list_value(
+            report.get("cell_comparisons"), f"{label}.cell_comparisons"
+        )
+        if len(raw_cell_comparisons) != len(cell_keys) * len(PPROF_TAX_COMPARISONS):
+            fail(f"{label}.cell_comparisons: expected exactly one set of 6 per cell")
+        grouped: dict[tuple[str, str], dict[str, dict[str, object]]] = {}
+        for index, item in enumerate(raw_cell_comparisons):
+            preview = object_value(item, f"{label}.cell_comparisons[{index}]")
+            scenario = string_value(
+                preview.get("scenario_id"), f"{label}.cell_comparisons[{index}].scenario_id"
+            )
+            point = string_value(
+                preview.get("thread_point"), f"{label}.cell_comparisons[{index}].thread_point"
+            )
+            if (scenario, point) not in cell_keys:
+                fail(f"{label}.cell_comparisons[{index}]: undeclared cell")
+            comparison_id = preview.get("comparison_id")
+            expected = next(
+                (candidate for candidate in PPROF_TAX_COMPARISONS if candidate[0] == comparison_id),
+                None,
+            )
+            if expected is None:
+                fail(f"{label}.cell_comparisons[{index}]: unknown comparison id")
+            parsed = validate_pprof_tax_comparison(
+                item, f"{label}.cell_comparisons[{index}]", expected, cell=(scenario, point)
+            )
+            if parsed.get("headline_eligible") is True:
+                fail(
+                    f"{label}.cell_comparisons[{index}]: a per-cell comparison is never "
+                    "headline eligible"
+                )
+            bucket = grouped.setdefault((scenario, point), {})
+            if cast(str, comparison_id) in bucket:
+                fail(f"{label}.cell_comparisons[{index}]: duplicate comparison for its cell")
+            bucket[cast(str, comparison_id)] = parsed
+        expected_ids = {candidate[0] for candidate in PPROF_TAX_COMPARISONS}
+        if set(grouped) != set(cell_keys) or any(
+            set(bucket) != expected_ids for bucket in grouped.values()
+        ):
+            fail(f"{label}.cell_comparisons: every cell requires exactly the 6 comparisons")
+
+        telemetry = [
+            object_value(item, f"{label}.active_telemetry[{index}]")
+            for index, item in enumerate(
+                list_value(report.get("active_telemetry"), f"{label}.active_telemetry")
+            )
+        ]
+        seen_telemetry: set[tuple[str, str, str]] = set()
+        for index, item in enumerate(telemetry):
+            item_label = f"{label}.active_telemetry[{index}]"
+            exact_fields(item, PPROF_TAX_TELEMETRY_FIELDS, item_label)
+            configuration_id = string_value(
+                item.get("configuration_id"), f"{item_label}.configuration_id"
+            )
+            if configuration_id not in active_ids:
+                fail(
+                    f"{item_label}.configuration_id: telemetry is only for actively "
+                    "sampling configurations"
+                )
+            scenario = string_value(item.get("scenario_id"), f"{item_label}.scenario_id")
+            point = string_value(item.get("thread_point"), f"{item_label}.thread_point")
+            if (scenario, point) not in cell_keys:
+                fail(f"{item_label}: undeclared cell")
+            telemetry_key = (configuration_id, scenario, point)
+            if telemetry_key in seen_telemetry:
+                fail(f"{item_label}: duplicate telemetry cell")
+            seen_telemetry.add(telemetry_key)
+            for field in ("valid_runs", "invalid_runs"):
+                int_value(item.get(field), f"{item_label}.{field}")
+            # Every telemetry aggregate is null when no run of that configuration and cell
+            # produced telemetry at all -- the expected state for a rate-1-stress cell whose
+            # stress budget ran out before it was measured. Null means "not observed", never 0.
+            for field in (
+                "median_sample_count",
+                "median_sampled_bytes",
+                "max_dropped_records",
+                "max_profiler_arena_bytes",
+                "median_profile_size_bytes",
+            ):
+                observed = item.get(field)
+                if observed is not None:
+                    int_value(observed, f"{item_label}.{field}")
+            validity = item.get("validity_status")
+            if validity not in ("valid", "invalid"):
+                fail(f"{item_label}.validity_status: unsupported value")
+            reasons = [
+                string_value(reason, f"{item_label}.invalid_reasons")
+                for reason in list_value(
+                    item.get("invalid_reasons"), f"{item_label}.invalid_reasons"
+                )
+            ]
+            if validity == "valid" and reasons:
+                fail(f"{item_label}.invalid_reasons: a valid telemetry cell carries no reasons")
+            if validity == "invalid" and not reasons:
+                fail(f"{item_label}.invalid_reasons: an invalid telemetry cell must explain why")
+        if seen_telemetry != {
+            (configuration, scenario, point)
+            for configuration in active_ids
+            for scenario, point in cell_keys
+        }:
+            fail(
+                f"{label}.active_telemetry: expected exactly one entry per active "
+                "configuration and cell"
+            )
+
+        rss_summaries = [
+            object_value(item, f"{label}.rss_summaries[{index}]")
+            for index, item in enumerate(
+                list_value(report.get("rss_summaries"), f"{label}.rss_summaries")
+            )
+        ]
+        seen_rss: set[tuple[str, str, str]] = set()
+        for index, item in enumerate(rss_summaries):
+            item_label = f"{label}.rss_summaries[{index}]"
+            exact_fields(item, PPROF_TAX_RSS_SUMMARY_FIELDS, item_label)
+            configuration_id = string_value(
+                item.get("configuration_id"), f"{item_label}.configuration_id"
+            )
+            if configuration_id not in PPROF_TAX_CONFIGURATION_IDS:
+                fail(f"{item_label}.configuration_id: undeclared configuration")
+            scenario = string_value(item.get("scenario_id"), f"{item_label}.scenario_id")
+            point = string_value(item.get("thread_point"), f"{item_label}.thread_point")
+            if (scenario, point) not in cell_keys:
+                fail(f"{item_label}: undeclared cell")
+            rss_key = (configuration_id, scenario, point)
+            if rss_key in seen_rss:
+                fail(f"{item_label}: duplicate RSS summary")
+            seen_rss.add(rss_key)
+            peak = item.get("median_peak_rss_bytes")
+            if peak is not None:
+                int_value(peak, f"{item_label}.median_peak_rss_bytes")
+            delta = item.get("median_end_rss_delta_bytes")
+            if delta is not None:
+                signed_int_value(delta, f"{item_label}.median_end_rss_delta_bytes")
+        if seen_rss != {
+            (configuration, scenario, point)
+            for configuration in PPROF_TAX_CONFIGURATION_IDS
+            for scenario, point in cell_keys
+        }:
+            fail(f"{label}.rss_summaries: expected exactly one entry per configuration and cell")
+
+    latency_status = object_value(report.get("latency"), f"{label}.latency")
+    exact_fields(latency_status, {"status", "reason"}, f"{label}.latency")
+    if latency_status.get("status") != "not-collected":
+        fail(f"{label}.latency.status: only not-collected is supported")
+    string_value(latency_status.get("reason"), f"{label}.latency.reason")
+    return report
+
+
+PPROF_TAX_PANEL_WIDTH = 960
+PPROF_TAX_PANEL_HEIGHT = 540
+PPROF_TAX_PLOT_LEFT = 320
+PPROF_TAX_PLOT_RIGHT = 910
+PPROF_TAX_PLOT_CENTER = (PPROF_TAX_PLOT_LEFT + PPROF_TAX_PLOT_RIGHT) // 2
+PPROF_TAX_ROW_TOP = 140
+PPROF_TAX_ROW_HEIGHT = 62
+PPROF_TAX_MIN_SCALE = 0.05
+
+
+def pprof_tax_scale(comparisons: Sequence[Mapping[str, object]]) -> float:
+    """Half-width of the overhead axis, in fraction-of-baseline units.
+
+    Computed only from non-stress supported comparisons so the deliberately extreme
+    rate-1-stress overhead never flattens the other five bars onto a single pixel;
+    rate-1-stress is drawn as a clipped off-scale arrow instead.
+    """
+
+    bounds = [
+        abs(float_value(comparison["overhead"], "pprof-tax comparison overhead"))
+        for comparison in comparisons
+        if comparison.get("comparison_id") != "rate-1-stress"
+        and comparison.get("support_status") == "supported"
+    ]
+    return max(max(bounds) if bounds else 0.0, PPROF_TAX_MIN_SCALE)
+
+
+def pprof_tax_x(overhead: float, scale: float) -> int:
+    span = PPROF_TAX_PLOT_RIGHT - PPROF_TAX_PLOT_CENTER
+    clamped = max(-scale, min(scale, overhead))
+    return PPROF_TAX_PLOT_CENTER + int(span * clamped / scale)
+
+
+def pprof_tax_badge_text(value: Mapping[str, object]) -> str:
+    key = value["badge"] if value.get("support_status") == "supported" else value["support_status"]
+    return PPROF_TAX_BADGE_TEXT.get(cast(str, key), cast(str, key))
+
+
+def pprof_tax_png(section: Mapping[str, object]) -> bytes:
+    canvas = Canvas(PPROF_TAX_PANEL_WIDTH, PPROF_TAX_PANEL_HEIGHT, (248, 250, 252))
+    canvas.rectangle(0, 0, PPROF_TAX_PANEL_WIDTH, 62, (24, 35, 52))
+    canvas.text(30, 22, "PPROF COMPILATION AND RUNTIME TAX", (232, 238, 247), 1)
+    headline = object_value(section["headline"], "pprof-tax headline")
+    scope = string_value(section["hosted_runner_scope"], "pprof-tax hosted_runner_scope")
+    if headline.get("support_status") == "supported":
+        overhead = float_value(headline["overhead"], "headline overhead") * 100
+        lower = float_value(headline["overhead_lower"], "headline overhead lower") * 100
+        upper = float_value(headline["overhead_upper"], "headline overhead upper") * 100
+        headline_text = f"SPARSE OVERHEAD {overhead:+.1f}% (95% {lower:+.1f}% TO {upper:+.1f}%)"
+    else:
+        headline_text = f"SPARSE OVERHEAD: {pprof_tax_badge_text(headline).upper()}"
+    canvas.text(30, 85, headline_text, (24, 35, 52), 2)
+    canvas.text(30, 110, f"RUNNER SCOPE: {scope}", (117, 126, 140), 1)
+    comparisons = [
+        object_value(value, "pprof-tax comparison")
+        for value in list_value(section["comparisons"], "pprof-tax comparisons")
+    ]
+    scale = pprof_tax_scale(comparisons)
+    zero_x = pprof_tax_x(0.0, scale)
+    plot_bottom = PPROF_TAX_ROW_TOP + len(comparisons) * PPROF_TAX_ROW_HEIGHT
+    canvas.line(zero_x, PPROF_TAX_ROW_TOP - 12, zero_x, plot_bottom, (90, 102, 115), 2)
+    for index, comparison in enumerate(comparisons):
+        top = PPROF_TAX_ROW_TOP + index * PPROF_TAX_ROW_HEIGHT
+        comparison_id = cast(str, comparison["comparison_id"])
+        label_text = f"{comparison_id} ({pprof_tax_badge_text(comparison)})"
+        canvas.text(16, top, label_text, (24, 35, 52), 1)
+        support_status = comparison.get("support_status")
+        if support_status != "supported":
+            status_text = PPROF_TAX_BADGE_TEXT.get(
+                cast(str, support_status), cast(str, support_status)
+            )
+            canvas.text(PPROF_TAX_PLOT_LEFT, top + 22, status_text, (117, 126, 140), 1)
+            continue
+        overhead = float_value(comparison["overhead"], "comparison overhead")
+        lower = float_value(comparison["overhead_lower"], "comparison overhead lower")
+        upper = float_value(comparison["overhead_upper"], "comparison overhead upper")
+        if comparison_id == "rate-1-stress" and (
+            abs(overhead) > scale or abs(lower) > scale or abs(upper) > scale
+        ):
+            edge = PPROF_TAX_PLOT_RIGHT if overhead >= 0 else PPROF_TAX_PLOT_LEFT
+            direction = 1 if overhead >= 0 else -1
+            arrow_y = top + 20
+            canvas.line(zero_x, arrow_y, edge, arrow_y, COLORS[1], 4)
+            canvas.line(edge, arrow_y, edge - direction * 14, arrow_y - 8, COLORS[1], 3)
+            canvas.line(edge, arrow_y, edge - direction * 14, arrow_y + 8, COLORS[1], 3)
+            canvas.text(
+                PPROF_TAX_PLOT_LEFT, top + 36, "STRESS-ONLY (OFF SCALE)", (117, 126, 140), 1
+            )
+            continue
+        x_lower = pprof_tax_x(lower, scale)
+        x_upper = pprof_tax_x(upper, scale)
+        x_point = pprof_tax_x(overhead, scale)
+        bar_y = top + 20
+        canvas.line(x_lower, bar_y, x_upper, bar_y, COLORS[0], 3)
+        canvas.rectangle(x_lower - 1, bar_y - 6, 2, 12, COLORS[0])
+        canvas.rectangle(x_upper - 1, bar_y - 6, 2, 12, COLORS[0])
+        canvas.rectangle(x_point - 4, bar_y - 4, 8, 8, COLORS[2])
+    return encode_png(
+        PPROF_TAX_PANEL_WIDTH,
+        PPROF_TAX_PANEL_HEIGHT,
+        canvas.pixels,
+        "pprof compilation and runtime tax: overhead vs baseline by configuration; "
+        "rate-1-stress is stress-only and excluded from the headline",
+    )
+
+
 #: Where each optional section records the allocator each of its samples was measured
 #: against. The shapes differ because the sections were written at different times.
 OPTIONAL_SECTION_SAMPLE_PINS = {
@@ -4329,11 +5040,36 @@ def core_pinned_pairs(latest: Mapping[str, object]) -> set[tuple[str, str]]:
     return _pinned_pairs(latest.get("allocators"), "allocator_id", "source_sha")
 
 
+def pprof_tax_pinned_pairs(section: object) -> set[tuple[str, str]]:
+    """The pin a carried pprof-tax section was measured at.
+
+    Unlike memory/latency/scaling, pprof-tax carries no per-sample list to read pins from --
+    it is a validator-computed comparison table, not a raw-sample matrix -- but it records
+    the one pin that matters: the upstream mimalloc commit its tax comparisons were measured
+    against.
+    """
+    if not isinstance(section, dict):
+        return set()
+    sha = cast("dict[str, object]", section).get("upstream_source_sha")
+    return {("upstream-mimalloc", sha)} if isinstance(sha, str) else set()
+
+
+#: (section key, pending metric id, pin lookup) for every optional metric the carry-forward
+#: knows about. The metric id and section key differ for pprof-tax (`pprof-tax` vs
+#: `pprof_tax`), unlike memory/latency/scaling where they are the same string.
+OPTIONAL_METRICS = (
+    ("memory", "memory", section_pinned_pairs),
+    ("latency", "latency", section_pinned_pairs),
+    ("scaling", "scaling", section_pinned_pairs),
+    ("pprof_tax", "pprof-tax", pprof_tax_pinned_pairs),
+)
+
+
 def carry_forward_optional_metrics(latest: dict[str, object], prior: dict[str, object]) -> bool:
     validate_latest(prior, "prior latest")
     carried = False
     core = core_pinned_pairs(latest)
-    for metric in ("memory", "latency", "scaling"):
+    for metric, pending_id, pinned_pairs in OPTIONAL_METRICS:
         if metric not in latest and metric in prior:
             # #376: a section measured against different allocator pins may not ride on this
             # core envelope. `validate_carried_pins` rejects exactly that a few lines later,
@@ -4342,10 +5078,10 @@ def carry_forward_optional_metrics(latest: dict[str, object], prior: dict[str, o
             # (the #332 bump to 6def7be9 took benchmark-stats red immediately).
             #
             # A section left behind is not lost data: it simply stays `pending`, which the
-            # report already knows how to render, and the next memory/latency/scaling run
-            # refills it at the new pin. Re-baselining one metric at a time is the normal
-            # consequence of moving a pin; a dead pipeline is not.
-            stale = section_pinned_pairs(prior[metric]) - core
+            # report already knows how to render, and the next memory/latency/scaling/
+            # pprof-tax run refills it at the new pin. Re-baselining one metric at a time is
+            # the normal consequence of moving a pin; a dead pipeline is not.
+            stale = pinned_pairs(prior[metric]) - core
             if stale and core:
                 continue
             latest[metric] = copy.deepcopy(prior[metric])
@@ -4353,7 +5089,7 @@ def carry_forward_optional_metrics(latest: dict[str, object], prior: dict[str, o
             latest["pending_metrics"] = [
                 value
                 for value in pending
-                if object_value(value, "latest pending metric").get("metric_id") != metric
+                if object_value(value, "latest pending metric").get("metric_id") != pending_id
             ]
             carried = True
     return carried
@@ -4505,6 +5241,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
         )
         latency_html = f"""<section><h2 id="latency">Transaction latency</h2><img src="benchmark-latency.png" alt="End-to-end transaction latency p99 for all five allocators; lower is better"><img src="benchmark-latency-tail.png" alt="Transaction latency distribution p50/p95/p99 with MAD and IQR spread for all five allocators; lower is better"><p><strong>Lower is better; informational hosted-runner measurements.</strong> These are transaction latencies, never allocator-call latencies and never throughput reciprocals. Local: {escaped(definitions["local"])}. Cross-thread: {escaped(definitions["cross-thread"])}. Large object: {escaped(definitions["large-object"])}.</p><p>Each allocator/cell has at least 10,000 raw samples across {escaped(block_count)} paired blocks. Controls are reported without subtraction. Runner: {escaped(latency_runner["runner_class"])}; affinity: {escaped(scheduling["affinity_policy"])}; reference allocator: Microsoft mimalloc (<code>upstream-mimalloc</code>). Latency run <a href="{latency_actions}">{escaped(latency_run["run_id"])}/{escaped(latency_run["run_attempt"])}</a> measured mimalloc-pprof at source <code>{escaped(latency_run["source_sha"])}</code>, which is not necessarily the commit above; metric key <code>{escaped(latency["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>p50 ns</th><th>p95 ns</th><th>p99 ns</th><th>Overhead</th><th>Samples</th></tr></thead><tbody>{latency_rows}</tbody></table></section>"""
     scaling_html = ""
+    pprof_tax_html = ""
     if "scaling" in latest:
         scaling = validate_scaling_report(latest["scaling"], "latest.scaling")
         scaling_run = object_value(scaling["run"], "latest.scaling.run")
@@ -4541,6 +5278,121 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             else "https://github.com/zackees/mimalloc-pprof/actions"
         )
         scaling_html = f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(SCALING_RIGOR_LABEL)}.</strong> These panels trade statistical rigor for thread coverage: {escaped(SCALING_BLOCKS)} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating. Do not read them as headline-grade numbers.</p><p>Worker counts are literal {escaped(", ".join(str(point) for point in scaling_thread_points))}; the runner allows {escaped(scaling_topology["allowed_logical_cpus"])} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling_methodology["seed_chain"])}. Scaling run <a href="{scaling_actions}">{escaped(scaling_run["run_id"])}/{escaped(scaling_run["run_attempt"])}</a> measured mimalloc-pprof at source <code>{escaped(scaling_run["source_sha"])}</code>, which is not necessarily the commit above; metric key <code>{escaped(scaling["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table></section>"""
+    if "pprof_tax" in latest:
+        pprof_tax = validate_pprof_tax_report(latest["pprof_tax"], "latest.pprof_tax")
+        pprof_tax_run = object_value(pprof_tax["run"], "latest.pprof_tax.run")
+        headline = object_value(pprof_tax["headline"], "latest.pprof_tax.headline")
+        pprof_tax_comparisons = [
+            object_value(value, "pprof-tax comparison")
+            for value in list_value(pprof_tax["comparisons"], "latest.pprof_tax.comparisons")
+        ]
+        pprof_tax_configurations = [
+            object_value(value, "pprof-tax configuration")
+            for value in list_value(
+                pprof_tax["configurations"], "latest.pprof_tax.configurations"
+            )
+        ]
+        pprof_tax_cells = [
+            object_value(value, "pprof-tax cell")
+            for value in list_value(pprof_tax["cells"], "latest.pprof_tax.cells")
+        ]
+        pprof_tax_cell_comparisons = [
+            object_value(value, "pprof-tax cell comparison")
+            for value in list_value(
+                pprof_tax["cell_comparisons"], "latest.pprof_tax.cell_comparisons"
+            )
+        ]
+        pprof_tax_telemetry = [
+            object_value(value, "pprof-tax telemetry")
+            for value in list_value(
+                pprof_tax["active_telemetry"], "latest.pprof_tax.active_telemetry"
+            )
+        ]
+
+        def pprof_tax_interval(value: Mapping[str, object]) -> str:
+            if value.get("support_status") != "supported":
+                return "-"
+            lower = round(float_value(value["overhead_lower"], "overhead_lower") * 100, 2)
+            upper = round(float_value(value["overhead_upper"], "overhead_upper") * 100, 2)
+            return f"{lower:+.2f}% to {upper:+.2f}%"
+
+        def pprof_tax_overhead_text(value: Mapping[str, object]) -> str:
+            if value.get("support_status") != "supported":
+                return "-"
+            return f"{round(float_value(value['overhead'], 'overhead') * 100, 2):+.2f}%"
+
+        comparison_rows = "".join(
+            f"<tr><td>{escaped(value['comparison_id'])}</td>"
+            f"<td>{escaped(value['numerator_configuration_id'])}</td>"
+            f"<td>{escaped(value['denominator_configuration_id'])}</td>"
+            f"<td>{escaped(value['valid_block_count'])}</td>"
+            f"<td>{escaped(round(float_value(value['ratio'], 'ratio'), 4)) if value.get('support_status') == 'supported' else '-'}</td>"
+            f"<td>{escaped(pprof_tax_overhead_text(value))}</td>"
+            f"<td>{escaped(pprof_tax_interval(value))}</td>"
+            f"<td>{escaped(pprof_tax_badge_text(value))}</td></tr>"
+            for value in pprof_tax_comparisons
+        )
+        configuration_rows = "".join(
+            f"<tr><td>{escaped(value['configuration_id'])}</td>"
+            f"<td>{escaped(value['sampling_interval_bytes']) if value.get('sampling_interval_bytes') is not None else 'inactive'}</td>"
+            f"<td>{escaped(value['frame_pointer_policy'])}</td>"
+            f"<td>{escaped(value['support_status'])}</td>"
+            f"<td><code>{escaped(value['executable_sha256']) if value.get('executable_sha256') is not None else '-'}</code></td></tr>"
+            for value in pprof_tax_configurations
+        )
+        pprof_tax_telemetry_by_cell: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+        for value in pprof_tax_telemetry:
+            pprof_tax_telemetry_by_cell.setdefault(
+                (cast(str, value["scenario_id"]), cast(str, value["thread_point"])), []
+            ).append(value)
+        pprof_tax_cell_comparisons_by_cell: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+        for value in pprof_tax_cell_comparisons:
+            pprof_tax_cell_comparisons_by_cell.setdefault(
+                (cast(str, value["scenario_id"]), cast(str, value["thread_point"])), []
+            ).append(value)
+        drilldowns = ""
+        for cell in pprof_tax_cells:
+            key = (cast(str, cell["scenario_id"]), cast(str, cell["thread_point"]))
+            cell_rows = "".join(
+                f"<tr><td>{escaped(value['comparison_id'])}</td>"
+                f"<td>{escaped(pprof_tax_overhead_text(value))}</td>"
+                f"<td>{escaped(pprof_tax_badge_text(value))}</td></tr>"
+                for value in pprof_tax_cell_comparisons_by_cell.get(key, [])
+            )
+            telemetry_fields = (
+                "median_sample_count",
+                "max_dropped_records",
+                "max_profiler_arena_bytes",
+                "median_profile_size_bytes",
+            )
+            # A null telemetry aggregate means "not observed" (e.g. an exhausted
+            # rate-1-stress budget); render it as a dash, never as 0 or "None".
+            telemetry_rows = "".join(
+                f"<tr><td>{escaped(value['configuration_id'])}</td>"
+                + "".join(
+                    f"<td>{escaped(value[field]) if value.get(field) is not None else '-'}</td>"
+                    for field in telemetry_fields
+                )
+                + "</tr>"
+                for value in pprof_tax_telemetry_by_cell.get(key, [])
+            )
+            drilldowns += (
+                f"<details><summary>{escaped(cell['scenario_id'])}/{escaped(cell['thread_point'])}</summary>"
+                f"<table><thead><tr><th>Comparison</th><th>Overhead</th><th>Badge</th></tr></thead><tbody>{cell_rows}</tbody></table>"
+                f"<table><thead><tr><th>Configuration</th><th>Samples</th><th>Dropped records</th><th>Profiler-arena bytes</th><th>Profile size</th></tr></thead><tbody>{telemetry_rows}</tbody></table>"
+                "</details>"
+            )
+        pprof_tax_actions = (
+            f"https://github.com/zackees/mimalloc-pprof/actions/runs/{escaped(pprof_tax_run['run_id'])}"
+            if pprof_tax_run["run_origin"] == "github-actions"
+            else "https://github.com/zackees/mimalloc-pprof/actions"
+        )
+        headline_text = (
+            pprof_tax_overhead_text(headline)
+            if headline.get("support_status") == "supported"
+            else pprof_tax_badge_text(headline)
+        )
+        pprof_tax_html = f"""<section><h2 id="pprof-tax">pprof compilation and runtime tax</h2><img src="benchmark-pprof-tax.png" alt="pprof compilation and runtime tax: overhead vs baseline by configuration; rate-1-stress is stress-only and excluded from the headline"><p><strong>Sparse-sampling overhead vs the profiler compiled in but stopped: {escaped(headline_text)} (95% {escaped(pprof_tax_interval(headline))}).</strong> This is the headline: <code>fork-pprof-sparse</code> over <code>fork-pprof-on-stopped</code>, the sampling rate this project recommends for production. <code>rate-1-stress</code> samples every allocation; it is stress-only and deliberately excluded from the headline and must never be read as steady-state overhead.</p><p class="note">Measured only on the runner scope <strong>{escaped(pprof_tax["hosted_runner_scope"])}</strong>; this is not a claim about any other machine.</p><table><thead><tr><th>Comparison</th><th>Numerator</th><th>Denominator</th><th>Blocks</th><th>Ratio</th><th>Overhead</th><th>95% interval</th><th>Badge</th></tr></thead><tbody>{comparison_rows}</tbody></table><h3>Configurations</h3><table><thead><tr><th>Configuration</th><th>Sampling interval (bytes)</th><th>Frame pointers</th><th>Support</th><th>Executable</th></tr></thead><tbody>{configuration_rows}</tbody></table><h3>Per-workload drill-down</h3>{drilldowns}<p>Configuration manifest <code>{escaped(pprof_tax["configuration_manifest_sha256"])}</code> and raw artifact <code>{escaped(pprof_tax["raw_artifact_name"])}</code> (<code>{escaped(pprof_tax["raw_artifact_sha256"])}</code>) are private audit artifacts and are never published to Pages; see the <a href="{escaped(latest["actions_run_url"])}">Actions run</a>. pprof-tax run <a href="{pprof_tax_actions}">{escaped(pprof_tax_run["run_id"])}/{escaped(pprof_tax_run["run_attempt"])}</a>; metric key <code>{escaped(pprof_tax["metric_comparison_key"])}</code>.</p></section>"""
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>mimalloc allocator benchmarks</title>
 <style>body{{font:15px system-ui,sans-serif;max-width:1200px;margin:auto;padding:24px;color:#182334}}table{{border-collapse:collapse;width:100%;margin:16px 0}}th,td{{border:1px solid #ccd4dd;padding:7px;text-align:left}}img{{max-width:100%;height:auto}}.pending{{border:1px solid #ccd4dd;padding:12px;margin:12px 0}}code,pre{{overflow-wrap:anywhere;white-space:pre-wrap}}small{{color:#596575}}</style></head><body>
@@ -4549,7 +5401,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
 <h2 id="throughput">Throughput</h2><img src="benchmark-throughput.png" alt="Per-scenario absolute throughput bars for all five allocators"><table><thead><tr><th>Scenario</th><th>Threads</th><th>Allocator</th><th>Median</th><th>Noisy</th></tr></thead><tbody>{absolute_rows}</tbody></table>
 {memory_html}<h2>Paired effects</h2><table><thead><tr><th>Scenario</th><th>Candidate</th><th>Effect</th><th>95% interval</th><th>Interpretation</th></tr></thead><tbody>{paired_rows}</tbody></table>
 <h2 id="history">Compatible history</h2><img src="benchmark-history.png" alt="History connected only across the selected identical comparison key">
-{latency_html}{scaling_html}<h2>Pending Phase 6 panels</h2>{pending_html}<section id="phase-6"><p>Pending panels contain no measured values.</p></section>
+{latency_html}{scaling_html}{pprof_tax_html}<h2>Pending Phase 6 panels</h2>{pending_html}<section id="phase-6"><p>Pending panels contain no measured values.</p></section>
 <h2>Provenance</h2><p>Run {escaped(run["run_id"])}, attempt {escaped(run["run_attempt"])}; target {escaped(runner["target"])}; fingerprint <code>{escaped(runner["fingerprint_sha256"])}</code>.</p><table><thead><tr><th>Allocator</th><th>Source</th><th>Binary</th></tr></thead><tbody>{allocator_rows}</tbody></table><p><a href="{escaped(latest["actions_run_url"])}">Actions run</a></p>
 <h2>Methodology</h2><pre>{escaped(json.dumps(latest["methodology"], sort_keys=True, ensure_ascii=False))}</pre><h2>Reproduce</h2><pre><code>{escaped(latest["reproduction_command"])}</code></pre>
 </body></html>"""
@@ -4696,10 +5548,14 @@ def render(
         reason = cast(str, pending["scaling"]["reason"])
         for pattern, name in SCALING_PANELS.items():
             (output / name).write_bytes(pending_scaling_svg(pattern, reason))
-    item = pending["pprof-tax"]
-    (output / image_names["pprof-tax"]).write_bytes(
-        pending_png("pprof-tax", cast(str, item["reason"]))
-    )
+    if "pprof_tax" in latest:
+        pprof_tax = validate_pprof_tax_report(latest["pprof_tax"], "latest.pprof_tax")
+        (output / image_names["pprof-tax"]).write_bytes(pprof_tax_png(pprof_tax))
+    else:
+        item = pending["pprof-tax"]
+        (output / image_names["pprof-tax"]).write_bytes(
+            pending_png("pprof-tax", cast(str, item["reason"]))
+        )
     (output / "manifest.json").write_bytes(compact_json(manifest_for(output)))
     digest = sha256(output / "manifest.json")
     digest_out.parent.mkdir(parents=True, exist_ok=True)

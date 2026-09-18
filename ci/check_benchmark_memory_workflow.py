@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Fail-closed policy checker for the Linux process-memory workflow."""
+"""Fail-closed policy checker for the Linux process-memory workflow.
+
+`--selftest` is a real test: it mutates a copy of the on-disk workflow once
+per rule and requires every mutation to be rejected. A checker that only ever
+sees a passing input cannot prove it checks anything.
+"""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import NoReturn, cast
+from typing import Any, NoReturn, cast
 
 import yaml
 
@@ -158,15 +164,146 @@ def load(path: Path) -> dict[str, object]:
     return mapping(value, str(path))
 
 
+def _build_job(workflow: dict[str, Any]) -> dict[str, Any]:
+    return cast(dict[str, Any], cast(dict[str, Any], workflow["jobs"])["build-and-measure"])
+
+
+def _step(workflow: dict[str, Any], name: str, job: str | None = None) -> dict[str, Any]:
+    """A step by name, from `build-and-measure` unless another job is named."""
+    steps = (
+        cast(list[dict[str, Any]], cast(dict[str, Any], workflow["jobs"])[job]["steps"])
+        if job is not None
+        else cast(list[dict[str, Any]], _build_job(workflow)["steps"])
+    )
+    for step in steps:
+        if step.get("name") == name:
+            return step
+    raise KeyError(name)
+
+
+def _triggers(workflow: dict[str, Any]) -> dict[str, Any]:
+    # PyYAML 1.1 parses the bare `on:` key as the boolean True.
+    raw = cast(dict[Any, Any], workflow)
+    return cast(dict[str, Any], raw["on"] if "on" in raw else raw[True])
+
+
+def _rename_pages_site_artifact(workflow: dict[str, Any]) -> None:
+    """Point `package-pages`'s download step at a different artifact name."""
+    steps = cast(
+        list[dict[str, Any]], cast(dict[str, Any], workflow["jobs"])["package-pages"]["steps"]
+    )
+    for step in steps:
+        with_block = step.get("with")
+        if not isinstance(with_block, dict):
+            continue
+        with_mapping = cast(dict[str, Any], with_block)
+        if "benchmark-memory-site-" in str(with_mapping.get("name", "")):
+            with_mapping["name"] = "other-site"
+            return
+    raise KeyError("package-pages download step")
+
+
+MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
+    "push trigger added": lambda wf: _triggers(wf).__setitem__("push", {"branches": ["main"]}),
+    "second schedule entry added": lambda wf: _triggers(wf).__setitem__(
+        "schedule", [{"cron": "41 8 * * 0"}, {"cron": "0 0 * * 1"}]
+    ),
+    "extra dispatch input added": lambda wf: cast(
+        dict[str, Any],
+        cast(dict[str, Any], _triggers(wf)["workflow_dispatch"])["inputs"],
+    ).__setitem__("allocator", {"type": "string"}),
+    "mode default changed to smoke": lambda wf: cast(
+        dict[str, Any],
+        cast(dict[str, Any], _triggers(wf)["workflow_dispatch"])["inputs"]["mode"],
+    ).__setitem__("default", "smoke"),
+    "shared concurrency group dropped": lambda wf: wf.__setitem__(
+        "concurrency", {"group": "memory-only", "cancel-in-progress": False}
+    ),
+    "cancel-in-progress enabled": lambda wf: cast(dict[str, Any], wf["concurrency"]).__setitem__(
+        "cancel-in-progress", True
+    ),
+    "workflow write permission": lambda wf: wf.__setitem__("permissions", {"contents": "write"}),
+    "runs-on changed on build job": lambda wf: _build_job(wf).__setitem__(
+        "runs-on", "ubuntu-latest"
+    ),
+    "budget exceeded": lambda wf: _build_job(wf).__setitem__("timeout-minutes", 61),
+    "build timeout below the required 60": lambda wf: _build_job(wf).__setitem__(
+        "timeout-minutes", 45
+    ),
+    "matrix introduced": lambda wf: _build_job(wf).__setitem__(
+        "strategy", {"matrix": {"allocator": ["a", "b"]}}
+    ),
+    "unpinned action": lambda wf: cast(list[dict[str, Any]], _build_job(wf)["steps"])[
+        0
+    ].__setitem__("uses", "actions/checkout@v4"),
+    "allocators run in parallel": lambda wf: _step(wf, "run external memory suite").__setitem__(
+        "run", "benchmark-memory-run --blocks 15 &"
+    ),
+    "measurement step without explicit blocks": lambda wf: _step(
+        wf, "run external memory suite"
+    ).__setitem__("run", "benchmark-memory-run"),
+    "input interpolated into shell": lambda wf: _step(wf, "determine run seed").__setitem__(
+        "run", "SEED=${{ inputs.run_seed }}"
+    ),
+    "seed validation removed": lambda wf: _step(wf, "determine run seed").__setitem__(
+        "run", "echo seed=1 >> $GITHUB_OUTPUT"
+    ),
+    "raw artifact conditional": lambda wf: _step(wf, "upload raw proc artifact").__setitem__(
+        "if", "success()"
+    ),
+    "retention shortened": lambda wf: cast(
+        dict[str, Any], _step(wf, "upload raw proc artifact")["with"]
+    ).__setitem__("retention-days", 1),
+    "hidden files dropped": lambda wf: cast(
+        dict[str, Any], _step(wf, "upload raw proc artifact")["with"]
+    ).__setitem__("include-hidden-files", False),
+    "eligibility accepts any ref": lambda wf: _step(
+        wf, "compute publication eligibility"
+    ).__setitem__("run", "echo publish_eligible=true >> $GITHUB_OUTPUT"),
+    "publish job over-permissioned": lambda wf: cast(dict[str, Any], wf["jobs"])[
+        "publish-branch"
+    ].__setitem__("permissions", {"contents": "write", "packages": "write"}),
+    "deploy environment renamed": lambda wf: cast(dict[str, Any], wf["jobs"])[
+        "deploy-pages"
+    ].__setitem__("environment", {"name": "staging"}),
+    "deploy over-permissioned": lambda wf: cast(dict[str, Any], wf["jobs"])[
+        "deploy-pages"
+    ].__setitem__("permissions", {"pages": "write", "id-token": "write", "contents": "write"}),
+    "lease dropped": lambda wf: _step(
+        wf, "publish exact memory site revision", "publish-branch"
+    ).__setitem__("run", "git push origin HEAD:$PUBLISH_REF"),
+    "Pages consumes a different artifact": _rename_pages_site_artifact,
+    "publication audit weakened": lambda wf: _step(
+        wf, "audit memory publication", "publication-audit"
+    ).__setitem__("run", "echo ok"),
+}
+
+
+def selftest(path: Path) -> None:
+    """Every declared rule must reject at least one concrete mutation."""
+
+    baseline = load(path)
+    validate(baseline)
+    for label, mutate in MUTATIONS.items():
+        candidate = copy.deepcopy(baseline)
+        mutate(cast(dict[str, Any], candidate))
+        try:
+            validate(candidate)
+        except MemoryWorkflowError:
+            continue
+        fail(f"selftest: the checker accepted a workflow with {label}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workflow", type=Path, default=WORKFLOW)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
-    validate(load(args.workflow))
     if args.selftest:
-        print("PASS benchmark memory workflow policy selftest")
+        selftest(args.workflow)
+        print(f"PASS benchmark memory workflow policy selftest ({len(MUTATIONS)} controls)")
     else:
+        validate(load(args.workflow))
         print(f"PASS benchmark memory workflow policy: {args.workflow}")
     return 0
 

@@ -959,6 +959,33 @@ class BenchmarkReportTests(unittest.TestCase):
             self.assertNotIn("vs upstream<", page)
             self.assertIn("1.00x", page, "the upstream allocator row must read 1.00x")
 
+    def test_memory_section_surfaces_the_commit_it_was_measured_at(self) -> None:
+        latest = self.with_complete_memory(self.load_latest())
+        memory = latest["memory"]
+        assert isinstance(memory, dict)
+        run = memory["run"]
+        assert isinstance(run, dict)
+        sha = run["source_sha"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            memory_heading = page.find('<h2 id="memory">')
+            self.assertGreater(memory_heading, -1)
+            provenance = (
+                f"measured mimalloc-pprof at source <code>{sha}</code>, "
+                "which is not necessarily the commit above"
+            )
+            provenance_position = page.find(provenance)
+            self.assertGreater(
+                provenance_position,
+                memory_heading,
+                "provenance must sit inside the memory section",
+            )
+
     def test_rss_timeline_sawtooth_rises_falls_and_decay_markers_at_offsets(self) -> None:
         # One synthetic cell: every allocator gets a sawtooth timeline that
         # rises to a distinct peak, falls back, and then decays through the
@@ -1295,6 +1322,33 @@ class BenchmarkReportTests(unittest.TestCase):
             chart = (site / "benchmark-latency.png").read_bytes()
             self.assertIn(b"Transaction latency", chart)
             self.assertIn(b"through free", chart)
+
+    def test_latency_section_surfaces_the_commit_it_was_measured_at(self) -> None:
+        latest = self.with_complete_latency(self.load_latest())
+        latency = latest["latency"]
+        assert isinstance(latency, dict)
+        run = latency["run"]
+        assert isinstance(run, dict)
+        sha = run["source_sha"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            latency_heading = page.find('<h2 id="latency">')
+            self.assertGreater(latency_heading, -1)
+            provenance = (
+                f"measured mimalloc-pprof at source <code>{sha}</code>, "
+                "which is not necessarily the commit above"
+            )
+            provenance_position = page.find(provenance)
+            self.assertGreater(
+                provenance_position,
+                latency_heading,
+                "provenance must sit inside the latency section",
+            )
 
     def test_incomplete_or_failed_control_latency_cannot_replace_pending(self) -> None:
         complete = self.with_complete_latency(self.load_latest())
@@ -2196,6 +2250,56 @@ class LegacyAllocatorLineageTests(unittest.TestCase):
                 item["source_sha"] = "f" * 40
         with self.assertRaisesRegex(report.ReportError, "allocator source pins"):
             report.validate_latest(moved_competitor, "competitor pin moved")
+
+    def test_render_shows_both_the_core_and_the_weekly_sections_own_commit(self) -> None:
+        """When the fork has moved on since the weekly memory/latency run,
+        `validate_latest` still passes (the previous test) -- but the reader
+        must not be left assuming the sections describe the commit in the
+        page header. Both shas must appear: the core one in the Provenance
+        table's header line, and each section's own in its paragraph."""
+
+        helper = BenchmarkReportTests("test_memory_section_sits_next_to_throughput")
+        latest = helper.with_complete_latency(helper.with_complete_memory(helper.load_latest()))
+        moved_fork = copy.deepcopy(latest)
+        allocators = cast(list[dict[str, object]], moved_fork["allocators"])
+        for item in allocators:
+            if item["allocator_id"] == "mimalloc-pprof":
+                item["source_sha"] = "9" * 40
+        report.validate_latest(moved_fork, "fork rebuilt since the weekly run")
+
+        memory = moved_fork["memory"]
+        latency = moved_fork["latency"]
+        assert isinstance(memory, dict) and isinstance(latency, dict)
+        memory_run = memory["run"]
+        latency_run = latency["run"]
+        assert isinstance(memory_run, dict) and isinstance(latency_run, dict)
+        core_sha = next(
+            item["source_sha"] for item in allocators if item["allocator_id"] == "mimalloc-pprof"
+        )
+        memory_sha = memory_run["source_sha"]
+        latency_sha = latency_run["source_sha"]
+        self.assertEqual("9" * 40, core_sha)
+        self.assertNotEqual(core_sha, memory_sha)
+        self.assertNotEqual(core_sha, latency_sha)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            source.write_text(json.dumps(moved_fork) + "\n", encoding="utf-8", newline="\n")
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            self.assertIn(f"<td>mimalloc-pprof</td><td><code>{core_sha}</code></td>", page)
+            memory_provenance = (
+                f"measured mimalloc-pprof at source <code>{memory_sha}</code>, "
+                "which is not necessarily the commit above"
+            )
+            latency_provenance = (
+                f"measured mimalloc-pprof at source <code>{latency_sha}</code>, "
+                "which is not necessarily the commit above"
+            )
+            self.assertIn(memory_provenance, page)
+            self.assertIn(latency_provenance, page)
 
     def test_render_rejects_a_core_envelope_recorded_under_the_older_set(self) -> None:
         """Lineage tolerance is for artifacts that were already published, never

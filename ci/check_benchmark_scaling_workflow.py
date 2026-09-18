@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Fail-closed policy checker for the Linux sparse thread-scaling workflow.
 
-Unlike the 6A/6B checkers, `--selftest` here is a real test: it mutates a copy
-of the on-disk workflow once per rule and requires every mutation to be
-rejected. A checker that only ever sees a passing input cannot prove it checks
+`--selftest` is a real test: it mutates a copy of the on-disk workflow once per
+rule and requires every mutation to be rejected. A checker that only ever sees a passing input cannot prove it checks
 anything.
 """
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import copy
 import unittest
+from typing import Any
+from unittest import mock
 
 import check_benchmark_memory_workflow as policy
 
@@ -15,6 +17,26 @@ class BenchmarkMemoryWorkflowTests(unittest.TestCase):
 
     def test_production_workflow_passes(self) -> None:
         policy.validate(self.workflow())
+
+    def test_selftest_negative_controls_all_fail_closed(self) -> None:
+        # The selftest is the real guard against a checker that checks nothing.
+        policy.selftest(policy.WORKFLOW)
+        self.assertGreaterEqual(len(policy.MUTATIONS), 15)
+
+    def test_selftest_catches_a_mutation_the_checker_fails_to_reject(self) -> None:
+        # A mutation that never breaks `validate` must fail the selftest itself,
+        # otherwise the selftest can't tell a real control from a dead one.
+        def no_op(workflow: dict[str, Any]) -> None:
+            del workflow
+
+        with mock.patch.dict(policy.MUTATIONS, {"no-op": no_op}):
+            with self.assertRaisesRegex(
+                policy.MemoryWorkflowError, "accepted a workflow with no-op"
+            ):
+                policy.selftest(policy.WORKFLOW)
+
+    def test_main_selftest_returns_zero(self) -> None:
+        self.assertEqual(policy.main(["--selftest"]), 0)
 
     def test_parallel_matrix_is_rejected(self) -> None:
         value = self.workflow()

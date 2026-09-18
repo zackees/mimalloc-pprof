@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import copy
 import unittest
+from typing import Any
+from unittest.mock import patch
 
 import check_benchmark_latency_workflow as policy
 
@@ -73,6 +75,24 @@ class BenchmarkLatencyWorkflowTests(unittest.TestCase):
         seed["run"] = 'SEED="${{ inputs.run_seed }}"'
         with self.assertRaisesRegex(policy.LatencyWorkflowError, "through env"):
             policy.validate(value)
+
+    def test_selftest_negative_controls_all_fail_closed(self) -> None:
+        # The selftest is the real guard against a checker that checks nothing.
+        policy.selftest(policy.WORKFLOW)
+        self.assertGreaterEqual(len(policy.MUTATIONS), 15)
+
+    def test_selftest_catches_a_mutation_the_checker_does_not_reject(self) -> None:
+        def no_op(workflow: dict[str, Any]) -> None:
+            del workflow
+
+        with patch.dict(policy.MUTATIONS, {"no-op": no_op}):
+            with self.assertRaisesRegex(
+                policy.LatencyWorkflowError, "accepted a workflow with no-op"
+            ):
+                policy.selftest(policy.WORKFLOW)
+
+    def test_selftest_cli_flag_passes(self) -> None:
+        self.assertEqual(policy.main(["--selftest"]), 0)
 
 
 if __name__ == "__main__":

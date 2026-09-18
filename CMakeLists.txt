@@ -419,6 +419,17 @@ elseif(CMAKE_BUILD_TYPE MATCHES "Debug")
   set(MI_DEBUG ON)
   list(APPEND mi_defines MI_DEBUG=2)   # invariant checking (mi_assert and mi_assert_internal)
 endif()
+# #373: an explicit MI_DEBUG=N in MI_EXTRA_CPPDEFS (the debug3-extra row, #312) wins over the
+# level computed above. Drop the computed one so the compiler never sees MI_DEBUG redefined,
+# which MI_WARNINGS_AS_ERRORS makes fatal. (GCC already used the extra value: last -D wins.)
+if(MI_EXTRA_CPPDEFS MATCHES "(^|;)MI_DEBUG=")
+  list(FILTER mi_defines EXCLUDE REGEX "^MI_DEBUG=")
+  foreach(mi_extra_def IN LISTS MI_EXTRA_CPPDEFS)
+    if(mi_extra_def MATCHES "^MI_DEBUG=")
+      list(APPEND mi_defines ${mi_extra_def})
+    endif()
+  endforeach()
+endif()
 
 # Debug-only lock diagnostics (#167). Keep this source out of release libraries
 # entirely -- ci/verify_local.py's `diag` config (and check_release_equivalence.py)

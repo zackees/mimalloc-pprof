@@ -20,6 +20,7 @@ use crate::model::{
 };
 use crate::orchestration::ChildProgram;
 use crate::provenance::sha256_bytes;
+use crate::scaling::LOCK_PINNED_ALLOCATORS;
 use crate::scenarios::{CardId, ThreadPoint, Topology};
 use crate::stats::{summarize_absolute, summarize_paired, MetricDirection, MetricObservation};
 
@@ -1578,6 +1579,39 @@ pub fn attach_memory_report(
         .collect::<BTreeSet<_>>();
     if !pending_ids.contains("memory") && latest.memory.is_none() {
         return Err("latest report has neither memory pending state nor prior memory data".into());
+    }
+    let expected = latest
+        .allocators
+        .iter()
+        .filter(|value| LOCK_PINNED_ALLOCATORS.contains(&value.allocator_id.as_str()))
+        .map(|value| (&value.allocator_id, &value.source_sha))
+        .collect::<BTreeSet<_>>();
+    let observed = report
+        .raw_samples
+        .iter()
+        .filter(|value| LOCK_PINNED_ALLOCATORS.contains(&value.allocator_id.as_str()))
+        .map(|value| (&value.allocator_id, &value.allocator_source_sha))
+        .collect::<BTreeSet<_>>();
+    if expected != observed {
+        return Err("memory allocator provenance differs from core latest".into());
+    }
+    // The fork's own commit is deliberately not required to match. This sweep
+    // runs weekly and overlays onto whatever daily core envelope is published,
+    // so mimalloc-pprof is normally built from a newer commit than the base.
+    // Requiring equality would make the overlay permanently unpublishable.
+    // Instead the sweep must actually contain the fork, and the commit it was
+    // measured at is recorded on the report so the two sections of latest.json
+    // can never be read as one build.
+    let fork_sources = report
+        .raw_samples
+        .iter()
+        .filter(|value| value.allocator_id == "mimalloc-pprof")
+        .map(|value| value.allocator_source_sha.as_str())
+        .collect::<BTreeSet<_>>();
+    match fork_sources.len() {
+        1 => {}
+        0 => return Err("memory run does not contain mimalloc-pprof".into()),
+        _ => return Err("memory run mixes several mimalloc-pprof builds".into()),
     }
     latest
         .pending_metrics

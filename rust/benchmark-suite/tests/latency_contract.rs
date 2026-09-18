@@ -342,3 +342,72 @@ fn complete_latency_raw_matrix_is_bound_to_calibration_provenance_and_schedule()
     wrong_checksum.samples[0].measured.checksum ^= 1;
     assert!(validate_latency_raw_run(&wrong_checksum).is_err());
 }
+
+#[test]
+fn overlay_accepts_a_newer_fork_build_but_not_a_moved_competitor_pin() {
+    use benchmark_suite::latency::{attach_latency_report, build_latency_report};
+
+    // Reproduces the first live run's failure: the sweep runs weekly and
+    // overlays onto whichever daily core envelope is published, so
+    // mimalloc-pprof is normally built from a newer commit than the base.
+    let report = build_latency_report(&complete_raw_fixture()).unwrap();
+    let core = synthetic_full_fixture().unwrap();
+    let validation = benchmark_suite::validate::validate_publication_raw(&core).unwrap();
+    let base = benchmark_suite::report::build_latest_report(&core, validation)
+        .unwrap()
+        .0;
+
+    let mut newer_fork = report.clone();
+    for sample in &mut newer_fork.raw_samples {
+        if sample.allocator_id == "mimalloc-pprof" {
+            sample.allocator_source_sha = "a".repeat(40);
+        }
+    }
+    let mut latest = base.clone();
+    attach_latency_report(&mut latest, newer_fork)
+        .expect("a newer fork build must still overlay");
+    assert!(latest.latency.is_some());
+    assert!(!latest
+        .pending_metrics
+        .iter()
+        .any(|value| value.metric_id == "latency"));
+
+    let mut moved_pin = report.clone();
+    for sample in &mut moved_pin.raw_samples {
+        if sample.allocator_id == "upstream-mimalloc" {
+            sample.allocator_source_sha = "f".repeat(40);
+        }
+    }
+    let mut moved_pin_latest = base.clone();
+    assert!(
+        attach_latency_report(&mut moved_pin_latest, moved_pin)
+            .unwrap_err()
+            .contains("provenance"),
+        "a competitor built from a different commit must be rejected"
+    );
+
+    let mut fork_missing = report.clone();
+    fork_missing
+        .raw_samples
+        .retain(|sample| sample.allocator_id != "mimalloc-pprof");
+    let mut fork_missing_latest = base.clone();
+    assert!(
+        attach_latency_report(&mut fork_missing_latest, fork_missing).is_err(),
+        "a run without the fork must be rejected"
+    );
+
+    let mut mixed_fork = report;
+    let mut changed_first = false;
+    for sample in &mut mixed_fork.raw_samples {
+        if sample.allocator_id == "mimalloc-pprof" && !changed_first {
+            sample.allocator_source_sha = "b".repeat(40);
+            changed_first = true;
+        }
+    }
+    assert!(changed_first);
+    let mut mixed_fork_latest = base;
+    let error = attach_latency_report(&mut mixed_fork_latest, mixed_fork)
+        .expect_err("a run mixing two fork commits must be rejected");
+    assert!(error.contains("several mimalloc-pprof builds"), "{error}");
+    assert!(mixed_fork_latest.latency.is_none());
+}

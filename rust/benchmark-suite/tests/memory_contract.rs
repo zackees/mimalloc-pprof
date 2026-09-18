@@ -549,3 +549,65 @@ fn old_latest_stays_pending_until_complete_memory_is_attached() {
         .iter()
         .any(|value| value.metric_id == "memory"));
 }
+
+#[test]
+fn overlay_accepts_a_newer_fork_build_but_not_a_moved_competitor_pin() {
+    use benchmark_suite::scaling::LOCK_PINNED_ALLOCATORS;
+
+    // Reproduces the scaling overlay's fix for the memory metric: the sweep
+    // runs weekly and overlays onto whichever daily core envelope is
+    // published, so mimalloc-pprof is normally built from a newer commit
+    // than the base, but the lock-pinned competitors must match exactly.
+    let throughput = synthetic_full_fixture().unwrap();
+    let validation = validate_publication_raw(&throughput).unwrap();
+    let (base, _) = build_latest_report(&throughput, validation).unwrap();
+    let report = build_memory_report(&memory_fixture()).unwrap();
+
+    let mut newer_fork = report.clone();
+    for sample in &mut newer_fork.raw_samples {
+        if sample.allocator_id == "mimalloc-pprof" {
+            sample.allocator_source_sha = "a".repeat(40);
+            sample.child_sample.allocator_source_sha = "a".repeat(40);
+        }
+    }
+    let mut latest = base.clone();
+    attach_memory_report(&mut latest, newer_fork)
+        .expect("a newer fork build must still overlay");
+    assert!(latest.memory.is_some());
+    assert!(!latest
+        .pending_metrics
+        .iter()
+        .any(|value| value.metric_id == "memory"));
+
+    let mut moved_pin = report.clone();
+    for sample in &mut moved_pin.raw_samples {
+        if sample.allocator_id == "upstream-mimalloc" {
+            sample.allocator_source_sha = "f".repeat(40);
+        }
+    }
+    let mut moved_pin_latest = base.clone();
+    let error = attach_memory_report(&mut moved_pin_latest, moved_pin)
+        .expect_err("a competitor built from a different commit must be rejected");
+    assert!(error.contains("provenance"), "{error}");
+
+    let mut missing_fork = report.clone();
+    missing_fork
+        .raw_samples
+        .retain(|sample| sample.allocator_id != "mimalloc-pprof");
+    let mut missing_fork_latest = base.clone();
+    let error = attach_memory_report(&mut missing_fork_latest, missing_fork).unwrap_err();
+    assert!(error.contains("does not contain mimalloc-pprof"), "{error}");
+
+    let mut mixed_fork = report.clone();
+    let first_fork_sample = mixed_fork
+        .raw_samples
+        .iter_mut()
+        .find(|sample| sample.allocator_id == "mimalloc-pprof")
+        .unwrap();
+    first_fork_sample.allocator_source_sha = "b".repeat(40);
+    let mut mixed_fork_latest = base;
+    let error = attach_memory_report(&mut mixed_fork_latest, mixed_fork).unwrap_err();
+    assert!(error.contains("several mimalloc-pprof builds"), "{error}");
+
+    assert_eq!(LOCK_PINNED_ALLOCATORS.len(), 4);
+}

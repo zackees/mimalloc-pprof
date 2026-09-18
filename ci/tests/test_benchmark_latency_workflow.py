@@ -85,11 +85,11 @@ class BenchmarkLatencyWorkflowTests(unittest.TestCase):
         def no_op(workflow: dict[str, Any]) -> None:
             del workflow
 
-        with patch.dict(policy.MUTATIONS, {"no-op": no_op}):
-            with self.assertRaisesRegex(
-                policy.LatencyWorkflowError, "accepted a workflow with no-op"
-            ):
-                policy.selftest(policy.WORKFLOW)
+        with (
+            patch.dict(policy.MUTATIONS, {"no-op": no_op}),
+            self.assertRaisesRegex(policy.LatencyWorkflowError, "accepted a workflow with no-op"),
+        ):
+            policy.selftest(policy.WORKFLOW)
 
     def test_selftest_cli_flag_passes(self) -> None:
         self.assertEqual(policy.main(["--selftest"]), 0)

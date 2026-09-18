@@ -29,11 +29,11 @@ class BenchmarkMemoryWorkflowTests(unittest.TestCase):
         def no_op(workflow: dict[str, Any]) -> None:
             del workflow
 
-        with mock.patch.dict(policy.MUTATIONS, {"no-op": no_op}):
-            with self.assertRaisesRegex(
-                policy.MemoryWorkflowError, "accepted a workflow with no-op"
-            ):
-                policy.selftest(policy.WORKFLOW)
+        with (
+            mock.patch.dict(policy.MUTATIONS, {"no-op": no_op}),
+            self.assertRaisesRegex(policy.MemoryWorkflowError, "accepted a workflow with no-op"),
+        ):
+            policy.selftest(policy.WORKFLOW)
 
     def test_main_selftest_returns_zero(self) -> None:
         self.assertEqual(policy.main(["--selftest"]), 0)

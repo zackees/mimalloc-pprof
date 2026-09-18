@@ -99,15 +99,21 @@ static void mi_purge_all_arenas(bool force) {
 // the sweeping thread's tld (the hole bookkeeping -- `holes_sweeping`, the per-pass counters --
 // lives on it). A heap that is being deleted (`releasing`) is abandoning its pages unmapped
 // right now and is skipped, as `_mi_subproc_prof_sync_force_slow` does.
+// Split out of the subprocs walk so the two `mi_lock` scopes do not nest in one function
+// (the macro's `_mi_go` would shadow itself under -Wshadow, #373).
+static void mi_purge_all_abandoned_subproc(mi_subproc_t* sp, mi_tld_t* my_tld) {
+  mi_lock(&sp->heaps_lock) {
+    for (mi_heap_t* heap = sp->heaps; heap != NULL; heap = heap->next) {
+      if (mi_atomic_load_acquire(&heap->releasing) != 0) continue;
+      _mi_arenas_purge_abandoned_holes(heap, my_tld);
+    }
+  }
+}
+
 static void mi_purge_all_abandoned(mi_tld_t* my_tld) {
   mi_lock(_mi_subprocs_lock()) {
     for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {
-      mi_lock(&sp->heaps_lock) {
-        for (mi_heap_t* heap = sp->heaps; heap != NULL; heap = heap->next) {
-          if (mi_atomic_load_acquire(&heap->releasing) != 0) continue;
-          _mi_arenas_purge_abandoned_holes(heap, my_tld);
-        }
-      }
+      mi_purge_all_abandoned_subproc(sp, my_tld);
     }
   }
 }

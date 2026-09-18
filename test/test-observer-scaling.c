@@ -147,6 +147,7 @@ int main(void) {
      here, which is the gate working as designed, not #371 returning. Asserting scaling
      against a build whose whole point is to serialise would make this test a liar. */
   printf("test-observer-scaling: SKIP (MI_OWNER_GATE trades fast-path scaling by design)\n");
+  (void)test_hardware_threads; (void)test_run_workers;  /* unused in this build (#373) */
   return 0;
 #else
   /* MI_GUARDED with a sample rate of 1 gives EVERY allocation its own guard page, so the

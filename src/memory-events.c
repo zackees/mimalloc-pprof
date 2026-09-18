@@ -259,6 +259,9 @@ static void memevt_dispatch(mi_hooks_tld_t* hooks, mi_memory_change_kind_t kind,
    The shared suppression depth excludes callback-internal and moving-realloc internals
    from both observers. */
 void _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size) {
+  #if !MI_DHAT
+  MI_UNUSED(p);  // only DHAT consumes the block address (#373)
+  #endif
   // #266: must be the very first thing touched -- see hooks-tld.h's file comment. A
   // thread mid-init (inside `_mi_thread_init_with_heap` -> `_mi_meta_zalloc`, allocating
   // its OWN tld/theap) reaches this hook too; peeking (rather than touching any TLS
@@ -306,6 +309,9 @@ void _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size) {
 // free.c's "free'd after thread_done" comment). So: peek, and fall back to a local,
 // per-call scratch `mi_hooks_tld_t` instead of forcing -- see hooks-tld.h.
 void _mi_memevt_on_free_slow(mi_page_t* page, void* p) {
+  #if !MI_DHAT
+  MI_UNUSED(p);  // only DHAT consumes the block address (#373)
+  #endif
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
   if (hooks->memevt_suppress_depth > 0) return;
@@ -333,6 +339,9 @@ void _mi_memevt_on_free_slow(mi_page_t* page, void* p) {
 }
 
 void _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t request_size) {
+  #if !MI_DHAT
+  MI_UNUSED(p);  // only DHAT consumes the block address (#373)
+  #endif
   // #266: see _mi_memevt_on_free above.
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);
@@ -352,6 +361,9 @@ void _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t reques
 }
 
 void _mi_memevt_on_resize_slow(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
+  #if !MI_DHAT
+  MI_UNUSED(oldp); MI_UNUSED(newp);  // only DHAT consumes the block addresses (#373)
+  #endif
   // #266: see _mi_memevt_on_free above.
   mi_hooks_tld_t local_hooks;
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek_or_local(&local_hooks);

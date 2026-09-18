@@ -314,14 +314,17 @@ static void test_degenerate_arguments(void) {
     mi_free(p);
   }
 
-  /* absurd sizes must fail cleanly (NULL), not abort or wrap around */
-  void* huge = mi_malloc(SIZE_MAX);
+  /* absurd sizes must fail cleanly (NULL), not abort or wrap around. `volatile` keeps the
+     sizes opaque to the compiler: GCC's -Walloc-size-larger-than would otherwise reject the
+     deliberately oversized constants at compile time under -Werror (#373). */
+  volatile size_t size_max = SIZE_MAX;
+  void* huge = mi_malloc(size_max);
   assert(huge == NULL);
-  void* huge2 = mi_malloc(SIZE_MAX / 2);
+  void* huge2 = mi_malloc(size_max / 2);
   if (huge2 != NULL) { mi_free(huge2); }   /* allowed to succeed on paper; must not corrupt */
 
   /* calloc overflow must be detected rather than silently under-allocating */
-  void* ov = mi_calloc(SIZE_MAX / 2, 4);
+  void* ov = mi_calloc(size_max / 2, 4);
   assert(ov == NULL);
 
   printf("  degenerate args: zero-size, NULL free, alignments, overflow all handled\n");

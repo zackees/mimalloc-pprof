@@ -261,6 +261,13 @@ if(MI_WARNINGS_AS_ERRORS)
     list(APPEND mi_cflags /WX)
   elseif(CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU|Intel")
     list(APPEND mi_cflags -Werror)
+    # upstream types.h's `#warning "mimalloc assertions enabled in a release build"` is a
+    # deliberate notice (the debug-full row is exactly that build): keep it visible, not fatal
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU")
+      list(APPEND mi_cflags -Wno-error=cpp)
+    else()
+      list(APPEND mi_cflags -Wno-error=\#warnings)
+    endif()
   endif()
   message(STATUS "Warnings are errors (MI_WARNINGS_AS_ERRORS=ON)")
 endif()
@@ -453,7 +460,11 @@ endif()
 if(MI_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND NOT MI_CLANG_CL)
   # a single variable so the integrator can remove a flag that cannot be made clean --
   # never add a -Wno-* here instead.
-  set(mi_strict_fork_cflags -Wpedantic -Wshadow -Wpointer-arith -Wwrite-strings -Wformat=2)
+  # -Wpedantic is deliberately absent (#373 phase 1): upstream types.h's `#warning` for a
+  # release build with assertions (the debug-full row) is itself a pedantic diagnostic before
+  # C23, and win-gnu's GetProcAddress function-pointer cast in scavenger.c is another; both
+  # are follow-up work, tracked in docs/ci-gates.md.
+  set(mi_strict_fork_cflags -Wshadow -Wpointer-arith -Wwrite-strings -Wformat=2)
   if(NOT MI_USE_CXX)
     # C-only: g++ reports "valid for C/ObjC but not for C++", which -Werror makes fatal
     list(APPEND mi_strict_fork_cflags -Wmissing-prototypes)
@@ -673,7 +684,9 @@ endif()
 if(CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND NOT MI_CLANG_CL)
   list(APPEND mi_cflags -Wno-unknown-pragmas -fvisibility=hidden)
   if(NOT MI_USE_CXX)
-    list(APPEND mi_cflags -Wstrict-prototypes)
+    # C-only flag: the C++ test executables also take mi_cflags, and g++ reports it as
+    # "valid for C/ObjC but not for C++", which MI_WARNINGS_AS_ERRORS makes fatal (#373)
+    list(APPEND mi_cflags $<$<COMPILE_LANGUAGE:C>:-Wstrict-prototypes>)
   endif()
   if(CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang")
     list(APPEND mi_cflags -Wno-static-in-inline)
@@ -879,9 +892,12 @@ endif()
 # that warning, not on something unrelated. cl's /W3 does not report unused statics (that's
 # C4505, gated on /W4), which is one reason MSVC is excluded here until its phase.
 if(MI_WARNINGS_AS_ERRORS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND NOT MI_CLANG_CL)
+  # try_compile does not evaluate generator expressions; drop the language-gated ones
+  set(mi_strict_control_cflags ${mi_cflags})
+  list(FILTER mi_strict_control_cflags EXCLUDE REGEX "^\\$<")
   try_compile(mi_strict_control_ok ${CMAKE_CURRENT_BINARY_DIR}/strict-warnings-control
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/strict-warnings-control.c
-    COMPILE_DEFINITIONS ${mi_cflags}
+    COMPILE_DEFINITIONS ${mi_strict_control_cflags}
     OUTPUT_VARIABLE mi_strict_control_out)
   # the MATCHES check below makes an unrelated link/toolchain failure count as red, not a pass
   if(mi_strict_control_ok OR NOT mi_strict_control_out MATCHES "mi_strict_control_unused")

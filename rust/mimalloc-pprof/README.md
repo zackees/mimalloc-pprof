@@ -25,18 +25,31 @@ debug = "line-tables-only"
 strip = false
 ```
 
-Profiling hooks are enabled by default, preserving the behavior of earlier
-releases. If an application only needs mimalloc and wants to compile the
-profiler out, opt out of the default feature:
+Both the pprof-compatible sampled profiler and the exact DHAT observer are
+enabled by default, preserving the behavior of earlier releases. If an
+application only needs mimalloc and wants to compile both profilers out, opt
+out of the default feature:
 
 ```toml
 [dependencies]
-mimalloc-pprof = { version = "0.9", default-features = false }
+mimalloc-pprof = { version = "0.11", default-features = false }
 ```
 
 With `default-features = false`, the allocator remains available and the
 profiling API is retained for source compatibility, but profiling cannot be
-started (`prof::start` and `enable_heap_profiling` return `false`).
+started (`prof::start` and `enable_heap_profiling` return `false`) and
+`dhat::start` returns `false`.
+
+The `dhat` feature (on by default) builds the C code with `MI_DHAT=1`
+([#371](https://github.com/zackees/mimalloc-pprof/issues/371)): the exact
+DHAT v2 observer. Compiled in but not started it costs one not-taken branch
+per allocation and free; turn it off to remove even that. To keep one of the
+two, re-enable it explicitly:
+
+```toml
+[dependencies]
+mimalloc-pprof = { version = "0.11", default-features = false, features = ["pprof"] }
+```
 
 The `owner-gate` feature builds the C code with `MI_OWNER_GATE=1`
 ([#366](https://github.com/zackees/mimalloc-pprof/issues/366)): every allocator call takes a
@@ -119,7 +132,7 @@ The short version. Safe wrappers, all at the crate root unless noted:
 | Module | What it covers |
 |---|---|
 | `prof` | sampled pprof profiling: start/stop, text and `profile.proto` dumps, `stats()`, `samples()`, `modules()` |
-| `dhat` | exact DHAT v2 profiling: start/stop, `stats()`, `dump_file()` |
+| `dhat` | exact DHAT v2 profiling: start/stop, `stats()`, `dump_file()` (`dhat` feature, on by default) |
 | `stats` | the allocator's **exact** counters: `get()`, `json()`, `print()`, `bin_size()`, and the subprocess-scoped forms |
 | `memory_events` | opt-in allocation-change accounting: `set_enabled`, `snapshot`, `set_callbacks`, `visit_live_allocations` |
 | `options` | every `mi_option_t`, including the thirteen this fork adds (`Opt::PROF`, `Opt::SCAVENGER`, `Opt::PURGE_HOLES`, …) |

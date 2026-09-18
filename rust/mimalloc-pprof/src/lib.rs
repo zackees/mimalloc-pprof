@@ -524,6 +524,11 @@ pub const PURGE_ALL_DEFAULT_WAIT_MS: usize = 100;
 /// It is intended for short diagnostic runs and tests rather than continuous production
 /// telemetry. The generated JSON opens in the standard Valgrind `dh_view.html` viewer.
 /// It is independent of sampled [`prof`] profiling and of `mi_memory_set_callbacks`.
+///
+/// Requires the default-on `dhat` cargo feature (C `MI_DHAT=1`). Without it the observer
+/// is compiled out of the allocator, the API stays present for source compatibility, and
+/// [`start`] returns `false`, [`is_enabled`] and `Stats::enabled` are `false`, and
+/// [`dump_file`] returns an error.
 pub mod dhat {
     use std::ffi::CString;
     use std::io;
@@ -549,7 +554,8 @@ pub mod dhat {
         pub internal_bytes: u64,
     }
 
-    /// Start exact allocation/lifetime tracking. Returns `false` if it is already active.
+    /// Start exact allocation/lifetime tracking. Returns `false` if it is already active,
+    /// or if the crate was built without the `dhat` feature.
     pub fn start() -> bool {
         unsafe { sys::mi_dhat_start() }
     }
@@ -566,7 +572,8 @@ pub mod dhat {
     }
 
     /// Read the collector's exact counters. Returns a zero/default snapshot only if the
-    /// linked C library rejected the versioned ABI structure.
+    /// linked C library rejected the versioned ABI structure, or if the crate was built
+    /// without the `dhat` feature.
     pub fn stats() -> Stats {
         let mut raw: sys::mi_dhat_stats_t = unsafe { core::mem::zeroed() };
         raw.size = core::mem::size_of::<sys::mi_dhat_stats_t>();
@@ -1815,6 +1822,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "dhat")]
     #[test]
     fn dhat_controls_report_lifecycle() {
         let _guard = DHAT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1827,6 +1835,16 @@ mod tests {
         dhat::stop();
         assert!(!dhat::is_enabled());
         assert!(!dhat::stats().enabled);
+    }
+
+    #[cfg(not(feature = "dhat"))]
+    #[test]
+    fn dhat_compiled_out_is_inert() {
+        let _guard = DHAT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!dhat::start(), "without the dhat feature the observer is compiled out");
+        assert!(!dhat::is_enabled());
+        assert!(!dhat::stats().enabled);
+        dhat::stop();
     }
     #[test]
     fn heap_dump_json_reports_well_formed_json_with_current_heap() {

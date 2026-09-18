@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **New default-on `dhat` cargo feature** ([#371](https://github.com/zackees/mimalloc-pprof/issues/371)).
+  It controls the C `MI_DHAT` define the crate previously hard-coded to `1`. Default builds are
+  unchanged. Builds with `default-features = false` now compile the DHAT observer out as well
+  as the profiler: `dhat::start()` returns `false` there. Add `features = ["dhat"]` to keep it.
+
 ## 0.11.1
 
 Safe, bounded live-heap JSON capture under concurrent allocation.

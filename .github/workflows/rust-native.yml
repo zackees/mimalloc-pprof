@@ -120,5 +120,11 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
-      - name: Test allocator-only build (profiler compiled out)
+      - name: Test allocator-only build (profiler and DHAT compiled out)
         run: soldr cargo test -p mimalloc-pprof --no-default-features --locked
+      # #371: the `dhat` cargo feature is independent of `pprof`; prove each compiles and
+      # passes with the other one off.
+      - name: Test pprof without DHAT (dhat feature off)
+        run: soldr cargo test -p mimalloc-pprof --no-default-features --features pprof --locked
+      - name: Test DHAT without pprof (pprof feature off)
+        run: soldr cargo test -p mimalloc-pprof --no-default-features --features dhat --locked

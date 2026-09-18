@@ -272,11 +272,13 @@ def ctest_run(
 # re-derived, so `ci/tests/test_verify_local.py` can catch drift by grepping this file.
 # --------------------------------------------------------------------------------------
 
+C_UNIT_STRICT = "-DMI_WARNINGS_AS_ERRORS=ON"  # c-unit.yml build/Configure step (#373)
+
 
 def run_release(ctx: RunCtx) -> bool:
     """c-unit.yml `build (release)` + its slice of `run-linux`: -DMI_PPROF=ON, Release."""
     build = ctx.dir / "build"
-    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON"])
+    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON", C_UNIT_STRICT])
     if rc:
         return False
     if cmake_build(ctx, build, config="Release"):
@@ -287,7 +289,7 @@ def run_release(ctx: RunCtx) -> bool:
 def run_off(ctx: RunCtx) -> bool:
     """c-unit.yml `build (pprof-off)` + its slice of `run-linux`: -DMI_PPROF=OFF."""
     build = ctx.dir / "build"
-    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=OFF"])
+    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=OFF", C_UNIT_STRICT])
     if rc:
         return False
     if cmake_build(ctx, build):
@@ -298,7 +300,7 @@ def run_off(ctx: RunCtx) -> bool:
 def run_debug_full(ctx: RunCtx) -> bool:
     """c-unit.yml `build (debug-full)` + its slice of `run-linux`: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug."""
     build = ctx.dir / "build"
-    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON"])
+    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON", C_UNIT_STRICT])
     if rc:
         return False
     if cmake_build(ctx, build, config="Debug"):
@@ -325,7 +327,12 @@ def run_debug3_extra(ctx: RunCtx) -> bool:
     rc, configure_out = cmake_configure(
         ctx,
         build,
-        ["-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_EXTRA_CPPDEFS=MI_DEBUG=3"],
+        [
+            "-DCMAKE_BUILD_TYPE=Debug",
+            "-DMI_PPROF=ON",
+            "-DMI_EXTRA_CPPDEFS=MI_DEBUG=3",
+            C_UNIT_STRICT,
+        ],
     )
     if rc:
         return False
@@ -441,7 +448,9 @@ def run_guarded(ctx: RunCtx) -> bool:
     allocation (in CI that second pass is an `--env-variant` scoped to this bundle)."""
     build = ctx.dir / "build-guarded"
     rc, configure_out = cmake_configure(
-        ctx, build, ["-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_GUARDED=ON"]
+        ctx,
+        build,
+        ["-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_GUARDED=ON", C_UNIT_STRICT],
     )
     if rc:
         return False
@@ -467,6 +476,7 @@ def run_shared(ctx: RunCtx) -> bool:
         "-DMI_BUILD_SHARED=ON",
         "-DMI_BUILD_STATIC=OFF",
         "-DMI_BUILD_OBJECT=OFF",
+        C_UNIT_STRICT,
     ]
     rc, _ = cmake_configure(ctx, build, args)
     if rc:
@@ -483,7 +493,9 @@ def run_gated(ctx: RunCtx) -> bool:
     resolved defines, since a flag that never reaches the compiler is this repository's
     most-repeated CI bug (docs/ci-gates.md)."""
     build = ctx.dir / "build"
-    rc, configure_out = cmake_configure(ctx, build, ["-DMI_PPROF=ON", "-DMI_OWNER_GATE=ON"])
+    rc, configure_out = cmake_configure(
+        ctx, build, ["-DMI_PPROF=ON", "-DMI_OWNER_GATE=ON", C_UNIT_STRICT]
+    )
     if rc:
         return False
     if not re.search(r"Compiler defines\s*:.*MI_OWNER_GATE=1", configure_out):
@@ -500,7 +512,9 @@ def run_dhat_off(ctx: RunCtx) -> bool:
     per-allocation hook sites disappear from the alloc/free path, so every test is a test
     of that. Asserted on the resolved defines like `gated`, and for the same reason."""
     build = ctx.dir / "build"
-    rc, configure_out = cmake_configure(ctx, build, ["-DMI_PPROF=ON", "-DMI_DHAT=OFF"])
+    rc, configure_out = cmake_configure(
+        ctx, build, ["-DMI_PPROF=ON", "-DMI_DHAT=OFF", C_UNIT_STRICT]
+    )
     if rc:
         return False
     if not re.search(r"Compiler defines\s*:.*MI_DHAT=0", configure_out):
@@ -569,7 +583,7 @@ def run_memory_gate(ctx: RunCtx) -> bool:
     import memory_gate
 
     build = ctx.dir / "build"
-    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON"])
+    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON", C_UNIT_STRICT])
     if rc:
         return False
     if cmake_build(ctx, build, config="Release"):
@@ -602,7 +616,9 @@ def run_memory_gate(ctx: RunCtx) -> bool:
 
     # Positive control: the gate must catch an injected leak, or it is decoration.
     build_leak = ctx.dir / "build-leak"
-    rc, _ = cmake_configure(ctx, build_leak, ["-DMI_PPROF=ON", "-DMI_BENCH_INJECT_LEAK=600000"])
+    rc, _ = cmake_configure(
+        ctx, build_leak, ["-DMI_PPROF=ON", "-DMI_BENCH_INJECT_LEAK=600000", C_UNIT_STRICT]
+    )
     if rc:
         return False
     if cmake_build(ctx, build_leak, config="Release", target="mimalloc-test-memory-gate"):
@@ -651,6 +667,7 @@ def run_diag(ctx: RunCtx) -> bool:
             "-DMI_DEBUG=OFF",
             f"-DMI_PPROF={pprof}",
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+            C_UNIT_STRICT,
         ]
         rc, _ = cmake_configure(ctx, build, args)
         if rc:
@@ -681,7 +698,9 @@ def run_diag(ctx: RunCtx) -> bool:
     ok = py("check_isa_baseline.py", "--selftest") and ok
 
     build_portable = ctx.dir / "build-portable"
-    rc, _ = cmake_configure(ctx, build_portable, ["-DMI_PPROF=ON", "-DMI_NO_OPT_ARCH=ON"])
+    rc, _ = cmake_configure(
+        ctx, build_portable, ["-DMI_PPROF=ON", "-DMI_NO_OPT_ARCH=ON", C_UNIT_STRICT]
+    )
     if rc:
         return False
     if cmake_build(ctx, build_portable, target="mimalloc-static"):
@@ -692,7 +711,9 @@ def run_diag(ctx: RunCtx) -> bool:
     ok = py("check_isa_baseline.py", str(portable_libs[0])) and ok
 
     build_arch = ctx.dir / "build-arch"
-    rc, _ = cmake_configure(ctx, build_arch, ["-DMI_PPROF=ON", "-DMI_OPT_ARCH=ON"])
+    rc, _ = cmake_configure(
+        ctx, build_arch, ["-DMI_PPROF=ON", "-DMI_OPT_ARCH=ON", C_UNIT_STRICT]
+    )
     if rc:
         return False
     if cmake_build(ctx, build_arch, target="mimalloc-static"):
@@ -1592,7 +1613,7 @@ def like_ci_build_one(row: LikeCiBuild, jobs: int) -> tuple[bool, Path]:
     log_start(log, f"=== build {row.config} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
     ctx = RunCtx(name=row.config, dir=out, log=log, jobs=jobs, slow=True)
     build = out / "build"
-    rc, configure_out = cmake_configure(ctx, build, list(row.cmake))
+    rc, configure_out = cmake_configure(ctx, build, [*row.cmake, C_UNIT_STRICT])
     if rc:
         return False, log
     if row.config == "guarded" and not re.search(

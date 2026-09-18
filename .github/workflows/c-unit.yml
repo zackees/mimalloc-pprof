@@ -227,7 +227,11 @@ jobs:
           set -e
           # Redirect rather than pipe through `tee`: this runs under alpine's `sh`, which
           # has no `pipefail`, so a pipeline would report cmake's failure as success.
-          if ! cmake -B build ${{ matrix.generator }} ${{ matrix.cmake }} > configure.log 2>&1; then
+          # #373 phase 1: every row of this matrix is ubuntu or alpine GCC, so every Linux
+          # build row compiles with -Werror for both MI_PPROF=ON and OFF. The configure-time
+          # positive control (cmake/strict-warnings-control.c) proves -Werror reached the
+          # compiler rather than silently no-opping like #116.
+          if ! cmake -B build ${{ matrix.generator }} ${{ matrix.cmake }} -DMI_WARNINGS_AS_ERRORS=ON > configure.log 2>&1; then
             cat configure.log
             exit 1
           fi

@@ -136,6 +136,75 @@ appears in `verify_local.py`. Without that, a templated flag would read as the l
 token `-DCMAKE_BUILD_TYPE=${{` and the drift guard would have to be silenced — the same
 kind of blind spot as the seven dead gates listed at the top of this page.
 
+## Strict diagnostics and fatal warnings (#373)
+
+Two independent options, so "louder" and "fatal" can be turned on separately:
+
+- **`MI_STRICT_WARNINGS`** (default **ON**) adds fork-scoped extra diagnostics --
+  `-Wpedantic -Wshadow -Wpointer-arith -Wwrite-strings -Wmissing-prototypes -Wformat=2` --
+  applied with `set_source_files_properties(... COMPILE_OPTIONS ...)` to the fork's own
+  source files only (`src/profile*.c`, `src/memory-events.c`, `src/dhat*.c`,
+  `src/scavenger.c`, `src/page-holes.c`, `src/purge-all.c`, `src/heap-snapshot.c`,
+  `src/heap-dump.c`, `src/diagnostic.c`). Upstream-owned engine files (`arena.c`, `page.c`,
+  `os.c`, `free.c`, `alloc.c`, ...) stay on the pinned `6def7be9` baseline flags
+  unconditionally -- putting them under new warning flags risks disturbing a
+  byte-identical upstream cherry-pick surface (CLAUDE.md rule 2 / repo facts).
+- **`MI_WARNINGS_AS_ERRORS`** (default **OFF**) turns every warning `-Werror` (`/WX` for
+  `cl`/clang-cl). OFF is the right default for a consumer vendoring this tree with their
+  own toolchain's warning set; CI opts in explicitly per lane, one phase at a time.
+
+The strict-flag block and the positive control are gated by `CMAKE_C_COMPILER_ID MATCHES
+"AppleClang|Clang|GNU" AND NOT MI_CLANG_CL` in this phase, and the extra
+`-Wmissing-prototypes` is C-only (skipped under `MI_USE_CXX`). `MI_WARNINGS_AS_ERRORS`
+itself maps to `/WX` on `cl`/clang-cl, but no MSVC-ABI lane passes it yet, so clang-cl
+and native `cl` builds are unchanged.
+
+### The configure-time positive control
+
+`cmake/strict-warnings-control.c` is a deliberately-broken translation unit (an unused
+static function) compiled with `try_compile()` only when `MI_WARNINGS_AS_ERRORS=ON`. It
+**must fail** to compile -- a `FATAL_ERROR` at configure time if it does not, naming the
+file, because a `-Werror` flag that silently fails to reach the compiler is this
+repository's most-repeated CI bug (see the seven-dead-gates list at the top of this
+document). The same shape as the `guarded`/`gated`/`dhat-off` "assert on resolved
+defines" controls, but exercised at configure time rather than by grepping
+`Compiler defines`, since `-Werror` is not itself a define.
+
+### Per-lane status
+
+| Lane | Strict (`MI_STRICT_WARNINGS`) | Fatal (`MI_WARNINGS_AS_ERRORS`) | Phase |
+|---|---|---|---|
+| Linux GCC (`c-unit.yml` `build`) | on | **on** | 1 (this PR) |
+| ubuntu Clang (`asan.yml`) | on | off | pending |
+| win-gnu mingw (`windows-bundles.yml`) | on | off | next |
+| clang-cl cross + native `cl` `ctest (windows-latest)` | unchanged | off | pending (`/W4` count unmeasured) |
+| Apple cross (`macos-bundles.yml`) | on | off | pending |
+| Rust clippy + fmt (`rust-native.yml`) | none | pending | last |
+
+Phase 1 (this PR) turns every row of `c-unit.yml`'s `build` matrix fatal -- every row is
+ubuntu or alpine GCC, for both `MI_PPROF=ON` and `MI_PPROF=OFF` -- via
+`-DMI_WARNINGS_AS_ERRORS=ON` appended to that job's `Configure` step, mirrored in
+`ci/verify_local.py` (`C_UNIT_STRICT`) so `--like-ci` and every per-config runner that
+mirrors a `c-unit.yml` `build` row builds under the same flag locally.
+`build-windows-native`, `run-windows-native` and every other job are untouched in this
+phase; MSVC and win-gnu are later phases and stay exactly as they were.
+
+### The amnesty rule
+
+A warning that genuinely cannot be made clean gets a **line-scoped suppression with an
+inline reason**, never a project-wide `-Wno-*` and never dropping a lane back to
+advisory (`continue-on-error`) to make a red build go away. If a lane cannot be made
+clean at all yet, it stays at `Strict=on, Fatal=off` in the table above until it can,
+rather than being gated dirty.
+
+`-Wconversion`, `-Wsign-conversion`, `-Wcast-qual`, `-Wundef` and `-Wdouble-promotion`
+are **deferred, not dropped**: real, uncommented existing hits are expected to be common
+enough in an allocator that mixes size types across an old C codebase that turning them
+on is its own phase of work, not a one-line flag flip.
+
+No new required check is added by this phase -- `c-unit.yml`'s `build` job is already
+required; this makes what it already gates stricter, not a new gate.
+
 ## Test bundles
 
 Issue #277 wants the macOS and Windows test binaries built once on Linux (through the

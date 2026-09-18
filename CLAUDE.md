@@ -73,9 +73,17 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    allocation paths (`mi_malloc`/`operator new`/`GlobalAlloc`). Debug builds assert this.
 5. **No new required dependencies for the C build** (no mandatory libunwind/protobuf/zlib).
 6. New logic goes in new files (`src/profile*.c`, `include/mimalloc/profile.h`,
-   `src/memory-events.c`, `include/mimalloc/memory-events.h`); edits to upstream files stay to
-   a few guarded lines — `#if MI_PPROF` for the profiler hooks, unconditional (but tiny, one
-   function-call each) for the always-on memory-events hooks in `src/alloc.c`/`src/free.c`.
+   `src/memory-events.c`, `include/mimalloc/memory-events.h`, `src/dhat*.c`,
+   `include/mimalloc/dhat.h`); edits to upstream files stay to a few guarded lines —
+   `#if MI_PPROF` for the profiler hooks, and one unconditional line each for the always-on
+   observer hooks in `src/alloc.c`/`src/free.c`/`src/alloc-aligned.c`. Those lines call the
+   `static inline` `_mi_memevt_on_*` wrappers in `include/mimalloc/internal.h`, whose disabled
+   path is one relaxed load of `_mi_observers_armed` and a not-taken branch; everything else
+   (TLS peek, suppression depth, meta-page check, DHAT bookkeeping) lives behind that test in
+   the out-of-line `_slow` bodies (#371). Never put a call, TLS read or atomic RMW in front of
+   the flag test: `ci/check_fastpath_identity.py` rejects any `lock`/`xchg` in the default
+   build's fast path and `test-observer-scaling` measures the scaling it protects. DHAT itself
+   compiles out with CMake `MI_DHAT=OFF` or the Rust `dhat` feature off (default on in both).
 7. **Escalate, don't improvise:** when reality diverges from a sub-issue (API drift, toolchain
    fights, unreachable threshold), comment on that issue with evidence and stop.
 

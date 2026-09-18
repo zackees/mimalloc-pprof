@@ -56,12 +56,21 @@ def main() -> None:
     version = crate_version(
         Path(__file__).resolve().parent.parent / "rust" / "mimalloc-pprof" / "Cargo.toml"
     )
-    required_manifest = (f'version = "{version}"', 'default = ["pprof"]', "pprof = []")
+    required_manifest = (
+        f'version = "{version}"',
+        'default = ["pprof", "dhat"]',
+        "pprof = []",
+        "dhat = []",
+    )
     for text in required_manifest:
         if text not in manifest:
             raise AssertionError(f"published manifest missing {text!r}")
     if 'var_os("CARGO_FEATURE_PPROF")' not in build or '"MI_PPROF"' not in build:
         raise AssertionError("published build script does not select MI_PPROF from the feature")
+    # #371: the `dhat` cargo feature must drive MI_DHAT; a hard-coded define would make
+    # `default-features = false` silently keep the observer compiled in.
+    if 'var_os("CARGO_FEATURE_DHAT")' not in build or '"MI_DHAT"' not in build:
+        raise AssertionError("published build script does not select MI_DHAT from the feature")
     if "pub mod dhat" not in library or "mi_dhat_start" not in native:
         raise AssertionError("published archive lost internal DHAT")
 

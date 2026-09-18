@@ -110,13 +110,43 @@ pub enum ScalingPattern {
     MixedGeneral,
     LargeBuffers,
     CrossThread,
+    /// Larson & Krishnan server workload: P.-A. Larson and M. Krishnan,
+    /// "Memory Allocation for Long-Running Server Applications", ISMM 1998.
+    /// Sizes and live-set shape mirror mimalloc-bench's invocation
+    /// (`larson 5 8 1000 5000 100 4141 N`): 8-1000 B blocks, 5000 live blocks
+    /// per thread, replaced one at a time (free-and-realloc the evicted
+    /// slot). Each thread's block array rotates to the next thread every
+    /// round, so later frees are frequently of another thread's allocation.
+    ///
+    /// This is a clean-room reimplementation of the workload *shape* from
+    /// the published papers and mimalloc-bench's documented parameters, not
+    /// a byte-identical port of mimalloc-bench's or Hoard's (GPL-licensed)
+    /// sources; no code from either was consulted or copied. `CrossThread`
+    /// (`sparse-cross-thread`) remains a separate, differently-shaped
+    /// workload -- this pattern is additive, not a replacement.
+    Larson,
+    /// xmalloc-test: the multi-threaded producer/consumer allocator stress
+    /// test from C. Lever and D. Boreham, "malloc() Performance in a
+    /// Multi-threaded Linux Environment", USENIX 2000, as distributed in
+    /// mimalloc-bench. Dedicated producer threads allocate small blocks and
+    /// hand them to dedicated consumer threads, which do all of the freeing.
+    ///
+    /// This is a clean-room reimplementation of the workload *shape* from
+    /// the published paper and mimalloc-bench's documented parameters, not a
+    /// byte-identical port of mimalloc-bench's (GPL-licensed)
+    /// `xmalloc-test.c`; no code from mimalloc-bench or Hoard was consulted
+    /// or copied. `CrossThread` (`sparse-cross-thread`) remains a separate,
+    /// differently-shaped workload.
+    XmallocTest,
 }
 
-pub const SCALING_PATTERNS: [ScalingPattern; 4] = [
+pub const SCALING_PATTERNS: [ScalingPattern; 6] = [
     ScalingPattern::TinyHot,
     ScalingPattern::MixedGeneral,
     ScalingPattern::LargeBuffers,
     ScalingPattern::CrossThread,
+    ScalingPattern::Larson,
+    ScalingPattern::XmallocTest,
 ];
 
 impl ScalingPattern {
@@ -126,6 +156,8 @@ impl ScalingPattern {
             Self::MixedGeneral => "sparse-mixed-general",
             Self::LargeBuffers => "sparse-large-buffers",
             Self::CrossThread => "sparse-cross-thread",
+            Self::Larson => "larson",
+            Self::XmallocTest => "xmalloc-test",
         }
     }
 
@@ -143,6 +175,8 @@ impl ScalingPattern {
             Self::MixedGeneral => 0x0000_0002_6d69_7802,
             Self::LargeBuffers => 0x0000_0003_6c61_7203,
             Self::CrossThread => 0x0000_0004_7874_6804,
+            Self::Larson => 0x0000_0005_6c61_7205,
+            Self::XmallocTest => 0x0000_0006_786d_6c06,
         }
     }
 
@@ -156,6 +190,8 @@ impl ScalingPattern {
             Self::CrossThread => {
                 "16-512 B producer/consumer handoff; blocks freed by another worker"
             }
+            Self::Larson => "Larson & Krishnan server workload: 8-1000 B random slot replacement over a 5000-block array per thread; arrays rotate between threads each round, so later frees are remote",
+            Self::XmallocTest => "xmalloc-test (Lever & Boreham): dedicated producer threads allocate 8-128 B blocks and hand them to dedicated consumer threads that free them",
         }
     }
 
@@ -172,6 +208,7 @@ impl ScalingPattern {
                 weight_realloc: 0,
                 cross_thread: false,
                 page_touch: false,
+                mode: PatternMode::Slots,
             },
             Self::MixedGeneral => PatternSpec {
                 min_size: 8,
@@ -184,6 +221,7 @@ impl ScalingPattern {
                 weight_realloc: 2,
                 cross_thread: false,
                 page_touch: false,
+                mode: PatternMode::Slots,
             },
             Self::LargeBuffers => PatternSpec {
                 min_size: 64 * 1024,
@@ -196,6 +234,7 @@ impl ScalingPattern {
                 weight_realloc: 0,
                 cross_thread: false,
                 page_touch: true,
+                mode: PatternMode::Slots,
             },
             Self::CrossThread => PatternSpec {
                 min_size: 16,
@@ -208,9 +247,56 @@ impl ScalingPattern {
                 weight_realloc: 0,
                 cross_thread: true,
                 page_touch: false,
+                mode: PatternMode::Handoff,
+            },
+            Self::Larson => PatternSpec {
+                min_size: 8,
+                max_size: 1000,
+                log_uniform: false,
+                capacity: 5000,
+                weight_alloc: 1,
+                weight_free_oldest: 0,
+                weight_free_random: 0,
+                weight_realloc: 0,
+                cross_thread: true,
+                page_touch: false,
+                mode: PatternMode::LarsonRotation { rounds: 8 },
+            },
+            Self::XmallocTest => PatternSpec {
+                min_size: 8,
+                max_size: 128,
+                log_uniform: false,
+                capacity: 256,
+                weight_alloc: 1,
+                weight_free_oldest: 0,
+                weight_free_random: 1,
+                weight_realloc: 0,
+                cross_thread: true,
+                page_touch: false,
+                mode: PatternMode::ProducerConsumer,
             },
         }
     }
+}
+
+/// How `WorkerPlanner::next_action` decides the next action for a pattern.
+/// Dispatch is on this, not on `PatternSpec::cross_thread`: `cross_thread`
+/// stays a semantic flag consumed by the oracle and the executor's mailbox
+/// setup, while `mode` picks the actual draw logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternMode {
+    /// Private per-worker live set; a weighted mix of alloc/free/realloc.
+    Slots,
+    /// Private per-worker live set, but allocations are handed off to a
+    /// randomly chosen peer's mailbox instead of kept; frees come from
+    /// draining one's own mailbox.
+    Handoff,
+    /// Larson & Krishnan free-and-replace over `rounds` shared tables that
+    /// rotate across workers every round.
+    LarsonRotation { rounds: u32 },
+    /// Fixed roles by worker index: even workers only produce (hand off),
+    /// odd workers only drain their mailbox.
+    ProducerConsumer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +311,7 @@ pub struct PatternSpec {
     pub weight_realloc: u32,
     pub cross_thread: bool,
     pub page_touch: bool,
+    pub mode: PatternMode,
 }
 
 impl PatternSpec {
@@ -275,6 +362,14 @@ pub struct WorkerPlanner {
     queued: VecDeque<PlannedAction>,
     worker: u32,
     thread_count: u32,
+    /// Per-round draw budget for `LarsonRotation`, consumed independently of
+    /// `remaining`. `None` means unbounded, which is every pattern except
+    /// Larson and Larson itself before its first round quota is set.
+    round_quota: Option<u64>,
+    /// Round-robin cursor over the odd (consumer) workers, advanced once per
+    /// `ProducerConsumer` producer draw. Deterministic: unlike `draw_peer`,
+    /// no RNG is involved in choosing a target.
+    producer_ordinal: u64,
 }
 
 impl WorkerPlanner {
@@ -295,7 +390,19 @@ impl WorkerPlanner {
             queued: VecDeque::new(),
             worker,
             thread_count,
+            round_quota: None,
+            producer_ordinal: 0,
         }
+    }
+
+    /// Bound the next draws to at most `draws`, independently of `remaining`;
+    /// `next_action` returns `None` once the quota is spent (after flushing
+    /// anything already `queued`). Used by the Larson rotation executor to
+    /// hand a shared table's planner to one worker at a time for exactly one
+    /// round. A planner on which this is never called behaves exactly as it
+    /// did before this existed: unbounded, driven only by `remaining`.
+    pub fn set_round_quota(&mut self, draws: u64) {
+        self.round_quota = Some(draws);
     }
 
     pub const fn page_touch(&self) -> bool {
@@ -338,6 +445,15 @@ impl WorkerPlanner {
     }
 
     /// Advance the stream and return the next allocator-independent action.
+    ///
+    /// Dispatch is on `spec.mode`, not `spec.cross_thread`. `Handoff` and
+    /// `Slots` reproduce today's byte-identical draw sequence exactly -- the
+    /// mode check sits where the old `cross_thread` check sat, with no extra
+    /// draws inserted ahead of it, so existing seeds/streams do not change.
+    /// `LarsonRotation` shares the `Slots` branch (Larson's free-and-replace
+    /// is exactly `Slots`' occupied-slot eviction path with every weight but
+    /// `weight_alloc` zeroed). `ProducerConsumer` is role-driven by worker
+    /// index and draws no weighted `choice` at all.
     pub fn next_action(&mut self) -> Option<PlannedAction> {
         loop {
             if let Some(action) = self.queued.pop_front() {
@@ -346,10 +462,31 @@ impl WorkerPlanner {
             if self.remaining == 0 {
                 return None;
             }
+            if self.round_quota == Some(0) {
+                return None;
+            }
             self.remaining -= 1;
+            if let Some(quota) = self.round_quota.as_mut() {
+                *quota -= 1;
+            }
             let spec = self.spec;
+            if spec.mode == PatternMode::ProducerConsumer {
+                if self.worker % 2 == 0 {
+                    let size = self.draw_size();
+                    let token = self.next_u64() | 1;
+                    let target = self.producer_consumer_target();
+                    return Some(PlannedAction::Handoff {
+                        size,
+                        token,
+                        target,
+                    });
+                }
+                return Some(PlannedAction::DrainMailbox {
+                    budget: DRAIN_BUDGET,
+                });
+            }
             let choice = (self.next_u64() % u64::from(spec.total_weight())) as u32;
-            if spec.cross_thread {
+            if spec.mode == PatternMode::Handoff {
                 if choice < spec.weight_alloc {
                     let size = self.draw_size();
                     let token = self.next_u64() | 1;
@@ -364,6 +501,7 @@ impl WorkerPlanner {
                     budget: DRAIN_BUDGET,
                 });
             }
+            // `Slots` and `LarsonRotation` share this branch.
             let mut threshold = spec.weight_alloc;
             if choice < threshold {
                 let slot = (self.next_u64() % spec.capacity as u64) as usize;
@@ -423,6 +561,22 @@ impl WorkerPlanner {
         } else {
             peer
         }
+    }
+
+    /// Deterministic round-robin target for a `ProducerConsumer` producer:
+    /// the odd (consumer) workers `1, 3, 5, ...` in worker-index order,
+    /// cycling by this producer's own handoff ordinal. Unlike `draw_peer`, no
+    /// RNG is involved in choosing the target. A single-worker run has no
+    /// consumer and hands off to itself, matching `draw_peer`'s degenerate
+    /// 1-thread point.
+    fn producer_consumer_target(&mut self) -> u32 {
+        let odd_workers = self.thread_count / 2;
+        if odd_workers == 0 {
+            return self.worker;
+        }
+        let ordinal = self.producer_ordinal;
+        self.producer_ordinal = self.producer_ordinal.wrapping_add(1);
+        (ordinal % u64::from(odd_workers)) as u32 * 2 + 1
     }
 
     fn pop_oldest_occupied(&mut self) -> Option<usize> {
@@ -701,6 +855,11 @@ struct Parcel {
     pointer: NonNull<u8>,
     size: usize,
     token: u64,
+    /// Worker that allocated this parcel (set for both plain allocations and
+    /// `Handoff` allocations). Compared against the freeing worker to count
+    /// `remote_frees` for the Larson rotation, where a shared table's parcels
+    /// are frequently allocated by one worker and freed by another.
+    owner: u32,
 }
 
 // A parcel is published to its mailbox only after the producer finished
@@ -715,6 +874,14 @@ struct WorkerTally {
 }
 
 /// Execute one scaling child request against the linked allocator.
+///
+/// Dispatches on the pattern's `PatternMode`: `Slots`, `Handoff`, and
+/// `ProducerConsumer` share the mailbox-based worker loop below --
+/// `ProducerConsumer` reuses `Handoff`'s mailbox machinery unmodified because
+/// its spec also sets `cross_thread: true`, it just assigns fixed roles by
+/// worker index. `LarsonRotation` needs a structurally different concurrency
+/// shape (tables shared and rotated across workers, not private per-worker
+/// state) and gets its own executor, `execute_larson_rotation`.
 pub fn execute_scaling_child_request<A: AllocatorAdapter>(
     adapter: &A,
     request: ScalingChildRequest,
@@ -729,6 +896,9 @@ pub fn execute_scaling_child_request<A: AllocatorAdapter>(
     }
     let pattern = request.pattern()?;
     let spec = pattern.spec();
+    if let PatternMode::LarsonRotation { rounds } = spec.mode {
+        return execute_larson_rotation(adapter, &request, pattern, rounds);
+    }
     let threads = request.thread_count as usize;
     let setup_started = Instant::now();
     let mailboxes: Arc<Vec<Mutex<VecDeque<Parcel>>>> = Arc::new(
@@ -863,6 +1033,263 @@ struct SlotTable {
     slots: Vec<Option<Parcel>>,
 }
 
+/// Execute the Larson & Krishnan rotation: `threads` shared slot tables, one
+/// per table index (not per executing worker -- `stream_seed`'s `worker`
+/// component is the table index, exactly as the oracle's `simulate_cell`
+/// assumes), rotated round-robin across workers every round so a later free
+/// is frequently of another worker's allocation.
+///
+/// Mirrors the mailbox executor's barrier discipline: every worker reaches
+/// every barrier -- `ready`, `start`, one `round_barrier` wait per round, and
+/// `finished` -- on both the success and the failure path, because `Barrier`
+/// has no poison state; a worker that returned early would strand every
+/// other worker (and the table lock it still held) forever, and the child
+/// would die on the parent's watchdog with an empty stderr instead of
+/// reporting the real error. The outcome is therefore carried, not returned
+/// early.
+fn execute_larson_rotation<A: AllocatorAdapter>(
+    adapter: &A,
+    request: &ScalingChildRequest,
+    pattern: ScalingPattern,
+    rounds: u32,
+) -> Result<ScalingChildResponse, String> {
+    let rounds = rounds.max(1);
+    let threads = request.thread_count as usize;
+    let setup_started = Instant::now();
+    let tables: Arc<Vec<Mutex<(WorkerPlanner, SlotTable)>>> = Arc::new(
+        (0..threads)
+            .map(|table_index| {
+                let seed = stream_seed(
+                    request.run_seed,
+                    pattern,
+                    request.thread_count,
+                    request.block_id,
+                    table_index as u32,
+                );
+                let planner = WorkerPlanner::new(
+                    pattern,
+                    seed,
+                    request.operations_per_worker,
+                    table_index as u32,
+                    request.thread_count,
+                );
+                let capacity = planner.capacity();
+                Mutex::new((
+                    planner,
+                    SlotTable {
+                        slots: vec![None; capacity],
+                    },
+                ))
+            })
+            .collect(),
+    );
+    let ready = Arc::new(Barrier::new(threads + 1));
+    let start = Arc::new(Barrier::new(threads + 1));
+    let round_barrier = Arc::new(Barrier::new(threads));
+    let finished = Arc::new(Barrier::new(threads + 1));
+    // Set by the first worker that fails. Tables are shared, so a failed
+    // worker can leave a table whose planner marked a slot live that holds no
+    // block; a peer that kept rotating onto it would report a derived
+    // "freed an empty slot" error that could mask the real one. Every worker
+    // re-checks this after each round barrier and stops doing work (while
+    // still reaching every barrier) once it is set.
+    let aborted = Arc::new(AtomicBool::new(false));
+    let setup_ns = nonzero_ns(setup_started);
+    let mut warmup_ns = 0u64;
+    let mut elapsed_ns = 0u64;
+    let base_quota = request.operations_per_worker / u64::from(rounds);
+    let extra_rounds = request.operations_per_worker % u64::from(rounds);
+    let tallies = std::thread::scope(|scope| -> Result<Vec<WorkerTally>, String> {
+        let mut handles = Vec::with_capacity(threads);
+        for worker in 0..threads {
+            let tables = Arc::clone(&tables);
+            let ready = Arc::clone(&ready);
+            let start = Arc::clone(&start);
+            let round_barrier = Arc::clone(&round_barrier);
+            let finished = Arc::clone(&finished);
+            let aborted = Arc::clone(&aborted);
+            handles.push(scope.spawn(move || -> Result<WorkerTally, String> {
+                let worker_index = worker as u32;
+                let warmup_seed = stream_seed(
+                    request.run_seed,
+                    pattern,
+                    request.thread_count,
+                    request.block_id,
+                    worker_index,
+                );
+                let mut outcome = warm_up_worker(
+                    adapter,
+                    request,
+                    pattern,
+                    warmup_seed,
+                    worker_index,
+                    threads,
+                );
+                if outcome.is_err() {
+                    aborted.store(true, Ordering::Release);
+                }
+                ready.wait();
+                start.wait();
+                let mut tally = WorkerTally::default();
+                for round in 0..rounds {
+                    if outcome.is_ok() && !aborted.load(Ordering::Acquire) {
+                        let table_index = (worker + round as usize) % threads;
+                        let quota = base_quota + u64::from(u64::from(round) < extra_rounds);
+                        outcome = larson_round(
+                            adapter,
+                            &tables[table_index],
+                            quota,
+                            worker_index,
+                            &mut tally,
+                        );
+                        if outcome.is_err() {
+                            aborted.store(true, Ordering::Release);
+                        }
+                    }
+                    round_barrier.wait();
+                }
+                if outcome.is_ok() && !aborted.load(Ordering::Acquire) {
+                    outcome = larson_drain(adapter, &tables[worker], worker_index, &mut tally);
+                }
+                finished.wait();
+                outcome.map(|()| tally)
+            }));
+        }
+        let warmup_mark = Instant::now();
+        ready.wait();
+        warmup_ns = if request.warmup_operations_per_worker > 0 {
+            nonzero_ns(warmup_mark)
+        } else {
+            0
+        };
+        let measured = Instant::now();
+        start.wait();
+        finished.wait();
+        elapsed_ns = nonzero_ns(measured);
+        let mut tallies = Vec::with_capacity(threads);
+        for handle in handles {
+            tallies.push(
+                handle
+                    .join()
+                    .map_err(|_| "scaling worker panicked".to_string())??,
+            );
+        }
+        Ok(tallies)
+    })?;
+    let teardown_started = Instant::now();
+    let mut counts = ScalingCounts::default();
+    let mut remote_free_calls = 0u64;
+    for tally in &tallies {
+        counts.alloc_calls += tally.counts.alloc_calls;
+        counts.realloc_calls += tally.counts.realloc_calls;
+        counts.free_calls += tally.counts.free_calls;
+        counts.checksum = counts.checksum.wrapping_add(tally.counts.checksum);
+        remote_free_calls += tally.remote_frees;
+    }
+    let operation_count = counts.operation_count();
+    let teardown_ns = nonzero_ns(teardown_started);
+    Ok(ScalingChildResponse {
+        protocol_version: SCALING_CHILD_PROTOCOL_VERSION.into(),
+        metric_schema_version: SCALING_SCHEMA_VERSION.into(),
+        allocator_id: adapter.allocator_id().to_string(),
+        thread_count: request.thread_count,
+        alloc_calls: counts.alloc_calls,
+        realloc_calls: counts.realloc_calls,
+        free_calls: counts.free_calls,
+        operation_count,
+        checksum: counts.checksum,
+        remote_free_calls,
+        producer_fallback_frees: 0,
+        setup_ns,
+        warmup_ns,
+        elapsed_ns,
+        teardown_ns,
+        throughput_operations_per_second: operation_count as f64 * 1_000_000_000.0
+            / elapsed_ns as f64,
+    })
+}
+
+/// One shared Larson table: the planner that owns its seeded stream plus the
+/// live blocks indexed by the planner's slots.
+type LarsonTable = Mutex<(WorkerPlanner, SlotTable)>;
+
+/// Run one round of one shared Larson table on the calling worker: exactly
+/// `quota` planner draws (plus any eviction already queued), each an
+/// allocation into a slot or the free of that slot's previous occupant. A
+/// free of a block another worker allocated counts as a remote free.
+fn larson_round<A: AllocatorAdapter>(
+    adapter: &A,
+    table: &LarsonTable,
+    quota: u64,
+    worker: u32,
+    tally: &mut WorkerTally,
+) -> Result<(), String> {
+    let mut guard = table
+        .lock()
+        .map_err(|_| "scaling table lock poisoned".to_string())?;
+    let (planner, slots) = &mut *guard;
+    let page_touch = planner.page_touch();
+    planner.set_round_quota(quota);
+    while let Some(action) = planner.next_action() {
+        match action {
+            PlannedAction::Alloc { slot, size, token } => {
+                let pointer = adapter.alloc(size)?;
+                let parcel = Parcel {
+                    pointer,
+                    size,
+                    token,
+                    owner: worker,
+                };
+                touch(&parcel, page_touch, tally)?;
+                tally.counts.alloc_calls += 1;
+                slots.slots[slot] = Some(parcel);
+            }
+            PlannedAction::FreeSlot { slot } => {
+                larson_free(adapter, slots, slot, worker, tally, "scaling plan freed an empty slot")?;
+            }
+            _ => return Err("larson rotation planner emitted a non-slot action".into()),
+        }
+    }
+    Ok(())
+}
+
+/// Free every block still live in one shared Larson table after the last
+/// round. The oracle counts exactly this set through `drain_actions`.
+fn larson_drain<A: AllocatorAdapter>(
+    adapter: &A,
+    table: &LarsonTable,
+    worker: u32,
+    tally: &mut WorkerTally,
+) -> Result<(), String> {
+    let mut guard = table
+        .lock()
+        .map_err(|_| "scaling table lock poisoned".to_string())?;
+    let (planner, slots) = &mut *guard;
+    for action in planner.drain_actions() {
+        if let PlannedAction::FreeSlot { slot } = action {
+            larson_free(adapter, slots, slot, worker, tally, "scaling drain freed an empty slot")?;
+        }
+    }
+    Ok(())
+}
+
+fn larson_free<A: AllocatorAdapter>(
+    adapter: &A,
+    slots: &mut SlotTable,
+    slot: usize,
+    worker: u32,
+    tally: &mut WorkerTally,
+    empty: &str,
+) -> Result<(), String> {
+    let parcel = slots.slots[slot].take().ok_or(empty)?;
+    if parcel.owner != worker {
+        tally.remote_frees += 1;
+    }
+    unsafe { adapter.free(parcel.pointer) };
+    tally.counts.free_calls += 1;
+    Ok(())
+}
+
 /// Untimed warmup on a private mailbox set, so a warmup parcel can never be
 /// drained by the measured region.
 fn warm_up_worker<A: AllocatorAdapter>(
@@ -918,6 +1345,7 @@ fn run_worker_stream<A: AllocatorAdapter>(
                     pointer,
                     size,
                     token,
+                    owner: worker,
                 };
                 touch(&parcel, page_touch, &mut tally)?;
                 tally.counts.alloc_calls += 1;
@@ -932,6 +1360,7 @@ fn run_worker_stream<A: AllocatorAdapter>(
                     pointer,
                     size,
                     token,
+                    owner: worker,
                 };
                 touch(&parcel, page_touch, &mut tally)?;
                 tally.counts.realloc_calls += 1;
@@ -954,6 +1383,7 @@ fn run_worker_stream<A: AllocatorAdapter>(
                     pointer,
                     size,
                     token,
+                    owner: worker,
                 };
                 touch(&parcel, page_touch, &mut tally)?;
                 tally.counts.alloc_calls += 1;
@@ -1441,7 +1871,7 @@ pub fn methodology() -> ScalingMethodology {
         rigor: SCALING_RIGOR_LABEL.into(),
         blocks_per_cell: SCALING_BLOCKS,
         aggregation: "median of per-block aggregate throughput, with min and max across the same blocks".into(),
-        operation_stream: "seeded random operation stream; each operation, size, and slot is drawn from a splitmix64 stream that never observes allocator behavior".into(),
+        operation_stream: "seeded random operation stream; each operation, size, and slot is drawn from a splitmix64 stream that never observes allocator behavior; larson additionally rotates its slot arrays between workers every round, and xmalloc-test assigns fixed producer/consumer roles by worker index".into(),
         seed_chain: "splitmix64 chain over (run seed, pattern tag, thread count, block, worker); the allocator is deliberately absent so all five allocators replay one stream".into(),
         pairing: "all five allocators run the same frozen per-worker operation count and the same stream inside one block, in a rotated near-balanced order".into(),
         work_normalization: "operations per worker are calibrated once per (pattern, thread point) against upstream-mimalloc and frozen across allocators; total work scales with worker count".into(),

@@ -284,9 +284,32 @@ fn mixed_general_pattern_exercises_realloc_and_large_buffers_touch_pages() {
     assert!(response.alloc_calls > 0 && response.checksum != 0);
 }
 
+/// A complete raw run for the current pattern catalogue, round-tripped
+/// through JSON so the wire shape is exercised exactly as the controller
+/// writes and the validator reads it. Built from the same oracle production
+/// uses rather than read from a checked-in file, so adding a pattern (#216)
+/// cannot leave the contract tests validating a stale catalogue.
 fn sample_run() -> ScalingRawRun {
+    let raw = benchmark_suite::scaling::synthetic_scaling_fixture(0x6d69_6d61_6c6c_6f63)
+        .expect("synthetic scaling fixture builds");
+    let text = serde_json::to_string(&raw).expect("scaling fixture serializes");
+    serde_json::from_str(&text).expect("scaling fixture parses")
+}
+
+#[test]
+fn checked_in_pre_named_workload_fixture_still_deserializes() {
+    // `fixtures/scaling/scaling-raw-run.json` was recorded under the four
+    // `sparse-*` patterns, before larson/xmalloc-test (#216). Raw runs of that
+    // lineage must still deserialize (published rows and `--base-latest`
+    // inputs carry the same shapes), even though a fresh run is now required
+    // to cover all six patterns.
     let text = include_str!("fixtures/scaling/scaling-raw-run.json");
-    serde_json::from_str(text).expect("scaling fixture parses")
+    let raw: ScalingRawRun = serde_json::from_str(text).expect("legacy scaling fixture parses");
+    assert!(!raw.samples.is_empty());
+    assert!(raw
+        .samples
+        .iter()
+        .all(|sample| ScalingPattern::parse(&sample.pattern).is_some()));
 }
 
 #[test]

@@ -85,7 +85,8 @@
     "patterns": {
       "type": "array",
       "minItems": 4,
-      "maxItems": 4,
+      "maxItems": 6,
+      "description": "Either the four sparse-* patterns (pre-#216 lineage) or those four plus the named workloads larson and xmalloc-test (#216).",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -103,7 +104,9 @@
               "sparse-tiny-hot",
               "sparse-mixed-general",
               "sparse-large-buffers",
-              "sparse-cross-thread"
+              "sparse-cross-thread",
+              "larson",
+              "xmalloc-test"
             ]
           },
           "description": { "type": "string", "minLength": 1 },

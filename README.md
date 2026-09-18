@@ -613,7 +613,9 @@ Rust API stays present and `prof::start` returns `false`.
 | `mi_dhat_stats_get`, `mi_dhat_stats_t` | ✅ | `dhat::stats() -> dhat::Stats` |
 | `mi_dhat_dump` | ✅ | `dhat::dump_file` |
 
-Independent of `MI_PPROF`: available in both feature modes.
+Independent of `MI_PPROF`. Compiled out with the crate's default-on `dhat` feature turned
+off, or `MI_DHAT=OFF` in CMake (#371, mirrors `#if MI_DHAT`); the Rust API stays present
+and `dhat::start` returns `false`.
 
 #### Memory events — `include/mimalloc/memory-events.h`
 

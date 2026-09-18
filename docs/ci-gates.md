@@ -141,7 +141,7 @@ kind of blind spot as the seven dead gates listed at the top of this page.
 Two independent options, so "louder" and "fatal" can be turned on separately:
 
 - **`MI_STRICT_WARNINGS`** (default **ON**) adds fork-scoped extra diagnostics --
-  `-Wpedantic -Wshadow -Wpointer-arith -Wwrite-strings -Wmissing-prototypes -Wformat=2` --
+  `-Wshadow -Wpointer-arith -Wwrite-strings -Wmissing-prototypes -Wformat=2` --
   applied with `set_source_files_properties(... COMPILE_OPTIONS ...)` to the fork's own
   source files only (`src/profile*.c`, `src/memory-events.c`, `src/dhat*.c`,
   `src/scavenger.c`, `src/page-holes.c`, `src/purge-all.c`, `src/heap-snapshot.c`,
@@ -158,6 +158,14 @@ The strict-flag block and the positive control are gated by `CMAKE_C_COMPILER_ID
 `-Wmissing-prototypes` is C-only (skipped under `MI_USE_CXX`). `MI_WARNINGS_AS_ERRORS`
 itself maps to `/WX` on `cl`/clang-cl, but no MSVC-ABI lane passes it yet, so clang-cl
 and native `cl` builds are unchanged.
+
+`-Wpedantic` is deliberately not in the set yet: upstream `types.h`'s `#warning
+"mimalloc assertions enabled in a release build"` is itself a pedantic diagnostic before
+C23 and fires on the `debug-full` row (a Release build with `MI_DEBUG_FULL`), and win-gnu's
+`GetProcAddress` function-pointer cast in `scavenger.c` is another. Both need fixing before
+it can be added. That same `#warning` is kept visible but non-fatal under
+`MI_WARNINGS_AS_ERRORS` (`-Wno-error=cpp` on GCC, `-Wno-error=#warnings` on Clang): it is
+a deliberate notice, and that build is deliberate.
 
 ### The configure-time positive control
 

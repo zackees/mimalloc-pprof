@@ -711,9 +711,7 @@ def run_diag(ctx: RunCtx) -> bool:
     ok = py("check_isa_baseline.py", str(portable_libs[0])) and ok
 
     build_arch = ctx.dir / "build-arch"
-    rc, _ = cmake_configure(
-        ctx, build_arch, ["-DMI_PPROF=ON", "-DMI_OPT_ARCH=ON", C_UNIT_STRICT]
-    )
+    rc, _ = cmake_configure(ctx, build_arch, ["-DMI_PPROF=ON", "-DMI_OPT_ARCH=ON", C_UNIT_STRICT])
     if rc:
         return False
     if cmake_build(ctx, build_arch, target="mimalloc-static"):

@@ -364,8 +364,7 @@ fn overlay_accepts_a_newer_fork_build_but_not_a_moved_competitor_pin() {
         }
     }
     let mut latest = base.clone();
-    attach_latency_report(&mut latest, newer_fork)
-        .expect("a newer fork build must still overlay");
+    attach_latency_report(&mut latest, newer_fork).expect("a newer fork build must still overlay");
     assert!(latest.latency.is_some());
     assert!(!latest
         .pending_metrics

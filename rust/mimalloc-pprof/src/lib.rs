@@ -520,15 +520,16 @@ pub const PURGE_ALL_DEFAULT_WAIT_MS: usize = 100;
 
 /// Exact DHAT v2 heap/lifetime profiling controls.
 ///
-/// DHAT records every non-internal allocation from the moment [`start`] succeeds.
+/// DHAT records every non-internal allocation from the moment [`start`](dhat::start)
+/// succeeds.
 /// It is intended for short diagnostic runs and tests rather than continuous production
 /// telemetry. The generated JSON opens in the standard Valgrind `dh_view.html` viewer.
 /// It is independent of sampled [`prof`] profiling and of `mi_memory_set_callbacks`.
 ///
 /// Requires the default-on `dhat` cargo feature (C `MI_DHAT=1`). Without it the observer
 /// is compiled out of the allocator, the API stays present for source compatibility, and
-/// [`start`] returns `false`, [`is_enabled`] and `Stats::enabled` are `false`, and
-/// [`dump_file`] returns an error.
+/// [`start`](dhat::start) returns `false`, [`is_enabled`](dhat::is_enabled) and
+/// `Stats::enabled` are `false`, and [`dump_file`](dhat::dump_file) returns an error.
 pub mod dhat {
     use std::ffi::CString;
     use std::io;

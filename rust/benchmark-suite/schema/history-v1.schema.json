@@ -16,7 +16,8 @@
     "absolute_summaries": { "type": "array", "minItems": 150, "items": { "$ref": "latest-v1.schema.json#/$defs/absoluteCell" } },
     "paired_summaries": { "type": "array", "minItems": 120, "items": { "$ref": "latest-v1.schema.json#/$defs/pairedCell" } },
     "memory": { "$ref": "memory-v1.schema.json#/$defs/history" },
-    "latency": { "$ref": "latency-v1.schema.json#/$defs/history" }
+    "latency": { "$ref": "latency-v1.schema.json#/$defs/history" },
+    "pprof_tax": { "$ref": "pprof-tax-v1.schema.json#/$defs/history" }
   },
   "$defs": {
     "allocatorIdentity": {

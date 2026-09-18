@@ -236,6 +236,10 @@ pub struct LatestReport {
     /// `throughput-scaling-sparse-v1` sweep is available; it never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaling: Option<crate::scaling::ScalingMetricReport>,
+    /// Backward-compatible Phase 6D extension. Absence means no validated
+    /// pprof-tax-v1 matrix; it never means zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pprof_tax: Option<crate::pprof_tax::PprofTaxMetricReport>,
     pub canonical_urls: CanonicalUrls,
     pub reproduction_command: String,
     pub actions_run_url: String,
@@ -259,6 +263,8 @@ pub struct HistoryRow {
     pub latency: Option<crate::latency::LatencyHistoryReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaling: Option<crate::scaling::ScalingHistoryReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pprof_tax: Option<crate::pprof_tax::PprofTaxHistoryReport>,
 }
 
 /// Immutable identity supplied by the producer after it hashes the directly

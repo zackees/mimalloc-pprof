@@ -12,6 +12,8 @@ use crate::execution::{
 use crate::latency::{execute_latency_child_request, LatencyChildRequest};
 use crate::memory::{read_control_record, write_control_record, ControlKind, ControlRecord};
 use crate::model::BenchmarkChildRequest;
+use crate::pprof_tax_adapter::{LinkedProfiler, ProfilerControl};
+use crate::pprof_tax_child::{execute_pprof_tax_child_request, PprofTaxChildRequest};
 use crate::scaling::{execute_scaling_child_request, ScalingChildRequest};
 
 #[derive(Serialize)]
@@ -43,10 +45,95 @@ pub fn benchmark_child_main() -> Result<(), String> {
         Some(argument) if argument == "--scaling" && arguments.next().is_none() => {
             run_scaling_measurement()
         }
-        Some(_) => {
-            Err("usage: benchmark-child [--adapter-smoke|--memory|--latency|--scaling]".into())
+        Some(argument) if argument == "--pprof-tax" && arguments.next().is_none() => {
+            run_pprof_tax_measurement()
         }
+        Some(argument) if argument == "--pprof-tax-identity" && arguments.next().is_none() => {
+            run_pprof_tax_identity()
+        }
+        Some(_) => Err(
+            "usage: benchmark-child [--adapter-smoke|--memory|--latency|--scaling|--pprof-tax|--pprof-tax-identity]"
+                .into(),
+        ),
     }
+}
+
+/// Validate the child-binary hash the parent passes so every raw record and
+/// identity probe echoes a hash that was actually verified, never trusted.
+fn validate_child_binary_sha256(value: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("BENCH_CHILD_BINARY_SHA256 must be 64 lowercase hexadecimal bytes".into());
+    }
+    Ok(())
+}
+
+fn run_pprof_tax_measurement() -> Result<(), String> {
+    let adapter = LinkedAdapter::load().map_err(|error| error.to_string())?;
+    let profiler = LinkedProfiler::load()?;
+    let child_binary_sha256 = std::env::var("BENCH_CHILD_BINARY_SHA256")
+        .map_err(|_| "BENCH_CHILD_BINARY_SHA256 is required for pprof-tax".to_string())?;
+    validate_child_binary_sha256(&child_binary_sha256)?;
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut input)
+        .map_err(|error| format!("read pprof-tax child request: {error}"))?;
+    if input.len() > 1024 * 1024 {
+        return Err("pprof-tax child request exceeded 1 MiB".into());
+    }
+    let request: PprofTaxChildRequest = serde_json::from_slice(&input)
+        .map_err(|error| format!("expected exactly one pprof-tax child request: {error}"))?;
+    let response =
+        execute_pprof_tax_child_request(&adapter, &profiler, request, &child_binary_sha256)?;
+    let output = serde_json::to_vec(&response)
+        .map_err(|error| format!("serialize pprof-tax child response: {error}"))?;
+    std::io::stdout()
+        .lock()
+        .write_all(&output)
+        .map_err(|error| format!("write pprof-tax child response: {error}"))
+}
+
+#[derive(Serialize)]
+struct PprofTaxIdentityOutput<'a> {
+    configuration_id: &'a str,
+    allocator_id: &'a str,
+    allocator_version: &'a str,
+    source_sha: &'a str,
+    library_sha256: &'a str,
+    executable_sha256: &'a str,
+    pprof_compiled: bool,
+    pprof_enabled: bool,
+}
+
+fn run_pprof_tax_identity() -> Result<(), String> {
+    let child_binary_sha256 = std::env::var("BENCH_CHILD_BINARY_SHA256")
+        .map_err(|_| "BENCH_CHILD_BINARY_SHA256 is required for pprof-tax identity".to_string())?;
+    validate_child_binary_sha256(&child_binary_sha256)?;
+    let adapter = LinkedAdapter::load().map_err(|error| error.to_string())?;
+    let identity = adapter.identity();
+    let profiler = LinkedProfiler::load()?;
+    let telemetry = profiler.telemetry()?;
+    let output = PprofTaxIdentityOutput {
+        configuration_id: profiler.configuration_id(),
+        allocator_id: identity.allocator_id,
+        allocator_version: identity.allocator_version,
+        source_sha: identity.source_sha,
+        library_sha256: identity.library_sha256,
+        executable_sha256: &child_binary_sha256,
+        pprof_compiled: profiler.pprof_compiled(),
+        pprof_enabled: telemetry.enabled,
+    };
+    let encoded = serde_json::to_vec(&output)
+        .map_err(|error| format!("serialize pprof-tax identity response: {error}"))?;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(&encoded)
+        .and_then(|()| stdout.write_all(b"\n"))
+        .map_err(|error| format!("write pprof-tax identity response: {error}"))
 }
 
 fn run_scaling_measurement() -> Result<(), String> {

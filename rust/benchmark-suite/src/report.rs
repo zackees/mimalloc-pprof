@@ -128,6 +128,7 @@ pub fn build_latest_report(
         memory: None,
         latency: None,
         scaling: None,
+        pprof_tax: None,
         canonical_urls: CanonicalUrls {
             pages: "https://zackees.github.io/mimalloc-pprof/".into(),
             stats_branch: "https://github.com/zackees/mimalloc-pprof/tree/benchmark-stats".into(),
@@ -171,6 +172,10 @@ pub fn build_latest_report(
             .map(|value| value.history_projection()),
         scaling: latest
             .scaling
+            .as_ref()
+            .map(|value| value.history_projection()),
+        pprof_tax: latest
+            .pprof_tax
             .as_ref()
             .map(|value| value.history_projection()),
     };

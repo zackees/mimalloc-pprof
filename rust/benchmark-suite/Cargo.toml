@@ -46,6 +46,14 @@ path = "src/bin/benchmark-scaling-run.rs"
 name = "benchmark-scaling-validate"
 path = "src/bin/benchmark-scaling-validate.rs"
 
+[[bin]]
+name = "benchmark-pprof-tax-run"
+path = "src/bin/benchmark-pprof-tax-run.rs"
+
+[[bin]]
+name = "benchmark-pprof-tax-validate"
+path = "src/bin/benchmark-pprof-tax-validate.rs"
+
 [[test]]
 name = "timed_allocation_audit"
 path = "tests/timed_allocation_audit.rs"

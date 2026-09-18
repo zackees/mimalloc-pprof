@@ -14,11 +14,27 @@ const LINK_ENV: &[&str] = &[
     "BENCH_ALLOCATOR_LINK_MANIFEST",
 ];
 
+// Deliberately not part of LINK_ENV: the pprof-tax panel is an optional,
+// additional native seam layered onto an ordinary linked allocator build, so
+// the all-or-nothing LINK_ENV count (and therefore every normal five-allocator
+// build) must stay byte-identical whether or not this var is set.
+const PPROF_TAX_ENV: &str = "BENCH_PPROF_TAX_CONFIGURATION";
+
+// (configuration id, required BENCH_ALLOCATOR_ID).
+const PPROF_TAX_CONFIGURATIONS: &[(&str, &str)] = &[
+    ("upstream-baseline", "upstream-mimalloc"),
+    ("fork-pprof-off", "mimalloc-pprof"),
+    ("fork-pprof-on", "mimalloc-pprof"),
+    ("fork-pprof-off-frame-pointers", "mimalloc-pprof"),
+];
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(benchmark_native_adapter)");
+    println!("cargo:rustc-check-cfg=cfg(benchmark_pprof_tax_adapter)");
     for name in LINK_ENV {
         println!("cargo:rerun-if-env-changed={name}");
     }
+    println!("cargo:rerun-if-env-changed={PPROF_TAX_ENV}");
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=CXX");
     println!("cargo:rerun-if-env-changed=AR");
@@ -26,6 +42,8 @@ fn main() {
     println!("cargo:rerun-if-changed=native/adapter_mimalloc.c");
     println!("cargo:rerun-if-changed=native/adapter_jemalloc.c");
     println!("cargo:rerun-if-changed=native/adapter_tcmalloc.cc");
+    println!("cargo:rerun-if-changed=native/pprof_tax_adapter.h");
+    println!("cargo:rerun-if-changed=native/adapter_pprof_tax.c");
 
     let present = LINK_ENV
         .iter()
@@ -33,6 +51,10 @@ fn main() {
         .count();
     if present == 0 {
         emit_unlinked_identity();
+        if env::var_os(PPROF_TAX_ENV).is_some() {
+            panic!("{PPROF_TAX_ENV} requires a native allocator link");
+        }
+        println!("cargo:rustc-env={PPROF_TAX_ENV}=none");
         return;
     }
     if present != LINK_ENV.len() {
@@ -61,13 +83,33 @@ fn main() {
     let manifest = canonical_file(&required_env("BENCH_ALLOCATOR_LINK_MANIFEST"));
     let link_inputs = parse_link_manifest(&manifest, &primary_library);
     let include_dirs = parse_include_dirs(&required_env("BENCH_ALLOCATOR_INCLUDE_DIRS"));
-    let adapter_archive = compile_adapter(&allocator_id, &allocator_version, &include_dirs);
+    let mut adapter_objects =
+        vec![compile_adapter(&allocator_id, &allocator_version, &include_dirs)];
+
+    let pprof_tax_configuration = match env::var(PPROF_TAX_ENV) {
+        Ok(value) => {
+            let has_profiler_api = validate_pprof_tax_configuration(&value, &allocator_id);
+            adapter_objects.push(compile_pprof_tax_adapter(
+                &value,
+                has_profiler_api,
+                &include_dirs,
+            ));
+            println!("cargo:rustc-cfg=benchmark_pprof_tax_adapter");
+            value
+        }
+        Err(env::VarError::NotPresent) => "none".to_owned(),
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("{PPROF_TAX_ENV} must be a non-empty single-line value")
+        }
+    };
+    let adapter_archive = archive_objects(&adapter_objects);
 
     println!("cargo:rustc-cfg=benchmark_native_adapter");
     println!("cargo:rustc-env=BENCH_ALLOCATOR_ID={allocator_id}");
     println!("cargo:rustc-env=BENCH_ALLOCATOR_VERSION={allocator_version}");
     println!("cargo:rustc-env=BENCH_ALLOCATOR_SOURCE_SHA={source_sha}");
     println!("cargo:rustc-env=BENCH_ALLOCATOR_LIBRARY_SHA256={library_sha}");
+    println!("cargo:rustc-env={PPROF_TAX_ENV}={pprof_tax_configuration}");
 
     // Absolute archives and an explicit group retain Bazel's complete TCMalloc
     // closure and make the actual final link auditable from the build log.
@@ -255,7 +297,6 @@ fn compile_adapter(id: &str, version: &str, includes: &[PathBuf]) -> PathBuf {
     };
     let source = manifest_dir.join("native").join(source_name);
     let object = out_dir.join("benchmark_allocator_adapter.o");
-    let archive = out_dir.join("libbenchmark_allocator_adapter.a");
     let compiler = env::var(compiler_var).unwrap_or_else(|_| compiler_default.to_owned());
     let mut command = tool_command(&compiler, compiler_var);
     command
@@ -284,11 +325,91 @@ fn compile_adapter(id: &str, version: &str, includes: &[PathBuf]) -> PathBuf {
     if !status.success() {
         panic!("adapter compiler exited with {status}");
     }
-    let ar = env::var("AR").unwrap_or_else(|_| "ar".to_owned());
-    let status = tool_command(&ar, "AR")
-        .arg("crs")
-        .arg(&archive)
+    object
+}
+
+/// Validate an opt-in `BENCH_PPROF_TAX_CONFIGURATION` value against the
+/// allocator identity already selected via `BENCH_ALLOCATOR_ID`, returning
+/// whether the configuration links against the fork's profiler API.
+fn validate_pprof_tax_configuration(value: &str, allocator_id: &str) -> bool {
+    let Some(&(_, required_allocator_id)) = PPROF_TAX_CONFIGURATIONS
+        .iter()
+        .find(|(id, _)| *id == value)
+    else {
+        let known: Vec<&str> = PPROF_TAX_CONFIGURATIONS.iter().map(|(id, _)| *id).collect();
+        panic!(
+            "unsupported {PPROF_TAX_ENV} {value:?}; expected one of {}",
+            known.join(", ")
+        );
+    };
+    if allocator_id != required_allocator_id {
+        panic!(
+            "{PPROF_TAX_ENV} {value:?} requires BENCH_ALLOCATOR_ID={required_allocator_id:?}, \
+             got {allocator_id:?}"
+        );
+    }
+    value != "upstream-baseline"
+}
+
+fn compile_pprof_tax_adapter(
+    configuration_id: &str,
+    has_profiler_api: bool,
+    includes: &[PathBuf],
+) -> PathBuf {
+    let manifest_dir = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
+    let out_dir = PathBuf::from(required_env("OUT_DIR"));
+    let source = manifest_dir.join("native").join("adapter_pprof_tax.c");
+    let object = out_dir.join("benchmark_pprof_tax_adapter.o");
+    let compiler = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    let mut command = tool_command(&compiler, "CC");
+    command
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
         .arg(&object)
+        .arg("-O3")
+        .arg("-fno-omit-frame-pointer")
+        .arg("-fPIC")
+        .arg("-std=c11")
+        .arg("-I")
+        .arg(manifest_dir.join("native"))
+        .arg(format!(
+            "-DBENCH_PPROF_TAX_CONFIGURATION=\"{configuration_id}\""
+        ))
+        .arg(format!(
+            "-DBENCH_PPROF_TAX_HAS_PROFILER_API={}",
+            i32::from(has_profiler_api)
+        ));
+    for include in includes {
+        command.arg("-I").arg(include);
+    }
+    let status = command
+        .status()
+        .unwrap_or_else(|error| panic!("cannot execute adapter compiler {compiler}: {error}"));
+    if !status.success() {
+        panic!("pprof-tax adapter compiler exited with {status}");
+    }
+    object
+}
+
+fn archive_objects(objects: &[PathBuf]) -> PathBuf {
+    let out_dir = PathBuf::from(required_env("OUT_DIR"));
+    let archive = out_dir.join("libbenchmark_allocator_adapter.a");
+    // `ar crs` adds to an existing archive, so a rebuild in the same OUT_DIR
+    // after BENCH_PPROF_TAX_CONFIGURATION was unset would otherwise keep a stale
+    // pprof-tax member. Start from an empty archive every time.
+    match fs::remove_file(&archive) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("cannot remove stale {}: {error}", archive.display()),
+    }
+    let ar = env::var("AR").unwrap_or_else(|_| "ar".to_owned());
+    let mut command = tool_command(&ar, "AR");
+    command.arg("crs").arg(&archive);
+    for object in objects {
+        command.arg(object);
+    }
+    let status = command
         .status()
         .unwrap_or_else(|error| panic!("cannot execute archive tool {ar}: {error}"));
     if !status.success() {

@@ -740,6 +740,10 @@ pub fn selftest() -> Result<(), ValidationError> {
             "scaling-v1.schema.json",
             include_str!("../schema/scaling-v1.schema.json"),
         ),
+        (
+            "pprof-tax-v1.schema.json",
+            include_str!("../schema/pprof-tax-v1.schema.json"),
+        ),
     ] {
         let value: serde_json::Value = serde_json::from_str(schema)
             .map_err(|error| ValidationError::new(format!("{name}: invalid JSON: {error}")))?;

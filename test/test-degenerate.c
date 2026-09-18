@@ -300,7 +300,7 @@ static void test_huge_churn(void) {
 static void test_degenerate_arguments(void) {
   /* zero-size: must return either NULL or a uniquely freeable pointer, never crash */
   void* z = mi_malloc(0);
-  if (z != NULL) { assert(mi_usable_size(z) >= 0); mi_free(z); }
+  if (z != NULL) { const size_t zs = mi_usable_size(z); assert(zs < ((size_t)1 << 20)); (void)zs; mi_free(z); }
 
   /* free(NULL) is a no-op */
   mi_free(NULL);

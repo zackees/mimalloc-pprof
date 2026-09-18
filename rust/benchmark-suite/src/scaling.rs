@@ -471,7 +471,7 @@ impl WorkerPlanner {
             }
             let spec = self.spec;
             if spec.mode == PatternMode::ProducerConsumer {
-                if self.worker % 2 == 0 {
+                if self.worker.is_multiple_of(2) {
                     let size = self.draw_size();
                     let token = self.next_u64() | 1;
                     let target = self.producer_consumer_target();

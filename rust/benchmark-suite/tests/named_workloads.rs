@@ -20,8 +20,8 @@ use std::sync::Mutex;
 use benchmark_suite::execution::AllocatorAdapter;
 use benchmark_suite::model::{AllocatorIdentity, RunnerMetadata, ToolchainMetadata};
 use benchmark_suite::scaling::{
-    execute_scaling_child_request, pattern_definitions, simulate_cell, stream_seed,
-    PlannedAction, ScalingChildRequest, ScalingPattern, WorkerPlanner, SCALING_PATTERNS,
+    execute_scaling_child_request, pattern_definitions, simulate_cell, stream_seed, PlannedAction,
+    ScalingChildRequest, ScalingPattern, WorkerPlanner, SCALING_PATTERNS,
 };
 
 /// Leak-detecting mock allocator. `Drop` asserts every block was released, so
@@ -136,8 +136,8 @@ fn request_for(
             source_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             library_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .into(),
-            child_binary_sha256:
-                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+            child_binary_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .into(),
         },
         runner: RunnerMetadata {
             os: "linux".into(),
@@ -263,8 +263,13 @@ fn xmalloc_test_assigns_fixed_producer_consumer_roles_by_worker_index() {
     let operations = 300u64;
     for worker in 0..threads {
         let seed = stream_seed(RUN_SEED, ScalingPattern::XmallocTest, threads, 0, worker);
-        let observed =
-            actions_for_worker(ScalingPattern::XmallocTest, seed, operations, worker, threads);
+        let observed = actions_for_worker(
+            ScalingPattern::XmallocTest,
+            seed,
+            operations,
+            worker,
+            threads,
+        );
         assert!(!observed.is_empty(), "worker {worker} produced no actions");
         if worker % 2 == 0 {
             assert!(

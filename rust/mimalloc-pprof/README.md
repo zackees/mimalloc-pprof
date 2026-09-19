@@ -25,10 +25,10 @@ debug = "line-tables-only"
 strip = false
 ```
 
-Both the pprof-compatible sampled profiler and the exact DHAT observer are
-enabled by default, preserving the behavior of earlier releases. If an
-application only needs mimalloc and wants to compile both profilers out, opt
-out of the default feature:
+The pprof-compatible sampled profiler is enabled by default. The exact DHAT
+observer is **opt-in**: it is compiled out unless you enable the `dhat` feature
+(see below). If an application only needs mimalloc and wants to compile the
+profiler out as well, opt out of the default feature:
 
 ```toml
 [dependencies]
@@ -40,15 +40,23 @@ profiling API is retained for source compatibility, but profiling cannot be
 started (`prof::start` and `enable_heap_profiling` return `false`) and
 `dhat::start` returns `false`.
 
-The `dhat` feature (on by default) builds the C code with `MI_DHAT=1`
+The `dhat` feature (off by default) builds the C code with `MI_DHAT=1`
 ([#371](https://github.com/zackees/mimalloc-pprof/issues/371)): the exact
-DHAT v2 observer. Compiled in but not started it costs one not-taken branch
-per allocation and free; turn it off to remove even that. To keep one of the
-two, re-enable it explicitly:
+DHAT v2 observer. Without it the observer's hook sites are compiled out of
+the allocator entirely and `dhat::start` returns `false`; compiled in but not
+started it costs one not-taken branch per allocation and free. Opt in
+explicitly:
 
 ```toml
 [dependencies]
-mimalloc-pprof = { version = "0.11", default-features = false, features = ["pprof"] }
+mimalloc-pprof = { version = "0.11", features = ["dhat"] }
+```
+
+or, for DHAT without the sampled profiler:
+
+```toml
+[dependencies]
+mimalloc-pprof = { version = "0.11", default-features = false, features = ["dhat"] }
 ```
 
 The `owner-gate` feature builds the C code with `MI_OWNER_GATE=1`
@@ -132,7 +140,7 @@ The short version. Safe wrappers, all at the crate root unless noted:
 | Module | What it covers |
 |---|---|
 | `prof` | sampled pprof profiling: start/stop, text and `profile.proto` dumps, `stats()`, `samples()`, `modules()` |
-| `dhat` | exact DHAT v2 profiling: start/stop, `stats()`, `dump_file()` (`dhat` feature, on by default) |
+| `dhat` | exact DHAT v2 profiling: start/stop, `stats()`, `dump_file()` (opt-in `dhat` feature, off by default) |
 | `stats` | the allocator's **exact** counters: `get()`, `json()`, `print()`, `bin_size()`, and the subprocess-scoped forms |
 | `memory_events` | opt-in allocation-change accounting: `set_enabled`, `snapshot`, `set_callbacks`, `visit_live_allocations` |
 | `options` | every `mi_option_t`, including the thirteen this fork adds (`Opt::PROF`, `Opt::SCAVENGER`, `Opt::PURGE_HOLES`, …) |

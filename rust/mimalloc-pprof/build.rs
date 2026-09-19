@@ -34,7 +34,7 @@ fn main() {
                 "0"
             },
         )
-        // #371: the exact DHAT observer, behind the default-on `dhat` feature. Mirrors
+        // #371: the exact DHAT observer, behind the opt-in (default-off) `dhat` feature. Mirrors
         // CMake's `MI_DHAT` option; the C code tests `#if MI_DHAT`, so it is always
         // defined, to 0 or 1. With it off, `sys::mi_dhat_*` link to C's stubs and
         // `dhat::start()` returns `false`.

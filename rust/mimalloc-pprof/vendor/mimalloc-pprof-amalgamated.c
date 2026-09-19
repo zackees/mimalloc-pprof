@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 5fb2820e of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit c79a8ced of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -1273,10 +1273,11 @@ terms of the MIT license. A copy of the license can be found in the file
 
 // #371: compile-time switch for the exact DHAT v2 observer (src/dhat.c). When 0 the
 // per-allocation hook sites compile away entirely -- no call, no flag load -- and only the
-// public `mi_dhat_*` API survives, as stubs. Defaults to 1 to match CMake's `MI_DHAT=ON`
-// and so a build system that does not set it keeps today's behavior.
+// public `mi_dhat_*` API survives, as stubs. Defaults to 0 to match CMake's `MI_DHAT=OFF`:
+// DHAT is opt-in (owner decision 2026-09-18), so a client -- or a build system that does
+// not set it, such as a direct `src/static.c` compile -- must define MI_DHAT=1 to get it.
 #ifndef MI_DHAT
-#define MI_DHAT 1
+#define MI_DHAT 0
 #endif
 
 // --------------------------------------------------------------------------

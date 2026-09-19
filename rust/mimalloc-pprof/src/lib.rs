@@ -526,7 +526,8 @@ pub const PURGE_ALL_DEFAULT_WAIT_MS: usize = 100;
 /// telemetry. The generated JSON opens in the standard Valgrind `dh_view.html` viewer.
 /// It is independent of sampled [`prof`] profiling and of `mi_memory_set_callbacks`.
 ///
-/// Requires the default-on `dhat` cargo feature (C `MI_DHAT=1`). Without it the observer
+/// Requires the opt-in `dhat` cargo feature (C `MI_DHAT=1`; off by default, enable it with
+/// `features = ["dhat"]`). Without it the observer
 /// is compiled out of the allocator, the API stays present for source compatibility, and
 /// [`start`](dhat::start) returns `false`, [`is_enabled`](dhat::is_enabled) and
 /// `Stats::enabled` are `false`, and [`dump_file`](dhat::dump_file) returns an error.

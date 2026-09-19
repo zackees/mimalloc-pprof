@@ -2,10 +2,14 @@
 
 ## Unreleased
 
-- **New default-on `dhat` cargo feature** ([#371](https://github.com/zackees/mimalloc-pprof/issues/371)).
-  It controls the C `MI_DHAT` define the crate previously hard-coded to `1`. Default builds are
-  unchanged. Builds with `default-features = false` now compile the DHAT observer out as well
-  as the profiler: `dhat::start()` returns `false` there. Add `features = ["dhat"]` to keep it.
+- **Behavior change: DHAT is now opt-in.** New `dhat` cargo feature, **off by default**
+  ([#371](https://github.com/zackees/mimalloc-pprof/issues/371)). It controls the C `MI_DHAT`
+  define the crate previously hard-coded to `1`. Default builds now compile the exact DHAT
+  observer out of the allocator — no hook sites on the alloc/free path — and `dhat::start()`
+  returns `false` (`dhat::is_enabled()` / `Stats::enabled` are `false`, `dhat::dump_file`
+  errors). The `dhat::` API stays present for source compatibility. To keep DHAT, opt in with
+  `mimalloc-pprof = { version = "0.11", features = ["dhat"] }`. The C side matches: CMake's
+  `MI_DHAT` option now defaults to `OFF` (pass `-DMI_DHAT=ON`).
 
 ## 0.11.1
 

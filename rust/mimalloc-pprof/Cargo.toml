@@ -16,15 +16,14 @@ build = "build.rs"
 [dependencies]
 
 [features]
-# Profiling and the exact DHAT observer remain enabled by default for compatibility.
-# Consumers that only need the allocator can compile both out with
-# `default-features = false`, then re-enable one with `features = ["pprof"]` /
-# `["dhat"]`.
-default = ["pprof", "dhat"]
+# Sampled pprof profiling is enabled by default. The exact DHAT observer is NOT: it is
+# opt-in (owner decision 2026-09-18) via `features = ["dhat"]`. Consumers that only need
+# the allocator can compile the profiler out too with `default-features = false`.
+default = ["pprof"]
 pprof = []
-# Build the exact DHAT v2 observer (C `MI_DHAT=1`, issue #371). On by default so
-# `dhat::start()` keeps working; with it off the observer's per-allocation hook sites
-# are compiled out of the C allocator and `dhat::start()` returns `false`.
+# Build the exact DHAT v2 observer (C `MI_DHAT=1`, issue #371). Opt-in, off by default:
+# without it the observer's per-allocation hook sites are compiled out of the C allocator
+# and `dhat::start()` returns `false`. Clients that want DHAT enable it explicitly.
 dhat = []
 # Build the allocator with the per-thread owner gate (C `MI_OWNER_GATE=1`, issue #366):
 # every allocator call takes a gate so `purge_all` can sweep EVERY thread's heap, not only

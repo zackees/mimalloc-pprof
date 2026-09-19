@@ -64,6 +64,22 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: python ../ci/check_rust_surface.py
+      # Lint gate (#373 phase 2, the Rust row of docs/ci-gates.md's strict-warnings table).
+      # Platform-independent, so ubuntu only -- same reasoning as the steps above. Both
+      # cover every workspace member (benchmark-suite, bench-harness, dashboard,
+      # mimalloc-pprof, stress-harness, xtask) and every target (lib, bins, tests,
+      # benches, examples). Run before `cargo test` so lint debt is reported as lint
+      # debt. A lint that is genuinely wrong for a line gets a line-scoped `#[allow]`
+      # with a one-line reason, never a crate- or workspace-wide one.
+      - name: rustfmt + clippy components
+        if: runner.os != 'Windows'
+        run: rustup component add rustfmt clippy
+      - name: cargo fmt --check (whole workspace)
+        if: runner.os != 'Windows'
+        run: soldr cargo fmt --all --check
+      - name: cargo clippy -D warnings (whole workspace, all targets, all features)
+        if: runner.os != 'Windows'
+        run: soldr cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: soldr cargo test --locked
       # The `dhat` cargo feature is opt-in (default OFF since 2026-09-18), so the default
       # run above compiles the observer out. This is the pprof + DHAT build -- the old
@@ -125,6 +141,15 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
+      - name: clippy components
+        run: rustup component add clippy
+      # The `pprof`/`dhat` cfg-gated code paths only compile out in this job, so this is
+      # the only place clippy can see the feature-off halves of mimalloc-pprof.
+      - name: clippy -D warnings for each feature-off combination
+        run: |
+          soldr cargo clippy -p mimalloc-pprof --all-targets --no-default-features --locked -- -D warnings
+          soldr cargo clippy -p mimalloc-pprof --all-targets --no-default-features --features pprof --locked -- -D warnings
+          soldr cargo clippy -p mimalloc-pprof --all-targets --no-default-features --features dhat --locked -- -D warnings
       - name: Test allocator-only build (profiler and DHAT compiled out)
         run: soldr cargo test -p mimalloc-pprof --no-default-features --locked
       # #371: the `dhat` cargo feature is independent of `pprof`; prove each compiles and

@@ -187,7 +187,7 @@ defines" controls, but exercised at configure time rather than by grepping
 | win-gnu mingw (`windows-bundles.yml`) | on | off | next |
 | clang-cl cross + native `cl` `ctest (windows-latest)` | unchanged | off | pending (`/W4` count unmeasured) |
 | Apple cross (`macos-bundles.yml`) | on | off | pending |
-| Rust clippy + fmt (`rust-native.yml`) | none | pending | last |
+| Rust clippy + fmt (`rust-native.yml` `test` ubuntu row + `test-no-pprof`) | `clippy -D warnings`, `fmt --check` | **on** | 2 |
 
 Phase 1 (this PR) turns every row of `c-unit.yml`'s `build` matrix fatal -- every row is
 ubuntu or alpine GCC, for both `MI_PPROF=ON` and `MI_PPROF=OFF` -- via
@@ -212,6 +212,16 @@ on is its own phase of work, not a one-line flag flip.
 
 No new required check is added by this phase -- `c-unit.yml`'s `build` job is already
 required; this makes what it already gates stricter, not a new gate.
+
+Phase 2 (Rust) adds `cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` as steps of
+`rust-native.yml`'s ubuntu `test` row (before `cargo test`), plus clippy for each
+feature-off combination of `mimalloc-pprof` in `test-no-pprof` -- the only job that
+compiles the `pprof`/`dhat`-gated halves out. The pre-existing debt found during #404
+(rustfmt drift in 12 files, clippy errors concentrated in `benchmark-suite`) was fixed in
+the same PR. Amnesty is the same as for C: a line-scoped `#[allow(clippy::…)]` with an
+inline reason, never a crate-wide one. `ci/verify_local.py`'s `rust` config runs the
+same two commands. Again no new job and no new required check.
 
 ## Test bundles
 

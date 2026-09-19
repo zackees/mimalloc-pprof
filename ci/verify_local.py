@@ -748,6 +748,28 @@ def run_rust(ctx: RunCtx) -> bool:
     rc, _ = run_logged(["uv", "run", "ci/check_rust_surface.py"], cwd=ROOT, log=ctx.log)
     if rc:
         return False
+    # rust-native.yml's lint gate (#373 phase 2): fmt + clippy over every workspace
+    # member and target, before the tests, exactly as the ubuntu `test` row runs them.
+    rc, _ = run_logged(["cargo", "fmt", "--all", "--check"], cwd=rust_dir, log=ctx.log, env=env)
+    if rc:
+        return False
+    rc, _ = run_logged(
+        [
+            "cargo",
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        cwd=rust_dir,
+        log=ctx.log,
+        env=env,
+    )
+    if rc:
+        return False
     rc, _ = run_logged(["cargo", "test", "--workspace"], cwd=rust_dir, log=ctx.log, env=env)
     if rc:
         return False
@@ -1114,7 +1136,12 @@ CONFIGS: list[ConfigSpec] = [
         run_diag,
         _need_uv,
     ),
-    ConfigSpec("rust", "rust-native.yml: test", "xtask check + cargo test --workspace", run_rust),
+    ConfigSpec(
+        "rust",
+        "rust-native.yml: test",
+        "xtask check + fmt + clippy + cargo test --workspace",
+        run_rust,
+    ),
     ConfigSpec(
         "lint",
         "python-lint.yml: lint",

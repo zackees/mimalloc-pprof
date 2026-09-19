@@ -417,6 +417,14 @@ mod tests {
     /// downstream llvm-ld build). The inliner already emits each header once, and
     /// the headers keep their #ifndef guards, so the pragma must not survive.
     #[test]
+    // These read the source tree through the compile-time CARGO_MANIFEST_DIR.
+    // windows-bundles.yml cross-builds the test binaries on Linux and runs them on a
+    // Windows runner where that path does not exist; the generated text is
+    // platform-independent, and the Linux rust-native rows run these tests.
+    #[cfg_attr(
+        windows,
+        ignore = "needs the source tree at the build-time path; run on Linux"
+    )]
     fn amalgamated_c_has_no_pragma_once() {
         let paths = Paths::discover();
         let fresh = pragma_once_lines(&amalgamate_c(&paths));
@@ -435,6 +443,14 @@ mod tests {
     }
 
     #[test]
+    // These read the source tree through the compile-time CARGO_MANIFEST_DIR.
+    // windows-bundles.yml cross-builds the test binaries on Linux and runs them on a
+    // Windows runner where that path does not exist; the generated text is
+    // platform-independent, and the Linux rust-native rows run these tests.
+    #[cfg_attr(
+        windows,
+        ignore = "needs the source tree at the build-time path; run on Linux"
+    )]
     fn amalgamated_c_suppresses_only_amalgamation_artifacts() {
         let paths = Paths::discover();
         let fresh = amalgamate_c(&paths);

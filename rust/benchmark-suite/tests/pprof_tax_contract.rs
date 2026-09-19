@@ -6,7 +6,6 @@
 use std::collections::BTreeSet;
 
 use benchmark_suite::model::LatestReport;
-use benchmark_suite::provenance::sha256_bytes;
 use benchmark_suite::pprof_tax::{
     attach_pprof_tax_report, block_orders, build_pprof_tax_report, classify_sample,
     latency_overhead, synthetic_pprof_tax_fixture, throughput_overhead, validate_block_orders,
@@ -14,6 +13,7 @@ use benchmark_suite::pprof_tax::{
     PprofTaxRawRun, PprofTaxRawSample, PPROF_TAX_COMPILED_CONFIGURATION_IDS,
     PPROF_TAX_CONFIGURATIONS, PPROF_TAX_CONFIGURATION_IDS, PPROF_TAX_MIN_BLOCKS,
 };
+use benchmark_suite::provenance::sha256_bytes;
 use benchmark_suite::report::build_latest_report;
 use benchmark_suite::stats::{summarize_paired, MetricDirection, MetricObservation};
 use benchmark_suite::validate::{synthetic_full_fixture, validate_publication_raw};
@@ -182,7 +182,9 @@ fn identity_probe_mismatch_is_rejected() {
     assert!(validate_manifest(&bad_config_id).is_err());
 
     let mut bad_exe = raw.manifest.clone();
-    bad_exe.compiled_configurations[0].identity_probe.executable_sha256 = "0".repeat(64);
+    bad_exe.compiled_configurations[0]
+        .identity_probe
+        .executable_sha256 = "0".repeat(64);
     assert!(validate_manifest(&bad_exe).is_err());
 
     let mut bad_compiled = raw.manifest.clone();
@@ -494,18 +496,9 @@ fn history_projection_drops_exactly_the_declared_keys() {
 
     let report_value = serde_json::to_value(&report).unwrap();
     let history_value = serde_json::to_value(&history).unwrap();
-    let report_keys: BTreeSet<String> = report_value
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
-    let history_keys: BTreeSet<String> = history_value
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
+    let report_keys: BTreeSet<String> = report_value.as_object().unwrap().keys().cloned().collect();
+    let history_keys: BTreeSet<String> =
+        history_value.as_object().unwrap().keys().cloned().collect();
 
     let expected_dropped: BTreeSet<String> = [
         "runner",
@@ -518,7 +511,8 @@ fn history_projection_drops_exactly_the_declared_keys() {
     .into_iter()
     .map(String::from)
     .collect();
-    let actually_dropped: BTreeSet<String> = report_keys.difference(&history_keys).cloned().collect();
+    let actually_dropped: BTreeSet<String> =
+        report_keys.difference(&history_keys).cloned().collect();
     assert_eq!(actually_dropped, expected_dropped);
     assert!(history_keys.contains("runner_fingerprint_sha256"));
 }

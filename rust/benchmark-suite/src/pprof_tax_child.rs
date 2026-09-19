@@ -115,8 +115,12 @@ pub fn execute_pprof_tax_child_request<A: AllocatorAdapter, P: ProfilerControl>(
     if request.protocol_version != pprof_tax::PPROF_TAX_CHILD_PROTOCOL_VERSION {
         return Err("unsupported pprof-tax child protocol version".into());
     }
-    let configuration = pprof_tax::configuration(&request.configuration_id)
-        .ok_or_else(|| format!("unknown pprof-tax configuration {}", request.configuration_id))?;
+    let configuration = pprof_tax::configuration(&request.configuration_id).ok_or_else(|| {
+        format!(
+            "unknown pprof-tax configuration {}",
+            request.configuration_id
+        )
+    })?;
     if configuration.compiled_configuration_id != request.compiled_configuration_id
         || configuration.pprof_active != request.pprof_active
         || configuration.sampling_interval_bytes != request.sampling_interval_bytes
@@ -127,8 +131,7 @@ pub fn execute_pprof_tax_child_request<A: AllocatorAdapter, P: ProfilerControl>(
         || profiler.pprof_compiled() != configuration.pprof_compiled
     {
         return Err(
-            "pprof-tax child request configuration labels disagree with the linked profiler"
-                .into(),
+            "pprof-tax child request configuration labels disagree with the linked profiler".into(),
         );
     }
     // The parent-verified executable digest must be the one the inner request
@@ -143,9 +146,7 @@ pub fn execute_pprof_tax_child_request<A: AllocatorAdapter, P: ProfilerControl>(
     // Active requests must carry a place to dump the profile; inactive
     // requests must not, because they never call `dump_proto`.
     if request.pprof_active == request.profile_path.is_none() {
-        return Err(
-            "pprof-tax child request profile_path presence must match pprof_active".into(),
-        );
+        return Err("pprof-tax child request profile_path presence must match pprof_active".into());
     }
 
     let initial_telemetry = profiler.telemetry()?;

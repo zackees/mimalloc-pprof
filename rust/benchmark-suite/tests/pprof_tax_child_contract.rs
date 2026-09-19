@@ -153,7 +153,10 @@ fn mock_identity() -> AllocatorIdentity {
     }
 }
 
-fn inner_request(allocator: AllocatorIdentity, transactions_per_worker: u64) -> BenchmarkChildRequest {
+fn inner_request(
+    allocator: AllocatorIdentity,
+    transactions_per_worker: u64,
+) -> BenchmarkChildRequest {
     BenchmarkChildRequest {
         protocol_version: CHILD_PROTOCOL_VERSION.into(),
         schema_version: RAW_SCHEMA_VERSION.into(),
@@ -281,8 +284,9 @@ fn fork_pprof_off_request_never_starts_or_dumps() {
     let request = pprof_tax_request(configuration, inner, None);
     let executable_sha256 = "d".repeat(64);
 
-    let response = execute_pprof_tax_child_request(&adapter, &profiler, request, &executable_sha256)
-        .expect("inactive pprof-tax request succeeds");
+    let response =
+        execute_pprof_tax_child_request(&adapter, &profiler, request, &executable_sha256)
+            .expect("inactive pprof-tax request succeeds");
 
     assert!(!response.telemetry.enabled);
     assert!(!response.profile_written);
@@ -315,10 +319,11 @@ fn requests_that_disagree_with_the_linked_profilers_compiled_state_are_rejected(
         let request = pprof_tax_request(configuration, inner, profile_path);
         let executable_sha256 = "d".repeat(64);
 
-        let error = execute_pprof_tax_child_request(&adapter, &profiler, request, &executable_sha256)
-            .expect_err(&format!(
-                "{id} against a profiler with an inverted compiled flag must be rejected"
-            ));
+        let error =
+            execute_pprof_tax_child_request(&adapter, &profiler, request, &executable_sha256)
+                .expect_err(&format!(
+                    "{id} against a profiler with an inverted compiled flag must be rejected"
+                ));
         assert!(
             error.contains("disagree"),
             "unexpected error for {id}: {error}"
@@ -396,8 +401,9 @@ fn response_telemetry_json_reports_dropped_records_and_profiler_arena_bytes() {
     );
     let executable_sha256 = "d".repeat(64);
 
-    let response = execute_pprof_tax_child_request(&adapter, &profiler, request, &executable_sha256)
-        .expect("planted active request succeeds");
+    let response =
+        execute_pprof_tax_child_request(&adapter, &profiler, request, &executable_sha256)
+            .expect("planted active request succeeds");
     let encoded = serde_json::to_string(&response).expect("serialize pprof-tax child response");
     assert!(encoded.contains("\"dropped_records\""), "{encoded}");
     assert!(encoded.contains("\"profiler_arena_bytes\""), "{encoded}");

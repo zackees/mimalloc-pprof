@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use benchmark_suite::model::LatestReport;
 use benchmark_suite::pprof_tax::{
     attach_pprof_tax_report, build_pprof_tax_report, synthetic_pprof_tax_fixture,
-    validate_manifest, validate_pprof_tax_report, validate_raw_run, PprofTaxManifest, PprofTaxRawRun,
+    validate_manifest, validate_pprof_tax_report, validate_raw_run, PprofTaxManifest,
+    PprofTaxRawRun,
 };
 use benchmark_suite::provenance::{sha256_bytes, sha256_file};
 
@@ -143,10 +144,17 @@ fn run() -> Result<(), String> {
 
 /// Build the synthetic core `latest.json` plus a matching pprof-tax report,
 /// ready to be attached. Shared by `--fixture-latest-out` and `selftest`.
-fn fixture_latest() -> Result<(LatestReport, benchmark_suite::pprof_tax::PprofTaxMetricReport), String> {
-    let core = benchmark_suite::validate::synthetic_full_fixture().map_err(|error| error.to_string())?;
-    let validation =
-        benchmark_suite::validate::validate_publication_raw(&core).map_err(|error| error.to_string())?;
+fn fixture_latest() -> Result<
+    (
+        LatestReport,
+        benchmark_suite::pprof_tax::PprofTaxMetricReport,
+    ),
+    String,
+> {
+    let core =
+        benchmark_suite::validate::synthetic_full_fixture().map_err(|error| error.to_string())?;
+    let validation = benchmark_suite::validate::validate_publication_raw(&core)
+        .map_err(|error| error.to_string())?;
     let (latest, _history) = benchmark_suite::report::build_latest_report(&core, validation)?;
     let raw = synthetic_pprof_tax_fixture(FIXTURE_SEED)?;
     let raw_bytes = serde_json::to_vec(&raw).map_err(|error| error.to_string())?;
@@ -181,7 +189,9 @@ fn selftest() -> Result<(), String> {
     let mut drifted = raw.manifest.clone();
     for entry in &mut drifted.compiled_configurations {
         if entry.compiled_configuration_id == "fork-pprof-on" {
-            entry.cmake_cache.insert("MI_OPT_ARCH".into(), Some("ON".into()));
+            entry
+                .cmake_cache
+                .insert("MI_OPT_ARCH".into(), Some("ON".into()));
         }
     }
     if validate_manifest(&drifted).is_ok() {
@@ -190,7 +200,9 @@ fn selftest() -> Result<(), String> {
 
     // 3. Identity probe mismatch (executable digest disagrees with its entry).
     let mut bad_probe = raw.manifest.clone();
-    bad_probe.compiled_configurations[0].identity_probe.executable_sha256 = "0".repeat(64);
+    bad_probe.compiled_configurations[0]
+        .identity_probe
+        .executable_sha256 = "0".repeat(64);
     if validate_manifest(&bad_probe).is_ok() {
         return Err("selftest: an identity probe mismatch was accepted".into());
     }
@@ -243,9 +255,7 @@ fn selftest() -> Result<(), String> {
         .expect("fixture contains fork-pprof-off samples");
     stopped_claims.samples[index].sample_count = Some(5);
     if benchmark_suite::pprof_tax::validate_raw_sample(&stopped_claims.samples[index]).is_ok() {
-        return Err(
-            "selftest: a stopped sample claiming profiler samples was accepted".into(),
-        );
+        return Err("selftest: a stopped sample claiming profiler samples was accepted".into());
     }
 
     // 8. A report missing the frame-pointer-tax comparison.
@@ -290,9 +300,7 @@ fn selftest() -> Result<(), String> {
         }
     }
     if attach_pprof_tax_report(&mut mismatched_latest, report.clone()).is_ok() {
-        return Err(
-            "selftest: attaching with mismatched upstream provenance was accepted".into(),
-        );
+        return Err("selftest: attaching with mismatched upstream provenance was accepted".into());
     }
 
     // 12. Attaching a report with an empty manifest digest.
@@ -300,7 +308,9 @@ fn selftest() -> Result<(), String> {
     empty_digest.configuration_manifest_sha256 = String::new();
     let (mut latest_for_empty, _report) = fixture_latest()?;
     if attach_pprof_tax_report(&mut latest_for_empty, empty_digest).is_ok() {
-        return Err("selftest: attaching a report with an empty manifest digest was accepted".into());
+        return Err(
+            "selftest: attaching a report with an empty manifest digest was accepted".into(),
+        );
     }
 
     println!("PASS benchmark-pprof-tax-validate selftest");

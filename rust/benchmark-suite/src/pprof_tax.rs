@@ -135,8 +135,9 @@ pub fn pprof_tax_cells(topology: &Topology) -> Result<Vec<PprofTaxCellSpec>, Str
     topology.validate().map_err(|error| error.to_string())?;
     let mut cells = Vec::new();
     for &scenario_id in &PPROF_TAX_WORKLOADS {
-        let card_id = CardId::parse(scenario_id)
-            .ok_or_else(|| format!("pprof-tax workload names an unknown scenario: {scenario_id}"))?;
+        let card_id = CardId::parse(scenario_id).ok_or_else(|| {
+            format!("pprof-tax workload names an unknown scenario: {scenario_id}")
+        })?;
         let definition = card(card_id);
         let mut candidates = [ThreadPoint::One, ThreadPoint::PhysicalCores];
         if !definition.thread_points.contains(&ThreadPoint::One) {
@@ -471,11 +472,14 @@ pub fn validate_manifest(manifest: &PprofTaxManifest) -> Result<(), String> {
         || upstream.source_sha != manifest.upstream_source_sha
     {
         return Err(
-            "pprof-tax manifest upstream-baseline source_sha does not match the pinned base"
-                .into(),
+            "pprof-tax manifest upstream-baseline source_sha does not match the pinned base".into(),
         );
     }
-    for id in ["fork-pprof-off", "fork-pprof-on", "fork-pprof-off-frame-pointers"] {
+    for id in [
+        "fork-pprof-off",
+        "fork-pprof-on",
+        "fork-pprof-off-frame-pointers",
+    ] {
         let entry = by_id
             .get(id)
             .ok_or_else(|| format!("pprof-tax manifest is missing {id}"))?;
@@ -536,8 +540,7 @@ pub fn validate_manifest(manifest: &PprofTaxManifest) -> Result<(), String> {
         .collect();
     if compiler_identities.len() != 1 || linker_identities.len() != 1 {
         return Err(
-            "pprof-tax manifest compiled configurations do not share one toolchain identity"
-                .into(),
+            "pprof-tax manifest compiled configurations do not share one toolchain identity".into(),
         );
     }
     let executable_hashes: BTreeSet<&str> = manifest
@@ -813,16 +816,14 @@ pub fn classify_sample(sample: &mut PprofTaxRawSample, stress_budget_exhausted: 
     } else if sample.pprof_active
         && sample.sample_count == Some(0)
         && sample.allocated_bytes_lower_bound.unwrap_or(0)
-            >= PPROF_TAX_ZERO_SAMPLE_CROSSING_FACTOR
-                * sample.sampling_interval_bytes.unwrap_or(0)
+            >= PPROF_TAX_ZERO_SAMPLE_CROSSING_FACTOR * sample.sampling_interval_bytes.unwrap_or(0)
     {
         Some("zero-samples-after-crossing-interval")
     } else if sample.pprof_active {
         let dropped = sample.dropped_records.unwrap_or(0);
         let counted = sample.sample_count.unwrap_or(0);
         let denominator = counted + dropped;
-        if denominator > 0
-            && (dropped as f64 / denominator as f64) > PPROF_TAX_MAX_DROPPED_FRACTION
+        if denominator > 0 && (dropped as f64 / denominator as f64) > PPROF_TAX_MAX_DROPPED_FRACTION
         {
             Some("dropped-records-above-threshold")
         } else {
@@ -891,9 +892,7 @@ pub fn validate_raw_sample(sample: &PprofTaxRawSample) -> Result<(), String> {
     if !sample.pprof_active
         && (active_profile_fields_present || sample.sample_count.unwrap_or(0) > 0)
     {
-        return Err(
-            "a stopped or inactive pprof-tax sample must not claim profile data".into(),
-        );
+        return Err("a stopped or inactive pprof-tax sample must not claim profile data".into());
     }
     if sample.validity_status == "valid" {
         if sample.throughput_operations_per_second.is_none()
@@ -918,9 +917,7 @@ pub fn validate_raw_sample(sample: &PprofTaxRawSample) -> Result<(), String> {
                 || sample.profiler_arena_bytes.is_none()
                 || sample.interval_confirmed.is_none())
         {
-            return Err(
-                "a valid active pprof-tax sample is missing profile telemetry".into(),
-            );
+            return Err("a valid active pprof-tax sample is missing profile telemetry".into());
         }
     }
     Ok(())
@@ -987,11 +984,10 @@ pub fn validate_raw_run(raw: &PprofTaxRawRun) -> Result<(), String> {
                         .any(|(a, e)| a.as_str() != *e)
             })
     {
-        return Err(
-            "pprof-tax raw run block orders do not match the seeded permutation".into(),
-        );
+        return Err("pprof-tax raw run block orders do not match the seeded permutation".into());
     }
-    let expected_total = raw.blocks as usize * expected_cells.len() * PPROF_TAX_CONFIGURATIONS.len();
+    let expected_total =
+        raw.blocks as usize * expected_cells.len() * PPROF_TAX_CONFIGURATIONS.len();
     let mut seen: BTreeSet<(u32, String, String, String)> = BTreeSet::new();
     for sample in &raw.samples {
         validate_raw_sample(sample)?;
@@ -1003,7 +999,9 @@ pub fn validate_raw_run(raw: &PprofTaxRawRun) -> Result<(), String> {
             .compiled_configurations
             .iter()
             .find(|entry| entry.compiled_configuration_id == sample.compiled_configuration_id)
-            .ok_or_else(|| "pprof-tax sample names an unknown compiled configuration".to_string())?;
+            .ok_or_else(|| {
+                "pprof-tax sample names an unknown compiled configuration".to_string()
+            })?;
         if sample.executable_sha256 != compiled_entry.executable_sha256 {
             return Err(
                 "pprof-tax sample executable digest does not match its manifest entry".into(),
@@ -1236,10 +1234,14 @@ impl PprofTaxMetricReport {
 // Report construction
 // ---------------------------------------------------------------------
 
-fn configuration_support(manifest: &PprofTaxManifest, configuration_id: &str) -> (&'static str, Option<String>) {
+fn configuration_support(
+    manifest: &PprofTaxManifest,
+    configuration_id: &str,
+) -> (&'static str, Option<String>) {
     if configuration_id == "fork-pprof-off-frame-pointers" {
         let target = manifest.target.as_str();
-        let supported = target.contains("linux") || target.contains("darwin") || target.contains("apple");
+        let supported =
+            target.contains("linux") || target.contains("darwin") || target.contains("apple");
         if !supported {
             return (
                 "unsupported",
@@ -1367,7 +1369,10 @@ fn build_comparison(
         _ => None,
     };
 
-    let valid_block_count = paired.as_ref().map(|summary| summary.block_count as u32).unwrap_or(0);
+    let valid_block_count = paired
+        .as_ref()
+        .map(|summary| summary.block_count as u32)
+        .unwrap_or(0);
     if let Some(summary) = paired.filter(|_| valid_block_count >= PPROF_TAX_MIN_BLOCKS) {
         let ratio = summary.effect;
         let ratio_lower = summary.confidence_interval.lower;
@@ -1395,7 +1400,10 @@ fn build_comparison(
     } else {
         let invalid_reason = find_invalid_reason(
             raw,
-            [spec.numerator_configuration_id, spec.denominator_configuration_id],
+            [
+                spec.numerator_configuration_id,
+                spec.denominator_configuration_id,
+            ],
             scenario_id,
             thread_point,
         );
@@ -1544,7 +1552,10 @@ pub fn build_pprof_tax_report(
         per_config_block
             .entry((sample.configuration_id.as_str(), sample.block_id))
             .or_default()
-            .insert((sample.scenario_id.as_str(), sample.thread_point.as_str()), throughput);
+            .insert(
+                (sample.scenario_id.as_str(), sample.thread_point.as_str()),
+                throughput,
+            );
         per_cell_values
             .entry((
                 sample.scenario_id.as_str(),
@@ -1656,10 +1667,14 @@ pub fn build_pprof_tax_report(
                 .iter()
                 .filter(|sample| sample.validity_status == "invalid")
                 .count() as u64;
-            let mut sample_counts: Vec<u64> =
-                matching.iter().filter_map(|sample| sample.sample_count).collect();
-            let mut sampled_bytes: Vec<u64> =
-                matching.iter().filter_map(|sample| sample.sampled_bytes).collect();
+            let mut sample_counts: Vec<u64> = matching
+                .iter()
+                .filter_map(|sample| sample.sample_count)
+                .collect();
+            let mut sampled_bytes: Vec<u64> = matching
+                .iter()
+                .filter_map(|sample| sample.sampled_bytes)
+                .collect();
             let dropped: Vec<u64> = matching
                 .iter()
                 .filter_map(|sample| sample.dropped_records)
@@ -1676,7 +1691,11 @@ pub fn build_pprof_tax_report(
                 .iter()
                 .filter_map(|sample| sample.invalid_reason.clone())
                 .collect();
-            let validity_status = if invalid_runs == 0 { "valid" } else { "invalid" };
+            let validity_status = if invalid_runs == 0 {
+                "valid"
+            } else {
+                "invalid"
+            };
             active_telemetry.push(PprofTaxActiveTelemetry {
                 configuration_id: (*configuration_id).into(),
                 scenario_id: cell.scenario_id.clone(),
@@ -1706,7 +1725,10 @@ pub fn build_pprof_tax_report(
                         && sample.thread_point == cell.thread_point
                 })
                 .collect();
-            let mut peak: Vec<u64> = matching.iter().filter_map(|sample| sample.peak_rss_bytes).collect();
+            let mut peak: Vec<u64> = matching
+                .iter()
+                .filter_map(|sample| sample.peak_rss_bytes)
+                .collect();
             let mut delta: Vec<i64> = matching
                 .iter()
                 .filter_map(|sample| sample.end_rss_delta_bytes)
@@ -1834,7 +1856,10 @@ pub fn validate_pprof_tax_report(report: &PprofTaxMetricReport) -> Result<(), St
         // Mirrors ci/benchmark_report.py: the frame-pointer control must resolve to a
         // number or an explicit platform `unsupported`, never a silent gap.
         Some(comparison)
-            if !matches!(comparison.support_status.as_str(), "supported" | "unsupported") =>
+            if !matches!(
+                comparison.support_status.as_str(),
+                "supported" | "unsupported"
+            ) =>
         {
             return Err(
                 "pprof-tax frame-pointer-tax must resolve to supported or unsupported".into(),
@@ -1866,7 +1891,11 @@ pub fn validate_pprof_tax_report(report: &PprofTaxMetricReport) -> Result<(), St
     if headline_eligible_count != 1 {
         return Err("exactly one pprof-tax comparison may be headline eligible".into());
     }
-    for comparison in report.comparisons.iter().chain(report.cell_comparisons.iter()) {
+    for comparison in report
+        .comparisons
+        .iter()
+        .chain(report.cell_comparisons.iter())
+    {
         if comparison.headline_eligible && comparison.comparison_id != "sparse-sampling-tax" {
             return Err("only sparse-sampling-tax may be headline eligible".into());
         }
@@ -1928,17 +1957,15 @@ pub fn attach_pprof_tax_report(
             && allocator.source_sha == report.upstream_source_sha
     });
     if !upstream_matches {
-        return Err(
-            "pprof-tax upstream provenance does not match the core latest report".into(),
-        );
+        return Err("pprof-tax upstream provenance does not match the core latest report".into());
     }
     if report.configuration_manifest_sha256.is_empty() || report.raw_artifact_sha256.is_empty() {
-        return Err(
-            "pprof-tax report is missing manifest or raw artifact provenance".into(),
-        );
+        return Err("pprof-tax report is missing manifest or raw artifact provenance".into());
     }
     latest.pprof_tax = Some(report);
-    latest.pending_metrics.retain(|value| value.metric_id != "pprof-tax");
+    latest
+        .pending_metrics
+        .retain(|value| value.metric_id != "pprof-tax");
     Ok(())
 }
 
@@ -1967,7 +1994,11 @@ fn base_throughput(configuration_id: &str) -> f64 {
     }
 }
 
-fn fixture_cache(mi_pprof: Option<&str>, mi_dhat: Option<&str>, c_flags_release: &str) -> BTreeMap<String, Option<String>> {
+fn fixture_cache(
+    mi_pprof: Option<&str>,
+    mi_dhat: Option<&str>,
+    c_flags_release: &str,
+) -> BTreeMap<String, Option<String>> {
     let mut cache = BTreeMap::new();
     cache.insert("CMAKE_AR".into(), Some("/usr/bin/ar".into()));
     cache.insert("CMAKE_BUILD_TYPE".into(), Some("Release".into()));
@@ -1975,7 +2006,10 @@ fn fixture_cache(mi_pprof: Option<&str>, mi_dhat: Option<&str>, c_flags_release:
     cache.insert("CMAKE_C_FLAGS".into(), Some("-O3".into()));
     cache.insert("CMAKE_C_FLAGS_RELEASE".into(), Some(c_flags_release.into()));
     cache.insert("CMAKE_EXE_LINKER_FLAGS".into(), Some("-fuse-ld=lld".into()));
-    cache.insert("CMAKE_INTERPROCEDURAL_OPTIMIZATION".into(), Some("ON".into()));
+    cache.insert(
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION".into(),
+        Some("ON".into()),
+    );
     cache.insert("CMAKE_STATIC_LINKER_FLAGS".into(), Some(String::new()));
     cache.insert("MI_BUILD_SHARED".into(), Some("OFF".into()));
     cache.insert("MI_BUILD_STATIC".into(), Some("ON".into()));
@@ -2068,7 +2102,11 @@ pub fn synthetic_pprof_tax_fixture(run_seed: u64) -> Result<PprofTaxRawRun, Stri
             frame_pointer_policy: frame_pointer_policy.into(),
             cmake_arguments: vec![format!(
                 "-DMI_PPROF={}",
-                cache.get("MI_PPROF").cloned().flatten().unwrap_or_else(|| "OFF".into())
+                cache
+                    .get("MI_PPROF")
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| "OFF".into())
             )],
             cmake_cache: cache,
             c_compiler_identity: "clang version 18.1.0".into(),
@@ -2111,7 +2149,10 @@ pub fn synthetic_pprof_tax_fixture(run_seed: u64) -> Result<PprofTaxRawRun, Stri
             ("CFLAGS".to_string(), None),
             ("LDFLAGS".to_string(), None),
             ("RUSTFLAGS".to_string(), None),
-            ("SOURCE_DATE_EPOCH".to_string(), Some("1700000000".to_string())),
+            (
+                "SOURCE_DATE_EPOCH".to_string(),
+                Some("1700000000".to_string()),
+            ),
         ]),
         compiled_configurations,
     };
@@ -2179,7 +2220,8 @@ pub fn synthetic_pprof_tax_fixture(run_seed: u64) -> Result<PprofTaxRawRun, Stri
         .map(|order| order.iter().map(|id| id.to_string()).collect())
         .collect();
 
-    let mut samples = Vec::with_capacity(blocks as usize * cell_specs.len() * PPROF_TAX_CONFIGURATIONS.len());
+    let mut samples =
+        Vec::with_capacity(blocks as usize * cell_specs.len() * PPROF_TAX_CONFIGURATIONS.len());
     for block in 0..blocks {
         for cell in &cell_specs {
             for spec in &PPROF_TAX_CONFIGURATIONS {
@@ -2188,14 +2230,22 @@ pub fn synthetic_pprof_tax_fixture(run_seed: u64) -> Result<PprofTaxRawRun, Stri
                     .iter()
                     .find(|entry| entry.compiled_configuration_id == spec.compiled_configuration_id)
                     .expect("compiled configuration exists for every spec");
-                let seed_material =
-                    format!("{block}:{}:{}:{}", cell.scenario_id, cell.thread_point, spec.configuration_id);
+                let seed_material = format!(
+                    "{block}:{}:{}:{}",
+                    cell.scenario_id, cell.thread_point, spec.configuration_id
+                );
                 let jitter_seed = fold_seed(run_seed, &seed_material);
                 let jitter = 1.0 + ((jitter_seed % 1000) as f64 / 1000.0 - 0.5) * 0.01;
-                let throughput = base_throughput(spec.configuration_id) * f64::from(cell.thread_count) * 1000.0 * jitter;
+                let throughput = base_throughput(spec.configuration_id)
+                    * f64::from(cell.thread_count)
+                    * 1000.0
+                    * jitter;
                 let elapsed_ns = PPROF_TAX_TARGET_BLOCK_NS;
-                let operation_count = ((throughput * elapsed_ns as f64 / 1_000_000_000.0).round().max(1.0)) as u64;
-                let allocated_bytes_lower_bound = operation_count * minimum_request_bytes(cell.scenario_id)?;
+                let operation_count = ((throughput * elapsed_ns as f64 / 1_000_000_000.0)
+                    .round()
+                    .max(1.0)) as u64;
+                let allocated_bytes_lower_bound =
+                    operation_count * minimum_request_bytes(cell.scenario_id)?;
 
                 let mut sample = PprofTaxRawSample {
                     block_id: block,
@@ -2258,7 +2308,8 @@ pub fn synthetic_pprof_tax_fixture(run_seed: u64) -> Result<PprofTaxRawRun, Stri
         sample.position = order
             .iter()
             .position(|id| *id == sample.configuration_id)
-            .expect("every sample names one of the seven configurations") as u32;
+            .expect("every sample names one of the seven configurations")
+            as u32;
     }
 
     Ok(PprofTaxRawRun {

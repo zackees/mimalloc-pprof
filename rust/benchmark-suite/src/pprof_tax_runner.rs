@@ -21,8 +21,8 @@ use crate::model::{
     CHILD_PROTOCOL_VERSION,
 };
 use crate::pprof_tax::{
-    self, PprofTaxCellSpec, PprofTaxCompiledConfiguration, PprofTaxConfiguration,
-    PprofTaxManifest, PprofTaxRawCell, PprofTaxRawRun, PprofTaxRawSample,
+    self, PprofTaxCellSpec, PprofTaxCompiledConfiguration, PprofTaxConfiguration, PprofTaxManifest,
+    PprofTaxRawCell, PprofTaxRawRun, PprofTaxRawSample,
 };
 use crate::pprof_tax_child::{PprofTaxChildRequest, PprofTaxChildResponse};
 use crate::provenance::{sha256_bytes, sha256_file};
@@ -120,7 +120,11 @@ fn run(options: Options) -> Result<(), String> {
     } else {
         "headline"
     };
-    let mode = if options.reduced_smoke { "smoke" } else { "full" };
+    let mode = if options.reduced_smoke {
+        "smoke"
+    } else {
+        "full"
+    };
     if options.reduced_smoke {
         if options.blocks == 0 || options.blocks >= pprof_tax::PPROF_TAX_MIN_BLOCKS {
             return Err("--reduced-smoke requires 1 <= --blocks < 15".into());
@@ -440,9 +444,11 @@ fn calibrate_pprof_tax_cell(
             runner_metadata,
             None,
         )?;
-        let (response, _peak_rss_bytes) = run_pprof_tax_child(reference_compiled, &request, timeout)?;
+        let (response, _peak_rss_bytes) =
+            run_pprof_tax_child(reference_compiled, &request, timeout)?;
         let elapsed = response.inner.sample.elapsed_ns;
-        if (pprof_tax::PPROF_TAX_MIN_BLOCK_NS..=pprof_tax::PPROF_TAX_MAX_BLOCK_NS).contains(&elapsed)
+        if (pprof_tax::PPROF_TAX_MIN_BLOCK_NS..=pprof_tax::PPROF_TAX_MAX_BLOCK_NS)
+            .contains(&elapsed)
         {
             return Ok(PprofTaxRawCell {
                 scenario_id: cell.scenario_id.to_string(),
@@ -479,7 +485,12 @@ fn calibrate_pprof_tax_cell(
 /// paired block: it depends only on (run seed, block, scenario, thread
 /// point), never on the configuration, so all seven children replay the same
 /// operation stream.
-fn pprof_tax_workload_seed(run_seed: u64, block_id: u32, scenario_id: &str, thread_point: &str) -> u64 {
+fn pprof_tax_workload_seed(
+    run_seed: u64,
+    block_id: u32,
+    scenario_id: &str,
+    thread_point: &str,
+) -> u64 {
     const DOMAIN: u64 = 0x7072_6f66_5f74_6178; // "prof_tax"
     let mut state = splitmix64(run_seed ^ DOMAIN);
     state = splitmix64(state ^ u64::from(block_id));
@@ -609,15 +620,16 @@ fn build_raw_sample(
     } else {
         (None, None, None)
     };
-    let allocated_bytes_lower_bound = pprof_tax::minimum_request_bytes(cell.scenario_id)
-        .ok()
-        .map(|minimum| {
-            (inner.allocation_calls
-                + inner.calloc_calls
-                + inner.aligned_allocation_calls
-                + inner.realloc_calls)
-                .saturating_mul(minimum)
-        });
+    let allocated_bytes_lower_bound =
+        pprof_tax::minimum_request_bytes(cell.scenario_id)
+            .ok()
+            .map(|minimum| {
+                (inner.allocation_calls
+                    + inner.calloc_calls
+                    + inner.aligned_allocation_calls
+                    + inner.realloc_calls)
+                    .saturating_mul(minimum)
+            });
     let (sample_count, sampled_bytes, dropped_records, profiler_arena_bytes) =
         if configuration.pprof_active {
             (

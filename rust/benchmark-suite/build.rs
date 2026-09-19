@@ -83,8 +83,11 @@ fn main() {
     let manifest = canonical_file(&required_env("BENCH_ALLOCATOR_LINK_MANIFEST"));
     let link_inputs = parse_link_manifest(&manifest, &primary_library);
     let include_dirs = parse_include_dirs(&required_env("BENCH_ALLOCATOR_INCLUDE_DIRS"));
-    let mut adapter_objects =
-        vec![compile_adapter(&allocator_id, &allocator_version, &include_dirs)];
+    let mut adapter_objects = vec![compile_adapter(
+        &allocator_id,
+        &allocator_version,
+        &include_dirs,
+    )];
 
     let pprof_tax_configuration = match env::var(PPROF_TAX_ENV) {
         Ok(value) => {
@@ -332,9 +335,8 @@ fn compile_adapter(id: &str, version: &str, includes: &[PathBuf]) -> PathBuf {
 /// allocator identity already selected via `BENCH_ALLOCATOR_ID`, returning
 /// whether the configuration links against the fork's profiler API.
 fn validate_pprof_tax_configuration(value: &str, allocator_id: &str) -> bool {
-    let Some(&(_, required_allocator_id)) = PPROF_TAX_CONFIGURATIONS
-        .iter()
-        .find(|(id, _)| *id == value)
+    let Some(&(_, required_allocator_id)) =
+        PPROF_TAX_CONFIGURATIONS.iter().find(|(id, _)| *id == value)
     else {
         let known: Vec<&str> = PPROF_TAX_CONFIGURATIONS.iter().map(|(id, _)| *id).collect();
         panic!(

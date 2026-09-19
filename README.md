@@ -274,7 +274,8 @@ commit, and reachable from both C and Rust ([full API table](#api-surface)).
   API, bound completely in Rust here. → [Exact allocator stats](#exact-allocator-stats)
 - **DHAT total accounting.** Exact, every-allocation profiling with lifetimes and
   access counts (`mi_dhat_start`, `dhat::start()`), dumped in Valgrind's DHAT format for
-  `dh_view.html`. Independent of `MI_PPROF`. → [DHAT](#dhat-exact-heap-profiling)
+  `dh_view.html`. Independent of `MI_PPROF`; **opt-in at build time** (`features = ["dhat"]`
+  / `-DMI_DHAT=ON`). → [DHAT](#dhat-exact-heap-profiling)
 - **Memory-events API.** Opt-in allocation-change callbacks and live-allocation
   snapshots (`mi_memory_set_callbacks`, `memory_events::snapshot()`) for your own
   counters — one relaxed flag check per operation while off, available even with the
@@ -475,7 +476,11 @@ two apart. Full field list and the rest of the caveats:
 When sampling isn't enough — you want **every** allocation's size and lifetime —
 run a short, focused session under the exact DHAT observer and open the result
 in Valgrind's [`dh_view.html`](https://valgrind.org/docs/manual/dh-manual.html).
-No code needed at all:
+
+DHAT is **off by default** and must be built in explicitly: the Rust crate's `dhat`
+feature (`mimalloc-pprof = { version = "0.11", features = ["dhat"] }`) or CMake's
+`-DMI_DHAT=ON`. Without it the observer is compiled out of the allocator entirely and
+`mi_dhat_start` / `dhat::start()` return `false`. Once built in, no code is needed at all:
 
 ```sh
 MIMALLOC_DHAT=1 MIMALLOC_DHAT_DUMP_AT_EXIT=heap.dhat.json ./my_app
@@ -619,9 +624,9 @@ Rust API stays present and `prof::start` returns `false`.
 | `mi_dhat_stats_get`, `mi_dhat_stats_t` | ✅ | `dhat::stats() -> dhat::Stats` |
 | `mi_dhat_dump` | ✅ | `dhat::dump_file` |
 
-Independent of `MI_PPROF`. Compiled out with the crate's default-on `dhat` feature turned
-off, or `MI_DHAT=OFF` in CMake (#371, mirrors `#if MI_DHAT`); the Rust API stays present
-and `dhat::start` returns `false`.
+Independent of `MI_PPROF`. **Opt-in:** compiled in only with the crate's `dhat` feature
+(off by default) or `-DMI_DHAT=ON` in CMake (default `OFF`; #371, mirrors `#if MI_DHAT`).
+Without it the Rust API stays present and `dhat::start` returns `false`.
 
 #### Memory events — `include/mimalloc/memory-events.h`
 

@@ -83,7 +83,8 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    the out-of-line `_slow` bodies (#371). Never put a call, TLS read or atomic RMW in front of
    the flag test: `ci/check_fastpath_identity.py` rejects any `lock`/`xchg` in the default
    build's fast path and `test-observer-scaling` measures the scaling it protects. DHAT itself
-   compiles out with CMake `MI_DHAT=OFF` or the Rust `dhat` feature off (default on in both).
+   compiles out with CMake `MI_DHAT=OFF` or the Rust `dhat` feature off — **default OFF in both**;
+   clients opt in explicitly (`-DMI_DHAT=ON` / `features = ["dhat"]`; owner decision 2026-09-18).
 7. **Escalate, don't improvise:** when reality diverges from a sub-issue (API drift, toolchain
    fights, unreachable threshold), comment on that issue with evidence and stop.
 

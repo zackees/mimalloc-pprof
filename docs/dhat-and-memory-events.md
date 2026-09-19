@@ -10,6 +10,12 @@ writes [DHAT file-version 2](https://valgrind.org/docs/manual/dh-manual.html) JS
 raw-OS-backed record for every observed live allocation. Use it for short tests and
 focused investigations, not a continuously running production workload.
 
+**DHAT is opt-in at build time** and compiled out by default: configure CMake with
+`-DMI_DHAT=ON` (default `OFF`), enable the Rust crate's `dhat` feature
+(`features = ["dhat"]`), or define `MI_DHAT=1` when compiling `src/static.c` directly.
+Without it the per-allocation hook sites vanish from the allocator and the `mi_dhat_*`
+API remains only as stubs: `mi_dhat_start` returns `false` and `mi_dhat_dump` fails.
+
 ```c
 #include <mimalloc.h>
 #include <mimalloc/dhat.h>

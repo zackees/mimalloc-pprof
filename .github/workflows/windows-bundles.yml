@@ -91,7 +91,10 @@ jobs:
             # `ctest-win-gnu`: `cmake -B build -G Ninja -DMI_PPROF=ON`. It passes no
             # CMAKE_BUILD_TYPE and CMakeLists.txt (~137-145) defaults it from the binary
             # directory's name, which is `build` -> Release. Spelled out here.
-            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON
+            # -DMI_DHAT=ON: DHAT is opt-in (default OFF since 2026-09-18). The release and
+            # debug-full bundles build it in so test-dhat keeps running on win-gnu; shared,
+            # gated and leak stay at the default, so both shapes are covered.
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON
           - bundle: windows-gnu-x64-debug-full
             # `ctest-debug-full-win-gnu`: `-DMI_PPROF=ON -DMI_DEBUG_FULL=ON
             # -DCMAKE_BUILD_TYPE=Debug`. NOTE: unlike macOS's `ctest-debug-full`, this job
@@ -99,7 +102,7 @@ jobs:
             # ("debug-full is really Release + MI_DEBUG=3") does NOT transfer to win-gnu.
             # Debug here also turns on MI_GUARDED=1 and MI_FREE_IS_CHECKED=1, and renames
             # the library to `mimalloc-debug`.
-            cmake: -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
+            cmake: -DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON
           - bundle: windows-gnu-x64-shared
             # `ctest-shared-win-gnu`.
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
@@ -306,7 +309,10 @@ jobs:
           # frame-pointer flags either: the profiler does not walk frame pointers on
           # Windows (it uses RtlCaptureStackBackTrace), which is why cross.yml's
           # frame-pointer steps are gated on `apple-darwin`.
-          cargo test -p mimalloc-pprof --no-run --target x86_64-pc-windows-gnu --release \
+          # --features dhat: the crate's DHAT observer is opt-in (default OFF since
+          # 2026-09-18); this is the win-gnu run of its DHAT tests. rust-native.yml covers
+          # the default (compiled-out) feature set.
+          cargo test -p mimalloc-pprof --no-run --target x86_64-pc-windows-gnu --release --features dhat \
             --message-format=json > cargo.json || rc=$?
           jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' cargo.json > bins.txt
           if [ "$rc" -ne 0 ]; then
@@ -357,7 +363,10 @@ jobs:
             #
             # This is the one native MSVC job that is NOT being replaced: it stays a hard
             # gate (CLAUDE.md rule 3). This bundle is the cross-built comparison arm.
-            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON
+            #
+            # -DMI_DHAT=ON mirrors that job's main tree (DHAT is opt-in since 2026-09-18);
+            # debug-full builds it in too, shared/gated/leak stay at the default OFF.
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON
           - bundle: windows-msvc-x64-debug-full
             # `ctest-debug-full (windows-latest)`: `-DMI_PPROF=ON -DMI_DEBUG_FULL=ON` then
             # `--config Debug`.
@@ -383,7 +392,7 @@ jobs:
             # (Phase C correction 4 said phase B's "debug-full is really Release" finding
             # was macOS-only. It is not: it applies to windows-MSVC too, for the different
             # reason above. windows-GNU remains the odd one out.)
-            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON
           - bundle: windows-msvc-x64-shared
             # `ctest-shared (windows-latest)`.
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
@@ -700,7 +709,9 @@ jobs:
           # rust-native.yml's `test (windows-latest)`: the whole workspace, DEBUG.
           build workspace-debug --workspace
           # cross.yml's `test (x86_64-pc-windows-msvc)`: the profiler crate, RELEASE.
-          build pprof-release -p mimalloc-pprof --release
+          # --features dhat: DHAT is opt-in (default OFF since 2026-09-18); the workspace
+          # build above covers the default feature set, this one the DHAT tests.
+          build pprof-release -p mimalloc-pprof --release --features dhat
           # Staged into separate directories, not one flat one. `t3_stats` and `t12_proto`
           # exist in BOTH sets, and the pprof dump checks stand in for cross.yml's row,
           # which is a RELEASE row -- a flat directory would leave `ls … | head -1`
@@ -1570,10 +1581,10 @@ jobs:
           set -euo pipefail
           gcc --version | head -1
           # `ctest-win-gnu`
-          cmake -B native-release -G Ninja -DMI_PPROF=ON
+          cmake -B native-release -G Ninja -DMI_PPROF=ON -DMI_DHAT=ON
           cmake --build native-release
           # `ctest-debug-full-win-gnu` (CMAKE_BUILD_TYPE=Debug is explicit there)
-          cmake -B native-debug-full -G Ninja -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake -B native-debug-full -G Ninja -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DCMAKE_BUILD_TYPE=Debug
           # `ctest-shared-win-gnu`
           cmake -B native-shared -G Ninja -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
           # the owner-gate bundle (#366)
@@ -1637,12 +1648,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           # `ctest (windows-latest)` -- the retained gate
-          cmake -B native-msvc-release -DMI_PPROF=ON
+          cmake -B native-msvc-release -DMI_PPROF=ON -DMI_DHAT=ON
           if ($LASTEXITCODE -ne 0) { throw 'native MSVC Release configure failed' }
           cmake --build native-msvc-release --config Release
           if ($LASTEXITCODE -ne 0) { throw 'native MSVC Release build failed' }
           # `ctest-debug-full (windows-latest)`
-          cmake -B native-msvc-debug-full -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
+          cmake -B native-msvc-debug-full -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON
           if ($LASTEXITCODE -ne 0) { throw 'native MSVC debug-full configure failed' }
           # `ctest-shared (windows-latest)`
           cmake -B native-msvc-shared -DMI_PPROF=ON -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF

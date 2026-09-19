@@ -93,7 +93,9 @@ jobs:
             # The awkward config: 6 `cmake -P run-negative.cmake` negative controls and a
             # `cmake -E env` LD_PRELOAD wrapper, none of which is a plain argv. If the
             # bundle format can carry this one it can carry anything (#277 phase A).
-            cmake: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON
+            # -DMI_DHAT=ON (opt-in since 2026-09-18): the DHAT observer's MI_DEBUG=3
+            # assertions are only compiled when both are on, so this row keeps them run.
+            cmake: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON
             build_config: Debug
             kind: bundle
           - config: guarded
@@ -125,18 +127,21 @@ jobs:
             build_config: Release
             assert_defines: MI_OWNER_GATE=1
             kind: bundle
-          - config: dhat-off
+          - config: dhat-on
             container: ''
             python: uv run
-            # #371: the DHAT observer compiled out. With MI_DHAT=OFF the per-allocation
-            # hook sites vanish from the alloc/free path entirely and only the public
-            # `mi_dhat_*` API survives as stubs, so this row is what keeps "free when not
-            # compiled in" a fact rather than a claim -- the whole suite runs against it,
-            # since every test is a test of the hook sites. Asserted on the resolved
-            # defines like `guarded`/`gated`, and for the same reason.
-            cmake: -DMI_PPROF=ON -DMI_DHAT=OFF
+            # #371: the DHAT observer compiled IN. MI_DHAT is opt-in (default OFF since
+            # the 2026-09-18 owner decision), so `release` and every row that does not
+            # pass it is the compiled-out build clients get by default -- the per-
+            # allocation hook sites vanish and only the `mi_dhat_*` stubs survive. This
+            # row is the opt-in build: the WHOLE suite runs against it, because every test
+            # is a test of the hook sites, and it is the Release row that registers and
+            # runs test-dhat / test-fork-locks-dhat-env. Asserted on the resolved defines
+            # like `guarded`/`gated`, and for the same reason: an opt-in flag that
+            # silently failed to reach the compiler would leave DHAT untested and green.
+            cmake: -DMI_PPROF=ON -DMI_DHAT=ON
             build_config: Release
-            assert_defines: MI_DHAT=0
+            assert_defines: MI_DHAT=1
             kind: bundle
           - config: musl
             # Bun ships musl builds (`MI_LIBC_MUSL=1`, `-ftls-model=local-dynamic`);
@@ -147,7 +152,9 @@ jobs:
             container: alpine:3.20
             python: python3
             generator: -G Ninja
-            cmake: -DMI_LIBC_MUSL=ON -DMI_PPROF=ON -DCMAKE_C_FLAGS=-ftls-model=local-dynamic
+            # -DMI_DHAT=ON (opt-in): the DHAT tests keep a musl run; musl-pprof-off below
+            # stays at the default (compiled out).
+            cmake: -DMI_LIBC_MUSL=ON -DMI_PPROF=ON -DMI_DHAT=ON -DCMAKE_C_FLAGS=-ftls-model=local-dynamic
             kind: bundle
           - config: musl-pprof-off
             container: alpine:3.20
@@ -360,7 +367,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
-      - run: cmake -B build -DMI_PPROF=ON
+      # -DMI_DHAT=ON: DHAT is opt-in (default OFF since 2026-09-18), so the main `cl` tree
+      # builds it in to keep test-dhat running under Microsoft's compiler; the owner-gate
+      # tree below stays at the default, so `cl` compiles both the ON and OFF shapes.
+      - name: Configure the main tree (MI_DHAT=ON)
+        run: |
+          set -euo pipefail
+          cmake -B build -DMI_PPROF=ON -DMI_DHAT=ON | tee configure.log
+          if ! grep -qE "Compiler defines *:.*MI_DHAT=1" configure.log; then
+            echo "::error::MI_DHAT=1 did not reach mi_defines"
+            exit 1
+          fi
       - run: cmake --build build --config Release
       - name: Enumerate the suite this tree registers
         run: ctest --test-dir build --show-only=json-v1 -C Release > show-only-windows-native.json
@@ -457,7 +474,7 @@ jobs:
           # A download that silently produced fewer bundles would otherwise surface as a
           # confusing `No such file` in the middle of a gate, or -- worse -- as a green
           # run over less.
-          for expected in release pprof-off debug-full guarded shared gated dhat-off musl musl-pprof-off \
+          for expected in release pprof-off debug-full guarded shared gated dhat-on musl musl-pprof-off \
                           memory-gate-leak; do
             if [ ! -d "bundle/$expected" ]; then
               echo "::error::bundle/$expected was not downloaded"
@@ -484,7 +501,7 @@ jobs:
         run: |
           set -euo pipefail
           uv run ci/run_test_bundle.py \
-            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared bundle/gated bundle/dhat-off \
+            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared bundle/gated bundle/dhat-on \
             --jobs 4 --select parallel \
             --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
             --junit-dir results
@@ -631,7 +648,7 @@ jobs:
             mkdir -p "bundle/$name"
             tar -C "bundle/$name" -xzf "$archive"
           done
-          for expected in release pprof-off debug-full guarded shared gated dhat-off musl musl-pprof-off; do
+          for expected in release pprof-off debug-full guarded shared gated dhat-on musl musl-pprof-off; do
             if [ ! -d "bundle/$expected" ]; then
               echo "::error::bundle/$expected was not downloaded"
               ls bundle
@@ -643,7 +660,7 @@ jobs:
         run: |
           set -euo pipefail
           uv run ci/run_test_bundle.py \
-            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared bundle/gated bundle/dhat-off \
+            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared bundle/gated bundle/dhat-on \
             --jobs 1 --select serial \
             --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
             --junit-dir results
@@ -706,7 +723,7 @@ jobs:
           # with several lands as `<dest>/results/<file>`. Locating the file makes this
           # step independent of that, and a missing half is a named error rather than a
           # bare `cp: No such file`.
-          for config in release pprof-off debug-full guarded shared gated dhat-off musl musl-pprof-off; do
+          for config in release pprof-off debug-full guarded shared gated dhat-on musl musl-pprof-off; do
             mkdir -p "executed/$config"
             for half in parallel serial; do
               found=$(find "$half" -type f -name "$config.xml" | head -1)
@@ -731,7 +748,7 @@ jobs:
             --compare guarded manifests/show-only-guarded.json executed/guarded \
             --compare shared manifests/show-only-shared.json executed/shared \
             --compare gated manifests/show-only-gated.json executed/gated \
-            --compare dhat-off manifests/show-only-dhat-off.json executed/dhat-off \
+            --compare dhat-on manifests/show-only-dhat-on.json executed/dhat-on \
             --compare musl manifests/show-only-musl.json executed/musl \
             --compare musl-pprof-off manifests/show-only-musl-pprof-off.json executed/musl-pprof-off \
             --heading "Coverage: registered by ctest vs executed by the run stage" \

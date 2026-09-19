@@ -65,6 +65,11 @@ jobs:
         shell: bash
         run: python ../ci/check_rust_surface.py
       - run: soldr cargo test --locked
+      # The `dhat` cargo feature is opt-in (default OFF since 2026-09-18), so the default
+      # run above compiles the observer out. This is the pprof + DHAT build -- the old
+      # default -- so the DHAT tests (lib's dhat lifecycle, feature_contract) keep running.
+      - name: Test pprof + DHAT (dhat feature opted in)
+        run: soldr cargo test -p mimalloc-pprof --features dhat --locked
       - name: cargo publish --dry-run (mimalloc-pprof)
         if: runner.os != 'Windows'
         run: soldr cargo publish --dry-run -p mimalloc-pprof --locked

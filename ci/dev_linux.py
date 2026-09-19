@@ -19,8 +19,10 @@ if os.name != "nt":
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKER_BUILD = ["clud", "tool", "run", "docker/docker-build.py", "soldr", str(ROOT)]
+# -DMI_DHAT=ON: DHAT is opt-in (default OFF since 2026-09-18); the dev loop builds it in so
+# test-dhat runs locally too.
 C_TEST = (
-    "cmake -S /src -B /target/c-build -G Ninja -DMI_PPROF=ON "
+    "cmake -S /src -B /target/c-build -G Ninja -DMI_PPROF=ON -DMI_DHAT=ON "
     "-DCMAKE_C_COMPILER_LAUNCHER=zccache && cmake --build /target/c-build && "
     "ctest --test-dir /target/c-build --output-on-failure -E 'test-stress.*' && "
     'threads=$(nproc); [ "$threads" -le 4 ] || threads=4; '

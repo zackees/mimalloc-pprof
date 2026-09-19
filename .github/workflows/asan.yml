@@ -40,15 +40,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # -DMI_DHAT=ON on these two rows: DHAT is opt-in (default OFF since 2026-09-18),
+          # so without it the observer would never run under ASan. The clang
+          # RelWithDebInfo and owner-gate rows stay at the default, keeping the compiled-
+          # out shape sanitized too.
           - cc: clang
             cxx: clang++
             build_type: Debug
-            extra: -DMI_DEBUG_FULL=ON
+            extra: -DMI_DEBUG_FULL=ON -DMI_DHAT=ON
             label: ''
           - cc: gcc
             cxx: g++
             build_type: RelWithDebInfo
-            extra: ''
+            extra: -DMI_DHAT=ON
             label: ''
           - cc: clang
             cxx: clang++

@@ -63,7 +63,14 @@ FASTPATH_SYMBOLS: tuple[str, ...] = (
     "mi_malloc_small",
 )
 
-COMMON_CMAKE: tuple[str, ...] = ("-DCMAKE_BUILD_TYPE=Release", "-DMI_PPROF=ON")
+#: `-DMI_DHAT=ON` is pinned rather than left to the default. MI_DHAT flipped to OFF by
+#: default on 2026-09-18, so relying on the default would compare a base built one way
+#: against a HEAD built the other the moment either side crossed that change -- a
+#: byte-identity check that fails (or passes) for a reason unrelated to the diff. ON, not
+#: OFF: it is the build with MORE on the fast path (the disabled observer's hook sites),
+#: i.e. the one where #371's atomic-RMW regression actually lived, so the absolute
+#: forbidden-instruction scan below still looks where that bug was.
+COMMON_CMAKE: tuple[str, ...] = ("-DCMAKE_BUILD_TYPE=Release", "-DMI_PPROF=ON", "-DMI_DHAT=ON")
 
 # `    7c2e:\tpush   %rbp` -> the instruction; `    7c2e:\t...` prefixes are addresses.
 ADDR_PREFIX_RE = re.compile(r"^\s*[0-9a-f]+:\s*")

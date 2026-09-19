@@ -230,7 +230,7 @@ class VerifyLocalDriftTests(unittest.TestCase):
             "guarded",
             "shared",
             "gated",
-            "dhat-off",
+            "dhat-on",
             "fastpath",
             "bundle",
             "memory-gate",

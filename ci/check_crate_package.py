@@ -58,7 +58,9 @@ def main() -> None:
     )
     required_manifest = (
         f'version = "{version}"',
-        'default = ["pprof", "dhat"]',
+        # DHAT is opt-in (owner decision 2026-09-18): `dhat` must exist but must NOT be a
+        # default feature, or every client pays for the observer's hook sites.
+        'default = ["pprof"]',
         "pprof = []",
         "dhat = []",
     )
@@ -67,8 +69,8 @@ def main() -> None:
             raise AssertionError(f"published manifest missing {text!r}")
     if 'var_os("CARGO_FEATURE_PPROF")' not in build or '"MI_PPROF"' not in build:
         raise AssertionError("published build script does not select MI_PPROF from the feature")
-    # #371: the `dhat` cargo feature must drive MI_DHAT; a hard-coded define would make
-    # `default-features = false` silently keep the observer compiled in.
+    # #371: the `dhat` cargo feature must drive MI_DHAT; a hard-coded define would either
+    # compile the observer into every client (defeating opt-in) or make opting in a no-op.
     if 'var_os("CARGO_FEATURE_DHAT")' not in build or '"MI_DHAT"' not in build:
         raise AssertionError("published build script does not select MI_DHAT from the feature")
     if "pub mod dhat" not in library or "mi_dhat_start" not in native:

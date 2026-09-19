@@ -298,9 +298,13 @@ def run_off(ctx: RunCtx) -> bool:
 
 
 def run_debug_full(ctx: RunCtx) -> bool:
-    """c-unit.yml `build (debug-full)` + its slice of `run-linux`: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON, Debug."""
+    """c-unit.yml `build (debug-full)` + its slice of `run-linux`: -DMI_PPROF=ON
+    -DMI_DEBUG_FULL=ON -DMI_DHAT=ON, Debug (DHAT is opt-in; this row keeps its MI_DEBUG=3
+    assertions run)."""
     build = ctx.dir / "build"
-    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON", C_UNIT_STRICT])
+    rc, _ = cmake_configure(
+        ctx, build, ["-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON", "-DMI_DHAT=ON", C_UNIT_STRICT]
+    )
     if rc:
         return False
     if cmake_build(ctx, build, config="Debug"):
@@ -506,19 +510,20 @@ def run_gated(ctx: RunCtx) -> bool:
     return ctest_run(ctx, build, config="Release") == 0
 
 
-def run_dhat_off(ctx: RunCtx) -> bool:
-    """c-unit.yml `build (dhat-off)` + its slice of `run-linux` (#371): Release,
-    -DMI_PPROF=ON -DMI_DHAT=OFF, the WHOLE suite -- with the observer compiled out the
-    per-allocation hook sites disappear from the alloc/free path, so every test is a test
-    of that. Asserted on the resolved defines like `gated`, and for the same reason."""
+def run_dhat_on(ctx: RunCtx) -> bool:
+    """c-unit.yml `build (dhat-on)` + its slice of `run-linux` (#371): Release,
+    -DMI_PPROF=ON -DMI_DHAT=ON, the WHOLE suite. DHAT is opt-in (default OFF since
+    2026-09-18), so `release` is the compiled-out build and this is the one that registers
+    test-dhat and runs every test against the compiled-in hook sites. Asserted on the
+    resolved defines like `gated`, and for the same reason."""
     build = ctx.dir / "build"
     rc, configure_out = cmake_configure(
-        ctx, build, ["-DMI_PPROF=ON", "-DMI_DHAT=OFF", C_UNIT_STRICT]
+        ctx, build, ["-DMI_PPROF=ON", "-DMI_DHAT=ON", C_UNIT_STRICT]
     )
     if rc:
         return False
-    if not re.search(r"Compiler defines\s*:.*MI_DHAT=0", configure_out):
-        log_write(ctx.log, "\n[verify_local] FAIL: MI_DHAT=0 did not reach mi_defines\n")
+    if not re.search(r"Compiler defines\s*:.*MI_DHAT=1", configure_out):
+        log_write(ctx.log, "\n[verify_local] FAIL: MI_DHAT=1 did not reach mi_defines\n")
         return False
     if cmake_build(ctx, build, config="Release"):
         return False
@@ -744,6 +749,15 @@ def run_rust(ctx: RunCtx) -> bool:
     if rc:
         return False
     rc, _ = run_logged(["cargo", "test", "--workspace"], cwd=rust_dir, log=ctx.log, env=env)
+    if rc:
+        return False
+    # rust-native.yml's "Test pprof + DHAT" step: the `dhat` feature is opt-in.
+    rc, _ = run_logged(
+        ["cargo", "test", "-p", "mimalloc-pprof", "--features", "dhat"],
+        cwd=rust_dir,
+        log=ctx.log,
+        env=env,
+    )
     return rc == 0
 
 
@@ -971,7 +985,13 @@ def run_asan(ctx: RunCtx) -> bool:
         cc,
         cxx,
         "debug",
-        ["-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON", "-DMI_TRACK_ASAN=ON"],
+        [
+            "-DCMAKE_BUILD_TYPE=Debug",
+            "-DMI_PPROF=ON",
+            "-DMI_DEBUG_FULL=ON",
+            "-DMI_DHAT=ON",
+            "-DMI_TRACK_ASAN=ON",
+        ],
     )
     # `and` in this order, not short-circuited away by `debug_ok and ...`: --keep-going is
     # about seeing every failure in one run, and the release row is the interesting one here.
@@ -1063,10 +1083,10 @@ CONFIGS: list[ConfigSpec] = [
         run_gated,
     ),
     ConfigSpec(
-        "dhat-off",
-        "c-unit.yml: build(dhat-off)+run-linux",
-        "Release, MI_DHAT=OFF, full ctest (#371)",
-        run_dhat_off,
+        "dhat-on",
+        "c-unit.yml: build(dhat-on)+run-linux",
+        "Release, MI_DHAT=ON (opt-in), full ctest (#371)",
+        run_dhat_on,
     ),
     ConfigSpec(
         "fastpath",
@@ -1164,7 +1184,7 @@ BUNDLES: list[BundleSpec] = [
         "macos-bundles.yml",
         "build-macos",
         "aarch64-apple-darwin",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON",
         DARWIN_LINK_LIBRARIES,
     ),
     BundleSpec(
@@ -1172,7 +1192,7 @@ BUNDLES: list[BundleSpec] = [
         "macos-bundles.yml",
         "build-macos",
         "aarch64-apple-darwin",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_TLS_MODEL_FIXED=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DMI_TLS_MODEL_FIXED=ON",
         DARWIN_LINK_LIBRARIES,
     ),
     BundleSpec(
@@ -1188,7 +1208,7 @@ BUNDLES: list[BundleSpec] = [
         "macos-bundles.yml",
         "build-macos",
         "x86_64-apple-darwin",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON",
         DARWIN_LINK_LIBRARIES,
     ),
     BundleSpec(
@@ -1196,7 +1216,7 @@ BUNDLES: list[BundleSpec] = [
         "macos-bundles.yml",
         "build-macos",
         "x86_64-apple-darwin",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON",
         DARWIN_LINK_LIBRARIES,
     ),
     BundleSpec(
@@ -1216,7 +1236,7 @@ BUNDLES: list[BundleSpec] = [
         "windows-bundles.yml",
         "build-windows-gnu",
         "x86_64-pc-windows-gnu",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON",
         WINDOWS_LINK_LIBRARIES,
         (
             "--objdump",
@@ -1230,7 +1250,7 @@ BUNDLES: list[BundleSpec] = [
         "windows-bundles.yml",
         "build-windows-gnu",
         "x86_64-pc-windows-gnu",
-        "-DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_DEBUG_FULL=ON",
+        "-DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON",
         WINDOWS_LINK_LIBRARIES,
         (
             "--objdump",
@@ -1290,7 +1310,7 @@ BUNDLES: list[BundleSpec] = [
         "windows-bundles.yml",
         "build-windows-msvc",
         "x86_64-pc-windows-msvc",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON",
         WINDOWS_LINK_LIBRARIES,
         ("--objdump", "llvm-objdump", "--check-dll-closure", "--allow-msvc-runtime"),
     ),
@@ -1299,7 +1319,7 @@ BUNDLES: list[BundleSpec] = [
         "windows-bundles.yml",
         "build-windows-msvc",
         "x86_64-pc-windows-msvc",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON",
         WINDOWS_LINK_LIBRARIES,
         ("--objdump", "llvm-objdump", "--check-dll-closure", "--allow-msvc-runtime"),
     ),
@@ -1545,7 +1565,7 @@ class LikeCiBuild:
 LIKE_CI_BUILDS: list[LikeCiBuild] = [
     LikeCiBuild("release", ("-DMI_PPROF=ON",), "Release"),
     LikeCiBuild("pprof-off", ("-DMI_PPROF=OFF",)),
-    LikeCiBuild("debug-full", ("-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON"), "Debug"),
+    LikeCiBuild("debug-full", ("-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON", "-DMI_DHAT=ON"), "Debug"),
     LikeCiBuild("guarded", ("-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_GUARDED=ON")),
     LikeCiBuild(
         "shared",
@@ -1559,6 +1579,8 @@ LIKE_CI_BUILDS: list[LikeCiBuild] = [
     ),
     # #366: the owner gate, whole suite (every allocator entry is a gate site).
     LikeCiBuild("gated", ("-DMI_PPROF=ON", "-DMI_OWNER_GATE=ON"), "Release"),
+    # #371: DHAT is opt-in (default OFF), so this is the compiled-in whole-suite row.
+    LikeCiBuild("dhat-on", ("-DMI_PPROF=ON", "-DMI_DHAT=ON"), "Release"),
     LikeCiBuild(
         "memory-gate-leak",
         # See c-unit.yml's memory-gate-leak row for why 600000 rather than 200000.

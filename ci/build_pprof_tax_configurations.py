@@ -301,9 +301,7 @@ def check_equivalence(configurations: Sequence[Mapping[str, object]]) -> None:
     fork_ids = ("fork-pprof-off", "fork-pprof-on", "fork-pprof-off-frame-pointers")
     fork_source_shas = {by_id[cid].get("source_sha") for cid in fork_ids}
     if len(fork_source_shas) != 1:
-        raise EquivalenceError(
-            f"fork configurations do not share a source sha: {fork_source_shas}"
-        )
+        raise EquivalenceError(f"fork configurations do not share a source sha: {fork_source_shas}")
 
     compiler_identities = {
         by_id[cid].get("c_compiler_identity") for cid in COMPILED_CONFIGURATION_IDS
@@ -312,9 +310,7 @@ def check_equivalence(configurations: Sequence[Mapping[str, object]]) -> None:
         raise EquivalenceError(
             f"compiler identities differ across configurations: {compiler_identities}"
         )
-    linker_identities = {
-        by_id[cid].get("linker_identity") for cid in COMPILED_CONFIGURATION_IDS
-    }
+    linker_identities = {by_id[cid].get("linker_identity") for cid in COMPILED_CONFIGURATION_IDS}
     if len(linker_identities) != 1:
         raise EquivalenceError(
             f"linker identities differ across configurations: {linker_identities}"
@@ -344,7 +340,7 @@ def validate_identity_probe(probe: object, expected: Mapping[str, object]) -> No
     if not isinstance(probe, dict):
         raise BuildError("pprof-tax identity probe did not emit a JSON object")
     probe_map = cast(Mapping[str, object], probe)
-    keys = set(probe_map.keys())
+    keys = frozenset(probe_map.keys())
     if keys != IDENTITY_PROBE_KEYS:
         raise BuildError(
             f"pprof-tax identity probe keys must be exactly {sorted(IDENTITY_PROBE_KEYS)}, "
@@ -696,7 +692,7 @@ def _selftest_configurations() -> list[dict[str, object]]:
     the one knob each pair is allowed to differ in."""
 
     def cache_with(**overrides: object) -> dict[str, object]:
-        merged: dict[str, object] = {key: "SAME" for key in EQUIVALENCE_CACHE_KEYS}
+        merged: dict[str, object] = dict.fromkeys(EQUIVALENCE_CACHE_KEYS, "SAME")
         merged["CMAKE_C_FLAGS_RELEASE"] = "-O3"
         merged.update(overrides)
         return merged

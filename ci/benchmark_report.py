@@ -4654,12 +4654,12 @@ def validate_pprof_tax_report(
     string_value(intervals.get("sparse_rationale"), f"{label}.intervals.sparse_rationale")
 
     cell_keys: tuple[tuple[str, str], ...] = ()
+    active_ids: set[str] = set()
     if not compact:
         configurations = list_value(report.get("configurations"), f"{label}.configurations")
         if len(configurations) != len(PPROF_TAX_CONFIGURATION_IDS):
             fail(
-                f"{label}.configurations: expected exactly "
-                f"{len(PPROF_TAX_CONFIGURATION_IDS)} rows"
+                f"{label}.configurations: expected exactly {len(PPROF_TAX_CONFIGURATION_IDS)} rows"
             )
         parsed_configurations = [
             validate_pprof_tax_configuration(
@@ -5288,9 +5288,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
         ]
         pprof_tax_configurations = [
             object_value(value, "pprof-tax configuration")
-            for value in list_value(
-                pprof_tax["configurations"], "latest.pprof_tax.configurations"
-            )
+            for value in list_value(pprof_tax["configurations"], "latest.pprof_tax.configurations")
         ]
         pprof_tax_cells = [
             object_value(value, "pprof-tax cell")

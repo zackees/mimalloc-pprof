@@ -23,9 +23,7 @@ import yaml
 from benchmark_report import PPROF_TAX_MIN_BLOCKS, PPROF_TAX_SCHEMA
 from check_benchmark_workflow import check_action_ref
 
-WORKFLOW = (
-    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "benchmark-pprof-tax.yml"
-)
+WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "benchmark-pprof-tax.yml"
 # The block-count floor is declared twice: the Rust producer emits it and the
 # Python validator rejects anything short of it. Drift is silent until a
 # scheduled run has already spent its budget and fails at overlay time, so the
@@ -233,7 +231,9 @@ def validate(workflow: Mapping[str, object]) -> None:
             continue
         job = mapping(value, f"workflow.jobs.{name}")
         permissions = job.get("permissions")
-        if isinstance(permissions, dict) and permissions.get("contents") == "write":
+        if isinstance(permissions, Mapping) and (
+            cast(Mapping[str, object], permissions).get("contents") == "write"
+        ):
             fail(f"workflow.jobs.{name}: only publish-branch may use contents: write")
     deploy = mapping(jobs["deploy-pages"], "deploy-pages")
     if mapping(deploy.get("permissions"), "deploy permissions") != {
@@ -246,9 +246,10 @@ def validate(workflow: Mapping[str, object]) -> None:
             continue
         job = mapping(value, f"workflow.jobs.{name}")
         permissions = job.get("permissions")
-        if isinstance(permissions, dict) and (
-            permissions.get("pages") == "write" or permissions.get("id-token") == "write"
-        ):
+        granted: Mapping[str, object] = (
+            cast(Mapping[str, object], permissions) if isinstance(permissions, Mapping) else {}
+        )
+        if granted.get("pages") == "write" or granted.get("id-token") == "write":
             fail(f"workflow.jobs.{name}: only deploy-pages may use pages/id-token write")
     if mapping(deploy.get("environment"), "deploy environment").get("name") != "github-pages":
         fail("deploy-pages must target the github-pages environment")
@@ -364,9 +365,9 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
     "manifest leaks into the site artifact": lambda wf: cast(
         dict[str, Any], _step(wf, "upload site artifact")["with"]
     ).__setitem__("path", "${{ runner.temp }}/site/manifest-copy/"),
-    "raw artifact conditional": lambda wf: _step(
-        wf, "upload raw pprof-tax artifact"
-    ).__setitem__("if", "success()"),
+    "raw artifact conditional": lambda wf: _step(wf, "upload raw pprof-tax artifact").__setitem__(
+        "if", "success()"
+    ),
     "retention shortened": lambda wf: cast(
         dict[str, Any], _step(wf, "upload raw pprof-tax artifact")["with"]
     ).__setitem__("retention-days", 1),

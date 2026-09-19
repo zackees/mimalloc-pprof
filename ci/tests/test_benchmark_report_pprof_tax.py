@@ -126,7 +126,9 @@ CONFIGURATION_ATTRS: dict[str, tuple[str, str, bool, bool, int | None, str]] = {
     ),
 }
 ACTIVE_CONFIGURATION_IDS = (
-    "fork-pprof-sparse", "fork-pprof-aggressive", "fork-pprof-rate-1-stress"
+    "fork-pprof-sparse",
+    "fork-pprof-aggressive",
+    "fork-pprof-rate-1-stress",
 )
 
 

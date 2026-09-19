@@ -36,7 +36,7 @@ def cache_with(**overrides: object) -> dict[str, Any]:
     """A cache projection where every EQUIVALENCE_CACHE_KEYS entry agrees, except
     whatever `overrides` names -- the baseline `check_equivalence` fixture tests
     mutate one key at a time away from."""
-    merged: dict[str, Any] = {key: "SAME" for key in builder.EQUIVALENCE_CACHE_KEYS}
+    merged: dict[str, Any] = dict.fromkeys(builder.EQUIVALENCE_CACHE_KEYS, "SAME")
     merged["CMAKE_C_FLAGS_RELEASE"] = "-O3"
     merged.update(overrides)
     return merged

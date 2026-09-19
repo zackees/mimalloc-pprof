@@ -48,8 +48,20 @@ pub trait AllocatorAdapter: Sync {
     fn library_sha256(&self) -> &str;
     fn alloc(&self, size: usize) -> Result<NonNull<u8>, String>;
     fn calloc(&self, count: usize, size: usize) -> Result<NonNull<u8>, String>;
+    /// Resize an allocation returned by this adapter.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must be live and must have been returned by this adapter. On
+    /// error the original allocation remains live and must still be freed.
     unsafe fn realloc(&self, pointer: NonNull<u8>, size: usize) -> Result<NonNull<u8>, String>;
     fn aligned_alloc(&self, alignment: usize, size: usize) -> Result<NonNull<u8>, String>;
+    /// Free an allocation returned by this adapter.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must be live and must have been returned by this adapter; it
+    /// must not be used afterwards.
     unsafe fn free(&self, pointer: NonNull<u8>);
 }
 
@@ -1204,6 +1216,9 @@ fn finish_execution(
     })
 }
 
+// Called inside the timed latency region: keep the flat argument list rather
+// than bundling state behind another indirection that could shift measured codegen.
+#[allow(clippy::too_many_arguments)]
 fn execute_one<A: AllocatorAdapter>(
     adapter: &A,
     card_id: CardId,
@@ -1239,7 +1254,7 @@ fn execute_one<A: AllocatorAdapter>(
         }
         RequestKind::AlignedAlloc => {
             let pointer = adapter.aligned_alloc(request.alignment, request.size)?;
-            if pointer.as_ptr() as usize % request.alignment != 0 {
+            if !(pointer.as_ptr() as usize).is_multiple_of(request.alignment) {
                 unsafe { adapter.free(pointer) };
                 return Err("adapter returned a misaligned allocation".into());
             }

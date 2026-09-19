@@ -158,6 +158,10 @@ impl LinkedAdapter {
         Err(AdapterError::Unlinked)
     }
 
+    /// Resize an allocation returned by this adapter.
+    ///
+    /// # Safety
+    ///
     /// The caller must pass a live pointer returned by this adapter. On error,
     /// the original allocation remains live and must still be freed.
     #[cfg(benchmark_native_adapter)]
@@ -175,6 +179,12 @@ impl LinkedAdapter {
             .ok_or(AdapterError::AllocationFailed("realloc"))
     }
 
+    /// Resize an allocation returned by this adapter.
+    ///
+    /// # Safety
+    ///
+    /// The caller must pass a live pointer returned by this adapter. On error,
+    /// the original allocation remains live and must still be freed.
     #[cfg(not(benchmark_native_adapter))]
     pub unsafe fn realloc(
         &self,
@@ -223,21 +233,39 @@ impl LinkedAdapter {
         Err(AdapterError::Unlinked)
     }
 
+    /// Free an allocation returned by this adapter.
+    ///
+    /// # Safety
+    ///
     /// The pointer must be live and must have been returned by this adapter.
     #[cfg(benchmark_native_adapter)]
     pub unsafe fn free(&self, pointer: NonNull<u8>) {
         unsafe { bench_free(pointer.as_ptr().cast()) }
     }
 
+    /// Free an allocation returned by this adapter.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must be live and must have been returned by this adapter.
     #[cfg(not(benchmark_native_adapter))]
     pub unsafe fn free(&self, _pointer: NonNull<u8>) {}
 
+    /// Usable size of an allocation returned by this adapter.
+    ///
+    /// # Safety
+    ///
     /// The pointer must be live and must have been returned by this adapter.
     #[cfg(benchmark_native_adapter)]
     pub unsafe fn usable_size(&self, pointer: NonNull<u8>) -> usize {
         unsafe { bench_usable_size(pointer.as_ptr().cast()) }
     }
 
+    /// Usable size of an allocation returned by this adapter.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must be live and must have been returned by this adapter.
     #[cfg(not(benchmark_native_adapter))]
     pub unsafe fn usable_size(&self, _pointer: NonNull<u8>) -> usize {
         0

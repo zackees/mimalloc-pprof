@@ -511,7 +511,8 @@ impl WorkerPlanner {
                     // Evicting a live slot is exactly one free plus one
                     // allocation; queueing both keeps each counted once.
                     self.occupied[slot] = false;
-                    self.queued.push_back(PlannedAction::Alloc { slot, size, token });
+                    self.queued
+                        .push_back(PlannedAction::Alloc { slot, size, token });
                     self.occupied[slot] = true;
                     self.fifo.push_back(slot);
                     return Some(PlannedAction::FreeSlot { slot });
@@ -937,8 +938,7 @@ pub fn execute_scaling_child_request<A: AllocatorAdapter>(
                 // thread forever; the child would then die on the parent's
                 // watchdog with an empty stderr instead of reporting the real
                 // error. The outcome is therefore carried, not propagated.
-                let warmup =
-                    warm_up_worker(adapter, request, pattern, seed, worker_index, threads);
+                let warmup = warm_up_worker(adapter, request, pattern, seed, worker_index, threads);
                 ready.wait();
                 start.wait();
                 let mut outcome = warmup.and_then(|()| {
@@ -1245,7 +1245,14 @@ fn larson_round<A: AllocatorAdapter>(
                 slots.slots[slot] = Some(parcel);
             }
             PlannedAction::FreeSlot { slot } => {
-                larson_free(adapter, slots, slot, worker, tally, "scaling plan freed an empty slot")?;
+                larson_free(
+                    adapter,
+                    slots,
+                    slot,
+                    worker,
+                    tally,
+                    "scaling plan freed an empty slot",
+                )?;
             }
             _ => return Err("larson rotation planner emitted a non-slot action".into()),
         }
@@ -1267,7 +1274,14 @@ fn larson_drain<A: AllocatorAdapter>(
     let (planner, slots) = &mut *guard;
     for action in planner.drain_actions() {
         if let PlannedAction::FreeSlot { slot } = action {
-            larson_free(adapter, slots, slot, worker, tally, "scaling drain freed an empty slot")?;
+            larson_free(
+                adapter,
+                slots,
+                slot,
+                worker,
+                tally,
+                "scaling drain freed an empty slot",
+            )?;
         }
     }
     Ok(())
@@ -1947,9 +1961,7 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
     let frozen = raw
         .calibrations
         .iter()
-        .map(|value| {
-            ((value.pattern.clone(), value.thread_count), value)
-        })
+        .map(|value| ((value.pattern.clone(), value.thread_count), value))
         .collect::<BTreeMap<_, _>>();
     for calibration in &raw.calibrations {
         if calibration.operations_per_worker == 0
@@ -1984,9 +1996,7 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
             .get(&key)
             .ok_or_else(|| "scaling sample has no matching calibration".to_string())?;
         if sample.operations_per_worker != calibration.operations_per_worker {
-            return Err(
-                "scaling sample did not use the frozen per-worker operation count".into(),
-            );
+            return Err("scaling sample did not use the frozen per-worker operation count".into());
         }
         if sample.peak_rss_bytes == 0 {
             return Err(format!(
@@ -2106,10 +2116,7 @@ pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, 
     for ((pattern, threads, allocator), values) in &grouped {
         if *threads == 1 {
             let mut values = values.clone();
-            single.insert(
-                (pattern.clone(), allocator.clone()),
-                median(&mut values),
-            );
+            single.insert((pattern.clone(), allocator.clone()), median(&mut values));
         }
     }
     let mut cell_summaries = Vec::new();
@@ -2137,12 +2144,11 @@ pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, 
         });
     }
     cell_summaries.sort_by(|left, right| {
-        (
-            &left.pattern,
-            left.thread_count,
-            &left.allocator_id,
-        )
-            .cmp(&(&right.pattern, right.thread_count, &right.allocator_id))
+        (&left.pattern, left.thread_count, &left.allocator_id).cmp(&(
+            &right.pattern,
+            right.thread_count,
+            &right.allocator_id,
+        ))
     });
     let mut rss_cell_summaries = Vec::new();
     for ((pattern, threads, allocator), mut values) in rss_grouped {
@@ -2158,12 +2164,11 @@ pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, 
         });
     }
     rss_cell_summaries.sort_by(|left, right| {
-        (
-            &left.pattern,
-            left.thread_count,
-            &left.allocator_id,
-        )
-            .cmp(&(&right.pattern, right.thread_count, &right.allocator_id))
+        (&left.pattern, left.thread_count, &left.allocator_id).cmp(&(
+            &right.pattern,
+            right.thread_count,
+            &right.allocator_id,
+        ))
     });
     Ok(ScalingMetricReport {
         metric_schema_version: SCALING_SCHEMA_VERSION.into(),
@@ -2307,10 +2312,9 @@ pub fn validate_scaling_report(report: &ScalingMetricReport) -> Result<(), Strin
 /// exercise the validator, the report builder, and the renderer end to end.
 pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String> {
     use crate::model::{AffinityMetadata, PowerMetadata};
-    let lock =
-        crate::config::AllocatorLock::parse_and_validate(include_str!(
-            "../allocators/allocator-lock.json"
-        ))?;
+    let lock = crate::config::AllocatorLock::parse_and_validate(include_str!(
+        "../allocators/allocator-lock.json"
+    ))?;
     let run = RunIdentity {
         source_repository: "https://github.com/zackees/mimalloc-pprof".into(),
         source_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
@@ -2392,7 +2396,10 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                 build_flags: pin.build.flags.clone(),
                 compiler: format!("fixture-compiler-{index}"),
                 linker: format!("fixture-linker-{index}"),
-                static_library_sha256: crate::validate::repeated_hex((b'5' + index as u8) as char, 64),
+                static_library_sha256: crate::validate::repeated_hex(
+                    (b'5' + index as u8) as char,
+                    64,
+                ),
                 child_binary_sha256: crate::validate::repeated_hex(
                     ['9', 'a', 'b', 'c', 'd'][index],
                     64,

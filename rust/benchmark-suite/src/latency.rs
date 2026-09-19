@@ -750,7 +750,10 @@ pub fn validate_latency_raw_run(raw: &LatencyRawRun) -> Result<(), String> {
         || raw.runner.physical_cores == 0
         || raw.runner.logical_cores == 0
         || raw.runner.physical_cores > raw.runner.logical_cores
-        || !matches!(raw.runner.affinity.policy.as_str(), "unrestricted" | "pinned")
+        || !matches!(
+            raw.runner.affinity.policy.as_str(),
+            "unrestricted" | "pinned"
+        )
         || (raw.runner.affinity.policy == "pinned"
             && raw.runner.affinity.logical_cpu_ids.is_empty())
         || raw
@@ -1681,12 +1684,15 @@ pub fn block_bootstrap_quantile_effect(
         .ok_or_else(|| "latency bootstrap omitted a required quantile".into())
 }
 
+/// Per-block (candidate, reference) latency observations, in nanoseconds.
+type LatencyBlockPair = (Vec<u64>, Vec<u64>);
+
 fn latency_block_pairs(
     cell_id: &str,
     candidate_id: &str,
     reference_id: &str,
     samples: &[LatencyRawSample],
-) -> Result<Vec<(Vec<u64>, Vec<u64>)>, String> {
+) -> Result<Vec<LatencyBlockPair>, String> {
     if cell_id.is_empty()
         || candidate_id.is_empty()
         || reference_id.is_empty()
@@ -1699,8 +1705,8 @@ fn latency_block_pairs(
         if format!("{}/{}", sample.scenario_id, sample.thread_point) != cell_id {
             continue;
         }
-        if sample.allocator_id == candidate_id || sample.allocator_id == reference_id {
-            if blocks
+        if (sample.allocator_id == candidate_id || sample.allocator_id == reference_id)
+            && blocks
                 .entry(sample.block_id)
                 .or_default()
                 .insert(
@@ -1713,9 +1719,8 @@ fn latency_block_pairs(
                         .collect(),
                 )
                 .is_some()
-            {
-                return Err("latency bootstrap block duplicates an allocator".into());
-            }
+        {
+            return Err("latency bootstrap block duplicates an allocator".into());
         }
     }
     if blocks.is_empty() {

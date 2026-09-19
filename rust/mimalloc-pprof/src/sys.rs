@@ -596,12 +596,12 @@ mi_options! {
     _mi_option_last = 61;
 }
 
-/// Deprecated upstream alias for [`mi_option_allow_large_os_pages`].
-#[allow(non_upper_case_globals)]
 /// `MI_SNAPSHOT_BLOCKS` (include/mimalloc.h, #338): include per-block free bitmaps for the
 /// pages the calling thread owns.
 pub const MI_SNAPSHOT_BLOCKS: c_uint = 0x01;
 
+/// Deprecated upstream alias for [`mi_option_allow_large_os_pages`].
+#[allow(non_upper_case_globals)]
 pub const mi_option_large_os_pages: mi_option_t = mi_option_allow_large_os_pages;
 /// Deprecated upstream alias for [`mi_option_arena_eager_commit`].
 #[allow(non_upper_case_globals)]

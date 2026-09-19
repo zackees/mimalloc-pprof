@@ -45,7 +45,10 @@ fn run() -> Result<(), String> {
         let raw = synthetic_scaling_fixture(0x6d69_6d61_6c6c_6f63)?;
         validate_scaling_raw_run(&raw)?;
         write_new_json(&path, &raw)?;
-        println!("PASS wrote a complete scaling fixture with {} samples", raw.samples.len());
+        println!(
+            "PASS wrote a complete scaling fixture with {} samples",
+            raw.samples.len()
+        );
         return Ok(());
     }
     let raw: ScalingRawRun = read_json(&input.ok_or("--input is required")?)?;

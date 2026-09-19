@@ -6,7 +6,9 @@ use std::thread;
 #[test]
 fn on_thread_idle_is_safe_on_any_thread() {
     // a thread that never allocated: documented as a no-op, must not crash
-    thread::spawn(mimalloc_pprof::on_thread_idle).join().unwrap();
+    thread::spawn(mimalloc_pprof::on_thread_idle)
+        .join()
+        .unwrap();
     // ... and on a thread that has
     let v: Vec<u8> = vec![7u8; 4096];
     assert_eq!(v[0], 7);
@@ -26,7 +28,7 @@ fn park_guard_round_trips() {
             let _park = mimalloc_pprof::park_while_idle();
             thread::yield_now();
         } // drop -> mi_on_thread_idle_end
-        // allocating immediately after the wake must be safe
+          // allocating immediately after the wake must be safe
         let p: Vec<u8> = vec![1u8; 1024];
         assert_eq!(p.len(), 1024);
     }

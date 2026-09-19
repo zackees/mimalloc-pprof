@@ -989,102 +989,39 @@ impl ScenarioCell {
     ) {
         let entropy = mix(self.seed ^ ((worker as u64) << 32) ^ operation);
         let base_token = transaction * 64 + 1;
+        let txn = TxnSlot {
+            worker,
+            tx: transaction,
+            token: base_token,
+        };
         match self.card {
-            CardId::TinyFixed16 => {
-                self.simple_alloc_free(worker, transaction, base_token, 16, entropy, out, checksum)
+            CardId::TinyFixed16 => self.simple_alloc_free(txn, 16, entropy, out, checksum),
+            CardId::TinyFixed64 => self.simple_alloc_free(txn, 64, entropy, out, checksum),
+            CardId::SmallLogMixed => {
+                self.simple_alloc_free(txn, small_size(entropy), entropy, out, checksum)
             }
-            CardId::TinyFixed64 => {
-                self.simple_alloc_free(worker, transaction, base_token, 64, entropy, out, checksum)
+            CardId::MediumLogMixed => {
+                self.simple_alloc_free(txn, medium_size(entropy), entropy, out, checksum)
             }
-            CardId::SmallLogMixed => self.simple_alloc_free(
-                worker,
-                transaction,
-                base_token,
-                small_size(entropy),
-                entropy,
-                out,
-                checksum,
-            ),
-            CardId::MediumLogMixed => self.simple_alloc_free(
-                worker,
-                transaction,
-                base_token,
-                medium_size(entropy),
-                entropy,
-                out,
-                checksum,
-            ),
-            CardId::LargeObjects => self.simple_alloc_free(
-                worker,
-                transaction,
-                base_token,
-                large_size(entropy),
-                entropy,
-                out,
-                checksum,
-            ),
-            CardId::BatchLifo => self.batch(
-                worker,
-                transaction,
-                base_token,
-                entropy,
-                true,
-                out,
-                checksum,
-            ),
-            CardId::BatchFifo => self.batch(
-                worker,
-                transaction,
-                base_token,
-                entropy,
-                false,
-                out,
-                checksum,
-            ),
-            CardId::CrossThreadProducerConsumer => self.cross_thread(
-                worker,
-                operation,
-                transaction,
-                base_token,
-                entropy,
-                false,
-                out,
-                checksum,
-            ),
-            CardId::RandomOwnership => self.cross_thread(
-                worker,
-                operation,
-                transaction,
-                base_token,
-                entropy,
-                true,
-                out,
-                checksum,
-            ),
-            CardId::ReallocGeometric => {
-                self.realloc_geometric(worker, transaction, base_token, entropy, out, checksum)
+            CardId::LargeObjects => {
+                self.simple_alloc_free(txn, large_size(entropy), entropy, out, checksum)
             }
-            CardId::CallocZero => {
-                self.calloc_zero(worker, transaction, base_token, entropy, out, checksum)
+            CardId::BatchLifo => self.batch(txn, entropy, true, out, checksum),
+            CardId::BatchFifo => self.batch(txn, entropy, false, out, checksum),
+            CardId::CrossThreadProducerConsumer => {
+                self.cross_thread(txn, operation, entropy, false, out, checksum)
             }
-            CardId::AlignedRange => {
-                self.aligned(worker, transaction, base_token, entropy, out, checksum)
+            CardId::RandomOwnership => {
+                self.cross_thread(txn, operation, entropy, true, out, checksum)
             }
-            CardId::SawtoothRetainDrain => {
-                self.sawtooth(worker, transaction, base_token, entropy, out, checksum)
+            CardId::ReallocGeometric => self.realloc_geometric(txn, entropy, out, checksum),
+            CardId::CallocZero => self.calloc_zero(txn, entropy, out, checksum),
+            CardId::AlignedRange => self.aligned(txn, entropy, out, checksum),
+            CardId::SawtoothRetainDrain => self.sawtooth(txn, entropy, out, checksum),
+            CardId::ThreadChurn => self.thread_churn(txn, entropy, out, checksum),
+            CardId::RepresentativeMix => {
+                self.representative_mix(txn, operation, entropy, out, checksum)
             }
-            CardId::ThreadChurn => {
-                self.thread_churn(worker, transaction, base_token, entropy, out, checksum)
-            }
-            CardId::RepresentativeMix => self.representative_mix(
-                worker,
-                operation,
-                transaction,
-                base_token,
-                entropy,
-                out,
-                checksum,
-            ),
         }
     }
 
@@ -1097,14 +1034,13 @@ impl ScenarioCell {
 
     fn simple_alloc_free(
         &self,
-        worker: usize,
-        tx: u64,
-        token: u64,
+        txn: TxnSlot,
         size: usize,
         touch: u64,
         out: &mut Vec<Request>,
         sum: &mut Option<&mut u64>,
     ) {
+        let TxnSlot { worker, tx, token } = txn;
         self.push(
             out,
             sum,
@@ -1116,14 +1052,13 @@ impl ScenarioCell {
 
     fn batch(
         &self,
-        worker: usize,
-        tx: u64,
-        token: u64,
+        txn: TxnSlot,
         entropy: u64,
         lifo: bool,
         out: &mut Vec<Request>,
         sum: &mut Option<&mut u64>,
     ) {
+        let TxnSlot { worker, tx, token } = txn;
         for slot in 0..BATCH_WIDTH {
             let slot_token = token + slot as u64;
             let size = 8usize << ((entropy.wrapping_add(slot as u64) % 8) as usize);
@@ -1158,15 +1093,14 @@ impl ScenarioCell {
 
     fn cross_thread(
         &self,
-        worker: usize,
+        txn: TxnSlot,
         operation: u64,
-        tx: u64,
-        token: u64,
         entropy: u64,
         random: bool,
         out: &mut Vec<Request>,
         sum: &mut Option<&mut u64>,
     ) {
+        let TxnSlot { worker, tx, token } = txn;
         let consumer = if random {
             // Every operation gets a seed-derived cyclic derangement. Using
             // one offset for all owners makes this a true permutation.
@@ -1193,13 +1127,12 @@ impl ScenarioCell {
 
     fn realloc_geometric(
         &self,
-        worker: usize,
-        tx: u64,
-        token: u64,
+        txn: TxnSlot,
         entropy: u64,
         out: &mut Vec<Request>,
         sum: &mut Option<&mut u64>,
     ) {
+        let TxnSlot { worker, tx, token } = txn;
         let mut size = 16usize << ((entropy % 5) as usize);
         self.push(
             out,
@@ -1243,13 +1176,12 @@ impl ScenarioCell {
 
     fn calloc_zero(
         &self,
-        worker: usize,
-        tx: u64,
-        token: u64,
+        txn: TxnSlot,
         entropy: u64,
         out: &mut Vec<Request>,
         sum: &mut Option<&mut u64>,
     ) {
+        let TxnSlot { worker, tx, token } = txn;
         let size = 8usize << ((entropy % 8) as usize);
         self.push(out, sum, Request::calloc(tx, token, worker, size, entropy));
         self.push(
@@ -1278,13 +1210,12 @@ impl ScenarioCell {
 
     fn aligned(
         &self,
-        worker: usize,
-        tx: u64,
-        token: u64,
+        txn: TxnSlot,
         entropy: u64,
         out: &mut Vec<Request>,
         sum: &mut Option<&mut u64>,
     ) {
+        let TxnSlot { worker, tx, token } = txn;
         let alignment = 16usize << ((entropy % 9) as usize); // 16 through 4096
         let size = alignment + ((entropy >> 12) as usize & (alignment - 1));
         self.push(
@@ -1313,13 +1244,12 @@ impl ScenarioCell {
 
     fn sawtooth(
         &self,
-        worker: usize,
-        tx: u64,
-        token: u64,
+        txn: TxnSlot,
         entropy: u64,
         out: &mut Vec<Request>,
         sum: &mut Option<&mut u64>,
     ) {
+        let TxnSlot { worker, tx, token } = txn;
         for slot in 0..SAWTOOTH_WIDTH {
             let size = medium_size(mix(entropy ^ slot as u64));
             self.push(
@@ -1371,13 +1301,12 @@ impl ScenarioCell {
 
     fn thread_churn(
         &self,
-        worker: usize,
-        tx: u64,
-        token: u64,
+        txn: TxnSlot,
         entropy: u64,
         out: &mut Vec<Request>,
         sum: &mut Option<&mut u64>,
     ) {
+        let TxnSlot { worker, tx, token } = txn;
         for generation in 0..CHURN_GENERATIONS {
             self.push(
                 out,
@@ -1432,26 +1361,29 @@ impl ScenarioCell {
 
     fn representative_mix(
         &self,
-        worker: usize,
+        txn: TxnSlot,
         operation: u64,
-        tx: u64,
-        token: u64,
         entropy: u64,
         out: &mut Vec<Request>,
         sum: &mut Option<&mut u64>,
     ) {
         // Checked-in weights: 50% small, 20% medium, 15% realloc, 15% batch.
         match operation % 20 {
-            0..=9 => {
-                self.simple_alloc_free(worker, tx, token, small_size(entropy), entropy, out, sum)
-            }
-            10..=13 => {
-                self.simple_alloc_free(worker, tx, token, medium_size(entropy), entropy, out, sum)
-            }
-            14..=16 => self.realloc_geometric(worker, tx, token, entropy, out, sum),
-            _ => self.batch(worker, tx, token, entropy, true, out, sum),
+            0..=9 => self.simple_alloc_free(txn, small_size(entropy), entropy, out, sum),
+            10..=13 => self.simple_alloc_free(txn, medium_size(entropy), entropy, out, sum),
+            14..=16 => self.realloc_geometric(txn, entropy, out, sum),
+            _ => self.batch(txn, entropy, true, out, sum),
         }
     }
+}
+
+/// The (worker, transaction, first token) triple every request generator in
+/// `ScenarioCell::append_transaction` stamps onto the requests it emits.
+#[derive(Clone, Copy)]
+struct TxnSlot {
+    worker: usize,
+    tx: u64,
+    token: u64,
 }
 
 fn counts_for_operations(card: CardId, operations: u64) -> ExpectedCounts {
@@ -1581,28 +1513,22 @@ fn mix(mut value: u64) -> u64 {
 fn small_size(entropy: u64) -> usize {
     let exponent = ((entropy.trailing_zeros().min(7)) as usize).min(7);
     let base = 8usize << exponent;
-    (base + (((entropy >> 16) as usize) & (base - 1)))
-        .min(1024)
-        .max(8)
+    (base + (((entropy >> 16) as usize) & (base - 1))).clamp(8, 1024)
 }
 
 fn medium_size(entropy: u64) -> usize {
     let exponent = ((entropy.trailing_zeros().min(4)) as usize).min(4);
     let base = 4usize << (10 + exponent);
-    (base + (((entropy >> 20) as usize) & (base - 1)))
-        .min(64 * 1024)
-        .max(4 * 1024)
+    (base + (((entropy >> 20) as usize) & (base - 1))).clamp(4 * 1024, 64 * 1024)
 }
 
 fn large_size(entropy: u64) -> usize {
     let exponent = ((entropy.trailing_zeros().min(4)) as usize).min(4);
     let base = 1usize << (20 + exponent);
-    (base + (((entropy >> 24) as usize) & (base - 1)))
-        .min(16 * 1024 * 1024)
-        .max(1024 * 1024)
+    (base + (((entropy >> 24) as usize) & (base - 1))).clamp(1024 * 1024, 16 * 1024 * 1024)
 }
 
 fn retained(entropy: u64, slot: u32) -> bool {
     // Exactly one third of each burst is retained, independent of allocator.
-    (mix(entropy ^ slot as u64) % 3) == 0
+    mix(entropy ^ slot as u64).is_multiple_of(3)
 }

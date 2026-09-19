@@ -168,10 +168,9 @@ fn complete_raw_fixture() -> LatencyRawRun {
         .iter()
         .map(|(card_id, point, _)| {
             let threads = topology.resolve(*point).unwrap();
-            let count = benchmark_suite::latency::minimum_transactions_per_worker(
-                threads, 15, 1, 10_000,
-            )
-            .unwrap();
+            let count =
+                benchmark_suite::latency::minimum_transactions_per_worker(threads, 15, 1, 10_000)
+                    .unwrap();
             transactions.insert((card_id.as_str(), point.name()), count);
             let cell = ScenarioCell::new(*card_id, *point, topology, count, 1).unwrap();
             CellCalibration {
@@ -185,8 +184,8 @@ fn complete_raw_fixture() -> LatencyRawRun {
             }
         })
         .collect::<Vec<_>>();
-    let orders = benchmark_suite::orchestration::balanced_block_orders(15, throughput.run_seed)
-        .unwrap();
+    let orders =
+        benchmark_suite::orchestration::balanced_block_orders(15, throughput.run_seed).unwrap();
     let samples = throughput
         .samples
         .iter()
@@ -198,8 +197,8 @@ fn complete_raw_fixture() -> LatencyRawRun {
             let card_id = CardId::parse(&sample.scenario_id).unwrap();
             let point = ThreadPoint::parse(&sample.thread_point).unwrap();
             let count = transactions[&(card_id.as_str(), point.name())];
-            let cell = ScenarioCell::new(card_id, point, topology, count, order.workload_seed)
-                .unwrap();
+            let cell =
+                ScenarioCell::new(card_id, point, topology, count, order.workload_seed).unwrap();
             let schedule = (0..cell.threads)
                 .flat_map(|worker| {
                     deterministic_sample_indices(

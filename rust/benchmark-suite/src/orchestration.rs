@@ -52,12 +52,7 @@ pub fn calibrate_cell(
     request_template: &BenchmarkChildRequest,
     timeout: Duration,
 ) -> Result<CalibrationResult, String> {
-    calibrate_cell_with(
-        upstream,
-        request_template,
-        timeout,
-        |child, request, timeout| run_child_sample(child, request, timeout),
-    )
+    calibrate_cell_with(upstream, request_template, timeout, run_child_sample)
 }
 
 pub fn calibrate_cell_with<R>(

@@ -1254,7 +1254,7 @@ fn configuration_support(
     ("supported", None)
 }
 
-fn median_u64(values: &mut Vec<u64>) -> Option<u64> {
+fn median_u64(values: &mut [u64]) -> Option<u64> {
     if values.is_empty() {
         return None;
     }
@@ -1262,7 +1262,7 @@ fn median_u64(values: &mut Vec<u64>) -> Option<u64> {
     Some(values[(values.len() - 1) / 2])
 }
 
-fn median_i64(values: &mut Vec<i64>) -> Option<i64> {
+fn median_i64(values: &mut [i64]) -> Option<i64> {
     if values.is_empty() {
         return None;
     }
@@ -1279,8 +1279,8 @@ fn find_invalid_reason(
     raw.samples
         .iter()
         .filter(|sample| configuration_ids.contains(&sample.configuration_id.as_str()))
-        .filter(|sample| scenario_id.map_or(true, |id| sample.scenario_id == id))
-        .filter(|sample| thread_point.map_or(true, |point| sample.thread_point == point))
+        .filter(|sample| scenario_id.is_none_or(|id| sample.scenario_id == id))
+        .filter(|sample| thread_point.is_none_or(|point| sample.thread_point == point))
         .find(|sample| sample.validity_status == "invalid")
         .and_then(|sample| sample.invalid_reason.clone())
 }
@@ -1542,7 +1542,9 @@ pub fn build_pprof_tax_report(
         })
         .collect();
 
-    let mut per_config_block: BTreeMap<(&str, u32), BTreeMap<(&str, &str), f64>> = BTreeMap::new();
+    // (configuration, block) -> (scenario, thread point) -> throughput.
+    type CellThroughput<'a> = BTreeMap<(&'a str, &'a str), f64>;
+    let mut per_config_block: BTreeMap<(&str, u32), CellThroughput> = BTreeMap::new();
     let mut per_cell_values: BTreeMap<(&str, &str, &str), BTreeMap<u32, f64>> = BTreeMap::new();
     for sample in &raw.samples {
         if sample.validity_status != "valid" {

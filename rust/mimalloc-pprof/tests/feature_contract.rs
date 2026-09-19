@@ -11,7 +11,10 @@ fn published_feature_contract_selects_dhat_and_pprof() {
 
     #[cfg(feature = "dhat")]
     {
-        assert!(dhat::start(), "the dhat feature must compile the observer in");
+        assert!(
+            dhat::start(),
+            "the dhat feature must compile the observer in"
+        );
 
         let allocation = vec![0x5au8; 64 * 1024];
         std::hint::black_box(&allocation);
@@ -26,7 +29,10 @@ fn published_feature_contract_selects_dhat_and_pprof() {
 
     #[cfg(not(feature = "dhat"))]
     {
-        assert!(!dhat::start(), "without the dhat feature DHAT must use the C stubs");
+        assert!(
+            !dhat::start(),
+            "without the dhat feature DHAT must use the C stubs"
+        );
         assert!(!dhat::is_enabled());
         assert!(!dhat::stats().enabled);
     }

@@ -270,21 +270,27 @@ pub const HEAP_DUMP_JSON_DEFAULT_WAIT_MS: usize = 100;
 ///
 /// Errors: the file could not be created or written. The same snapshot can be produced
 /// without code by setting `MIMALLOC_SNAPSHOT_ON_EXIT=1|2` (and `MIMALLOC_SNAPSHOT_PATH`).
-pub fn heap_snapshot_to_file(path: impl AsRef<std::path::Path>, blocks: bool) -> std::io::Result<()> {
+pub fn heap_snapshot_to_file(
+    path: impl AsRef<std::path::Path>,
+    blocks: bool,
+) -> std::io::Result<()> {
     use std::ffi::CString;
     let path = path.as_ref();
     let c_path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains an interior NUL byte")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains an interior NUL byte",
+        )
     })?;
     let flags = if blocks { sys::MI_SNAPSHOT_BLOCKS } else { 0 };
     let rc = unsafe { sys::mi_heap_snapshot_to_file(c_path.as_ptr(), flags) };
     if rc == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("mi_heap_snapshot_to_file({}) failed", path.display()),
-        ))
+        Err(std::io::Error::other(format!(
+            "mi_heap_snapshot_to_file({}) failed",
+            path.display()
+        )))
     }
 }
 
@@ -1843,7 +1849,10 @@ mod tests {
     #[test]
     fn dhat_compiled_out_is_inert() {
         let _guard = DHAT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(!dhat::start(), "without the dhat feature the observer is compiled out");
+        assert!(
+            !dhat::start(),
+            "without the dhat feature the observer is compiled out"
+        );
         assert!(!dhat::is_enabled());
         assert!(!dhat::stats().enabled);
         dhat::stop();
@@ -1863,8 +1872,8 @@ mod tests {
         let with_blocks = heap_dump_json(true, true).expect("heap_dump_json should not fail");
         assert!(with_blocks.contains("\"blocks\""));
 
-        let one_attempt = heap_dump_json_ex(false, false, 0)
-            .expect("heap_dump_json_ex should not fail");
+        let one_attempt =
+            heap_dump_json_ex(false, false, 0).expect("heap_dump_json_ex should not fail");
         assert!(one_attempt.starts_with("{ \"heaps\": ["));
         assert!(one_attempt.contains("\"complete\":"));
     }

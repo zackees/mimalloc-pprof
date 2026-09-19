@@ -102,7 +102,12 @@ impl AllocatorAdapter for MockAdapter {
     }
 }
 
-fn actions(pattern: ScalingPattern, seed: u64, operations: u64, threads: u32) -> Vec<PlannedAction> {
+fn actions(
+    pattern: ScalingPattern,
+    seed: u64,
+    operations: u64,
+    threads: u32,
+) -> Vec<PlannedAction> {
     let mut planner = WorkerPlanner::new(pattern, seed, operations, 0, threads);
     let mut collected = Vec::new();
     while let Some(action) = planner.next_action() {
@@ -118,7 +123,12 @@ fn stream_is_reproducible_for_identical_inputs() {
         let seed = stream_seed(0x1234_5678_9abc_def0, pattern, 4, 2, 1);
         let first = actions(pattern, seed, 500, 4);
         let second = actions(pattern, seed, 500, 4);
-        assert_eq!(first, second, "{} stream is not reproducible", pattern.as_str());
+        assert_eq!(
+            first,
+            second,
+            "{} stream is not reproducible",
+            pattern.as_str()
+        );
         assert!(!first.is_empty());
     }
 }
@@ -201,8 +211,8 @@ fn request_for(
             source_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             library_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .into(),
-            child_binary_sha256:
-                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+            child_binary_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .into(),
         },
         runner: RunnerMetadata {
             os: "linux".into(),
@@ -343,7 +353,10 @@ fn validator_rejects_an_incomplete_matrix() {
     let mut raw = sample_run();
     let victim = raw.samples[0].pattern.clone();
     raw.samples.retain(|sample| sample.pattern != victim);
-    assert!(validate_scaling_raw_run(&raw).is_err(), "a missing cell must fail");
+    assert!(
+        validate_scaling_raw_run(&raw).is_err(),
+        "a missing cell must fail"
+    );
 
     let mut raw = sample_run();
     raw.calibrations.pop();
@@ -362,7 +375,10 @@ fn validator_rejects_a_sample_that_contradicts_its_plan() {
 
     let mut raw = sample_run();
     raw.samples[0].response.alloc_calls += 1;
-    assert!(validate_scaling_raw_run(&raw).is_err(), "wrong counts must fail");
+    assert!(
+        validate_scaling_raw_run(&raw).is_err(),
+        "wrong counts must fail"
+    );
 
     let mut raw = sample_run();
     raw.run_seed ^= 0xff;
@@ -557,8 +573,7 @@ fn overlay_accepts_a_newer_fork_build_but_not_a_moved_competitor_pin() {
             sample.allocator_source_sha = "a".repeat(40);
         }
     }
-    attach_scaling_report(&mut latest, newer_fork)
-        .expect("a newer fork build must still overlay");
+    attach_scaling_report(&mut latest, newer_fork).expect("a newer fork build must still overlay");
     assert!(latest.scaling.is_some());
     assert!(!latest
         .pending_metrics

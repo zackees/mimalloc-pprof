@@ -171,7 +171,7 @@ impl SeededRng {
         Self(seed.wrapping_add(0x9e3779b97f4a7c15))
     }
 
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
@@ -184,7 +184,7 @@ impl SeededRng {
         if max == 0 {
             return 0;
         }
-        (self.next() as usize) % max
+        (self.next_u64() as usize) % max
     }
 }
 
@@ -413,9 +413,9 @@ pub fn run_in_child_process(
     let input_json = serde_json::to_string(&(&config, scenario)).expect("serialise child input");
 
     // Build the reproduction command before we consume config.
-    let repro = format!(
+    let repro =
         "cargo test -p stress-harness -- child_process_isolation --nocapture --test-threads=1"
-    );
+            .to_string();
 
     // Spawn the *same test binary* directly (not via `cargo test`) to avoid
     // lock-file collisions when a prior child was killed.

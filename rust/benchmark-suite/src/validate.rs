@@ -238,13 +238,15 @@ fn validate_runner(runner: &PublicationRunner) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn validate_allocators<'a>(
-    input: &'a PublicationRawRun,
-) -> Result<BTreeMap<&'a str, &'a AllocatorBuildIdentity>, ValidationError> {
+fn validate_allocators(
+    input: &PublicationRawRun,
+) -> Result<BTreeMap<&str, &AllocatorBuildIdentity>, ValidationError> {
     let lock = AllocatorLock::parse_and_validate(include_str!("../allocators/allocator-lock.json"))
         .map_err(|error| ValidationError::new(format!("embedded allocator lock: {error}")))?;
     let expected_lock_sha = sha256_bytes(include_bytes!("../allocators/allocator-lock.json"));
-    if input.allocator_lock_sha256 != expected_lock_sha || input.allocators.len() != HEADLINE_ALLOCATORS.len() {
+    if input.allocator_lock_sha256 != expected_lock_sha
+        || input.allocators.len() != HEADLINE_ALLOCATORS.len()
+    {
         return Err(ValidationError::new(
             "allocator provenance does not match the embedded five-allocator lock",
         ));
@@ -970,5 +972,5 @@ pub fn synthetic_full_fixture() -> Result<PublicationRawRun, ValidationError> {
 }
 
 pub(crate) fn repeated_hex(character: char, length: usize) -> String {
-    std::iter::repeat(character).take(length).collect()
+    std::iter::repeat_n(character, length).collect()
 }

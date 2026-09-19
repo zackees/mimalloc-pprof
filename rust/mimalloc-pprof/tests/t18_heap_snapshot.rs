@@ -22,11 +22,19 @@ fn snapshot_has_header_and_footer() {
         let path = dir.join(name);
         heap_snapshot_to_file(&path, blocks).expect("snapshot written");
         let bytes = std::fs::read(&path).unwrap();
-        assert!(bytes.len() > 64, "{name}: too short ({} bytes)", bytes.len());
+        assert!(
+            bytes.len() > 64,
+            "{name}: too short ({} bytes)",
+            bytes.len()
+        );
         assert_eq!(read_u32(&bytes, 0), MAGIC, "{name}: magic");
         assert_eq!(read_u32(&bytes, 4), 1, "{name}: version");
         let flags = read_u32(&bytes, 16);
-        assert_eq!(flags & sys::MI_SNAPSHOT_BLOCKS, u32::from(blocks), "{name}: flags");
+        assert_eq!(
+            flags & sys::MI_SNAPSHOT_BLOCKS,
+            u32::from(blocks),
+            "{name}: flags"
+        );
         // footer: u32 ' END' then u64 page_count
         let tail = bytes.len() - 12;
         assert_eq!(read_u32(&bytes, tail), SEC_END, "{name}: END footer");
@@ -39,6 +47,8 @@ fn snapshot_has_header_and_footer() {
 
 #[test]
 fn unwritable_path_is_an_error() {
-    let bad = std::env::temp_dir().join("no-such-dir-mimalloc-pprof-t18").join("x.bin");
+    let bad = std::env::temp_dir()
+        .join("no-such-dir-mimalloc-pprof-t18")
+        .join("x.bin");
     assert!(heap_snapshot_to_file(&bad, false).is_err());
 }

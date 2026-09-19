@@ -202,9 +202,13 @@ fn sys_cpu_model() -> String {
         std::fs::read_to_string("/proc/cpuinfo")
             .ok()
             .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("model name"))
-                    .map(|l| l.splitn(2, ':').nth(1).unwrap_or("").trim().to_string())
+                s.lines().find(|l| l.starts_with("model name")).map(|l| {
+                    l.split_once(':')
+                        .map(|x| x.1)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                })
             })
             .unwrap_or_else(|| "unknown".into())
     }
@@ -370,7 +374,7 @@ pub fn run_benchmark(config: BenchConfig, child: &ChildProgram) -> Result<BenchR
     }
 
     let summary = compute_summary(&samples);
-    let repro = format!("cargo test -p bench-harness --release -- --nocapture --test-threads=1");
+    let repro = "cargo test -p bench-harness --release -- --nocapture --test-threads=1".to_string();
 
     Ok(BenchResult {
         config,
@@ -609,11 +613,10 @@ fn t_critical_value(df: f64, alpha: f64) -> f64 {
     let zp2 = zp * zp;
     let zp3 = zp2 * zp;
     let zp5 = zp3 * zp2;
-    let t = zp
-        + (zp3 + zp) / (4.0 * df)
+
+    zp + (zp3 + zp) / (4.0 * df)
         + (5.0 * zp5 + 16.0 * zp3 + 3.0 * zp) / (96.0 * df * df)
-        + (3.0 * zp5 * zp2 + 19.0 * zp5 + 17.0 * zp3 - 15.0 * zp) / (384.0 * df * df * df);
-    t
+        + (3.0 * zp5 * zp2 + 19.0 * zp5 + 17.0 * zp3 - 15.0 * zp) / (384.0 * df * df * df)
 }
 
 /// Inverse CDF of the standard normal distribution (probit approximation).
@@ -631,7 +634,7 @@ fn z_score(p: f64) -> f64 {
     let a1 = -39.6968302866538;
     let a2 = 220.9460984245205;
     let a3 = -275.9285104469687;
-    let a4 = 138.3577518672690;
+    let a4 = 138.357_751_867_269;
     let a5 = -30.66479806614716;
     let a6 = 2.506628277459239;
 

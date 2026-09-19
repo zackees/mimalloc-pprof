@@ -208,7 +208,7 @@ fn run(options: Options) -> Result<(), String> {
         template.transactions_per_worker = minimum_transactions;
         let mut request = template.clone();
         request.block_id = u32::MAX;
-        request.workload_seed = 0x6c61_7465_6e63_79;
+        request.workload_seed = 0x6c_61_74_65_6e_63_79;
         request.reproduction_command = "latency realized-count calibration".into();
         let sample = run_child_sample(upstream, &request, options.timeout)?;
         let realized = crate::orchestration::CalibrationResult {
@@ -373,7 +373,7 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
     let mut build_root = None;
     let mut output_dir = None;
     let mut blocks = 15;
-    let mut run_seed = 0x6c61_7465_6e63_79;
+    let mut run_seed = 0x6c_61_74_65_6e_63_79;
     let mut timeout_secs = 30;
     let mut warmup_transactions = 1;
     let mut initial_transactions = 1;

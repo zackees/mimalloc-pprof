@@ -146,10 +146,24 @@ fn amalgamate_c(paths: &Paths) -> String {
         paths,
         &mut visited,
         &mut body,
+        PragmaOnce::Strip,
     );
     let header = generated_header(paths, "src/static.c", "amalgamate-c");
-    format!("{header}{body}")
+    format!("{header}{AMALGAMATED_C_PREAMBLE}{body}")
 }
+
+/// Emitted at the top of the amalgamated .c only. Inlining turns every header's
+/// `static` helpers into main-file definitions, and clang (which exempts functions
+/// defined in headers) then reports each one the TU happens not to call as
+/// `-Wunused-function`. That is an artifact of amalgamation: the real per-file
+/// builds under CMake keep the warning (fatal on the -Werror lanes), so genuinely
+/// dead code is still caught there.
+const AMALGAMATED_C_PREAMBLE: &str = "\
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic ignored \"-Wunused-function\"
+#endif
+
+";
 
 /// Amalgamate the public headers (in this fixed order, sharing one dedup set
 /// so the extension headers' own `#include "mimalloc.h"` does not duplicate
@@ -168,6 +182,7 @@ fn amalgamate_h(paths: &Paths) -> String {
             paths,
             &mut visited,
             &mut body,
+            PragmaOnce::Keep,
         );
     }
     let header = generated_header(
@@ -200,11 +215,30 @@ fn git_short_sha(repo_root: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+/// What to do with an inlined header's `#pragma once`.
+///
+/// The amalgamated .c is compiled as a main file, where the pragma is meaningless
+/// and clang warns about each one (`-Wpragma-once-outside-header`). Dropping it is
+/// safe: the inliner emits every header once, and each keeps its `#ifndef` guard.
+/// The amalgamated .h is itself a header, so it keeps them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PragmaOnce {
+    Keep,
+    Strip,
+}
+
 /// Recursively inline `path` into `out`, resolving every `#include "..."`
 /// line it contains and skipping files already inlined (tracked in
 /// `visited` by canonical path). `#include <...>` lines and every
-/// preprocessor conditional/definition are passed through verbatim.
-fn inline_file(path: &Path, paths: &Paths, visited: &mut HashSet<PathBuf>, out: &mut String) {
+/// preprocessor conditional/definition are passed through verbatim, except
+/// `#pragma once` under [`PragmaOnce::Strip`].
+fn inline_file(
+    path: &Path,
+    paths: &Paths,
+    visited: &mut HashSet<PathBuf>,
+    out: &mut String,
+    pragma_once: PragmaOnce,
+) {
     let canon = fs::canonicalize(path)
         .unwrap_or_else(|e| panic!("cannot resolve include path {}: {e}", path.display()));
     // Only dedup header files. Headers carry their own #pragma once / #ifndef
@@ -244,7 +278,7 @@ fn inline_file(path: &Path, paths: &Paths, visited: &mut HashSet<PathBuf>, out: 
     for line in content.lines() {
         match parse_quoted_include(line) {
             Some(inc) => match resolve_include(&inc, &current_dir, paths) {
-                Some(resolved) => inline_file(&resolved, paths, visited, out),
+                Some(resolved) => inline_file(&resolved, paths, visited, out, pragma_once),
                 None => panic!(
                     "could not resolve #include \"{inc}\" referenced from {} \
                      (searched: same directory, {}, {})",
@@ -253,6 +287,7 @@ fn inline_file(path: &Path, paths: &Paths, visited: &mut HashSet<PathBuf>, out: 
                     paths.src_root.display()
                 ),
             },
+            None if pragma_once == PragmaOnce::Strip && is_pragma_once(line) => {}
             None => {
                 out.push_str(line);
                 out.push('\n');
@@ -260,6 +295,21 @@ fn inline_file(path: &Path, paths: &Paths, visited: &mut HashSet<PathBuf>, out: 
         }
     }
     out.push_str(&format!("/* ---- end inlined: {rel} ---- */\n"));
+}
+
+/// True for a `#pragma once` directive (any spacing, optional trailing comment).
+fn is_pragma_once(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix('#') else {
+        return false;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix("pragma") else {
+        return false;
+    };
+    let mut words = rest.split_whitespace();
+    words.next() == Some("once")
+        && words
+            .next()
+            .is_none_or(|w| w.starts_with("//") || w.starts_with("/*"))
 }
 
 /// If `line` is a `#include "quoted/path"` directive, return the quoted
@@ -347,4 +397,63 @@ fn check(paths: &Paths) -> bool {
     }
 
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pragma_once_lines(content: &str) -> Vec<usize> {
+        content
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| is_pragma_once(line))
+            .map(|(i, _)| i + 1)
+            .collect()
+    }
+
+    /// The amalgamated .c is compiled as a main file, where every inlined header's
+    /// `#pragma once` draws clang's -Wpragma-once-outside-header (13 warnings in a
+    /// downstream llvm-ld build). The inliner already emits each header once, and
+    /// the headers keep their #ifndef guards, so the pragma must not survive.
+    #[test]
+    fn amalgamated_c_has_no_pragma_once() {
+        let paths = Paths::discover();
+        let fresh = pragma_once_lines(&amalgamate_c(&paths));
+        assert!(
+            fresh.is_empty(),
+            "fresh amalgamation has #pragma once at lines {fresh:?}"
+        );
+        let vendored = fs::read_to_string(paths.vendor_dir.join(AMALGAMATED_C_NAME))
+            .expect("vendored amalgamated .c exists");
+        let vendored = pragma_once_lines(&vendored);
+        assert!(
+            vendored.is_empty(),
+            "vendored {AMALGAMATED_C_NAME} has #pragma once at lines {vendored:?}; \
+             regenerate with: cargo run -p xtask -- amalgamate-c"
+        );
+    }
+
+    #[test]
+    fn amalgamated_c_suppresses_only_amalgamation_artifacts() {
+        let paths = Paths::discover();
+        let fresh = amalgamate_c(&paths);
+        let body = strip_stamp(&fresh);
+        assert!(
+            body.starts_with(AMALGAMATED_C_PREAMBLE),
+            "amalgamated .c must open with the -Wunused-function preamble"
+        );
+        assert!(
+            !strip_stamp(&amalgamate_h(&paths)).contains("diagnostic ignored"),
+            "the public amalgamated header must not change consumers' diagnostics"
+        );
+    }
+
+    #[test]
+    fn pragma_once_detection() {
+        assert!(is_pragma_once("#pragma once"));
+        assert!(is_pragma_once("  #  pragma   once  // guard"));
+        assert!(!is_pragma_once("#pragma comment(lib, \"advapi32\")"));
+        assert!(!is_pragma_once("// #pragma once"));
+    }
 }

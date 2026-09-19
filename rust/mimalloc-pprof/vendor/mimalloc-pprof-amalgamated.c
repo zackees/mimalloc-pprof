@@ -1,4 +1,8 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit c79a8ced of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit df8afc62 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -23,7 +27,6 @@ This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
-#pragma once
 #ifndef MIMALLOC_H
 #define MIMALLOC_H
 
@@ -772,7 +775,6 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_heap_alloc_new_n(mi_h
    automatic process-exit path (_mi_auto_process_done), which a build configured with
    MI_NO_PROCESS_DETACH skips entirely. An embedder using MI_NO_PROCESS_DETACH must call
    mi_prof_dump / mi_dhat_dump themselves before exit, or no dump is written. */
-#pragma once
 #ifndef MIMALLOC_PROFILE_H
 #define MIMALLOC_PROFILE_H
 
@@ -976,7 +978,6 @@ mi_decl_nodiscard mi_decl_export bool mi_prof_modules_visit(mi_prof_module_visit
      subsequent `mi_memory_set_callbacks` call replaces/clears them, or tracking is
      permanently torn down at process exit).
 */
-#pragma once
 #ifndef MIMALLOC_MEMORY_EVENTS_H
 #define MIMALLOC_MEMORY_EVENTS_H
 
@@ -1235,7 +1236,6 @@ This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
-#pragma once
 #ifndef MI_INTERNAL_H
 #define MI_INTERNAL_H
 
@@ -1251,7 +1251,6 @@ This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
-#pragma once
 #ifndef MI_TYPES_H
 #define MI_TYPES_H
 
@@ -1313,7 +1312,6 @@ terms of the MIT license. A copy of the license can be found in the file
   Bit operation, and platform dependent definition (MI_INTPTR_SIZE etc)
 ---------------------------------------------------------------------------- */
 
-#pragma once
 #ifndef MI_BITS_H
 #define MI_BITS_H
 
@@ -1664,7 +1662,6 @@ This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
-#pragma once
 #ifndef MI_ATOMIC_H
 #define MI_ATOMIC_H
 
@@ -3348,7 +3345,6 @@ This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
-#pragma once
 #ifndef MI_TRACK_H
 #define MI_TRACK_H
 
@@ -3432,7 +3428,6 @@ defined, undefined, or not accessible at all:
 //*                                                                    *`
 //* Copyright (c) Microsoft Corporation. All Rights Reserved.          *`
 //**********************************************************************`
-#pragma once
 
 //*****************************************************************************
 //
@@ -5409,7 +5404,6 @@ This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
-#pragma once
 #ifndef MI_OWNER_GATE_H
 #define MI_OWNER_GATE_H
 
@@ -6618,7 +6612,6 @@ This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
-#pragma once
 #ifndef MIMALLOC_PRIM_TLS_H
 #define MIMALLOC_PRIM_TLS_H
 
@@ -10171,7 +10164,6 @@ This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
-#pragma once
 #ifndef MIMALLOC_PRIM_H
 #define MIMALLOC_PRIM_H
 
@@ -10362,7 +10354,6 @@ terms of the MIT license. A copy of the license can be found in the file
 /* ----------------------------------------------------------------------------
 Concurrent bitmap that can set/reset sequences of bits atomically
 ---------------------------------------------------------------------------- */
-#pragma once
 #ifndef MI_BITMAP_H
 #define MI_BITMAP_H
 
@@ -13758,7 +13749,6 @@ bool mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block
 // No allocator fast-path changes: ownership is acquired only by this diagnostic.
 /* ---- begin inlined: src/diagnostic-walk.h ---- */
 // #374: internal ownership-protected capture. Not a general user-callback API.
-#pragma once
 
 typedef struct mi_diag_coverage_s {
   size_t skipped_pages;
@@ -20000,7 +19990,6 @@ mi_decl_noinline size_t _mi_popcount_generic(size_t x) {
      `test_free_from_foreign_thread` in test-memory-events.c. The returned pointer is
      valid only for the duration of the call that obtained it (it may point at the
      caller's own stack-local `mi_hooks_tld_t`); never stash it anywhere longer-lived. */
-#pragma once
 #ifndef MIMALLOC_HOOKS_TLD_H
 #define MIMALLOC_HOOKS_TLD_H
 
@@ -20595,7 +20584,6 @@ void* mi_unwrapped_realloc(void* p, size_t new_size, size_t alignment) mi_attr_n
    automatic process-exit path (_mi_auto_process_done), which a build configured with
    MI_NO_PROCESS_DETACH skips entirely. An embedder using MI_NO_PROCESS_DETACH must
    call mi_dhat_dump themselves before exit, or no report is written. */
-#pragma once
 #ifndef MIMALLOC_DHAT_H
 #define MIMALLOC_DHAT_H
 
@@ -27016,7 +27004,6 @@ This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
-#pragma once
 #ifndef MIMALLOC_STATS_H
 #define MIMALLOC_STATS_H
 

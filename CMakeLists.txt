@@ -72,7 +72,7 @@ option(MI_WIN_USE_FLS       "Use Fiber local storage on Windows to detect thread
 option(MI_CHECK_FULL        "Use full internal invariant checking in DEBUG mode (deprecated, use MI_DEBUG_FULL instead)" OFF)
 option(MI_USE_LIBATOMIC     "Explicitly link with -latomic (on older systems) (deprecated and detected automatically)" OFF)
 option(MI_PPROF             "Enable the allocation sampling profiler" ON)
-option(MI_DHAT              "Enable the exact DHAT v2 heap observer (#371: hooks cost nothing when OFF)" ON)
+option(MI_DHAT              "Enable the exact DHAT v2 heap observer (#371: hooks cost nothing when OFF; opt-in, default OFF)" OFF)
 option(MI_OWNER_GATE        "Take a per-thread owner gate on every allocator call so mi_purge_all can sweep every thread (#366; slower fast path)" OFF)
 option(MI_STRICT_WARNINGS     "Strict diagnostics on the fork's own sources (#373); default ON" ON)
 option(MI_WARNINGS_AS_ERRORS  "Make compiler warnings fatal (-Werror, or /WX on MSVC). OFF for consumers, ON in CI (#373)" OFF)

@@ -173,6 +173,9 @@ mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 // A true complete result still does not make independently captured pages one global
 // instant. Ungated foreign owners must cooperatively park for coverage. Use mi_free
 // to free the result.
+// #414: compiled in only with MI_DIAGNOSTICS=1 (CMake -DMI_DIAGNOSTICS=ON, cargo feature
+// `diagnostics`; default OFF). Without it these three link and report nothing: the two
+// dumps return NULL and mi_heap_get_seq returns 0.
 mi_decl_export char*   mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms) mi_attr_noexcept;
 // == mi_heap_dump_json_ex(include_blocks, hash_addresses, 100)
 mi_decl_export char*   mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept;

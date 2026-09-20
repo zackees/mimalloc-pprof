@@ -1,8 +1,15 @@
 /* Opt-in global-heap allocation-change accounting and callbacks (issue #20).
 
-   Independent of MI_PPROF: always compiled in (see src/static.c), gated only by the
-   runtime `memevt_state` flag below (env var MIMALLOC_MEMORY_EVENTS, or the
-   mi_memory_tracking_set_enabled API). Structurally this module mirrors src/profile.c's
+   Independent of MI_PPROF. #414: opt-in at COMPILE time too -- `MI_MEMEVT` (CMake
+   `-DMI_MEMEVT=ON`, cargo feature `memory-events`) must be 1 or the accounting, the
+   callback table and the per-allocation hook sites all compile away and the public
+   `mi_memory_*` API is the stub block near the end of this file. The hook *entry points*
+   survive whenever `MI_MEMEVT || MI_DHAT`, because DHAT dispatches through them.
+   Once compiled in, it is still gated by the runtime `memevt_state` flag below (env var
+   MIMALLOC_MEMORY_EVENTS, or the mi_memory_tracking_set_enabled API).
+   The `mi_unwrapped_*` family at the end is NOT part of any of this: it is a raw-OS
+   helper for instrumentation callers and is real in every configuration.
+   Structurally this module mirrors src/profile.c's
    patterns (mi_atomic_do_once-style lazy env read, snapshot-then-release callback
    dispatch, a thread-local reentrancy depth counter) but is a separate, independent
    feature: see include/mimalloc/memory-events.h for the full API contract.
@@ -41,12 +48,15 @@
 // resolved via the lazy env path -- matching "tracking may also be enabled/disabled by
 // API" as an override, not just a fallback.
 // ---------------------------------------------------------------------------------------
+#if MI_MEMEVT
 #define MEMEVT_UNINIT    0
 #define MEMEVT_DISABLED  1
 #define MEMEVT_ENABLED   2
 
 static _Atomic(size_t) memevt_state;
+#endif
 
+#if MI_MEMEVT || MI_DHAT
 // #371 tier 2: the word the alloc/free fast path reads (see internal.h). Starts non-zero so
 // the first hook still resolves the environment lazily, exactly as documented; each observer
 // publishes its own bits into it and cannot clear the other's.
@@ -56,7 +66,9 @@ static _Atomic(size_t) memevt_state;
 // written on every event once tracking is on, and false sharing there would hand the enabled
 // path the very cache-line ping-pong this issue is about.
 mi_decl_cache_align _Atomic(size_t) _mi_observers_armed = MI_OBSERVERS_INITIAL;
+#endif // MI_MEMEVT || MI_DHAT
 
+#if MI_MEMEVT
 // Publish this module's two bits. Order matters when arming: ON is set before UNRESOLVED is
 // cleared, so the word is never transiently zero while tracking is on.
 static void memevt_publish_armed(size_t state) {
@@ -86,6 +98,7 @@ static _Atomic(size_t) memevt_accum_count;
 static mi_lock_t memevt_cb_lock = MI_LOCK_INITIALIZER;
 static mi_memory_change_fun* memevt_handlers[MI_MEMORY_CHANGE_COUNT];
 static void*                 memevt_args[MI_MEMORY_CHANGE_COUNT];
+#endif // MI_MEMEVT
 
 // Reentrancy / internal-op suppression (mirrors profile.c's prof_callback_depth).
 // >0 means: skip accounting and skip dispatch entirely. Two callers increment this:
@@ -105,9 +118,14 @@ static void*                 memevt_args[MI_MEMORY_CHANGE_COUNT];
 // but also mid *teardown* (mi_thread_theaps_done resets the default theap to the empty
 // sentinel before freeing this thread's theaps specifically so nothing re-initializes it
 // in that window; see its comment in init.c). No-op on NULL rather than crash either way.
+// #414: these two stay REAL in every configuration -- they are a per-thread depth counter
+// on state that exists unconditionally, they are off the mi_malloc/mi_free fast path
+// (guarded-page, aligned and moving-realloc paths only), and keeping them real leaves the
+// unconditional call sites in alloc.c/alloc-aligned.c/dhat.c untouched.
 void _mi_memevt_suppress_begin(void) { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth++; }
 void _mi_memevt_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth--; }
 
+#if MI_MEMEVT
 // #270: fork-safety. Child-side policy: CONTINUE. `memevt_cb_lock` only ever guards a
 // snapshot-copy of the callback table (see the comment above its declaration) and, per
 // that same comment, is never held while a user handler runs -- so unlike
@@ -244,7 +262,9 @@ static void memevt_dispatch(mi_hooks_tld_t* hooks, mi_memory_change_kind_t kind,
   handler(&change, handler_arg);
   hooks->memevt_suppress_depth--;
 }
+#endif // MI_MEMEVT
 
+#if MI_MEMEVT || MI_DHAT
 // ---------------------------------------------------------------------------------------
 // Hook entry points. Each begins with the single disabled-hot-path flag check: a plain
 // relaxed load compared against MEMEVT_DISABLED. Only when that check is *not* true
@@ -284,12 +304,16 @@ void _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size) {
   #if MI_DHAT
   _mi_dhat_begin_alloc(page, p, request_size);
   #endif
+  #if MI_MEMEVT
   size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
     memevt_dispatch(hooks, MI_MEMORY_ALLOCATE, (int64_t)usable, (uint64_t)request_size);
   }
+  #else
+  MI_UNUSED(request_size);  // #414: memory-events compiled out; only DHAT observes here
+  #endif
   #if MI_DHAT
   _mi_dhat_finish_event();
   #endif
@@ -328,11 +352,13 @@ void _mi_memevt_on_free_slow(mi_page_t* page, void* p) {
   #if MI_DHAT
   _mi_dhat_begin_free(p);
   #endif
+  #if MI_MEMEVT
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
     memevt_dispatch(hooks, MI_MEMORY_FREE, -(int64_t)usable, 0);
   }
+  #endif
   #if MI_DHAT
   _mi_dhat_finish_event();
   #endif
@@ -349,12 +375,17 @@ void _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t reques
   #if MI_DHAT
   _mi_dhat_begin_resize(p, p, request_size);
   #endif
+  #if MI_MEMEVT
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     // Same page => same block-size class => usable size is identical before and after.
-    MI_UNUSED(page);
     memevt_dispatch(hooks, MI_MEMORY_RESIZE, 0, (uint64_t)request_size);
   }
+  #else
+  MI_UNUSED(request_size);  // #414: memory-events compiled out; only DHAT observes here
+  #endif
+  // Same page => same block-size class => usable size is identical before and after.
+  MI_UNUSED(page);
   #if MI_DHAT
   _mi_dhat_finish_event();
   #endif
@@ -371,16 +402,23 @@ void _mi_memevt_on_resize_slow(void* oldp, void* newp, size_t usable_pre, size_t
   #if MI_DHAT
   _mi_dhat_begin_resize(oldp, newp, request_size);
   #endif
+  #if MI_MEMEVT
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const int64_t delta = (int64_t)usable_post - (int64_t)usable_pre;
     memevt_dispatch(hooks, MI_MEMORY_RESIZE, delta, (uint64_t)request_size);
   }
+  #else
+  // #414: memory-events compiled out; only DHAT observes here.
+  MI_UNUSED(usable_pre); MI_UNUSED(usable_post); MI_UNUSED(request_size);
+  #endif
   #if MI_DHAT
   _mi_dhat_finish_event();
   #endif
 }
+#endif // MI_MEMEVT || MI_DHAT
 
+#if MI_MEMEVT
 // ---------------------------------------------------------------------------------------
 // Best-effort live-allocation visitor.
 //
@@ -464,6 +502,23 @@ static bool mi_memory_visit_live_allocations_inner(mi_theap_t* theap, mi_memory_
   }
   return true;
 }
+
+#else  // !MI_MEMEVT
+
+// #414: memory-events compiled out. The public API stays present in every configuration --
+// same contract as src/profile.c's `#else` block -- so a downstream crate keeps linking and
+// `ci/check_rust_surface.py` / the README API table stay valid. Everything reports "off".
+bool mi_memory_tracking_set_enabled(bool enabled) mi_attr_noexcept { MI_UNUSED(enabled); return false; }
+bool mi_memory_tracking_is_enabled(void) mi_attr_noexcept { return false; }
+bool mi_memory_set_callbacks(const mi_memory_callbacks_t* callbacks) mi_attr_noexcept { MI_UNUSED(callbacks); return false; }
+bool mi_memory_snapshot(mi_memory_snapshot_t* out) mi_attr_noexcept { MI_UNUSED(out); return false; }
+bool mi_memory_visit_live_allocations(mi_memory_allocation_visit_fun* visitor, void* arg) mi_attr_noexcept { MI_UNUSED(visitor); MI_UNUSED(arg); return false; }
+// #270: no `memevt_cb_lock` exists when memory-events is off -- nothing to quiesce.
+void _mi_memevt_fork_prepare(void) { }
+void _mi_memevt_fork_parent(void)  { }
+void _mi_memevt_fork_child(void)   { }
+
+#endif // MI_MEMEVT
 
 // ---------------------------------------------------------------------------------------
 // Stable public "unwrapped" instrumentation allocation path: backed directly by

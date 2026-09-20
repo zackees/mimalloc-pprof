@@ -37,6 +37,12 @@ terms of the MIT license. A copy of the license can be found in the file
 size_t   mi_arenas_get_count(mi_subproc_t* subproc);              // arena.c (not in internal.h here)
 uint8_t* mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);  // arena.c (not in internal.h here)
 
+// #414: the heap snapshot is opt-in (`MI_DIAGNOSTICS`, CMake -DMI_DIAGNOSTICS=ON, cargo
+// feature `diagnostics`). With it off the whole writer compiles away and the three entry
+// points below become the stubs at the end of this file; `mi_option_snapshot_on_exit`
+// still exists in every build (Bun parity contract), it just has nothing to run.
+#if MI_DIAGNOSTICS
+
 #if defined(_WIN32)
 #include <io.h>
 #include <fcntl.h>
@@ -470,3 +476,14 @@ void _mi_heap_snapshot_on_exit(void) {
     _mi_warning_message("failed to write heap snapshot to %s\n", path);
   }
 }
+
+#else  // !MI_DIAGNOSTICS
+
+// #414: compiled out. The public API stays present in every configuration (same contract
+// as src/profile.c's `#else` block) so downstream keeps linking; a snapshot request just
+// fails. `_mi_heap_snapshot_on_exit` is still called unconditionally from mi_process_done.
+int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept { MI_UNUSED(fd); MI_UNUSED(flags); return -1; }
+int mi_heap_snapshot_to_file(const char* path, unsigned flags) mi_attr_noexcept { MI_UNUSED(path); MI_UNUSED(flags); return -1; }
+void _mi_heap_snapshot_on_exit(void) { }
+
+#endif // MI_DIAGNOSTICS

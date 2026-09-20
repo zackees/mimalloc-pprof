@@ -8,11 +8,15 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MI_TYPES_H
 #define MI_TYPES_H
 
-// #267: default the allocation sampling profiler ON so a consumer that compiles
-// `src/static.c` directly (no CMake, e.g. Bun's build) gets it, matching this fork's
-// CMake default (`option(MI_PPROF ... ON)`, CMakeLists.txt). CMake keeps passing
-// -DMI_PPROF=0/1 explicitly, which wins over this default since that's a command-line
-// define, not a re-definition. See README's C build section.
+// #414: EVERY observability subsystem is opt-in (owner decision 2026-09-19). The default
+// build -- including a consumer that compiles `src/static.c` directly with no CMake, e.g.
+// Bun's build -- is a plain fast allocator: profiler, memory-events, diagnostics, DHAT and
+// the owner gate are all compiled out, and the public API of each survives only as stubs.
+// Each fallback below matches its CMake `option(... OFF)` default; CMake keeps passing
+// -DMI_<X>=0/1 explicitly, which wins over these defaults since a command-line define is
+// not a re-definition. See README's C build section, and #415 for the follow-up that could
+// make memory-events free enough to default back on.
+//
 // #366: compile-time owner gate. When 1, every allocator operation takes the thread's own
 // `park_state` lock (the park protocol with its default inverted), so `mi_purge_all` can
 // sweep every registered thread. Off by default: the default build's fast path is byte-identical.
@@ -20,8 +24,29 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_OWNER_GATE 0
 #endif
 
+// #267/#414: allocation sampling profiler (src/profile*.c). When 0 the sampling hooks, the
+// per-page record fields and the profiler's per-theap state all compile away; the public
+// `mi_prof_*` API survives as stubs (see the `#else` block at the end of src/profile.c).
 #ifndef MI_PPROF
-#define MI_PPROF 1
+#define MI_PPROF 0
+#endif
+
+// #20/#414: allocation-change accounting and callbacks (src/memory-events.c). When 0 the
+// per-allocation hook sites compile away entirely and the public `mi_memory_*` API survives
+// as stubs. NOTE: DHAT dispatches through the memory-events slow paths, so the hook sites
+// are compiled in whenever `MI_MEMEVT || MI_DHAT` -- see include/mimalloc/internal.h.
+// The `mi_unwrapped_*` family is NOT part of this: it is a raw-OS allocation helper for
+// instrumentation callers, unrelated to tracking, and is real in every build.
+#ifndef MI_MEMEVT
+#define MI_MEMEVT 0
+#endif
+
+// #338/#269/#414: heap snapshot (src/heap-snapshot.c) and live-heap JSON dump
+// (src/heap-dump.c). When 0 both compile away and `mi_heap_snapshot`,
+// `mi_heap_snapshot_to_file`, `mi_heap_dump_json{,_ex}` and `mi_heap_get_seq` survive as
+// stubs. `mi_option_snapshot_on_exit` stays present in every build (Bun parity contract).
+#ifndef MI_DIAGNOSTICS
+#define MI_DIAGNOSTICS 0
 #endif
 
 // #371: compile-time switch for the exact DHAT v2 observer (src/dhat.c). When 0 the
@@ -462,8 +487,10 @@ typedef struct mi_page_s {
   uintptr_t                 keys[2];           // const: two random keys to encode the free lists (see `_mi_block_next`) or padding canary
   #endif
 
+  #if MI_PPROF
   struct mi_prof_record_s*  metadata;          // sampled live allocation records, or NULL (MI_PPROF)
   bool                      has_metadata;      // `true` if profiler records are attached to this page
+  #endif
 
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
   // The OS pages inside this page whose memory was discarded to the OS. A block is

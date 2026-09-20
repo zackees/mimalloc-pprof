@@ -454,6 +454,9 @@ mi_decl_export void   mi_arenas_print(void) mi_attr_noexcept;
 // Write a binary heap snapshot to `fd` for offline analysis (see tools/mi-heapview.c and
 // examples/heap-snapshot/). Returns 0 on success, -1 on write error. Bun parity (#338):
 // format version 1 is byte-identical to oven-sh/mimalloc's.
+// #414: compiled in only with MI_DIAGNOSTICS=1 (CMake -DMI_DIAGNOSTICS=ON, cargo feature
+// `diagnostics`; default OFF). Without it both entry points link and return -1, and
+// `mi_option_snapshot_on_exit` below still exists but has nothing to run.
 #define MI_SNAPSHOT_BLOCKS  0x01    // include per-block free bitmaps for pages owned by the calling thread
 mi_decl_export int    mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept;
 mi_decl_export int    mi_heap_snapshot_to_file(const char* path, unsigned flags) mi_attr_noexcept;

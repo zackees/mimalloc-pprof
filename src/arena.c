@@ -3080,7 +3080,10 @@ bool mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block
 
 // #374: kept separate from the upstream visitor; needs this TU's private page pins
 // and ownership-release helpers. Also included transitively by src/static.c.
+// #414: its only consumer is src/heap-dump.c, so it follows MI_DIAGNOSTICS.
+#if MI_DIAGNOSTICS
 #include "diagnostic-walk.c"
+#endif
 
 
 typedef struct mi_heap_delete_visit_info_s {

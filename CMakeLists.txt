@@ -71,7 +71,9 @@ option(MI_TLS_RECURSE_GUARD  "Force a recursion check on thread local access (fo
 option(MI_WIN_USE_FLS       "Use Fiber local storage on Windows to detect thread termination (deprecated)" OFF)
 option(MI_CHECK_FULL        "Use full internal invariant checking in DEBUG mode (deprecated, use MI_DEBUG_FULL instead)" OFF)
 option(MI_USE_LIBATOMIC     "Explicitly link with -latomic (on older systems) (deprecated and detected automatically)" OFF)
-option(MI_PPROF             "Enable the allocation sampling profiler" ON)
+option(MI_PPROF             "Enable the allocation sampling profiler (#414: opt-in, default OFF)" OFF)
+option(MI_MEMEVT            "Enable allocation-change accounting and callbacks (#414: opt-in, default OFF)" OFF)
+option(MI_DIAGNOSTICS       "Enable the heap snapshot and the live-heap JSON dump (#414: opt-in, default OFF)" OFF)
 option(MI_DHAT              "Enable the exact DHAT v2 heap observer (#371: hooks cost nothing when OFF; opt-in, default OFF)" OFF)
 option(MI_OWNER_GATE        "Take a per-thread owner gate on every allocator call so mi_purge_all can sweep every thread (#366; slower fast path)" OFF)
 option(MI_STRICT_WARNINGS     "Strict diagnostics on the fork's own sources (#373); default ON" ON)
@@ -563,6 +565,24 @@ if(MI_PPROF)
   endif()
 else()
   list(APPEND mi_defines MI_PPROF=0)
+endif()
+
+if(MI_MEMEVT)
+  message(STATUS "Enable allocation-change accounting and callbacks (MI_MEMEVT=ON)")
+  list(APPEND mi_defines MI_MEMEVT=1)
+else()
+  # #414: with MI_MEMEVT=OFF the alloc/free hook sites compile away entirely (unless
+  # MI_DHAT=ON, which dispatches through them) and memory-events.c keeps only stubs.
+  message(STATUS "Compile out allocation-change accounting (MI_MEMEVT=OFF)")
+  list(APPEND mi_defines MI_MEMEVT=0)
+endif()
+
+if(MI_DIAGNOSTICS)
+  message(STATUS "Enable the heap snapshot and live-heap JSON dump (MI_DIAGNOSTICS=ON)")
+  list(APPEND mi_defines MI_DIAGNOSTICS=1)
+else()
+  message(STATUS "Compile out the heap snapshot and live-heap JSON dump (MI_DIAGNOSTICS=OFF)")
+  list(APPEND mi_defines MI_DIAGNOSTICS=0)
 endif()
 
 if(MI_DHAT)
@@ -1301,7 +1321,8 @@ if (MI_BUILD_TESTS)
   # #374 uses native threads on Windows and pthreads elsewhere. Keep these outside
   # the POSIX-only tests: both MSVC and win-gnu must execute the ownership regressions.
   # Internal page state requires the static library and its exact compilation defines.
-  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+  # #414: the walk exists to serve `mi_heap_dump_json`, so it follows MI_DIAGNOSTICS.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN AND MI_DIAGNOSTICS)
     add_executable(mimalloc-test-diagnostic-walks test/test-diagnostic-walks.c)
     target_compile_definitions(mimalloc-test-diagnostic-walks PRIVATE ${mi_defines} MI_STATIC_LIB)
     target_compile_options(mimalloc-test-diagnostic-walks PRIVATE ${mi_cflags})
@@ -1358,8 +1379,10 @@ if (MI_BUILD_TESTS)
       add_test(NAME test-fork-locks-dhat-env COMMAND mimalloc-test-fork-locks)
       set_tests_properties(test-fork-locks-dhat-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_DHAT=1")
     endif()
-    add_test(NAME test-fork-locks-memevt-env COMMAND mimalloc-test-fork-locks)
-    set_tests_properties(test-fork-locks-memevt-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
+    if(MI_MEMEVT)
+      add_test(NAME test-fork-locks-memevt-env COMMAND mimalloc-test-fork-locks)
+      set_tests_properties(test-fork-locks-memevt-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
+    endif()
 
     # #270 review follow-up (F1): the lock-ORDER stress variant. `MI_TEST_FORK_SPAWN=1`
     # makes the test start short-lived threads continuously while it forks; each thread
@@ -1671,7 +1694,10 @@ if (MI_BUILD_TESTS)
   add_test(NAME test-degenerate COMMAND mimalloc-test-degenerate)
   set_tests_properties(test-degenerate PROPERTIES TIMEOUT 600)
 
-  # memory-events (issue #20): independent of MI_PPROF, always built/registered.
+  # memory-events (issue #20): independent of MI_PPROF.
+  # #414: but not of MI_MEMEVT -- with the accounting compiled out the public API is stubs,
+  # so this test is registered only when the subsystem is actually built in.
+  if(MI_MEMEVT)
   add_executable(mimalloc-test-memory-events test/test-memory-events.c)
   target_compile_definitions(mimalloc-test-memory-events PRIVATE ${mi_defines})
   target_compile_options(mimalloc-test-memory-events PRIVATE ${mi_cflags})
@@ -1684,10 +1710,14 @@ if (MI_BUILD_TESTS)
   add_test(NAME test-memory-events COMMAND mimalloc-test-memory-events)
   add_test(NAME test-memory-events-env-enabled COMMAND mimalloc-test-memory-events --env-enabled-check)
   set_tests_properties(test-memory-events-env-enabled PROPERTIES ENVIRONMENT "MIMALLOC_MEMORY_EVENTS=1")
+  endif()
 
   # #371 behavioural regression gate: the observer hooks must not serialise the allocator.
   # Ratio-based, RUN_SERIAL, and skips itself below four hardware threads -- see the file
   # comment for why a rate threshold would be a flake generator.
+  # #414: deliberately NOT gated on MI_MEMEVT/MI_DHAT. It measures the allocator's scaling,
+  # which must hold in every configuration -- including the minimal one, where it is the
+  # positive control that compiling the hooks out did not break the fast path.
   add_executable(mimalloc-test-observer-scaling test/test-observer-scaling.c)
   target_compile_definitions(mimalloc-test-observer-scaling PRIVATE ${mi_defines})
   target_compile_options(mimalloc-test-observer-scaling PRIVATE ${mi_cflags})
@@ -1721,7 +1751,8 @@ if (MI_BUILD_TESTS)
 
   # mi_heap_dump_json / mi_heap_get_seq (issue #269, Bun parity P4): backs bun:jsc
   # heapStats({dump:true|"blocks"}).mimallocDump. Independent of MI_PPROF, same as
-  # memory-events/dhat above.
+  # memory-events/dhat above. #414: gated on MI_DIAGNOSTICS, which compiles it in.
+  if(MI_DIAGNOSTICS)
   add_executable(mimalloc-test-heap-dump-json test/test-heap-dump-json.c)
   target_compile_definitions(mimalloc-test-heap-dump-json PRIVATE ${mi_defines})
   target_compile_options(mimalloc-test-heap-dump-json PRIVATE ${mi_cflags})
@@ -1736,13 +1767,17 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-heap-dump-json PRIVATE Threads::Threads)
   endif()
   add_test(NAME test-heap-dump-json COMMAND mimalloc-test-heap-dump-json)
+  endif()
 
   # #338 (Bun parity): binary heap snapshot writer + its CLI viewer. Both imported from
   # oven-sh/mimalloc @ b20b60d9 (MIT). The viewer is a plain-libc tool, not a test; it is
   # built here so every gate proves it compiles, and the snapshot test hands its output to
   # it (`summary`) so the writer and the reader are pinned to each other on every run.
+  # The viewer reads a file and never links the allocator, so it is built in every
+  # configuration; the writer's tests follow MI_DIAGNOSTICS (#414).
   add_executable(mi-heapview tools/mi-heapview.c)
   target_include_directories(mi-heapview PRIVATE include)
+  if(MI_DIAGNOSTICS)
   add_executable(mimalloc-test-snapshot test/test-snapshot.c)
   target_compile_definitions(mimalloc-test-snapshot PRIVATE ${mi_defines})
   target_compile_options(mimalloc-test-snapshot PRIVATE ${mi_cflags})
@@ -1767,6 +1802,7 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-snapshot-exit PRIVATE mimalloc ${mi_libraries})
   endif()
   add_test(NAME test-snapshot-exit COMMAND mimalloc-test-snapshot-exit test-snapshot-exit.bin)
+  endif()
 
   # #339: macOS malloc-zone introspection (what `leaks`/`heap`/`vmmap` call). Darwin-only:
   # the zone exists only with MI_OVERRIDE + MI_OSX_ZONE. Both are `test-osx-*`, so

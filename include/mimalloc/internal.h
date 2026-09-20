@@ -620,18 +620,33 @@ size_t      _mi_prof_debug_records_compared(void);
    that contract -- the word starts non-zero, so the first hook still takes the slow path
    and still resolves the environment there -- while letting the steady state be zero.
    Each observer owns its own two bits and publishes them when it resolves, is enabled, or
-   is stopped; neither module can clear the other's. */
+   is stopped; neither module can clear the other's.
+
+   #414: and when no observer is COMPILED in at all -- the default build -- even that one
+   load and branch is gone: every hook site below expands to nothing. The hook sites survive
+   whenever `MI_MEMEVT || MI_DHAT`, because DHAT dispatches through the memory-events slow
+   paths (src/memory-events.c), so `MI_MEMEVT=0 MI_DHAT=1` must still keep them. */
+#if MI_MEMEVT || MI_DHAT
+
 #define MI_OBSERVERS_MEMEVT_UNRESOLVED  ((size_t)1)
 #define MI_OBSERVERS_MEMEVT_ON          ((size_t)2)
+#if MI_MEMEVT
+#define MI_OBSERVERS_MEMEVT_INITIAL     (MI_OBSERVERS_MEMEVT_UNRESOLVED)
+#else
+// #414: compiled out -- memory-events never resolves, so (exactly like DHAT below) it must
+// not leave an `unresolved` bit set or the fast path would take the slow branch forever.
+#define MI_OBSERVERS_MEMEVT_INITIAL     ((size_t)0)
+#endif
 #if MI_DHAT
 #define MI_OBSERVERS_DHAT_UNRESOLVED    ((size_t)4)
 #define MI_OBSERVERS_DHAT_ON            ((size_t)8)
-#define MI_OBSERVERS_INITIAL  (MI_OBSERVERS_MEMEVT_UNRESOLVED | MI_OBSERVERS_DHAT_UNRESOLVED)
+#define MI_OBSERVERS_DHAT_INITIAL       (MI_OBSERVERS_DHAT_UNRESOLVED)
 #else
 // Compiled out (#372): DHAT never resolves, so it must not leave an `unresolved` bit set
 // or the fast path would take the slow branch forever.
-#define MI_OBSERVERS_INITIAL  (MI_OBSERVERS_MEMEVT_UNRESOLVED)
+#define MI_OBSERVERS_DHAT_INITIAL       ((size_t)0)
 #endif
+#define MI_OBSERVERS_INITIAL  (MI_OBSERVERS_MEMEVT_INITIAL | MI_OBSERVERS_DHAT_INITIAL)
 
 extern _Atomic(size_t) _mi_observers_armed;   // defined in memory-events.c
 
@@ -640,7 +655,7 @@ static inline bool _mi_observers_idle(void) {
 }
 
 // "memory-events.c": opt-in allocation-change accounting/callbacks (issue #20). Independent of
-// MI_PPROF: always compiled in and hooked; the runtime activation flag gates all real work.
+// MI_PPROF; the runtime activation flag gates all real work once compiled in.
 void        _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size);
 void        _mi_memevt_on_free_slow(mi_page_t* page, void* p);
 void        _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t request_size);
@@ -665,6 +680,29 @@ static inline void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pr
   if mi_likely(_mi_observers_idle()) return;
   _mi_memevt_on_resize_slow(oldp, newp, usable_pre, usable_post, request_size);
 }
+
+#else  // !(MI_MEMEVT || MI_DHAT)
+
+// #414: no observer is compiled in. Every hook site expands to nothing -- no load, no
+// branch, no call -- so `mi_malloc`/`mi_free` are byte-identical to upstream mimalloc
+// (proved by ci/check_fastpath_identity.py). The call sites in alloc.c/alloc-aligned.c/
+// free.c stay exactly as they are; only these definitions change.
+// (`MI_UNUSED` is not defined yet at this point in the header, hence the plain casts.)
+static inline void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
+  (void)page; (void)p; (void)request_size;
+}
+static inline void _mi_memevt_on_free(mi_page_t* page, void* p) {
+  (void)page; (void)p;
+}
+static inline void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size) {
+  (void)page; (void)p; (void)request_size;
+}
+static inline void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
+  (void)oldp; (void)newp; (void)usable_pre; (void)usable_post; (void)request_size;
+}
+
+#endif // MI_MEMEVT || MI_DHAT
+
 // Suppress accounting/dispatch for internal allocate+free pairs that are really one resize
 // (e.g. a moving realloc's internal mi_theap_umalloc+mi_free), and for reentrant calls made
 // from inside a memory-change callback itself.

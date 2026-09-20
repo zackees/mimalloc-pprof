@@ -36,8 +36,10 @@ static const mi_page_t mi_page_empty = {
   #if (MI_PADDING || MI_ENCODE_FREELIST)
   { 0, 0 },                // keys
   #endif
+  #if MI_PPROF
   NULL,                   // metadata (MI_PPROF)
   false,                  // has_metadata
+  #endif
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
   { 0 },                  // purged: no discarded OS pages
   0, 0,                   // unformed_purged_lo / _hi: nothing of the unformed tail is discarded

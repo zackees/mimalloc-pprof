@@ -1,9 +1,20 @@
-/* Public, allocation-change accounting/monitoring API. Independent of MI_PPROF: this
-   module (src/memory-events.c) is always compiled in, opt-in only via the
-   `MIMALLOC_MEMORY_EVENTS` environment variable or the `mi_memory_tracking_set_enabled`
-   API below.
+/* Public, allocation-change accounting/monitoring API. Independent of MI_PPROF.
 
-   ## Activation
+   ## Compile-time opt-in (#414)
+
+   Since 0.12.0 this module (src/memory-events.c) is compiled in only when `MI_MEMEVT` is
+   1 (CMake `-DMI_MEMEVT=ON`, cargo feature `memory-events`; both default OFF). Its cost
+   when compiled in but disabled was measured at 9-13 instructions per malloc/free pair,
+   which is 18-26% of the pair, so the default build leaves it out entirely and every hook
+   site expands to nothing. Everything declared below still LINKS in that build -- the
+   functions are stubs that report the subsystem off (`false`) -- so downstream code needs
+   no `#ifdef`. `MI_DHAT=1` keeps the hook sites (DHAT dispatches through them) but does
+   not make this API real. #415 tracks making the hooks free enough to default back on.
+
+   The `mi_unwrapped_*` family at the end of this header is NOT part of that: it is a
+   raw-OS allocation helper for instrumentation callers and is real in every build.
+
+   ## Activation (runtime, once compiled in)
 
    - `MIMALLOC_MEMORY_EVENTS=1` is read lazily, exactly once, the first time any
      allocation/free/realloc hook runs -- never during process startup. The result is
@@ -16,9 +27,11 @@
      reconstruct allocations made while tracking was disabled -- the running totals
      silently omit that interval. Callers that need an exact total must enable tracking
      before their first allocation and leave it enabled for the life of the process.
-   - When tracking is disabled (the default), every allocate/free/realloc pays for
-     exactly one relaxed flag check on the hot path -- no atomic accounting update, no
-     callback-table lock, no callback-table lookup.
+   - When tracking is disabled (the default) but the module is compiled in, every
+     allocate/free/realloc pays for one relaxed flag check plus the branch and the call
+     frame it forces -- measured at 9-13 instructions per malloc/free pair -- and no
+     atomic accounting update, callback-table lock or callback-table lookup.
+     When the module is compiled out (`MI_MEMEVT=0`, the default), it pays nothing.
 
    ## Callback contract
 

@@ -13,6 +13,11 @@
 #include "mimalloc/prim-tls.h"
 #include "diagnostic-walk.h"
 
+// #414: the live-heap JSON dump is opt-in (`MI_DIAGNOSTICS`, CMake -DMI_DIAGNOSTICS=ON,
+// cargo feature `diagnostics`). With it off the capture/serializer compiles away and the
+// three public entry points become the stubs at the end of this file.
+#if MI_DIAGNOSTICS
+
 #if MI_DEBUG > 0
 mi_decl_export _Atomic(uintptr_t) mi_debug_dump_fail_after;
 mi_decl_export _Atomic(uintptr_t) mi_debug_dump_retrying;
@@ -305,3 +310,18 @@ char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexce
 size_t mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept {
   return heap != NULL ? heap->heap_seq : 0;
 }
+
+#else  // !MI_DIAGNOSTICS
+
+// #414: compiled out. The public API stays present in every configuration (same contract
+// as src/profile.c's `#else` block) so downstream keeps linking; a dump request just
+// returns NULL and the heap sequence number reads as 0.
+char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms) mi_attr_noexcept {
+  MI_UNUSED(include_blocks); MI_UNUSED(hash_addresses); MI_UNUSED(wait_ms); return NULL;
+}
+char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept {
+  MI_UNUSED(include_blocks); MI_UNUSED(hash_addresses); return NULL;
+}
+size_t mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept { MI_UNUSED(heap); return 0; }
+
+#endif // MI_DIAGNOSTICS

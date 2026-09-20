@@ -815,10 +815,7 @@ function(find_link_library libname outlibname)
 endfunction()
 
 if(WIN32)
-  # `synchronization` is `WaitOnAddress`/`WakeByAddressSingle` (src/scavenger.c, #272). Needed for
-  # EVERY Windows toolchain: src/scavenger.c's `#pragma comment(lib, "synchronization")` reaches
-  # only MSVC/clang-cl, so MinGW (ld/lld) needs the explicit `-lsynchronization` this adds.
-  list(APPEND mi_libraries psapi shell32 user32 advapi32 bcrypt synchronization)
+  list(APPEND mi_libraries psapi shell32 user32 advapi32 bcrypt)
 else()
   find_link_library("pthread" MI_LIB_PTHREAD)
   if(MI_LIB_PTHREAD)

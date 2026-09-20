@@ -409,30 +409,56 @@ static void mi_scav_wake_one(_Atomic(mi_scav_word_t)* addr) {
 
 #elif defined(_WIN32)
 
-// WaitOnAddress/WakeByAddressSingle require Windows 8+ and link against
-// `synchronization.lib` (added to `mi_libraries` in CMakeLists.txt for every Windows
-// toolchain, MinGW included -- the `#pragma comment` below only reaches MSVC/clang-cl).
-// windows.h is already included via mimalloc/atomic.h; declare here as well (matching the
-// SDK signature) so older/MinGW headers that gate on _WIN32_WINNT still resolve.
+// WaitOnAddress/WakeByAddressSingle require Windows 8+. Resolve them at runtime so the
+// allocator still loads on Windows 7, and fall back to a Vista+ condition variable there.
+// windows.h is already included via mimalloc/atomic.h; declare the SDK signatures here so
+// older/MinGW headers that gate them on _WIN32_WINNT do not affect the build.
 #if defined(__cplusplus)
 extern "C" {
 #endif
-BOOL WINAPI WaitOnAddress(volatile VOID* Address, PVOID CompareAddress, SIZE_T AddressSize, DWORD dwMilliseconds);
-VOID WINAPI WakeByAddressSingle(PVOID Address);
+typedef BOOL (WINAPI *mi_wait_on_address_fun)(volatile VOID* Address, PVOID CompareAddress, SIZE_T AddressSize, DWORD dwMilliseconds);
+typedef VOID (WINAPI *mi_wake_by_address_single_fun)(PVOID Address);
 #if defined(__cplusplus)
 }
 #endif
-#if defined(_MSC_VER)
-#pragma comment(lib, "synchronization")
-#endif
+
+static mi_wait_on_address_fun         mi_wait_on_address = NULL;
+static mi_wake_by_address_single_fun mi_wake_by_address_single = NULL;
+static CRITICAL_SECTION               mi_scav_mutex;
+static CONDITION_VARIABLE             mi_scav_cond;
+static bool                           mi_scav_use_native_wait = false;
+
+#define MI_SCAV_HAS_INIT 1
+static void mi_scav_init(void) {
+  mi_atomic_do_once {
+    const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (kernel32 != NULL) {
+      mi_wait_on_address = (mi_wait_on_address_fun)(void*)GetProcAddress(kernel32, "WaitOnAddress");
+      mi_wake_by_address_single = (mi_wake_by_address_single_fun)(void*)GetProcAddress(kernel32, "WakeByAddressSingle");
+    }
+    mi_scav_use_native_wait = (mi_wait_on_address != NULL && mi_wake_by_address_single != NULL);
+    if (!mi_scav_use_native_wait) {
+      InitializeCriticalSection(&mi_scav_mutex);
+      InitializeConditionVariable(&mi_scav_cond);
+    }
+  }
+}
 
 static void mi_scav_wait(_Atomic(mi_scav_word_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;
   mi_scav_word_t expected = 0;
+  if (!mi_scav_use_native_wait) {
+    EnterCriticalSection(&mi_scav_mutex);
+    while (mi_atomic_load_acquire(addr) == 0) {
+      if (!SleepConditionVariableCS(&mi_scav_cond, &mi_scav_mutex, (DWORD)timeout_ms)) break;
+    }
+    LeaveCriticalSection(&mi_scav_mutex);
+    return;
+  }
   while (mi_atomic_load_acquire(addr) == 0) {
     // the size argument must follow `scavenger_wake`'s ACTUAL width (`mi_scav_word_t`), which is
     // pointer-width on Windows so the MSVC C atomics wrapper's word-width accessors fit it.
-    if (!WaitOnAddress((volatile VOID*)addr, &expected, sizeof(mi_scav_word_t), (DWORD)timeout_ms)) {
+    if (!mi_wait_on_address((volatile VOID*)addr, &expected, sizeof(mi_scav_word_t), (DWORD)timeout_ms)) {
       return;  // timeout (GetLastError() == ERROR_TIMEOUT)
     }
     // woken (possibly spuriously): loop re-checks *addr
@@ -440,7 +466,14 @@ static void mi_scav_wait(_Atomic(mi_scav_word_t)* addr, mi_msecs_t timeout_ms) {
 }
 
 static void mi_scav_wake_one(_Atomic(mi_scav_word_t)* addr) {
-  WakeByAddressSingle((PVOID)addr);
+  if (mi_scav_use_native_wait) {
+    mi_wake_by_address_single((PVOID)addr);
+  }
+  else {
+    EnterCriticalSection(&mi_scav_mutex);
+    WakeConditionVariable(&mi_scav_cond);
+    LeaveCriticalSection(&mi_scav_mutex);
+  }
 }
 
 #else  // generic POSIX (FreeBSD, OpenBSD, etc.)
@@ -627,6 +660,9 @@ void _mi_scavenger_start(void) {
   if (mi_atomic_load_acquire(&_mi_scavenger_shutdown) != 0) return;   // teardown has begun
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
+  // Resolve the wait primitive before publishing `running`, so a concurrent wake can never
+  // observe an uninitialized Windows 7 condition-variable fallback.
+  mi_scav_init();
   // Claim `running` FIRST, then re-check `shutdown`. Loading `shutdown` before publishing
   // `running` leaves a window in which `_mi_scavenger_stop` sets `shutdown`, reads `running == 0`
   // and returns having joined nothing, and we then create a thread nobody will ever stop.

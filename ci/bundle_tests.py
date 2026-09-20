@@ -654,7 +654,6 @@ SYSTEM_DLLS = frozenset(
         "secur32.dll",
         "shell32.dll",
         "shlwapi.dll",
-        "synchronization.dll",
         "ucrtbase.dll",
         "user32.dll",
         "userenv.dll",

@@ -17,9 +17,9 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
 2. **Never mix C-core paths (`src/`, `include/`, `test/`, `CMakeLists.txt`) and `rust/` paths
    in one commit.** This keeps upstream cherry-picks clean.
 3. **Merge gates for every PR:** `c-unit` green on ubuntu and windows-MSVC with
-   `MI_PPROF=ON`, the `OFF` configuration green (profiler hooks disabled; upstream allocator
-   behavior with independent memory-events tracking left runtime-disabled), win-gnu green in
-   `windows-bundles.yml`, `rust-native` green. Since #307 `c-unit.yml` is two stages —
+   `MI_PPROF=ON`, the `pprof-off` configuration green — since #414 that row is the MINIMAL
+   build: every observability subsystem compiled out, i.e. the plain fast allocator a
+   consumer gets by default — win-gnu green in `windows-bundles.yml`, `rust-native` green. Since #307 `c-unit.yml` is two stages —
    every configuration built exactly once in `build`, then `run-linux` executes every
    bundle at once — so "the OFF job" is a `build` matrix row plus its slice of that wave,
    not a job of its own. A test that only passes with the machine to itself belongs in the
@@ -75,16 +75,27 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
 6. New logic goes in new files (`src/profile*.c`, `include/mimalloc/profile.h`,
    `src/memory-events.c`, `include/mimalloc/memory-events.h`, `src/dhat*.c`,
    `include/mimalloc/dhat.h`); edits to upstream files stay to a few guarded lines —
-   `#if MI_PPROF` for the profiler hooks, and one unconditional line each for the always-on
-   observer hooks in `src/alloc.c`/`src/free.c`/`src/alloc-aligned.c`. Those lines call the
-   `static inline` `_mi_memevt_on_*` wrappers in `include/mimalloc/internal.h`, whose disabled
-   path is one relaxed load of `_mi_observers_armed` and a not-taken branch; everything else
+   `#if MI_PPROF` for the profiler hooks, and one line each for the observer hooks in
+   `src/alloc.c`/`src/free.c`/`src/alloc-aligned.c`. Those lines call the
+   `static inline` `_mi_memevt_on_*` wrappers in `include/mimalloc/internal.h`, which since
+   #414 expand to NOTHING unless `MI_MEMEVT || MI_DHAT` (DHAT dispatches through the
+   memory-events slow paths, so the hook sites must survive whenever `MI_DHAT=1`). Compiled
+   in, their disabled path is one relaxed load of `_mi_observers_armed` and a not-taken
+   branch; everything else
    (TLS peek, suppression depth, meta-page check, DHAT bookkeeping) lives behind that test in
    the out-of-line `_slow` bodies (#371). Never put a call, TLS read or atomic RMW in front of
    the flag test: `ci/check_fastpath_identity.py` rejects any `lock`/`xchg` in the default
-   build's fast path and `test-observer-scaling` measures the scaling it protects. DHAT itself
-   compiles out with CMake `MI_DHAT=OFF` or the Rust `dhat` feature off — **default OFF in both**;
-   clients opt in explicitly (`-DMI_DHAT=ON` / `features = ["dhat"]`; owner decision 2026-09-18).
+   build's fast path and `test-observer-scaling` measures the scaling it protects.
+   **Every observability subsystem is opt-in and OFF by default, on both surfaces**
+   (owner decision 2026-09-19, #414): CMake `MI_PPROF` / `MI_MEMEVT` / `MI_DIAGNOSTICS` /
+   `MI_DHAT` / `MI_OWNER_GATE`, mirrored by the cargo features `pprof` / `memory-events` /
+   `diagnostics` / `dhat` (implies `memory-events`) / `owner-gate`, with `full` for all five
+   and `default = []`. The public C API and every Rust wrapper stay present in EVERY
+   configuration as stubs — template: the `#else` block at the end of `src/profile.c` — so
+   `ci/check_rust_surface.py`, `layout_probe.c`, `t19_layout.rs` and the README API table
+   stay valid and no downstream needs an `#ifdef`. `ci/check_fastpath_identity.py` proves
+   the minimal build's fast path byte-identical to upstream at the pinned overlay base.
+   Never add a CI row or script that relies on one of these defaults: name the flag.
 7. **Escalate, don't improvise:** when reality diverges from a sub-issue (API drift, toolchain
    fights, unreachable threshold), comment on that issue with evidence and stop.
 

@@ -53,11 +53,13 @@ The allocator tracks sampled live allocations and writes either the gperftools
 in [google/pprof](https://github.com/google/pprof) for flame graphs, call graphs,
 top reports, and profile diffs.
 
-Profiling is **opt-in at runtime**: a build with `MI_PPROF=ON` (the default) does
-not sample until you call a start API or set `MIMALLOC_PROF=1`.
+Profiling is opt-in twice over. Since **0.12.0** it is opt-in at **compile** time —
+cargo `features = ["pprof"]`, CMake `-DMI_PPROF=ON`; the default build is a plain fast
+allocator (see [Integration](#integration)) — and, once built in, it still does not
+sample until you call a start API or set `MIMALLOC_PROF=1`.
 
 **v3 only.** This fork tracks upstream mimalloc's `dev3` line (crate
-[`mimalloc-pprof` 0.11.x](https://crates.io/crates/mimalloc-pprof)). The legacy v2
+[`mimalloc-pprof` 0.12.x](https://crates.io/crates/mimalloc-pprof)). The legacy v2
 line (0.8.x, upstream `main`) is preserved on the
 [`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch but is not
 maintained going forward. Upstream mimalloc v3 (`dev3`) is itself still a
@@ -329,6 +331,30 @@ re-verified under this tree's stress suite. → [Bun features](#bun-features)
 
 ## Integration
 
+> **0.12.0 changed the defaults.** Every observability subsystem is now **opt-in**, and
+> the default build is a plain fast allocator whose `malloc`/`free` fast path is
+> byte-identical to upstream mimalloc (checked on the instruction stream by
+> `ci/check_fastpath_identity.py`). Name what you want:
+>
+> | Cargo feature | CMake option | What it turns on |
+> |---|---|---|
+> | `pprof` | `-DMI_PPROF=ON` | sampled pprof heap profiling |
+> | `memory-events` | `-DMI_MEMEVT=ON` | allocation-change accounting and callbacks |
+> | `diagnostics` | `-DMI_DIAGNOSTICS=ON` | heap snapshot + live-heap JSON dump |
+> | `dhat` (implies `memory-events`) | `-DMI_DHAT=ON` | the exact DHAT v2 observer |
+> | `owner-gate` | `-DMI_OWNER_GATE=ON` | `purge_all` can sweep every thread |
+> | `full` | — | all five |
+>
+> ```toml
+> mimalloc-pprof = { version = "0.12", features = ["pprof"] }   # or ["full"] for 0.11's shape and more
+> ```
+>
+> The whole API compiles and links in **every** configuration — a subsystem that was not
+> built in reports itself off (`prof::start` returns `false`, `heap_dump_json` returns
+> `None`) — so nothing downstream needs a `#[cfg]` or an `#ifdef`. Cargo features are
+> additive and unified across the dependency graph: if any crate in your build enables
+> one, your build gets it. `cargo tree -e features` shows who.
+
 Three instruments, each shown in Rust and C: **pprof** sampled profiling for
 production, **exact allocator stats** to check a sampled profile against, and
 **DHAT** exact profiling for focused investigations.
@@ -343,7 +369,7 @@ and its safe Rust wrapper.
 
 ```toml
 [dependencies]
-mimalloc-pprof = "0.11"
+mimalloc-pprof = { version = "0.12", features = ["pprof"] }
 
 [profile.release]
 debug = "line-tables-only"
@@ -478,7 +504,7 @@ run a short, focused session under the exact DHAT observer and open the result
 in Valgrind's [`dh_view.html`](https://valgrind.org/docs/manual/dh-manual.html).
 
 DHAT is **off by default** and must be built in explicitly: the Rust crate's `dhat`
-feature (`mimalloc-pprof = { version = "0.11", features = ["dhat"] }`) or CMake's
+feature (`mimalloc-pprof = { version = "0.12", features = ["dhat"] }`) or CMake's
 `-DMI_DHAT=ON`. Without it the observer is compiled out of the allocator entirely and
 `mi_dhat_start` / `dhat::start()` return `false`. Once built in, no code is needed at all:
 
@@ -639,8 +665,14 @@ Without it the Rust API stays present and `dhat::start` returns `false`.
 | `mi_memory_visit_live_allocations` | ✅ | `unsafe memory_events::visit_live_allocations` |
 | `mi_unwrapped_malloc` / `_free` / `_realloc` | ✅ | `unwrapped_malloc` / `unwrapped_free` / `unwrapped_realloc` |
 
-Always compiled in, opt-in at runtime. Off by default, and while it is off every
-allocate/free/realloc pays for one relaxed flag check and nothing else.
+Opt-in at compile time (CMake `-DMI_MEMEVT=ON`, cargo feature `memory-events`; both
+default OFF since [#414](https://github.com/zackees/mimalloc-pprof/issues/414)) *and* at
+runtime. Compiled out, it costs nothing and every function above is a stub that reports
+the subsystem off. Compiled in but disabled, each allocate/free/realloc pays a relaxed
+flag load, the branch on it, and the call frame that forces — **9 to 13 instructions per
+malloc/free pair, 18–26% of the pair**, which is why it is no longer on by default.
+[#415](https://github.com/zackees/mimalloc-pprof/issues/415) tracks making that free
+again, which would let it default back on.
 
 #### Exact allocator statistics — `include/mimalloc-stats.h`
 
@@ -696,13 +728,13 @@ and the `mi_purge_holes_stats_t` gauges.
 
 | C | Rust FFI (`sys::`) | Rust safe wrapper |
 |---|---|---|
-| `mi_option_t` (61 enumerators; 13 added by this fork at indices 47–59) | `sys::mi_option_*`, `sys::MI_OPTIONS_IN_ORDER` | `options::Opt` (named constants + range-checked `Opt::from_raw`) |
+| `mi_option_t` (62 enumerators; 14 added by this fork at indices 47–60) | `sys::mi_option_*`, `sys::MI_OPTIONS_IN_ORDER` | `options::Opt` (named constants + range-checked `Opt::from_raw`) |
 | `mi_option_get` / `_get_clamp` / `_get_size` | ✅ | `options::get` / `get_clamp` / `get_size` |
 | `mi_option_set` / `_set_default` | ✅ | `options::set` / `set_default` |
 | `mi_option_is_enabled` / `_enable` / `_disable` / `_set_enabled` / `_set_enabled_default` | ✅ | `options::is_enabled` / `enable` / `disable` / `set_enabled` / `set_enabled_default` |
 | `mi_options_print_out` | ✅ | `options::print` |
 
-The thirteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the environment:
+The fourteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the environment:
 
 | Option | Default | What it does |
 |---|---|---|
@@ -713,12 +745,13 @@ The thirteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the envi
 | `prof_seed` | `0` | sampling PRNG seed; 0 = nondeterministic |
 | `prof_max_bytes` | `0` | budget for profiler-internal arena memory; 0 = unbudgeted |
 | `memory_events` | `0` | enable allocation-change accounting/callbacks |
-| `purge_zeroes` | `0` | **dead** since #80; the slot is kept so nothing renumbers |
+| `purge_zeroes` | `0` | zero-tracking: after a purge the OS documents as zero-filling, let `mi_zalloc` skip its `memset` (lost in #80, restored by [#337](https://github.com/zackees/mimalloc-pprof/issues/337)) |
 | `scavenger` | `1` | run the background arena-purging thread |
 | `purge_holes` | `1` | discard free blocks inside still-used pages on idle |
 | `purge_holes_eager_zero` | `0` | zero before discarding, so a mis-scoped discard corrupts visibly |
 | `purge_holes_min_interval` | `100` | ms floor between sweeps of one thread's heaps |
 | `purge_holes_full_every` | `64` | every N-th sweep walks every page; 0 disables |
+| `snapshot_on_exit` | `0` | write a heap snapshot at process exit; `1` = on, `2` = with per-block freemaps (needs `MI_DIAGNOSTICS`) |
 
 Because they are positional, a stale Rust mirror of this enum would silently set the
 *wrong* option — which is why `tests/t19_layout.rs` checks every value against the C

@@ -276,10 +276,16 @@ C_UNIT_STRICT = "-DMI_WARNINGS_AS_ERRORS=ON"  # c-unit.yml build/Configure step 
 
 
 def run_release(ctx: RunCtx) -> bool:
-    """c-unit.yml `build (release)` + its slice of `run-linux`: -DMI_PPROF=ON, Release."""
+    """c-unit.yml `build (release)` + its slice of `run-linux`: Release with pprof,
+    memory-events and the diagnostics compiled in (#414 made all three opt-in)."""
     build = ctx.dir / "build"
-    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=ON", C_UNIT_STRICT])
+    rc, configure_out = cmake_configure(
+        ctx, build, ["-DMI_PPROF=ON", "-DMI_MEMEVT=ON", "-DMI_DIAGNOSTICS=ON", C_UNIT_STRICT]
+    )
     if rc:
+        return False
+    if not re.search(r"Compiler defines\s*:.*MI_DIAGNOSTICS=1", configure_out):
+        log_write(ctx.log, "\n[verify_local] FAIL: MI_DIAGNOSTICS=1 did not reach mi_defines\n")
         return False
     if cmake_build(ctx, build, config="Release"):
         return False
@@ -287,14 +293,49 @@ def run_release(ctx: RunCtx) -> bool:
 
 
 def run_off(ctx: RunCtx) -> bool:
-    """c-unit.yml `build (pprof-off)` + its slice of `run-linux`: -DMI_PPROF=OFF."""
+    """c-unit.yml `build (pprof-off)` + its slice of `run-linux`: the MINIMAL build
+    (#414) -- every observability subsystem compiled out, spelled out rather than
+    inherited from a default."""
     build = ctx.dir / "build"
-    rc, _ = cmake_configure(ctx, build, ["-DMI_PPROF=OFF", C_UNIT_STRICT])
+    rc, configure_out = cmake_configure(
+        ctx,
+        build,
+        [
+            "-DMI_PPROF=OFF",
+            "-DMI_MEMEVT=OFF",
+            "-DMI_DIAGNOSTICS=OFF",
+            "-DMI_DHAT=OFF",
+            "-DMI_OWNER_GATE=OFF",
+            C_UNIT_STRICT,
+        ],
+    )
     if rc:
+        return False
+    if not re.search(r"Compiler defines\s*:.*MI_MEMEVT=0", configure_out):
+        log_write(ctx.log, "\n[verify_local] FAIL: MI_MEMEVT=0 did not reach mi_defines\n")
         return False
     if cmake_build(ctx, build):
         return False
     return ctest_run(ctx, build) == 0
+
+
+def run_memevt_only(ctx: RunCtx) -> bool:
+    """c-unit.yml `build (memevt-only)` + its slice of `run-linux` (#414): Release,
+    -DMI_MEMEVT=ON -DMI_PPROF=OFF, the WHOLE suite. Memory-events compiled in with the
+    profiler compiled out -- the row that proves the two are independent and the one that
+    registers test-memory-events in a pprof-free build."""
+    build = ctx.dir / "build"
+    rc, configure_out = cmake_configure(
+        ctx, build, ["-DMI_MEMEVT=ON", "-DMI_PPROF=OFF", C_UNIT_STRICT]
+    )
+    if rc:
+        return False
+    if not re.search(r"Compiler defines\s*:.*MI_MEMEVT=1", configure_out):
+        log_write(ctx.log, "\n[verify_local] FAIL: MI_MEMEVT=1 did not reach mi_defines\n")
+        return False
+    if cmake_build(ctx, build, config="Release"):
+        return False
+    return ctest_run(ctx, build, config="Release") == 0
 
 
 def run_debug_full(ctx: RunCtx) -> bool:
@@ -303,7 +344,16 @@ def run_debug_full(ctx: RunCtx) -> bool:
     assertions run)."""
     build = ctx.dir / "build"
     rc, _ = cmake_configure(
-        ctx, build, ["-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON", "-DMI_DHAT=ON", C_UNIT_STRICT]
+        ctx,
+        build,
+        [
+            "-DMI_PPROF=ON",
+            "-DMI_DEBUG_FULL=ON",
+            "-DMI_DHAT=ON",
+            "-DMI_MEMEVT=ON",
+            "-DMI_DIAGNOSTICS=ON",
+            C_UNIT_STRICT,
+        ],
     )
     if rc:
         return False
@@ -498,7 +548,7 @@ def run_gated(ctx: RunCtx) -> bool:
     most-repeated CI bug (docs/ci-gates.md)."""
     build = ctx.dir / "build"
     rc, configure_out = cmake_configure(
-        ctx, build, ["-DMI_PPROF=ON", "-DMI_OWNER_GATE=ON", C_UNIT_STRICT]
+        ctx, build, ["-DMI_PPROF=ON", "-DMI_OWNER_GATE=ON", "-DMI_DIAGNOSTICS=ON", C_UNIT_STRICT]
     )
     if rc:
         return False
@@ -773,14 +823,18 @@ def run_rust(ctx: RunCtx) -> bool:
     rc, _ = run_logged(["cargo", "test", "--workspace"], cwd=rust_dir, log=ctx.log, env=env)
     if rc:
         return False
-    # rust-native.yml's "Test pprof + DHAT" step: the `dhat` feature is opt-in.
-    rc, _ = run_logged(
-        ["cargo", "test", "-p", "mimalloc-pprof", "--features", "dhat"],
-        cwd=rust_dir,
-        log=ctx.log,
-        env=env,
-    )
-    return rc == 0
+    # rust-native.yml's per-feature lanes. #414 made every subsystem opt-in, so each one
+    # needs a run that actually compiles it in; `full` is the everything-on build.
+    for features in ("full", "pprof,dhat", "memory-events", "diagnostics", "owner-gate"):
+        rc, _ = run_logged(
+            ["cargo", "test", "-p", "mimalloc-pprof", "--features", features],
+            cwd=rust_dir,
+            log=ctx.log,
+            env=env,
+        )
+        if rc:
+            return False
+    return True
 
 
 def run_lint(ctx: RunCtx) -> bool:
@@ -1072,7 +1126,16 @@ CONFIGS: list[ConfigSpec] = [
         run_release,
     ),
     ConfigSpec(
-        "off", "c-unit.yml: build(pprof-off)+run-linux", "MI_PPROF=OFF, full ctest", run_off
+        "off",
+        "c-unit.yml: build(pprof-off)+run-linux",
+        "the minimal build: every subsystem compiled out, full ctest (#414)",
+        run_off,
+    ),
+    ConfigSpec(
+        "memevt-only",
+        "c-unit.yml: build(memevt-only)+run-linux",
+        "Release, MI_MEMEVT=ON with MI_PPROF=OFF, full ctest (#414)",
+        run_memevt_only,
     ),
     ConfigSpec(
         "debug-full",
@@ -1211,7 +1274,7 @@ BUNDLES: list[BundleSpec] = [
         "macos-bundles.yml",
         "build-macos",
         "aarch64-apple-darwin",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON",
         DARWIN_LINK_LIBRARIES,
     ),
     BundleSpec(
@@ -1219,7 +1282,7 @@ BUNDLES: list[BundleSpec] = [
         "macos-bundles.yml",
         "build-macos",
         "aarch64-apple-darwin",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DMI_TLS_MODEL_FIXED=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON -DMI_TLS_MODEL_FIXED=ON",
         DARWIN_LINK_LIBRARIES,
     ),
     BundleSpec(
@@ -1235,7 +1298,7 @@ BUNDLES: list[BundleSpec] = [
         "macos-bundles.yml",
         "build-macos",
         "x86_64-apple-darwin",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON",
         DARWIN_LINK_LIBRARIES,
     ),
     BundleSpec(
@@ -1243,7 +1306,7 @@ BUNDLES: list[BundleSpec] = [
         "macos-bundles.yml",
         "build-macos",
         "x86_64-apple-darwin",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON",
         DARWIN_LINK_LIBRARIES,
     ),
     BundleSpec(
@@ -1263,7 +1326,7 @@ BUNDLES: list[BundleSpec] = [
         "windows-bundles.yml",
         "build-windows-gnu",
         "x86_64-pc-windows-gnu",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON",
         WINDOWS_LINK_LIBRARIES,
         (
             "--objdump",
@@ -1277,7 +1340,7 @@ BUNDLES: list[BundleSpec] = [
         "windows-bundles.yml",
         "build-windows-gnu",
         "x86_64-pc-windows-gnu",
-        "-DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON",
+        "-DCMAKE_BUILD_TYPE=Debug -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON",
         WINDOWS_LINK_LIBRARIES,
         (
             "--objdump",
@@ -1319,7 +1382,7 @@ BUNDLES: list[BundleSpec] = [
         "windows-bundles.yml",
         "build-windows-gnu",
         "x86_64-pc-windows-gnu",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_OWNER_GATE=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_OWNER_GATE=ON -DMI_DIAGNOSTICS=ON",
         WINDOWS_LINK_LIBRARIES,
         (
             "--objdump",
@@ -1337,7 +1400,7 @@ BUNDLES: list[BundleSpec] = [
         "windows-bundles.yml",
         "build-windows-msvc",
         "x86_64-pc-windows-msvc",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON",
         WINDOWS_LINK_LIBRARIES,
         ("--objdump", "llvm-objdump", "--check-dll-closure", "--allow-msvc-runtime"),
     ),
@@ -1346,7 +1409,7 @@ BUNDLES: list[BundleSpec] = [
         "windows-bundles.yml",
         "build-windows-msvc",
         "x86_64-pc-windows-msvc",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON",
         WINDOWS_LINK_LIBRARIES,
         ("--objdump", "llvm-objdump", "--check-dll-closure", "--allow-msvc-runtime"),
     ),
@@ -1364,7 +1427,7 @@ BUNDLES: list[BundleSpec] = [
         "windows-bundles.yml",
         "build-windows-msvc",
         "x86_64-pc-windows-msvc",
-        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_OWNER_GATE=ON",
+        "-DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_OWNER_GATE=ON -DMI_DIAGNOSTICS=ON",
         WINDOWS_LINK_LIBRARIES,
         ("--objdump", "llvm-objdump", "--check-dll-closure", "--allow-msvc-runtime"),
     ),
@@ -1590,9 +1653,31 @@ class LikeCiBuild:
 
 
 LIKE_CI_BUILDS: list[LikeCiBuild] = [
-    LikeCiBuild("release", ("-DMI_PPROF=ON",), "Release"),
-    LikeCiBuild("pprof-off", ("-DMI_PPROF=OFF",)),
-    LikeCiBuild("debug-full", ("-DMI_PPROF=ON", "-DMI_DEBUG_FULL=ON", "-DMI_DHAT=ON"), "Debug"),
+    LikeCiBuild("release", ("-DMI_PPROF=ON", "-DMI_MEMEVT=ON", "-DMI_DIAGNOSTICS=ON"), "Release"),
+    # #414: the minimal build -- every subsystem compiled out, spelled out explicitly.
+    LikeCiBuild(
+        "pprof-off",
+        (
+            "-DMI_PPROF=OFF",
+            "-DMI_MEMEVT=OFF",
+            "-DMI_DIAGNOSTICS=OFF",
+            "-DMI_DHAT=OFF",
+            "-DMI_OWNER_GATE=OFF",
+        ),
+    ),
+    # #414: memory-events compiled in with the profiler compiled out.
+    LikeCiBuild("memevt-only", ("-DMI_MEMEVT=ON", "-DMI_PPROF=OFF"), "Release"),
+    LikeCiBuild(
+        "debug-full",
+        (
+            "-DMI_PPROF=ON",
+            "-DMI_DEBUG_FULL=ON",
+            "-DMI_DHAT=ON",
+            "-DMI_MEMEVT=ON",
+            "-DMI_DIAGNOSTICS=ON",
+        ),
+        "Debug",
+    ),
     LikeCiBuild("guarded", ("-DCMAKE_BUILD_TYPE=Debug", "-DMI_PPROF=ON", "-DMI_GUARDED=ON")),
     LikeCiBuild(
         "shared",
@@ -1605,7 +1690,7 @@ LIKE_CI_BUILDS: list[LikeCiBuild] = [
         "Release",
     ),
     # #366: the owner gate, whole suite (every allocator entry is a gate site).
-    LikeCiBuild("gated", ("-DMI_PPROF=ON", "-DMI_OWNER_GATE=ON"), "Release"),
+    LikeCiBuild("gated", ("-DMI_PPROF=ON", "-DMI_OWNER_GATE=ON", "-DMI_DIAGNOSTICS=ON"), "Release"),
     # #371: DHAT is opt-in (default OFF), so this is the compiled-in whole-suite row.
     LikeCiBuild("dhat-on", ("-DMI_PPROF=ON", "-DMI_DHAT=ON"), "Release"),
     LikeCiBuild(

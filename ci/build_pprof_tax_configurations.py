@@ -83,6 +83,11 @@ EQUIVALENCE_CACHE_KEYS = (
     "MI_BUILD_TESTS",
     "MI_DEBUG_FULL",
     "MI_DHAT",
+    # #414: both became opt-in CMake options; projecting them keeps a silent drift in
+    # either one out of the tax measurement (upstream's cache has neither, which is why
+    # they join MI_PPROF/MI_DHAT in the upstream-vs-fork allowance below).
+    "MI_DIAGNOSTICS",
+    "MI_MEMEVT",
     "MI_OPT_ARCH",
     "MI_OPT_SIMD",
     "MI_OVERRIDE",
@@ -327,7 +332,11 @@ def check_equivalence(configurations: Sequence[Mapping[str, object]]) -> None:
 
     upstream_cache = _require_cache(by_id["upstream-baseline"], "upstream-baseline")
     _check_cache_diff(
-        "upstream-baseline", "fork-pprof-off", upstream_cache, off_cache, {"MI_PPROF", "MI_DHAT"}
+        "upstream-baseline",
+        "fork-pprof-off",
+        upstream_cache,
+        off_cache,
+        {"MI_PPROF", "MI_DHAT", "MI_MEMEVT", "MI_DIAGNOSTICS"},
     )
 
 

@@ -20,9 +20,12 @@ if os.name != "nt":
 ROOT = Path(__file__).resolve().parents[1]
 DOCKER_BUILD = ["clud", "tool", "run", "docker/docker-build.py", "soldr", str(ROOT)]
 # -DMI_DHAT=ON: DHAT is opt-in (default OFF since 2026-09-18); the dev loop builds it in so
-# test-dhat runs locally too.
+# test-dhat runs locally too. #414: every other subsystem became opt-in as well, so the
+# dev loop names them all -- the point of `c-test` is to run the WHOLE suite, and without
+# these the memory-events, heap-snapshot and heap-dump tests are not even registered.
 C_TEST = (
     "cmake -S /src -B /target/c-build -G Ninja -DMI_PPROF=ON -DMI_DHAT=ON "
+    "-DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON "
     "-DCMAKE_C_COMPILER_LAUNCHER=zccache && cmake --build /target/c-build && "
     "ctest --test-dir /target/c-build --output-on-failure -E 'test-stress.*' && "
     'threads=$(nproc); [ "$threads" -le 4 ] || threads=4; '
@@ -117,7 +120,10 @@ def rust_test(extra: list[str]) -> None:
     if not (ROOT / "rust" / "Cargo.toml").is_file():
         print("rust workspace not present yet (see #4)")
         return
-    command = "cd /src/rust && soldr cargo test"
+    # #414: `default = []` since 0.12.0, so name the everything-on feature set -- the dev
+    # loop's rust-test is meant to run the whole crate's tests, and cargo SKIPS a target
+    # whose `required-features` are unmet rather than failing.
+    command = "cd /src/rust && soldr cargo test --features mimalloc-pprof/full"
     if extra:
         command += " " + " ".join(extra)
     run_tool(["run", "bash", "-lc", command], timeout_seconds=60)

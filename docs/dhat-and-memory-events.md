@@ -53,6 +53,14 @@ visitor, and raw-OS-layer `mi_unwrapped_*` functions for instrumentation that mu
 avoid allocator recursion. It is **independent of `MI_PPROF`** and remains
 available in an `MI_PPROF=OFF` build.
 
+Since #414 it is also **opt-in at compile time**: build with `-DMI_MEMEVT=ON` (cargo
+feature `memory-events`, which `dhat` implies), or the counters, the callback table and
+the per-allocation hook sites are compiled out and every function here is a stub that
+returns `false`/`NULL`. Compiled in but disabled it costs 9-13 instructions per
+malloc/free pair, which is why it is no longer on by default. `mi_unwrapped_malloc` /
+`_free` / `_realloc` are NOT part of that: they are raw-OS helpers and are real in every
+build.
+
 Enable tracking before the first allocation when exact lifetime totals matter:
 
 ```c

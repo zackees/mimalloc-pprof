@@ -79,13 +79,33 @@ jobs:
           - config: release
             container: ''
             python: uv run
-            cmake: -DMI_PPROF=ON
+            # #414: every observability subsystem is opt-in and OFF by default, so the
+            # "everything compiled in" shape has to be spelled out. This row is it for
+            # pprof + memory-events + diagnostics; `dhat-on` and `gated` carry the other
+            # two so the matrix stays a set of rows, not a cross product (#307).
+            cmake: -DMI_PPROF=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON
             build_config: Release
+            assert_defines: MI_DIAGNOSTICS=1
             kind: bundle
           - config: pprof-off
             container: ''
             python: uv run
-            cmake: -DMI_PPROF=OFF
+            # #414: this is now the MINIMAL build -- the plain fast allocator every
+            # consumer gets by default -- so every switch is passed explicitly rather
+            # than inherited, and the resolved defines are asserted. The name is kept
+            # for continuity with the bundle/manifest plumbing that already knows it.
+            cmake: -DMI_PPROF=OFF -DMI_MEMEVT=OFF -DMI_DIAGNOSTICS=OFF -DMI_DHAT=OFF -DMI_OWNER_GATE=OFF
+            assert_defines: MI_MEMEVT=0
+            kind: bundle
+          - config: memevt-only
+            container: ''
+            python: uv run
+            # #414: memory-events compiled IN with the profiler compiled OUT. Proves the
+            # two are independent, and is the row that registers and runs
+            # test-memory-events / test-fork-locks-memevt-env in a pprof-free build.
+            cmake: -DMI_MEMEVT=ON -DMI_PPROF=OFF
+            build_config: Release
+            assert_defines: MI_MEMEVT=1
             kind: bundle
           - config: debug-full
             container: ''
@@ -95,7 +115,9 @@ jobs:
             # bundle format can carry this one it can carry anything (#277 phase A).
             # -DMI_DHAT=ON (opt-in since 2026-09-18): the DHAT observer's MI_DEBUG=3
             # assertions are only compiled when both are on, so this row keeps them run.
-            cmake: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON
+            # #414: also the memory-events x DHAT pair -- the one interaction worth
+            # covering, because DHAT dispatches through the memory-events slow paths.
+            cmake: -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON
             build_config: Debug
             kind: bundle
           - config: guarded
@@ -123,7 +145,10 @@ jobs:
             # runs under it, not just test-purge-all: every allocator entry is a gate site,
             # so every test is a test of the gate. Asserted on the resolved defines like
             # `guarded`, and for the same reason.
-            cmake: -DMI_PPROF=ON -DMI_OWNER_GATE=ON
+            # #414: -DMI_DIAGNOSTICS=ON because the live-heap dump's ownership protocol
+            # (#374, test-diagnostic-walks) exists FOR the gated build -- compiling the
+            # dump out here would drop the only coverage that protocol has.
+            cmake: -DMI_PPROF=ON -DMI_OWNER_GATE=ON -DMI_DIAGNOSTICS=ON
             build_config: Release
             assert_defines: MI_OWNER_GATE=1
             kind: bundle
@@ -139,6 +164,9 @@ jobs:
             # runs test-dhat / test-fork-locks-dhat-env. Asserted on the resolved defines
             # like `guarded`/`gated`, and for the same reason: an opt-in flag that
             # silently failed to reach the compiler would leave DHAT untested and green.
+            # #414: deliberately WITHOUT -DMI_MEMEVT=ON. This is the `MI_MEMEVT=0
+            # MI_DHAT=1` shape, where the shared `#if MI_MEMEVT || MI_DHAT` hook-site
+            # guard is load-bearing; `debug-full` covers the both-on pair.
             cmake: -DMI_PPROF=ON -DMI_DHAT=ON
             build_config: Release
             assert_defines: MI_DHAT=1
@@ -154,7 +182,9 @@ jobs:
             generator: -G Ninja
             # -DMI_DHAT=ON (opt-in): the DHAT tests keep a musl run; musl-pprof-off below
             # stays at the default (compiled out).
-            cmake: -DMI_LIBC_MUSL=ON -DMI_PPROF=ON -DMI_DHAT=ON -DCMAKE_C_FLAGS=-ftls-model=local-dynamic
+            # #414: memory-events and diagnostics opt in here too, so musl keeps
+            # running their tests.
+            cmake: -DMI_LIBC_MUSL=ON -DMI_PPROF=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON -DCMAKE_C_FLAGS=-ftls-model=local-dynamic
             kind: bundle
           - config: musl-pprof-off
             container: alpine:3.20
@@ -370,10 +400,14 @@ jobs:
       # -DMI_DHAT=ON: DHAT is opt-in (default OFF since 2026-09-18), so the main `cl` tree
       # builds it in to keep test-dhat running under Microsoft's compiler; the owner-gate
       # tree below stays at the default, so `cl` compiles both the ON and OFF shapes.
+      # #414: -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON for the same reason -- both are opt-in
+      # now, and this is the tree that keeps test-memory-events / test-snapshot* /
+      # test-heap-dump-json running under Microsoft's own compiler. The owner-gate tree
+      # below leaves memory-events out, so `cl` still compiles that shape too.
       - name: Configure the main tree (MI_DHAT=ON)
         run: |
           set -euo pipefail
-          cmake -B build -DMI_PPROF=ON -DMI_DHAT=ON | tee configure.log
+          cmake -B build -DMI_PPROF=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON | tee configure.log
           if ! grep -qE "Compiler defines *:.*MI_DHAT=1" configure.log; then
             echo "::error::MI_DHAT=1 did not reach mi_defines"
             exit 1
@@ -395,7 +429,7 @@ jobs:
       - name: Configure and build the owner-gate tree (MI_OWNER_GATE=ON)
         run: |
           set -euo pipefail
-          cmake -B build-gated -DMI_PPROF=ON -DMI_OWNER_GATE=ON | tee configure-gated.log
+          cmake -B build-gated -DMI_PPROF=ON -DMI_OWNER_GATE=ON -DMI_DIAGNOSTICS=ON | tee configure-gated.log
           if ! grep -qE "Compiler defines *:.*MI_OWNER_GATE=1" configure-gated.log; then
             echo "::error::MI_OWNER_GATE=1 did not reach mi_defines"
             exit 1
@@ -474,7 +508,7 @@ jobs:
           # A download that silently produced fewer bundles would otherwise surface as a
           # confusing `No such file` in the middle of a gate, or -- worse -- as a green
           # run over less.
-          for expected in release pprof-off debug-full guarded shared gated dhat-on musl musl-pprof-off \
+          for expected in release pprof-off memevt-only debug-full guarded shared gated dhat-on musl musl-pprof-off \
                           memory-gate-leak; do
             if [ ! -d "bundle/$expected" ]; then
               echo "::error::bundle/$expected was not downloaded"
@@ -501,7 +535,7 @@ jobs:
         run: |
           set -euo pipefail
           uv run ci/run_test_bundle.py \
-            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared bundle/gated bundle/dhat-on \
+            --bundles bundle/release bundle/pprof-off bundle/memevt-only bundle/debug-full bundle/guarded bundle/shared bundle/gated bundle/dhat-on \
             --jobs 4 --select parallel \
             --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
             --junit-dir results
@@ -648,7 +682,7 @@ jobs:
             mkdir -p "bundle/$name"
             tar -C "bundle/$name" -xzf "$archive"
           done
-          for expected in release pprof-off debug-full guarded shared gated dhat-on musl musl-pprof-off; do
+          for expected in release pprof-off memevt-only debug-full guarded shared gated dhat-on musl musl-pprof-off; do
             if [ ! -d "bundle/$expected" ]; then
               echo "::error::bundle/$expected was not downloaded"
               ls bundle
@@ -660,7 +694,7 @@ jobs:
         run: |
           set -euo pipefail
           uv run ci/run_test_bundle.py \
-            --bundles bundle/release bundle/pprof-off bundle/debug-full bundle/guarded bundle/shared bundle/gated bundle/dhat-on \
+            --bundles bundle/release bundle/pprof-off bundle/memevt-only bundle/debug-full bundle/guarded bundle/shared bundle/gated bundle/dhat-on \
             --jobs 1 --select serial \
             --env-variant guarded:sample-rate-1 MIMALLOC_GUARDED_SAMPLE_RATE=1 \
             --junit-dir results
@@ -723,7 +757,7 @@ jobs:
           # with several lands as `<dest>/results/<file>`. Locating the file makes this
           # step independent of that, and a missing half is a named error rather than a
           # bare `cp: No such file`.
-          for config in release pprof-off debug-full guarded shared gated dhat-on musl musl-pprof-off; do
+          for config in release pprof-off memevt-only debug-full guarded shared gated dhat-on musl musl-pprof-off; do
             mkdir -p "executed/$config"
             for half in parallel serial; do
               found=$(find "$half" -type f -name "$config.xml" | head -1)
@@ -744,6 +778,7 @@ jobs:
           uv run ci/bundle_coverage.py \
             --compare release manifests/show-only-release.json executed/release \
             --compare pprof-off manifests/show-only-pprof-off.json executed/pprof-off \
+            --compare memevt-only manifests/show-only-memevt-only.json executed/memevt-only \
             --compare debug-full manifests/show-only-debug-full.json executed/debug-full \
             --compare guarded manifests/show-only-guarded.json executed/guarded \
             --compare shared manifests/show-only-shared.json executed/shared \

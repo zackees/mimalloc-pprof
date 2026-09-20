@@ -10,9 +10,27 @@ cmake --build build --config RelWithDebInfo
 cmake --install build --config RelWithDebInfo --prefix /path/to/prefix
 ```
 
-Use `MI_PPROF=OFF` to omit the profiler implementation and its allocation hooks.
-The public profiler functions remain linkable as no-op stubs, and the
-memory-events API remains fully available.
+**Every observability subsystem is opt-in and OFF by default** (#414). The default
+`cmake -S . -B build` builds a plain fast allocator whose `mi_malloc`/`mi_free` are
+byte-identical to upstream mimalloc. Name the ones you want:
+
+| Option | Default | What it builds in |
+|---|---|---|
+| `MI_PPROF` | `OFF` | sampled pprof heap profiling (`include/mimalloc/profile.h`) |
+| `MI_MEMEVT` | `OFF` | allocation-change accounting and callbacks (`include/mimalloc/memory-events.h`) |
+| `MI_DIAGNOSTICS` | `OFF` | heap snapshot (`mi_heap_snapshot*`) + live-heap JSON dump (`mi_heap_dump_json*`) |
+| `MI_DHAT` | `OFF` | the exact DHAT v2 observer (`include/mimalloc/dhat.h`) |
+| `MI_OWNER_GATE` | `OFF` | `mi_purge_all` can sweep every thread, at a cost on the fast path |
+
+The public functions of every one of them **remain linkable in every configuration**, as
+no-op stubs that report the subsystem off (`mi_prof_start` / `mi_dhat_start` /
+`mi_memory_tracking_set_enabled` return `false`, `mi_heap_dump_json` returns `NULL`,
+`mi_heap_snapshot*` return `-1`), so a consumer needs no `#ifdef`. The `mi_unwrapped_*`
+family and `mi_option_snapshot_on_exit` exist in every build too.
+
+The same defaults apply to a build that never runs this CMake — a direct `src/static.c`
+compile, e.g. Bun's — because `include/mimalloc/types.h`'s fallbacks match; define
+`MI_PPROF=1` (or the others) on the command line to opt in there.
 
 In a CMake consumer, link the `mimalloc` shared target or the `mimalloc-static`
 static target exactly as with upstream mimalloc:

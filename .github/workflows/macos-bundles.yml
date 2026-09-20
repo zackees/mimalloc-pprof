@@ -90,10 +90,14 @@ jobs:
           # opt-in (default OFF since 2026-09-18), these keep test-dhat built and run, and
           # the arm64 test-name set is compared against x86_64's so the two must agree.
           # The leak bundles stay at the default (compiled out).
+          # #414: -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON on the same four bundles, for the same
+          # reason -- both subsystems became opt-in, and without naming them Darwin would
+          # stop building and running test-memory-events / test-snapshot* /
+          # test-heap-dump-json entirely. Applied to BOTH arches so the name sets agree.
           - bundle: macos-arm64-release
             arch: arm64
             triple: aarch64-apple-darwin
-            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON
           - bundle: macos-arm64-debug-full
             arch: arm64
             triple: aarch64-apple-darwin
@@ -102,7 +106,7 @@ jobs:
             # compile coverage on macOS -- no other lane passes this flag. It exercises
             # test-tls-slots-heap and test-threadlocal-growth under the fixed model; the
             # TSD-slot guard above is the runtime-drift check for the same feature.
-            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DMI_TLS_MODEL_FIXED=ON
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON -DMI_TLS_MODEL_FIXED=ON
           # The memory gate's positive control. It is a separate *build*
           # (MI_BENCH_INJECT_LEAK), not a separate run, so it cannot be an entry in
           # another bundle's manifest; it gets its own bundle rather than being dropped
@@ -116,11 +120,11 @@ jobs:
           - bundle: macos-x64-release
             arch: x86_64
             triple: x86_64-apple-darwin
-            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON
           - bundle: macos-x64-debug-full
             arch: x86_64
             triple: x86_64-apple-darwin
-            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON
+            cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON
           - bundle: macos-x64-leak
             arch: x86_64
             triple: x86_64-apple-darwin
@@ -384,7 +388,10 @@ jobs:
           # a second time and report the same failure twice. (cross.yml carries the same
           # dead retry; it is left alone here so this PR does not change the control arm
           # of #277 phase B's comparison.)
-          run_build "cargo test -p mimalloc-pprof --no-run"
+          # #414: `default = []` since 0.12.0 -- name the features this lane used to
+          # get implicitly (pprof was the default; memory-events and diagnostics were
+          # unconditional C), so the Apple test-name set is unchanged.
+          run_build "cargo test -p mimalloc-pprof --features pprof,memory-events,diagnostics --no-run"
           test -s bins.txt
           mkdir -p "dist/$TARGET"
           xargs -r -a bins.txt -I{} cp {} "dist/$TARGET/"

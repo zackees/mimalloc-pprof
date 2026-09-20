@@ -44,15 +44,18 @@ jobs:
           # so without it the observer would never run under ASan. The clang
           # RelWithDebInfo and owner-gate rows stay at the default, keeping the compiled-
           # out shape sanitized too.
+          # #414: the same now goes for memory-events and the diagnostics (heap
+          # snapshot / live-heap JSON dump) -- opt-in and OFF by default -- so these two
+          # rows name them explicitly or ASan would stop seeing any of that code.
           - cc: clang
             cxx: clang++
             build_type: Debug
-            extra: -DMI_DEBUG_FULL=ON -DMI_DHAT=ON
+            extra: -DMI_DEBUG_FULL=ON -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON
             label: ''
           - cc: gcc
             cxx: g++
             build_type: RelWithDebInfo
-            extra: -DMI_DHAT=ON
+            extra: -DMI_DHAT=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON
             label: ''
           - cc: clang
             cxx: clang++
@@ -68,7 +71,9 @@ jobs:
           - cc: clang
             cxx: clang++
             build_type: Debug
-            extra: -DMI_DEBUG_FULL=ON -DMI_OWNER_GATE=ON
+            # #414: -DMI_DIAGNOSTICS=ON so the #374 ownership-protected capture, which
+            # exists for the gated build, stays under the sanitizer.
+            extra: -DMI_DEBUG_FULL=ON -DMI_OWNER_GATE=ON -DMI_DIAGNOSTICS=ON
             label: ', owner-gate'
     env:
       CC: ${{ matrix.cc }}

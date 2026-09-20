@@ -58,23 +58,45 @@ def main() -> None:
     )
     required_manifest = (
         f'version = "{version}"',
-        # DHAT is opt-in (owner decision 2026-09-18): `dhat` must exist but must NOT be a
-        # default feature, or every client pays for the observer's hook sites.
-        'default = ["pprof"]',
+        # #414 (owner decision 2026-09-19): EVERY observability subsystem is opt-in, so
+        # the published default feature set must be empty -- a client that asks for the
+        # allocator gets the allocator and pays for nothing else. Each subsystem must
+        # still exist as a feature (otherwise opting in is impossible), `dhat` must imply
+        # `memory-events` (it dispatches through those hook sites), and `full` must name
+        # all five (it is the documented way to restore the pre-0.12 behaviour).
+        "default = []",
         "pprof = []",
-        "dhat = []",
+        "memory-events = []",
+        "diagnostics = []",
+        'dhat = ["memory-events"]',
+        "owner-gate = []",
+        'full = ["pprof", "memory-events", "diagnostics", "dhat", "owner-gate"]',
     )
     for text in required_manifest:
         if text not in manifest:
             raise AssertionError(f"published manifest missing {text!r}")
-    if 'var_os("CARGO_FEATURE_PPROF")' not in build or '"MI_PPROF"' not in build:
-        raise AssertionError("published build script does not select MI_PPROF from the feature")
-    # #371: the `dhat` cargo feature must drive MI_DHAT; a hard-coded define would either
-    # compile the observer into every client (defeating opt-in) or make opting in a no-op.
-    if 'var_os("CARGO_FEATURE_DHAT")' not in build or '"MI_DHAT"' not in build:
-        raise AssertionError("published build script does not select MI_DHAT from the feature")
+    # Every one of the five must reach the C compiler from its cargo feature. A hard-coded
+    # define would either compile the subsystem into every client (defeating opt-in) or
+    # make opting in a silent no-op.
+    for feature_env, define in (
+        ("CARGO_FEATURE_PPROF", "MI_PPROF"),
+        ("CARGO_FEATURE_MEMORY_EVENTS", "MI_MEMEVT"),
+        ("CARGO_FEATURE_DIAGNOSTICS", "MI_DIAGNOSTICS"),
+        ("CARGO_FEATURE_DHAT", "MI_DHAT"),
+        ("CARGO_FEATURE_OWNER_GATE", "MI_OWNER_GATE"),
+    ):
+        if f'var_os("{feature_env}")' not in build or f'"{define}"' not in build:
+            raise AssertionError(
+                f"published build script does not select {define} from its cargo feature"
+            )
     if "pub mod dhat" not in library or "mi_dhat_start" not in native:
         raise AssertionError("published archive lost internal DHAT")
+    # #414: the API must be present in EVERY configuration, so the published sources must
+    # still carry the stub halves the compiled-out builds link against.
+    if "pub mod memory_events" not in library or "mi_memory_tracking_set_enabled" not in native:
+        raise AssertionError("published archive lost the memory-events surface")
+    if "pub fn heap_snapshot_to_file" not in library or "mi_heap_dump_json" not in native:
+        raise AssertionError("published archive lost the diagnostics surface")
 
     print(f"verified publish archive: {archive_path}")
 

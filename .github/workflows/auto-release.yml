@@ -219,8 +219,12 @@ jobs:
         # files and, on Windows, mimalloc-redirect.dll -- verified on all four lanes.
         run: |
           set -euo pipefail
+          # #414: every observability subsystem became opt-in, so the shipped release
+          # asset names the ones it has always carried (pprof, memory-events and the
+          # heap snapshot / live-heap dump) rather than inheriting them from a default.
+          # DHAT and the owner gate stay out, exactly as before.
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON -DMI_BUILD_TESTS=OFF \
             --toolchain cmake/toolchains/soldr-${{ matrix.triple }}.cmake \
             --log-level=VERBOSE 2>&1 | tee configure.log
           # Assert on the RESOLVED library list, not on the option that was passed in --

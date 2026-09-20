@@ -80,12 +80,25 @@ jobs:
       - name: cargo clippy -D warnings (whole workspace, all targets, all features)
         if: runner.os != 'Windows'
         run: soldr cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # #414: the crate's default feature set is EMPTY, so this workspace run exercises
+      # the minimal allocator -- except that stress-harness's dev-dependency names
+      # `features = ["pprof"]`, and cargo unifies features, so the pprof tests still run
+      # here exactly as they always did. The explicit per-feature lanes are below.
       - run: soldr cargo test --locked
-      # The `dhat` cargo feature is opt-in (default OFF since 2026-09-18), so the default
-      # run above compiles the observer out. This is the pprof + DHAT build -- the old
-      # default -- so the DHAT tests (lib's dhat lifecycle, feature_contract) keep running.
-      - name: Test pprof + DHAT (dhat feature opted in)
-        run: soldr cargo test -p mimalloc-pprof --features dhat --locked
+      # Every subsystem is opt-in since #414, so each one gets a lane that actually
+      # compiles it in. `full` is the everything-on build (and the pre-0.12 default plus
+      # DHAT and the owner gate); the individual lanes keep each feature honest on its
+      # own, and `test-no-pprof` below covers the compiled-out halves.
+      - name: Test the everything-on build (--features full)
+        run: soldr cargo test -p mimalloc-pprof --features full --locked
+      - name: Test pprof + DHAT (dhat feature opted in; dhat implies memory-events)
+        run: soldr cargo test -p mimalloc-pprof --features pprof,dhat --locked
+      - name: Test memory-events on its own
+        run: soldr cargo test -p mimalloc-pprof --features memory-events --locked
+      - name: Test diagnostics on its own
+        run: soldr cargo test -p mimalloc-pprof --features diagnostics --locked
+      - name: Test the owner gate on its own
+        run: soldr cargo test -p mimalloc-pprof --features owner-gate --locked
       - name: cargo publish --dry-run (mimalloc-pprof)
         if: runner.os != 'Windows'
         run: soldr cargo publish --dry-run -p mimalloc-pprof --locked
@@ -150,6 +163,9 @@ jobs:
           soldr cargo clippy -p mimalloc-pprof --all-targets --no-default-features --locked -- -D warnings
           soldr cargo clippy -p mimalloc-pprof --all-targets --no-default-features --features pprof --locked -- -D warnings
           soldr cargo clippy -p mimalloc-pprof --all-targets --no-default-features --features dhat --locked -- -D warnings
+          soldr cargo clippy -p mimalloc-pprof --all-targets --no-default-features --features memory-events --locked -- -D warnings
+          soldr cargo clippy -p mimalloc-pprof --all-targets --no-default-features --features diagnostics --locked -- -D warnings
+          soldr cargo clippy -p mimalloc-pprof --all-targets --no-default-features --features owner-gate --locked -- -D warnings
       - name: Test allocator-only build (profiler and DHAT compiled out)
         run: soldr cargo test -p mimalloc-pprof --no-default-features --locked
       # #371: the `dhat` cargo feature is independent of `pprof`; prove each compiles and
@@ -158,3 +174,13 @@ jobs:
         run: soldr cargo test -p mimalloc-pprof --no-default-features --features pprof --locked
       - name: Test DHAT without pprof (pprof feature off)
         run: soldr cargo test -p mimalloc-pprof --no-default-features --features dhat --locked
+      # #414: the remaining single-subsystem shapes, each with everything else compiled
+      # out. `feature_contract` asserts both halves of every feature in each of them.
+      - name: Test memory-events without pprof
+        run: soldr cargo test -p mimalloc-pprof --no-default-features --features memory-events --locked
+      - name: Test diagnostics without pprof
+        run: soldr cargo test -p mimalloc-pprof --no-default-features --features diagnostics --locked
+      - name: Test the owner gate without pprof
+        run: soldr cargo test -p mimalloc-pprof --no-default-features --features owner-gate --locked
+      - name: Test the everything-on build
+        run: soldr cargo test -p mimalloc-pprof --no-default-features --features full --locked

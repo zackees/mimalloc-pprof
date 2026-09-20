@@ -225,6 +225,8 @@ class VerifyLocalDriftTests(unittest.TestCase):
         expected = [
             "release",
             "off",
+            # #414: memory-events compiled in with the profiler compiled out.
+            "memevt-only",
             "debug-full",
             "debug3-extra",
             "guarded",

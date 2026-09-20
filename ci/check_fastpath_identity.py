@@ -10,7 +10,12 @@ base revision and at HEAD with identical flags and the same compiler, disassembl
 fast-path entry points, normalises everything that is allowed to move (addresses, section
 offsets, relocation addends into data sections), and requires an empty diff.
 
-The positive control is a THIRD build, HEAD with `-DMI_OWNER_GATE=ON`: its fast path must
+A THIRD comparison (#414) is absolute rather than relative: the MINIMAL build -- every
+observability subsystem compiled out, which is what `default = []` / every CMake option OFF
+now gives -- must be byte-identical to UPSTREAM mimalloc at the pinned overlay base. That
+turns "the allocator-only build carries no tax from this fork" from a claim into a check.
+
+The positive control is a FOURTH build, HEAD with `-DMI_OWNER_GATE=ON`: its fast path must
 differ from HEAD's default build in at least one of the checked symbols. That is a real,
 always-available control -- the gate's whole point is that it changes those bytes -- so it
 stands in for the `-DMI_PURGE_ALL_FASTPATH_CANARY` source canary the plan sketched, which
@@ -31,6 +36,7 @@ Two things make the disassembly step easy to get vacuously wrong, and both are h
 
 Usage:
     check_fastpath_identity.py [--base REV] [--out DIR] [--expect-dirty] [--skip-control]
+                               [--skip-upstream]
     check_fastpath_identity.py --selftest
 
 `--base` defaults to the merge base of HEAD and origin/main (else HEAD~1). `--expect-dirty`
@@ -70,7 +76,38 @@ FASTPATH_SYMBOLS: tuple[str, ...] = (
 #: OFF: it is the build with MORE on the fast path (the disabled observer's hook sites),
 #: i.e. the one where #371's atomic-RMW regression actually lived, so the absolute
 #: forbidden-instruction scan below still looks where that bug was.
-COMMON_CMAKE: tuple[str, ...] = ("-DCMAKE_BUILD_TYPE=Release", "-DMI_PPROF=ON", "-DMI_DHAT=ON")
+#: `-DMI_MEMEVT=ON` is pinned for exactly the same reason as of #414: memory-events became
+#: opt-in and default-OFF, and its hook sites ARE fast-path instructions, so leaving it to
+#: the default would compare a base built with the hooks against a HEAD built without them
+#: and report "the fast path changed" for a reason that has nothing to do with the diff
+#: under review. A base revision that predates the option ignores the flag (its hooks were
+#: unconditional), which is precisely the shape this pin has to reproduce.
+COMMON_CMAKE: tuple[str, ...] = (
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DMI_PPROF=ON",
+    "-DMI_DHAT=ON",
+    "-DMI_MEMEVT=ON",
+)
+
+#: #414: the minimal build -- every observability subsystem compiled out. This is the
+#: default a consumer gets (`default = []`, every CMake option OFF); the flags are spelled
+#: out so the comparison below does not silently depend on what the defaults happen to be.
+MINIMAL_CMAKE: tuple[str, ...] = (
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DMI_PPROF=OFF",
+    "-DMI_MEMEVT=OFF",
+    "-DMI_DIAGNOSTICS=OFF",
+    "-DMI_DHAT=OFF",
+    "-DMI_OWNER_GATE=OFF",
+)
+
+#: Upstream microsoft/mimalloc at the commit this fork's v3 overlay is pinned to (CLAUDE.md
+#: "Repo facts"). Its CMakeLists knows none of the options above, so it is configured with
+#: the build type alone -- the point is that the same compiler and the same optimisation
+#: level produce the same bytes, not that the two option sets look alike.
+UPSTREAM_PIN = "6def7be9458fb8a97b8323af3fb0b0ae04387065"
+UPSTREAM_URL = "https://github.com/microsoft/mimalloc.git"
+UPSTREAM_CMAKE: tuple[str, ...] = ("-DCMAKE_BUILD_TYPE=Release",)
 
 # `    7c2e:\tpush   %rbp` -> the instruction; `    7c2e:\t...` prefixes are addresses.
 ADDR_PREFIX_RE = re.compile(r"^\s*[0-9a-f]+:\s*")
@@ -147,26 +184,55 @@ def have(tool: str) -> bool:
     return shutil.which(tool) is not None
 
 
-def build_static(source: Path, build: Path, gate: bool) -> Path:
-    """Configure + build `mimalloc-static` and return the archive path."""
+def build_archive(source: Path, build: Path, cmake_args: tuple[str, ...]) -> tuple[Path, str]:
+    """Configure + build `mimalloc-static`; return (archive path, configure output)."""
     if build.exists():
         shutil.rmtree(build)
     cmake = shutil.which("cmake") or "cmake"
-    args = [cmake, "-S", str(source), "-B", str(build), *COMMON_CMAKE]
+    args = [cmake, "-S", str(source), "-B", str(build), *cmake_args]
     if have("ninja"):
         args += ["-G", "Ninja"]
-    args.append(f"-DMI_OWNER_GATE={'ON' if gate else 'OFF'}")
     configure = run(args, cwd=source)
+    run([cmake, "--build", str(build), "--parallel", "--target", "mimalloc-static"], cwd=source)
+    libs = sorted(build.glob("libmimalloc*.a"))
+    if not libs:
+        raise RuntimeError(f"no libmimalloc*.a under {build}")
+    return libs[0], configure
+
+
+def build_static(source: Path, build: Path, gate: bool) -> Path:
+    """Configure + build `mimalloc-static` and return the archive path."""
+    args = (*COMMON_CMAKE, f"-DMI_OWNER_GATE={'ON' if gate else 'OFF'}")
+    archive, configure = build_archive(source, build, args)
     defines = next((ln for ln in configure.splitlines() if "Compiler defines" in ln), "")
     if gate and "MI_OWNER_GATE=1" not in defines:
         raise RuntimeError(f"MI_OWNER_GATE=1 did not reach the compiler defines: {defines}")
     if not gate and "MI_OWNER_GATE" in defines:
         raise RuntimeError(f"MI_OWNER_GATE leaked into the default build's defines: {defines}")
-    run([cmake, "--build", str(build), "--parallel", "--target", "mimalloc-static"], cwd=source)
-    libs = sorted(build.glob("libmimalloc*.a"))
-    if not libs:
-        raise RuntimeError(f"no libmimalloc*.a under {build}")
-    return libs[0]
+    return archive
+
+
+def build_minimal(source: Path, build: Path) -> Path:
+    """#414: the fork with every observability subsystem compiled out."""
+    archive, configure = build_archive(source, build, MINIMAL_CMAKE)
+    defines = next((ln for ln in configure.splitlines() if "Compiler defines" in ln), "")
+    for expected in ("MI_PPROF=0", "MI_MEMEVT=0", "MI_DIAGNOSTICS=0", "MI_DHAT=0"):
+        if expected not in defines:
+            raise RuntimeError(f"{expected} did not reach the compiler defines: {defines}")
+    if "MI_OWNER_GATE" in defines:
+        raise RuntimeError(f"MI_OWNER_GATE leaked into the minimal build: {defines}")
+    return archive
+
+
+def resolve_upstream() -> str:
+    """The pinned upstream commit, fetching it from microsoft/mimalloc if this clone (a CI
+    checkout has only `origin`, at depth 1) does not already have the object."""
+    try:
+        return git("rev-parse", "--verify", f"{UPSTREAM_PIN}^{{commit}}")
+    except RuntimeError:
+        pass
+    run(["git", "fetch", "--depth=1", UPSTREAM_URL, UPSTREAM_PIN], cwd=ROOT)
+    return git("rev-parse", "--verify", "FETCH_HEAD^{commit}")
 
 
 def disassemble_symbols(
@@ -462,6 +528,12 @@ def main(argv: list[str] | None = None) -> int:
         "--skip-control", action="store_true", help="do not build the gated positive control"
     )
     parser.add_argument(
+        "--skip-upstream",
+        action="store_true",
+        help="do not compare the minimal build against upstream (#414); use only where "
+        "microsoft/mimalloc cannot be fetched",
+    )
+    parser.add_argument(
         "--selftest", action="store_true", help="check the normaliser on fixtures and exit"
     )
     args = parser.parse_args(argv)
@@ -533,6 +605,46 @@ def main(argv: list[str] | None = None) -> int:
             rc = 1
         else:
             print("PASS: no lock-prefixed instruction in the default build's fast path")
+
+        # #414: the absolute comparison. Everything above is relative to a base revision;
+        # this one asks whether the minimal build -- what a consumer gets by default -- is
+        # the upstream allocator, instruction for instruction. It is the evidence behind
+        # "the default build is a plain fast allocator", and it is what would notice a new
+        # fork hook sneaking into the fast path unguarded.
+        if not args.skip_upstream:
+            upstream_rev = resolve_upstream()
+            upstream_src = out / "upstream-src"
+            try:
+                add_worktree(upstream_rev, upstream_src)
+                print(f"building upstream {upstream_rev[:12]} (plain Release) ...")
+                upstream = disassemble_symbols(
+                    build_archive(upstream_src, out / "upstream", UPSTREAM_CMAKE)[0],
+                    FASTPATH_SYMBOLS,
+                    out / "x-upstream",
+                )
+            finally:
+                remove_worktree(upstream_src)
+            print("building HEAD (the minimal build: every subsystem compiled out) ...")
+            head_minimal = disassemble_symbols(
+                build_minimal(ROOT, out / "head-minimal"), FASTPATH_SYMBOLS, out / "x-head-minimal"
+            )
+            print("upstream vs HEAD minimal build (must be identical):")
+            drifted = compare("upstream", upstream, "head-minimal", head_minimal, FASTPATH_SYMBOLS)
+            if drifted:
+                print(
+                    "FAIL: the minimal build's fast path is not upstream's: "
+                    f"{', '.join(drifted)}\n"
+                    "  #414's contract is that a build with no observability compiled in is "
+                    "byte-identical to microsoft/mimalloc at the pinned overlay base. Either a "
+                    "fork hook reached the fast path without a compile-time guard, or the "
+                    "overlay pin moved (CLAUDE.md 'Repo facts') without this pin following it."
+                )
+                rc = 1
+            else:
+                print(
+                    "PASS: the minimal build's fast path is byte-identical to upstream "
+                    f"{upstream_rev[:12]}"
+                )
 
         print("base vs HEAD, default build (must be identical):")
         differing = compare("base-off", base_off, "head-off", head_off, FASTPATH_SYMBOLS)

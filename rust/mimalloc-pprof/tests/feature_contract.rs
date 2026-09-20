@@ -6,6 +6,14 @@
 //! half is the load-bearing one -- it is what lets a downstream crate call this API with
 //! no `#[cfg]` of its own, and what `ci/check_rust_surface.py` and the README's API table
 //! assume. No `required-features`: this test runs in every configuration.
+//!
+//! Deliberately ONE `#[test]`, run in sections, for the same reason t20_memory_events and
+//! t21_visit_live are: every subsystem here is switched through PROCESS-global state (the
+//! profiler flag, DHAT's, memory-events tracking), and cargo runs the tests of one binary
+//! on several threads at once -- so a second test flipping the very flag the first is
+//! asserting on is not a test, it is a race. `purge_all` makes that concrete: run
+//! concurrently with unrelated allocation it can trip a debug assertion in the hole sweep
+//! (issue #417), which reproduces on `main` too and is NOT introduced here.
 
 use mimalloc_pprof::{dhat, memory_events, prof, MiMalloc};
 
@@ -13,7 +21,14 @@ use mimalloc_pprof::{dhat, memory_events, prof, MiMalloc};
 static ALLOCATOR: MiMalloc = MiMalloc;
 
 #[test]
-fn published_feature_contract_selects_dhat_and_pprof() {
+fn published_feature_contract() {
+    dhat_and_pprof();
+    memory_events_section();
+    diagnostics_section();
+    owner_gate_section();
+}
+
+fn dhat_and_pprof() {
     if dhat::is_enabled() {
         dhat::stop();
     }
@@ -63,8 +78,7 @@ fn published_feature_contract_selects_dhat_and_pprof() {
     }
 }
 
-#[test]
-fn published_feature_contract_selects_memory_events() {
+fn memory_events_section() {
     // `dhat` implies `memory-events`, so this is the same cfg on both sides.
     #[cfg(feature = "memory-events")]
     {
@@ -94,8 +108,7 @@ fn published_feature_contract_selects_memory_events() {
     }
 }
 
-#[test]
-fn published_feature_contract_selects_diagnostics() {
+fn diagnostics_section() {
     let path = std::env::temp_dir().join(format!(
         "mimalloc-pprof-feature-contract-{}.bin",
         std::process::id()
@@ -125,8 +138,7 @@ fn published_feature_contract_selects_diagnostics() {
     let _ = std::fs::remove_file(&path);
 }
 
-#[test]
-fn published_feature_contract_selects_owner_gate() {
+fn owner_gate_section() {
     // `gated` reports how the C code was COMPILED, which is exactly this feature.
     let report = mimalloc_pprof::purge_all(false);
     assert_eq!(report.gated, cfg!(feature = "owner-gate"));

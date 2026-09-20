@@ -23,12 +23,33 @@ fn main() {
         .file("vendor/mimalloc-pprof-amalgamated.c")
         .file("layout_probe.c")
         .define("MI_STATIC_LIB", None)
-        // Preserve the crate's default profiler-enabled behavior, while
-        // allowing allocator-only consumers to compile hooks out with
-        // `default-features = false`.
+        // #414: every observability subsystem is opt-in, so each of the five defines below
+        // is derived from its cargo feature and is ALWAYS defined, to 0 or 1 -- the C code
+        // tests `#if MI_<X>`, and mirrors CMake's option of the same name. With nothing
+        // enabled the C library is a plain fast allocator and every API is a C stub.
         .define(
             "MI_PPROF",
             if env::var_os("CARGO_FEATURE_PPROF").is_some() {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        // Issue #20: allocation-change accounting and callbacks, behind `memory-events`.
+        // Note `dhat` implies this feature, and the C side additionally keeps the hook
+        // sites whenever `MI_MEMEVT || MI_DHAT`.
+        .define(
+            "MI_MEMEVT",
+            if env::var_os("CARGO_FEATURE_MEMORY_EVENTS").is_some() {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        // Issues #338/#269: heap snapshot + live-heap JSON dump, behind `diagnostics`.
+        .define(
+            "MI_DIAGNOSTICS",
+            if env::var_os("CARGO_FEATURE_DIAGNOSTICS").is_some() {
                 "1"
             } else {
                 "0"

@@ -14,4 +14,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [dev-dependencies]
-mimalloc-pprof = { path = "../mimalloc-pprof" }
+# #414: the crate's default feature set is empty now, and `tests/allocator_scenario.rs`
+# drives the sampled profiler, so name the feature it needs rather than relying on a
+# default. Cargo unifies features, so a workspace-wide `cargo test` builds the C library
+# once, with pprof in -- which is what that test (and the workspace run) has always had.
+mimalloc-pprof = { path = "../mimalloc-pprof", features = ["pprof"] }

@@ -18,53 +18,53 @@ graphs, call graphs, top reports, and profile diffs.
 
 ```toml
 [dependencies]
-mimalloc-pprof = "0.11"
+mimalloc-pprof = { version = "0.12", features = ["pprof"] }
 
 [profile.release]
 debug = "line-tables-only"
 strip = false
 ```
 
-The pprof-compatible sampled profiler is enabled by default. The exact DHAT
-observer is **opt-in**: it is compiled out unless you enable the `dhat` feature
-(see below). If an application only needs mimalloc and wants to compile the
-profiler out as well, opt out of the default feature:
+### Features (0.12.0: everything is opt-in)
+
+`default = []`. The default build is a **plain fast allocator**: no profiler, no
+accounting hooks, no diagnostics, no DHAT, no owner gate — and its `malloc`/`free` fast
+path is byte-identical to upstream mimalloc, checked on the instruction stream by
+`ci/check_fastpath_identity.py`. Name what you want:
+
+| Feature | C define | What it builds in | Cost when built in but idle |
+|---|---|---|---|
+| `pprof` | `MI_PPROF=1` | sampled pprof heap profiling | +3.4 instructions per malloc/free pair, 28.9 KB |
+| `memory-events` | `MI_MEMEVT=1` | allocation-change accounting and callbacks | +9–13 instructions per pair, 4.0 KB |
+| `diagnostics` | `MI_DIAGNOSTICS=1` | heap snapshot + live-heap JSON dump | 0 instructions, 25.7 KB |
+| `dhat` (implies `memory-events`) | `MI_DHAT=1` | the exact DHAT v2 observer | 0 instructions, 9.8 KB |
+| `owner-gate` | `MI_OWNER_GATE=1` | `purge_all` can sweep every thread | +95 instructions per pair |
+| `full` | all of the above | everything | — |
+
+To restore what 0.11.x built by default, and more:
 
 ```toml
 [dependencies]
-mimalloc-pprof = { version = "0.11", default-features = false }
+mimalloc-pprof = { version = "0.12", features = ["full"] }
 ```
 
-With `default-features = false`, the allocator remains available and the
-profiling API is retained for source compatibility, but profiling cannot be
-started (`prof::start` and `enable_heap_profiling` return `false`) and
-`dhat::start` returns `false`.
+**The whole API is present in every configuration.** A subsystem that was not built in
+is still there as a stub that reports itself off — `prof::start` and
+`enable_heap_profiling` return `false`, `dhat::start` returns `false`,
+`memory_events::set_enabled` returns `false`, `heap_dump_json` returns `None`,
+`heap_snapshot_to_file` returns `Err` — so no caller needs a `#[cfg]` and
+`default-features = false` never fails to *compile* anything.
 
-The `dhat` feature (off by default) builds the C code with `MI_DHAT=1`
-([#371](https://github.com/zackees/mimalloc-pprof/issues/371)): the exact
-DHAT v2 observer. Without it the observer's hook sites are compiled out of
-the allocator entirely and `dhat::start` returns `false`; compiled in but not
-started it costs one not-taken branch per allocation and free. Opt in
-explicitly:
+Cargo features are additive and **unified across the dependency graph**: if any crate in
+your build enables one of these, the C library is built with it and your build pays for
+it too. `cargo tree -e features` shows who asked.
 
-```toml
-[dependencies]
-mimalloc-pprof = { version = "0.11", features = ["dhat"] }
-```
-
-or, for DHAT without the sampled profiler:
-
-```toml
-[dependencies]
-mimalloc-pprof = { version = "0.11", default-features = false, features = ["dhat"] }
-```
-
-The `owner-gate` feature builds the C code with `MI_OWNER_GATE=1`
-([#366](https://github.com/zackees/mimalloc-pprof/issues/366)): every allocator call takes a
-per-thread gate so `purge_all` can sweep *every* thread's heap, not only threads parked in
-`park_while_idle`. It costs a few percent on the malloc/free fast path and is off by default;
-without it `purge_all` reports running threads as pending (`PurgeStatus::Partial`), which is
-a normal outcome, not an error.
+`owner-gate` is the one that changes allocator *behaviour* rather than only adding
+observation: every allocator call takes a per-thread gate so `purge_all` can sweep
+*every* thread's heap, not only threads parked in `park_while_idle`
+([#366](https://github.com/zackees/mimalloc-pprof/issues/366)). Measured at +206% cycles
+on a tight malloc/free loop. Without it `purge_all` reports running threads as pending
+(`PurgeStatus::Partial`), which is a normal outcome, not an error.
 
 ```rust
 use mimalloc_pprof::{prof, MiMalloc};
@@ -101,13 +101,18 @@ MIMALLOC_PROF=1 MIMALLOC_PROF_DUMP_AT_EXIT=heap.prof ./my_app
 
 | | crate | engine |
 |---|---|---|
-| **0.11.x** — current | `mimalloc-pprof = "0.11"` | mimalloc v3 |
+| **0.12.x** — current | `mimalloc-pprof = { version = "0.12", features = ["pprof"] }` | mimalloc v3 |
+| 0.11.x | `mimalloc-pprof = "0.11"` | mimalloc v3 |
 | 0.8.x — previous | `mimalloc-pprof = "0.8"` | mimalloc v2 |
+
+**0.12.0 is a breaking default change**, not an API change: `default = []`, so a
+`mimalloc-pprof = "0.12"` with no features is the allocator alone. Add
+`features = ["full"]` to get 0.11.x's shape (and then some). Nothing stops compiling.
 
 The profiler API, environment variables, and output formats are identical in both,
 so moving between them is a version bump rather than a code change.
 
-**0.11.x is recommended.** It has strictly more test coverage, per-heap allocator
+**0.12.x is recommended.** It has strictly more test coverage, per-heap allocator
 statistics, and fixes two upstream mimalloc bugs that 0.8.x still carries —
 including an unbounded memory leak on Windows/MinGW where every exiting thread
 leaked its heap and pages (23.5 GB at 100 stress iterations, versus flat after the
@@ -115,7 +120,7 @@ fix). Note that upstream mimalloc v3 is itself still a pre-release branch.
 
 ## Exact statistics alongside sampled ones
 
-On 0.11.x, `prof::stats()` carries the allocator's **exact** counters next to the
+On 0.11.x and later, `prof::stats()` carries the allocator's **exact** counters next to the
 sampled ones. A sampled profile alone cannot tell you whether it under-counted;
 comparing the two measures the sampling error directly:
 
@@ -140,11 +145,11 @@ The short version. Safe wrappers, all at the crate root unless noted:
 | Module | What it covers |
 |---|---|
 | `prof` | sampled pprof profiling: start/stop, text and `profile.proto` dumps, `stats()`, `samples()`, `modules()` |
-| `dhat` | exact DHAT v2 profiling: start/stop, `stats()`, `dump_file()` (opt-in `dhat` feature, off by default) |
+| `dhat` | exact DHAT v2 profiling: start/stop, `stats()`, `dump_file()` (needs the `dhat` feature) |
 | `stats` | the allocator's **exact** counters: `get()`, `json()`, `print()`, `bin_size()`, and the subprocess-scoped forms |
-| `memory_events` | opt-in allocation-change accounting: `set_enabled`, `snapshot`, `set_callbacks`, `visit_live_allocations` |
-| `options` | every `mi_option_t`, including the thirteen this fork adds (`Opt::PROF`, `Opt::SCAVENGER`, `Opt::PURGE_HOLES`, …) |
-| crate root | `MiMalloc`, `heap_dump_json`, `on_thread_idle`, `park_while_idle`, `scavenger_stop`, `purge_all`/`purge_all_ex`, `purge_holes_stats`, `purge_holes_report`, `rezalloc`/`recalloc`/`expand`, `unwrapped_malloc`/`_free`/`_realloc` |
+| `memory_events` | allocation-change accounting: `set_enabled`, `snapshot`, `set_callbacks`, `visit_live_allocations` (needs the `memory-events` feature) |
+| `options` | every `mi_option_t`, including the fourteen this fork adds (`Opt::PROF`, `Opt::SCAVENGER`, `Opt::PURGE_HOLES`, …) |
+| crate root | `MiMalloc`, `heap_dump_json` / `heap_snapshot_to_file` (need the `diagnostics` feature), `on_thread_idle`, `park_while_idle`, `scavenger_stop`, `purge_all`/`purge_all_ex`, `purge_holes_stats`, `purge_holes_report`, `rezalloc`/`recalloc`/`expand`, `unwrapped_malloc`/`_free`/`_realloc` |
 
 `mimalloc_pprof::sys` holds the raw `unsafe extern "C"` declarations and the `#[repr(C)]`
 struct mirrors behind all of the above. The mirrors are checked field-by-field against

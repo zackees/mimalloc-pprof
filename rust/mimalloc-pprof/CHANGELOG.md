@@ -1,6 +1,62 @@
 # Changelog
 
-## Unreleased
+## 0.12.0
+
+**Every observability subsystem is opt-in. The default build is a plain fast allocator.**
+
+- **Breaking default change: `default = []`**
+  ([#414](https://github.com/zackees/mimalloc-pprof/issues/414)). `mimalloc-pprof = "0.12"`
+  with no features now builds mimalloc and nothing else — no sampled profiler, no
+  allocation-change accounting, no heap snapshot / live-heap JSON dump, no DHAT, no owner
+  gate. Its `mi_malloc`/`mi_free` fast path is **byte-identical to upstream mimalloc** at
+  the pinned v3 overlay base, which `ci/check_fastpath_identity.py` now checks on the
+  instruction stream rather than asserting in prose.
+
+  **To restore the previous behaviour and more, use `features = ["full"]`:**
+
+  ```toml
+  mimalloc-pprof = { version = "0.12", features = ["full"] }
+  ```
+
+  Or name just what you need:
+
+  | Feature | C define | Turns on | Cost when built in but idle |
+  |---|---|---|---|
+  | `pprof` | `MI_PPROF=1` | sampled pprof heap profiling | +3.4 instr / malloc+free pair, 28.9 KB |
+  | `memory-events` | `MI_MEMEVT=1` | allocation-change accounting and callbacks | +9–13 instr / pair (18–26%), 4.0 KB |
+  | `diagnostics` | `MI_DIAGNOSTICS=1` | heap snapshot (#338) + live-heap JSON dump (#269) | 0 instr, 25.7 KB |
+  | `dhat` (implies `memory-events`) | `MI_DHAT=1` | the exact DHAT v2 observer | 0 instr, 9.8 KB |
+  | `owner-gate` | `MI_OWNER_GATE=1` | `purge_all` sweeps every thread | +95 instr / pair (+206% cycles) |
+  | `full` | — | all five | — |
+
+  **The API does not change.** Every `mi_*` export and every Rust wrapper is present in
+  every configuration; a subsystem that was not built in reports itself off
+  (`prof::start` / `dhat::start` / `memory_events::set_enabled` return `false`,
+  `heap_dump_json` returns `None`, `heap_snapshot_to_file` returns `Err`). No caller
+  needs a `#[cfg]`, and `default-features = false` never fails to compile anything.
+  `Opt::SNAPSHOT_ON_EXIT` and the whole `mi_option_t` sequence are unchanged in every
+  build (Bun parity contract).
+
+  Cargo features are additive and unified across the dependency graph: if any crate in
+  your build enables one of these, the C library is built with it and your build pays for
+  it too. `cargo tree -e features` shows who asked.
+
+  [#415](https://github.com/zackees/mimalloc-pprof/issues/415) tracks making the
+  memory-events hooks free, which would let that one default back on at no cost.
+
+- **CMake matches**: `MI_PPROF` flips `ON` → `OFF`, and two new options join `MI_DHAT`
+  and `MI_OWNER_GATE` at `OFF`: `MI_MEMEVT` and `MI_DIAGNOSTICS`. The fallbacks in
+  `include/mimalloc/types.h` match, so a consumer that compiles `src/static.c` directly
+  (no CMake — e.g. Bun's build) gets the same minimal allocator. DHAT still dispatches
+  through the memory-events slow paths, so the hook sites survive whenever
+  `MI_MEMEVT || MI_DHAT`.
+
+- **Corrected documentation that measurement disproved**: the owner gate costs +206%
+  cycles on a tight malloc/free loop, not "a few percent"; memory-events costs 9–13
+  instructions per malloc/free pair when idle, not "one relaxed flag check and nothing
+  else"; `mi_option_t` has 62 enumerators with 14 added by this fork at indices 47–60,
+  not 61/13/47–59; and `purge_zeroes` is live again (restored by
+  [#337](https://github.com/zackees/mimalloc-pprof/issues/337)), not dead since #80.
 
 - **Behavior change: DHAT is now opt-in.** New `dhat` cargo feature, **off by default**
   ([#371](https://github.com/zackees/mimalloc-pprof/issues/371)). It controls the C `MI_DHAT`

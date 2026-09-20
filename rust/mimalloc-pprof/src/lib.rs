@@ -9,9 +9,21 @@
 //! # Ok(()) }
 //! ```
 //!
-//! Profiling is enabled by default. To build the allocator without profiler
-//! hooks, depend on this crate with `default-features = false`; in that mode the
-//! profiling API remains available but cannot start a profiler.
+//! Since 0.12.0 **every observability subsystem is opt-in** and the default build is a
+//! plain fast allocator whose `malloc`/`free` fast path is byte-identical to upstream
+//! mimalloc. Enable what you need with cargo features -- `pprof` (the example above),
+//! `memory-events`, `diagnostics`, `dhat` (implies `memory-events`), `owner-gate`, or
+//! `full` for all of them:
+//!
+//! ```toml
+//! mimalloc-pprof = { version = "0.12", features = ["pprof"] }
+//! ```
+//!
+//! The whole API compiles and links in every configuration: a subsystem that was not
+//! built in simply reports itself off (`prof::start` returns `false`, `heap_dump_json`
+//! returns `None`, and so on), so no `#[cfg]` is needed at the call site. Cargo features
+//! are additive and unified across the dependency graph, so a dependency that enables one
+//! enables it for your build too -- `cargo tree -e features` shows who.
 //!
 //! See the README's Rust integration guide for frame-pointer and line-table
 //! build flags. Open the resulting profile with `pprof -http=: app.exe heap.prof`.
@@ -212,8 +224,11 @@ pub unsafe fn usable_size(p: *const u8) -> usize {
 /// [`HEAP_DUMP_JSON_DEFAULT_WAIT_MS`] as the owner-acquisition deadline. See
 /// [`heap_dump_json_ex`] for the complete waiting and coverage contract.
 ///
-/// Returns `None` only on allocation failure (out of memory building the JSON buffer),
-/// not for an empty subprocess.
+/// Requires the `diagnostics` feature (#414): without it the dump is compiled out of the
+/// C library and this returns `None`.
+///
+/// Otherwise returns `None` only on allocation failure (out of memory building the JSON
+/// buffer), not for an empty subprocess.
 pub fn heap_dump_json(include_blocks: bool, hash_addresses: bool) -> Option<String> {
     let ptr = unsafe { sys::mi_heap_dump_json(include_blocks, hash_addresses) };
     heap_dump_json_from_ptr(ptr)
@@ -268,8 +283,12 @@ pub const HEAP_DUMP_JSON_DEFAULT_WAIT_MS: usize = 100;
 /// threads keep allocating while it is written, so their pages' counts may be slightly
 /// stale. Allocation-free on the writer's side, so it is safe to call from anywhere.
 ///
+/// Requires the `diagnostics` feature (#414): without it the writer is compiled out of the
+/// C library and this always returns `Err`.
+///
 /// Errors: the file could not be created or written. The same snapshot can be produced
-/// without code by setting `MIMALLOC_SNAPSHOT_ON_EXIT=1|2` (and `MIMALLOC_SNAPSHOT_PATH`).
+/// without code by setting `MIMALLOC_SNAPSHOT_ON_EXIT=1|2` (and `MIMALLOC_SNAPSHOT_PATH`)
+/// -- also only in a `diagnostics` build.
 pub fn heap_snapshot_to_file(
     path: impl AsRef<std::path::Path>,
     blocks: bool,
@@ -1457,10 +1476,13 @@ pub mod stats {
 
 /// Opt-in allocation-change accounting and callbacks (`include/mimalloc/memory-events.h`).
 ///
-/// Independent of the sampled profiler: this module is compiled into the C library in
-/// every configuration, including `default-features = false`. Tracking is **off** by
-/// default; while it is off every allocate/free/realloc pays for exactly one relaxed flag
-/// check and nothing else.
+/// Independent of the sampled profiler, and **opt-in at compile time** since 0.12.0
+/// (#414): the C side is built only with the `memory-events` cargo feature (which `dhat`
+/// implies). Without it the per-allocation hook sites are compiled out -- they were
+/// measured at 9-13 instructions per malloc/free pair, 18-26% of the pair, even with
+/// tracking disabled -- and every function here links but reports the subsystem off
+/// ([`set_enabled`] returns `false`, [`snapshot`] returns `None`). With the feature on,
+/// tracking is still **off** until [`set_enabled`] or `MIMALLOC_MEMORY_EVENTS=1`.
 ///
 /// ```
 /// use mimalloc_pprof::{memory_events, MiMalloc};
@@ -1471,7 +1493,9 @@ pub mod stats {
 /// static ALLOCATOR: MiMalloc = MiMalloc;
 ///
 /// fn main() {
-///     memory_events::set_enabled(true);
+///     if !memory_events::set_enabled(true) {
+///         return; // built without the `memory-events` feature: the API is a stub
+///     }
 ///     let before = memory_events::snapshot().expect("snapshot").accum_count;
 ///     let v = vec![0_u8; 4096];
 ///     std::hint::black_box(&v);
@@ -1858,6 +1882,7 @@ mod tests {
         dhat::stop();
     }
     #[test]
+    #[cfg(feature = "diagnostics")]
     fn heap_dump_json_reports_well_formed_json_with_current_heap() {
         // The default/main heap always has at least one live allocation by the time any
         // Rust test runs (the runtime itself allocates), so a pages-only dump of the
@@ -1876,5 +1901,19 @@ mod tests {
             heap_dump_json_ex(false, false, 0).expect("heap_dump_json_ex should not fail");
         assert!(one_attempt.starts_with("{ \"heaps\": ["));
         assert!(one_attempt.contains("\"complete\":"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "diagnostics"))]
+    fn heap_dump_and_snapshot_are_inert_when_compiled_out() {
+        // #414: the API is still here and still safe to call; it just reports nothing.
+        assert!(heap_dump_json(false, false).is_none());
+        assert!(heap_dump_json_ex(true, true, 0).is_none());
+        let path = std::env::temp_dir().join(format!(
+            "mimalloc-pprof-no-diagnostics-{}.bin",
+            std::process::id()
+        ));
+        assert!(heap_snapshot_to_file(&path, false).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

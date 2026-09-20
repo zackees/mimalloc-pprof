@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit df8afc62 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4aee27a1 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -476,6 +476,9 @@ mi_decl_export void   mi_arenas_print(void) mi_attr_noexcept;
 // Write a binary heap snapshot to `fd` for offline analysis (see tools/mi-heapview.c and
 // examples/heap-snapshot/). Returns 0 on success, -1 on write error. Bun parity (#338):
 // format version 1 is byte-identical to oven-sh/mimalloc's.
+// #414: compiled in only with MI_DIAGNOSTICS=1 (CMake -DMI_DIAGNOSTICS=ON, cargo feature
+// `diagnostics`; default OFF). Without it both entry points link and return -1, and
+// `mi_option_snapshot_on_exit` below still exists but has nothing to run.
 #define MI_SNAPSHOT_BLOCKS  0x01    // include per-block free bitmaps for pages owned by the calling thread
 mi_decl_export int    mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept;
 mi_decl_export int    mi_heap_snapshot_to_file(const char* path, unsigned flags) mi_attr_noexcept;
@@ -937,12 +940,23 @@ mi_decl_nodiscard mi_decl_export bool mi_prof_modules_visit(mi_prof_module_visit
 #endif
 /* ---- end inlined: include/mimalloc/profile.h ---- */
 /* ---- begin inlined: include/mimalloc/memory-events.h ---- */
-/* Public, allocation-change accounting/monitoring API. Independent of MI_PPROF: this
-   module (src/memory-events.c) is always compiled in, opt-in only via the
-   `MIMALLOC_MEMORY_EVENTS` environment variable or the `mi_memory_tracking_set_enabled`
-   API below.
+/* Public, allocation-change accounting/monitoring API. Independent of MI_PPROF.
 
-   ## Activation
+   ## Compile-time opt-in (#414)
+
+   Since 0.12.0 this module (src/memory-events.c) is compiled in only when `MI_MEMEVT` is
+   1 (CMake `-DMI_MEMEVT=ON`, cargo feature `memory-events`; both default OFF). Its cost
+   when compiled in but disabled was measured at 9-13 instructions per malloc/free pair,
+   which is 18-26% of the pair, so the default build leaves it out entirely and every hook
+   site expands to nothing. Everything declared below still LINKS in that build -- the
+   functions are stubs that report the subsystem off (`false`) -- so downstream code needs
+   no `#ifdef`. `MI_DHAT=1` keeps the hook sites (DHAT dispatches through them) but does
+   not make this API real. #415 tracks making the hooks free enough to default back on.
+
+   The `mi_unwrapped_*` family at the end of this header is NOT part of that: it is a
+   raw-OS allocation helper for instrumentation callers and is real in every build.
+
+   ## Activation (runtime, once compiled in)
 
    - `MIMALLOC_MEMORY_EVENTS=1` is read lazily, exactly once, the first time any
      allocation/free/realloc hook runs -- never during process startup. The result is
@@ -955,9 +969,11 @@ mi_decl_nodiscard mi_decl_export bool mi_prof_modules_visit(mi_prof_module_visit
      reconstruct allocations made while tracking was disabled -- the running totals
      silently omit that interval. Callers that need an exact total must enable tracking
      before their first allocation and leave it enabled for the life of the process.
-   - When tracking is disabled (the default), every allocate/free/realloc pays for
-     exactly one relaxed flag check on the hot path -- no atomic accounting update, no
-     callback-table lock, no callback-table lookup.
+   - When tracking is disabled (the default) but the module is compiled in, every
+     allocate/free/realloc pays for one relaxed flag check plus the branch and the call
+     frame it forces -- measured at 9-13 instructions per malloc/free pair -- and no
+     atomic accounting update, callback-table lock or callback-table lookup.
+     When the module is compiled out (`MI_MEMEVT=0`, the default), it pays nothing.
 
    ## Callback contract
 
@@ -1254,11 +1270,15 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MI_TYPES_H
 #define MI_TYPES_H
 
-// #267: default the allocation sampling profiler ON so a consumer that compiles
-// `src/static.c` directly (no CMake, e.g. Bun's build) gets it, matching this fork's
-// CMake default (`option(MI_PPROF ... ON)`, CMakeLists.txt). CMake keeps passing
-// -DMI_PPROF=0/1 explicitly, which wins over this default since that's a command-line
-// define, not a re-definition. See README's C build section.
+// #414: EVERY observability subsystem is opt-in (owner decision 2026-09-19). The default
+// build -- including a consumer that compiles `src/static.c` directly with no CMake, e.g.
+// Bun's build -- is a plain fast allocator: profiler, memory-events, diagnostics, DHAT and
+// the owner gate are all compiled out, and the public API of each survives only as stubs.
+// Each fallback below matches its CMake `option(... OFF)` default; CMake keeps passing
+// -DMI_<X>=0/1 explicitly, which wins over these defaults since a command-line define is
+// not a re-definition. See README's C build section, and #415 for the follow-up that could
+// make memory-events free enough to default back on.
+//
 // #366: compile-time owner gate. When 1, every allocator operation takes the thread's own
 // `park_state` lock (the park protocol with its default inverted), so `mi_purge_all` can
 // sweep every registered thread. Off by default: the default build's fast path is byte-identical.
@@ -1266,8 +1286,29 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_OWNER_GATE 0
 #endif
 
+// #267/#414: allocation sampling profiler (src/profile*.c). When 0 the sampling hooks, the
+// per-page record fields and the profiler's per-theap state all compile away; the public
+// `mi_prof_*` API survives as stubs (see the `#else` block at the end of src/profile.c).
 #ifndef MI_PPROF
-#define MI_PPROF 1
+#define MI_PPROF 0
+#endif
+
+// #20/#414: allocation-change accounting and callbacks (src/memory-events.c). When 0 the
+// per-allocation hook sites compile away entirely and the public `mi_memory_*` API survives
+// as stubs. NOTE: DHAT dispatches through the memory-events slow paths, so the hook sites
+// are compiled in whenever `MI_MEMEVT || MI_DHAT` -- see include/mimalloc/internal.h.
+// The `mi_unwrapped_*` family is NOT part of this: it is a raw-OS allocation helper for
+// instrumentation callers, unrelated to tracking, and is real in every build.
+#ifndef MI_MEMEVT
+#define MI_MEMEVT 0
+#endif
+
+// #338/#269/#414: heap snapshot (src/heap-snapshot.c) and live-heap JSON dump
+// (src/heap-dump.c). When 0 both compile away and `mi_heap_snapshot`,
+// `mi_heap_snapshot_to_file`, `mi_heap_dump_json{,_ex}` and `mi_heap_get_seq` survive as
+// stubs. `mi_option_snapshot_on_exit` stays present in every build (Bun parity contract).
+#ifndef MI_DIAGNOSTICS
+#define MI_DIAGNOSTICS 0
 #endif
 
 // #371: compile-time switch for the exact DHAT v2 observer (src/dhat.c). When 0 the
@@ -2816,8 +2857,10 @@ typedef struct mi_page_s {
   uintptr_t                 keys[2];           // const: two random keys to encode the free lists (see `_mi_block_next`) or padding canary
   #endif
 
+  #if MI_PPROF
   struct mi_prof_record_s*  metadata;          // sampled live allocation records, or NULL (MI_PPROF)
   bool                      has_metadata;      // `true` if profiler records are attached to this page
+  #endif
 
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
   // The OS pages inside this page whose memory was discarded to the OS. A block is
@@ -4998,18 +5041,33 @@ size_t      _mi_prof_debug_records_compared(void);
    that contract -- the word starts non-zero, so the first hook still takes the slow path
    and still resolves the environment there -- while letting the steady state be zero.
    Each observer owns its own two bits and publishes them when it resolves, is enabled, or
-   is stopped; neither module can clear the other's. */
+   is stopped; neither module can clear the other's.
+
+   #414: and when no observer is COMPILED in at all -- the default build -- even that one
+   load and branch is gone: every hook site below expands to nothing. The hook sites survive
+   whenever `MI_MEMEVT || MI_DHAT`, because DHAT dispatches through the memory-events slow
+   paths (src/memory-events.c), so `MI_MEMEVT=0 MI_DHAT=1` must still keep them. */
+#if MI_MEMEVT || MI_DHAT
+
 #define MI_OBSERVERS_MEMEVT_UNRESOLVED  ((size_t)1)
 #define MI_OBSERVERS_MEMEVT_ON          ((size_t)2)
+#if MI_MEMEVT
+#define MI_OBSERVERS_MEMEVT_INITIAL     (MI_OBSERVERS_MEMEVT_UNRESOLVED)
+#else
+// #414: compiled out -- memory-events never resolves, so (exactly like DHAT below) it must
+// not leave an `unresolved` bit set or the fast path would take the slow branch forever.
+#define MI_OBSERVERS_MEMEVT_INITIAL     ((size_t)0)
+#endif
 #if MI_DHAT
 #define MI_OBSERVERS_DHAT_UNRESOLVED    ((size_t)4)
 #define MI_OBSERVERS_DHAT_ON            ((size_t)8)
-#define MI_OBSERVERS_INITIAL  (MI_OBSERVERS_MEMEVT_UNRESOLVED | MI_OBSERVERS_DHAT_UNRESOLVED)
+#define MI_OBSERVERS_DHAT_INITIAL       (MI_OBSERVERS_DHAT_UNRESOLVED)
 #else
 // Compiled out (#372): DHAT never resolves, so it must not leave an `unresolved` bit set
 // or the fast path would take the slow branch forever.
-#define MI_OBSERVERS_INITIAL  (MI_OBSERVERS_MEMEVT_UNRESOLVED)
+#define MI_OBSERVERS_DHAT_INITIAL       ((size_t)0)
 #endif
+#define MI_OBSERVERS_INITIAL  (MI_OBSERVERS_MEMEVT_INITIAL | MI_OBSERVERS_DHAT_INITIAL)
 
 extern _Atomic(size_t) _mi_observers_armed;   // defined in memory-events.c
 
@@ -5018,7 +5076,7 @@ static inline bool _mi_observers_idle(void) {
 }
 
 // "memory-events.c": opt-in allocation-change accounting/callbacks (issue #20). Independent of
-// MI_PPROF: always compiled in and hooked; the runtime activation flag gates all real work.
+// MI_PPROF; the runtime activation flag gates all real work once compiled in.
 void        _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size);
 void        _mi_memevt_on_free_slow(mi_page_t* page, void* p);
 void        _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t request_size);
@@ -5043,6 +5101,29 @@ static inline void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pr
   if mi_likely(_mi_observers_idle()) return;
   _mi_memevt_on_resize_slow(oldp, newp, usable_pre, usable_post, request_size);
 }
+
+#else  // !(MI_MEMEVT || MI_DHAT)
+
+// #414: no observer is compiled in. Every hook site expands to nothing -- no load, no
+// branch, no call -- so `mi_malloc`/`mi_free` are byte-identical to upstream mimalloc
+// (proved by ci/check_fastpath_identity.py). The call sites in alloc.c/alloc-aligned.c/
+// free.c stay exactly as they are; only these definitions change.
+// (`MI_UNUSED` is not defined yet at this point in the header, hence the plain casts.)
+static inline void _mi_memevt_on_alloc(mi_page_t* page, void* p, size_t request_size) {
+  (void)page; (void)p; (void)request_size;
+}
+static inline void _mi_memevt_on_free(mi_page_t* page, void* p) {
+  (void)page; (void)p;
+}
+static inline void _mi_memevt_on_realloc_in_place(mi_page_t* page, void* p, size_t request_size) {
+  (void)page; (void)p; (void)request_size;
+}
+static inline void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pre, size_t usable_post, size_t request_size) {
+  (void)oldp; (void)newp; (void)usable_pre; (void)usable_post; (void)request_size;
+}
+
+#endif // MI_MEMEVT || MI_DHAT
+
 // Suppress accounting/dispatch for internal allocate+free pairs that are really one resize
 // (e.g. a moving realloc's internal mi_theap_umalloc+mi_free), and for reentrant calls made
 // from inside a memory-change callback itself.
@@ -13744,6 +13825,8 @@ bool mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block
 
 // #374: kept separate from the upstream visitor; needs this TU's private page pins
 // and ownership-release helpers. Also included transitively by src/static.c.
+// #414: its only consumer is src/heap-dump.c, so it follows MI_DIAGNOSTICS.
+#if MI_DIAGNOSTICS
 /* ---- begin inlined: src/diagnostic-walk.c ---- */
 // #374: compiled inside arena.c (including the Rust single-TU build).
 // No allocator fast-path changes: ownership is acquired only by this diagnostic.
@@ -13916,6 +13999,7 @@ bool _mi_heap_visit_capture(mi_heap_t* heap, bool blocks, mi_block_visit_fun* vi
   return ok;
 }
 /* ---- end inlined: src/diagnostic-walk.c ---- */
+#endif
 
 
 typedef struct mi_heap_delete_visit_info_s {
@@ -17743,6 +17827,11 @@ bool _mi_test_heaps_lock_poison_observed(void) {
    pages are captured independently. Cooperatively park foreign owners for coverage.
    The generic mi_heap_visit_blocks API retains its existing concurrency contract. */
 
+// #414: the live-heap JSON dump is opt-in (`MI_DIAGNOSTICS`, CMake -DMI_DIAGNOSTICS=ON,
+// cargo feature `diagnostics`). With it off the capture/serializer compiles away and the
+// three public entry points become the stubs at the end of this file.
+#if MI_DIAGNOSTICS
+
 #if MI_DEBUG > 0
 mi_decl_export _Atomic(uintptr_t) mi_debug_dump_fail_after;
 mi_decl_export _Atomic(uintptr_t) mi_debug_dump_retrying;
@@ -18035,6 +18124,21 @@ char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexce
 size_t mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept {
   return heap != NULL ? heap->heap_seq : 0;
 }
+
+#else  // !MI_DIAGNOSTICS
+
+// #414: compiled out. The public API stays present in every configuration (same contract
+// as src/profile.c's `#else` block) so downstream keeps linking; a dump request just
+// returns NULL and the heap sequence number reads as 0.
+char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms) mi_attr_noexcept {
+  MI_UNUSED(include_blocks); MI_UNUSED(hash_addresses); MI_UNUSED(wait_ms); return NULL;
+}
+char* mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept {
+  MI_UNUSED(include_blocks); MI_UNUSED(hash_addresses); return NULL;
+}
+size_t mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept { MI_UNUSED(heap); return 0; }
+
+#endif // MI_DIAGNOSTICS
 /* ---- end inlined: src/heap-dump.c ---- */
 /* ---- begin inlined: src/heap-snapshot.c ---- */
 /* ----------------------------------------------------------------------------
@@ -18069,6 +18173,12 @@ terms of the MIT license. A copy of the license can be found in the file
 
 size_t   mi_arenas_get_count(mi_subproc_t* subproc);              // arena.c (not in internal.h here)
 uint8_t* mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);  // arena.c (not in internal.h here)
+
+// #414: the heap snapshot is opt-in (`MI_DIAGNOSTICS`, CMake -DMI_DIAGNOSTICS=ON, cargo
+// feature `diagnostics`). With it off the whole writer compiles away and the three entry
+// points below become the stubs at the end of this file; `mi_option_snapshot_on_exit`
+// still exists in every build (Bun parity contract), it just has nothing to run.
+#if MI_DIAGNOSTICS
 
 #if defined(_WIN32)
 #include <io.h>
@@ -18503,6 +18613,17 @@ void _mi_heap_snapshot_on_exit(void) {
     _mi_warning_message("failed to write heap snapshot to %s\n", path);
   }
 }
+
+#else  // !MI_DIAGNOSTICS
+
+// #414: compiled out. The public API stays present in every configuration (same contract
+// as src/profile.c's `#else` block) so downstream keeps linking; a snapshot request just
+// fails. `_mi_heap_snapshot_on_exit` is still called unconditionally from mi_process_done.
+int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept { MI_UNUSED(fd); MI_UNUSED(flags); return -1; }
+int mi_heap_snapshot_to_file(const char* path, unsigned flags) mi_attr_noexcept { MI_UNUSED(path); MI_UNUSED(flags); return -1; }
+void _mi_heap_snapshot_on_exit(void) { }
+
+#endif // MI_DIAGNOSTICS
 /* ---- end inlined: src/heap-snapshot.c ---- */
 /* ---- begin inlined: src/init.c ---- */
 /* ----------------------------------------------------------------------------
@@ -18539,8 +18660,10 @@ static const mi_page_t mi_page_empty = {
   #if (MI_PADDING || MI_ENCODE_FREELIST)
   { 0, 0 },                // keys
   #endif
+  #if MI_PPROF
   NULL,                   // metadata (MI_PPROF)
   false,                  // has_metadata
+  #endif
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
   { 0 },                  // purged: no discarded OS pages
   0, 0,                   // unformed_purged_lo / _hi: nothing of the unformed tail is discarded
@@ -19927,9 +20050,16 @@ mi_decl_noinline size_t _mi_popcount_generic(size_t x) {
 /* ---- begin inlined: src/memory-events.c ---- */
 /* Opt-in global-heap allocation-change accounting and callbacks (issue #20).
 
-   Independent of MI_PPROF: always compiled in (see src/static.c), gated only by the
-   runtime `memevt_state` flag below (env var MIMALLOC_MEMORY_EVENTS, or the
-   mi_memory_tracking_set_enabled API). Structurally this module mirrors src/profile.c's
+   Independent of MI_PPROF. #414: opt-in at COMPILE time too -- `MI_MEMEVT` (CMake
+   `-DMI_MEMEVT=ON`, cargo feature `memory-events`) must be 1 or the accounting, the
+   callback table and the per-allocation hook sites all compile away and the public
+   `mi_memory_*` API is the stub block near the end of this file. The hook *entry points*
+   survive whenever `MI_MEMEVT || MI_DHAT`, because DHAT dispatches through them.
+   Once compiled in, it is still gated by the runtime `memevt_state` flag below (env var
+   MIMALLOC_MEMORY_EVENTS, or the mi_memory_tracking_set_enabled API).
+   The `mi_unwrapped_*` family at the end is NOT part of any of this: it is a raw-OS
+   helper for instrumentation callers and is real in every configuration.
+   Structurally this module mirrors src/profile.c's
    patterns (mi_atomic_do_once-style lazy env read, snapshot-then-release callback
    dispatch, a thread-local reentrancy depth counter) but is a separate, independent
    feature: see include/mimalloc/memory-events.h for the full API contract.
@@ -20041,12 +20171,15 @@ static inline mi_hooks_tld_t* _mi_hooks_tld_peek_or_local(mi_hooks_tld_t* local)
 // resolved via the lazy env path -- matching "tracking may also be enabled/disabled by
 // API" as an override, not just a fallback.
 // ---------------------------------------------------------------------------------------
+#if MI_MEMEVT
 #define MEMEVT_UNINIT    0
 #define MEMEVT_DISABLED  1
 #define MEMEVT_ENABLED   2
 
 static _Atomic(size_t) memevt_state;
+#endif
 
+#if MI_MEMEVT || MI_DHAT
 // #371 tier 2: the word the alloc/free fast path reads (see internal.h). Starts non-zero so
 // the first hook still resolves the environment lazily, exactly as documented; each observer
 // publishes its own bits into it and cannot clear the other's.
@@ -20056,7 +20189,9 @@ static _Atomic(size_t) memevt_state;
 // written on every event once tracking is on, and false sharing there would hand the enabled
 // path the very cache-line ping-pong this issue is about.
 mi_decl_cache_align _Atomic(size_t) _mi_observers_armed = MI_OBSERVERS_INITIAL;
+#endif // MI_MEMEVT || MI_DHAT
 
+#if MI_MEMEVT
 // Publish this module's two bits. Order matters when arming: ON is set before UNRESOLVED is
 // cleared, so the word is never transiently zero while tracking is on.
 static void memevt_publish_armed(size_t state) {
@@ -20086,6 +20221,7 @@ static _Atomic(size_t) memevt_accum_count;
 static mi_lock_t memevt_cb_lock = MI_LOCK_INITIALIZER;
 static mi_memory_change_fun* memevt_handlers[MI_MEMORY_CHANGE_COUNT];
 static void*                 memevt_args[MI_MEMORY_CHANGE_COUNT];
+#endif // MI_MEMEVT
 
 // Reentrancy / internal-op suppression (mirrors profile.c's prof_callback_depth).
 // >0 means: skip accounting and skip dispatch entirely. Two callers increment this:
@@ -20105,9 +20241,14 @@ static void*                 memevt_args[MI_MEMORY_CHANGE_COUNT];
 // but also mid *teardown* (mi_thread_theaps_done resets the default theap to the empty
 // sentinel before freeing this thread's theaps specifically so nothing re-initializes it
 // in that window; see its comment in init.c). No-op on NULL rather than crash either way.
+// #414: these two stay REAL in every configuration -- they are a per-thread depth counter
+// on state that exists unconditionally, they are off the mi_malloc/mi_free fast path
+// (guarded-page, aligned and moving-realloc paths only), and keeping them real leaves the
+// unconditional call sites in alloc.c/alloc-aligned.c/dhat.c untouched.
 void _mi_memevt_suppress_begin(void) { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth++; }
 void _mi_memevt_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_peek(); if (h != NULL) h->memevt_suppress_depth--; }
 
+#if MI_MEMEVT
 // #270: fork-safety. Child-side policy: CONTINUE. `memevt_cb_lock` only ever guards a
 // snapshot-copy of the callback table (see the comment above its declaration) and, per
 // that same comment, is never held while a user handler runs -- so unlike
@@ -20244,7 +20385,9 @@ static void memevt_dispatch(mi_hooks_tld_t* hooks, mi_memory_change_kind_t kind,
   handler(&change, handler_arg);
   hooks->memevt_suppress_depth--;
 }
+#endif // MI_MEMEVT
 
+#if MI_MEMEVT || MI_DHAT
 // ---------------------------------------------------------------------------------------
 // Hook entry points. Each begins with the single disabled-hot-path flag check: a plain
 // relaxed load compared against MEMEVT_DISABLED. Only when that check is *not* true
@@ -20284,12 +20427,16 @@ void _mi_memevt_on_alloc_slow(mi_page_t* page, void* p, size_t request_size) {
   #if MI_DHAT
   _mi_dhat_begin_alloc(page, p, request_size);
   #endif
+  #if MI_MEMEVT
   size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_UNINIT) { memevt_resolve_env(); state = mi_atomic_load_relaxed(&memevt_state); }
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
     memevt_dispatch(hooks, MI_MEMORY_ALLOCATE, (int64_t)usable, (uint64_t)request_size);
   }
+  #else
+  MI_UNUSED(request_size);  // #414: memory-events compiled out; only DHAT observes here
+  #endif
   #if MI_DHAT
   _mi_dhat_finish_event();
   #endif
@@ -20328,11 +20475,13 @@ void _mi_memevt_on_free_slow(mi_page_t* page, void* p) {
   #if MI_DHAT
   _mi_dhat_begin_free(p);
   #endif
+  #if MI_MEMEVT
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const size_t usable = mi_page_usable_block_size(page);
     memevt_dispatch(hooks, MI_MEMORY_FREE, -(int64_t)usable, 0);
   }
+  #endif
   #if MI_DHAT
   _mi_dhat_finish_event();
   #endif
@@ -20349,12 +20498,17 @@ void _mi_memevt_on_realloc_in_place_slow(mi_page_t* page, void* p, size_t reques
   #if MI_DHAT
   _mi_dhat_begin_resize(p, p, request_size);
   #endif
+  #if MI_MEMEVT
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     // Same page => same block-size class => usable size is identical before and after.
-    MI_UNUSED(page);
     memevt_dispatch(hooks, MI_MEMORY_RESIZE, 0, (uint64_t)request_size);
   }
+  #else
+  MI_UNUSED(request_size);  // #414: memory-events compiled out; only DHAT observes here
+  #endif
+  // Same page => same block-size class => usable size is identical before and after.
+  MI_UNUSED(page);
   #if MI_DHAT
   _mi_dhat_finish_event();
   #endif
@@ -20371,16 +20525,23 @@ void _mi_memevt_on_resize_slow(void* oldp, void* newp, size_t usable_pre, size_t
   #if MI_DHAT
   _mi_dhat_begin_resize(oldp, newp, request_size);
   #endif
+  #if MI_MEMEVT
   const size_t state = mi_atomic_load_relaxed(&memevt_state);
   if (state == MEMEVT_ENABLED) {
     const int64_t delta = (int64_t)usable_post - (int64_t)usable_pre;
     memevt_dispatch(hooks, MI_MEMORY_RESIZE, delta, (uint64_t)request_size);
   }
+  #else
+  // #414: memory-events compiled out; only DHAT observes here.
+  MI_UNUSED(usable_pre); MI_UNUSED(usable_post); MI_UNUSED(request_size);
+  #endif
   #if MI_DHAT
   _mi_dhat_finish_event();
   #endif
 }
+#endif // MI_MEMEVT || MI_DHAT
 
+#if MI_MEMEVT
 // ---------------------------------------------------------------------------------------
 // Best-effort live-allocation visitor.
 //
@@ -20464,6 +20625,23 @@ static bool mi_memory_visit_live_allocations_inner(mi_theap_t* theap, mi_memory_
   }
   return true;
 }
+
+#else  // !MI_MEMEVT
+
+// #414: memory-events compiled out. The public API stays present in every configuration --
+// same contract as src/profile.c's `#else` block -- so a downstream crate keeps linking and
+// `ci/check_rust_surface.py` / the README API table stay valid. Everything reports "off".
+bool mi_memory_tracking_set_enabled(bool enabled) mi_attr_noexcept { MI_UNUSED(enabled); return false; }
+bool mi_memory_tracking_is_enabled(void) mi_attr_noexcept { return false; }
+bool mi_memory_set_callbacks(const mi_memory_callbacks_t* callbacks) mi_attr_noexcept { MI_UNUSED(callbacks); return false; }
+bool mi_memory_snapshot(mi_memory_snapshot_t* out) mi_attr_noexcept { MI_UNUSED(out); return false; }
+bool mi_memory_visit_live_allocations(mi_memory_allocation_visit_fun* visitor, void* arg) mi_attr_noexcept { MI_UNUSED(visitor); MI_UNUSED(arg); return false; }
+// #270: no `memevt_cb_lock` exists when memory-events is off -- nothing to quiesce.
+void _mi_memevt_fork_prepare(void) { }
+void _mi_memevt_fork_parent(void)  { }
+void _mi_memevt_fork_child(void)   { }
+
+#endif // MI_MEMEVT
 
 // ---------------------------------------------------------------------------------------
 // Stable public "unwrapped" instrumentation allocation path: backed directly by
@@ -27172,6 +27350,9 @@ mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 // A true complete result still does not make independently captured pages one global
 // instant. Ungated foreign owners must cooperatively park for coverage. Use mi_free
 // to free the result.
+// #414: compiled in only with MI_DIAGNOSTICS=1 (CMake -DMI_DIAGNOSTICS=ON, cargo feature
+// `diagnostics`; default OFF). Without it these three link and report nothing: the two
+// dumps return NULL and mi_heap_get_seq returns 0.
 mi_decl_export char*   mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms) mi_attr_noexcept;
 // == mi_heap_dump_json_ex(include_blocks, hash_addresses, 100)
 mi_decl_export char*   mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept;

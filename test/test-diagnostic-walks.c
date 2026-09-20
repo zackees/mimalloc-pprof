@@ -232,12 +232,20 @@ static void test_dump_coverage(void) {
   puts("dump-coverage: busy owner reported, cooperative owner captured");
 }
 
+#if MI_MEMEVT
 static size_t dump_resizes;
 static void on_dump_resize(const mi_memory_change_t* change, void* arg) {
   MI_UNUSED(change); MI_UNUSED(arg);
   dump_resizes++;
 }
+#endif
 
+// #414: this file is registered under MI_DIAGNOSTICS, which is independent of MI_MEMEVT --
+// the owner-gate trees (native `cl`, the ASan owner-gate row) deliberately build the dump
+// WITHOUT memory-events. The capture itself is asserted in every one of those builds; the
+// "no hooked buffer resize" control needs a live memory-change callback to observe, so it
+// runs wherever memory-events is compiled in (release, debug-full, musl, the clang/gcc ASan
+// rows, the Windows/macOS release and debug-full bundles, the native `cl` main tree).
 static void test_dump_growth(void) {
   // Hundreds of kilobytes of JSON: exercise many raw-OS scratch chunks and the
   // partial-page bitmap path that asserted in the plain Rust unit test (#374).
@@ -245,16 +253,24 @@ static void test_dump_growth(void) {
   void** blocks = (void**)mi_unwrapped_malloc(N * sizeof(void*), 0);
   assert(blocks != NULL);
   for (size_t i = 0; i < N; i++) { blocks[i] = mi_malloc(32); assert(blocks[i] != NULL); }
+  #if MI_MEMEVT
   mi_memory_callbacks_t callbacks = { { NULL }, { NULL } };
   callbacks.handlers[MI_MEMORY_RESIZE] = &on_dump_resize;
   assert(mi_memory_set_callbacks(&callbacks));
   assert(mi_memory_tracking_set_enabled(true));
   dump_resizes = 0;
+  #else
+  // memory-events compiled out: its API must still LINK and must report itself off.
+  assert(!mi_memory_tracking_set_enabled(true));
+  assert(!mi_memory_tracking_is_enabled());
+  #endif
   char* json = mi_heap_dump_json(true, false);
   assert(json != NULL && strlen(json) > 500000);
+  #if MI_MEMEVT
   assert(dump_resizes == 0); // the old mi_rezalloc-backed callback fails this
   assert(mi_memory_set_callbacks(NULL));
   assert(mi_memory_tracking_set_enabled(false));
+  #endif
   mi_free(json);
   for (size_t i = 0; i < N; i++) mi_free(blocks[i]);
   mi_unwrapped_free(blocks);

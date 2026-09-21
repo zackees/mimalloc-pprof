@@ -53,13 +53,13 @@ The allocator tracks sampled live allocations and writes either the gperftools
 in [google/pprof](https://github.com/google/pprof) for flame graphs, call graphs,
 top reports, and profile diffs.
 
-Profiling is opt-in twice over. Since **0.12.0** it is opt-in at **compile** time —
-cargo `features = ["pprof"]`, CMake `-DMI_PPROF=ON`; the default build is a plain fast
-allocator (see [Integration](#integration)) — and, once built in, it still does not
-sample until you call a start API or set `MIMALLOC_PROF=1`.
+Profiling in **1.0** is opt-in twice over: first at **compile time** with cargo
+`features = ["pprof"]` or CMake `-DMI_PPROF=ON`, and then at **runtime** by calling a
+start API or setting `MIMALLOC_PROF=1`. The default build is a plain fast allocator;
+see [Enable instrumentation](#enable-instrumentation) for every supported setup.
 
 **v3 only.** This fork tracks upstream mimalloc's `dev3` line (crate
-[`mimalloc-pprof` 0.12.x](https://crates.io/crates/mimalloc-pprof)). The legacy v2
+[`mimalloc-pprof` 1.x](https://crates.io/crates/mimalloc-pprof)). The legacy v2
 line (0.8.x, upstream `main`) is preserved on the
 [`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch but is not
 maintained going forward. Upstream mimalloc v3 (`dev3`) is itself still a
@@ -95,7 +95,7 @@ image and the table below are rendered from.
 
 | Feature | **mimalloc-pprof** | Microsoft MiMalloc-V3 | Bun mimalloc | jemalloc |
 |---|:--|:--|:--|:--|
-|  | this fork, 0.11.x | v3 dev3 @ 6def7be9 | oven-sh @ b20b60d9 | 5.3.1 @ 81034ce1 |
+|  | this fork, 1.0.x | v3 dev3 @ 6def7be9 | oven-sh @ b20b60d9 | 5.3.1 @ 81034ce1 |
 | **Memory return** | | | | |
 | Process-wide eager purge, from any thread | ✅ gated 72 %, default parked | ❌ mi_collect is caller-only | ❌ mi_collect is caller-only | ✅ MALLCTL_ARENAS_ALL, 74 % |
 | Purge the calling thread's own memory | ✅ mi_collect, idle hook | ✅ mi_collect | ✅ mi_collect, idle hook | ✅ tcache.flush + arena.i.purge |
@@ -105,7 +105,7 @@ image and the table below are rendered from.
 | Time-delayed / decaying purge | ✅ purge_delay 100 ms | ✅ purge_delay 1000 ms | ✅ purge_delay 100 ms | ✅ dirty_decay_ms 10 s |
 | RSS returned after 10 s idle (churn) | 74 % | 0 % (18 % w/ mi_collect) | 74 % | 0 % (74 % if asked) |
 | **Profiling and observability** | | | | |
-| pprof-compatible sampled heap profiler | ✅ runtime opt-in | ❌ none at all | ✅ runtime opt-in | ✅ build-time --enable-prof |
+| pprof-compatible sampled heap profiler | ✅ compile + runtime opt-in | ❌ none at all | ✅ runtime opt-in | ✅ build-time --enable-prof |
 | Heap profiler on Windows | ✅ MSVC and MinGW | ❌ no profiler | ⚠️ frames, no module map | ⚠️ not MSVC; MinGW untested |
 | profile.proto (protobuf) output | ✅ and gperftools text | ❌ no profiler | ✅ | ❌ text format; jeprof reads |
 | Exact allocator statistics | ✅ mi_stats_get | ✅ mi_stats_get | ✅ mi_stats_get | ✅ mallctl / malloc_stats_print |
@@ -331,29 +331,46 @@ re-verified under this tree's stress suite. → [Bun features](#bun-features)
 
 ## Integration
 
-> **0.12.0 changed the defaults.** Every observability subsystem is now **opt-in**, and
-> the default build is a plain fast allocator whose `malloc`/`free` fast path is
-> byte-identical to upstream mimalloc (checked on the instruction stream by
-> `ci/check_fastpath_identity.py`). Name what you want:
->
-> | Cargo feature | CMake option | What it turns on |
-> |---|---|---|
-> | `pprof` | `-DMI_PPROF=ON` | sampled pprof heap profiling |
-> | `memory-events` | `-DMI_MEMEVT=ON` | allocation-change accounting and callbacks |
-> | `diagnostics` | `-DMI_DIAGNOSTICS=ON` | heap snapshot + live-heap JSON dump |
-> | `dhat` (implies `memory-events`) | `-DMI_DHAT=ON` | the exact DHAT v2 observer |
-> | `owner-gate` | `-DMI_OWNER_GATE=ON` | `purge_all` can sweep every thread |
-> | `full` | — | all five |
->
-> ```toml
-> mimalloc-pprof = { version = "0.12", features = ["pprof"] }   # or ["full"] for 0.11's shape and more
-> ```
->
-> The whole API compiles and links in **every** configuration — a subsystem that was not
-> built in reports itself off (`prof::start` returns `false`, `heap_dump_json` returns
-> `None`) — so nothing downstream needs a `#[cfg]` or an `#ifdef`. Cargo features are
-> additive and unified across the dependency graph: if any crate in your build enables
-> one, your build gets it. `cargo tree -e features` shows who.
+### Enable instrumentation
+
+Version 1.0 builds a plain fast allocator by default. Every observability subsystem is
+compile-time opt-in, so enable exactly what the application uses:
+
+| Instrumentation | Cargo feature | CMake or direct-C define | Runtime activation |
+|---|---|---|---|
+| sampled pprof profiling | `pprof` | `MI_PPROF=1` | `prof::start` / `mi_prof_start`, or `MIMALLOC_PROF=1` |
+| allocation events | `memory-events` | `MI_MEMEVT=1` | `memory_events::set_enabled` / `mi_memory_tracking_set_enabled`, or `MIMALLOC_MEMORY_EVENTS=1` |
+| heap snapshots and JSON dumps | `diagnostics` | `MI_DIAGNOSTICS=1` | call the snapshot or dump API |
+| exact DHAT profiling | `dhat` (implies `memory-events`) | `MI_DHAT=1` | `dhat::start` / `mi_dhat_start`, or `MIMALLOC_DHAT=1` |
+| process-wide owner gate | `owner-gate` | `MI_OWNER_GATE=1` | active whenever compiled in |
+| everything above | `full` | define all five options | activate each observer as needed |
+
+**Rust:** name one feature or use `full`:
+
+```toml
+[dependencies]
+mimalloc-pprof = { version = "1", features = ["pprof"] }
+# mimalloc-pprof = { version = "1", features = ["full"] }
+```
+
+**CMake:** CMake options use `ON`/`OFF`:
+
+```sh
+cmake -S . -B build -DMI_PPROF=ON
+cmake --build build --config Release
+```
+
+**Direct C build:** when compiling `src/static.c` without CMake, pass numeric defines:
+
+```sh
+cc -O2 -DMI_PPROF=1 -fno-omit-frame-pointer -Iinclude src/static.c app.c -o app -pthread
+```
+
+Compile-time enablement only includes the implementation. Observers such as pprof, memory
+events, and DHAT remain idle until activated at runtime. The full API still compiles and
+links when a subsystem is absent; its functions report that it is unavailable, so callers
+need no `#[cfg]` or `#ifdef`. Cargo features are additive and unified across the dependency
+graph; use `cargo tree -e features` to see which dependency enabled one.
 
 Three instruments, each shown in Rust and C: **pprof** sampled profiling for
 production, **exact allocator stats** to check a sampled profile against, and
@@ -369,7 +386,7 @@ and its safe Rust wrapper.
 
 ```toml
 [dependencies]
-mimalloc-pprof = { version = "0.12", features = ["pprof"] }
+mimalloc-pprof = { version = "1", features = ["pprof"] }
 
 [profile.release]
 debug = "line-tables-only"
@@ -402,12 +419,9 @@ cmake -S . -B build -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build --config RelWithDebInfo
 ```
 
-`MI_PPROF` now defaults to `1` in the header (`include/mimalloc/types.h`), so a
-build that compiles `src/static.c` directly instead of using CMake gets the
-profiler by default too — CMake keeps passing `-DMI_PPROF=0/1` explicitly, which
-still wins over the header default. On non-Windows you still need to pass
-`-fno-omit-frame-pointer` yourself in that case — without it the profiler's stack
-capture is unreliable.
+A direct `src/static.c` build must define `MI_PPROF=1`; the header default is `0`,
+matching CMake and the Rust crate. On non-Windows also pass
+`-fno-omit-frame-pointer` — without it the profiler's stack capture is unreliable.
 
 ```c
 #include <mimalloc.h>
@@ -504,7 +518,7 @@ run a short, focused session under the exact DHAT observer and open the result
 in Valgrind's [`dh_view.html`](https://valgrind.org/docs/manual/dh-manual.html).
 
 DHAT is **off by default** and must be built in explicitly: the Rust crate's `dhat`
-feature (`mimalloc-pprof = { version = "0.12", features = ["dhat"] }`) or CMake's
+feature (`mimalloc-pprof = { version = "1", features = ["dhat"] }`) or CMake's
 `-DMI_DHAT=ON`. Without it the observer is compiled out of the allocator entirely and
 `mi_dhat_start` / `dhat::start()` return `false`. Once built in, no code is needed at all:
 
@@ -1060,10 +1074,10 @@ Four complementary instruments. Pick by the question you're asking:
 
 Two details worth knowing before you go deeper:
 
-- **The pprof profiler** is runtime opt-in (`mi_prof_start` / `prof::start` /
-  `MIMALLOC_PROF=1`) and dumps `heap_v2` text or `profile.proto`. Env vars,
-  deterministic seeding, the config-override API, and the measured cost of
-  shipping `MI_PPROF=ON` are all in its doc.
+- **The pprof profiler** must be compiled in (`pprof` / `MI_PPROF=1`) and then
+  activated at runtime (`mi_prof_start` / `prof::start` / `MIMALLOC_PROF=1`). It dumps
+  `heap_v2` text or `profile.proto`; env vars, deterministic seeding, the config-override
+  API, and the measured cost of shipping `MI_PPROF=ON` are all in its doc.
 - **The exact stats are what make a sampled profile trustworthy**: comparing the
   allocator's exact `malloc_requested` against the profiler's sampled
   `live_bytes` measures the sampling error directly. They ride along inside
@@ -1213,7 +1227,7 @@ Design history and milestone decisions are in
 
 The authoritative release record, with the reasoning behind each fix, is
 [`rust/mimalloc-pprof/CHANGELOG.md`](rust/mimalloc-pprof/CHANGELOG.md). The v3
-line ships as [`mimalloc-pprof` 0.11.x](https://crates.io/crates/mimalloc-pprof);
+line ships as [`mimalloc-pprof` 1.x](https://crates.io/crates/mimalloc-pprof);
 the v2 line (0.8.x) is maintained on the
 [`v2`](https://github.com/zackees/mimalloc-pprof/tree/v2) branch.
 

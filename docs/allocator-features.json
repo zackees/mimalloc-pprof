@@ -5,7 +5,7 @@
     {
       "key": "mimalloc-pprof",
       "label": "mimalloc-pprof",
-      "version": "this fork, 0.11.x"
+      "version": "this fork, 1.0.x"
     },
     {
       "key": "upstream",
@@ -212,8 +212,8 @@
           "cells": {
             "mimalloc-pprof": {
               "status": "yes",
-              "note": "runtime opt-in",
-              "source": "include/mimalloc/profile.h:39"
+              "note": "compile + runtime opt-in",
+              "source": "include/mimalloc/types.h:27-31; src/profile.c:273-306"
             },
             "upstream": {
               "status": "no",

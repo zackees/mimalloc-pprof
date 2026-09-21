@@ -466,6 +466,10 @@ static void mi_scav_wait(_Atomic(mi_scav_word_t)* addr, mi_msecs_t timeout_ms) {
 }
 
 static void mi_scav_wake_one(_Atomic(mi_scav_word_t)* addr) {
+  // Acquire the publication edge from `_mi_scavenger_start` before reading the
+  // dynamically initialized function pointers or condition-variable state. The caller's
+  // earlier relaxed `running` check deliberately keeps the ordinary no-wake path cheap.
+  MI_UNUSED(mi_atomic_load_acquire(&_mi_scavenger_running));
   if (mi_scav_use_native_wait) {
     mi_wake_by_address_single((PVOID)addr);
   }

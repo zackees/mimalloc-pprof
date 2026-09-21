@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.0
+
+First stable release of the v3-based crate.
+
+- **Instrumentation remains explicit.** The default feature set is empty and builds the
+  allocator alone. Enable sampled profiling with
+  `mimalloc-pprof = { version = "1", features = ["pprof"] }`, select individual
+  `memory-events`, `diagnostics`, `dhat`, or `owner-gate` features, or use `full` for all
+  five. The README now documents the matching CMake and direct-C defines and the separate
+  runtime activation step.
+- **Windows 7 compatibility.** Windows 8's address-wait functions are resolved at runtime;
+  Windows 7 uses the condition-variable fallback and its loader-safe random provider.
+- **No API break from 0.12.** Public C exports and Rust wrappers remain available in every
+  feature configuration, with compiled-out subsystems reporting themselves unavailable.
+
 ## 0.12.0
 
 **Every observability subsystem is opt-in. The default build is a plain fast allocator.**

@@ -18,14 +18,14 @@ graphs, call graphs, top reports, and profile diffs.
 
 ```toml
 [dependencies]
-mimalloc-pprof = { version = "0.12", features = ["pprof"] }
+mimalloc-pprof = { version = "1", features = ["pprof"] }
 
 [profile.release]
 debug = "line-tables-only"
 strip = false
 ```
 
-### Features (0.12.0: everything is opt-in)
+### Enable instrumentation (1.0: everything is opt-in)
 
 `default = []`. The default build is a **plain fast allocator**: no profiler, no
 accounting hooks, no diagnostics, no DHAT, no owner gate — and its `malloc`/`free` fast
@@ -45,7 +45,7 @@ To restore what 0.11.x built by default, and more:
 
 ```toml
 [dependencies]
-mimalloc-pprof = { version = "0.12", features = ["full"] }
+mimalloc-pprof = { version = "1", features = ["full"] }
 ```
 
 **The whole API is present in every configuration.** A subsystem that was not built in
@@ -101,18 +101,19 @@ MIMALLOC_PROF=1 MIMALLOC_PROF_DUMP_AT_EXIT=heap.prof ./my_app
 
 | | crate | engine |
 |---|---|---|
-| **0.12.x** — current | `mimalloc-pprof = { version = "0.12", features = ["pprof"] }` | mimalloc v3 |
+| **1.x** — current | `mimalloc-pprof = { version = "1", features = ["pprof"] }` | mimalloc v3 |
+| 0.12.x | `mimalloc-pprof = { version = "0.12", features = ["pprof"] }` | mimalloc v3 |
 | 0.11.x | `mimalloc-pprof = "0.11"` | mimalloc v3 |
 | 0.8.x — previous | `mimalloc-pprof = "0.8"` | mimalloc v2 |
 
-**0.12.0 is a breaking default change**, not an API change: `default = []`, so a
-`mimalloc-pprof = "0.12"` with no features is the allocator alone. Add
-`features = ["full"]` to get 0.11.x's shape (and then some). Nothing stops compiling.
+**1.0 keeps the opt-in defaults introduced in 0.12:** `default = []`, so a
+`mimalloc-pprof = "1"` dependency with no features is the allocator alone. Add
+`features = ["pprof"]` for sampled profiling or `features = ["full"]` for every
+instrumentation subsystem. The API remains available as inert stubs when a feature is absent.
 
-The profiler API, environment variables, and output formats are identical in both,
-so moving between them is a version bump rather than a code change.
+The profiler API, environment variables, and output formats remain compatible with 0.12.
 
-**0.12.x is recommended.** It has strictly more test coverage, per-heap allocator
+**1.x is recommended.** It has strictly more test coverage, per-heap allocator
 statistics, and fixes two upstream mimalloc bugs that 0.8.x still carries —
 including an unbounded memory leak on Windows/MinGW where every exiting thread
 leaked its heap and pages (23.5 GB at 100 stress iterations, versus flat after the

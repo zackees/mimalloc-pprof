@@ -16,7 +16,7 @@
 //! `full` for all of them:
 //!
 //! ```toml
-//! mimalloc-pprof = { version = "0.12", features = ["pprof"] }
+//! mimalloc-pprof = { version = "1", features = ["pprof"] }
 //! ```
 //!
 //! The whole API compiles and links in every configuration: a subsystem that was not

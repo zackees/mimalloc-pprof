@@ -84,13 +84,7 @@ fn main() {
     build.compile("mimalloc");
 
     if env::var("TARGET").is_ok_and(|target| target.contains("windows")) {
-        for library in [
-            "psapi",
-            "shell32",
-            "user32",
-            "advapi32",
-            "bcrypt",
-        ] {
+        for library in ["psapi", "shell32", "user32", "advapi32", "bcrypt"] {
             println!("cargo:rustc-link-lib={library}");
         }
     }

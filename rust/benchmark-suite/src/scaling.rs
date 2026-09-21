@@ -12,7 +12,7 @@
 //! intervals or noise gating. Every published surface carries that label.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::{Command, Stdio};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,8 +37,8 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-pub const SCALING_SCHEMA_VERSION: &str = "throughput-scaling-sparse-v1";
-pub const SCALING_CHILD_PROTOCOL_VERSION: &str = "throughput-scaling-sparse-child-v1";
+pub const SCALING_SCHEMA_VERSION: &str = "throughput-scaling-sparse-v2";
+pub const SCALING_CHILD_PROTOCOL_VERSION: &str = "throughput-scaling-sparse-child-v2";
 /// The RSS side-car overlaid on the same sweep. It is deliberately an optional
 /// object inside the scaling report (not a mutation of the cell summaries) so
 /// every already-published sparse row stays valid history: rows recorded
@@ -47,6 +47,9 @@ pub const SCALING_RSS_SCHEMA_VERSION: &str = "throughput-scaling-rss-v1";
 /// Coverage mode: three blocks is the minimum that still permits a paired
 /// comparison and still exposes a single wild outlier through min/max.
 pub const SCALING_BLOCKS: u32 = 3;
+/// The distribution workloads publish empirical P5--P95 bands. Forty paired
+/// observations is the minimum full-run sample count; smoke remains one.
+pub const DISTRIBUTION_BLOCKS: u32 = 40;
 /// Fixed literal worker counts. These are deliberately not topology-resolved;
 /// the runner records its own topology as metadata and labels oversubscription.
 /// Dense sweep up to 2x the 4-vCPU hosted runner's logical cores; the 6/8
@@ -56,7 +59,8 @@ pub const SCALING_BLOCKS: u32 = 3;
 pub const SCALING_THREAD_POINTS: [u32; 6] = [1, 2, 3, 4, 6, 8];
 /// External RSS sampling cadence while a scaling child runs.
 pub const SCALING_RSS_POLL_INTERVAL_NS: u64 = 5_000_000;
-pub const SCALING_RIGOR_LABEL: &str = "coverage mode - reduced statistical rigor (3 blocks)";
+pub const SCALING_RIGOR_LABEL: &str =
+    "mixed rigor - 3-block legacy coverage plus 40-repetition distribution bands";
 pub const SCALING_MIN_BLOCK_NS: u64 = 400_000_000;
 pub const SCALING_MAX_BLOCK_NS: u64 = 1_500_000_000;
 pub const SCALING_TARGET_BLOCK_NS: u64 = 750_000_000;
@@ -138,16 +142,27 @@ pub enum ScalingPattern {
     /// or copied. `CrossThread` (`sparse-cross-thread`) remains a separate,
     /// differently-shaped workload.
     XmallocTest,
+    /// Exact requested sizes 2^16 through 2^22, selected uniformly. This is a
+    /// requested-size workload using the normal allocation API, not an
+    /// additional pointer-alignment requirement.
+    PowerOfTwoLarge,
+    /// Unbiased uniform integer requested sizes in [64 KiB, 4 MiB].
+    RandomLarge,
 }
 
-pub const SCALING_PATTERNS: [ScalingPattern; 6] = [
+pub const SCALING_PATTERNS: [ScalingPattern; 8] = [
     ScalingPattern::TinyHot,
     ScalingPattern::MixedGeneral,
     ScalingPattern::LargeBuffers,
     ScalingPattern::CrossThread,
     ScalingPattern::Larson,
     ScalingPattern::XmallocTest,
+    ScalingPattern::PowerOfTwoLarge,
+    ScalingPattern::RandomLarge,
 ];
+
+pub const DISTRIBUTION_PATTERNS: [ScalingPattern; 2] =
+    [ScalingPattern::PowerOfTwoLarge, ScalingPattern::RandomLarge];
 
 impl ScalingPattern {
     pub const fn as_str(self) -> &'static str {
@@ -158,6 +173,8 @@ impl ScalingPattern {
             Self::CrossThread => "sparse-cross-thread",
             Self::Larson => "larson",
             Self::XmallocTest => "xmalloc-test",
+            Self::PowerOfTwoLarge => "power-of-two-large",
+            Self::RandomLarge => "random-large",
         }
     }
 
@@ -177,6 +194,8 @@ impl ScalingPattern {
             Self::CrossThread => 0x0000_0004_7874_6804,
             Self::Larson => 0x0000_0005_6c61_7205,
             Self::XmallocTest => 0x0000_0006_786d_6c06,
+            Self::PowerOfTwoLarge => 0x0000_0007_7032_6c07,
+            Self::RandomLarge => 0x0000_0008_726e_6408,
         }
     }
 
@@ -192,6 +211,8 @@ impl ScalingPattern {
             }
             Self::Larson => "Larson & Krishnan server workload: 8-1000 B random slot replacement over a 5000-block array per thread; arrays rotate between threads each round, so later frees are remote",
             Self::XmallocTest => "xmalloc-test (Lever & Boreham): dedicated producer threads allocate 8-128 B blocks and hand them to dedicated consumer threads that free them",
+            Self::PowerOfTwoLarge => "normal allocations with requested sizes uniformly selected from exact powers 2^16 through 2^22; eight live slots per worker, page-touched",
+            Self::RandomLarge => "normal allocations with unbiased uniform integer requested sizes from 64 KiB through 4 MiB; eight live slots per worker, page-touched",
         }
     }
 
@@ -275,6 +296,44 @@ impl ScalingPattern {
                 page_touch: false,
                 mode: PatternMode::ProducerConsumer,
             },
+            Self::PowerOfTwoLarge => PatternSpec {
+                min_size: 64 * 1024,
+                max_size: 4 * 1024 * 1024,
+                log_uniform: false,
+                capacity: 8,
+                weight_alloc: 8,
+                weight_free_oldest: 6,
+                weight_free_random: 2,
+                weight_realloc: 0,
+                cross_thread: false,
+                page_touch: true,
+                mode: PatternMode::Slots,
+            },
+            Self::RandomLarge => PatternSpec {
+                min_size: 64 * 1024,
+                max_size: 4 * 1024 * 1024,
+                log_uniform: false,
+                capacity: 8,
+                weight_alloc: 8,
+                weight_free_oldest: 6,
+                weight_free_random: 2,
+                weight_realloc: 0,
+                cross_thread: false,
+                page_touch: true,
+                mode: PatternMode::Slots,
+            },
+        }
+    }
+
+    pub const fn is_distribution(self) -> bool {
+        matches!(self, Self::PowerOfTwoLarge | Self::RandomLarge)
+    }
+
+    pub const fn full_blocks(self) -> u32 {
+        if self.is_distribution() {
+            DISTRIBUTION_BLOCKS
+        } else {
+            SCALING_BLOCKS
         }
     }
 }
@@ -354,8 +413,13 @@ pub enum PlannedAction {
 /// observes allocator behavior, so driving it twice with the same seed yields
 /// byte-identical action sequences.
 pub struct WorkerPlanner {
+    pattern: ScalingPattern,
     spec: PatternSpec,
     state: u64,
+    /// Distribution workloads keep requested-size draws independent from
+    /// allocation/free lifetime draws. Existing workloads retain their v1
+    /// single-stream replay unchanged.
+    size_state: Option<u64>,
     remaining: u64,
     occupied: Vec<bool>,
     fifo: VecDeque<usize>,
@@ -382,8 +446,12 @@ impl WorkerPlanner {
     ) -> Self {
         let spec = pattern.spec();
         Self {
+            pattern,
             spec,
             state: seed,
+            size_state: pattern
+                .is_distribution()
+                .then(|| splitmix64(seed ^ 0x7369_7a65_2d76_3101)),
             remaining: operations,
             occupied: vec![false; spec.capacity],
             fifo: VecDeque::with_capacity(spec.capacity),
@@ -422,8 +490,41 @@ impl WorkerPlanner {
         self.state
     }
 
+    fn next_size_u64(&mut self) -> u64 {
+        match self.size_state.as_mut() {
+            Some(state) => {
+                *state = splitmix64(*state);
+                *state
+            }
+            None => self.next_u64(),
+        }
+    }
+
+    fn uniform_below(&mut self, bound: u64) -> u64 {
+        debug_assert!(bound > 0);
+        let threshold = bound.wrapping_neg() % bound;
+        loop {
+            let value = self.next_size_u64();
+            if value >= threshold {
+                return value % bound;
+            }
+        }
+    }
+
     fn draw_size(&mut self) -> usize {
         let spec = self.spec;
+        if self.size_state.is_some()
+            && spec.min_size == 64 * 1024
+            && spec.max_size == 4 * 1024 * 1024
+        {
+            // The two new patterns share lifetime rules but deliberately
+            // differ only in requested-size selection.
+            if self.pattern == ScalingPattern::PowerOfTwoLarge {
+                return 1usize << (16 + self.uniform_below(7) as usize);
+            }
+            return spec.min_size
+                + self.uniform_below((spec.max_size - spec.min_size + 1) as u64) as usize;
+        }
         if spec.min_size >= spec.max_size {
             return spec.min_size;
         }
@@ -749,6 +850,12 @@ pub struct ScalingChildRequest {
     pub runner: RunnerMetadata,
     pub toolchain: ToolchainMetadata,
     pub reproduction_command: String,
+    /// Optional diagnostic-only shared file containing the current requested
+    /// live bytes as a little-endian u64. Production timing requests omit it;
+    /// the controller uses a separate replay to correlate live payload with
+    /// the externally observed RSS peak.
+    #[serde(default)]
+    pub live_telemetry_path: Option<String>,
 }
 
 impl ScalingChildRequest {
@@ -792,6 +899,12 @@ pub struct ScalingChildResponse {
     pub free_calls: u64,
     pub operation_count: u64,
     pub checksum: u64,
+    #[serde(default)]
+    pub worker_seeds: Vec<u64>,
+    #[serde(default)]
+    pub size_histogram: Vec<ScalingSizeHistogramBucket>,
+    #[serde(default)]
+    pub peak_live_requested_bytes: u64,
     pub remote_free_calls: u64,
     pub producer_fallback_frees: u64,
     pub setup_ns: u64,
@@ -799,6 +912,90 @@ pub struct ScalingChildResponse {
     pub elapsed_ns: u64,
     pub teardown_ns: u64,
     pub throughput_operations_per_second: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScalingSizeHistogramBucket {
+    pub lower_inclusive_bytes: u64,
+    pub upper_inclusive_bytes: u64,
+    pub allocation_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalingPlanMetadata {
+    pub worker_seeds: Vec<u64>,
+    pub size_histogram: Vec<ScalingSizeHistogramBucket>,
+    pub peak_live_requested_bytes: u64,
+}
+
+pub fn simulate_plan_metadata(
+    pattern: ScalingPattern,
+    run_seed: u64,
+    thread_count: u32,
+    block_id: u32,
+    operations_per_worker: u64,
+) -> ScalingPlanMetadata {
+    let mut histogram = BTreeMap::<(u64, u64), u64>::new();
+    let mut peak_live_requested_bytes = 0u64;
+    let mut worker_seeds = Vec::new();
+    for worker in 0..thread_count {
+        let seed = stream_seed(run_seed, pattern, thread_count, block_id, worker);
+        worker_seeds.push(seed);
+        let mut planner =
+            WorkerPlanner::new(pattern, seed, operations_per_worker, worker, thread_count);
+        let mut slots = vec![0u64; planner.capacity()];
+        let mut live = 0u64;
+        let mut worker_peak = 0u64;
+        while let Some(action) = planner.next_action() {
+            match action {
+                PlannedAction::Alloc { slot, size, .. } => {
+                    let size = size as u64;
+                    slots[slot] = size;
+                    live += size;
+                    worker_peak = worker_peak.max(live);
+                    let lower = (size / (64 * 1024)) * (64 * 1024);
+                    *histogram.entry((lower, lower + 64 * 1024 - 1)).or_default() += 1;
+                }
+                PlannedAction::ReallocSlot { slot, size, .. } => {
+                    live -= slots[slot];
+                    let size = size as u64;
+                    slots[slot] = size;
+                    live += size;
+                    worker_peak = worker_peak.max(live);
+                    let lower = (size / (64 * 1024)) * (64 * 1024);
+                    *histogram.entry((lower, lower + 64 * 1024 - 1)).or_default() += 1;
+                }
+                PlannedAction::FreeSlot { slot } => {
+                    live -= slots[slot];
+                    slots[slot] = 0;
+                }
+                PlannedAction::Handoff { size, .. } => {
+                    let size = size as u64;
+                    let lower = (size / (64 * 1024)) * (64 * 1024);
+                    *histogram.entry((lower, lower + 64 * 1024 - 1)).or_default() += 1;
+                }
+                PlannedAction::DrainMailbox { .. } => {}
+            }
+        }
+        peak_live_requested_bytes += worker_peak;
+    }
+    ScalingPlanMetadata {
+        worker_seeds,
+        size_histogram: histogram
+            .into_iter()
+            .map(
+                |((lower_inclusive_bytes, upper_inclusive_bytes), allocation_count)| {
+                    ScalingSizeHistogramBucket {
+                        lower_inclusive_bytes,
+                        upper_inclusive_bytes,
+                        allocation_count,
+                    }
+                },
+            )
+            .collect(),
+        peak_live_requested_bytes,
+    }
 }
 
 impl ScalingChildResponse {
@@ -828,6 +1025,13 @@ impl ScalingChildResponse {
         let expected_throughput =
             expected.operation_count() as f64 * 1_000_000_000.0 / self.elapsed_ns as f64;
         let tolerance = (expected_throughput.abs() * 1e-12).max(f64::EPSILON);
+        let metadata = simulate_plan_metadata(
+            pattern,
+            request.run_seed,
+            request.thread_count,
+            request.block_id,
+            request.operations_per_worker,
+        );
         if self.protocol_version != SCALING_CHILD_PROTOCOL_VERSION
             || self.metric_schema_version != SCALING_SCHEMA_VERSION
             || self.allocator_id != request.allocator.allocator_id
@@ -838,6 +1042,15 @@ impl ScalingChildResponse {
             || self.free_calls != expected.free_calls
             || self.operation_count != expected.operation_count()
             || self.checksum != expected.checksum
+            || (pattern.is_distribution()
+                && (self.worker_seeds != metadata.worker_seeds
+                    || self.size_histogram != metadata.size_histogram
+                    || if request.live_telemetry_path.is_some() {
+                        self.peak_live_requested_bytes == 0
+                            || self.peak_live_requested_bytes > metadata.peak_live_requested_bytes
+                    } else {
+                        self.peak_live_requested_bytes != metadata.peak_live_requested_bytes
+                    }))
             || (self.throughput_operations_per_second - expected_throughput).abs() > tolerance
             || !self.throughput_operations_per_second.is_finite()
             || self.throughput_operations_per_second <= 0.0
@@ -874,6 +1087,55 @@ struct WorkerTally {
     fallback_frees: u64,
 }
 
+struct LiveTelemetry {
+    current: std::sync::atomic::AtomicU64,
+    peak: std::sync::atomic::AtomicU64,
+    file: Mutex<std::fs::File>,
+}
+
+impl LiveTelemetry {
+    fn open(path: &str) -> Result<Arc<Self>, String> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("open live telemetry: {error}"))?;
+        Ok(Arc::new(Self {
+            current: std::sync::atomic::AtomicU64::new(0),
+            peak: std::sync::atomic::AtomicU64::new(0),
+            file: Mutex::new(file),
+        }))
+    }
+
+    fn add(&self, size: usize) -> Result<(), String> {
+        let value = self.current.fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+        self.peak.fetch_max(value, Ordering::Relaxed);
+        self.publish(value)
+    }
+
+    fn remove(&self, size: usize) -> Result<(), String> {
+        let value = self.current.fetch_sub(size as u64, Ordering::Relaxed) - size as u64;
+        self.publish(value)
+    }
+
+    fn replace(&self, old: usize, new: usize) -> Result<(), String> {
+        if new >= old {
+            self.add(new - old)
+        } else {
+            self.remove(old - new)
+        }
+    }
+
+    fn publish(&self, value: u64) -> Result<(), String> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| "live telemetry lock poisoned".to_string())?;
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.write_all(&value.to_le_bytes()))
+            .map_err(|error| format!("write live telemetry: {error}"))
+    }
+}
+
 /// Execute one scaling child request against the linked allocator.
 ///
 /// Dispatches on the pattern's `PatternMode`: `Slots`, `Handoff`, and
@@ -901,6 +1163,11 @@ pub fn execute_scaling_child_request<A: AllocatorAdapter>(
         return execute_larson_rotation(adapter, &request, pattern, rounds);
     }
     let threads = request.thread_count as usize;
+    let telemetry = request
+        .live_telemetry_path
+        .as_deref()
+        .map(LiveTelemetry::open)
+        .transpose()?;
     let setup_started = Instant::now();
     let mailboxes: Arc<Vec<Mutex<VecDeque<Parcel>>>> = Arc::new(
         (0..threads)
@@ -923,6 +1190,7 @@ pub fn execute_scaling_child_request<A: AllocatorAdapter>(
             let produced = Arc::clone(&produced);
             let finished = Arc::clone(&finished);
             let request = &request;
+            let telemetry = telemetry.clone();
             handles.push(scope.spawn(move || -> Result<WorkerTally, String> {
                 let worker_index = worker as u32;
                 let seed = stream_seed(
@@ -949,8 +1217,14 @@ pub fn execute_scaling_child_request<A: AllocatorAdapter>(
                         worker_index,
                         request.thread_count,
                     );
-                    run_worker_stream(adapter, &mut planner, worker_index, &mailboxes)
-                        .map(|tally| (tally, planner.page_touch()))
+                    run_worker_stream(
+                        adapter,
+                        &mut planner,
+                        worker_index,
+                        &mailboxes,
+                        telemetry.as_ref(),
+                    )
+                    .map(|tally| (tally, planner.page_touch()))
                 });
                 if spec.cross_thread {
                     // Every producer must finish before any final drain, so a
@@ -1006,6 +1280,13 @@ pub fn execute_scaling_child_request<A: AllocatorAdapter>(
     }
     let operation_count = counts.operation_count();
     let teardown_ns = nonzero_ns(teardown_started);
+    let metadata = simulate_plan_metadata(
+        pattern,
+        request.run_seed,
+        request.thread_count,
+        request.block_id,
+        request.operations_per_worker,
+    );
     Ok(ScalingChildResponse {
         protocol_version: SCALING_CHILD_PROTOCOL_VERSION.into(),
         metric_schema_version: SCALING_SCHEMA_VERSION.into(),
@@ -1016,6 +1297,12 @@ pub fn execute_scaling_child_request<A: AllocatorAdapter>(
         free_calls: counts.free_calls,
         operation_count,
         checksum: counts.checksum,
+        worker_seeds: metadata.worker_seeds,
+        size_histogram: metadata.size_histogram,
+        peak_live_requested_bytes: telemetry
+            .as_ref()
+            .map(|value| value.peak.load(Ordering::Relaxed))
+            .unwrap_or(metadata.peak_live_requested_bytes),
         remote_free_calls,
         producer_fallback_frees,
         setup_ns,
@@ -1188,6 +1475,13 @@ fn execute_larson_rotation<A: AllocatorAdapter>(
     }
     let operation_count = counts.operation_count();
     let teardown_ns = nonzero_ns(teardown_started);
+    let metadata = simulate_plan_metadata(
+        pattern,
+        request.run_seed,
+        request.thread_count,
+        request.block_id,
+        request.operations_per_worker,
+    );
     Ok(ScalingChildResponse {
         protocol_version: SCALING_CHILD_PROTOCOL_VERSION.into(),
         metric_schema_version: SCALING_SCHEMA_VERSION.into(),
@@ -1198,6 +1492,9 @@ fn execute_larson_rotation<A: AllocatorAdapter>(
         free_calls: counts.free_calls,
         operation_count,
         checksum: counts.checksum,
+        worker_seeds: metadata.worker_seeds,
+        size_histogram: metadata.size_histogram,
+        peak_live_requested_bytes: metadata.peak_live_requested_bytes,
         remote_free_calls,
         producer_fallback_frees: 0,
         setup_ns,
@@ -1326,7 +1623,7 @@ fn warm_up_worker<A: AllocatorAdapter>(
     );
     let warm_mailboxes: Vec<Mutex<VecDeque<Parcel>>> =
         (0..threads).map(|_| Mutex::new(VecDeque::new())).collect();
-    let outcome = run_worker_stream(adapter, &mut warm, worker, &warm_mailboxes);
+    let outcome = run_worker_stream(adapter, &mut warm, worker, &warm_mailboxes, None);
     // Release warmup parcels even when the stream failed, so a failing warmup
     // does not also leak.
     for mailbox in &warm_mailboxes {
@@ -1344,6 +1641,7 @@ fn run_worker_stream<A: AllocatorAdapter>(
     planner: &mut WorkerPlanner,
     worker: u32,
     mailboxes: &[Mutex<VecDeque<Parcel>>],
+    telemetry: Option<&Arc<LiveTelemetry>>,
 ) -> Result<WorkerTally, String> {
     let page_touch = planner.page_touch();
     let capacity = planner.capacity();
@@ -1361,6 +1659,9 @@ fn run_worker_stream<A: AllocatorAdapter>(
                     token,
                     owner: worker,
                 };
+                if let Some(telemetry) = telemetry {
+                    telemetry.add(size)?;
+                }
                 touch(&parcel, page_touch, &mut tally)?;
                 tally.counts.alloc_calls += 1;
                 table.slots[slot] = Some(parcel);
@@ -1376,6 +1677,9 @@ fn run_worker_stream<A: AllocatorAdapter>(
                     token,
                     owner: worker,
                 };
+                if let Some(telemetry) = telemetry {
+                    telemetry.replace(existing.size, size)?;
+                }
                 touch(&parcel, page_touch, &mut tally)?;
                 tally.counts.realloc_calls += 1;
                 table.slots[slot] = Some(parcel);
@@ -1385,6 +1689,9 @@ fn run_worker_stream<A: AllocatorAdapter>(
                     .take()
                     .ok_or("scaling plan freed an empty slot")?;
                 unsafe { adapter.free(parcel.pointer) };
+                if let Some(telemetry) = telemetry {
+                    telemetry.remove(parcel.size)?;
+                }
                 tally.counts.free_calls += 1;
             }
             PlannedAction::Handoff {
@@ -1441,6 +1748,9 @@ fn run_worker_stream<A: AllocatorAdapter>(
                 .take()
                 .ok_or("scaling drain freed an empty slot")?;
             unsafe { adapter.free(parcel.pointer) };
+            if let Some(telemetry) = telemetry {
+                telemetry.remove(parcel.size)?;
+            }
             tally.counts.free_calls += 1;
         }
     }
@@ -1510,23 +1820,39 @@ fn nonzero_ns(started: Instant) -> u64 {
 /// peak. Linux-only: production collection refuses to run anywhere else, and
 /// other targets record zero so the code still compiles for the full matrix.
 pub fn sample_peak_rss(pid: u32, stop: &AtomicBool) -> u64 {
+    sample_peak_rss_with_live(pid, stop, None).0
+}
+
+fn sample_peak_rss_with_live(
+    pid: u32,
+    stop: &AtomicBool,
+    live_telemetry_path: Option<&str>,
+) -> (u64, u64) {
     let mut peak = 0u64;
+    let mut live_at_peak = 0u64;
     if !cfg!(target_os = "linux") {
-        return 0;
+        return (0, 0);
     }
     let path = format!("/proc/{pid}/smaps_rollup");
     while !stop.load(Ordering::Relaxed) {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 if let Ok(rss) = crate::memory::parse_smaps_rollup(&text) {
-                    peak = peak.max(rss);
+                    if rss > peak {
+                        peak = rss;
+                        live_at_peak = live_telemetry_path
+                            .and_then(|telemetry| std::fs::read(telemetry).ok())
+                            .and_then(|bytes| bytes.get(..8)?.try_into().ok())
+                            .map(u64::from_le_bytes)
+                            .unwrap_or(0);
+                    }
                 }
             }
             Err(_) => break,
         }
         std::thread::sleep(Duration::from_nanos(SCALING_RSS_POLL_INTERVAL_NS));
     }
-    peak
+    (peak, live_at_peak)
 }
 
 /// Spawn one isolated scaling child and validate its response against the
@@ -1537,7 +1863,7 @@ pub fn run_scaling_child(
     child: &ChildProgram,
     request: &ScalingChildRequest,
     timeout: Duration,
-) -> Result<(ScalingChildResponse, u64), String> {
+) -> Result<(ScalingChildResponse, u64, u64), String> {
     let pattern = request.pattern()?;
     let expected = simulate_cell(
         pattern,
@@ -1555,7 +1881,7 @@ pub fn run_scaling_child_with_plan(
     request: &ScalingChildRequest,
     timeout: Duration,
     expected: &ScalingCounts,
-) -> Result<(ScalingChildResponse, u64), String> {
+) -> Result<(ScalingChildResponse, u64, u64), String> {
     request.validate()?;
     if child.allocator != request.allocator || timeout.is_zero() {
         return Err("scaling child identity mismatch or zero timeout".into());
@@ -1579,7 +1905,10 @@ pub fn run_scaling_child_with_plan(
     let pid = child_process.id();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_sampler = Arc::clone(&stop);
-    let sampler = std::thread::spawn(move || sample_peak_rss(pid, &stop_for_sampler));
+    let telemetry_path = request.live_telemetry_path.clone();
+    let sampler = std::thread::spawn(move || {
+        sample_peak_rss_with_live(pid, &stop_for_sampler, telemetry_path.as_deref())
+    });
     child_process
         .stdin
         .take()
@@ -1633,7 +1962,7 @@ pub fn run_scaling_child_with_plan(
         std::thread::sleep(Duration::from_millis(2));
     };
     stop.store(true, Ordering::Relaxed);
-    let peak_rss_bytes = sampler
+    let (peak_rss_bytes, live_requested_bytes_at_peak_rss) = sampler
         .join()
         .map_err(|_| "scaling RSS sampler panicked".to_string())?;
     let output = stdout_reader
@@ -1651,7 +1980,7 @@ pub fn run_scaling_child_with_plan(
     let response: ScalingChildResponse = serde_json::from_slice(&output)
         .map_err(|error| format!("decode scaling child response: {error}"))?;
     response.validate_against_expected(request, expected)?;
-    Ok((response, peak_rss_bytes))
+    Ok((response, peak_rss_bytes, live_requested_bytes_at_peak_rss))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1705,6 +2034,12 @@ pub struct ScalingRawSample {
     /// new run.
     #[serde(default)]
     pub peak_rss_bytes: u64,
+    #[serde(default)]
+    pub diagnostic_peak_rss_bytes: u64,
+    #[serde(default)]
+    pub live_requested_bytes_at_diagnostic_peak_rss: u64,
+    #[serde(default)]
+    pub diagnostic_peak_live_requested_bytes: u64,
     pub response: ScalingChildResponse,
 }
 
@@ -1733,6 +2068,10 @@ pub struct ScalingCellSummary {
     pub allocator_id: String,
     pub block_count: u32,
     pub median_throughput: f64,
+    #[serde(default)]
+    pub p05_throughput: f64,
+    #[serde(default)]
+    pub p95_throughput: f64,
     pub min_throughput: f64,
     pub max_throughput: f64,
     /// Median throughput at this point divided by the same allocator's median
@@ -1756,6 +2095,10 @@ pub struct ScalingPatternDefinition {
 pub struct ScalingMethodology {
     pub rigor: String,
     pub blocks_per_cell: u32,
+    #[serde(default)]
+    pub distribution_blocks_per_cell: u32,
+    #[serde(default)]
+    pub percentile_method: String,
     pub aggregation: String,
     pub operation_stream: String,
     pub seed_chain: String,
@@ -1774,6 +2117,10 @@ pub struct ScalingRssCellSummary {
     pub allocator_id: String,
     pub block_count: u32,
     pub median_peak_rss_bytes: u64,
+    #[serde(default)]
+    pub p05_peak_rss_bytes: u64,
+    #[serde(default)]
+    pub p95_peak_rss_bytes: u64,
     pub min_peak_rss_bytes: u64,
     pub max_peak_rss_bytes: u64,
 }
@@ -1797,7 +2144,7 @@ pub struct ScalingRssReport {
 pub fn rss_sampling() -> ScalingRssSampling {
     ScalingRssSampling {
         source: "external /proc/<pid>/smaps_rollup Rss, parsed as integer kB * 1024".into(),
-        method: "polled while the measured block runs; the peak over the block is retained".into(),
+        method: "polled externally from child spawn through process exit, so startup, setup, warmup, measured work, and teardown are all in scope; the process-lifetime peak is retained and phase durations are recorded separately".into(),
         poll_interval_ns: SCALING_RSS_POLL_INTERVAL_NS,
     }
 }
@@ -1884,9 +2231,11 @@ pub fn methodology() -> ScalingMethodology {
     ScalingMethodology {
         rigor: SCALING_RIGOR_LABEL.into(),
         blocks_per_cell: SCALING_BLOCKS,
-        aggregation: "median of per-block aggregate throughput, with min and max across the same blocks".into(),
-        operation_stream: "seeded random operation stream; each operation, size, and slot is drawn from a splitmix64 stream that never observes allocator behavior; larson additionally rotates its slot arrays between workers every round, and xmalloc-test assigns fixed producer/consumer roles by worker index".into(),
-        seed_chain: "splitmix64 chain over (run seed, pattern tag, thread count, block, worker); the allocator is deliberately absent so all five allocators replay one stream".into(),
+        distribution_blocks_per_cell: DISTRIBUTION_BLOCKS,
+        percentile_method: "empirical P5/P50/P95 over paired per-run observations; linear interpolation h=(n-1)p; bands are not confidence intervals".into(),
+        aggregation: "median of per-block aggregate throughput, with P5/P95 and retained min/max across the same blocks".into(),
+        operation_stream: "versioned splitmix64-v1 deterministic operation streams; the two distribution workloads use separate lifetime and requested-size streams, normal allocation alignment, eight live slots per worker, and page touching; existing workloads retain their prior stream; live bytes at RSS peak and actual peak live requested bytes come from a separate instrumented replay so telemetry does not contaminate timed throughput or published peak RSS".into(),
+        seed_chain: "splitmix64-v1 chain over (master seed, workload tag, worker-count cell, repetition/block, worker index); allocator identity, time and scheduling are absent; distribution size streams derive from the worker seed with the size-v1 domain".into(),
         pairing: "all five allocators run the same frozen per-worker operation count and the same stream inside one block, in a rotated near-balanced order".into(),
         work_normalization: "operations per worker are calibrated once per (pattern, thread point) against upstream-mimalloc and frozen across allocators; total work scales with worker count".into(),
         oversubscription: format!(
@@ -1898,7 +2247,7 @@ pub fn methodology() -> ScalingMethodology {
                 .join("/")
         ),
         cross_thread_backpressure: "bounded per-worker mailbox; a producer facing a full mailbox frees the block itself rather than blocking, and the fallback count is published".into(),
-        statistics_omitted: "no bootstrap confidence intervals and no noise gating; three blocks cannot support them and the panel says so".into(),
+        statistics_omitted: "no bootstrap confidence intervals and no noise gating; legacy workloads remain three-block coverage signals, while distribution workloads use at least 40 repetitions for empirical percentile bands".into(),
     }
 }
 
@@ -1913,6 +2262,18 @@ fn median(values: &mut [f64]) -> f64 {
     } else {
         (values[middle - 1] + values[middle]) / 2.0
     }
+}
+
+fn quantile_sorted(values: &[f64], probability: f64) -> f64 {
+    let h = (values.len() - 1) as f64 * probability;
+    let lower = h.floor() as usize;
+    let upper = h.ceil() as usize;
+    values[lower] + (values[upper] - values[lower]) * (h - lower as f64)
+}
+
+fn quantile_u64_sorted(values: &[u64], probability: f64) -> u64 {
+    let floats = values.iter().map(|value| *value as f64).collect::<Vec<_>>();
+    quantile_sorted(&floats, probability).round() as u64
 }
 
 pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
@@ -1964,9 +2325,14 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
         .map(|value| ((value.pattern.clone(), value.thread_count), value))
         .collect::<BTreeMap<_, _>>();
     for calibration in &raw.calibrations {
-        if calibration.operations_per_worker == 0
-            || !(SCALING_MIN_BLOCK_NS..=SCALING_MAX_BLOCK_NS).contains(&calibration.elapsed_ns)
-        {
+        let pattern = ScalingPattern::parse(&calibration.pattern)
+            .ok_or_else(|| "scaling calibration names an unknown pattern".to_string())?;
+        let valid_window = if pattern.is_distribution() {
+            (25_000_000..=150_000_000).contains(&calibration.elapsed_ns)
+        } else {
+            (SCALING_MIN_BLOCK_NS..=SCALING_MAX_BLOCK_NS).contains(&calibration.elapsed_ns)
+        };
+        if calibration.operations_per_worker == 0 || !valid_window {
             return Err(format!(
                 "scaling calibration for {}/{} is outside the declared block window",
                 calibration.pattern, calibration.thread_count
@@ -2004,6 +2370,12 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
                 sample.pattern, sample.thread_count, sample.allocator_id
             ));
         }
+        if pattern.is_distribution() && sample.diagnostic_peak_rss_bytes == 0 {
+            return Err(format!(
+                "scaling distribution sample for {}/{} on {} has no diagnostic RSS observation",
+                sample.pattern, sample.thread_count, sample.allocator_id
+            ));
+        }
         // Re-derive the whole plan from the seed chain and compare every count.
         // The plan is allocator-independent, so it is derived once per
         // (pattern, thread point, block) and reused across that block's five
@@ -2024,6 +2396,13 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
             )
         });
         let response = &sample.response;
+        let metadata = simulate_plan_metadata(
+            pattern,
+            raw.run_seed,
+            sample.thread_count,
+            sample.block_id,
+            sample.operations_per_worker,
+        );
         // The published number is throughput, so it is re-derived too; checking
         // only that it is finite would let an arbitrary value reach the chart.
         let expected_throughput =
@@ -2034,6 +2413,17 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
             || response.free_calls != expected.free_calls
             || response.operation_count != expected.operation_count()
             || response.checksum != expected.checksum
+            || (pattern.is_distribution()
+                && (response.worker_seeds != metadata.worker_seeds
+                    || response.size_histogram != metadata.size_histogram
+                    || response.peak_live_requested_bytes != metadata.peak_live_requested_bytes
+                    || sample.live_requested_bytes_at_diagnostic_peak_rss
+                        > metadata.peak_live_requested_bytes
+                    || sample.diagnostic_peak_live_requested_bytes == 0
+                    || sample.diagnostic_peak_live_requested_bytes
+                        > metadata.peak_live_requested_bytes
+                    || sample.live_requested_bytes_at_diagnostic_peak_rss
+                        > sample.diagnostic_peak_live_requested_bytes))
             || response.thread_count != sample.thread_count
             || response.allocator_id != sample.allocator_id
             || response.protocol_version != SCALING_CHILD_PROTOCOL_VERSION
@@ -2071,9 +2461,10 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
                 let observed = blocks
                     .get(&key)
                     .ok_or_else(|| format!("scaling matrix is missing {key:?}"))?;
-                if observed.len() != SCALING_BLOCKS as usize {
+                let expected_blocks = pattern.full_blocks() as usize;
+                if observed.len() != expected_blocks {
                     return Err(format!(
-                        "scaling matrix cell {key:?} has {} blocks, expected {SCALING_BLOCKS}",
+                        "scaling matrix cell {key:?} has {} blocks, expected {expected_blocks}",
                         observed.len()
                     ));
                 }
@@ -2123,6 +2514,8 @@ pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, 
     for ((pattern, threads, allocator), values) in grouped {
         let mut sorted = values.clone();
         let median_value = median(&mut sorted);
+        let p05 = quantile_sorted(&sorted, 0.05);
+        let p95 = quantile_sorted(&sorted, 0.95);
         let minimum = sorted.first().copied().unwrap_or_default();
         let maximum = sorted.last().copied().unwrap_or_default();
         let baseline = single
@@ -2138,6 +2531,8 @@ pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, 
             allocator_id: allocator,
             block_count: values.len() as u32,
             median_throughput: median_value,
+            p05_throughput: p05,
+            p95_throughput: p95,
             min_throughput: minimum,
             max_throughput: maximum,
             speedup_vs_single_worker: median_value / baseline,
@@ -2153,12 +2548,17 @@ pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, 
     let mut rss_cell_summaries = Vec::new();
     for ((pattern, threads, allocator), mut values) in rss_grouped {
         values.sort_unstable();
+        let p05 = quantile_u64_sorted(&values, 0.05);
+        let p50 = quantile_u64_sorted(&values, 0.50);
+        let p95 = quantile_u64_sorted(&values, 0.95);
         rss_cell_summaries.push(ScalingRssCellSummary {
             pattern,
             thread_count: threads,
             allocator_id: allocator,
             block_count: values.len() as u32,
-            median_peak_rss_bytes: values[values.len() / 2],
+            median_peak_rss_bytes: p50,
+            p05_peak_rss_bytes: p05,
+            p95_peak_rss_bytes: p95,
             min_peak_rss_bytes: *values.first().unwrap_or(&0),
             max_peak_rss_bytes: *values.last().unwrap_or(&0),
         });
@@ -2199,7 +2599,7 @@ pub fn scaling_comparison_key(raw: &ScalingRawRun) -> Result<String, String> {
     struct Key<'a> {
         schema: &'a str,
         thread_points: &'a [u32],
-        blocks: u32,
+        blocks_by_pattern: BTreeMap<&'a str, u32>,
         patterns: Vec<ScalingPatternDefinition>,
         runner_fingerprint: &'a str,
         affinity_policy: &'a str,
@@ -2211,7 +2611,10 @@ pub fn scaling_comparison_key(raw: &ScalingRawRun) -> Result<String, String> {
     let value = Key {
         schema: SCALING_SCHEMA_VERSION,
         thread_points: &SCALING_THREAD_POINTS,
-        blocks: SCALING_BLOCKS,
+        blocks_by_pattern: SCALING_PATTERNS
+            .iter()
+            .map(|pattern| (pattern.as_str(), pattern.full_blocks()))
+            .collect(),
         patterns: pattern_definitions(),
         runner_fingerprint: &raw.runner.fingerprint_sha256,
         affinity_policy: &raw.topology.affinity_policy,
@@ -2260,9 +2663,14 @@ pub fn validate_scaling_report(report: &ScalingMetricReport) -> Result<(), Strin
         ));
     }
     for summary in &report.cell_summaries {
-        if summary.block_count != SCALING_BLOCKS
+        let expected_blocks = ScalingPattern::parse(&summary.pattern)
+            .ok_or_else(|| "scaling summary names unknown pattern".to_string())?
+            .full_blocks();
+        if summary.block_count != expected_blocks
             || !summary.median_throughput.is_finite()
             || summary.median_throughput <= 0.0
+            || summary.p05_throughput > summary.median_throughput
+            || summary.p95_throughput < summary.median_throughput
             || summary.min_throughput > summary.median_throughput
             || summary.max_throughput < summary.median_throughput
             || !summary.speedup_vs_single_worker.is_finite()
@@ -2275,7 +2683,13 @@ pub fn validate_scaling_report(report: &ScalingMetricReport) -> Result<(), Strin
             ));
         }
     }
-    if report.raw_samples.len() != expected_cells * SCALING_BLOCKS as usize {
+    let expected_samples = SCALING_PATTERNS
+        .iter()
+        .map(|pattern| {
+            pattern.full_blocks() as usize * SCALING_THREAD_POINTS.len() * ALLOCATOR_IDS.len()
+        })
+        .sum::<usize>();
+    if report.raw_samples.len() != expected_samples {
         return Err("scaling report raw sample count does not match its matrix".into());
     }
     if let Some(rss) = &report.rss {
@@ -2287,8 +2701,13 @@ pub fn validate_scaling_report(report: &ScalingMetricReport) -> Result<(), Strin
         }
         let mut rss_seen: BTreeSet<(String, u32, String)> = BTreeSet::new();
         for summary in &rss.cell_summaries {
-            if summary.block_count != SCALING_BLOCKS
+            let expected_blocks = ScalingPattern::parse(&summary.pattern)
+                .ok_or_else(|| "scaling RSS summary names unknown pattern".to_string())?
+                .full_blocks();
+            if summary.block_count != expected_blocks
                 || summary.min_peak_rss_bytes == 0
+                || summary.p05_peak_rss_bytes > summary.median_peak_rss_bytes
+                || summary.p95_peak_rss_bytes < summary.median_peak_rss_bytes
                 || summary.min_peak_rss_bytes > summary.median_peak_rss_bytes
                 || summary.max_peak_rss_bytes < summary.median_peak_rss_bytes
                 || !rss_seen.insert((
@@ -2418,9 +2837,13 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                 thread_count,
                 operations_per_worker,
                 warmup_operations_per_worker: 0,
-                elapsed_ns: SCALING_TARGET_BLOCK_NS,
+                elapsed_ns: if pattern.is_distribution() {
+                    50_000_000
+                } else {
+                    SCALING_TARGET_BLOCK_NS
+                },
             });
-            for block_id in 0..SCALING_BLOCKS {
+            for block_id in 0..pattern.full_blocks() {
                 let expected = simulate_cell(
                     pattern,
                     run_seed,
@@ -2450,6 +2873,13 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                         + u64::from(thread_count) * 3_000_000;
                     let elapsed_ns = base * allocator_scale / 100 * contention_scale / 100;
                     let operation_count = expected.operation_count();
+                    let metadata = simulate_plan_metadata(
+                        pattern,
+                        run_seed,
+                        thread_count,
+                        block_id,
+                        operations_per_worker,
+                    );
                     // Synthetic footprint: grows with worker count so the RSS
                     // panel exercises a per-thread-cache slope, plus a small
                     // per-allocator spread and per-block jitter.
@@ -2470,6 +2900,21 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                         child_binary_sha256: identity.child_binary_sha256.clone(),
                         operations_per_worker,
                         peak_rss_bytes,
+                        diagnostic_peak_rss_bytes: if pattern.is_distribution() {
+                            peak_rss_bytes
+                        } else {
+                            0
+                        },
+                        live_requested_bytes_at_diagnostic_peak_rss: if pattern.is_distribution() {
+                            metadata.peak_live_requested_bytes
+                        } else {
+                            0
+                        },
+                        diagnostic_peak_live_requested_bytes: if pattern.is_distribution() {
+                            metadata.peak_live_requested_bytes
+                        } else {
+                            0
+                        },
                         reproduction_command: format!(
                             "benchmark-scaling-run --run-seed {run_seed} # {}/{thread_count}",
                             pattern.as_str()
@@ -2484,6 +2929,9 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                             free_calls: expected.free_calls,
                             operation_count,
                             checksum: expected.checksum,
+                            worker_seeds: metadata.worker_seeds.clone(),
+                            size_histogram: metadata.size_histogram.clone(),
+                            peak_live_requested_bytes: metadata.peak_live_requested_bytes,
                             remote_free_calls: 0,
                             producer_fallback_frees: 0,
                             setup_ns: 1,

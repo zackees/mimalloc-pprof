@@ -32,6 +32,8 @@ jobs:
       - run: ruff check ci/
       - run: ruff format --check ci/
       - run: pyright
+      - run: python3 ci/check_scaling_typed_renderer.py --selftest
+      - run: python3 ci/check_scaling_typed_renderer.py
       # The linters must not have changed behavior. These are the same checks the
       # isa-baseline job runs, minus the compile: parser fixtures for both
       # architectures, which is what caught the arm64 breakage in the first place.

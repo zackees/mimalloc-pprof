@@ -178,6 +178,26 @@ allocators replay one identical stream inside each paired block.
 
 [![xmalloc-test producer/consumer: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-xmalloc-test.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
+### Deterministic requested-size distributions
+
+These final four scaling graphics use deterministic per-worker playback at 1, 2, 3, 4, 6,
+and 8 workers. They request either exact powers of two from 64 KiB through 4 MiB or an
+unbiased uniformly random byte size over the same inclusive range. Both use the normal
+allocation API; “power-of-two” describes the requested size, not extra pointer alignment.
+Each allocator row shows the empirical P5–P95 area and median from at least 40 paired runs.
+Within each metric every row—and both workloads—uses the same zero-based Y-axis domain and
+ticks, rounded upward from the maximum of all raw observations so outliers are not clipped.
+The four primary rows are TCMalloc, jemalloc, Microsoft mimalloc, and mimalloc-pprof; Bun
+mimalloc remains collected in a separately labelled supplemental row.
+
+[![Power-of-two requested sizes: four stacked allocator throughput areas plus supplemental Bun](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Power-of-two requested sizes: four stacked allocator peak RSS areas plus supplemental Bun](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Uniform random requested sizes: four stacked allocator throughput areas plus supplemental Bun](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Uniform random requested sizes: four stacked allocator peak RSS areas plus supplemental Bun](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
 Full methodology, per-cell tables and the other benchmark families are in
 [Performance](#performance) below and on the
 [dashboard](https://zackees.github.io/mimalloc-pprof/#scaling).

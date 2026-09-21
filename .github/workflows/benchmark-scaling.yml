@@ -2,12 +2,13 @@ name: benchmark-scaling
 
 # Linux-only thread-scaling sweep. It serializes with the other benchmark workflows and
 # publishes through the same sealed branch/Pages pipeline. Coverage mode:
-# 6 patterns (4 sparse + larson + xmalloc-test, #216) x 6 thread points x 5 allocators x
-# 3 blocks. The sweep doubled with the dense thread points (issue #211 WP4), grew another
+# Six legacy patterns use 3 coverage blocks; the two deterministic large-size
+# distributions use 40 paired repetitions for empirical P5-P95 bands (#424).
+# The sweep doubled with the dense thread points (issue #211 WP4), grew another
 # 25% with the Bun row (#325), which also adds a fifth benchmark-child build, and grew
 # another 50% with the two named workloads (#216). The 2026 live run measured 3m01s of
-# sweep in a 10m00s job against the 20-minute limit below, so ~4.5 min of sweep still
-# fits. That is now the tightest of the four benchmark budgets; if a run times out,
+# sweep in a 10m00s job before the distribution workloads were added. The 30-minute
+# bound budgets the 40-repetition additions; if a run times out,
 # raise timeout-minutes rather than dropping a thread point, a pattern, or a row.
 # ci/check_benchmark_scaling_workflow.py pins the thread points and pattern ids in
 # rust/benchmark-suite/src/scaling.rs to the ones ci/benchmark_report.py validates, so
@@ -16,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "full (publishable, 3 blocks) or smoke (1 block, artifact only)"
+        description: "full (3 legacy blocks + 40 distribution repetitions) or smoke (1 each, artifact only)"
         type: choice
         options: [full, smoke]
         default: full
@@ -25,7 +26,7 @@ on:
         required: false
         type: string
       blocks:
-        description: "Blocks per cell (full must use 3; smoke must use 1)"
+        description: "Legacy blocks per cell (full 3; smoke 1; distribution full is fixed at 40)"
         type: number
         default: 3
         required: false
@@ -49,7 +50,7 @@ env:
 jobs:
   build-and-measure:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
     outputs:

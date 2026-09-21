@@ -19,6 +19,7 @@ from typing import Any, Callable, NoReturn, cast
 import yaml
 
 from benchmark_report import (
+    DISTRIBUTION_BLOCKS,
     SCALING_BLOCKS,
     SCALING_PATTERN_IDS,
     SCALING_RSS_SCHEMA,
@@ -44,7 +45,7 @@ JOBS = {
     "publication-audit",
 }
 # Coverage mode exists to stay cheap; the budget is part of the contract.
-MAXIMUM_BUILD_TIMEOUT_MINUTES = 20
+MAXIMUM_BUILD_TIMEOUT_MINUTES = 30
 EXPECTED_BLOCKS = 3
 
 
@@ -191,6 +192,9 @@ RUST_THREAD_POINTS = re.compile(
     r"pub const SCALING_THREAD_POINTS:\s*\[u32;\s*(?P<length>\d+)\]\s*=\s*\[(?P<points>[^\]]*)\];"
 )
 RUST_BLOCKS = re.compile(r"pub const SCALING_BLOCKS:\s*u32\s*=\s*(?P<blocks>\d+);")
+RUST_DISTRIBUTION_BLOCKS = re.compile(
+    r"pub const DISTRIBUTION_BLOCKS:\s*u32\s*=\s*(?P<blocks>\d+);"
+)
 RUST_SCHEMA = re.compile(r'pub const SCALING_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<schema>[^"]*)";')
 RUST_RSS_SCHEMA = re.compile(
     r'pub const SCALING_RSS_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<schema>[^"]*)";'
@@ -236,6 +240,12 @@ def validate_source_contract(source: str) -> None:
     blocks_match = RUST_BLOCKS.search(source)
     if blocks_match is None or int(blocks_match.group("blocks")) != SCALING_BLOCKS:
         fail(f"scaling.rs: SCALING_BLOCKS must be {SCALING_BLOCKS}")
+    distribution_blocks = RUST_DISTRIBUTION_BLOCKS.search(source)
+    if (
+        distribution_blocks is None
+        or int(distribution_blocks.group("blocks")) != DISTRIBUTION_BLOCKS
+    ):
+        fail(f"scaling.rs: DISTRIBUTION_BLOCKS must be {DISTRIBUTION_BLOCKS}")
     schema_match = RUST_SCHEMA.search(source)
     if schema_match is None or schema_match.group("schema") != SCALING_SCHEMA:
         fail(f"scaling.rs: SCALING_SCHEMA_VERSION must be {SCALING_SCHEMA!r}")

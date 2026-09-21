@@ -82,14 +82,14 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(policy.ScalingWorkflowError, "array length disagrees"):
             policy.validate_source_contract(lied)
 
-    def test_budget_over_twenty_minutes_is_rejected(self) -> None:
+    def test_budget_over_thirty_minutes_is_rejected(self) -> None:
         value = self.workflow()
         jobs = value["jobs"]
         assert isinstance(jobs, dict)
         build = jobs["build-and-measure"]
         assert isinstance(build, dict)
         build["timeout-minutes"] = 45
-        with self.assertRaisesRegex(policy.ScalingWorkflowError, "20"):
+        with self.assertRaisesRegex(policy.ScalingWorkflowError, "30"):
             policy.validate(value)
 
     def test_parallel_matrix_is_rejected(self) -> None:

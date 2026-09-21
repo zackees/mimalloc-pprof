@@ -866,6 +866,8 @@ def run_lint(ctx: RunCtx) -> bool:
         ["uv", "run", "ci/check_internal_state.py", "--selftest"],
         ["uv", "run", "ci/check_rust_surface.py", "--selftest"],
         ["uv", "run", "ci/check_rust_surface.py"],
+        ["uv", "run", "ci/check_scaling_typed_renderer.py", "--selftest"],
+        ["uv", "run", "ci/check_scaling_typed_renderer.py"],
         ["uv", "run", "ci/check_isa_baseline.py", "--help"],
         ["uv", "run", "ci/check_release_equivalence.py", "--help"],
         # The committed chart SVGs must still re-render byte-for-byte from the

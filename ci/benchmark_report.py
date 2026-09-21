@@ -27,6 +27,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import NoReturn, cast
@@ -151,10 +152,14 @@ RUNNER_FIELDS = {
     "affinity",
     "power",
 }
-SCALING_SCHEMA = "throughput-scaling-sparse-v1"
+LEGACY_SCALING_SCHEMA = "throughput-scaling-sparse-v1"
+SCALING_SCHEMA = "throughput-scaling-sparse-v2"
+SCALING_SCHEMAS = (LEGACY_SCALING_SCHEMA, SCALING_SCHEMA)
 SCALING_RSS_SCHEMA = "throughput-scaling-rss-v1"
-SCALING_RIGOR_LABEL = "coverage mode - reduced statistical rigor (3 blocks)"
+LEGACY_SCALING_RIGOR_LABEL = "coverage mode - reduced statistical rigor (3 blocks)"
+SCALING_RIGOR_LABEL = "mixed rigor - 3-block legacy coverage plus 40-repetition distribution bands"
 SCALING_BLOCKS = 3
+DISTRIBUTION_BLOCKS = 40
 # Dense sweep up to 2x the 4-vCPU hosted runner's logical cores. The 6/8
 # points are oversubscribed and describe contention, not core scaling. The
 # thread points are part of the metric comparison key, so changing them
@@ -182,6 +187,8 @@ SCALING_PATTERN_IDS = (
     "sparse-cross-thread",
     "larson",
     "xmalloc-test",
+    "power-of-two-large",
+    "random-large",
 )
 # Every pattern set this validator will accept, oldest first. New production
 # runs carry SCALING_PATTERN_IDS, but the published branch still holds history
@@ -192,12 +199,23 @@ SCALING_PATTERN_IDS = (
 # patterns changed the metric comparison key, so it starts a new history
 # lineage instead of rewriting the sparse one. This mirrors
 # SCALING_THREAD_POINT_LINEAGES above.
-SCALING_PATTERN_LINEAGES = (LEGACY_SCALING_PATTERN_IDS, SCALING_PATTERN_IDS)
+PRE_DISTRIBUTION_PATTERN_IDS = SCALING_PATTERN_IDS[:-2]
+SCALING_PATTERN_LINEAGES = (
+    LEGACY_SCALING_PATTERN_IDS,
+    PRE_DISTRIBUTION_PATTERN_IDS,
+    SCALING_PATTERN_IDS,
+)
 # One panel per allocation pattern. Separate files (rather than one facet grid)
 # keep each chart legible in the README and on a phone.
 SCALING_PANELS = {
     pattern: f"benchmark-scaling-{pattern.removeprefix('sparse-')}.svg"
-    for pattern in SCALING_PATTERN_IDS
+    for pattern in PRE_DISTRIBUTION_PATTERN_IDS
+}
+DISTRIBUTION_PATTERN_IDS = ("power-of-two-large", "random-large")
+DISTRIBUTION_PANELS = {
+    (pattern, metric): f"benchmark-scaling-{pattern}-{metric}.svg"
+    for pattern in DISTRIBUTION_PATTERN_IDS
+    for metric in ("throughput", "rss")
 }
 SCALING_PANEL_TITLES = {
     "sparse-tiny-hot": "Tiny hot path (16-64 B)",
@@ -206,7 +224,82 @@ SCALING_PANEL_TITLES = {
     "sparse-cross-thread": "Cross-thread handoff (16-512 B, remote free)",
     "larson": "Larson server workload (8-1000 B, rotating owners)",
     "xmalloc-test": "xmalloc-test producer/consumer (8-128 B, remote free)",
+    "power-of-two-large": "Power-of-two requested sizes (64 KiB-4 MiB)",
+    "random-large": "Uniform random requested sizes (64 KiB-4 MiB)",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ScalingRunView:
+    run_id: str
+    run_attempt: int
+    run_origin: str
+    source_sha: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScalingTopologyView:
+    physical_cores: int
+    logical_cores: int
+    allowed_logical_cpus: int
+
+
+@dataclass(frozen=True, slots=True)
+class ScalingMethodologyView:
+    seed_chain: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScalingThroughputCell:
+    pattern: str
+    thread_count: int
+    allocator_id: str
+    block_count: int
+    median: float
+    p05: float
+    p95: float
+    minimum: float
+    maximum: float
+    speedup: float
+    oversubscribed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ScalingRssCell:
+    pattern: str
+    thread_count: int
+    allocator_id: str
+    block_count: int
+    median: int
+    p05: int
+    p95: int
+    minimum: int
+    maximum: int
+
+
+@dataclass(frozen=True, slots=True)
+class ScalingRawObservation:
+    pattern: str
+    allocator_id: str
+    throughput: float
+    peak_rss_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ScalingView:
+    schema: str
+    rigor_label: str
+    metric_comparison_key: str
+    thread_points: tuple[int, ...]
+    patterns: tuple[str, ...]
+    run: ScalingRunView
+    topology: ScalingTopologyView
+    methodology: ScalingMethodologyView
+    throughput_cells: tuple[ScalingThroughputCell, ...]
+    rss_cells: tuple[ScalingRssCell, ...]
+    raw_observations: tuple[ScalingRawObservation, ...]
+
+
 SITE_FILES = {
     ".nojekyll",
     "index.html",
@@ -223,6 +316,7 @@ SITE_FILES = {
     "benchmark-latency-tail.png",
     "benchmark-pprof-tax.png",
     *SCALING_PANELS.values(),
+    *DISTRIBUTION_PANELS.values(),
 }
 PNG_DIMENSIONS = {
     "benchmark-throughput.png": (1280, 720),
@@ -235,7 +329,7 @@ PNG_DIMENSIONS = {
     "benchmark-latency-tail.png": (960, 540),
     "benchmark-pprof-tax.png": (960, 540),
 }
-SVG_FILES = frozenset(SCALING_PANELS.values())
+SVG_FILES = frozenset((*SCALING_PANELS.values(), *DISTRIBUTION_PANELS.values()))
 FILE_CAPS = {
     ".nojekyll": 0,
     "index.html": 2 * 1024 * 1024,
@@ -268,6 +362,7 @@ ROLES = {
     "benchmark-latency-tail.png": "latency-tail-panel",
     "benchmark-pprof-tax.png": "pprof-tax-panel",
     **dict.fromkeys(SCALING_PANELS.values(), "scaling-panel"),
+    **dict.fromkeys(DISTRIBUTION_PANELS.values(), "distribution-scaling-panel"),
 }
 
 MEMORY_SCHEMA = "linux-process-memory-v1"
@@ -3648,6 +3743,10 @@ SCALING_METHODOLOGY_FIELDS = {
     "cross_thread_backpressure",
     "statistics_omitted",
 }
+SCALING_V2_METHODOLOGY_FIELDS = SCALING_METHODOLOGY_FIELDS | {
+    "distribution_blocks_per_cell",
+    "percentile_method",
+}
 SCALING_SUMMARY_FIELDS = {
     "pattern",
     "thread_count",
@@ -3660,6 +3759,11 @@ SCALING_SUMMARY_FIELDS = {
     "max_throughput",
     "speedup_vs_single_worker",
 }
+SCALING_V2_SUMMARY_FIELDS = SCALING_SUMMARY_FIELDS | {"p05_throughput", "p95_throughput"}
+
+
+def scaling_blocks_for_pattern(pattern: str) -> int:
+    return DISTRIBUTION_BLOCKS if pattern in DISTRIBUTION_PATTERN_IDS else SCALING_BLOCKS
 
 
 def scaling_patterns_of(scaling: Mapping[str, object]) -> tuple[str, ...]:
@@ -3719,19 +3823,26 @@ def validate_scaling_rss(
         fail(f"{label}.cell_summaries: expected exactly {expected_cells} cells")
     seen: set[tuple[str, int, str]] = set()
     for index, summary in enumerate(summaries):
-        exact_fields(
+        expected_rss_fields = {
+            "pattern",
+            "thread_count",
+            "allocator_id",
+            "block_count",
+            "median_peak_rss_bytes",
+            "min_peak_rss_bytes",
+            "max_peak_rss_bytes",
+        }
+        percentile_fields = {"p05_peak_rss_bytes", "p95_peak_rss_bytes"}
+        exact_fields_with_optional(
             summary,
-            {
-                "pattern",
-                "thread_count",
-                "allocator_id",
-                "block_count",
-                "median_peak_rss_bytes",
-                "min_peak_rss_bytes",
-                "max_peak_rss_bytes",
-            },
+            expected_rss_fields,
+            percentile_fields,
             f"{label}.cell_summaries[{index}]",
         )
+        if any(
+            pattern in DISTRIBUTION_PATTERN_IDS for pattern in patterns
+        ) and not percentile_fields.issubset(summary):
+            fail(f"{label}.cell_summaries[{index}]: percentile fields required")
         pattern = string_value(summary.get("pattern"), f"{label}.cell_summaries[{index}].pattern")
         allocator = string_value(
             summary.get("allocator_id"), f"{label}.cell_summaries[{index}].allocator_id"
@@ -3748,11 +3859,10 @@ def validate_scaling_rss(
         ):
             fail(f"{label}.cell_summaries[{index}]: undeclared or duplicate RSS cell")
         seen.add(key)
-        if (
-            int_value(summary.get("block_count"), f"{label}.cell_summaries[{index}].block_count", 1)
-            != SCALING_BLOCKS
-        ):
-            fail(f"{label}.cell_summaries[{index}].block_count: {SCALING_BLOCKS} blocks required")
+        if int_value(
+            summary.get("block_count"), f"{label}.cell_summaries[{index}].block_count", 1
+        ) != scaling_blocks_for_pattern(pattern):
+            fail(f"{label}.cell_summaries[{index}].block_count: wrong repetition count")
         minimum = int_value(
             summary.get("min_peak_rss_bytes"), f"{label}.cell_summaries[{index}].min", 1
         )
@@ -3764,6 +3874,15 @@ def validate_scaling_rss(
         )
         if minimum > median or maximum < median:
             fail(f"{label}.cell_summaries[{index}]: min/median/max are inconsistent")
+        if "p05_peak_rss_bytes" in summary:
+            p05 = int_value(
+                summary.get("p05_peak_rss_bytes"), f"{label}.cell_summaries[{index}].p05", 1
+            )
+            p95 = int_value(
+                summary.get("p95_peak_rss_bytes"), f"{label}.cell_summaries[{index}].p95", 1
+            )
+            if minimum > p05 or p05 > median or median > p95 or p95 > maximum:
+                fail(f"{label}.cell_summaries[{index}]: percentile order is inconsistent")
     return rss
 
 
@@ -3778,13 +3897,18 @@ def validate_scaling_report(
         required.add("runner_fingerprint_sha256")
     exact_fields_with_optional(report, required, {"rss"}, label)
     if (
-        report.get("metric_schema_version") != SCALING_SCHEMA
+        report.get("metric_schema_version") not in SCALING_SCHEMAS
         or report.get("status") != "complete"
         or report.get("direction") != "higher-is-better"
         or report.get("informational") is not True
     ):
         fail(f"{label}: complete informational higher-is-better scaling required")
-    if report.get("rigor_label") != SCALING_RIGOR_LABEL:
+    expected_rigor = (
+        SCALING_RIGOR_LABEL
+        if report.get("metric_schema_version") == SCALING_SCHEMA
+        else LEGACY_SCALING_RIGOR_LABEL
+    )
+    if report.get("rigor_label") != expected_rigor:
         fail(f"{label}.rigor_label: coverage-mode labeling is mandatory")
     points = [
         int_value(item, f"{label}.thread_points[{index}]", 1)
@@ -3835,13 +3959,29 @@ def validate_scaling_report(
         )
         int_value(topology.get("allowed_logical_cpus"), f"{label}.topology.allowed_logical_cpus", 1)
     methodology = object_value(report.get("methodology"), f"{label}.methodology")
-    exact_fields(methodology, SCALING_METHODOLOGY_FIELDS, f"{label}.methodology")
-    if methodology.get("rigor") != SCALING_RIGOR_LABEL:
+    is_v2 = report.get("metric_schema_version") == SCALING_SCHEMA
+    exact_fields(
+        methodology,
+        SCALING_V2_METHODOLOGY_FIELDS if is_v2 else SCALING_METHODOLOGY_FIELDS,
+        f"{label}.methodology",
+    )
+    if methodology.get("rigor") != expected_rigor:
         fail(f"{label}.methodology.rigor: coverage-mode labeling is mandatory")
     if int_value(methodology.get("blocks_per_cell"), f"{label}.methodology.blocks_per_cell", 1) != (
         SCALING_BLOCKS
     ):
         fail(f"{label}.methodology.blocks_per_cell: protocol fixes {SCALING_BLOCKS} blocks")
+    if is_v2:
+        if (
+            int_value(
+                methodology.get("distribution_blocks_per_cell"),
+                f"{label}.methodology.distribution_blocks_per_cell",
+                1,
+            )
+            < DISTRIBUTION_BLOCKS
+        ):
+            fail(f"{label}.methodology.distribution_blocks_per_cell: at least 40 required")
+        string_value(methodology.get("percentile_method"), f"{label}.methodology.percentile_method")
     summaries = list_value(report.get("cell_summaries"), f"{label}.cell_summaries")
     declared = declared_allocators(
         [
@@ -3854,9 +3994,11 @@ def validate_scaling_report(
     if len(summaries) != expected_cells:
         fail(f"{label}.cell_summaries: expected exactly {expected_cells} cells")
     seen: set[tuple[str, int, str]] = set()
+    summary_by_key: dict[tuple[str, int, str], dict[str, object]] = {}
     for index, item in enumerate(summaries):
         summary = object_value(item, f"{label}.cell_summaries[{index}]")
-        exact_fields(summary, SCALING_SUMMARY_FIELDS, f"{label}.cell_summaries[{index}]")
+        expected_summary_fields = SCALING_V2_SUMMARY_FIELDS if is_v2 else SCALING_SUMMARY_FIELDS
+        exact_fields(summary, expected_summary_fields, f"{label}.cell_summaries[{index}]")
         pattern = string_value(summary.get("pattern"), f"{label}.cell_summaries[{index}].pattern")
         allocator = string_value(
             summary.get("allocator_id"), f"{label}.cell_summaries[{index}].allocator_id"
@@ -3874,11 +4016,11 @@ def validate_scaling_report(
         if key in seen:
             fail(f"{label}.cell_summaries[{index}]: duplicate cell {key}")
         seen.add(key)
-        if (
-            int_value(summary.get("block_count"), f"{label}.cell_summaries[{index}].block_count", 1)
-            != SCALING_BLOCKS
-        ):
-            fail(f"{label}.cell_summaries[{index}].block_count: {SCALING_BLOCKS} blocks required")
+        summary_by_key[key] = summary
+        if int_value(
+            summary.get("block_count"), f"{label}.cell_summaries[{index}].block_count", 1
+        ) != scaling_blocks_for_pattern(pattern):
+            fail(f"{label}.cell_summaries[{index}].block_count: wrong repetition count")
         median = float_value(
             summary.get("median_throughput"), f"{label}.cell_summaries[{index}].median", True
         )
@@ -3900,15 +4042,217 @@ def validate_scaling_report(
         )
         if low > median or high < median:
             fail(f"{label}.cell_summaries[{index}]: min/median/max are inconsistent")
+        if is_v2:
+            p05 = float_value(
+                summary.get("p05_throughput"), f"{label}.cell_summaries[{index}].p05", True
+            )
+            p95 = float_value(
+                summary.get("p95_throughput"), f"{label}.cell_summaries[{index}].p95", True
+            )
+            if low > p05 or p05 > median or median > p95 or p95 > high:
+                fail(f"{label}.cell_summaries[{index}]: percentile order is inconsistent")
         if summary.get("oversubscribed") is not (factor > 1.0):
             fail(f"{label}.cell_summaries[{index}].oversubscribed: disagrees with its factor")
     if len(seen) != expected_cells:
         fail(f"{label}.cell_summaries: matrix is incomplete")
     if not compact:
         raw = list_value(report.get("raw_samples"), f"{label}.raw_samples")
-        if len(raw) != expected_cells * SCALING_BLOCKS:
-            fail(f"{label}.raw_samples: expected {expected_cells * SCALING_BLOCKS} samples")
+        expected_samples = (
+            len(thread_points)
+            * len(declared)
+            * sum(scaling_blocks_for_pattern(pattern) for pattern in declared_patterns)
+        )
+        if len(raw) != expected_samples:
+            fail(f"{label}.raw_samples: expected {expected_samples} samples")
+        raw_groups: dict[tuple[str, int, str], list[tuple[int, int, float]]] = {}
+        raw_keys: set[tuple[str, int, str, int]] = set()
+        paired_ordinals: dict[tuple[str, int, int], set[int]] = {}
+        for index, value in enumerate(raw):
+            item = object_value(value, f"{label}.raw_samples[{index}]")
+            pattern = string_value(item.get("pattern"), f"{label}.raw_samples[{index}].pattern")
+            threads = int_value(
+                item.get("thread_count"), f"{label}.raw_samples[{index}].thread_count", 1
+            )
+            allocator = string_value(
+                item.get("allocator_id"), f"{label}.raw_samples[{index}].allocator_id"
+            )
+            block = int_value(item.get("block_id"), f"{label}.raw_samples[{index}].block_id")
+            ordinal = int_value(item.get("ordinal"), f"{label}.raw_samples[{index}].ordinal")
+            cell_key = (pattern, threads, allocator)
+            sample_key = (*cell_key, block)
+            block_count = scaling_blocks_for_pattern(pattern)
+            if cell_key not in summary_by_key or block >= block_count:
+                fail(f"{label}.raw_samples[{index}]: undeclared cell or block")
+            if allocator not in declared or ordinal >= len(declared) or sample_key in raw_keys:
+                fail(f"{label}.raw_samples[{index}]: invalid ordinal or duplicate sample")
+            raw_keys.add(sample_key)
+            paired_ordinals.setdefault((pattern, threads, block), set()).add(ordinal)
+            response = object_value(item.get("response"), f"{label}.raw_samples[{index}].response")
+            if response.get("allocator_id") != allocator or response.get("thread_count") != threads:
+                fail(f"{label}.raw_samples[{index}].response: identity disagrees with sample")
+            throughput = float_value(
+                response.get("throughput_operations_per_second"),
+                f"{label}.raw_samples[{index}].response.throughput_operations_per_second",
+                True,
+            )
+            peak_rss_value = item.get("peak_rss_bytes")
+            peak_rss = (
+                int_value(peak_rss_value, f"{label}.raw_samples[{index}].peak_rss_bytes", 1)
+                if is_v2
+                else int_value(peak_rss_value, f"{label}.raw_samples[{index}].peak_rss_bytes")
+                if peak_rss_value is not None
+                else 0
+            )
+            raw_groups.setdefault(cell_key, []).append((block, peak_rss, throughput))
+
+        expected_raw_keys = {
+            (pattern, threads, allocator, block)
+            for pattern in declared_patterns
+            for threads in thread_points
+            for allocator in declared
+            for block in range(scaling_blocks_for_pattern(pattern))
+        }
+        if raw_keys != expected_raw_keys:
+            fail(f"{label}.raw_samples: matrix is incomplete")
+        if any(ordinals != set(range(len(declared))) for ordinals in paired_ordinals.values()):
+            fail(f"{label}.raw_samples: paired blocks do not carry every allocator ordinal")
+
+        rss_value = report.get("rss")
+        rss_by_key: dict[tuple[str, int, str], dict[str, object]] = {}
+        if rss_value is not None:
+            rss = object_value(rss_value, f"{label}.rss")
+            for value in list_value(rss.get("cell_summaries"), f"{label}.rss.cell_summaries"):
+                item = object_value(value, f"{label}.rss.cell_summary")
+                rss_by_key[
+                    (
+                        cast(str, item["pattern"]),
+                        cast(int, item["thread_count"]),
+                        cast(str, item["allocator_id"]),
+                    )
+                ] = item
+        for key, observations in raw_groups.items():
+            observations.sort(key=lambda value: value[0])
+            throughputs = [value[2] for value in observations]
+            summary = summary_by_key[key]
+            expected_throughput = {
+                "min_throughput": min(throughputs),
+                "p05_throughput": latency_type7(throughputs, 0.05),
+                "median_throughput": latency_type7(throughputs, 0.50),
+                "p95_throughput": latency_type7(throughputs, 0.95),
+                "max_throughput": max(throughputs),
+            }
+            fields = (
+                expected_throughput
+                if is_v2
+                else {
+                    name: value
+                    for name, value in expected_throughput.items()
+                    if name not in {"p05_throughput", "p95_throughput"}
+                }
+            )
+            if any(
+                not math.isclose(cast(float, summary[name]), expected, rel_tol=1e-12)
+                for name, expected in fields.items()
+            ):
+                fail(f"{label}: throughput summary differs from raw observations for {key}")
+            if key in rss_by_key and all(value[1] > 0 for value in observations):
+                rss_values = [value[1] for value in observations]
+                rss_summary = rss_by_key[key]
+                expected_rss = {
+                    "min_peak_rss_bytes": min(rss_values),
+                    "median_peak_rss_bytes": math.floor(latency_type7(rss_values, 0.50) + 0.5),
+                    "max_peak_rss_bytes": max(rss_values),
+                }
+                if is_v2:
+                    expected_rss.update(
+                        {
+                            "p05_peak_rss_bytes": math.floor(latency_type7(rss_values, 0.05) + 0.5),
+                            "p95_peak_rss_bytes": math.floor(latency_type7(rss_values, 0.95) + 0.5),
+                        }
+                    )
+                if any(rss_summary[name] != expected for name, expected in expected_rss.items()):
+                    fail(f"{label}: RSS summary differs from raw observations for {key}")
     return report
+
+
+def scaling_view_from_validated(report: Mapping[str, object]) -> ScalingView:
+    """Project validated JSON into the only representation renderers accept."""
+    run = object_value(report["run"], "scaling run")
+    topology = object_value(report["topology"], "scaling topology")
+    methodology = object_value(report["methodology"], "scaling methodology")
+    throughput_cells: list[ScalingThroughputCell] = []
+    for value in list_value(report["cell_summaries"], "scaling summaries"):
+        item = object_value(value, "scaling summary")
+        median = float(cast(float | int, item["median_throughput"]))
+        throughput_cells.append(
+            ScalingThroughputCell(
+                pattern=cast(str, item["pattern"]),
+                thread_count=cast(int, item["thread_count"]),
+                allocator_id=cast(str, item["allocator_id"]),
+                block_count=cast(int, item["block_count"]),
+                median=median,
+                p05=float(cast(float | int, item.get("p05_throughput", median))),
+                p95=float(cast(float | int, item.get("p95_throughput", median))),
+                minimum=float(cast(float | int, item["min_throughput"])),
+                maximum=float(cast(float | int, item["max_throughput"])),
+                speedup=float(cast(float | int, item["speedup_vs_single_worker"])),
+                oversubscribed=cast(bool, item["oversubscribed"]),
+            )
+        )
+    rss_cells: list[ScalingRssCell] = []
+    rss_value = report.get("rss")
+    if rss_value is not None:
+        rss = object_value(rss_value, "scaling rss")
+        for value in list_value(rss["cell_summaries"], "scaling rss summaries"):
+            item = object_value(value, "scaling rss summary")
+            median = cast(int, item["median_peak_rss_bytes"])
+            rss_cells.append(
+                ScalingRssCell(
+                    pattern=cast(str, item["pattern"]),
+                    thread_count=cast(int, item["thread_count"]),
+                    allocator_id=cast(str, item["allocator_id"]),
+                    block_count=cast(int, item["block_count"]),
+                    median=median,
+                    p05=cast(int, item.get("p05_peak_rss_bytes", median)),
+                    p95=cast(int, item.get("p95_peak_rss_bytes", median)),
+                    minimum=cast(int, item["min_peak_rss_bytes"]),
+                    maximum=cast(int, item["max_peak_rss_bytes"]),
+                )
+            )
+    raw_observations: list[ScalingRawObservation] = []
+    for value in list_value(report["raw_samples"], "scaling raw samples"):
+        item = object_value(value, "scaling raw sample")
+        response = object_value(item["response"], "scaling child response")
+        raw_observations.append(
+            ScalingRawObservation(
+                pattern=cast(str, item["pattern"]),
+                allocator_id=cast(str, item["allocator_id"]),
+                throughput=float(cast(float | int, response["throughput_operations_per_second"])),
+                peak_rss_bytes=cast(int, item.get("peak_rss_bytes", 0)),
+            )
+        )
+    return ScalingView(
+        schema=cast(str, report["metric_schema_version"]),
+        rigor_label=cast(str, report["rigor_label"]),
+        metric_comparison_key=cast(str, report["metric_comparison_key"]),
+        thread_points=tuple(cast(list[int], report["thread_points"])),
+        patterns=tuple(sorted({cell.pattern for cell in throughput_cells})),
+        run=ScalingRunView(
+            run_id=cast(str, run["run_id"]),
+            run_attempt=cast(int, run["run_attempt"]),
+            run_origin=cast(str, run["run_origin"]),
+            source_sha=cast(str, run["source_sha"]),
+        ),
+        topology=ScalingTopologyView(
+            physical_cores=cast(int, topology["physical_cores"]),
+            logical_cores=cast(int, topology["logical_cores"]),
+            allowed_logical_cpus=cast(int, topology["allowed_logical_cpus"]),
+        ),
+        methodology=ScalingMethodologyView(seed_chain=cast(str, methodology["seed_chain"])),
+        throughput_cells=tuple(throughput_cells),
+        rss_cells=tuple(rss_cells),
+        raw_observations=tuple(raw_observations),
+    )
 
 
 # Dark panel palette. Defined once so every scaling facet reads as one system.
@@ -4122,7 +4466,7 @@ def _scaling_plot_parts(
     parts.append(svg_text(left - 12, top - 24, subtitle, fill=SCALING_INK["muted"], size=13))
 
 
-def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
+def scaling_svg(scaling: ScalingView, pattern: str) -> bytes:
     """One dark chart per pattern. Without RSS data: throughput vs worker
     count. With the RSS side-car: throughput and peak-RSS panels side by side
     so per-thread-cache footprint growth reads against the throughput curve."""
@@ -4132,25 +4476,13 @@ def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
     plot_height = height - top - bottom
     # The report's own sweep, not the current contract: a published row from an
     # older lineage keeps rendering on the axis it was measured against.
-    thread_points = tuple(
-        int_value(item, "scaling thread point", 1)
-        for item in list_value(scaling["thread_points"], "scaling thread points")
-    )
-    summaries = [
-        object_value(item, "scaling cell summary")
-        for item in list_value(scaling["cell_summaries"], "scaling cell summaries")
-    ]
+    thread_points = scaling.thread_points
     series: dict[str, list[tuple[int, float]]] = {}
-    for summary in summaries:
-        if summary.get("pattern") != pattern:
+    for summary in scaling.throughput_cells:
+        if summary.pattern != pattern:
             continue
-        allocator = cast(str, summary["allocator_id"])
-        series.setdefault(allocator, []).append(
-            (
-                int(cast(int, summary["thread_count"])),
-                float(cast(float, summary["median_throughput"])),
-            )
-        )
+        allocator = summary.allocator_id
+        series.setdefault(allocator, []).append((summary.thread_count, summary.median))
     for points in series.values():
         points.sort()
     peak = max(
@@ -4158,25 +4490,17 @@ def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
         default=1.0,
     )
     ceiling = peak * 1.12
-    topology = object_value(scaling.get("topology", {}), "scaling topology")
-    allowed = int(cast(int, topology.get("allowed_logical_cpus", 1)) or 1)
+    topology = scaling.topology
+    allowed = topology.allowed_logical_cpus
     unit = axis_unit(ceiling)
-    rss = scaling.get("rss")
-    if rss is not None:
-        rss_report = validate_scaling_rss(
-            rss, "scaling rss", thread_points, scaling_patterns_of(scaling)
-        )
+    if scaling.rss_cells:
         rss_series: dict[str, list[tuple[int, float]]] = {}
-        for summary_value in list_value(rss_report["cell_summaries"], "scaling rss summaries"):
-            summary = object_value(summary_value, "scaling rss summary")
-            if summary.get("pattern") != pattern:
+        for summary in scaling.rss_cells:
+            if summary.pattern != pattern:
                 continue
-            allocator = cast(str, summary["allocator_id"])
+            allocator = summary.allocator_id
             rss_series.setdefault(allocator, []).append(
-                (
-                    int(cast(int, summary["thread_count"])),
-                    float(cast(int, summary["median_peak_rss_bytes"])),
-                )
+                (summary.thread_count, float(summary.median))
             )
         for points in rss_series.values():
             points.sort()
@@ -4257,7 +4581,7 @@ def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
             SCALING_LEFT - 12,
             height - 16,
             f"{SCALING_RIGOR_LABEL} | median of {SCALING_BLOCKS} paired blocks | "
-            f"runner {topology.get('physical_cores', '?')}P/{topology.get('logical_cores', '?')}L "
+            f"runner {topology.physical_cores}P/{topology.logical_cores}L "
             f"| informational",
             fill=SCALING_INK["muted"],
             size=11,
@@ -4265,6 +4589,172 @@ def scaling_svg(scaling: Mapping[str, object], pattern: str) -> bytes:
     )
     parts.append("</svg>")
     return ("\n".join(parts) + "\n").encode("utf-8")
+
+
+PRIMARY_DISTRIBUTION_ALLOCATORS = (
+    "tcmalloc",
+    "jemalloc",
+    "upstream-mimalloc",
+    "mimalloc-pprof",
+)
+
+
+def readable_ceiling(maximum: float, intervals: int = 5) -> tuple[float, float]:
+    """Return a zero-based ceiling and 1/2/2.5/5/10 x 10^k tick step."""
+    raw_step = max(maximum, 1.0) / intervals
+    exponent = math.floor(math.log10(raw_step))
+    scale = 10.0**exponent
+    normalized = raw_step / scale
+    nice = next(value for value in (1.0, 2.0, 2.5, 5.0, 10.0) if value >= normalized)
+    step = nice * scale
+    return math.ceil(maximum / step) * step, step
+
+
+def distribution_global_domain(scaling: ScalingView, metric: str) -> tuple[float, float]:
+    values: list[float] = []
+    for sample in scaling.raw_observations:
+        if sample.pattern not in DISTRIBUTION_PATTERN_IDS:
+            continue
+        if metric == "throughput":
+            values.append(sample.throughput)
+        else:
+            values.append(float(sample.peak_rss_bytes))
+    if not values:
+        fail(f"distribution {metric}: no raw observations")
+    return readable_ceiling(max(values))
+
+
+def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str) -> bytes:
+    """Four comparable allocator rows plus a clearly supplemental Bun row.
+
+    The domain is calculated once from every raw observation across both new
+    workloads (including outliers and Bun), then reused verbatim by every row
+    and both workload graphics for the metric.
+    """
+    width, height = 1120, 1120
+    left, right, top = 118, 34, 108
+    row_height, gap = 148, 38
+    plot_width = width - left - right
+    ceiling, step = distribution_global_domain(scaling, metric)
+    unit = axis_unit(ceiling)
+    points = scaling.thread_points
+    allowed = scaling.topology.allowed_logical_cpus
+    if metric == "throughput":
+        metric_title = "aggregate throughput (operations/second)"
+        values_by_allocator = {
+            allocator: sorted(
+                (cell.thread_count, cell.p05, cell.median, cell.p95)
+                for cell in scaling.throughput_cells
+                if cell.pattern == pattern and cell.allocator_id == allocator
+            )
+            for allocator in (*PRIMARY_DISTRIBUTION_ALLOCATORS, "bun-mimalloc")
+        }
+    else:
+        metric_title = "peak RSS (bytes; lower is better)"
+        values_by_allocator = {
+            allocator: sorted(
+                (cell.thread_count, float(cell.p05), float(cell.median), float(cell.p95))
+                for cell in scaling.rss_cells
+                if cell.pattern == pattern and cell.allocator_id == allocator
+            )
+            for allocator in (*PRIMARY_DISTRIBUTION_ALLOCATORS, "bun-mimalloc")
+        }
+    allocators = (*PRIMARY_DISTRIBUTION_ALLOCATORS, "bun-mimalloc")
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}" role="img">',
+        f"<title>{escaped(SCALING_PANEL_TITLES[pattern])}: {escaped(metric_title)}, P5-P95 empirical bands</title>",
+        f"<desc>Five vertically aligned allocator rows. The first four are the primary comparison and Bun mimalloc is supplemental. Every row starts at zero and uses domain 0 to {ceiling:g} with tick step {step:g}, shared across both requested-size workloads. Bands show empirical P5 to P95 from 40 paired repetitions; lines show medians.</desc>",
+        f'<metadata data-y-domain-min="0" data-y-domain-max="{ceiling:g}" data-y-tick-step="{step:g}" data-quantiles="linear-h=(n-1)p" data-samples="{DISTRIBUTION_BLOCKS}"/>',
+        f'<rect width="{width}" height="{height}" fill="{SCALING_INK["background"]}"/>',
+        svg_text(
+            left,
+            42,
+            SCALING_PANEL_TITLES[pattern],
+            fill=SCALING_INK["title"],
+            size=24,
+            weight="600",
+        ),
+        svg_text(left, 70, metric_title, fill=SCALING_INK["muted"], size=14),
+    ]
+    for row, allocator in enumerate(allocators):
+        y0 = top + row * (row_height + gap)
+        parts.append(
+            f'<rect x="{left}" y="{y0}" width="{plot_width}" height="{row_height}" fill="{SCALING_INK["plot"]}" rx="6"/>'
+        )
+        for tick in range(6):
+            value = step * tick
+            if value > ceiling + step / 100:
+                break
+            y = scaling_y_of(value, ceiling, y0, row_height)
+            parts.append(
+                f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_width}" y2="{y:.1f}" stroke="{SCALING_INK["grid"]}"/>'
+            )
+            parts.append(
+                svg_text(
+                    left - 10,
+                    y + 4,
+                    format_throughput(value, unit),
+                    fill=SCALING_INK["axis"],
+                    size=10,
+                    anchor="end",
+                )
+            )
+        values = values_by_allocator[allocator]
+        if len(values) != len(points):
+            fail(f"distribution {pattern}/{metric}/{allocator}: incomplete worker sweep")
+        color = SCALING_SERIES[allocator]
+        upper = [(threads, high) for threads, _low, _median, high in values]
+        lower = list(reversed([(threads, low) for threads, low, _median, _high in values]))
+        polygon = " ".join(
+            f"{scaling_x_of(threads, left, plot_width, points):.1f},{scaling_y_of(value, ceiling, y0, row_height):.1f}"
+            for threads, value in (*upper, *lower)
+        )
+        parts.append(f'<polygon points="{polygon}" fill="{color}" fill-opacity="0.24"/>')
+        path = " ".join(
+            f"{'M' if index == 0 else 'L'} {scaling_x_of(threads, left, plot_width, points):.1f} {scaling_y_of(median, ceiling, y0, row_height):.1f}"
+            for index, (threads, _low, median, _high) in enumerate(values)
+        )
+        parts.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.5"/>')
+        label = allocator_label(allocator) + (
+            " (supplemental)" if allocator == "bun-mimalloc" else ""
+        )
+        parts.append(
+            svg_text(left + 10, y0 + 22, label, fill=SCALING_INK["title"], size=13, weight="600")
+        )
+        for threads in points:
+            x = scaling_x_of(threads, left, plot_width, points)
+            parts.append(
+                svg_text(
+                    x,
+                    y0 + row_height + 18,
+                    str(threads),
+                    fill=SCALING_INK["axis"],
+                    size=10,
+                    anchor="middle",
+                )
+            )
+            if threads > allowed:
+                parts.append(
+                    svg_text(
+                        x,
+                        y0 + row_height + 31,
+                        f"{threads / max(allowed, 1):g}x",
+                        fill=SCALING_INK["muted"],
+                        size=9,
+                        anchor="middle",
+                    )
+                )
+    parts.append(
+        svg_text(
+            left,
+            height - 20,
+            f"shared domain 0-{ceiling:g}; tick {step:g}; P5-P95 empirical area, median line; n={DISTRIBUTION_BLOCKS}; normal allocation API",
+            fill=SCALING_INK["muted"],
+            size=12,
+        )
+    )
+    parts.append("</svg>")
+    return ("\n".join(parts) + "\n").encode()
 
 
 def pending_scaling_svg(pattern: str, reason: str) -> bytes:
@@ -5099,6 +5589,72 @@ def escaped(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
+def has_complete_distribution(scaling: ScalingView) -> bool:
+    expected = {
+        (pattern, threads, allocator)
+        for pattern in DISTRIBUTION_PATTERN_IDS
+        for threads in scaling.thread_points
+        for allocator in ALLOCATOR_IDS
+    }
+    throughput = {
+        (cell.pattern, cell.thread_count, cell.allocator_id)
+        for cell in scaling.throughput_cells
+        if cell.pattern in DISTRIBUTION_PATTERN_IDS
+    }
+    rss = {
+        (cell.pattern, cell.thread_count, cell.allocator_id)
+        for cell in scaling.rss_cells
+        if cell.pattern in DISTRIBUTION_PATTERN_IDS
+    }
+    return throughput == expected and rss == expected
+
+
+def render_scaling_html(scaling: ScalingView) -> str:
+    scaling_rows = "".join(
+        f"<tr><td>{escaped(cell.pattern)}</td><td>{cell.thread_count}</td>"
+        f"<td>{escaped(cell.allocator_id)}</td><td>{cell.median:.1f}</td>"
+        f"<td>{cell.minimum:.1f} - {cell.maximum:.1f}</td>"
+        f"<td>{cell.speedup:.2f}x</td><td>{'yes' if cell.oversubscribed else 'no'}</td></tr>"
+        for cell in scaling.throughput_cells
+    )
+    scaling_images = "".join(
+        f'<img src="{name}" alt="Aggregate throughput by worker count for the '
+        f'{escaped(SCALING_PANEL_TITLES[pattern])} pattern, one line per allocator">'
+        for pattern, name in SCALING_PANELS.items()
+    )
+    distribution_images = ""
+    distribution_tables = ""
+    if has_complete_distribution(scaling):
+        distribution_images = "".join(
+            f'<img src="{name}" alt="{escaped(SCALING_PANEL_TITLES[pattern])} {metric}: four primary allocator area rows with a supplemental Bun row; shared zero-based axis; P5 to P95 empirical band and median line">'
+            for (pattern, metric), name in DISTRIBUTION_PANELS.items()
+        )
+        rows: list[str] = []
+        for cell in scaling.throughput_cells:
+            if cell.pattern not in DISTRIBUTION_PATTERN_IDS:
+                continue
+            rss = next(
+                value
+                for value in scaling.rss_cells
+                if value.pattern == cell.pattern
+                and value.thread_count == cell.thread_count
+                and value.allocator_id == cell.allocator_id
+            )
+            rows.append(
+                f"<tr><td>{escaped(cell.pattern)}</td><td>{cell.thread_count}</td><td>{escaped(cell.allocator_id)}</td>"
+                f"<td>{cell.p05:.1f} / {cell.median:.1f} / {cell.p95:.1f}</td>"
+                f"<td>{rss.p05} / {rss.median} / {rss.p95}</td><td>{cell.block_count}</td></tr>"
+            )
+        distribution_tables = f"<table><thead><tr><th>Workload</th><th>Workers</th><th>Allocator</th><th>Throughput P5 / P50 / P95</th><th>Peak RSS bytes P5 / P50 / P95</th><th>Samples</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"
+    actions = (
+        f"https://github.com/zackees/mimalloc-pprof/actions/runs/{escaped(scaling.run.run_id)}"
+        if scaling.run.run_origin == "github-actions"
+        else "https://github.com/zackees/mimalloc-pprof/actions"
+    )
+    workers = ", ".join(str(point) for point in scaling.thread_points)
+    return f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(scaling.rigor_label)}.</strong> Legacy panels use {SCALING_BLOCKS} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating.</p><p>Worker counts are literal {escaped(workers)}; the runner allows {scaling.topology.allowed_logical_cpus} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling.methodology.seed_chain)}. Scaling run <a href="{actions}">{escaped(scaling.run.run_id)}/{scaling.run.run_attempt}</a> measured mimalloc-pprof at source <code>{escaped(scaling.run.source_sha)}</code>, which is not necessarily the commit above; metric key <code>{escaped(scaling.metric_comparison_key)}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table><h2 id="requested-size-distributions">Deterministic requested-size distributions</h2>{distribution_images}<p>These are normal allocation requests, not pointer-alignment tests. Each area is the empirical middle 90% (P5-P95) of at least 40 paired repetitions and is not a confidence interval. Every allocator row within a metric uses the same zero-based Y domain and ticks, computed from every raw observation across both workloads and rounded upward; outliers are retained and cannot be clipped. Bun mimalloc remains collected and is shown as a supplemental fifth row.</p>{distribution_tables}</section>"""
+
+
 def render_html(latest: Mapping[str, object]) -> bytes:
     run = object_value(latest["run"], "run")
     runner = object_value(latest["runner"], "runner")
@@ -5243,41 +5799,8 @@ def render_html(latest: Mapping[str, object]) -> bytes:
     scaling_html = ""
     pprof_tax_html = ""
     if "scaling" in latest:
-        scaling = validate_scaling_report(latest["scaling"], "latest.scaling")
-        scaling_run = object_value(scaling["run"], "latest.scaling.run")
-        scaling_topology = object_value(scaling["topology"], "latest.scaling.topology")
-        scaling_methodology = object_value(scaling["methodology"], "latest.scaling.methodology")
-        # Read from the report, not from the current contract: a published row
-        # measured under the earlier sweep must describe its own worker counts.
-        scaling_thread_points = [
-            int_value(item, "latest.scaling.thread_points", 1)
-            for item in list_value(scaling["thread_points"], "latest.scaling.thread_points")
-        ]
-        scaling_summaries = [
-            object_value(value, "scaling summary")
-            for value in list_value(scaling["cell_summaries"], "scaling cell summaries")
-        ]
-        scaling_rows = "".join(
-            f"<tr><td>{escaped(value['pattern'])}</td><td>{escaped(value['thread_count'])}</td>"
-            f"<td>{escaped(value['allocator_id'])}</td>"
-            f"<td>{escaped(round(float_value(value['median_throughput'], 'scaling median'), 1))}</td>"
-            f"<td>{escaped(round(float_value(value['min_throughput'], 'scaling min'), 1))} - "
-            f"{escaped(round(float_value(value['max_throughput'], 'scaling max'), 1))}</td>"
-            f"<td>{escaped(round(float_value(value['speedup_vs_single_worker'], 'scaling speedup'), 2))}x</td>"
-            f"<td>{'yes' if value['oversubscribed'] else 'no'}</td></tr>"
-            for value in scaling_summaries
-        )
-        scaling_images = "".join(
-            f'<img src="{name}" alt="Aggregate throughput by worker count for the '
-            f'{escaped(SCALING_PANEL_TITLES[pattern])} pattern, one line per allocator">'
-            for pattern, name in SCALING_PANELS.items()
-        )
-        scaling_actions = (
-            f"https://github.com/zackees/mimalloc-pprof/actions/runs/{escaped(scaling_run['run_id'])}"
-            if scaling_run["run_origin"] == "github-actions"
-            else "https://github.com/zackees/mimalloc-pprof/actions"
-        )
-        scaling_html = f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(SCALING_RIGOR_LABEL)}.</strong> These panels trade statistical rigor for thread coverage: {escaped(SCALING_BLOCKS)} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating. Do not read them as headline-grade numbers.</p><p>Worker counts are literal {escaped(", ".join(str(point) for point in scaling_thread_points))}; the runner allows {escaped(scaling_topology["allowed_logical_cpus"])} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling_methodology["seed_chain"])}. Scaling run <a href="{scaling_actions}">{escaped(scaling_run["run_id"])}/{escaped(scaling_run["run_attempt"])}</a> measured mimalloc-pprof at source <code>{escaped(scaling_run["source_sha"])}</code>, which is not necessarily the commit above; metric key <code>{escaped(scaling["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table></section>"""
+        scaling_report = validate_scaling_report(latest["scaling"], "latest.scaling")
+        scaling_html = render_scaling_html(scaling_view_from_validated(scaling_report))
     if "pprof_tax" in latest:
         pprof_tax = validate_pprof_tax_report(latest["pprof_tax"], "latest.pprof_tax")
         pprof_tax_run = object_value(pprof_tax["run"], "latest.pprof_tax.run")
@@ -5529,8 +6052,9 @@ def render(
             pending_png("latency tail distribution", cast(str, item["reason"]))
         )
     if "scaling" in latest:
-        scaling = validate_scaling_report(latest["scaling"], "latest.scaling")
-        measured_patterns = set(scaling_patterns_of(scaling))
+        scaling_report = validate_scaling_report(latest["scaling"], "latest.scaling")
+        scaling = scaling_view_from_validated(scaling_report)
+        measured_patterns = set(scaling.patterns)
         for pattern, name in SCALING_PANELS.items():
             if pattern in measured_patterns:
                 (output / name).write_bytes(scaling_svg(scaling, pattern))
@@ -5542,9 +6066,18 @@ def render(
                         "starts with the next scheduled sweep",
                     )
                 )
+        for (pattern, metric), name in DISTRIBUTION_PANELS.items():
+            if has_complete_distribution(scaling):
+                (output / name).write_bytes(distribution_stack_svg(scaling, pattern, metric))
+            else:
+                (output / name).write_bytes(
+                    pending_scaling_svg(pattern, "deterministic distribution baseline pending")
+                )
     else:
         reason = cast(str, pending["scaling"]["reason"])
         for pattern, name in SCALING_PANELS.items():
+            (output / name).write_bytes(pending_scaling_svg(pattern, reason))
+        for (pattern, _metric), name in DISTRIBUTION_PANELS.items():
             (output / name).write_bytes(pending_scaling_svg(pattern, reason))
     if "pprof_tax" in latest:
         pprof_tax = validate_pprof_tax_report(latest["pprof_tax"], "latest.pprof_tax")

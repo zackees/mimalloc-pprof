@@ -9,8 +9,8 @@ use benchmark_suite::model::{AllocatorIdentity, RunnerMetadata, ToolchainMetadat
 use benchmark_suite::scaling::{
     build_scaling_report, execute_scaling_child_request, simulate_cell, simulate_worker,
     stream_seed, validate_scaling_raw_run, validate_scaling_report, PlannedAction, ScalingCounts,
-    ScalingPattern, ScalingRawRun, WorkerPlanner, SCALING_BLOCKS, SCALING_PATTERNS,
-    SCALING_RIGOR_LABEL, SCALING_THREAD_POINTS,
+    ScalingPattern, ScalingRawRun, WorkerPlanner, SCALING_BLOCKS, SCALING_CHILD_PROTOCOL_VERSION,
+    SCALING_PATTERNS, SCALING_RIGOR_LABEL, SCALING_SCHEMA_VERSION, SCALING_THREAD_POINTS,
 };
 
 /// Leak-detecting mock allocator. `Drop` asserts every block was released, so
@@ -134,6 +134,55 @@ fn stream_is_reproducible_for_identical_inputs() {
 }
 
 #[test]
+fn distribution_sizes_obey_bounds_and_power_of_two_contract() {
+    for pattern in [ScalingPattern::PowerOfTwoLarge, ScalingPattern::RandomLarge] {
+        let seed = stream_seed(0x1234_5678_9abc_def0, pattern, 4, 9, 2);
+        for action in actions(pattern, seed, 20_000, 4) {
+            let size = match action {
+                PlannedAction::Alloc { size, .. } | PlannedAction::ReallocSlot { size, .. } => size,
+                _ => continue,
+            };
+            assert!((64 * 1024..=4 * 1024 * 1024).contains(&size));
+            if pattern == ScalingPattern::PowerOfTwoLarge {
+                assert!(size.is_power_of_two());
+            }
+        }
+    }
+}
+
+#[test]
+fn distribution_size_draws_do_not_change_lifetime_playback() {
+    fn lifetime(action: PlannedAction) -> (u8, usize) {
+        match action {
+            PlannedAction::Alloc { slot, .. } => (0, slot),
+            PlannedAction::FreeSlot { slot } => (1, slot),
+            PlannedAction::ReallocSlot { slot, .. } => (2, slot),
+            PlannedAction::Handoff { target, .. } => (3, target as usize),
+            PlannedAction::DrainMailbox { budget } => (4, budget as usize),
+        }
+    }
+    let master = 0x1234_5678_9abc_def0;
+    let p2_seed = stream_seed(master, ScalingPattern::PowerOfTwoLarge, 4, 3, 1);
+    let random_seed = stream_seed(master, ScalingPattern::RandomLarge, 4, 3, 1);
+    // Workload tags deliberately give workers different root seeds. Reusing
+    // one root here isolates the promised property: the independent size
+    // stream cannot perturb the lifetime stream.
+    let p2 = actions(ScalingPattern::PowerOfTwoLarge, p2_seed, 2_000, 4)
+        .into_iter()
+        .map(lifetime)
+        .collect::<Vec<_>>();
+    let random = actions(ScalingPattern::RandomLarge, p2_seed, 2_000, 4)
+        .into_iter()
+        .map(lifetime)
+        .collect::<Vec<_>>();
+    assert_eq!(p2, random);
+    assert_ne!(
+        p2_seed, random_seed,
+        "workload identity must affect worker seeds"
+    );
+}
+
+#[test]
 fn differing_stream_inputs_produce_differing_streams() {
     let run_seed = 0x1234_5678_9abc_def0;
     let base = stream_seed(run_seed, ScalingPattern::MixedGeneral, 4, 2, 1);
@@ -196,8 +245,8 @@ fn request_for(
     operations: u64,
 ) -> benchmark_suite::scaling::ScalingChildRequest {
     benchmark_suite::scaling::ScalingChildRequest {
-        protocol_version: "throughput-scaling-sparse-child-v1".into(),
-        metric_schema_version: "throughput-scaling-sparse-v1".into(),
+        protocol_version: SCALING_CHILD_PROTOCOL_VERSION.into(),
+        metric_schema_version: SCALING_SCHEMA_VERSION.into(),
         run_seed: 0x6d69_6d61_6c6c_6f63,
         pattern: pattern.as_str().into(),
         thread_count: threads,
@@ -227,6 +276,7 @@ fn request_for(
             linker: "lld".into(),
         },
         reproduction_command: "test".into(),
+        live_telemetry_path: None,
     }
 }
 
@@ -341,6 +391,36 @@ fn complete_fixture_validates_and_builds_a_report() {
 }
 
 #[test]
+fn distribution_rss_uses_linear_interpolated_p5_p50_p95() {
+    let mut raw = sample_run();
+    let mut ordinal = 1u64;
+    for sample in raw.samples.iter_mut().filter(|sample| {
+        sample.pattern == ScalingPattern::RandomLarge.as_str()
+            && sample.thread_count == 1
+            && sample.allocator_id == "tcmalloc"
+    }) {
+        sample.peak_rss_bytes = ordinal;
+        ordinal += 1;
+    }
+    assert_eq!(ordinal, 41, "fixture must provide exactly 40 repetitions");
+    let report = build_scaling_report(&raw).expect("modified RSS observations remain valid");
+    let summary = report
+        .rss
+        .expect("RSS report exists")
+        .cell_summaries
+        .into_iter()
+        .find(|summary| {
+            summary.pattern == ScalingPattern::RandomLarge.as_str()
+                && summary.thread_count == 1
+                && summary.allocator_id == "tcmalloc"
+        })
+        .expect("target RSS cell exists");
+    assert_eq!(summary.p05_peak_rss_bytes, 3);
+    assert_eq!(summary.median_peak_rss_bytes, 21);
+    assert_eq!(summary.p95_peak_rss_bytes, 38);
+}
+
+#[test]
 fn validator_rejects_an_incomplete_matrix() {
     let mut raw = sample_run();
     raw.samples.pop();
@@ -385,6 +465,18 @@ fn validator_rejects_a_sample_that_contradicts_its_plan() {
     assert!(
         validate_scaling_raw_run(&raw).is_err(),
         "changing the run seed must invalidate every derived plan"
+    );
+
+    let mut raw = sample_run();
+    let sample = raw
+        .samples
+        .iter_mut()
+        .find(|sample| sample.pattern == ScalingPattern::RandomLarge.as_str())
+        .expect("fixture has random-large samples");
+    sample.response.worker_seeds[0] ^= 1;
+    assert!(
+        validate_scaling_raw_run(&raw).is_err(),
+        "changing a recorded worker seed must invalidate the distribution plan"
     );
 }
 

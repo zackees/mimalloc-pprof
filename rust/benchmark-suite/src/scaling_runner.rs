@@ -24,8 +24,14 @@ use crate::scenarios::Topology;
 
 /// Coverage mode exists to keep the daily signal cheap; a sweep that cannot
 /// finish inside this budget is a failure, not something to publish slowly.
-const HARD_LIMIT_SECONDS: f64 = 15.0 * 60.0;
+// Leave five minutes beneath the workflow timeout for validation, artifact
+// sealing, and upload. The two distribution workloads include separate
+// diagnostic replays in addition to their 40 timed repetitions.
+const HARD_LIMIT_SECONDS: f64 = 25.0 * 60.0;
 const CALIBRATION_ATTEMPTS: u32 = 12;
+const DISTRIBUTION_MIN_BLOCK_NS: u64 = 25_000_000;
+const DISTRIBUTION_TARGET_BLOCK_NS: u64 = 50_000_000;
+const DISTRIBUTION_MAX_BLOCK_NS: u64 = 150_000_000;
 
 #[derive(Debug)]
 struct Options {
@@ -95,6 +101,20 @@ fn calibrate(
     if child.allocator.allocator_id != "upstream-mimalloc" {
         return Err("only upstream-mimalloc may calibrate a scaling cell".into());
     }
+    let pattern = ScalingPattern::parse(&template.pattern).ok_or("unknown scaling pattern")?;
+    let (minimum, target, maximum) = if pattern.is_distribution() {
+        (
+            DISTRIBUTION_MIN_BLOCK_NS,
+            DISTRIBUTION_TARGET_BLOCK_NS,
+            DISTRIBUTION_MAX_BLOCK_NS,
+        )
+    } else {
+        (
+            SCALING_MIN_BLOCK_NS,
+            SCALING_TARGET_BLOCK_NS,
+            SCALING_MAX_BLOCK_NS,
+        )
+    };
     let mut operations = template.operations_per_worker.max(1);
     for _ in 0..CALIBRATION_ATTEMPTS {
         let mut probe = template.clone();
@@ -103,11 +123,11 @@ fn calibrate(
             "scaling calibration probe pattern={} threads={}",
             template.pattern, template.thread_count
         );
-        let (response, _peak_rss) = run_scaling_child(child, &probe, timeout)?;
-        if (SCALING_MIN_BLOCK_NS..=SCALING_MAX_BLOCK_NS).contains(&response.elapsed_ns) {
+        let (response, _peak_rss, _live_at_peak) = run_scaling_child(child, &probe, timeout)?;
+        if (minimum..=maximum).contains(&response.elapsed_ns) {
             return Ok((operations, response));
         }
-        let scaled = (operations as u128 * u128::from(SCALING_TARGET_BLOCK_NS)
+        let scaled = (operations as u128 * u128::from(target)
             / u128::from(response.elapsed_ns.max(1)))
         .max(1);
         let bounded = scaled
@@ -198,6 +218,7 @@ fn run(options: Options) -> Result<(), String> {
     let runner_started = Instant::now();
     let mut calibration_wall = Duration::ZERO;
     let mut block_wall = Duration::ZERO;
+    let mut projected_block_wall = Duration::ZERO;
     let mut calibrations = Vec::new();
     let mut samples = Vec::new();
     let request_dir = options.output_dir.join("requests");
@@ -220,6 +241,7 @@ fn run(options: Options) -> Result<(), String> {
                 runner: runner.clone(),
                 toolchain: upstream.toolchain.clone(),
                 reproduction_command: "scaling calibration placeholder".into(),
+                live_telemetry_path: None,
             };
             let started = Instant::now();
             let (operations_per_worker, probe) = calibrate(upstream, &template, options.timeout)?;
@@ -234,7 +256,12 @@ fn run(options: Options) -> Result<(), String> {
             let cell_key = format!("{}/{thread_count}", pattern.as_str());
 
             let started = Instant::now();
-            for order in balanced_block_orders(options.blocks, options.run_seed)? {
+            let pattern_blocks = if options.reduced_smoke {
+                1
+            } else {
+                pattern.full_blocks()
+            };
+            for order in balanced_block_orders(pattern_blocks, options.run_seed)? {
                 // The plan is allocator-independent, so derive it once per
                 // block and reuse it for all five children. Replaying it per
                 // child would cost as much as the measurement itself.
@@ -270,8 +297,44 @@ fn run(options: Options) -> Result<(), String> {
                         request_path.display()
                     );
                     write_new_json(request_path.clone(), &request)?;
-                    let (response, peak_rss_bytes) =
+                    let (response, peak_rss_bytes, _measured_live_at_peak) =
                         run_scaling_child_with_plan(child, &request, options.timeout, &plan)?;
+                    let (
+                        diagnostic_peak_rss_bytes,
+                        live_requested_bytes_at_diagnostic_peak_rss,
+                        diagnostic_peak_live_requested_bytes,
+                    ) = if pattern.is_distribution() {
+                        let telemetry_path = request_dir.join(format!(
+                            ".live-{}-{}-{:04}-{}",
+                            pattern.as_str(),
+                            thread_count,
+                            order.block_id,
+                            allocator_id
+                        ));
+                        write_new_bytes(telemetry_path.clone(), &0u64.to_le_bytes())?;
+                        let mut diagnostic = request.clone();
+                        diagnostic.live_telemetry_path = Some(
+                            telemetry_path
+                                .to_str()
+                                .ok_or("telemetry path is not UTF-8")?
+                                .to_string(),
+                        );
+                        diagnostic.reproduction_command =
+                            format!("diagnostic replay of {}", request.reproduction_command);
+                        let result =
+                            run_scaling_child_with_plan(child, &diagnostic, options.timeout, &plan);
+                        std::fs::remove_file(&telemetry_path).map_err(|error| {
+                            format!("remove {}: {error}", telemetry_path.display())
+                        })?;
+                        let (diagnostic_response, diagnostic_rss, live_at_rss) = result?;
+                        (
+                            diagnostic_rss,
+                            live_at_rss,
+                            diagnostic_response.peak_live_requested_bytes,
+                        )
+                    } else {
+                        (0, 0, 0)
+                    };
                     let sample = ScalingRawSample {
                         metric_schema_version: SCALING_SCHEMA_VERSION.into(),
                         block_id: order.block_id,
@@ -283,6 +346,9 @@ fn run(options: Options) -> Result<(), String> {
                         child_binary_sha256: child.allocator.child_binary_sha256.clone(),
                         operations_per_worker,
                         peak_rss_bytes,
+                        diagnostic_peak_rss_bytes,
+                        live_requested_bytes_at_diagnostic_peak_rss,
+                        diagnostic_peak_live_requested_bytes,
                         reproduction_command: request.reproduction_command.clone(),
                         response,
                     };
@@ -290,14 +356,18 @@ fn run(options: Options) -> Result<(), String> {
                     samples.push(sample);
                 }
             }
-            block_wall = block_wall.saturating_add(started.elapsed());
+            let cell_wall = started.elapsed();
+            block_wall = block_wall.saturating_add(cell_wall);
+            projected_block_wall = projected_block_wall.saturating_add(
+                cell_wall.mul_f64(f64::from(pattern.full_blocks()) / f64::from(pattern_blocks)),
+            );
             write_json_line(
                 &mut diagnostics,
                 &json!({
                     "event": "scaling-cell-complete", "cell": cell_key,
                     "operations_per_worker": operations_per_worker,
                     "calibrated_elapsed_ns": probe.elapsed_ns,
-                    "samples": options.blocks * ALLOCATOR_IDS.len() as u32,
+                    "samples": pattern_blocks * ALLOCATOR_IDS.len() as u32,
                 }),
             )?;
         }
@@ -307,7 +377,7 @@ fn run(options: Options) -> Result<(), String> {
     let fixed_wall = observed_wall.saturating_sub(calibration_wall + block_wall);
     let projected_full_seconds = provenance.build_elapsed_seconds
         + calibration_wall.as_secs_f64()
-        + block_wall.as_secs_f64() * f64::from(SCALING_BLOCKS) / f64::from(options.blocks)
+        + projected_block_wall.as_secs_f64()
         + fixed_wall.as_secs_f64()
         + 1.0;
     write_new_json(
@@ -318,7 +388,7 @@ fn run(options: Options) -> Result<(), String> {
             "observed_calibration_wall_seconds": calibration_wall.as_secs_f64(),
             "observed_block_wall_seconds": block_wall.as_secs_f64(),
             "native_build_elapsed_seconds": provenance.build_elapsed_seconds,
-            "projected_blocks": SCALING_BLOCKS,
+            "projected_repetitions_by_pattern": SCALING_PATTERNS.map(|pattern| (pattern.as_str(), pattern.full_blocks())),
             "projected_full_suite_seconds": projected_full_seconds,
             "hard_limit_seconds": HARD_LIMIT_SECONDS,
             "fits_limit": projected_full_seconds <= HARD_LIMIT_SECONDS,

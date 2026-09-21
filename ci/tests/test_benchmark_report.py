@@ -1497,6 +1497,10 @@ class BenchmarkReportTests(unittest.TestCase):
         # Every scaling panel is embedded and clicks through to its section.
         for name in report.SCALING_PANELS.values():
             expected[name] = "https://zackees.github.io/mimalloc-pprof/#scaling"
+        for name in report.DISTRIBUTION_PANELS.values():
+            expected[name] = (
+                "https://zackees.github.io/mimalloc-pprof/#requested-size-distributions"
+            )
         for image, destination in expected.items():
             raw = (
                 f"https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/{image}"
@@ -1701,6 +1705,7 @@ class BenchmarkReportTests(unittest.TestCase):
             for threads in report.SCALING_THREAD_POINTS:
                 for index, allocator in enumerate(report.ALLOCATOR_IDS):
                     median = 1_000_000.0 * threads * (1.0 + index / 10.0)
+                    blocks = report.scaling_blocks_for_pattern(pattern)
                     summaries.append(
                         {
                             "pattern": pattern,
@@ -1708,15 +1713,17 @@ class BenchmarkReportTests(unittest.TestCase):
                             "oversubscription_factor": threads / allowed,
                             "oversubscribed": threads / allowed > 1.0,
                             "allocator_id": allocator,
-                            "block_count": report.SCALING_BLOCKS,
+                            "block_count": blocks,
                             "median_throughput": median,
-                            "min_throughput": median * 0.97,
-                            "max_throughput": median * 1.03,
+                            "p05_throughput": median,
+                            "p95_throughput": median,
+                            "min_throughput": median,
+                            "max_throughput": median,
                             "speedup_vs_single_worker": float(threads),
                         }
                     )
                     source_sha, child_sha = allocator_sources[allocator]
-                    for block in range(report.SCALING_BLOCKS):
+                    for block in range(blocks):
                         raw.append(
                             {
                                 "metric_schema_version": report.SCALING_SCHEMA,
@@ -1728,9 +1735,10 @@ class BenchmarkReportTests(unittest.TestCase):
                                 "allocator_source_sha": source_sha,
                                 "child_binary_sha256": child_sha,
                                 "operations_per_worker": 4096,
+                                "peak_rss_bytes": (32 + 4 * threads + index) * 1024 * 1024,
                                 "reproduction_command": "benchmark-scaling-run --run-seed 1",
                                 "response": {
-                                    "protocol_version": "throughput-scaling-sparse-child-v1",
+                                    "protocol_version": "throughput-scaling-sparse-child-v2",
                                     "metric_schema_version": report.SCALING_SCHEMA,
                                     "allocator_id": allocator,
                                     "thread_count": threads,
@@ -1784,6 +1792,8 @@ class BenchmarkReportTests(unittest.TestCase):
             "methodology": {
                 "rigor": report.SCALING_RIGOR_LABEL,
                 "blocks_per_cell": report.SCALING_BLOCKS,
+                "distribution_blocks_per_cell": report.DISTRIBUTION_BLOCKS,
+                "percentile_method": "linear interpolation h=(n-1)p",
                 "aggregation": "median with min/max",
                 "operation_stream": "seeded random operation stream",
                 "seed_chain": "splitmix64 chain over (run seed, pattern, threads, block, worker)",
@@ -1807,10 +1817,12 @@ class BenchmarkReportTests(unittest.TestCase):
                         "pattern": pattern,
                         "thread_count": threads,
                         "allocator_id": allocator,
-                        "block_count": report.SCALING_BLOCKS,
+                        "block_count": report.scaling_blocks_for_pattern(pattern),
                         "median_peak_rss_bytes": (32 + 4 * threads + index) * 1024 * 1024,
-                        "min_peak_rss_bytes": (30 + 4 * threads + index) * 1024 * 1024,
-                        "max_peak_rss_bytes": (34 + 4 * threads + index) * 1024 * 1024,
+                        "p05_peak_rss_bytes": (32 + 4 * threads + index) * 1024 * 1024,
+                        "p95_peak_rss_bytes": (32 + 4 * threads + index) * 1024 * 1024,
+                        "min_peak_rss_bytes": (32 + 4 * threads + index) * 1024 * 1024,
+                        "max_peak_rss_bytes": (32 + 4 * threads + index) * 1024 * 1024,
                     }
                     for pattern in report.SCALING_PATTERN_IDS
                     for threads in report.SCALING_THREAD_POINTS
@@ -1849,19 +1861,14 @@ class BenchmarkReportTests(unittest.TestCase):
             for pattern, name in report.SCALING_PANELS.items():
                 panel = (site / name).read_text(encoding="utf-8")
                 self.assertTrue(panel.startswith("<svg"))
-                # Baked-in dark background: the panel must not inherit a theme.
                 self.assertIn(report.SCALING_INK["background"], panel)
                 self.assertIn(report.SCALING_PANEL_TITLES[pattern], panel)
                 self.assertIn(report.SCALING_RIGOR_LABEL, panel)
-                # #375: the legend carries the reader-facing label, not the wire id.
                 for allocator in report.ALLOCATOR_IDS:
                     self.assertIn(report.allocator_label(allocator), panel)
                 self.assertIn("oversubscribed", panel)
-                # The RSS side-car must render its own side-by-side panel.
                 self.assertIn("peak RSS by worker count", panel)
                 self.assertIn("external smaps_rollup peak", panel)
-                # The shaded band must actually be visible, not a zero-width
-                # rectangle collapsed onto the last tick.
                 band = re.search(
                     rf'<rect x="([\d.]+)" y="\d+" width="([\d.]+)" [^>]*'
                     rf'fill="{report.SCALING_INK["oversubscribed"]}"',
@@ -1870,6 +1877,84 @@ class BenchmarkReportTests(unittest.TestCase):
                 self.assertIsNotNone(band, "oversubscription band is missing")
                 assert band is not None
                 self.assertGreater(float(band.group(2)), 20.0)
+
+    def test_distribution_stacks_share_global_domains_and_keep_outliers(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = report.validate_scaling_report(latest["scaling"], "distribution fixture")
+        raw = scaling["raw_samples"]
+        assert isinstance(raw, list)
+        outlier = next(
+            item
+            for item in raw
+            if isinstance(item, dict)
+            and item.get("pattern") == "random-large"
+            and item.get("allocator_id") == "bun-mimalloc"
+        )
+        response = outlier["response"]
+        assert isinstance(response, dict)
+        response["throughput_operations_per_second"] = 99_000_000.0
+        outlier["peak_rss_bytes"] = 9_900_000_000
+        view = report.scaling_view_from_validated(scaling)
+        throughput = [
+            report.distribution_stack_svg(view, pattern, "throughput").decode()
+            for pattern in report.DISTRIBUTION_PATTERN_IDS
+        ]
+        rss = [
+            report.distribution_stack_svg(view, pattern, "rss").decode()
+            for pattern in report.DISTRIBUTION_PATTERN_IDS
+        ]
+        throughput_domains = [re.search(r"shared domain 0-([^;]+)", svg) for svg in throughput]
+        rss_domains = [re.search(r"shared domain 0-([^;]+)", svg) for svg in rss]
+        self.assertTrue(all(match is not None for match in (*throughput_domains, *rss_domains)))
+        self.assertEqual(throughput_domains[0].group(1), throughput_domains[1].group(1))  # type: ignore[union-attr]
+        self.assertEqual(rss_domains[0].group(1), rss_domains[1].group(1))  # type: ignore[union-attr]
+        self.assertGreaterEqual(float(throughput_domains[0].group(1)), 99_000_000.0)  # type: ignore[union-attr]
+        self.assertGreaterEqual(float(rss_domains[0].group(1)), 9_900_000_000.0)  # type: ignore[union-attr]
+        for svg in (*throughput, *rss):
+            self.assertEqual(svg.count("(supplemental)"), 1)
+            self.assertIn("P5-P95 empirical area", svg)
+
+    def test_scaling_report_rejects_raw_values_that_disagree_with_summaries(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        raw = scaling["raw_samples"]
+        assert isinstance(raw, list) and isinstance(raw[0], dict)
+        response = raw[0]["response"]
+        assert isinstance(response, dict)
+        response["throughput_operations_per_second"] = 1.0
+        with self.assertRaisesRegex(report.ReportError, "throughput summary differs"):
+            report.validate_scaling_report(scaling, "tampered throughput")
+
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        raw = scaling["raw_samples"]
+        assert isinstance(raw, list) and isinstance(raw[0], dict)
+        raw[0]["peak_rss_bytes"] = 1
+        with self.assertRaisesRegex(report.ReportError, "RSS summary differs"):
+            report.validate_scaling_report(scaling, "tampered rss")
+
+    def test_scaling_report_rejects_raw_identity_and_incomplete_pairing(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        raw = scaling["raw_samples"]
+        assert isinstance(raw, list) and isinstance(raw[0], dict)
+        response = raw[0]["response"]
+        assert isinstance(response, dict)
+        response["allocator_id"] = "jemalloc"
+        with self.assertRaisesRegex(report.ReportError, "identity disagrees"):
+            report.validate_scaling_report(scaling, "mismatched response")
+
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = latest["scaling"]
+        assert isinstance(scaling, dict)
+        raw = scaling["raw_samples"]
+        assert isinstance(raw, list) and isinstance(raw[0], dict)
+        raw[0]["ordinal"] = len(report.ALLOCATOR_IDS)
+        with self.assertRaisesRegex(report.ReportError, "invalid ordinal"):
+            report.validate_scaling_report(scaling, "bad pairing")
 
     def test_pending_scaling_panels_are_dark_and_carry_no_numbers(self) -> None:
         latest = self.load_latest()
@@ -2048,7 +2133,9 @@ class BenchmarkReportTests(unittest.TestCase):
         latest = self.with_complete_scaling(self.load_latest())
         scaling = latest["scaling"]
         assert isinstance(scaling, dict)
-        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        panel = report.scaling_svg(
+            report.scaling_view_from_validated(scaling), "sparse-tiny-hot"
+        ).decode("utf-8")
         self.assertIn("Microsoft mimalloc", panel)
         self.assertIn("Bun mimalloc", panel)
         self.assertNotIn("upstream-mimalloc", panel)
@@ -2064,7 +2151,9 @@ class BenchmarkReportTests(unittest.TestCase):
         latest = self.with_complete_scaling(self.load_latest())
         scaling = latest["scaling"]
         assert isinstance(scaling, dict)
-        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        panel = report.scaling_svg(
+            report.scaling_view_from_validated(scaling), "sparse-tiny-hot"
+        ).decode("utf-8")
         svg_width = re.search(r'<svg[^>]*width="(\d+)"', panel)
         assert svg_width is not None
         width = int(svg_width.group(1))
@@ -2079,7 +2168,9 @@ class BenchmarkReportTests(unittest.TestCase):
         latest = self.with_complete_scaling(self.load_latest())
         scaling = latest["scaling"]
         assert isinstance(scaling, dict)
-        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        panel = report.scaling_svg(
+            report.scaling_view_from_validated(scaling), "sparse-tiny-hot"
+        ).decode("utf-8")
         self.assertIn("peak RSS by worker count", panel)
         # The fixture RSS medians are (32 + 4*threads + index) MiB; the y
         # ceiling is the largest median across all cells with 12% headroom,
@@ -2145,7 +2236,9 @@ class BenchmarkReportTests(unittest.TestCase):
 
         # And renders on its own axis: the last legacy point sits at the right
         # edge, which it would not if the axis spanned the current sweep.
-        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        panel = report.scaling_svg(
+            report.scaling_view_from_validated(scaling), "sparse-tiny-hot"
+        ).decode("utf-8")
         self.assertAlmostEqual(
             report.scaling_x_of(legacy[-1], 0, 100, legacy),
             100.0,
@@ -2172,7 +2265,9 @@ class BenchmarkReportTests(unittest.TestCase):
         scaling = latest["scaling"]
         assert isinstance(scaling, dict)
         del scaling["rss"]
-        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        panel = report.scaling_svg(
+            report.scaling_view_from_validated(scaling), "sparse-tiny-hot"
+        ).decode("utf-8")
         self.assertNotIn("peak RSS by worker count", panel)
         self.assertIn('viewBox="0 0 1000 590"', panel)
 
@@ -2180,7 +2275,9 @@ class BenchmarkReportTests(unittest.TestCase):
         latest = self.with_complete_scaling(self.load_latest())
         scaling = latest["scaling"]
         assert isinstance(scaling, dict)
-        panel = report.scaling_svg(scaling, "sparse-tiny-hot").decode("utf-8")
+        panel = report.scaling_svg(
+            report.scaling_view_from_validated(scaling), "sparse-tiny-hot"
+        ).decode("utf-8")
         for forbidden in ("<script", "xlink:href", "<foreignObject", "<image", "@import"):
             self.assertNotIn(forbidden, panel)
         # The SVG namespace is the only permitted URL; nothing may be fetched.

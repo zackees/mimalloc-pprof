@@ -334,16 +334,20 @@ re-verified under this tree's stress suite. → [Bun features](#bun-features)
 ### Enable instrumentation
 
 Version 1.0 builds a plain fast allocator by default. Every observability subsystem is
-compile-time opt-in, so enable exactly what the application uses:
+absent from the default binary and must first be included at **compile time**. Profilers
+and observers that were compiled in still start **disabled at runtime** until explicitly
+activated. A runtime environment variable cannot add a subsystem that was compiled out.
 
-| Instrumentation | Cargo feature | CMake or direct-C define | Runtime activation |
-|---|---|---|---|
-| sampled pprof profiling | `pprof` | `MI_PPROF=1` | `prof::start` / `mi_prof_start`, or `MIMALLOC_PROF=1` |
-| allocation events | `memory-events` | `MI_MEMEVT=1` | `memory_events::set_enabled` / `mi_memory_tracking_set_enabled`, or `MIMALLOC_MEMORY_EVENTS=1` |
-| heap snapshots and JSON dumps | `diagnostics` | `MI_DIAGNOSTICS=1` | call the snapshot or dump API |
-| exact DHAT profiling | `dhat` (implies `memory-events`) | `MI_DHAT=1` | `dhat::start` / `mi_dhat_start`, or `MIMALLOC_DHAT=1` |
-| process-wide owner gate | `owner-gate` | `MI_OWNER_GATE=1` | active whenever compiled in |
-| everything above | `full` | define all five options | activate each observer as needed |
+| Instrumentation | Compile-time default | Include at compile time (Cargo / CMake or direct C) | Runtime default after inclusion | Activate at runtime |
+|---|---|---|---|---|
+| sampled pprof profiling | not compiled | `pprof` / `MI_PPROF=1` | stopped | `prof::start()` / `mi_prof_start()`, or `MIMALLOC_PROF=1` |
+| allocation events | not compiled | `memory-events` / `MI_MEMEVT=1` | disabled | `memory_events::set_enabled(true)` / `mi_memory_tracking_set_enabled(true)`, or `MIMALLOC_MEMORY_EVENTS=1` |
+| heap snapshots and JSON dumps | not compiled | `diagnostics` / `MI_DIAGNOSTICS=1` | available on demand | call the snapshot or dump API |
+| exact DHAT profiling | not compiled | `dhat` (implies `memory-events`) / `MI_DHAT=1` | stopped | `dhat::start()` / `mi_dhat_start()`, or `MIMALLOC_DHAT=1` |
+| process-wide owner gate | not compiled | `owner-gate` / `MI_OWNER_GATE=1` | active | no separate runtime switch |
+
+Cargo's `full` feature includes all five compile-time options; each profiler or observer
+still follows the runtime-default column above.
 
 **Rust:** name one feature or use `full`:
 

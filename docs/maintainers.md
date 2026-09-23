@@ -2,6 +2,47 @@
 
 *Part of the [mimalloc-pprof](../README.md) documentation.*
 
+## External-fork Actions approval
+
+GitHub Actions must require maintainer approval before running workflows from **every**
+external fork contributor, including returning contributors. The repository setting is
+not versioned, so audit it after ownership or repository-setting changes:
+
+```sh
+gh api repos/zackees/mimalloc-pprof/actions/permissions/fork-pr-contributor-approval
+```
+
+The required response is:
+
+```json
+{"approval_policy":"all_external_contributors"}
+```
+
+If it differs, restore the policy with:
+
+```sh
+gh api --method PUT \
+  repos/zackees/mimalloc-pprof/actions/permissions/fork-pr-contributor-approval \
+  -f approval_policy=all_external_contributors
+```
+
+This policy applies to fork authors without repository write access. Collaborator PRs
+continue to run normally. For a live audit, open one PR from a first-time external fork
+author and one from a returning external fork author. In both cases GitHub must wait for
+maintainer approval before scheduling any `pull_request` workflow; after approval, the
+normal workflow set must run.
+
+Keep untrusted workflows on `pull_request`, with least-privilege `permissions`. Audit
+trigger changes with:
+
+```sh
+rg -n 'pull_request_target|^permissions:|^[[:space:]]+permissions:' .github/workflows
+```
+
+There must be no `pull_request_target` workflow that checks out or executes fork code.
+That trigger runs in the base repository's security context and is not an alternative to
+the repository-level approval policy.
+
 ## Integration contract
 
 When changing or embedding this fork, preserve all of the following:

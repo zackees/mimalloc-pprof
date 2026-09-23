@@ -155,7 +155,7 @@ image and the table below are rendered from.
 
 ## Thread scaling by allocation pattern
 
-Aggregate throughput as worker threads go from 1 to 4 to 16, for four allocation
+Aggregate throughput at 1, 2, 3, 4, 6, and 8 workers, for four allocation
 patterns plus two named cross-project workloads, Larson and xmalloc-test
 (clean-room reimplementations of their published shapes, for comparison with
 mimalloc-bench). Each pattern is a seeded random operation stream, so all five
@@ -163,9 +163,9 @@ allocators replay one identical stream inside each paired block.
 
 > **Coverage mode: reduced statistical rigor (3 blocks per cell).** These panels
 > trade statistical rigor for thread coverage — no confidence intervals, no noise
-> gating; read them for shape. The runner allows 4 logical CPUs, so the 16-thread
-> point is 4× oversubscribed and describes contention, not core scaling — it is
-> shaded on every chart.
+> gating; read them for shape. The runner allows 4 logical CPUs, so the 6- and
+> 8-thread points are oversubscribed and describe contention, not core scaling;
+> they are shaded on every chart.
 
 [![Tiny hot path: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-tiny-hot.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
@@ -175,29 +175,29 @@ allocators replay one identical stream inside each paired block.
 
 [![Cross-thread producer/consumer handoff: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-cross-thread.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
-The Larson and xmalloc-test panels have not yet reached the published
-`benchmark-stats` site. They remain part of the full scaling sweep; see
-[#424](https://github.com/zackees/mimalloc-pprof/issues/424) for the publication
-blocker and the incomplete-run evidence. The four panels above are the ones
-currently available.
+[![Larson server workload: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-larson.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+[![xmalloc-test producer/consumer workload: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-xmalloc-test.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
 ### Deterministic requested-size distributions
 
-The pending four scaling graphics use deterministic per-worker playback at 1, 2, 3, 4, 6,
+These four scaling graphics use deterministic per-worker playback at 1, 2, 3, 4, 6,
 and 8 workers. They request either exact powers of two from 64 KiB through 4 MiB or an
 unbiased uniformly random byte size over the same inclusive range. Both use the normal
 allocation API; “power-of-two” describes the requested size, not extra pointer alignment.
-The planned allocator rows show the empirical P5–P95 area and median from at least 40 paired runs.
+The allocator rows show the empirical P5–P95 area and median from 40 paired runs.
 Within each metric every row—and both workloads—uses the same zero-based Y-axis domain and
 ticks, rounded upward from the maximum of all raw observations so outliers are not clipped.
 The four primary rows are TCMalloc, jemalloc, Microsoft mimalloc, and mimalloc-pprof; Bun
 mimalloc remains collected in a separately labelled supplemental row.
 
-The power-of-two and uniformly random requested-size throughput and peak-RSS
-reports are **not published yet**. Full collection has exceeded the existing
-30-minute workflow limit; partial runs are not valid 40-repetition reports.
-Follow [#424](https://github.com/zackees/mimalloc-pprof/issues/424) for the
-complete baseline and source data before interpreting these distributions.
+[![Power-of-two requested sizes: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Power-of-two requested sizes: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Uniformly random requested sizes: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Uniformly random requested sizes: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
 Full methodology, per-cell tables and the other benchmark families are in
 [Performance](#performance) below and on the

@@ -1493,24 +1493,21 @@ class BenchmarkReportTests(unittest.TestCase):
         # #210 dropped the unlabeled throughput/history PNG stubs from the
         # README: only charts with real axes, legend, and values are embedded.
         # The headline numbers stay live dashboard links instead.
-        # The published branch still contains only the four original panels.
-        # New panels must not be embedded as 404s; the completion evaluator
-        # requires all of them once the full #424 run has actually published.
-        published_patterns = set(report.LEGACY_SCALING_PATTERN_IDS)
         expected = {
             name: "https://zackees.github.io/mimalloc-pprof/#scaling"
-            for pattern, name in report.SCALING_PANELS.items()
-            if pattern in published_patterns
+            for name in report.SCALING_PANELS.values()
         }
+        expected.update(
+            {
+                name: "https://zackees.github.io/mimalloc-pprof/#requested-size-distributions"
+                for name in report.DISTRIBUTION_PANELS.values()
+            }
+        )
         for image, destination in expected.items():
             raw = (
                 f"https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/{image}"
             )
             self.assertIn(f"]({raw})]({destination})", source)
-        unpublished = set(report.SCALING_PANELS.values()) | set(report.DISTRIBUTION_PANELS.values())
-        for image in unpublished - expected.keys():
-            self.assertNotIn(f"/benchmark-stats/{image}", source)
-        self.assertIn("reports are **not published yet**", source)
         # Every embedded name must be a file the renderer actually emits, or
         # the README links 404 on the published branch.
         self.assertTrue(set(expected) <= report.SITE_FILES)

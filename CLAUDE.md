@@ -98,6 +98,13 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    Never add a CI row or script that relies on one of these defaults: name the flag.
 7. **Escalate, don't improvise:** when reality diverges from a sub-issue (API drift, toolchain
    fights, unreachable threshold), comment on that issue with evidence and stop.
+8. **C ABI compatibility scope (owner decision, #438):** applications build this fork with
+   matching headers and library artifacts. Do not treat an application compiled against an
+   older `mimalloc.h` loading a newer separately supplied library as a supported scenario,
+   or require a versioned C report/new entry point solely to preserve that cross-build ABI.
+   Appending fields to `mi_purge_all_report_t` is therefore not, by itself, a blocker for
+   #438. This does **not** waive same-build C/Rust layout checks, ordinary memory safety,
+   or the separate retained `mi_arena_id_t` use-after-free risk in arena reclamation.
 
 ## Repo facts
 

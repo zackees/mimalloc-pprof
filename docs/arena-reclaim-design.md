@@ -6,6 +6,9 @@ and its predecessors [#428](https://github.com/zackees/mimalloc-pprof/pull/428) 
 submitted implementation, the parts worth retaining, and the changes required before
 integration. It does not claim that arena reclamation is implemented on `main`.
 
+Decision record and implementation work order:
+[issue #434](https://github.com/zackees/mimalloc-pprof/issues/434).
+
 Related work: [#366](https://github.com/zackees/mimalloc-pprof/issues/366) introduced
 `mi_purge_all_ex` and owner gating. See [purge-all.md](purge-all.md) for its current
 contract and [purge-all-implementation.md](purge-all-implementation.md) for the existing

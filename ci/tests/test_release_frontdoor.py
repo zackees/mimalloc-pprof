@@ -73,6 +73,24 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             )
         )
 
+    def test_validated_json_document_rejects_ambiguous_standalone_objects(self) -> None:
+        raw = '{"state":"OPEN"}\n{"state":"CLOSED"}\n'
+        self.assertIsNone(
+            release.validated_json_document(
+                raw,
+                lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        )
+
+    def test_validated_json_document_rejects_mixed_ambiguity(self) -> None:
+        raw = '{"state":"OPEN"}\ndiagnostic: {"state":"CLOSED"}\n'
+        self.assertIsNone(
+            release.validated_json_document(
+                raw,
+                lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        )
+
     def test_validated_json_document_rejects_nested_or_inline_shape_matches(
         self,
     ) -> None:

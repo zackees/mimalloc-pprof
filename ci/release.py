@@ -79,7 +79,7 @@ def github_json(
 def validated_json_document(raw: str, validate: Callable[[object], bool]) -> object | None:
     """Find one schema-valid JSON document inside optionally decorated CLI output."""
     decoder = json.JSONDecoder()
-    inline_dicts: list[object] = []
+    candidates: list[object] = []
     for offset, character in enumerate(raw):
         if character not in "[{":
             continue
@@ -96,15 +96,16 @@ def validated_json_document(raw: str, validate: Callable[[object], bool]) -> obj
         if not validate(value):
             continue
         if not raw[line_start:offset].strip():
-            return value
+            candidates.append(value)
+            continue
         # Some runner-side gh wrappers prepend a diagnostic to the response on
         # the same physical line. A schema-valid object that consumes the rest
         # of that line is still unambiguous. Keep arrays strict because [] is a
         # common diagnostic value and is also a valid empty endpoint response.
         if isinstance(value, dict):
-            inline_dicts.append(cast(dict[object, object], value))
-    if len(inline_dicts) == 1:
-        return inline_dicts[0]
+            candidates.append(cast(dict[object, object], value))
+    if len(candidates) == 1:
+        return candidates[0]
     return None
 
 

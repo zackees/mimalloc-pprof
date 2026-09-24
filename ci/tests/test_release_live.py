@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from email.message import Message
 from pathlib import Path
-from typing import cast
+from typing import Callable, cast
 from unittest.mock import patch
 
 from ci import release, release_destinations, release_live
@@ -37,6 +37,32 @@ class FakeResponse:
 
 
 class LiveUploadTests(unittest.TestCase):
+    def test_finalize_requires_numeric_release_id_before_write(self) -> None:
+        destination = release_live.LiveDestination(444, Path("crate"))
+        responses = iter(['{"id":null}', '{"id":123}'])
+
+        def required(_endpoint: str, *, validate: Callable[[dict[str, object]], bool]) -> str:
+            while True:
+                raw = next(responses)
+                value = cast(dict[str, object], json.loads(raw))
+                if validate(value):
+                    return raw
+
+        with (
+            patch.object(destination, "_gh_required", side_effect=required),
+            patch.object(destination, "_github") as write,
+        ):
+            destination.finalize("v1.0.1")
+        write.assert_called_once_with(
+            "gh",
+            "api",
+            "--method",
+            "PATCH",
+            f"repos/{release.REPO}/releases/123",
+            "-F",
+            "draft=false",
+        )
+
     def test_publish_metadata_skips_soldr_json_telemetry(self) -> None:
         package: dict[str, object] = {
             "name": "mimalloc-pprof",

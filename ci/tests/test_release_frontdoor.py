@@ -38,7 +38,9 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         self.assertEqual(value, {"state": "OPEN"})
         self.assertEqual(sleeps, [1, 2])
 
-    def test_github_json_accepts_schema_valid_document_inside_decorated_output(self) -> None:
+    def test_github_json_accepts_schema_valid_document_inside_decorated_output(
+        self,
+    ) -> None:
         raw = 'soldr telemetry {"elapsed":1}\nwarning: transient\n{"state":"OPEN"}\nfooter'
         with patch.object(release, "command", return_value=raw):
             value = release.github_json(
@@ -49,7 +51,49 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             )
         self.assertEqual(value, {"state": "OPEN"})
 
-    def test_validated_json_document_rejects_nested_or_inline_shape_matches(self) -> None:
+    def test_github_json_accepts_schema_valid_object_after_same_line_decoration(
+        self,
+    ) -> None:
+        raw = 'runner diagnostic: {"state":"OPEN"}\n'
+        with patch.object(release, "command", return_value=raw):
+            value = release.github_json(
+                "gh",
+                "issue",
+                "view",
+                validate=lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        self.assertEqual(value, {"state": "OPEN"})
+
+    def test_validated_json_document_rejects_ambiguous_inline_objects(self) -> None:
+        raw = 'one {"state":"OPEN"}\ntwo {"state":"CLOSED"}\n'
+        self.assertIsNone(
+            release.validated_json_document(
+                raw,
+                lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        )
+
+    def test_validated_json_document_rejects_ambiguous_standalone_objects(self) -> None:
+        raw = '{"state":"OPEN"}\n{"state":"CLOSED"}\n'
+        self.assertIsNone(
+            release.validated_json_document(
+                raw,
+                lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        )
+
+    def test_validated_json_document_rejects_mixed_ambiguity(self) -> None:
+        raw = '{"state":"OPEN"}\ndiagnostic: {"state":"CLOSED"}\n'
+        self.assertIsNone(
+            release.validated_json_document(
+                raw,
+                lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        )
+
+    def test_validated_json_document_rejects_nested_or_inline_shape_matches(
+        self,
+    ) -> None:
         validate = release.release_list_shape
         self.assertIsNone(release.validated_json_document('{"error":{"releases":[]}}', validate))
         self.assertIsNone(release.validated_json_document("diagnostic []", validate))
@@ -88,7 +132,12 @@ class ReleaseFrontdoorTests(unittest.TestCase):
     def test_release_list_shape_validates_fields_used_by_preflight(self) -> None:
         self.assertTrue(
             release.release_list_shape(
-                [{"tag_name": "v1.0.1", "assets": [{"name": "asset", "digest": "sha256:a"}]}]
+                [
+                    {
+                        "tag_name": "v1.0.1",
+                        "assets": [{"name": "asset", "digest": "sha256:a"}],
+                    }
+                ]
             )
         )
         self.assertFalse(release.release_list_shape([{"tag_name": "v1.0.1"}]))
@@ -107,14 +156,24 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         response = "\n".join(
             json.dumps(page)
             for page in (
-                [{"body": "owner\nbody", "author_association": "OWNER", "login": "owner"}],
+                [
+                    {
+                        "body": "owner\nbody",
+                        "author_association": "OWNER",
+                        "login": "owner",
+                    }
+                ],
                 [
                     {
                         "body": "automation",
                         "author_association": "NONE",
                         "login": "github-actions[bot]",
                     },
-                    {"body": "untrusted", "author_association": "NONE", "login": "outsider"},
+                    {
+                        "body": "untrusted",
+                        "author_association": "NONE",
+                        "login": "outsider",
+                    },
                 ],
             )
         )
@@ -171,7 +230,10 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             (root / "rust/Cargo.lock").write_text(
                 '[[package]]\nname = "mimalloc-pprof"\nversion = "1.0.0"\n'
             )
-            with patch.object(release, "ROOT", root), self.assertRaises(release.ReleaseError):
+            with (
+                patch.object(release, "ROOT", root),
+                self.assertRaises(release.ReleaseError),
+            ):
                 release.source_version()
 
     def test_directive_is_exact_and_full(self) -> None:
@@ -189,7 +251,9 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             release.require_same_directive(original, release.directive(444, "1.0.1", "b" * 40))
 
-    def test_artifact_preflight_rejects_missing_oversize_and_hash_mismatch(self) -> None:
+    def test_artifact_preflight_rejects_missing_oversize_and_hash_mismatch(
+        self,
+    ) -> None:
         directive = release.directive(444, "1.0.1", SHA)
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -205,7 +269,8 @@ class ReleaseFrontdoorTests(unittest.TestCase):
                             "README.md",
                         ):
                             archive.write(
-                                release.ROOT / "rust/mimalloc-pprof/vendor" / member, member
+                                release.ROOT / "rust/mimalloc-pprof/vendor" / member,
+                                member,
                             )
                     continue
                 asset = next(key for key in release.TARGETS if f"-{key}-" in name)
@@ -410,7 +475,11 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             if args[:3] == ("gh", "pr", "view"):
                 oid = BUMP if args[3] == "999" else SHA
                 return json.dumps(
-                    {"baseRefName": "main", "mergedAt": "now", "mergeCommit": {"oid": oid}}
+                    {
+                        "baseRefName": "main",
+                        "mergedAt": "now",
+                        "mergeCommit": {"oid": oid},
+                    }
                 )
             if args[:3] == ("git", "rev-parse", "HEAD"):
                 return responses["HEAD"]
@@ -443,7 +512,10 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         old = release.directive(444, "1.0.1", BUMP)
         new = release.directive(444, "1.0.1", SHA)
         release.require_history([old, new], new, None)
-        info = {**new, "artifacts": [{"name": name, "sha256": "d" * 64} for name in new["assets"]]}
+        info = {
+            **new,
+            "artifacts": [{"name": name, "sha256": "d" * 64} for name in new["assets"]],
+        }
         frozen = release.freeze_record(new, info, "f" * 64)
         release.require_history([old, new], new, frozen)
         release.require_frozen_info(frozen, new, info)
@@ -491,7 +563,11 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             if args[:3] == ("gh", "pr", "view"):
                 oid = BUMP if args[3] == "999" else SHA
                 return json.dumps(
-                    {"baseRefName": "main", "mergedAt": "now", "mergeCommit": {"oid": oid}}
+                    {
+                        "baseRefName": "main",
+                        "mergedAt": "now",
+                        "mergeCommit": {"oid": oid},
+                    }
                 )
             if args[:3] == ("git", "rev-parse", "HEAD"):
                 return SHA
@@ -532,7 +608,15 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         with (
             patch(
                 "sys.argv",
-                ["release.py", "start", "--issue", "444", "--candidate-sha", SHA, "--dry"],
+                [
+                    "release.py",
+                    "start",
+                    "--issue",
+                    "444",
+                    "--candidate-sha",
+                    SHA,
+                    "--dry",
+                ],
             ),
             patch.object(release, "source_version", return_value="1.0.1"),
             patch.object(release, "issue_directives", return_value=[]),

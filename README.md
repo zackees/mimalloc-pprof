@@ -1,5 +1,7 @@
 # mimalloc-pprof
 
+[![Deploy GitHub Pages](https://github.com/zackees/mimalloc-pprof/actions/workflows/benchmark-stats.yml/badge.svg)](https://github.com/zackees/mimalloc-pprof/actions/workflows/benchmark-stats.yml)
+
 > ## mimalloc with native pprof-compatible heap profiling — on Windows, Linux, and macOS alike — and all of Bun's memory-returning features (aka "hole punch") imported and re-verified.
 
 > **The one mimalloc heap profiler that produces usable Windows profiles.** Upstream

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -117,6 +118,92 @@ class DestinationTests(unittest.TestCase):
         }
         self.backend = FakeDestination()
         self.sleeps: list[float] = []
+
+    def test_live_read_retries_empty_success_before_parsing(self) -> None:
+        responses = [
+            subprocess.CompletedProcess(["gh"], 0, stdout="", stderr=""),
+            subprocess.CompletedProcess(["gh"], 0, stdout="{}", stderr=""),
+            subprocess.CompletedProcess(
+                ["gh"],
+                0,
+                stdout='{"object":{"type":"commit","sha":"' + "a" * 40 + '"}}',
+                stderr="",
+            ),
+        ]
+        with (
+            patch.object(rd.subprocess, "run", side_effect=responses),
+            patch.object(rd.time, "sleep") as sleep,
+        ):
+            observed = rd.ReadOnlyDestination().tag_sha("v1.0.1")
+        self.assertEqual(observed, "a" * 40)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    def test_live_read_classifies_http_status_before_message_text(self) -> None:
+        permanent = subprocess.CompletedProcess(
+            ["gh"], 1, stdout="", stderr="HTTP 403: connection timeout is forbidden"
+        )
+        with (
+            patch.object(rd.subprocess, "run", return_value=permanent) as run,
+            patch.object(rd.time, "sleep") as sleep,
+            self.assertRaisesRegex(release.ReleaseError, "HTTP 403"),
+        ):
+            rd.ReadOnlyDestination().tag_sha("v1.0.1")
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+        transient = [
+            subprocess.CompletedProcess(
+                ["gh"], 1, stdout="", stderr="HTTP 500: upstream reported HTTP 404"
+            ),
+            subprocess.CompletedProcess(["gh"], 1, stdout="", stderr="HTTP 404"),
+        ]
+        with (
+            patch.object(rd.subprocess, "run", side_effect=transient),
+            patch.object(rd.time, "sleep") as sleep,
+        ):
+            self.assertIsNone(rd.ReadOnlyDestination().tag_sha("v1.0.1"))
+        sleep.assert_called_once_with(1)
+
+        for stderr in ("HTTP 429: rate limited", "connection reset by peer"):
+            with self.subTest(stderr=stderr):
+                responses = [
+                    subprocess.CompletedProcess(["gh"], 1, stdout="", stderr=stderr),
+                    subprocess.CompletedProcess(["gh"], 1, stdout="", stderr="HTTP 404"),
+                ]
+                with (
+                    patch.object(rd.subprocess, "run", side_effect=responses),
+                    patch.object(rd.time, "sleep") as sleep,
+                ):
+                    self.assertIsNone(rd.ReadOnlyDestination().tag_sha("v1.0.1"))
+                sleep.assert_called_once_with(1)
+
+    def test_live_read_rejects_unsupported_ref_type_without_retry(self) -> None:
+        unsupported = subprocess.CompletedProcess(
+            ["gh"],
+            0,
+            stdout='{"object":{"type":"blob","sha":"' + "a" * 40 + '"}}',
+            stderr="",
+        )
+        with (
+            patch.object(rd.subprocess, "run", return_value=unsupported) as run,
+            patch.object(rd.time, "sleep") as sleep,
+            self.assertRaisesRegex(release.ReleaseError, "does not resolve to a commit"),
+        ):
+            rd.ReadOnlyDestination().tag_sha("v1.0.1")
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_live_read_reports_persistent_malformed_success_with_context(self) -> None:
+        malformed = subprocess.CompletedProcess(["gh"], 0, stdout="", stderr="")
+        with (
+            patch.object(rd.subprocess, "run", return_value=malformed),
+            patch.object(rd.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                release.ReleaseError, "malformed JSON after 10 attempts.*git/ref/tags"
+            ),
+        ):
+            rd.ReadOnlyDestination().tag_sha("v1.0.1")
+        self.assertEqual(sleep.call_count, 9)
 
     def run_worker(self, frozen: dict[str, object] | None = None) -> None:
         with patch.object(release, "verify_info"):

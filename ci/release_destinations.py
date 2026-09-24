@@ -6,6 +6,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -67,7 +68,14 @@ class ReadOnlyDestination:
     """Live destination reads for dry preflight; write methods are absent."""
 
     def tag_sha(self, tag: str) -> str | None:
-        raw = self._gh_optional(f"repos/{release.REPO}/git/ref/tags/{tag}")
+        def object_shape(value: dict[str, object]) -> bool:
+            raw_object = value.get("object")
+            if not isinstance(raw_object, dict):
+                return False
+            obj = cast(dict[str, object], raw_object)
+            return isinstance(obj.get("type"), str) and isinstance(obj.get("sha"), str)
+
+        raw = self._gh_optional(f"repos/{release.REPO}/git/ref/tags/{tag}", validate=object_shape)
         if raw is None:
             return None
         data = json.loads(raw)
@@ -77,13 +85,29 @@ class ReadOnlyDestination:
                 return str(obj["sha"])
             if obj["type"] != "tag":
                 raise release.ReleaseError("release tag does not resolve to a commit")
-            obj = json.loads(self._gh_required(f"repos/{release.REPO}/git/tags/{obj['sha']}"))[
-                "object"
-            ]
+            obj = json.loads(
+                self._gh_required(
+                    f"repos/{release.REPO}/git/tags/{obj['sha']}", validate=object_shape
+                )
+            )["object"]
         raise release.ReleaseError("release tag indirection exceeds ten levels")
 
     def release(self, tag: str) -> ReleaseState | None:
-        raw = self._gh_optional(f"repos/{release.REPO}/releases/tags/{tag}")
+        def asset_shape(value: object) -> bool:
+            if not isinstance(value, dict):
+                return False
+            asset = cast(dict[str, object], value)
+            return isinstance(asset.get("name"), str) and isinstance(asset.get("digest"), str)
+
+        def release_shape(value: dict[str, object]) -> bool:
+            return (
+                isinstance(value.get("target_commitish"), str)
+                and isinstance(value.get("draft"), bool)
+                and isinstance(value.get("assets"), list)
+                and all(asset_shape(item) for item in cast(list[object], value.get("assets")))
+            )
+
+        raw = self._gh_optional(f"repos/{release.REPO}/releases/tags/{tag}", validate=release_shape)
         if raw is None:
             return None
         data = json.loads(raw)
@@ -94,19 +118,60 @@ class ReadOnlyDestination:
         return ReleaseState(str(data["target_commitish"]), bool(data["draft"]), assets)
 
     @staticmethod
-    def _gh_optional(endpoint: str) -> str | None:
-        result = subprocess.run(
-            ["gh", "api", endpoint], capture_output=True, text=True, check=False
-        )
-        if result.returncode == 0:
-            return result.stdout
-        if "HTTP 404" in result.stderr:
-            return None
-        raise release.ReleaseError(f"GitHub read failed: {result.stderr.strip()}")
+    def _gh_optional(
+        endpoint: str,
+        *,
+        validate: Callable[[dict[str, object]], bool] = lambda _: True,
+    ) -> str | None:
+        for attempt in range(10):
+            result = subprocess.run(
+                ["gh", "api", endpoint], capture_output=True, text=True, check=False
+            )
+            if result.returncode == 0:
+                try:
+                    value = json.loads(result.stdout)
+                    if not isinstance(value, dict) or not validate(cast(dict[str, object], value)):
+                        raise json.JSONDecodeError(
+                            "GitHub object response is not an object", result.stdout, 0
+                        )
+                    return result.stdout
+                except json.JSONDecodeError as error:
+                    if attempt == 9:
+                        raise release.ReleaseError(
+                            f"GitHub read returned malformed JSON after 10 attempts: {endpoint}"
+                        ) from error
+                    time.sleep(min(2**attempt, 30))
+                    continue
+            status_match = re.search(r"\bHTTP ([0-9]{3})\b", result.stderr)
+            status = int(status_match.group(1)) if status_match else None
+            if status == 404:
+                return None
+            retryable = status == 429 or (status is not None and status >= 500)
+            if status is None:
+                retryable = bool(
+                    re.search(
+                        r"(?:connection|timeout|EOF|broken pipe|EPIPE)",
+                        result.stderr,
+                        re.I,
+                    )
+                )
+            if not retryable:
+                raise release.ReleaseError(f"GitHub read failed: {result.stderr.strip()}")
+            if attempt == 9:
+                raise release.ReleaseError(
+                    f"GitHub read failed after 10 attempts: {result.stderr.strip()}"
+                )
+            time.sleep(min(2**attempt, 30))
+        raise AssertionError("unreachable GitHub retry loop")
 
     @classmethod
-    def _gh_required(cls, endpoint: str) -> str:
-        raw = cls._gh_optional(endpoint)
+    def _gh_required(
+        cls,
+        endpoint: str,
+        *,
+        validate: Callable[[dict[str, object]], bool] = lambda _: True,
+    ) -> str:
+        raw = cls._gh_optional(endpoint, validate=validate)
         if raw is None:
             raise release.ReleaseError("release tag object disappeared during verification")
         return raw

@@ -38,6 +38,23 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         self.assertEqual(value, {"state": "OPEN"})
         self.assertEqual(sleeps, [1, 2])
 
+    def test_github_json_accepts_schema_valid_document_inside_decorated_output(self) -> None:
+        raw = 'soldr telemetry {"elapsed":1}\nwarning: transient\n{"state":"OPEN"}\nfooter'
+        with patch.object(release, "command", return_value=raw):
+            value = release.github_json(
+                "gh",
+                "issue",
+                "view",
+                validate=lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        self.assertEqual(value, {"state": "OPEN"})
+
+    def test_validated_json_document_rejects_nested_or_inline_shape_matches(self) -> None:
+        validate = release.release_list_shape
+        self.assertIsNone(release.validated_json_document('{"error":{"releases":[]}}', validate))
+        self.assertIsNone(release.validated_json_document("diagnostic []", validate))
+        self.assertIsNone(release.validated_json_document("[] trailing diagnostic", validate))
+
     def test_github_json_bounds_malformed_success_retries(self) -> None:
         sleeps: list[float] = []
         with (

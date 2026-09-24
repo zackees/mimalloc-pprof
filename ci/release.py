@@ -64,19 +64,42 @@ def github_json(
     raw = ""
     for attempt in range(10):
         raw = command(*args)
-        try:
-            value: object = json.loads(raw)
-            if not validate(value):
-                raise json.JSONDecodeError("unexpected GitHub JSON shape", raw, 0)
+        value = validated_json_document(raw, validate)
+        if value is not None:
             return value
-        except json.JSONDecodeError as error:
-            if attempt == 9:
-                raise ReleaseError(
-                    "GitHub returned malformed JSON after 10 attempts "
-                    f"(response shape: {json_lines_shape(raw)})"
-                ) from error
-            sleep(min(2**attempt, 30))
+        if attempt == 9:
+            raise ReleaseError(
+                "GitHub returned no schema-valid JSON document after 10 attempts "
+                f"(command: {' '.join(args[:3])}; response shape: {json_lines_shape(raw)})"
+            )
+        sleep(min(2**attempt, 30))
     raise AssertionError("unreachable")
+
+
+def validated_json_document(raw: str, validate: Callable[[object], bool]) -> object | None:
+    """Find one schema-valid JSON document inside optionally decorated CLI output."""
+    decoder = json.JSONDecoder()
+    for offset, character in enumerate(raw):
+        if character not in "[{":
+            continue
+        line_start = raw.rfind("\n", 0, offset) + 1
+        if raw[line_start:offset].strip():
+            # Only accept a top-level document that begins its line. This avoids
+            # mistaking nested objects/arrays or JSON-looking diagnostic text for
+            # the endpoint response.
+            continue
+        try:
+            value, consumed = decoder.raw_decode(raw[offset:])
+        except json.JSONDecodeError:
+            continue
+        line_end = raw.find("\n", offset + consumed)
+        if line_end < 0:
+            line_end = len(raw)
+        if raw[offset + consumed : line_end].strip():
+            continue
+        if validate(value):
+            return value
+    return None
 
 
 def json_object_with_string_fields(value: object, fields: tuple[str, ...]) -> bool:

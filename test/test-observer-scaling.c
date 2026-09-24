@@ -67,7 +67,10 @@ static double test_now_seconds(void) {
 }
 #endif
 
-#define OPS_PER_THREAD   2000000
+#define CALIBRATION_OPS_PER_THREAD 2000000
+#define MIN_MEASURE_OPS_PER_THREAD 2000000
+#define MAX_MEASURE_OPS_PER_THREAD 100000000
+#define TARGET_MEASURE_SECONDS     1.5
 #define LIVE_SLOTS       256
 /* Chosen from measurement, not instinct. Observed aggregate speedup from 1 to 4 threads:
      0.69x  the #371 regression, on a quiet 16-core box
@@ -167,8 +170,31 @@ int main(void) {
   }
   const int threads = (cpus < 4 ? cpus : 4);
 
-  double one = test_run_workers(1, tiny_hot_worker, OPS_PER_THREAD);
-  double many = test_run_workers(threads, tiny_hot_worker, OPS_PER_THREAD);
+  /* The old fixed two-million-iteration sample completed in 0.28 seconds end-to-end on
+     a hosted Intel Mac in release run 35988859396. RUN_SERIAL keeps our own tests away,
+     but no repository setting can reserve the shared host's CPUs; that sample measured
+     a scheduler hiccup as 0.86x and blocked an otherwise clean release. Calibrate the
+     real measurement from a single-thread warm-up so slow debug builds and fast release
+     builds both observe roughly the same wall-clock window. This is deliberately not a
+     retry: the threshold and the one-vs-many comparison are unchanged, while the sample
+     itself contains enough allocator work to average over short host contention. */
+  const double calibration =
+      test_run_workers(1, tiny_hot_worker, CALIBRATION_OPS_PER_THREAD);
+  if (calibration <= 0.0) {
+    printf("test-observer-scaling: FAILED -- calibration interval was not positive\n");
+    return 1;
+  }
+  double planned = calibration * TARGET_MEASURE_SECONDS / 2.0;
+  if (planned < MIN_MEASURE_OPS_PER_THREAD) {
+    planned = MIN_MEASURE_OPS_PER_THREAD;
+  }
+  if (planned > MAX_MEASURE_OPS_PER_THREAD) {
+    planned = MAX_MEASURE_OPS_PER_THREAD;
+  }
+  const long measure_ops = (long)planned;
+
+  double one = test_run_workers(1, tiny_hot_worker, measure_ops);
+  double many = test_run_workers(threads, tiny_hot_worker, measure_ops);
   if (one <= 0.0 || many <= 0.0) {
     printf("test-observer-scaling: FAILED -- a measured interval was not positive\n");
     return 1;
@@ -187,8 +213,9 @@ int main(void) {
     return 0;
   }
   const double speedup = many / one;
-  printf("test-observer-scaling: 1 thread %.1f Mops/s, %d threads %.1f Mops/s, speedup %.2fx\n",
-         one / 1e6, threads, many / 1e6, speedup);
+  printf("test-observer-scaling: %ld ops/thread; 1 thread %.1f Mops/s, %d threads %.1f "
+         "Mops/s, speedup %.2fx\n",
+         measure_ops, one / 1e6, threads, many / 1e6, speedup);
   if (speedup < MIN_SPEEDUP) {
     printf("test-observer-scaling: FAILED -- aggregate throughput scaled %.2fx from 1 to %d "
            "threads, below the %.2fx floor.\n"

@@ -6,9 +6,7 @@ on:
       - 'test/test-purge-all.cpp'
       - '.github/workflows/purge-teardown-regression.yml'
   pull_request:
-    paths:
-      - 'test/test-purge-all.cpp'
-      - '.github/workflows/purge-teardown-regression.yml'
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
 # One live run per workflow per ref: a new push to a branch or PR cancels the
@@ -22,6 +20,7 @@ permissions:
   contents: read
 jobs:
   build:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:

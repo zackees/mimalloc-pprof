@@ -2,7 +2,18 @@
 
 *Part of the [mimalloc-pprof](../README.md) documentation.*
 
-Every gate below runs on each PR and is a **hard failure**. Where a gate can have a
+Ordinary PR and default-branch CI run the minimal lane. Literal `ci-test` PRs
+add the complete `c-unit` DAG; `ci-full` PRs run the release platform matrix
+across `c-unit`, `cross`, `rust-native`, `windows-bundles`, and `macos-bundles`.
+Adding or removing either label reruns the selector on the same PR head, even
+for documentation-only changes. The exact-SHA release dispatch runs full mode
+independently of PR labels. The 65-job release manifest and fail-closed
+publication gate remain authoritative; a skipped job does not pass release
+validation. Required check names stay visible in minimal mode, including the
+six macOS build matrix rows, whose costly steps are skipped there. The existing
+selective Darwin PR lane still builds and runs when its path/label decision says so.
+
+Every gate below is a **hard failure when its mode selects it**. Where a gate can have a
 *positive control* — a deliberately broken input it must catch — it has one, because a
 gate that has never been observed to fire proves nothing.
 
@@ -24,7 +35,7 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 |---|---|---|
 | **memory-gate** (`ci/memory_gate.py`) | peak memory or thread-count regressions vs a committed per-platform/arch/compiler baseline | builds a copy with an injected leak; the gate must fail — verified at +212% / +98% / +27% on linux/windows/macos. The macOS lane now measures inside the `dockurr/macos` guest and bootstraps its own `macos-x86_64-soldr-clang-21-pprof1.json` |
 | **isa-baseline** (`ci/check_isa_baseline.py`) | binaries containing instructions above the CPU baseline, which SIGILL on older hardware | builds with `MI_OPT_ARCH=ON`; the scanner must fire. The parser also self-tests against x86 and arm64 fixtures on every run |
-| **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW. **macOS uses no Apple hardware** (#277 phase B2): both arches are cross-built on Linux, x86_64 is executed under `dockurr/macos` on a Linux runner, arm64 is compile-only. **windows-MinGW is gated from Linux-built bundles run on one Windows runner** (`windows-bundles.yml`, #277 phase C — which also moves that lane from msvcrt to UCRT); the native MSYS2 MinGW jobs are informational during the comparison window | `ci/bundle_coverage.py` fails if any test a build job's `ctest --show-only` listed was not executed by the run stage (#307), if a test in the arm64 bundle is missing from the executed x86_64 one, or if any test the native MinGW `ctest` would run is missing from a bundle; `ci/lint_no_macos_runners.py` fails if any workflow names a macOS runner |
+| **ctest matrix** | correctness on ubuntu / windows-MSVC / windows-MinGW / macos, `MI_PPROF` on and off, `MI_DEBUG_FULL`, and shared-library builds on all three of ubuntu, MSVC and MinGW. Both Apple arches are cross-built on Linux. In ordinary PR/main runs ARM64 is compile-only; the x64 Recovery diagnostic remains manual. For literal `ci-full` PR labels and explicit full dispatches, #444 runs those same Linux-built bundles natively on hosted ARM64 and Intel Macs. **windows-MinGW is gated from Linux-built bundles run on one Windows runner** (`windows-bundles.yml`, #277 phase C — which also moves that lane from msvcrt to UCRT); the native MSYS2 MinGW jobs are informational during the comparison window | `ci/bundle_coverage.py` fails if any test a build job's manifest listed was not executed by the native full lane (#444) or ordinary run stage (#307); `ci/lint_no_macos_runners.py` permits only the opt-in #444 Mac matrix |
 | **owner-gate** (`gated` `build` row in `run-linux`/`run-linux-serial`; a second `cl` tree inside `build-windows-native`/`ctest (windows-latest)`; `windows-gnu-x64-gated` + `windows-msvc-x64-gated` in `windows-bundles.yml`; the `address sanitizer (clang, Debug, owner-gate)` row) | the **whole suite** with `MI_OWNER_GATE=ON` (#366): every allocator entry is a gate site, so every test is a test of the gate. The Debug ASan row arms the `_mi_gate_held` leaf assertions, which prove no path reads owner-private state outside the gate. `test-purge-all` (T1–T3, G1–G8, C1–C2 of docs/purge-all-implementation.md §11) and `test-fork-locks`' F1 run in **both** builds | the same binary's ungated half: G1 must report the 4 busy workers `pending` with `MI_PURGE_PARTIAL` in the default build (a walk that claimed to reach what it cannot reach fails there); configure steps grep the resolved defines for `MI_OWNER_GATE=1` |
 | **fastpath-identity** (`ci/check_fastpath_identity.py`) | a change to the DEFAULT build's `mi_malloc`/`mi_zalloc`/`mi_free`/`mi_heap_malloc_small`/`mi_malloc_small` machine code vs the base revision (address-normalised disassembly of `libmimalloc.a`, Release, `MI_PPROF=ON`, `MI_DHAT=ON`, `MI_MEMEVT=ON`, `MI_OWNER_GATE=OFF` — the observability flags are PINNED so a default flip cannot skew the comparison), **and** (#414) a third comparison: the MINIMAL build (every subsystem OFF) must be byte-identical to upstream microsoft/mimalloc at the pinned v3 overlay base, which is the evidence behind "the default build is a plain fast allocator" | a third build with `MI_OWNER_GATE=ON` must differ in at least one symbol (it changes all five: measured 46→93 instructions for `mi_malloc`); symbols are resolved with `nm` and sliced by address because objdump's `--disassemble=SYM` prints nothing for an alias (`mi_malloc` is `malloc`) — an empty result is an error, never "identical"; `--selftest` runs fixtures for the normaliser |
 | **dhat-on** (`dhat-on` `build` row in `run-linux`/`run-linux-serial`; `-DMI_DHAT=ON` also on the Linux `debug-full` and `musl` rows, the native `cl` main tree in `build-windows-native`/`ctest (windows-latest)`, the `release`/`debug-full` bundles of `windows-bundles.yml` (both toolchains) and `macos-bundles.yml` (both arches), and two `asan.yml` rows; the Rust `dhat` feature in `rust-native.yml` and the Windows Rust bundles) | the **whole suite** with `MI_DHAT=ON` (#371). DHAT is **opt-in** -- `MI_DHAT` and the crate's `dhat` feature default OFF since the 2026-09-18 owner decision -- so `release` and every row that does not pass the flag is the compiled-out build clients get by default (hook sites gone, `mi_dhat_*` stubs only), and these rows are the ones that build the observer in. Every test is a test of the compiled-in hook sites, which is why the whole suite runs rather than a smoke test | configure step greps the resolved defines for `MI_DHAT=1`, like `gated`/`guarded` (an opt-in flag that silently failed to reach the compiler would leave DHAT untested and green); `test-dhat` and `test-fork-locks-dhat-env` are registered only in these configurations |
@@ -50,9 +61,9 @@ gh workflow run macos-bundles.yml --ref <branch>            # default 3600 s gue
 gh workflow run macos-bundles.yml --ref <branch> -f run-timeout=1800
 ```
 
-Every push/PR still cross-builds all six macOS bundles (both arches) and runs the Mach-O
-and coverage assertions, so a macOS build break is caught immediately; only the execution
-is on demand. Run it before merging changes to macOS-specific paths (`src/prim/osx`,
+Full PR and exact-SHA release runs cross-build all six macOS bundles (both arches)
+and execute them on native Macs. A selective Darwin PR also cross-builds the bundles
+for its Recovery test lane. Run the manual Recovery diagnostic before merging changes to macOS-specific paths (`src/prim/osx`,
 interpose, TLS slots) and when a Linux-green change touches the arena/heap lifecycle.
 
 ### Selective macOS execution on PRs (#339, PR #348)
@@ -456,14 +467,30 @@ check. `ci/tests/test_verify_local.py` parses `c-unit.yml`'s matrix `include:` r
 as its `run:` blocks, so a cmake flag that moves into the matrix cannot silently escape the
 drift guard.
 
-## macOS: cross-built on Linux, x86_64 executed under emulation
+## macOS: cross-built on Linux, native execution in opt-in full runs
 
-Issue #277 phase B, then **phase B2**. **No workflow in this repository schedules a job
-onto a macOS runner.** Both Apple architectures are cross-compiled on `ubuntu-latest`
+Issue #277 phase B/B2 and #444. Ordinary PR/main events schedule no hosted macOS runner.
+Both Apple architectures are cross-compiled on `ubuntu-latest`
 through soldr's Darwin toolchains, and the x86_64 bundle is *executed* on an
 `ubuntu-24.04` runner inside a [`dockurr/macos`](https://github.com/dockur/macos) guest
-(QEMU + KVM). `ci/lint_no_macos_runners.py` fails `python-lint` if a macOS runner label
-reappears in any workflow.
+(QEMU + KVM) for manual Recovery diagnostics. A literal `ci-full` PR label or an explicit
+`ci-mode=full` dispatch additionally executes the same Linux-built C and Rust test
+artifacts on hosted `macos-15` (ARM64) and `macos-15-intel` (x64). For each architecture
+and each release/debug-full C bundle, the native job runs ordinary tests without privilege
+and runs `test-osx-zone-introspect-remote` alone through `sudo` for `task_for_pid`. It
+unions the two JUnit reports against the bundle manifest, so missing or skipped tests fail. The only
+macOS runner labels permitted by `ci/lint_no_macos_runners.py` are in that opt-in job.
+The full dispatch requires a lowercase 40-hex `candidate_sha`; `resolve-candidate`
+checks out that commit and verifies `git rev-parse HEAD` before any build or execution.
+PR runs similarly use the PR head SHA, rather than GitHub's synthetic merge commit.
+The full run title includes the candidate SHA for release evidence.
+
+The leak bundle is a memory-gate positive control, not an ordinary C test cell. On both
+native arches the full lane runs eight normal and eight injected-leak measurements from
+the cross-built bundles, then requires the leak minimum to exceed the same runner's
+normal minimum by twice the gate tolerance. This validates that the control fires even
+before a comparable committed baseline exists; it does not substitute for a committed
+per-arch memory regression baseline.
 
 Phase B's motivation was queue wait: over 20 runs per workflow, `cross.yml`'s Apple rows
 executed in 8–14 s and waited up to 5h26m (arm64) / 6h13m (Intel) — p90 1h29m / 2h32m —
@@ -473,17 +500,17 @@ one that must be proven to work, not a convenience.
 
 | arch | built | executed | gate |
 |---|---|---|---|
-| `x86_64-apple-darwin` | Linux, soldr clang 21 | **yes** — `dockurr/macos` guest on `ubuntu-24.04` | full: ctest-equivalent bundles, Rust test binaries, memory gate + leak control |
-| `aarch64-apple-darwin` | Linux, soldr clang 21 | no | **compile-only**, plus the Mach-O evidence below and a suite-parity check against x86_64 |
+| `x86_64-apple-darwin` | Linux, soldr clang 21 | native Intel in opt-in full; manual Recovery diagnostic on Linux | release and debug-full C bundles plus Rust test binaries on native full |
+| `aarch64-apple-darwin` | Linux, soldr clang 21 | native Apple Silicon in opt-in full | release and debug-full C bundles plus Rust test binaries on native full; compile-only in ordinary runs |
 
-### Why arm64 is compile-only, and what that costs
+### Why ordinary ARM64 runs are compile-only
 
 dockur publishes no arm64 image, and Apple ships no arm64 macOS that boots under QEMU on
-Linux; the only way to execute arm64 Mach-O binaries is Apple hardware, which is exactly
-what phase B2 removes. So arm64 gets a build, the header assertions below, and
-`ci/bundle_coverage.py` comparing its test-name set against the x86_64 bundle that *is*
-executed — which stops an arm64-only test from silently never running anywhere, but does
-not catch an arm64 runtime bug.
+Linux; the only way to execute arm64 Mach-O binaries is Apple hardware. To keep ordinary
+events within the compute budget, arm64 gets a build, the header assertions below, and
+`ci/bundle_coverage.py` comparing its test-name set against the x86_64 bundle used by
+the manual Recovery diagnostic — which stops an arm64-only test from silently going missing. Opt-in full runs
+execute the ARM64 bundle on Apple hardware and catch runtime bugs.
 
 Two further things are stated rather than gated, because nothing here can gate them:
 
@@ -1416,9 +1443,9 @@ architecture-independent vendored C amalgamation ZIP it always shipped:
 toolchain (state the decision)". **They are not.** Every binary asset is cross-built on
 Linux. Two owner decisions taken after that row was written force it:
 
-1. **No macOS build or test may run on a native Mac runner**, anywhere in this repository
-   (`ci/lint_no_macos_runners.py` fails the `python-lint` gate if a macOS label reappears).
-   There is no Apple toolchain available to build an Apple asset with.
+1. **Release assets are not built on native Mac runners.** The #444 owner exception permits
+   native execution of the cross-built artifacts only in opt-in full runs; the build
+   remains on Linux. `ci/lint_no_macos_runners.py` enforces the narrow runner exception.
 2. **Cross-compilation is a product requirement**, not a CI cost measure: mimalloc-pprof
    ships inside cross-compiled code, so the Linux-cross-built artifact *is* the product.
 

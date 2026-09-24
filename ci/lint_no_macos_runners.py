@@ -3,14 +3,13 @@
 # requires-python = ">=3.11"
 # dependencies = ["pyyaml==6.0.2"]
 # ///
-"""Fail if any workflow would schedule a job onto a native macOS runner.
+"""Fail if a workflow schedules a native macOS runner outside #444's full lane.
 
-Issue #277 phase B2. The owner's requirement is absolute -- "not one mac build may run on
-a native mac device" -- and a requirement that nothing checks is a requirement that comes
-back. Both Apple architectures are cross-built on Linux (see
-cmake/toolchains/soldr-*-apple-darwin.cmake) and the x86_64 bundle is executed inside a
-dockurr/macos guest on a Linux runner, so a macOS runner label reappearing in a workflow
-is always a regression, never a deliberate exception.
+Issue #277 phase B2 originally prohibited all native Mac jobs. Issue #444 narrowly
+permits hosted Intel and Apple Silicon runners for opt-in full validation; ordinary
+PR/main events remain Mac-free. Both Apple architectures are still cross-built on Linux
+(see cmake/toolchains/soldr-*-apple-darwin.cmake), and this lint permits only the reviewed
+full-lane matrix and its exact opt-in condition. Any other Mac runner is a regression.
 
     uv run ci/lint_no_macos_runners.py [.github/workflows] [azure-pipelines.yml] ...
 
@@ -116,6 +115,88 @@ def offenders(document: object) -> Iterator[tuple[str, str]]:
                 yield path, text.strip()
 
 
+def allowed_full_runner(file: Path, document: object, path: str, label: str) -> bool:
+    """The only owner-approved hosted Mac exception: both arches in one opt-in job."""
+    if file.name == "auto-release.yml" and path == "jobs.test-shipped-assets.strategy.matrix":
+        jobs = cast("dict[str, object]", cast("dict[str, object]", document).get("jobs", {}))
+        job = cast("dict[str, object]", jobs.get("test-shipped-assets", {}))
+        matrix = cast(
+            "dict[str, object]",
+            cast("dict[str, object]", job.get("strategy", {})).get("matrix", {}),
+        )
+        return (
+            label in {"macos-15", "macos-15-intel"}
+            and job.get("runs-on") == "${{ matrix.runner }}"
+            and job.get("needs") == ["build-binaries"]
+            and matrix.get("include")
+            == [
+                {"asset": "macos-arm64", "runner": "macos-15", "extension": "tar.gz"},
+                {"asset": "macos-x86_64", "runner": "macos-15-intel", "extension": "tar.gz"},
+                {"asset": "windows-x64-gnu", "runner": "windows-latest", "extension": "zip"},
+                {"asset": "windows-x64-msvc", "runner": "windows-latest", "extension": "zip"},
+            ]
+        )
+    if file.name == "auto-release.yml" and path == "jobs.smoke-shipped-assets.strategy.matrix":
+        jobs = cast("dict[str, object]", cast("dict[str, object]", document).get("jobs", {}))
+        job = cast("dict[str, object]", jobs.get("smoke-shipped-assets", {}))
+        preflight = cast("dict[str, object]", jobs.get("preflight-assets", {}))
+        release = cast("dict[str, object]", jobs.get("release", {}))
+        matrix = cast(
+            "dict[str, object]",
+            cast("dict[str, object]", job.get("strategy", {})).get("matrix", {}),
+        )
+        return (
+            label in {"macos-15", "macos-15-intel"}
+            and job.get("runs-on") == "${{ matrix.runner }}"
+            and "if" not in job
+            and job.get("needs") == ["preflight-assets"]
+            and preflight.get("needs")
+            == ["build-and-package", "build-binaries", "test-shipped-assets"]
+            and release.get("needs") == ["preflight-assets", "smoke-shipped-assets"]
+            and matrix.get("include")
+            == [
+                {"asset": "macos-arm64", "runner": "macos-15"},
+                {"asset": "macos-x86_64", "runner": "macos-15-intel"},
+                {"asset": "windows-x64-gnu", "runner": "windows-latest"},
+                {"asset": "windows-x64-msvc", "runner": "windows-latest"},
+            ]
+        )
+    if file.name != "macos-bundles.yml" or label not in {"macos-15", "macos-15-intel"}:
+        return False
+    if path != "jobs.run-macos-native-full.strategy.matrix":
+        return False
+    if not isinstance(document, dict):
+        return False
+    jobs = cast("dict[str, object]", document).get("jobs")
+    if not isinstance(jobs, dict):
+        return False
+    job = cast("dict[str, object]", jobs).get("run-macos-native-full")
+    if not isinstance(job, dict):
+        return False
+    fields = cast("dict[str, object]", job)
+    if fields.get("runs-on") != "${{ matrix.runner }}":
+        return False
+    gate = fields.get("if")
+    if not isinstance(gate, str):
+        return False
+    expected = (
+        "(github.event_name == 'pull_request' && "
+        "contains(github.event.pull_request.labels.*.name, 'ci-full')) || "
+        "(github.event_name == 'workflow_dispatch' && inputs.ci-mode == 'full')"
+    )
+    strategy = fields.get("strategy")
+    if not isinstance(strategy, dict):
+        return False
+    matrix = cast("dict[str, object]", strategy).get("matrix")
+    if not isinstance(matrix, dict):
+        return False
+    include = cast("dict[str, object]", matrix).get("include")
+    return " ".join(gate.split()) == expected and include == [
+        {"arch": "arm64", "runner": "macos-15", "triple": "aarch64-apple-darwin"},
+        {"arch": "x64", "runner": "macos-15-intel", "triple": "x86_64-apple-darwin"},
+    ]
+
+
 def unverifiable(document: object) -> Iterator[tuple[str, str]]:
     """(yaml path, expression) for runner choices this script cannot resolve.
 
@@ -171,6 +252,8 @@ def check(*targets: Path) -> int:
             print(f"lint_no_macos_runners: {file}: {exc}", file=sys.stderr)
             return 2
         for path, label in offenders(document):
+            if allowed_full_runner(file, document, path, label):
+                continue
             print(f"{file}: {path}: native macOS runner label {label!r}", file=sys.stderr)
             failures += 1
         for path, expression in unverifiable(document):
@@ -178,9 +261,8 @@ def check(*targets: Path) -> int:
             warnings += 1
     if failures:
         print(
-            f"\n{failures} native macOS runner label(s). Issue #277 phase B2 removed every\n"
-            "one of them: both Apple architectures are cross-built on Linux through soldr,\n"
-            "and the x86_64 bundle is executed under dockurr/macos on a Linux runner.\n"
+            f"\n{failures} unapproved native macOS runner label(s). Issue #444 permits only\n"
+            "the opt-in full matrix in macos-bundles.yml; all other labels are forbidden.\n"
             "See docs/ci-gates.md, section 'macOS'.",
             file=sys.stderr,
         )

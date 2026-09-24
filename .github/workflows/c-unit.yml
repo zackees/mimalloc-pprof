@@ -1,4 +1,5 @@
 name: c-unit
+run-name: c-unit/${{ github.event_name == 'workflow_dispatch' && 'full' || 'event' }}/${{ inputs.candidate_sha || github.sha }}
 
 # Two stages, one build per configuration (issue #307).
 #
@@ -41,9 +42,16 @@ name: c-unit
 # cross-built MSVC-ABI comparison arms, live in `windows-bundles.yml` and are untouched.
 
 on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact merged commit SHA to validate in the full release matrix
+        type: string
+        required: true
   push:
     branches: [main, v4]
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     # No `paths` filter (#360): every job here is a required status check on `main`, and a
     # filtered workflow never reports on a PR outside its paths, leaving that PR BLOCKED.
 
@@ -53,6 +61,38 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  resolve-candidate:
+    name: resolve-candidate (exact SHA ${{ inputs.candidate_sha }})
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.identity.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
+          fetch-depth: 0
+      - id: identity
+        env:
+          EVENT: ${{ github.event_name }}
+          SOURCE_REF: ${{ github.ref }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            [[ "$SOURCE_REF" == refs/heads/main ]] || { echo '::error::full dispatch must run from main'; exit 1; }
+            sha="$CANDIDATE_SHA"
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::candidate_sha must be a complete lowercase 40-hex SHA'; exit 1; }
+            git merge-base --is-ancestor "$sha" origin/main || { echo '::error::candidate_sha is not merged into main'; exit 1; }
+          else
+            sha="$EVENT_SHA"
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::candidate SHA is invalid'; exit 1; }
+          actual=$(git rev-parse HEAD)
+          [[ "$actual" == "$sha" ]] || { echo "::error::checked out $actual, expected $sha"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "exact candidate_sha=$sha" >> "$GITHUB_STEP_SUMMARY"
+
   # ------------------------------------------------------------------------------------
   # STAGE 1 -- every configuration, built exactly once, in parallel.
   # ------------------------------------------------------------------------------------
@@ -69,6 +109,8 @@ jobs:
   #           BUILD, so it cannot be an extra entry in another bundle's manifest.
   build:
     name: build (${{ matrix.config }})
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
     timeout-minutes: 30
@@ -256,6 +298,8 @@ jobs:
         if: matrix.container != ''
         run: apk add --no-cache build-base cmake ninja python3 git tar
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: astral-sh/setup-uv@v3
         if: matrix.container == ''
       - name: Configure
@@ -344,6 +388,8 @@ jobs:
   # `src/static.c` -- the one thing #307 exists to stop doing.
   build-bun-objects:
     name: build-bun-objects (${{ matrix.name }})
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
     timeout-minutes: 20
@@ -364,6 +410,8 @@ jobs:
         if: matrix.container != ''
         run: apk add --no-cache build-base git python3
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: astral-sh/setup-uv@v3
         if: matrix.container == ''
       - name: Compile the probe's objects with Bun's exact define set
@@ -389,6 +437,8 @@ jobs:
   # #307 split it into build + run for the same reason as Linux -- the configuration is
   # compiled once and the result is what gets executed -- not to weaken it.
   build-windows-native:
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: windows-latest
     timeout-minutes: 40
     defaults:
@@ -396,6 +446,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: astral-sh/setup-uv@v3
       # -DMI_DHAT=ON: DHAT is opt-in (default OFF since 2026-09-18), so the main `cl` tree
       # builds it in to keep test-dhat running under Microsoft's compiler; the owner-gate
@@ -477,11 +529,13 @@ jobs:
   # STAGE 2 -- every test, at once.
   # ------------------------------------------------------------------------------------
   run-linux:
-    needs: [build, build-bun-objects]
+    needs: [resolve-candidate, build, build-bun-objects]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: astral-sh/setup-uv@v3
       - uses: actions/download-artifact@v4
         with:
@@ -663,11 +717,13 @@ jobs:
   # nothing else on it, and a separate runner is exactly that. The list itself is
   # unchanged and still lives in CMakeLists.txt as `RUN_SERIAL`.
   run-linux-serial:
-    needs: build
+    needs: [resolve-candidate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: astral-sh/setup-uv@v3
       - uses: actions/download-artifact@v4
         with:
@@ -729,11 +785,13 @@ jobs:
   # run stage without this would have left each half able to report green on its own share,
   # which is precisely the "gate that verifies less" shape docs/ci-gates.md exists to stop.
   coverage:
-    needs: [run-linux, run-linux-serial]
+    needs: [resolve-candidate, run-linux, run-linux-serial]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: astral-sh/setup-uv@v3
       - uses: actions/download-artifact@v4
         with:
@@ -795,7 +853,7 @@ jobs:
   # compiled this tree and this runner executed the result -- and it is still a hard gate.
   run-windows-native:
     name: ctest (windows-latest)
-    needs: build-windows-native
+    needs: [resolve-candidate, build-windows-native]
     runs-on: windows-latest
     timeout-minutes: 45
     defaults:
@@ -803,6 +861,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: astral-sh/setup-uv@v3
       - uses: actions/download-artifact@v4
         with:
@@ -847,11 +907,14 @@ jobs:
   # build is the positive control -- the gate MUST change those bytes -- so a normaliser
   # that had gone blind fails here rather than reporting "identical" forever.
   fastpath-identity:
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
           # the base revision must be reachable for the worktree the script builds
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v3
@@ -871,10 +934,14 @@ jobs:
   # result would mean nothing.
   isa-baseline-arm64:
     name: isa-baseline (ubuntu-24.04-arm)
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: astral-sh/setup-uv@v3
       - name: Disassembly parser selftest
         run: uv run ci/check_isa_baseline.py --selftest

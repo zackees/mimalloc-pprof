@@ -1,8 +1,9 @@
 name: macos-bundles
+run-name: macos-bundles/${{ inputs.ci-mode || 'event' }}/${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
 
 # Issue #277 phase B/B2: build the macOS test binaries on Linux, and execute them on a
-# Linux runner inside a dockurr/macos guest. NO NATIVE macOS RUNNER IS USED ANYWHERE IN
-# THIS REPOSITORY (ci/lint_no_macos_runners.py enforces that).
+# Linux runner inside a dockurr/macos guest. Issue #444 permits hosted native execution
+# of the same Linux-built bundles only for opt-in ci-full PRs and explicit full dispatch.
 #
 # The motivation is not build time. Measured over 20 runs per workflow (#277 phase 0),
 # cross.yml's Apple rows EXECUTE in 8-14 seconds and WAIT up to 5h26m (arm64) / 6h13m
@@ -14,9 +15,9 @@ name: macos-bundles
 #
 # What replaces it: both Apple architectures are cross-built here on Linux, and the
 # x86_64 bundle is EXECUTED under emulation (dockurr/macos, QEMU+KVM) on ubuntu-24.04.
-# aarch64 is compile-only -- there is no arm64 dockur image, and Apple ships no arm64
-# macOS VM that runs on Linux, so a compile plus the Mach-O evidence below is the whole
-# arm64 gate. Its test suite is still checked for parity against the executed x86_64 one
+# aarch64 is compile-only on ordinary events -- there is no arm64 dockur image, and Apple
+# ships no arm64 macOS VM that runs on Linux. Opt-in full runs execute it on hosted Apple
+# Silicon. Its test suite is still checked for parity against the executed x86_64 one
 # (`ci/bundle_coverage.py`), so an arm64-only test cannot be silently dropped.
 #
 # The Linux side needs no Apple hardware and no Xcode: `soldr prepare --target
@@ -42,6 +43,16 @@ on:
   # --ref <branch>`) to execute the x86_64 bundles inside the Recovery guest.
   workflow_dispatch:
     inputs:
+      ci-mode:
+        description: Run the native full Apple matrix or the existing Recovery diagnostic
+        type: choice
+        options: [recovery, full]
+        default: recovery
+        required: true
+      candidate_sha:
+        description: Exact 40-character commit SHA required for ci-mode=full
+        type: string
+        required: false
       run-timeout:
         description: seconds the guest gets to run the bundles
         default: '3600'
@@ -52,7 +63,7 @@ on:
     # No `paths` filter (#360): every job here is a required status check on `main`, and a
     # filtered workflow never reports on a PR outside its paths, leaving that PR BLOCKED.
     # `labeled` so adding `needs-macos` to an open PR re-runs `decide` (#339).
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 concurrency:
   # The macOS pool is the scarce one this whole workflow exists to stop wasting (#277).
@@ -60,8 +71,49 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  resolve-candidate:
+    name: resolve-candidate (exact SHA)
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.candidate.outputs.sha }}
+    steps:
+      - id: candidate
+        env:
+          EVENT: ${{ github.event_name }}
+          MODE: ${{ inputs.ci-mode }}
+          DISPATCH_SHA: ${{ inputs.candidate_sha }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == workflow_dispatch && "$MODE" == full ]]; then
+            sha="$DISPATCH_SHA"
+          elif [[ "$EVENT" == pull_request ]]; then
+            sha="$PR_SHA"
+          else
+            sha="$EVENT_SHA"
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::candidate_sha must be a complete lowercase 40-hex SHA'; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.candidate.outputs.sha }}
+      - name: Verify checked-out candidate identity
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          test "$actual" = "$CANDIDATE_SHA" || { echo "::error::checked out $actual, expected $CANDIDATE_SHA"; exit 1; }
+          echo "exact candidate_sha=$actual" >> "$GITHUB_STEP_SUMMARY"
+
   build-macos:
-    # Ungated. The golden-image / unattended-install question (#277, #283) that this
+    needs: [resolve-candidate, decide]
+    # Keep this matrix job present on every PR: branch protection requires each of its
+    # six named rows. Expensive steps run only for full or selective Mac validation.
+    env:
+      RUN_MACOS_BUILD: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.decide.outputs.run == 'true')) }}
+    # The golden-image / unattended-install question (#277, #283) that this
     # lane was parked behind is settled by not needing an installed macOS at all: the
     # x86_64 bundles execute in macOS Recovery, booted off the image on an ordinary
     # Linux runner, so there is nothing to install, cache, or keep alive. The
@@ -130,8 +182,15 @@ jobs:
             triple: x86_64-apple-darwin
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
     steps:
+      - name: Report minimal-mode skip
+        if: env.RUN_MACOS_BUILD != 'true'
+        run: echo '${{ matrix.bundle }} is reserved for selective macOS or ci-full validation.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v4
+        if: env.RUN_MACOS_BUILD == 'true'
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
+        if: env.RUN_MACOS_BUILD == 'true'
         with:
           # zccache wraps `soldr cargo`; this job drives CMake directly, so there is
           # nothing for it to wrap. Only the toolchain provisioning is wanted here.
@@ -140,11 +199,13 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
       - name: Cache the prepared Darwin toolchain
+        if: env.RUN_MACOS_BUILD == 'true'
         uses: actions/cache@v4
         with:
           path: ~/soldr-${{ matrix.triple }}.tar.zst
           key: soldr-prepare-${{ matrix.triple }}-${{ hashFiles('rust/rust-toolchain.toml') }}
       - name: Prepare the soldr Darwin toolchain
+        if: env.RUN_MACOS_BUILD == 'true'
         # `soldr prepare` resolves rustc from a rust-toolchain.toml at or above the
         # working directory, which is why this runs in rust/ like cross.yml does.
         working-directory: rust
@@ -191,7 +252,7 @@ jobs:
         # elsewhere in the file cannot false-positive it. Runs once (this matrix entry
         # only), not once per bundle -- the header does not vary by architecture or build
         # config.
-        if: matrix.bundle == 'macos-arm64-release'
+        if: env.RUN_MACOS_BUILD == 'true' && matrix.bundle == 'macos-arm64-release'
         run: |
           set -euo pipefail
           url="https://raw.githubusercontent.com/apple-oss-distributions/libpthread/main/private/pthread/tsd_private.h"
@@ -220,6 +281,7 @@ jobs:
           fi
           echo "OK: slots 96 and 97 remain unassigned in apple-oss-distributions/libpthread's tsd_private.h"
       - name: Configure for ${{ matrix.triple }}
+        if: env.RUN_MACOS_BUILD == 'true'
         run: |
           set -euo pipefail
           cmake -S . -B build -G Ninja ${{ matrix.cmake }} \
@@ -235,7 +297,9 @@ jobs:
             exit 1
           fi
       - run: cmake --build build --parallel
+        if: env.RUN_MACOS_BUILD == 'true'
       - name: Prove the output is ${{ matrix.arch }} Mach-O with the profiler's Darwin sections
+        if: env.RUN_MACOS_BUILD == 'true'
         env:
           ARCH: ${{ matrix.arch }}
         run: |
@@ -267,12 +331,15 @@ jobs:
               | tee -a "$GITHUB_STEP_SUMMARY"
           fi
       - name: Bundle the tests
+        if: env.RUN_MACOS_BUILD == 'true'
         run: python3 ci/bundle_tests.py build bundle
       - name: Every Darwin-only test carries the `macos` label (#339)
+        if: env.RUN_MACOS_BUILD == 'true'
         # The selective lane runs `--label macos`; a `test-osx-*` without the label
         # would ship in the bundle and never execute anywhere. Red here, on Linux.
         run: python3 ci/check_macos_labels.py bundle/tests.json
       - name: The manifest must carry no absolute path
+        if: env.RUN_MACOS_BUILD == 'true'
         # bundle_tests.py already refuses these; this is the independent check, because
         # the whole portability claim rests on it and this is the first phase where the
         # bundle leaves the machine that built it.
@@ -285,11 +352,13 @@ jobs:
           python3 -c "import json,sys; d=json.load(open('bundle/tests.json')); print(len(d['tests']), 'tests')"
           ls bundle | grep -q '\.dylib$'
       - name: Pack the bundle
+        if: env.RUN_MACOS_BUILD == 'true'
         # tar, not a plain artifact upload: upload-artifact@v4 drops the executable bit
         # and does not preserve symlinks, and this bundle needs both (every test exe, and
         # the libmimalloc.dylib -> libmimalloc.3.dylib SONAME chain).
         run: tar -C bundle -czf "${{ matrix.bundle }}.tar.gz" .
       - uses: actions/upload-artifact@v4
+        if: env.RUN_MACOS_BUILD == 'true'
         with:
           name: bundle-${{ matrix.bundle }}
           path: ${{ matrix.bundle }}.tar.gz
@@ -297,7 +366,9 @@ jobs:
           retention-days: 7
 
   build-rust-apple:
-    # Ungated. The golden-image / unattended-install question (#277, #283) that this
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    # The golden-image / unattended-install question (#277, #283) that this
     # lane was parked behind is settled by not needing an installed macOS at all: the
     # x86_64 bundles execute in macOS Recovery, booted off the image on an ordinary
     # Linux runner, so there is nothing to install, cache, or keep alive. The
@@ -313,6 +384,8 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
           cache: true
@@ -445,35 +518,43 @@ jobs:
   # required by branch protection, so the *decision* is what the rule names.
   # ---------------------------------------------------------------------------------
   decide:
+    needs: resolve-candidate
     name: decide (selective macOS lane)
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
-      run: ${{ steps.decide.outputs.run }}
+      run: ${{ steps.decide.outputs.run || steps.no-pr.outputs.run }}
       reason: ${{ steps.decide.outputs.reason }}
     steps:
       - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
         with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
           fetch-depth: 0
       - id: decide
+        if: github.event_name == 'pull_request'
         run: |
           set -euo pipefail
           python3 ci/macos_lane_decide.py \
             --base "${{ github.event.pull_request.base.sha }}" \
             --head "${{ github.event.pull_request.head.sha }}" \
             --labels "${{ join(github.event.pull_request.labels.*.name, ',') }}"
+      - id: no-pr
+        if: github.event_name != 'pull_request'
+        run: echo 'run=false' >> "$GITHUB_OUTPUT"
       - run: |
-          echo "### selective macOS lane: run=${{ steps.decide.outputs.run }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### selective macOS lane: run=${{ steps.decide.outputs.run || steps.no-pr.outputs.run }}" >> "$GITHUB_STEP_SUMMARY"
           echo "${{ steps.decide.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
 
   run-macos-x64-selective:
     name: run-macos-x64-selective (tests labelled macos, in Recovery)
-    needs: [decide, build-macos]
+    needs: [resolve-candidate, decide, build-macos]
     if: needs.decide.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: actions/download-artifact@v4
         with:
           pattern: bundle-macos-x64-*
@@ -550,18 +631,117 @@ jobs:
           path: ${{ steps.macos.outputs.workdir }}/results/*.ppm
           if-no-files-found: warn
 
+  run-macos-native-full:
+    name: run-macos-native-full (${{ matrix.arch }})
+    needs: [resolve-candidate, build-macos, build-rust-apple]
+    # Hosted Apple hardware is approved only for literal ci-full PR labels and an
+    # explicit full dispatch (#444). Ordinary PR and main events allocate none.
+    if: >-
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.ci-mode == 'full')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            triple: aarch64-apple-darwin
+          - arch: x64
+            runner: macos-15-intel
+            triple: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-macos-${{ matrix.arch }}-*
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-test-bins-${{ matrix.triple }}
+          path: rust-bins
+      - name: Unpack exactly the Linux-built bundles
+        run: |
+          set -euo pipefail
+          for config in release debug-full leak; do
+            archive="artifacts/bundle-macos-${{ matrix.arch }}-$config/macos-${{ matrix.arch }}-$config.tar.gz"
+            test -s "$archive" || { echo "::error::missing cross-built $archive"; exit 1; }
+            mkdir -p "bundles/macos-${{ matrix.arch }}-$config"
+            tar -xzf "$archive" -C "bundles/macos-${{ matrix.arch }}-$config"
+            test -s "bundles/macos-${{ matrix.arch }}-$config/tests.json"
+          done
+          test -n "$(find rust-bins -type f -print -quit)" || { echo '::error::no cross-built Rust tests'; exit 1; }
+      - name: Execute the shipped C bundles on native macOS
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python="$(python3 -c 'import sys; print(sys.executable)')"
+          test "${python:0:1}" = / || { echo '::error::Python interpreter is not absolute'; exit 1; }
+          status=0
+          for config in release debug-full; do
+            name="macos-${{ matrix.arch }}-$config"
+            mkdir -p "results/$name"
+            "$python" ci/run_test_bundle.py "bundles/$name" \
+              --exclude test-osx-zone-introspect-remote \
+              --junit "results/$name/ordinary.xml" || status=1
+            sudo -n "$python" ci/run_test_bundle.py "bundles/$name" \
+              --only test-osx-zone-introspect-remote \
+              --junit "results/$name/remote-root.xml" || status=1
+            python3 ci/bundle_coverage.py --compare "$name" \
+              "bundles/$name/tests.json" "results/$name" || status=1
+          done
+          exit "$status"
+      - name: Prove the shipped leak control fires on native macOS
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5 6 7 8; do
+            DYLD_LIBRARY_PATH="$(pwd)/bundles/macos-${{ matrix.arch }}-release:${DYLD_LIBRARY_PATH:-}" \
+            MI_BENCH_JSON="$(pwd)/results/normal-$i.json" \
+              "bundles/macos-${{ matrix.arch }}-release/mimalloc-test-memory-gate" > /dev/null
+            DYLD_LIBRARY_PATH="$(pwd)/bundles/macos-${{ matrix.arch }}-leak:${DYLD_LIBRARY_PATH:-}" \
+            MI_BENCH_JSON="$(pwd)/results/leak-$i.json" \
+              "bundles/macos-${{ matrix.arch }}-leak/mimalloc-test-memory-gate" > /dev/null
+          done
+          python3 ci/check_macos_memory_control.py
+      - name: Execute the shipped Rust tests on native macOS
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bins=(rust-bins/*)
+          test "${#bins[@]}" -gt 0
+          for bin in "${bins[@]}"; do
+            test -f "$bin" || exit 1
+            chmod +x "$bin"
+            "$bin" --test-threads=4
+          done
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-native-${{ matrix.arch }}-results
+          path: results/
+          if-no-files-found: error
+          retention-days: 7
+
   run-macos-x64-recovery:
     name: run-macos-x64 (macOS Recovery on Linux)
-    needs: [build-macos, build-rust-apple]
+    needs: [resolve-candidate, build-macos, build-rust-apple]
     # Manual only -- see the `on:` block. Not a PR gate; run it before merging changes to
     # the allocator's macOS-specific paths (prim/osx, interpose, TLS slots) or on demand.
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.ci-mode == 'recovery'
     runs-on: ubuntu-latest
     # Emulated guest, everything in it serial, one boot retry budgeted.
     timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
 
       - uses: actions/download-artifact@v4
         with:

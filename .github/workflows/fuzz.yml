@@ -11,12 +11,7 @@ on:
   push:
     branches: [main, v4]
   pull_request:
-    paths:
-      - 'src/**'
-      - 'include/**'
-      - 'test/fuzz/**'
-      - 'CMakeLists.txt'
-      - '.github/workflows/fuzz.yml'
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   schedule:
     - cron: '0 4 * * *'   # nightly, longer budget
 
@@ -29,6 +24,7 @@ concurrency:
 
 jobs:
   fuzz:
+    if: github.event_name == 'schedule' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: ubuntu-latest
     env:
       CC: clang

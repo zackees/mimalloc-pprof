@@ -10,7 +10,8 @@ Issue #307 added the multi-bundle mode `c-unit.yml`'s run stage uses: every conf
 is built once, in parallel, by the build stage, and ONE run job then executes every
 bundle at once instead of each config rebuilding the library for its own slice.
 
-    uv run ci/run_test_bundle.py <bundle> [--only NAME ...] [--env K=V ...]
+    uv run ci/run_test_bundle.py <bundle> [--only NAME ...] [--exclude NAME ...]
+                                          [--env K=V ...]
                                           [--timeout-scale F] [--junit out.xml]
                                           [--compare-junit ctest.xml]
     uv run ci/run_test_bundle.py --bundles dir1 dir2 ... --jobs 4 --junit-dir results
@@ -564,8 +565,9 @@ def select(
     specs: Sequence[TestSpec],
     only: Sequence[str] | None,
     labels: Sequence[str] | None = None,
+    exclude: Sequence[str] | None = None,
 ) -> list[TestSpec]:
-    """The tests `--only` / `--label` ask for; both given means both must match.
+    """The tests `--only` / `--label` ask for, minus `--exclude` names.
 
     `--label` selects by the ctest LABELS the manifest carries (`ci/bundle_tests.py`
     lowers them verbatim). It exists for the selective macOS lane (#339): a PR that
@@ -579,6 +581,9 @@ def select(
     if labels is not None:
         needed = set(labels)
         chosen = [spec for spec in chosen if needed & set(spec.labels)]
+    if exclude is not None:
+        omitted = set(exclude)
+        chosen = [spec for spec in chosen if spec.name not in omitted]
     return chosen
 
 
@@ -605,6 +610,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "manifest marks `serial` always run alone, after the parallel wave.",
     )
     parser.add_argument("--only", nargs="+", default=None, metavar="NAME", help="run these tests")
+    parser.add_argument(
+        "--exclude",
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help="run every selected test except these named tests; unknown names are errors",
+    )
     parser.add_argument(
         "--label",
         nargs="+",
@@ -681,8 +693,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     only = cast("list[str] | None", args.only)
+    exclude = cast("list[str] | None", args.exclude)
     labels = cast("list[str] | None", args.label)
     loaded: list[tuple[str, Path, Sequence[TestSpec]]] = []
+    available_names: set[str] = set()
     for raw_path in paths:
         bundle = Path(raw_path).resolve()
         try:
@@ -690,12 +704,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"cannot read {bundle}: {exc}", file=sys.stderr)
             return 1
+        available_names.update(spec.name for spec in specs)
         if only is not None:
             missing = sorted(set(only) - {spec.name for spec in specs})
             if missing and not multi:
                 print(f"no such test(s) in the bundle: {missing}", file=sys.stderr)
                 return 1
-        chosen = select(specs, only, labels)
+        if exclude is not None:
+            missing = sorted(set(exclude) - {spec.name for spec in specs})
+            if missing and not multi:
+                print(f"no such test(s) in the bundle: {missing}", file=sys.stderr)
+                return 1
+        chosen = select(specs, only, labels, exclude)
         if labels is not None and not chosen and not multi:
             # `--label macos` against a bundle where no test carries the label would
             # otherwise fall through to "no tests selected" -- true, but the useful
@@ -707,6 +727,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 1
         loaded.append((bundle.name, bundle, chosen))
+
+    if multi and exclude is not None:
+        # A name may exist in just one bundle. It must exist somewhere, or a typo
+        # would silently leave the entire wave unchanged.
+        missing = sorted(set(exclude) - available_names)
+        if missing:
+            print(f"no such test(s) in the bundles: {missing}", file=sys.stderr)
+            return 1
 
     # A `--env-variant guarded:...` whose bundle name is a typo would silently drop the
     # second pass and still report green -- the "gate that verifies nothing" shape. Refuse.

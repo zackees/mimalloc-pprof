@@ -1,5 +1,12 @@
 # mimalloc-pprof — agent guidance
 
+> [!IMPORTANT]
+> Ordinary PR/main CI is fractional. Add `ci-full` to a PR for every supported
+> platform; a release needs the full matrix on the exact merged commit SHA.
+> Start or resume the issue-driven release attempt through `ci/release.py`.
+> Read [docs/release-process.md](docs/release-process.md) before changing release
+> workflows or trying to tag, publish, or dispatch a release.
+
 Fork of microsoft/mimalloc adding pprof-compatible sampled heap profiling (Windows-first)
 plus Rust crates in `rust/`. **All design decisions and work orders live in GitHub issues —
 start at issue #2 (the epic), which links the ordered sub-issues.**
@@ -11,6 +18,13 @@ Do not start a phase before its blocker is merged. Work from the sub-issue, not 
 if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decisions log win.
 
 ## Hard rules
+
+Ordinary PR and `main` CI use the minimal lane. Add literal `ci-test` for the
+complete C test DAG; add `ci-full` for the release platform matrix, including
+native Intel and Apple Silicon execution. Label changes recompute the mode on
+the same PR head. A release requires full validation from exact-SHA dispatches
+before tagging; the publication workflow remains fail-closed. See
+`docs/ci-gates.md` and `ci/release_full_ci_manifest.v1.json`.
 
 1. **Never commit directly to `main`.** Feature branch → PR → merge. Branch names come from
    the sub-issue. One PR per phase. Conventional commits (`feat:`, `fix:`, `ci:`, `docs:`, `test:`).
@@ -25,9 +39,10 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    not a job of its own. A test that only passes with the machine to itself belongs in the
    `RUN_SERIAL` group in `CMakeLists.txt`, never behind a retry.
    MSVC **and** win-gnu are priority platforms — both, always.
-   The **macOS** gate is `macos-bundles.yml` and uses no Apple hardware (#277 phase B2):
-   both Apple arches are cross-built on Linux through soldr on every push/PR (that build is
-   the gate), and `aarch64` is **compile-only** — a build plus Mach-O header assertions, with
+   The **macOS** gate is `macos-bundles.yml`. Its routine path uses no Apple hardware
+   (#277 phase B2):
+   both Apple arches are cross-built on Linux through soldr for `ci-full` and
+   selective Darwin PRs. In selective runs `aarch64` is **compile-only** — a build plus Mach-O header assertions, with
    its test-name set checked against the x86_64 bundle. *Executing* the x86_64 bundles inside
    a macOS Recovery guest on a Linux runner (`run-macos-x64-recovery`) is **manual-only**
    (`workflow_dispatch`; owner decision 2026-09-03: ~25–90 min per run cannot gate PRs).
@@ -38,8 +53,13 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    PR carries the `needs-macos` label, `run-macos-x64-selective` boots the same Recovery
    guest and executes only the tests labelled `macos` (~10 min). `decide` is the check
    to require; every `test-osx-*` must carry `LABELS macos` (`ci/check_macos_labels.py`).
-   Never add a `macos-*` runner label to a workflow or
-   to `azure-pipelines.yml`; `ci/lint_no_macos_runners.py` fails `python-lint` if you do.
+   Issue #444 makes one narrow owner-approved exception: `run-macos-native-full` executes
+   the same Linux-built ARM64 and x64 bundles on hosted `macos-15` and `macos-15-intel`
+   only for a literal `ci-full` PR label or an explicit `ci-mode=full` dispatch. Ordinary
+   PR/main events allocate no hosted Mac runner. The full dispatch requires an exact
+   `candidate_sha`, verified by `resolve-candidate`; PR runs build the PR head SHA.
+   `ci/lint_no_macos_runners.py` rejects any
+   other macOS runner label, including an exception whose opt-in gate is removed.
    The guest boots macOS **Recovery** straight off the image every run via the
    `zackees/docker-mac-x64` action — no golden disk, no Actions cache, nothing to expire
    (the hand-built-image design and its keep-alive workflow are gone). Recovery has no

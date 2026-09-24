@@ -108,6 +108,7 @@ SERIAL_LABEL = "serial"
 #: its command line -- a dynamically linked test finds them through the loader, not argv.
 LIBRARY_GLOBS = (
     "libmimalloc*",
+    "mimalloc.lib",
     "mimalloc*.dll",
     "mimalloc*.so*",
     "mimalloc*.dylib",

@@ -1,4 +1,5 @@
 name: windows-bundles
+run-name: windows-bundles/${{ github.event_name == 'workflow_dispatch' && 'full' || 'event' }}/${{ inputs.candidate_sha || github.sha }}
 
 # Issue #277 phases C and D: build the Windows test binaries on Linux, execute them on
 # ONE Windows runner.
@@ -65,9 +66,16 @@ env:
   SOLDR_GITHUB_TOKEN: ${{ github.token }}
 
 on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact merged commit SHA to validate in the full release matrix
+        type: string
+        required: true
   push:
     branches: [main, v4]
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     # No `paths` filter (#360): every job here is a required status check on `main`, and a
     # filtered workflow never reports on a PR outside its paths, leaving that PR BLOCKED.
 
@@ -76,8 +84,42 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  resolve-candidate:
+    name: resolve-candidate (exact SHA ${{ inputs.candidate_sha }})
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.identity.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
+          fetch-depth: 0
+      - id: identity
+        env:
+          EVENT: ${{ github.event_name }}
+          SOURCE_REF: ${{ github.ref }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            [[ "$SOURCE_REF" == refs/heads/main ]] || { echo '::error::full dispatch must run from main'; exit 1; }
+            sha="$CANDIDATE_SHA"
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::candidate_sha must be a complete lowercase 40-hex SHA'; exit 1; }
+            git merge-base --is-ancestor "$sha" origin/main || { echo '::error::candidate_sha is not merged into main'; exit 1; }
+          else
+            sha="$EVENT_SHA"
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::candidate SHA is invalid'; exit 1; }
+          actual=$(git rev-parse HEAD)
+          [[ "$actual" == "$sha" ]] || { echo "::error::checked out $actual, expected $sha"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "exact candidate_sha=$sha" >> "$GITHUB_STEP_SUMMARY"
+
   build-windows-gnu:
     name: build-windows-gnu (${{ matrix.bundle }})
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -121,6 +163,8 @@ jobs:
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: astral-sh/setup-uv@v3
       - uses: zackees/setup-soldr@v0
         with:
@@ -275,6 +319,8 @@ jobs:
 
   build-rust-windows-gnu:
     name: build-rust (x86_64-pc-windows-gnu)
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
     # cross.yml's `build-win-gnu` runs this on `windows-latest` (it predates soldr having
     # a Linux-hosted mingw lane). Nothing about it needs Windows: soldr's mingw-w64 is a
     # Linux-hosted cross compiler and cc-rs picks it up from CC_x86_64_pc_windows_gnu.
@@ -285,6 +331,8 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
           # Same reason cross.yml's build-win-gnu gives: the embedded cache expects
@@ -342,6 +390,8 @@ jobs:
 
   build-windows-msvc:
     name: build-windows-msvc (${{ matrix.bundle }})
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
     # Issue #277 phase D. soldr's `blessed-msvc` lane is clang-cl + lld-link + llvm-lib
     # against an xwin-materialised MS CRT and Windows SDK, all Linux-hosted. See
     # cmake/toolchains/soldr-x86_64-pc-windows-msvc.cmake for what it consumes and why
@@ -408,6 +458,8 @@ jobs:
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: astral-sh/setup-uv@v3
       - uses: zackees/setup-soldr@v0
         with:
@@ -612,6 +664,8 @@ jobs:
 
   build-rust-windows-msvc:
     name: build-rust (x86_64-pc-windows-msvc)
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
     # Duplicated from cross.yml's `build-cross` rather than reused: artifacts do not cross
     # workflows without run-id plumbing (#277 phase B correction 1). That row stays where
     # it is, feeding its now-informational `test (x86_64-pc-windows-msvc)`, until the
@@ -648,6 +702,8 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
           cache: false
@@ -869,7 +925,7 @@ jobs:
     # Rust test-binary sets, both memory gates and the PR benchmark sentinel. The only
     # other Windows job left per push is c-unit.yml's `ctest (windows-latest)`, kept
     # native and kept a hard gate because clang-cl is not `cl` (CLAUDE.md rule 3).
-    needs: [build-windows-gnu, build-rust-windows-gnu, build-windows-msvc, build-rust-windows-msvc]
+    needs: [resolve-candidate, build-windows-gnu, build-rust-windows-gnu, build-windows-msvc, build-rust-windows-msvc]
     runs-on: windows-latest
     # Everything here is serial, so a hung test would otherwise hold the slot for the
     # workflow's whole timeout. Raised from 45 with phase D's work added.
@@ -879,6 +935,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       # `windows-latest` ships a Python, but every ci/ script in this repo is run through
       # uv everywhere else and the two must not drift.
       - uses: astral-sh/setup-uv@v3

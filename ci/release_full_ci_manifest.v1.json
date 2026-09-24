@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "workflows": {
+    "macos-bundles.yml": {
+      "verifier": "resolve-candidate (exact SHA)",
+      "jobs": ["build-macos (macos-arm64-release)", "build-macos (macos-arm64-debug-full)", "build-macos (macos-arm64-leak)", "build-macos (macos-x64-release)", "build-macos (macos-x64-debug-full)", "build-macos (macos-x64-leak)", "build-rust (aarch64-apple-darwin)", "build-rust (x86_64-apple-darwin)", "run-macos-native-full (arm64)", "run-macos-native-full (x64)"]
+    },
+    "windows-bundles.yml": {
+      "verifier": "resolve-candidate (exact SHA {sha})",
+      "jobs": ["build-windows-gnu (windows-gnu-x64-release)", "build-windows-gnu (windows-gnu-x64-debug-full)", "build-windows-gnu (windows-gnu-x64-shared)", "build-windows-gnu (windows-gnu-x64-gated)", "build-windows-gnu (windows-gnu-x64-leak)", "build-windows-msvc (windows-msvc-x64-release)", "build-windows-msvc (windows-msvc-x64-debug-full)", "build-windows-msvc (windows-msvc-x64-shared)", "build-windows-msvc (windows-msvc-x64-gated)", "build-windows-msvc (windows-msvc-x64-leak)", "build-rust (x86_64-pc-windows-gnu)", "build-rust (x86_64-pc-windows-msvc)", "run-windows"]
+    },
+    "c-unit.yml": {
+      "verifier": "resolve-candidate (exact SHA {sha})",
+      "jobs": ["build (release)", "build (pprof-off)", "build (memevt-only)", "build (debug-full)", "build (guarded)", "build (shared)", "build (gated)", "build (dhat-on)", "build (musl)", "build (musl-pprof-off)", "build (memory-gate-leak)", "build (isa-portable)", "build (isa-arch)", "build (diag-pprof-on)", "build (diag-pprof-off)", "build (debug3-extra)", "build-bun-objects (glibc)", "build-bun-objects (musl)", "build-windows-native", "run-linux", "run-linux-serial", "coverage", "ctest (windows-latest)", "fastpath-identity", "isa-baseline (ubuntu-24.04-arm)"]
+    },
+    "cross.yml": {
+      "verifier": "resolve-candidate (exact SHA {sha})",
+      "jobs": ["build (x86_64-unknown-linux-gnu)", "build (aarch64-unknown-linux-gnu)", "build (x86_64-unknown-linux-musl)", "build (x86_64-pc-windows-msvc)", "build (aarch64-pc-windows-msvc)", "build (x86_64-pc-windows-gnu)", "build (x86_64-apple-darwin)", "build (aarch64-apple-darwin)", "test (x86_64-unknown-linux-gnu)", "test (aarch64-unknown-linux-gnu)", "test (x86_64-unknown-linux-musl)", "test (x86_64-pc-windows-msvc)", "test (x86_64-pc-windows-gnu)"]
+    },
+    "rust-native.yml": {
+      "verifier": "resolve-candidate (exact SHA {sha})",
+      "jobs": ["test (ubuntu-latest)", "test (windows-latest)", "test-win-gnu", "test-no-pprof"]
+    }
+  }
+}

@@ -591,6 +591,29 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout)
         self.assertIn("out of 1", proc.stdout)
 
+    def test_exclude_runs_complement_and_junit_records_only_it(self) -> None:
+        self.write_manifest([self.spec("t-ok", "ok"), self.spec("t-bad", "boom")])
+        report = self.bundle / "ordinary.xml"
+        proc = self.run_bundle("--exclude", "t-bad", "--junit", str(report))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(run_test_bundle.parse_junit(report), {"t-ok": True})
+        privileged = self.bundle / "privileged.xml"
+        proc = self.run_bundle("--only", "t-bad", "--junit", str(privileged))
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(run_test_bundle.parse_junit(privileged), {"t-bad": False})
+
+    def test_exclude_unknown_name_fails_closed(self) -> None:
+        self.write_manifest([self.spec("t-ok", "ok")])
+        proc = self.run_bundle("--exclude", "typo")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no such test", proc.stderr)
+
+    def test_exclude_every_test_fails_closed(self) -> None:
+        self.write_manifest([self.spec("t-ok", "ok")])
+        proc = self.run_bundle("--exclude", "t-ok")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no tests selected", proc.stderr)
+
     def test_label_selects_by_manifest_labels(self) -> None:
         """#339: `--label macos` runs exactly the tests whose LABELS carry `macos`."""
         self.write_manifest(

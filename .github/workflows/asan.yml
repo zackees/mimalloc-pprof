@@ -5,18 +5,13 @@ name: asan
 # pull_request trigger at all, so it has never run on a single commit of this fork.
 # Inherited configuration that looks like coverage and provides none.
 #
-# This job is ours, runs on PRs, and is a hard failure.
+# This job is ours, runs in the extended test tier, and is a hard failure.
 
 on:
   push:
     branches: [main, v4]
   pull_request:
-    paths:
-      - 'src/**'
-      - 'include/**'
-      - 'test/**'
-      - 'CMakeLists.txt'
-      - '.github/workflows/asan.yml'
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 concurrency:
   # Pure verification: a superseded push's answer is worthless.
@@ -25,6 +20,7 @@ concurrency:
 
 jobs:
   asan:
+    if: github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full'))
     # Issue #301. One row is not enough. `MI_TRACK_ASAN` implies `MI_PADDING`, and
     # CMakeLists auto-enables `MI_OPT_FREE_SMALL` (hence `MI_PAGE_META_ALIGNED_FREE_SMALL`)
     # only when `MI_DEBUG` is off -- so a Debug-only ASan lane can never reach the

@@ -1,15 +1,18 @@
 name: cross
+run-name: cross/${{ github.event_name == 'workflow_dispatch' && 'full' || 'event' }}/${{ inputs.candidate_sha || github.sha }}
 
 env:
   SOLDR_GITHUB_TOKEN: ${{ github.token }}
 
 on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact merged commit SHA to validate in the full release matrix
+        type: string
+        required: true
   pull_request:
-    paths:
-      - src/**
-      - include/**
-      - rust/**
-      - .github/workflows/cross.yml
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [main, v4]
     paths:
@@ -24,8 +27,42 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  resolve-candidate:
+    name: resolve-candidate (exact SHA ${{ inputs.candidate_sha }})
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.identity.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
+          fetch-depth: 0
+      - id: identity
+        env:
+          EVENT: ${{ github.event_name }}
+          SOURCE_REF: ${{ github.ref }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            [[ "$SOURCE_REF" == refs/heads/main ]] || { echo '::error::full dispatch must run from main'; exit 1; }
+            sha="$CANDIDATE_SHA"
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::candidate_sha must be a complete lowercase 40-hex SHA'; exit 1; }
+            git merge-base --is-ancestor "$sha" origin/main || { echo '::error::candidate_sha is not merged into main'; exit 1; }
+          else
+            sha="$EVENT_SHA"
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::candidate SHA is invalid'; exit 1; }
+          actual=$(git rev-parse HEAD)
+          [[ "$actual" == "$sha" ]] || { echo "::error::checked out $actual, expected $sha"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "exact candidate_sha=$sha" >> "$GITHUB_STEP_SUMMARY"
+
   build-linux:
     name: build (${{ matrix.target }})
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
     runs-on: ubuntu-latest
     env:
       # The profiler walks frame pointers on non-Windows platforms.  Keep both
@@ -54,6 +91,8 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
           cache: true
@@ -113,6 +152,8 @@ jobs:
 
   build-cross:
     name: build (${{ matrix.target }})
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -128,6 +169,8 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
           cache: true
@@ -257,6 +300,8 @@ jobs:
 
   build-win-gnu:
     name: build (x86_64-pc-windows-gnu)
+    needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
     runs-on: windows-latest
     # TODO(#277 phase C, added 2026-09-02): DELETE this job -- and the
     # x86_64-pc-windows-gnu row of test-binaries below -- after ten pushes have compared
@@ -264,12 +309,14 @@ jobs:
     # `run-windows`, which build the same test binaries on ubuntu-latest through
     # soldr's Linux-hosted mingw-w64 and run them on the shared Windows VM. Informational
     # until then. A permanently-yellow job is worse than an absent one.
-    continue-on-error: true
+    continue-on-error: ${{ github.event_name != 'workflow_dispatch' }}
     defaults:
       run:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
           # The embedded cache expects MSVC-style .pdb outputs even though this
@@ -303,7 +350,7 @@ jobs:
 
   test-binaries:
     name: test (${{ matrix.target }})
-    needs: [build-linux, build-cross, build-win-gnu]
+    needs: [resolve-candidate, build-linux, build-cross, build-win-gnu]
     runs-on: ${{ matrix.runner }}
     # The two apple-darwin rows are GONE (#277 phase B2). Nothing Apple is executed on a
     # native macOS runner anywhere in this repository any more: the x86_64 test binaries
@@ -325,7 +372,7 @@ jobs:
     # `build-cross`'s x86_64-pc-windows-msvc row above must go with it, but
     # aarch64-pc-windows-msvc must NOT -- that one is build-only and has no runner.
     # A permanently-yellow job is worse than an absent one.
-    continue-on-error: ${{ matrix.target == 'x86_64-pc-windows-gnu' || matrix.target == 'x86_64-pc-windows-msvc' }}
+    continue-on-error: ${{ github.event_name != 'workflow_dispatch' && (matrix.target == 'x86_64-pc-windows-gnu' || matrix.target == 'x86_64-pc-windows-msvc') }}
     strategy:
       fail-fast: false
       matrix:

@@ -166,6 +166,29 @@ class LiveDestination(destinations.ReadOnlyDestination):
         )
 
 
+def parse_cargo_metadata_stdout(stdout: str) -> dict[str, Any]:
+    """Extract Cargo metadata from Soldr output without mistaking telemetry for it."""
+    decoder = json.JSONDecoder()
+    offset = 0
+    while True:
+        start = stdout.find("{", offset)
+        if start < 0:
+            break
+        try:
+            value, consumed = decoder.raw_decode(stdout[start:])
+        except json.JSONDecodeError:
+            offset = start + 1
+            continue
+        offset = start + consumed
+        if isinstance(value, dict):
+            document = cast(dict[str, Any], value)
+            if isinstance(document.get("packages"), list) and isinstance(
+                document.get("workspace_members"), list
+            ):
+                return document
+    raise release.ReleaseError("Cargo metadata has no valid metadata JSON document")
+
+
 def crate_publish_metadata(path: Path) -> dict[str, object]:
     """Build the Registry Web API Publish JSON from Cargo's resolved package data.
 
@@ -181,11 +204,8 @@ def crate_publish_metadata(path: Path) -> dict[str, object]:
     )
     if result.returncode:
         raise release.ReleaseError(f"Cargo metadata failed: {result.stderr.strip()}")
-    # Soldr prepends timing telemetry to stdout before Cargo's JSON document.
-    start = result.stdout.find("{")
-    if start < 0:
-        raise release.ReleaseError("Cargo metadata has no JSON document")
-    document = cast(dict[str, Any], json.loads(result.stdout[start:]))
+    # Soldr may prepend JSON timing telemetry before Cargo's JSON document.
+    document = parse_cargo_metadata_stdout(result.stdout)
     packages = [row for row in document["packages"] if row.get("name") == "mimalloc-pprof"]
     if len(packages) != 1:
         raise release.ReleaseError("Cargo metadata has no unique mimalloc-pprof package")

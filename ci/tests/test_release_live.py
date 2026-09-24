@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import http.server
+import io
 import json
 import os
 import struct
 import subprocess
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -35,6 +37,60 @@ class FakeResponse:
 
 
 class LiveUploadTests(unittest.TestCase):
+    def test_publish_metadata_skips_soldr_json_telemetry(self) -> None:
+        package: dict[str, object] = {
+            "name": "mimalloc-pprof",
+            "version": "1.0.1",
+            "authors": [],
+            "description": None,
+            "documentation": None,
+            "homepage": None,
+            "keywords": [],
+            "categories": [],
+            "license": None,
+            "license_file": None,
+            "repository": None,
+            "links": None,
+            "rust_version": None,
+            "readme": None,
+            "features": {"default": []},
+            "dependencies": [],
+        }
+        metadata: dict[str, object] = {
+            "packages": [package],
+            "workspace_members": ["mimalloc-pprof 1.0.1"],
+            "version": 1,
+        }
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                '{"elapsed_seconds":0.2,"command":"cargo metadata"}\n'
+                "soldr: cache telemetry\n"
+                f"{json.dumps(metadata)}\n"
+            ),
+            stderr="",
+        )
+        manifest = (
+            b'[package]\nname = "mimalloc-pprof"\nversion = "1.0.1"\n'
+            b'edition = "2021"\n\n[features]\ndefault = []\n'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            crate = Path(temporary) / "mimalloc-pprof-1.0.1.crate"
+            with tarfile.open(crate, "w:gz") as archive:
+                member = tarfile.TarInfo("mimalloc-pprof-1.0.1/Cargo.toml")
+                member.size = len(manifest)
+                archive.addfile(member, io.BytesIO(manifest))
+            with patch.object(release_live.subprocess, "run", return_value=completed):
+                publish = release_live.crate_publish_metadata(crate)
+
+        self.assertEqual(publish["name"], "mimalloc-pprof")
+        self.assertEqual(publish["vers"], "1.0.1")
+
+    def test_metadata_parser_rejects_unrelated_json(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no valid metadata JSON document"):
+            release_live.parse_cargo_metadata_stdout('{"elapsed_seconds":0.2}\n')
+
     def test_permanent_registry_http_error_is_not_ambiguous(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             crate = Path(temporary) / "mimalloc-pprof-1.0.1.crate"

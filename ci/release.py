@@ -79,15 +79,11 @@ def github_json(
 def validated_json_document(raw: str, validate: Callable[[object], bool]) -> object | None:
     """Find one schema-valid JSON document inside optionally decorated CLI output."""
     decoder = json.JSONDecoder()
+    inline_dicts: list[object] = []
     for offset, character in enumerate(raw):
         if character not in "[{":
             continue
         line_start = raw.rfind("\n", 0, offset) + 1
-        if raw[line_start:offset].strip():
-            # Only accept a top-level document that begins its line. This avoids
-            # mistaking nested objects/arrays or JSON-looking diagnostic text for
-            # the endpoint response.
-            continue
         try:
             value, consumed = decoder.raw_decode(raw[offset:])
         except json.JSONDecodeError:
@@ -97,8 +93,18 @@ def validated_json_document(raw: str, validate: Callable[[object], bool]) -> obj
             line_end = len(raw)
         if raw[offset + consumed : line_end].strip():
             continue
-        if validate(value):
+        if not validate(value):
+            continue
+        if not raw[line_start:offset].strip():
             return value
+        # Some runner-side gh wrappers prepend a diagnostic to the response on
+        # the same physical line. A schema-valid object that consumes the rest
+        # of that line is still unambiguous. Keep arrays strict because [] is a
+        # common diagnostic value and is also a valid empty endpoint response.
+        if isinstance(value, dict):
+            inline_dicts.append(cast(dict[object, object], value))
+    if len(inline_dicts) == 1:
+        return inline_dicts[0]
     return None
 
 
@@ -293,7 +299,9 @@ def frozen_identity(issue: int) -> dict[str, Any] | None:
 
 
 def require_history(
-    records: list[dict[str, Any]], desired: dict[str, Any], frozen: dict[str, Any] | None
+    records: list[dict[str, Any]],
+    desired: dict[str, Any],
+    frozen: dict[str, Any] | None,
 ) -> None:
     for record in records:
         if {key: item for key, item in record.items() if key != "candidate_sha"} != {
@@ -407,7 +415,8 @@ def recorded_version_bump_pr(body: str) -> int:
 
 def recorded_version_bump_sha(body: str) -> str:
     matches = re.findall(
-        r"(?im)^- Version-bump merge SHA:\s*(?:`|\*\*)?([0-9a-f]{40})(?:`|\*\*)?\s*$", body
+        r"(?im)^- Version-bump merge SHA:\s*(?:`|\*\*)?([0-9a-f]{40})(?:`|\*\*)?\s*$",
+        body,
     )
     if len(matches) != 1:
         raise ReleaseError("release issue must record one full Version-bump merge SHA")
@@ -577,7 +586,11 @@ def archive_members(path: Path) -> dict[str, bytes]:
                     ):
                         raise ReleaseError(f"invalid archive member {row.filename}")
                     entries.append(
-                        (row.filename, row.is_dir(), archive.read(row) if not row.is_dir() else b"")
+                        (
+                            row.filename,
+                            row.is_dir(),
+                            archive.read(row) if not row.is_dir() else b"",
+                        )
                     )
         else:
             with tarfile.open(path, "r:gz") as archive:
@@ -750,12 +763,16 @@ def main() -> int:
         entry.add_argument("--candidate-sha")
         if name in ("start", "resume"):
             entry.add_argument(
-                "--dry", action="store_true", help="print a plan without issue writes or dispatch"
+                "--dry",
+                action="store_true",
+                help="print a plan without issue writes or dispatch",
             )
         if name == "record-outcome":
             entry.add_argument("--run-url", required=True)
             entry.add_argument(
-                "--state", choices=("dry-passed", "blocked", "real-passed"), required=True
+                "--state",
+                choices=("dry-passed", "blocked", "real-passed"),
+                required=True,
             )
             entry.add_argument("--results", required=True)
     for operation in ("preflight-artifacts", "verify-artifacts"):
@@ -823,7 +840,8 @@ def main() -> int:
         if args.dry:
             print(
                 json.dumps(
-                    {"action": args.operation, "dispatch": False, "directive": value}, indent=2
+                    {"action": args.operation, "dispatch": False, "directive": value},
+                    indent=2,
                 )
             )
             return 0

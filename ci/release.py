@@ -55,6 +55,63 @@ def command(*args: str) -> str:
     return result.stdout.strip()
 
 
+def github_json(
+    *args: str,
+    validate: Callable[[object], bool],
+    sleep: Callable[[float], None] = time.sleep,
+) -> object:
+    """Read schema-valid JSON from gh, retrying ambiguous successful responses."""
+    raw = ""
+    for attempt in range(10):
+        raw = command(*args)
+        try:
+            value: object = json.loads(raw)
+            if not validate(value):
+                raise json.JSONDecodeError("unexpected GitHub JSON shape", raw, 0)
+            return value
+        except json.JSONDecodeError as error:
+            if attempt == 9:
+                raise ReleaseError(
+                    "GitHub returned malformed JSON after 10 attempts "
+                    f"(response shape: {json_lines_shape(raw)})"
+                ) from error
+            sleep(min(2**attempt, 30))
+    raise AssertionError("unreachable")
+
+
+def json_object_with_string_fields(value: object, fields: tuple[str, ...]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    row = cast(dict[object, object], value)
+    return all(isinstance(row.get(field), str) for field in fields)
+
+
+def release_list_shape(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    rows = cast(list[object], value)
+    for value_row in rows:
+        if not isinstance(value_row, dict):
+            return False
+        row = cast(dict[object, object], value_row)
+        if not isinstance(row.get("tag_name"), str) or not isinstance(row.get("assets"), list):
+            return False
+        for value_asset in cast(list[object], row["assets"]):
+            if not isinstance(value_asset, dict):
+                return False
+            asset = cast(dict[object, object], value_asset)
+            if not isinstance(asset.get("name"), str) or not isinstance(asset.get("digest"), str):
+                return False
+    return True
+
+
+def merged_pr_shape(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    row = cast(dict[object, object], value)
+    return isinstance(row.get("baseRefName"), str) and isinstance(row.get("mergeCommit"), dict)
+
+
 def source_version() -> str:
     def field(section: str, name: str) -> str:
         match = re.search(rf'^\s*{re.escape(name)}\s*=\s*"([^"]+)"\s*$', section, re.MULTILINE)
@@ -264,8 +321,15 @@ def require_frozen_info(
 
 def verify_existing_release_assets(value: dict[str, Any], frozen: dict[str, Any]) -> None:
     """Reject conflicting destination bytes while allowing absent outputs on resume."""
-    raw = command("gh", "api", f"repos/{REPO}/releases?per_page=100")
-    releases: list[dict[str, Any]] = json.loads(raw)
+    releases = cast(
+        list[dict[str, Any]],
+        github_json(
+            "gh",
+            "api",
+            f"repos/{REPO}/releases?per_page=100",
+            validate=release_list_shape,
+        ),
+    )
     matches = [row for row in releases if row.get("tag_name") == value["tag"]]
     if len(matches) > 1:
         raise ReleaseError("duplicate GitHub Releases for tag")
@@ -335,8 +399,9 @@ def recorded_candidate_pr(body: str) -> int:
 
 
 def merged_pr_sha(number: int) -> str:
-    pr = json.loads(
-        command(
+    pr = cast(
+        dict[str, Any],
+        github_json(
             "gh",
             "pr",
             "view",
@@ -345,7 +410,8 @@ def merged_pr_sha(number: int) -> str:
             REPO,
             "--json",
             "baseRefName,mergedAt,mergeCommit",
-        )
+            validate=merged_pr_shape,
+        ),
     )
     sha = pr.get("mergeCommit", {}).get("oid")
     if (
@@ -380,10 +446,21 @@ def validate_candidate(
 ) -> None:
     expected = directive(value["issue"], value["version"], value["candidate_sha"])
     require_same_directive(expected, value)
-    issue = json.loads(
-        command(
-            "gh", "issue", "view", str(value["issue"]), "-R", REPO, "--json", "title,state,body"
-        )
+    issue = cast(
+        dict[str, Any],
+        github_json(
+            "gh",
+            "issue",
+            "view",
+            str(value["issue"]),
+            "-R",
+            REPO,
+            "--json",
+            "title,state,body",
+            validate=lambda result: json_object_with_string_fields(
+                result, ("title", "state", "body")
+            ),
+        ),
     )
     if issue.get("state") != "OPEN" or f"v{value['version']}" not in issue.get("title", ""):
         raise ReleaseError("release issue is closed or targets a different version")

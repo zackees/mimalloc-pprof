@@ -153,7 +153,12 @@ class LiveDestination(destinations.ReadOnlyDestination):
             ) from error
 
     def finalize(self, tag: str) -> None:
-        raw = self._gh_required(f"repos/{release.REPO}/releases/tags/{tag}")
+        def release_id_shape(value: dict[str, object]) -> bool:
+            return isinstance(value.get("id"), int)
+
+        raw = self._gh_required(
+            f"repos/{release.REPO}/releases/tags/{tag}", validate=release_id_shape
+        )
         release_id = int(json.loads(raw)["id"])
         self._github(
             "gh",

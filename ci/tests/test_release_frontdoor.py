@@ -21,6 +21,62 @@ PARENT = "c" * 40
 
 
 class ReleaseFrontdoorTests(unittest.TestCase):
+    def test_github_json_retries_empty_and_schema_invalid_success(self) -> None:
+        sleeps: list[float] = []
+        with patch.object(
+            release,
+            "command",
+            side_effect=["", "[]", '{"state":"OPEN"}'],
+        ):
+            value = release.github_json(
+                "gh",
+                "issue",
+                "view",
+                validate=lambda result: release.json_object_with_string_fields(result, ("state",)),
+                sleep=sleeps.append,
+            )
+        self.assertEqual(value, {"state": "OPEN"})
+        self.assertEqual(sleeps, [1, 2])
+
+    def test_github_json_bounds_malformed_success_retries(self) -> None:
+        sleeps: list[float] = []
+        with (
+            patch.object(release, "command", return_value=""),
+            self.assertRaisesRegex(release.ReleaseError, "after 10 attempts"),
+        ):
+            release.github_json(
+                "gh",
+                "issue",
+                "view",
+                validate=lambda result: isinstance(result, dict),
+                sleep=sleeps.append,
+            )
+        self.assertEqual(sleeps, [1, 2, 4, 8, 16, 30, 30, 30, 30])
+
+    def test_github_json_does_not_retry_command_failure(self) -> None:
+        sleeps: list[float] = []
+        with (
+            patch.object(release, "command", side_effect=release.ReleaseError("auth failed")),
+            self.assertRaisesRegex(release.ReleaseError, "auth failed"),
+        ):
+            release.github_json(
+                "gh",
+                "issue",
+                "view",
+                validate=lambda result: isinstance(result, dict),
+                sleep=sleeps.append,
+            )
+        self.assertEqual(sleeps, [])
+
+    def test_release_list_shape_validates_fields_used_by_preflight(self) -> None:
+        self.assertTrue(
+            release.release_list_shape(
+                [{"tag_name": "v1.0.1", "assets": [{"name": "asset", "digest": "sha256:a"}]}]
+            )
+        )
+        self.assertFalse(release.release_list_shape([{"tag_name": "v1.0.1"}]))
+        self.assertFalse(release.release_list_shape([{"tag_name": "v1.0.1", "assets": [None]}]))
+
     def test_issue_comment_read_retries_empty_success_response(self) -> None:
         sleeps: list[float] = []
         response = json.dumps(

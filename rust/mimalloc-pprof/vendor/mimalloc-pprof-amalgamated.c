@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 904e82ca of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit c13bf7d4 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -694,7 +694,7 @@ typedef enum mi_option_e {
   mi_option_scavenger,                  // run a background thread that purges scheduled arena memory (=1). imported from oven-sh/mimalloc @ 942b8342, MIT (#272)
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b). Appended
   // after `scavenger`, NOT at Bun's slot numbers 50-53: slots 47+ diverged long ago (#264).
-  mi_option_purge_holes,                // discard the memory of free blocks inside still-used pages, on `mi_on_thread_idle` (=1)
+  mi_option_purge_holes,                // discard the memory of free blocks inside still-used pages, on `mi_on_thread_idle` (=1); 2 also trims a new large page's resident tail
   mi_option_purge_holes_eager_zero,     // zero a range before discarding it, so a mis-scoped discard corrupts visibly (=0; forced on in debug builds). NOT zero-tracking -- see mi_option_purge_zeroes
   mi_option_purge_holes_min_interval,   // do not sweep one thread's heaps more often than every N milli-seconds (=100)
   mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=64); 0 disables
@@ -21775,7 +21775,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(scavenger) }              // background thread that purges scheduled arena memory (MIMALLOC_SCAVENGER)
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
-  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(purge_holes) }            // discard free blocks inside still-used pages on `mi_on_thread_idle`
+  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(purge_holes) }            // discard free blocks inside still-used pages on `mi_on_thread_idle`; 2 also trims a new large page's resident tail (#484)
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_holes_eager_zero) } // zero a range before discarding it so a mis-scoped discard corrupts visibly (debug builds force it on)
   ,{ 100,    MI_OPTION_UNINIT, MI_OPTION(purge_holes_min_interval) } // min milli-seconds between two sweeps of the same thread's heaps
   ,{ 64,     MI_OPTION_UNINIT, MI_OPTION(purge_holes_full_every) }   // every N'th sweep walks every page regardless of the skip check; 0 disables (Bun's default)
@@ -26196,11 +26196,13 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
 }
 
 // #484: a large page carved from slices an earlier page used is resident across its whole span,
-// though its owner has formed only its first blocks. Discard the rest at once, so a new page
-// costs what it uses: this is what made short-lived threads (a new theap, new pages, each
-// generation) hold far more than long-lived ones running the same requests.
+// though its owner has formed only its first blocks: that is what makes short-lived threads (a
+// new theap, new pages, each generation) hold far more than long-lived ones running the same
+// requests. `purge_holes=2` discards the rest at once, so a new page costs what it uses. Opt-in:
+// under churn the page grows back into the tail and re-faults it (perf-ab on #485: -32..-51%
+// peak RSS for +11..+72% CPU on large-block churn).
 void _mi_page_trim_unformed_tail(mi_page_t* page) {
-  if (mi_option_is_enabled(mi_option_purge_holes)) { mi_page_purge_unformed_tail(page); }
+  if (mi_option_get(mi_option_purge_holes) >= 2) { mi_page_purge_unformed_tail(page); }
 }
 
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything

@@ -2005,6 +2005,99 @@ done:
   mi_option_set(mi_option_purge_delay, delay);
   return ok;
 }
+
+// #493 strategy 9: a page carved from reused memory keeps the previous tenant's blocks resident
+// in the slack past its own last block. Thread A fills a large page with SLACK_OLD_SIZE blocks
+// and exits (page reserve off, so its slices go back to the arena, still resident); an idle
+// thread then takes one SLACK_NEW_SIZE block -- resident-first carves its page over A's range,
+// 10 blocks where A had 31, so ~250 KiB of A's written blocks lie past its last block -- frees
+// it and idles. When the retired page is released for idling, its slack must go too.
+#define SLACK_OLD_SIZE   (128 * 1024 - 256)   // 31 blocks fill a large page
+#define SLACK_NEW_SIZE   (384 * 1024 - 256)   // 10 blocks: the rest of the page is slack
+#define SLACK_OLD_COUNT  (31)
+
+static uint8_t* slack_old_lo;
+static uint8_t* slack_old_hi;
+static volatile int slack_ready, slack_release;
+static uint8_t* slack_new;
+static uintptr_t slack_lo, slack_hi;   // the new page's slack over A's written blocks (set while the block is live)
+
+static void slack_fill_page(void) {
+  void* p[SLACK_OLD_COUNT];
+  slack_old_lo = NULL; slack_old_hi = NULL;
+  for (int i = 0; i < SLACK_OLD_COUNT; i++) {
+    p[i] = mi_malloc(SLACK_OLD_SIZE);
+    if (p[i] == NULL) continue;
+    memset(p[i], 1, SLACK_OLD_SIZE);
+    if (slack_old_lo == NULL || (uint8_t*)p[i] < slack_old_lo) { slack_old_lo = (uint8_t*)p[i]; }
+    if ((uint8_t*)p[i] + SLACK_OLD_SIZE > slack_old_hi) { slack_old_hi = (uint8_t*)p[i] + SLACK_OLD_SIZE; }
+  }
+  for (int i = 0; i < SLACK_OLD_COUNT; i++) { mi_free(p[i]); }
+}
+
+static void* slack_idle_thread(void* arg) {
+  (void)arg;
+  slack_new = (uint8_t*)mi_malloc(SLACK_NEW_SIZE);
+  slack_lo = slack_hi = 0;
+  if (slack_new != NULL) {
+    const mi_page_t* const page = _mi_ptr_page(slack_new);
+    const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
+    const uintptr_t page_end = (uintptr_t)mi_page_slice_start(page) + page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE;
+    slack_lo = _mi_align_up((uintptr_t)mi_page_start(page) + (size_t)page->reserved * mi_page_block_size(page), psize);
+    slack_hi = _mi_align_down(((uintptr_t)slack_old_hi < page_end ? (uintptr_t)slack_old_hi : page_end), psize);   // A's written blocks in it
+    memset(slack_new, 2, SLACK_NEW_SIZE);
+    mi_free(slack_new);   // the page retires
+  }
+  slack_ready = 1;
+  while (!slack_release) { usleep(1000); }   // alive, but never allocates again
+  return NULL;
+}
+
+static bool test_retired_page_slack_released(void) {
+  if (!layout_is_predictable()) { fprintf(stderr, "(skipped: every allocation is guarded) "); return true; }
+  const long delay = mi_option_get(mi_option_purge_delay);
+  const long reserve = mi_option_get(mi_option_page_reserve);
+  mi_collect(true);                                    // nothing queued but what this case frees
+  mi_option_set(mi_option_purge_delay, RESERVE_DELAY_MS);
+  mi_option_set(mi_option_page_reserve, 0);
+  run_one_thread(&slack_fill_page);
+  pthread_t t;
+  bool ok = true;
+  slack_ready = 0; slack_release = 0;
+  if (pthread_create(&t, NULL, &slack_idle_thread, NULL) != 0) { ok = false; goto done; }
+  while (!slack_ready) { usleep(1000); }
+  {
+    const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
+    const uintptr_t lo = slack_lo, hi = slack_hi;
+    if (slack_new == NULL || (uint8_t*)slack_new < slack_old_lo || (uint8_t*)slack_new >= slack_old_hi || hi <= lo) {
+      fprintf(stderr, "(skipped: the new page did not land on the old one's written blocks) ");
+    }
+    else {
+      const mi_msecs_t limit = (mi_msecs_t)_mi_release_bound_ms() * RELEASE_TEST_MARGIN;
+      const mi_msecs_t start = _mi_clock_now();
+      size_t resident = 0, total = 0;
+      for (;;) {
+        unsigned char vec[128];
+        resident = 0; total = 0;
+        for (uintptr_t a = lo; a < hi; a += sizeof(vec) * psize) {
+          const size_t n = ((hi - a) / psize < sizeof(vec) ? (hi - a) / psize : sizeof(vec));
+          if (mincore((void*)a, n * psize, vec) != 0) break;
+          for (size_t i = 0; i < n; i++) { resident += (vec[i] & 1); total++; }
+        }
+        if (resident == 0 || _mi_clock_now() - start > limit) break;
+        usleep(RELEASE_POLL_MS * 1000);
+      }
+      fprintf(stderr, "(slack: %zu of %zu OS pages resident after %lld ms) ", resident, total, (long long)(_mi_clock_now() - start));
+      ok = (resident == 0);
+    }
+  }
+  slack_release = 1;
+  pthread_join(t, NULL);
+done:
+  mi_option_set(mi_option_page_reserve, reserve);
+  mi_option_set(mi_option_purge_delay, delay);
+  return ok;
+}
 #endif
 
 int main(void) {
@@ -2079,6 +2172,7 @@ int main(void) {
   #if !defined(_WIN32)
   CHECK("idle-thread-releases-large-page", test_idle_thread_releases_large_page());
   CHECK("reserved-page-is-released", test_reserved_page_is_released());
+  CHECK("retired-page-slack-released", test_retired_page_slack_released());
   #endif
   CHECK("dead-thread-page-is-reused", test_dead_thread_page_is_reused());
   CHECK("large-holes-without-idle", test_large_holes_without_idle());

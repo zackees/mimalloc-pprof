@@ -616,8 +616,11 @@ mi_options! {
     /// **Fork addition (#493).** At thread exit, keep an empty large page for the next thread
     /// of the heap instead of freeing it (=1); 0 frees it as upstream does.
     mi_option_page_reserve = 61;
+    /// **Fork addition (#493).** Claim arena slices that are free but still resident (queued
+    /// for purge) before any other free slices (=1); 0 = the plain search only.
+    mi_option_resident_first = 62;
     /// Sentinel: one past the last real option.
-    _mi_option_last = 62;
+    _mi_option_last = 63;
 }
 
 /// `MI_SNAPSHOT_BLOCKS` (include/mimalloc.h, #338): include per-block free bitmaps for the

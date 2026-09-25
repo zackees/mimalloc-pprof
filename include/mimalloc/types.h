@@ -322,6 +322,16 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_ARENA_PURGE_MULT_DEFAULT       (4)
 #endif
 
+// #493 (strategy 9): a new page first tries to claim free slices that are still resident (queued
+// for purge, see above) before the plain free-slice search, which knows nothing of residency and
+// would often fault in fresh or purged memory instead. At most this many queued runs long enough
+// for the page are tried per allocation: a failed try is a run that another thread, the purge, or
+// an earlier allocation took (a stale queue bit), and after a handful of those the queue is
+// mostly stale, so the plain search is the better bet. Keeps the extra cost per page small.
+#ifndef MI_RESIDENT_FIRST_MAX_TRIES
+#define MI_RESIDENT_FIRST_MAX_TRIES       (8)
+#endif
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from

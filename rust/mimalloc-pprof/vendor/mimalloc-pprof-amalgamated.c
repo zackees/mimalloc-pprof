@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 7e49e1e2 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8cde4e45 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -2693,6 +2693,16 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 #endif
 #ifndef MI_RETIRED_RELEASE_MULT
 #define MI_RETIRED_RELEASE_MULT           (10)
+#endif
+
+// #493 strategy 1: a new large page on reused slices keeps as many blocks resident as its bin's
+// pages have been forming (a decaying maximum that loses 1/2^MI_FORMED_DECAY_SHIFT per sample)
+// plus MI_FORMED_KEEP_MARGIN_BLOCKS, and discards the rest (see `src/page-holes.c`).
+#ifndef MI_FORMED_DECAY_SHIFT
+#define MI_FORMED_DECAY_SHIFT             (3)
+#endif
+#ifndef MI_FORMED_KEEP_MARGIN_BLOCKS
+#define MI_FORMED_KEEP_MARGIN_BLOCKS      (1)
 #endif
 
 
@@ -5934,6 +5944,9 @@ void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner rese
 void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
 bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
 void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
+void          _mi_page_trim_unformed_tail(mi_page_t* page);                     // #484: discard a new page's resident unformed tail
+void          _mi_page_note_formed(const mi_page_t* page);                      // #493: sample how far a large page got before it emptied
+size_t        _mi_page_formed_estimate(size_t block_size);                      // #493: blocks a large page of this size is expected to form
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
                                             size_t capacity, size_t k, size_t* first, size_t* last);
 bool          _mi_page_purge_holes_in_progress(void);            // is the calling thread inside a sweep of its own heaps?
@@ -12063,6 +12076,7 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(unabandon || (page->next==NULL && page->prev==NULL));
   mi_assert_internal(_mi_theap_can_touch(current_theapx));
+  _mi_page_note_formed(page);   // #493: also the pages that emptied on another thread
   #if MI_PPROF
   // #272 profiler-interaction invariant (1): no profiler record may be attached to a page that
   // is going back to the arena, because the slices it occupies can be decommitted by the
@@ -24442,6 +24456,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   mi_assert_internal(mi_page_all_free(page));
   MI_GATE_ASSERT_HELD(mi_page_theap(page));   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2)
 
+  if (mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE) { _mi_page_note_formed(page); }   // #493: before it is reset or freed
   if (page->retire_expire!=0) return;  // already retired, just keep it retired
   mi_page_set_has_interior_pointers(page, false);
 
@@ -24772,6 +24787,9 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   // initialize an initial free list
   if (!mi_page_extend_free(theap,page)) return false;
   mi_assert(mi_page_immediate_available(page));
+  if (!page->memid.initially_zero && mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE) {
+    _mi_page_trim_unformed_tail(page);   // #484: a large page on reused slices
+  }
   return true;
 }
 
@@ -26234,11 +26252,13 @@ size_t _mi_page_unformed_purged_bytes(const mi_page_t* page) {
             ? (size_t)(page->unformed_purged_hi - page->unformed_purged_lo) : 0);
 }
 
-// Discard the OS pages of the unformed tail that are not discarded already.
-static void mi_page_purge_unformed_tail(mi_page_t* page) {
+// Discard the OS pages of the unformed tail from `from` (an absolute address, 0 for the start of
+// the tail) that are not discarded already.
+static void mi_page_purge_unformed_tail(mi_page_t* page, uintptr_t from) {
   if (!mi_page_holes_madvisable(page)) return;
   uintptr_t lo, hi;
   mi_page_unformed_tail_range(page, &lo, &hi);
+  if (from > lo) { lo = _mi_align_up(from, _mi_os_page_size()); }
   if (lo >= hi) return;
   const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   mi_assert_internal(hi - pstart <= UINT32_MAX);   // only a huge page can be that big, and it has no tail
@@ -26262,6 +26282,38 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   mi_atomic_addi64_relaxed(&mi_holes_unformed_discard_calls, 1);
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes_total, (int64_t)(hi - dlo));
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
+}
+
+// #493 strategy 1: how many blocks the large pages of each bin form before they empty, as a
+// decaying maximum (each sample first takes 1/2^MI_FORMED_DECAY_SHIFT off the estimate, rounded
+// up). It leans high on purpose: keeping memory a page will form is cheap, discarding it costs a
+// refault. Relaxed and unlocked: it is a hint, and a lost race only drops one sample.
+static _Atomic(size_t) mi_bin_formed[MI_BIN_COUNT];
+
+void _mi_page_note_formed(const mi_page_t* page) {
+  const size_t bsize = mi_page_block_size(page);
+  if (page->capacity == 0 || bsize <= MI_MEDIUM_MAX_OBJ_SIZE) return;   // a retired page reset to unformed says nothing
+  _Atomic(size_t)* const estimate = &mi_bin_formed[_mi_bin(bsize)];
+  const size_t old = mi_atomic_load_relaxed(estimate);
+  const size_t decayed = old - ((old + ((size_t)1 << MI_FORMED_DECAY_SHIFT) - 1) >> MI_FORMED_DECAY_SHIFT);
+  const size_t next = (page->capacity > decayed ? page->capacity : decayed);
+  if (next != old) { mi_atomic_store_relaxed(estimate, next); }
+}
+
+size_t _mi_page_formed_estimate(size_t block_size) {
+  return mi_atomic_load_relaxed(&mi_bin_formed[_mi_bin(block_size)]);
+}
+
+// #484: a large page carved from slices an earlier page used is resident across its whole span,
+// though its owner has formed only its first blocks. Discard what its bin's pages do not get to
+// (#493: the estimate above, plus MI_FORMED_KEEP_MARGIN_BLOCKS), so a new page costs what it
+// will use: this is what made short-lived threads (a new theap, new pages, each generation) hold
+// far more than long-lived ones running the same requests. The kept part is never refaulted.
+void _mi_page_trim_unformed_tail(mi_page_t* page) {
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  const size_t bsize = mi_page_block_size(page);
+  const size_t keep = _mi_page_formed_estimate(bsize) + MI_FORMED_KEEP_MARGIN_BLOCKS;
+  mi_page_purge_unformed_tail(page, (uintptr_t)mi_page_start(page) + keep * bsize);
 }
 
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
@@ -26419,7 +26471,7 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
     const uint64_t sig = (uint64_t)(uintptr_t)page->free ^ mi_page_sweep_state(page);
     if (page->swept_state != sig) { page->swept_state = sig; return; }
   }
-  mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
+  mi_page_purge_unformed_tail(page, 0);                   // the blocks that are not formed yet: resident, but never handed out
   if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }
 
   if (!tld->holes_sweep_full && page->swept_state == mi_page_sweep_state(page)) {
@@ -26578,7 +26630,7 @@ bool _mi_pages_release_retired(mi_subproc_t* subproc) {
         // the page's memory is ours until we put it back
         if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not discarded already)
           if (now - page->retired_at < min_age) { pending = true; }
-          else { mi_page_purge_unformed_tail(page); }      // `capacity == 0`: the whole block area
+          else { mi_page_purge_unformed_tail(page, 0); }   // `capacity == 0`: the whole block area
         }
         mi_atomic_store_ptr_release(mi_page_t, slot, page);
       }

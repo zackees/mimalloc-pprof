@@ -805,7 +805,7 @@ The fourteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the envi
 | `memory_events` | `0` | enable allocation-change accounting/callbacks |
 | `purge_zeroes` | `0` | zero-tracking: after a purge the OS documents as zero-filling, let `mi_zalloc` skip its `memset` (lost in #80, restored by [#337](https://github.com/zackees/mimalloc-pprof/issues/337)) |
 | `scavenger` | `1` | run the background arena-purging thread |
-| `purge_holes` | `1` | discard free blocks inside still-used pages on idle |
+| `purge_holes` | `1` | discard free blocks inside still-used pages on idle; `2` also discards the resident tail of a new large page (much lower peak RSS with short-lived threads, at a CPU cost under large-block churn) |
 | `purge_holes_eager_zero` | `0` | zero before discarding, so a mis-scoped discard corrupts visibly |
 | `purge_holes_min_interval` | `100` | ms floor between sweeps of one thread's heaps |
 | `purge_holes_full_every` | `64` | every N-th sweep walks every page; 0 disables |

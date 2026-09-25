@@ -189,7 +189,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(scavenger) }              // background thread that purges scheduled arena memory (MIMALLOC_SCAVENGER)
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
-  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(purge_holes) }            // discard free blocks inside still-used pages on `mi_on_thread_idle`
+  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(purge_holes) }            // discard free blocks inside still-used pages on `mi_on_thread_idle`; 2 also trims a new large page's resident tail (#484)
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_holes_eager_zero) } // zero a range before discarding it so a mis-scoped discard corrupts visibly (debug builds force it on)
   ,{ 100,    MI_OPTION_UNINIT, MI_OPTION(purge_holes_min_interval) } // min milli-seconds between two sweeps of the same thread's heaps
   ,{ 64,     MI_OPTION_UNINIT, MI_OPTION(purge_holes_full_every) }   // every N'th sweep walks every page regardless of the skip check; 0 disables (Bun's default)

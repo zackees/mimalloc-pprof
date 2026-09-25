@@ -1701,10 +1701,13 @@ static void tail_new_page(void) { tail_new = mi_malloc(TAIL_SZ); }   // one bloc
 
 static bool test_new_page_tail_not_resident(void) {
   const long delay = mi_option_get(mi_option_purge_delay);
+  const long holes = mi_option_get(mi_option_purge_holes);
   mi_option_set(mi_option_purge_delay, 60000);   // the arena must not purge the old slices first
+  if (purging_enabled) { mi_option_set(mi_option_purge_holes, 2); }   // the opt-in trim
   run_one_thread(&tail_fill_page);
   run_one_thread(&tail_new_page);
   mi_option_set(mi_option_purge_delay, delay);
+  mi_option_set(mi_option_purge_holes, holes);
   if (tail_new == NULL) return false;
   const mi_page_t* const page = _mi_ptr_page(tail_new);
   const size_t psize = (size_t)sysconf(_SC_PAGESIZE);

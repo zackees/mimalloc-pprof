@@ -541,11 +541,13 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
 }
 
 // #484: a large page carved from slices an earlier page used is resident across its whole span,
-// though its owner has formed only its first blocks. Discard the rest at once, so a new page
-// costs what it uses: this is what made short-lived threads (a new theap, new pages, each
-// generation) hold far more than long-lived ones running the same requests.
+// though its owner has formed only its first blocks: that is what makes short-lived threads (a
+// new theap, new pages, each generation) hold far more than long-lived ones running the same
+// requests. `purge_holes=2` discards the rest at once, so a new page costs what it uses. Opt-in:
+// under churn the page grows back into the tail and re-faults it (perf-ab on #485: -32..-51%
+// peak RSS for +11..+72% CPU on large-block churn).
 void _mi_page_trim_unformed_tail(mi_page_t* page) {
-  if (mi_option_is_enabled(mi_option_purge_holes)) { mi_page_purge_unformed_tail(page); }
+  if (mi_option_get(mi_option_purge_holes) >= 2) { mi_page_purge_unformed_tail(page); }
 }
 
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything

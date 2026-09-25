@@ -140,7 +140,7 @@ See
     lower-case `#define`; `ci/macro_case_baseline.txt` grandfathers the ones inherited from upstream
     and may only shrink.
 
-9. **No magic numbers (owner rule, 2026-09-25).** A tuning constant (a time, size, count or
+11. **No magic numbers (owner rule, 2026-09-25).** A tuning constant (a time, size, count or
    threshold) is a named `#define` guarded by `#ifndef`, so a build can override it
    (`-DMI_SCAVENGER_MAX_WAIT_MS=5000`, including from the Rust crate's build script). Make it an
    `mi_option` when it should be settable at run time, from C or Rust. Never write the value inline.

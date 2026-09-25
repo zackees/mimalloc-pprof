@@ -68,6 +68,20 @@ jobs:
       # see the module docstring for why it parses the YAML instead of grepping it.
       - name: No workflow may schedule onto a native macOS runner
         run: python3 ci/lint_no_macos_runners.py
+      # No file-wide `-Wunused-function` suppression anywhere, and the vendored
+      # amalgamation compiles with `-Werror=unused-function` across the Rust feature
+      # combinations (ubuntu-latest ships clang; the script skips the compile without it).
+      - name: No -Wunused-function suppression
+        run: |
+          set -euo pipefail
+          python3 ci/check_no_diagnostic_suppression.py --selftest
+          python3 ci/check_no_diagnostic_suppression.py
+      # Macros are UPPER_CASE; ci/macro_case_baseline.txt grandfathers the inherited ones.
+      - name: Macro names are upper case
+        run: |
+          set -euo pipefail
+          python3 ci/check_macro_case.py --selftest
+          python3 ci/check_macro_case.py
       - name: Selective macOS lane helpers (#339)
         run: |
           set -euo pipefail

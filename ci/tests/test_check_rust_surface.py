@@ -49,6 +49,7 @@ class CheckRustSurfaceTests(unittest.TestCase):
             "mi_option_snapshot_on_exit",
             "mi_option_page_reserve",
             "mi_option_resident_first",
+            "mi_option_retain_feedback",
         ]
         self.assertEqual(options[-len(fork_block) - 1 : -1], fork_block)
 

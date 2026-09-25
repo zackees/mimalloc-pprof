@@ -619,8 +619,12 @@ mi_options! {
     /// **Fork addition (#493).** Claim arena slices that are free but still resident (queued
     /// for purge) before any other free slices (=1); 0 = the plain search only.
     mi_option_resident_first = 62;
+    /// **Fork addition (#493).** Lengthen the arena retention window while memory the arena
+    /// purge released keeps being refaulted, back to the base window when idle (=1); 0 = fixed
+    /// retention.
+    mi_option_retain_feedback = 63;
     /// Sentinel: one past the last real option.
-    _mi_option_last = 63;
+    _mi_option_last = 64;
 }
 
 /// `MI_SNAPSHOT_BLOCKS` (include/mimalloc.h, #338): include per-block free bitmaps for the

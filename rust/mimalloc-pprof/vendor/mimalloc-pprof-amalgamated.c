@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 16e58348 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 9a003f6f of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -709,6 +709,7 @@ typedef enum mi_option_e {
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin". Bun parity (#338)
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
   mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
+  mi_option_retain_feedback,            // lengthen the arena retention window while memory the arena purge released keeps being refaulted; back to the base window when idle (=1). 0 = fixed retention (#493)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -2734,6 +2735,27 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 #define MI_RESIDENT_FIRST_MAX_TRIES       (8)
 #endif
 
+// #493 (strategy 4): refault feedback on the arena retention window (`mi_option_retain_feedback`).
+// Once per arena purge period the purge compares the bytes it released in the period before with
+// the bytes that were claimed back from purged (dirty, no longer queued) slices since: when at
+// least MI_REFAULT_HIGH_PERCENT of what it purged came straight back, the purge was premature and
+// each arena deadline is held for one more base period (up to MI_RETAIN_BOOST_MAX extra periods,
+// so at most (1 + MI_RETAIN_BOOST_MAX) x the base window); under MI_REFAULT_LOW_PERCENT it steps
+// back down. 50/10 leave a wide dead band so a steady workload does not oscillate: "half of it
+// came straight back" is a clear refault pattern, while a tenth is what a quiet phase leaves.
+// 3 caps a busy process's window at 4 x the base (1.6-3.2 s at the defaults), bounding the extra
+// resident memory it can hold; an idle one gets no boost at all (a base period without any arena
+// claim drops it at once, see arena.c), so the idle release bound does not move.
+#ifndef MI_REFAULT_HIGH_PERCENT
+#define MI_REFAULT_HIGH_PERCENT           (50)
+#endif
+#ifndef MI_REFAULT_LOW_PERCENT
+#define MI_REFAULT_LOW_PERCENT            (10)
+#endif
+#ifndef MI_RETAIN_BOOST_MAX
+#define MI_RETAIN_BOOST_MAX               (3)
+#endif
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from
@@ -3250,6 +3272,14 @@ struct mi_subproc_s {
                      // expression) with C2059, and 8 over-aligns the 4-byte word harmlessly
   _Atomic(mi_scav_word_t) scavenger_wake;               // wait word signalled when a purge is scheduled (the scavenger thread waits on this)
   _Atomic(size_t)       retired_published;              // #483: 1 when some tld may hold a retired large page for the scavenger (appended at the tail, see above); #493: or the main heap a reserved one
+  // #493 (strategy 4): refault feedback on the arena retention (`mi_arena_retain_evaluate`, arena.c).
+  // Appended at the tail, see above. The counters are bumped in the arena claim and purge paths only.
+  _Atomic(size_t)       retain_claims;                  // arena claims since the last evaluation
+  _Atomic(size_t)       retain_refault_bytes;           // ... of slices that were dirty but not queued: purged, now faulted in again
+  _Atomic(size_t)       retain_purged_bytes;            // bytes the arena purge released since the last evaluation
+  _Atomic(size_t)       retain_boost;                   // extra base periods each arena purge deadline is held (0..MI_RETAIN_BOOST_MAX)
+  mi_decl_align(8)                                      // needed on some 32-bit platforms
+  mi_msecs_t            retain_eval_next;               // time of the next evaluation (only under the arena purge guard)
 };
 
 
@@ -3409,6 +3439,7 @@ typedef struct mi_arena_s {
   int                 numa_node;            // associated NUMA node
   bool                is_exclusive;         // only allow allocations if specifically for this arena
   bool                is_auto_reserved;     // created by mi_arena_reserve, not a public reserve/manage API
+  uint8_t             purge_skips;          // #493: base deadlines held back in a row by the retain boost (only under the arena purge guard)
   mi_decl_align(8)                          // needed on some 32-bit platforms
   _Atomic(mi_msecs_t) purge_expire;         // expiration time when slices can be purged from `slices_purge`.
   mi_commit_fun_t*    commit_fun;           // custom commit/decommit memory
@@ -11201,14 +11232,32 @@ static void mi_arena_unqueue_purge(mi_arena_t* arena, size_t slice_index, size_t
   }
 }
 
+// #493 (strategy 4): feed the retention feedback (`mi_arena_retain_evaluate`). Must run BEFORE the
+// claim unqueues the range and sets its dirty bits: a range that is dirty (handed out before) yet
+// in neither purge queue was purged since, so handing it out faults it in again -- a refault. A
+// range found by resident-first is queued, hence resident; a never-dirty range is fresh memory.
+// Only an arena that tracks dirtiness (`initially_zero`: otherwise every slice reads dirty) and
+// is ever purged (not pinned) can tell. Every claim counts as activity for the idle reset.
+static void mi_arena_retain_note_claim(mi_arena_t* arena, size_t slice_index, size_t slice_count, bool resident) {
+  if (!mi_option_is_enabled(mi_option_retain_feedback)) return;
+  mi_subproc_t* const subproc = arena->subproc;
+  mi_atomic_increment_relaxed(&subproc->retain_claims);
+  if (resident || arena->memid.is_pinned || !arena->memid.initially_zero) return;
+  if (!mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count) ||
+      !mi_bitmap_is_clearN(arena->slices_purge_aged, slice_index, slice_count)) return;   // (partly) queued: resident
+  const size_t dirty = mi_bitmap_popcountN(arena->slices_dirty, slice_index, slice_count);
+  if (dirty > 0) { mi_atomic_add_relaxed(&subproc->retain_refault_bytes, mi_size_of_slices(dirty)); }
+}
+
 static mi_decl_noinline void* mi_arena_try_alloc_at(
   mi_arena_t* arena, size_t slice_count, bool commit, size_t tseq, mi_memid_t* memid)
 {
   mi_assert_internal(arena!=NULL);
   mi_assert_internal(slice_count>0);
   size_t slice_index;
-  if (!mi_arena_try_claim_resident(arena, slice_count, &slice_index) &&
-      !mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  const bool resident = mi_arena_try_claim_resident(arena, slice_count, &slice_index);
+  if (!resident && !mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  mi_arena_retain_note_claim(arena, slice_index, slice_count, resident);
   if (!arena->memid.is_pinned) { mi_arena_unqueue_purge(arena, slice_index, slice_count); }
 
   // claimed it!
@@ -13116,6 +13165,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
     arena->numa_node = numa_node;
   }
   arena->purge_expire = 0;
+  arena->purge_skips = 0;
   arena->commit_fun = commit_fun;
   arena->commit_fun_arg = commit_fun_arg;
   arena->parent = parent;
@@ -13681,6 +13731,11 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
     // mi_subproc_stat_decrease(arena->subproc, committed, mi_size_of_slices(already_committed));
   }
 
+  // #493 (strategy 4): what this purge released, for `mi_arena_retain_evaluate` (the committed
+  // part only, so a range purged twice without a claim in between is not counted twice)
+  if (already_committed > 0 && mi_option_is_enabled(mi_option_retain_feedback)) {
+    mi_atomic_add_relaxed(&arena->subproc->retain_purged_bytes, mi_size_of_slices(already_committed));
+  }
   return needs_recommit;
 }
 
@@ -13812,7 +13867,19 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
   if (!force) {
     if (expire==0) return -1;
     if (expire > now) return 0;
+    // #493 (strategy 4): while refaults show the purge is premature, hold this deadline for
+    // `retain_boost` more base periods. Nothing is aged on a held deadline, so a queued range is
+    // aged and then purged (1 + boost) base periods apart: the whole window scales by (1 + boost).
+    // The deadline itself keeps firing every base period, so `mi_arena_retain_evaluate` (and its
+    // idle reset, which the release bound relies on) keeps running at the base cadence. A CAS: an
+    // unguarded `_mi_arenas_purge_now` may have pulled the deadline to now meanwhile.
+    if (arena->purge_skips < mi_atomic_load_relaxed(&arena->subproc->retain_boost)) {
+      arena->purge_skips++;
+      mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire, now + mi_arena_purge_delay());
+      return 0;
+    }
   }
+  arena->purge_skips = 0;
 
   // reset expire
   mi_atomic_storei64_release(&arena->purge_expire, (mi_msecs_t)0);
@@ -13870,6 +13937,62 @@ void _mi_arenas_purge_guard_release(void) {
   mi_atomic_store_release(&mi_arenas_purge_guard, (uintptr_t)0);
 }
 
+// #493 (strategy 4): drop the retain boost, and do not let memory queued while it held the
+// deadlines back outlive the base window. Everything queued is counted as aged and every armed
+// deadline is pulled to `now` (as `_mi_arenas_purge_now` does), so the pass that called us purges
+// it. That keeps the release bound (#491) at its base value: the reset comes at most two base
+// periods after the last claim (the evaluation that still sees it, then the first that sees none),
+// which is the unboosted window. Purging a range freed within the last period is the price, and a
+// cheap one: nothing claimed memory for a whole period, so nothing was reusing it. Under the guard.
+static void mi_arena_retain_reset(mi_subproc_t* subproc, mi_msecs_t now, size_t max_arena) {
+  mi_atomic_store_relaxed(&subproc->retain_boost, (size_t)0);
+  for (size_t i = 0; i < max_arena; i++) {
+    mi_arena_t* const arena = mi_arena_from_index(subproc, i);
+    if (arena == NULL || arena->memid.is_pinned) continue;
+    arena->purge_skips = 0;
+    const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+    if (expire == 0) continue;   // nothing queued
+    bool aged = false;
+    _mi_bitmap_forall_setc_ranges(arena->slices_purge, &mi_arena_age_purge_visitor, arena, &aged);
+    mi_msecs_t expected = expire;
+    if (expire > now) { mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expected, now); }
+  }
+}
+
+// #493 (strategy 4): refault feedback on the arena retention window. Runs once per base arena
+// purge period (`mi_arena_purge_delay()`), before that pass purges, so a period's counters pair
+// the purge that ended the previous period with the claims that followed it. When at least
+// MI_REFAULT_HIGH_PERCENT of the bytes purged came straight back (claimed while dirty but no
+// longer queued), the purge was premature: hold the deadlines one more period. Under
+// MI_REFAULT_LOW_PERCENT, step back. A period with no claim at all is idle: retention only pays
+// off through claims, so drop the boost at once (`mi_arena_retain_reset`). Under the purge guard.
+static void mi_arena_retain_evaluate(mi_subproc_t* subproc, mi_msecs_t now, long delay, size_t max_arena) {
+  const size_t boost = mi_atomic_load_relaxed(&subproc->retain_boost);
+  if (!mi_option_is_enabled(mi_option_retain_feedback)) {   // (turned off at run time: fixed retention again)
+    if (boost > 0) { mi_arena_retain_reset(subproc, now, max_arena); }
+    return;
+  }
+  if (now < subproc->retain_eval_next) return;
+  // a tenth early is still this period: the arena deadlines are re-armed at the pass's `now` too,
+  // so a pass a moment early must not skip the evaluation until the period after
+  subproc->retain_eval_next = now + delay - (delay / 10);
+  const size_t claims  = mi_atomic_exchange_relaxed(&subproc->retain_claims, (size_t)0);
+  const size_t refault = mi_atomic_exchange_relaxed(&subproc->retain_refault_bytes, (size_t)0);
+  const size_t purged  = mi_atomic_exchange_relaxed(&subproc->retain_purged_bytes, (size_t)0);
+  if (claims == 0) {
+    if (boost > 0) { mi_arena_retain_reset(subproc, now, max_arena); }
+    return;
+  }
+  if (purged == 0) return;   // a held deadline purges nothing: no evidence either way
+  const uint64_t refault100 = (uint64_t)refault * 100;   // (64-bit: no overflow on 32-bit targets)
+  if (refault100 >= (uint64_t)purged * MI_REFAULT_HIGH_PERCENT) {
+    if (boost < MI_RETAIN_BOOST_MAX) { mi_atomic_store_relaxed(&subproc->retain_boost, boost + 1); }
+  }
+  else if (refault100 < (uint64_t)purged * MI_REFAULT_LOW_PERCENT && boost > 0) {
+    mi_atomic_store_relaxed(&subproc->retain_boost, boost - 1);
+  }
+}
+
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
 // Bring every arena's scheduled purge forward to "now" and get it done: either by waking the
 // scavenger (which then runs `_mi_arenas_try_purge`), or inline when no scavenger is running.
@@ -13879,6 +14002,9 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
   if (subproc == NULL) return;
   const long delay = mi_arena_purge_delay();
   if (delay <= 0) return;   // purging disabled, or already immediate at free time
+  // #493 (strategy 4): the caller is idle, so a held deadline (`mi_arena_try_purge`) would only
+  // postpone what it asks for; the next evaluation raises the boost again if refaults say so
+  mi_atomic_store_relaxed(&subproc->retain_boost, (size_t)0);
   const mi_msecs_t now = _mi_clock_now();
   const size_t max_arena = mi_arenas_get_count(subproc);
   bool any_scheduled = false;
@@ -13965,6 +14091,7 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
     const size_t max_arena = mi_arenas_get_count(subproc);
     // increase global expire: at most one purge per delay cycle
     if (arenas_expire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now + (delay/10)); }
+    mi_arena_retain_evaluate(subproc, now, delay, max_arena);   // #493 (strategy 4): before the arenas purge
     const size_t arena_start = (max_arena == 0 ? 0 : tseq % max_arena);
     size_t max_purge_count = (visit_all ? max_arena : (max_arena/4)+1);
     bool all_visited = true;
@@ -22219,6 +22346,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(snapshot_on_exit) }       // write a heap snapshot on process exit (=0). 1=on, 2=on+blocks. Bun parity (#338)
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(page_reserve) }           // #493: reserve an exiting thread's empty large pages for the next thread (MIMALLOC_PAGE_RESERVE); 0 frees them as upstream
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(resident_first) }         // #493: claim free-but-resident (queued for purge) arena slices first (MIMALLOC_RESIDENT_FIRST); 0 = the plain search only
+  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(retain_feedback) }        // #493: lengthen the arena retention while purged memory is refaulted (MIMALLOC_RETAIN_FEEDBACK); 0 = fixed retention
 };
 
 static void mi_option_init(mi_option_desc_t* desc);

@@ -1295,6 +1295,9 @@ pub mod options {
         /// **Fork addition (#493).** Claim arena slices that are free but still resident (queued
         /// for purge) before any other free slices; 0 = the plain search only.
         pub const RESIDENT_FIRST: Self = Self(sys::mi_option_resident_first);
+        /// **Fork addition (#493).** Lengthen the arena retention window while memory the arena
+        /// purge released keeps being refaulted; back to the base window when idle. 0 = fixed.
+        pub const RETAIN_FEEDBACK: Self = Self(sys::mi_option_retain_feedback);
 
         /// Upstream: milliseconds to delay purging, which the scavenger also honours.
         pub const PURGE_DELAY: Self = Self(sys::mi_option_purge_delay);

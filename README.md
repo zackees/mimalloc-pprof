@@ -812,6 +812,7 @@ The fifteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the envir
 | `snapshot_on_exit` | `0` | write a heap snapshot at process exit; `1` = on, `2` = with per-block freemaps (needs `MI_DIAGNOSTICS`) |
 | `page_reserve` | `1` | at thread exit, keep an empty large page for the next thread instead of freeing it; released after `MI_PAGE_RESERVE_RELEASE_MULT` (10) purge delays; 0 frees it (#493) |
 | `resident_first` | `1` | claim arena slices that are free but still resident (queued for purge) before any other free slices, so a new page reuses memory the retention window kept instead of faulting in fresh pages; 0 = the plain search only (#493) |
+| `retain_feedback` | `1` | while memory the arena purge released keeps being faulted back in, lengthen the arena retention window (by up to `MI_RETAIN_BOOST_MAX` (3) extra windows); back to the base window as soon as the process goes quiet, so idle memory is still released within the release bound; 0 = fixed retention (#493) |
 
 Because they are positional, a stale Rust mirror of this enum would silently set the
 *wrong* option — which is why `tests/t19_layout.rs` checks every value against the C

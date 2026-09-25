@@ -165,9 +165,18 @@ pub enum ScalingPattern {
     PowerOfTwoLarge,
     /// Unbiased uniform integer requested sizes in [64 KiB, 4 MiB].
     RandomLarge,
+    /// Unbiased uniform requested sizes in [96 KiB, 512 KiB] -- the classes a
+    /// mimalloc large page serves -- on long-lived workers. The control for
+    /// `LargeClassEphemeral`, which replays the identical stream (#478).
+    LargeClassPersistent,
+    /// `LargeClassPersistent`'s stream, but each worker runs it as
+    /// `generations()` short-lived OS threads. A generation exits while its
+    /// live slots are still allocated; the next generation frees them, so only
+    /// thread lifetime differs from the control (#478).
+    LargeClassEphemeral,
 }
 
-pub const SCALING_PATTERNS: [ScalingPattern; 8] = [
+pub const SCALING_PATTERNS: [ScalingPattern; 10] = [
     ScalingPattern::TinyHot,
     ScalingPattern::MixedGeneral,
     ScalingPattern::LargeBuffers,
@@ -176,10 +185,16 @@ pub const SCALING_PATTERNS: [ScalingPattern; 8] = [
     ScalingPattern::XmallocTest,
     ScalingPattern::PowerOfTwoLarge,
     ScalingPattern::RandomLarge,
+    ScalingPattern::LargeClassPersistent,
+    ScalingPattern::LargeClassEphemeral,
 ];
 
-pub const DISTRIBUTION_PATTERNS: [ScalingPattern; 2] =
-    [ScalingPattern::PowerOfTwoLarge, ScalingPattern::RandomLarge];
+pub const DISTRIBUTION_PATTERNS: [ScalingPattern; 4] = [
+    ScalingPattern::PowerOfTwoLarge,
+    ScalingPattern::RandomLarge,
+    ScalingPattern::LargeClassPersistent,
+    ScalingPattern::LargeClassEphemeral,
+];
 
 impl ScalingPattern {
     pub const fn as_str(self) -> &'static str {
@@ -192,6 +207,8 @@ impl ScalingPattern {
             Self::XmallocTest => "xmalloc-test",
             Self::PowerOfTwoLarge => "power-of-two-large",
             Self::RandomLarge => "random-large",
+            Self::LargeClassPersistent => "large-class-persistent",
+            Self::LargeClassEphemeral => "large-class-ephemeral",
         }
     }
 
@@ -213,6 +230,9 @@ impl ScalingPattern {
             Self::XmallocTest => 0x0000_0006_786d_6c06,
             Self::PowerOfTwoLarge => 0x0000_0007_7032_6c07,
             Self::RandomLarge => 0x0000_0008_726e_6408,
+            // Deliberately one tag for both: the ephemeral workload must replay
+            // the control's exact stream so thread lifetime is the only variable.
+            Self::LargeClassPersistent | Self::LargeClassEphemeral => 0x0000_0009_6c63_6c09,
         }
     }
 
@@ -230,6 +250,8 @@ impl ScalingPattern {
             Self::XmallocTest => "xmalloc-test (Lever & Boreham): dedicated producer threads allocate 8-128 B blocks and hand them to dedicated consumer threads that free them",
             Self::PowerOfTwoLarge => "normal allocations with requested sizes uniformly selected from exact powers 2^16 through 2^22; eight live slots per worker, page-touched",
             Self::RandomLarge => "normal allocations with unbiased uniform integer requested sizes from 64 KiB through 4 MiB; eight live slots per worker, page-touched",
+            Self::LargeClassPersistent => "unbiased uniform requested sizes from 96 KiB through 512 KiB on long-lived workers; eight live slots per worker, page-touched",
+            Self::LargeClassEphemeral => "the large-class-persistent stream, run by each worker as 8 short-lived threads that exit still owning live blocks, which the next thread frees",
         }
     }
 
@@ -339,11 +361,40 @@ impl ScalingPattern {
                 page_touch: true,
                 mode: PatternMode::Slots,
             },
+            Self::LargeClassPersistent | Self::LargeClassEphemeral => PatternSpec {
+                min_size: 96 * 1024,
+                max_size: 512 * 1024,
+                log_uniform: false,
+                capacity: 8,
+                weight_alloc: 8,
+                weight_free_oldest: 6,
+                weight_free_random: 2,
+                weight_realloc: 0,
+                cross_thread: false,
+                page_touch: true,
+                mode: PatternMode::Slots,
+            },
         }
     }
 
     pub const fn is_distribution(self) -> bool {
-        matches!(self, Self::PowerOfTwoLarge | Self::RandomLarge)
+        matches!(
+            self,
+            Self::PowerOfTwoLarge
+                | Self::RandomLarge
+                | Self::LargeClassPersistent
+                | Self::LargeClassEphemeral
+        )
+    }
+
+    /// Short-lived threads each worker's stream is split across; 1 means the
+    /// worker thread runs the whole stream itself.
+    pub const fn generations(self) -> u32 {
+        if matches!(self, Self::LargeClassEphemeral) {
+            8
+        } else {
+            1
+        }
     }
 
     pub const fn full_blocks(self) -> u32 {
@@ -530,11 +581,8 @@ impl WorkerPlanner {
 
     fn draw_size(&mut self) -> usize {
         let spec = self.spec;
-        if self.size_state.is_some()
-            && spec.min_size == 64 * 1024
-            && spec.max_size == 4 * 1024 * 1024
-        {
-            // The two new patterns share lifetime rules but deliberately
+        if self.size_state.is_some() {
+            // The distribution patterns share lifetime rules but deliberately
             // differ only in requested-size selection.
             if self.pattern == ScalingPattern::PowerOfTwoLarge {
                 return 1usize << (16 + self.uniform_below(7) as usize);
@@ -1660,12 +1708,61 @@ fn run_worker_stream<A: AllocatorAdapter>(
     mailboxes: &[Mutex<VecDeque<Parcel>>],
     telemetry: Option<&Arc<LiveTelemetry>>,
 ) -> Result<WorkerTally, String> {
-    let page_touch = planner.page_touch();
-    let capacity = planner.capacity();
     let mut table = SlotTable {
-        slots: vec![None; capacity],
+        slots: vec![None; planner.capacity()],
     };
     let mut tally = WorkerTally::default();
+    let generations = planner.pattern.generations();
+    if generations == 1 {
+        run_actions(
+            adapter, planner, worker, mailboxes, telemetry, &mut table, &mut tally,
+        )?;
+    } else {
+        // Each generation is a fresh OS thread that exits still owning its live
+        // slots; the next generation, or the drain below, frees them.
+        let per_generation = planner.remaining.div_ceil(u64::from(generations));
+        for _ in 0..generations {
+            planner.set_round_quota(per_generation);
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        run_actions(
+                            adapter, planner, worker, mailboxes, telemetry, &mut table, &mut tally,
+                        )
+                    })
+                    .join()
+            })
+            .map_err(|_| "scaling generation thread panicked".to_string())??;
+        }
+    }
+    // Slots still live at the end of the stream are freed here; the oracle
+    // counts exactly the same set through `WorkerPlanner::drain_actions`.
+    for action in planner.drain_actions() {
+        if let PlannedAction::FreeSlot { slot } = action {
+            let parcel = table.slots[slot]
+                .take()
+                .ok_or("scaling drain freed an empty slot")?;
+            unsafe { adapter.free(parcel.pointer) };
+            if let Some(telemetry) = telemetry {
+                telemetry.remove(parcel.size)?;
+            }
+            tally.counts.free_calls += 1;
+        }
+    }
+    Ok(tally)
+}
+
+fn run_actions<A: AllocatorAdapter>(
+    adapter: &A,
+    planner: &mut WorkerPlanner,
+    worker: u32,
+    mailboxes: &[Mutex<VecDeque<Parcel>>],
+    telemetry: Option<&Arc<LiveTelemetry>>,
+    table: &mut SlotTable,
+    tally: &mut WorkerTally,
+) -> Result<(), String> {
+    let page_touch = planner.page_touch();
+    let capacity = planner.capacity();
     while let Some(action) = planner.next_action() {
         match action {
             PlannedAction::Alloc { slot, size, token } => {
@@ -1679,7 +1776,7 @@ fn run_worker_stream<A: AllocatorAdapter>(
                 if let Some(telemetry) = telemetry {
                     telemetry.add(size)?;
                 }
-                touch(&parcel, page_touch, &mut tally)?;
+                touch(&parcel, page_touch, tally)?;
                 tally.counts.alloc_calls += 1;
                 table.slots[slot] = Some(parcel);
             }
@@ -1697,7 +1794,7 @@ fn run_worker_stream<A: AllocatorAdapter>(
                 if let Some(telemetry) = telemetry {
                     telemetry.replace(existing.size, size)?;
                 }
-                touch(&parcel, page_touch, &mut tally)?;
+                touch(&parcel, page_touch, tally)?;
                 tally.counts.realloc_calls += 1;
                 table.slots[slot] = Some(parcel);
             }
@@ -1723,7 +1820,7 @@ fn run_worker_stream<A: AllocatorAdapter>(
                     token,
                     owner: worker,
                 };
-                touch(&parcel, page_touch, &mut tally)?;
+                touch(&parcel, page_touch, tally)?;
                 tally.counts.alloc_calls += 1;
                 let published = {
                     let mut mailbox = mailboxes[target as usize]
@@ -1751,27 +1848,13 @@ fn run_worker_stream<A: AllocatorAdapter>(
                     adapter,
                     &mailboxes[worker as usize],
                     budget as usize,
-                    &mut tally,
+                    tally,
                     page_touch,
                 )?;
             }
         }
     }
-    // Slots still live at the end of the stream are freed here; the oracle
-    // counts exactly the same set through `WorkerPlanner::drain_actions`.
-    for action in planner.drain_actions() {
-        if let PlannedAction::FreeSlot { slot } = action {
-            let parcel = table.slots[slot]
-                .take()
-                .ok_or("scaling drain freed an empty slot")?;
-            unsafe { adapter.free(parcel.pointer) };
-            if let Some(telemetry) = telemetry {
-                telemetry.remove(parcel.size)?;
-            }
-            tally.counts.free_calls += 1;
-        }
-    }
-    Ok(tally)
+    Ok(())
 }
 
 fn drain_own_mailbox<A: AllocatorAdapter>(

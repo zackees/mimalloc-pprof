@@ -189,6 +189,8 @@ SCALING_PATTERN_IDS = (
     "xmalloc-test",
     "power-of-two-large",
     "random-large",
+    "large-class-persistent",
+    "large-class-ephemeral",
 )
 # Every pattern set this validator will accept, oldest first. New production
 # runs carry SCALING_PATTERN_IDS, but the published branch still holds history
@@ -199,10 +201,12 @@ SCALING_PATTERN_IDS = (
 # patterns changed the metric comparison key, so it starts a new history
 # lineage instead of rewriting the sparse one. This mirrors
 # SCALING_THREAD_POINT_LINEAGES above.
-PRE_DISTRIBUTION_PATTERN_IDS = SCALING_PATTERN_IDS[:-2]
+PRE_DISTRIBUTION_PATTERN_IDS = SCALING_PATTERN_IDS[:6]
+PRE_LARGE_CLASS_PATTERN_IDS = SCALING_PATTERN_IDS[:8]
 SCALING_PATTERN_LINEAGES = (
     LEGACY_SCALING_PATTERN_IDS,
     PRE_DISTRIBUTION_PATTERN_IDS,
+    PRE_LARGE_CLASS_PATTERN_IDS,
     SCALING_PATTERN_IDS,
 )
 # One panel per allocation pattern. Separate files (rather than one facet grid)
@@ -211,7 +215,12 @@ SCALING_PANELS = {
     pattern: f"benchmark-scaling-{pattern.removeprefix('sparse-')}.svg"
     for pattern in PRE_DISTRIBUTION_PATTERN_IDS
 }
-DISTRIBUTION_PATTERN_IDS = ("power-of-two-large", "random-large")
+# Each family shares one Y domain per metric, so its workloads read on one scale.
+DISTRIBUTION_FAMILIES = (
+    ("power-of-two-large", "random-large"),
+    ("large-class-persistent", "large-class-ephemeral"),
+)
+DISTRIBUTION_PATTERN_IDS = tuple(pattern for family in DISTRIBUTION_FAMILIES for pattern in family)
 DISTRIBUTION_PANELS = {
     (pattern, metric): f"benchmark-scaling-{pattern}-{metric}.svg"
     for pattern in DISTRIBUTION_PATTERN_IDS
@@ -226,6 +235,8 @@ SCALING_PANEL_TITLES = {
     "xmalloc-test": "xmalloc-test producer/consumer (8-128 B, remote free)",
     "power-of-two-large": "Power-of-two requested sizes (64 KiB-4 MiB)",
     "random-large": "Uniform random requested sizes (64 KiB-4 MiB)",
+    "large-class-persistent": "Long-lived threads (96-512 KiB)",
+    "large-class-ephemeral": "Short-lived threads (96-512 KiB)",
 }
 
 
@@ -4645,10 +4656,17 @@ def readable_ceiling(maximum: float, intervals: int = 5) -> tuple[float, float]:
     return math.ceil(maximum / step) * step, step
 
 
-def distribution_global_domain(scaling: ScalingView, metric: str) -> tuple[float, float]:
+def distribution_family(pattern: str) -> tuple[str, ...]:
+    return next(family for family in DISTRIBUTION_FAMILIES if pattern in family)
+
+
+def distribution_global_domain(
+    scaling: ScalingView, pattern: str, metric: str
+) -> tuple[float, float]:
+    family = distribution_family(pattern)
     values: list[float] = []
     for sample in scaling.raw_observations:
-        if sample.pattern not in DISTRIBUTION_PATTERN_IDS:
+        if sample.pattern not in family:
             continue
         if metric == "throughput":
             values.append(sample.throughput)
@@ -4670,7 +4688,7 @@ def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str) -> b
     left, right, top = 118, 34, 108
     row_height, gap = 148, 38
     plot_width = width - left - right
-    ceiling, step = distribution_global_domain(scaling, metric)
+    ceiling, step = distribution_global_domain(scaling, pattern, metric)
     unit = axis_unit(ceiling)
     points = scaling.thread_points
     allowed = scaling.topology.allowed_logical_cpus
@@ -5624,22 +5642,24 @@ def escaped(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
-def has_complete_distribution(scaling: ScalingView) -> bool:
+def has_complete_distribution(
+    scaling: ScalingView, patterns: Sequence[str] = DISTRIBUTION_PATTERN_IDS
+) -> bool:
     expected = {
         (pattern, threads, allocator)
-        for pattern in DISTRIBUTION_PATTERN_IDS
+        for pattern in patterns
         for threads in scaling.thread_points
         for allocator in ALLOCATOR_IDS
     }
     throughput = {
         (cell.pattern, cell.thread_count, cell.allocator_id)
         for cell in scaling.throughput_cells
-        if cell.pattern in DISTRIBUTION_PATTERN_IDS
+        if cell.pattern in patterns
     }
     rss = {
         (cell.pattern, cell.thread_count, cell.allocator_id)
         for cell in scaling.rss_cells
-        if cell.pattern in DISTRIBUTION_PATTERN_IDS
+        if cell.pattern in patterns
     }
     return throughput == expected and rss == expected
 
@@ -5659,14 +5679,22 @@ def render_scaling_html(scaling: ScalingView) -> str:
     )
     distribution_images = ""
     distribution_tables = ""
-    if has_complete_distribution(scaling):
+    # Per family, so an older lineage keeps its charts while a new family is pending.
+    complete = [
+        pattern
+        for family in DISTRIBUTION_FAMILIES
+        if has_complete_distribution(scaling, family)
+        for pattern in family
+    ]
+    if complete:
         distribution_images = "".join(
             f'<img src="{name}" alt="{escaped(SCALING_PANEL_TITLES[pattern])} {metric}: four primary allocator area rows with a supplemental Bun row; shared zero-based axis; P5 to P95 empirical band and median line">'
             for (pattern, metric), name in DISTRIBUTION_PANELS.items()
+            if pattern in complete
         )
         rows: list[str] = []
         for cell in scaling.throughput_cells:
-            if cell.pattern not in DISTRIBUTION_PATTERN_IDS:
+            if cell.pattern not in complete:
                 continue
             rss = next(
                 value
@@ -6102,7 +6130,7 @@ def render(
                     )
                 )
         for (pattern, metric), name in DISTRIBUTION_PANELS.items():
-            if has_complete_distribution(scaling):
+            if has_complete_distribution(scaling, distribution_family(pattern)):
                 (output / name).write_bytes(distribution_stack_svg(scaling, pattern, metric))
             else:
                 (output / name).write_bytes(

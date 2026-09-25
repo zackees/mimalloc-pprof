@@ -63,9 +63,12 @@ def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = No
     return subprocess.run(cmd, cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout
 
 
-def build(ref: str, work: Path, profiled: bool) -> Path:
-    name = ref.replace("/", "_")
-    tree, out = work / f"src-{name}", work / f"bin-{name}{'-pprof' if profiled else ''}"
+def build(arm: str, ref: str, work: Path, profiled: bool) -> Path:
+    # Paths named by arm ("base"/"head") and build ("pprof"/"plain"), never by ref: every
+    # executable path then has the same length, and so does the process's initial stack. A
+    # longer argv/environment shifts stack alignment, the likely reason identical binaries
+    # differed by 17% on the small-object row of #494's null run.
+    tree, out = work / f"src-{arm}", work / f"bin-{arm}-{'pprof' if profiled else 'plain'}"
     if not tree.exists():
         run(["git", "worktree", "add", "--detach", str(tree), ref], cwd=ROOT)
     flags = [f if f != "-DMI_PPROF=OFF" or not profiled else "-DMI_PPROF=ON" for f in FLAGS]
@@ -113,7 +116,7 @@ def main() -> int:
         work = Path(tmp)
         try:
             exes = {
-                (arm, profiled): build(ref, work, profiled)
+                (arm, profiled): build(arm, ref, work, profiled)
                 for arm, ref in (("base", args.base), ("head", args.head))
                 for profiled in sorted({p for p, _ in workloads.values()})
             }

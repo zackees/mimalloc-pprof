@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2765bd1c of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 904e82ca of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -5893,6 +5893,7 @@ void          _mi_page_unpurge_all(mi_page_t* page);
 size_t        _mi_page_purged_count(const mi_page_t* page);
 void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   // hand the discarded unformed tail back below `end` (an absolute address)
 size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            // the bytes of this page's unformed tail that are discarded right now
+void          _mi_page_trim_unformed_tail(mi_page_t* page);                     // #484: discard a new page's resident unformed tail
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
                                             size_t capacity, size_t k, size_t* first, size_t* last);
 bool          _mi_page_purge_holes_in_progress(void);            // is the calling thread inside a sweep of its own heaps?
@@ -24699,6 +24700,9 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   // initialize an initial free list
   if (!mi_page_extend_free(theap,page)) return false;
   mi_assert(mi_page_immediate_available(page));
+  if (!page->memid.initially_zero && mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE) {
+    _mi_page_trim_unformed_tail(page);   // #484: a large page on reused slices
+  }
   return true;
 }
 
@@ -26189,6 +26193,14 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   mi_atomic_addi64_relaxed(&mi_holes_unformed_discard_calls, 1);
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes_total, (int64_t)(hi - dlo));
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
+}
+
+// #484: a large page carved from slices an earlier page used is resident across its whole span,
+// though its owner has formed only its first blocks. Discard the rest at once, so a new page
+// costs what it uses: this is what made short-lived threads (a new theap, new pages, each
+// generation) hold far more than long-lived ones running the same requests.
+void _mi_page_trim_unformed_tail(mi_page_t* page) {
+  if (mi_option_is_enabled(mi_option_purge_holes)) { mi_page_purge_unformed_tail(page); }
 }
 
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything

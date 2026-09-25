@@ -24,6 +24,7 @@
 
 #define BLOCK_SIZE  (1024 * 1024)   // a singleton page: its slices go back to the arena on free
 #define PERIOD_MS   (60)            // > MIMALLOC_PURGE_DELAY (set by ctest)
+#define MAX_PERIODS (50)            // give up after this many: the purge was lost, not late
 
 static void sleep_ms(unsigned ms) {
   #if MI_TEST_RESIDENCY
@@ -63,17 +64,21 @@ int main(void) {
   memset(c, 1, BLOCK_SIZE);
   mi_free(c);                  // ... which is young again
   char* const other = (c == a ? b : c == b ? a : NULL);
-  sleep_ms(PERIOD_MS);
-  mi_collect(false);           // second deadline: the other block has been free for a whole period
-  sleep_ms(PERIOD_MS);
-  mi_collect(false);           // (and a third, so the young one goes too)
-
   if (other == NULL) {
     fprintf(stderr, "skipped: the reuse did not land on either block\n");
     return 0;
   }
-  const size_t resident = resident_pages(other, BLOCK_SIZE);
-  fprintf(stderr, "the block that stayed free: %zu of %d OS pages resident\n", resident, BLOCK_SIZE / 4096);
+  // The other block has been free for a whole period: the next deadline purges it. Collect every
+  // period until it is gone, up to MAX_PERIODS -- a loaded runner may run a collect late, but a
+  // lost purge is never retried, so it still fails then.
+  size_t resident = 0;
+  int periods = 0;
+  do {
+    sleep_ms(PERIOD_MS);
+    mi_collect(false);
+    resident = resident_pages(other, BLOCK_SIZE);
+  } while (resident > 0 && ++periods < MAX_PERIODS);
+  fprintf(stderr, "the block that stayed free: %zu of %d OS pages resident after %d period(s)\n", resident, BLOCK_SIZE / 4096, periods + 1);
   #if MI_TEST_RESIDENCY
   if (resident > 0) {   // (main before the fix: 32 of 256 -- the slices of the run past the reused block)
     fprintf(stderr, "FAILED: part of its aged purge was lost\n");

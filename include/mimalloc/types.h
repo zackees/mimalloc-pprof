@@ -304,6 +304,15 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_PAGE_RESERVE_RELEASE_MULT      (10)
 #endif
 
+// #491: the one bound on "freed memory that stays idle is back with the OS within N ms"
+// (`_mi_release_bound_ms`, src/page-holes.c): the slower of the two page releases above, the two purge periods the
+// arena purge then needs (#481), and MI_RELEASE_SLACK_MS for the scavenger to wake and run.
+// Tests poll up to it and perf-ab holds the release time to it (ci/release_ratchet.json).
+#ifndef MI_RELEASE_SLACK_MS
+#define MI_RELEASE_SLACK_MS               (300)
+#endif
+#define MI_ARENA_PURGE_PERIODS            (2)   // #481: a range is purged at the second deadline after its free
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from

@@ -21,6 +21,7 @@
 #endif
 
 #include <mimalloc.h>
+#include "mimalloc/internal.h"   // _mi_release_bound_ms (#491)
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +43,7 @@ static void sleep_ms(unsigned ms) { usleep(ms * 1000u); }
 #define BLOCKS     (48)        /* 48 MiB per thread */
 #define ROUNDS     (30)
 #define POLL_MS    (5)
-#define POLL_ITERS (400)       /* 2 s of idling */
+#define RELEASE_TEST_MARGIN (4)  /* #491: idle up to this many release bounds; a loaded runner may delay the scavenger */
 
 static volatile int g_done[NTHREADS];
 static volatile int g_release = 0;
@@ -93,10 +94,14 @@ int main(void) {
   }
   const size_t held = high - rss0;
 
-  size_t low = high;    /* lowest RSS over the whole idle window */
-  for (int i = 0; i < POLL_ITERS && !g_failed && held >= 64u * 1024 * 1024; i++) {
+  /* #491: idle until the memory is back (the residual check below) or the release bound passes */
+  size_t low = high;    /* lowest RSS over the idle window */
+  const long limit = _mi_release_bound_ms() * RELEASE_TEST_MARGIN;
+  long idled = 0;
+  for (; idled <= limit && !g_failed && held >= 64u * 1024 * 1024; idled += POLL_MS) {
     const size_t now = rss_bytes();
     if (now < low) low = now;
+    if ((low > rss0 ? low - rss0 : 0) <= held / 4) break;
     sleep_ms(POLL_MS);
   }
   g_release = 1;
@@ -107,8 +112,8 @@ int main(void) {
     return 0;
   }
   const size_t residual = (low > rss0 ? low - rss0 : 0);
-  fprintf(stderr, "test-arena-purge-rearm: held %zu MiB, residual after %d ms idle %zu MiB\n",
-          held >> 20, POLL_ITERS * POLL_MS, residual >> 20);
+  fprintf(stderr, "test-arena-purge-rearm: held %zu MiB, residual after %ld ms idle %zu MiB (release bound %ld ms)\n",
+          held >> 20, idled, residual >> 20, _mi_release_bound_ms());
 #if MI_TEST_RSS_ASSERTED
   /* held/4, not tighter: RSS also moves for reasons outside the purge queue (runs with 0 bytes
      still queued have read up to ~24 MiB on a loaded runner), while the orphaned deadline this

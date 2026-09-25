@@ -14,6 +14,8 @@ the interval excludes zero. Linux only. Meant for a CI runner, not a busy dev ma
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import random
 import statistics
@@ -53,9 +55,13 @@ METRICS = (
     "minor faults",
     "peak RSS MiB",
     "RSS 0.5 s after drain MiB",
-    "RSS 2 s after drain MiB",
+    "RSS at release bound MiB",
+    "release ms",
 )
-IN_MIB = {"peak RSS MiB", "RSS 0.5 s after drain MiB", "RSS 2 s after drain MiB"}
+IN_MIB = {"peak RSS MiB", "RSS 0.5 s after drain MiB", "RSS at release bound MiB"}
+# #491: the promise "idle memory is back within bound_ms"; perf-ab fails when head breaks it
+RATCHET = ROOT / "ci/release_ratchet.json"
+RELEASE_PERCENTILE = 95
 PROFILER_ENV = {**os.environ, "MIMALLOC_PROF": "1"}
 
 
@@ -92,8 +98,19 @@ def build(arm: str, ref: str, work: Path, profiled: bool) -> Path:
     return exe
 
 
+def percent(b: float, h: float) -> float:
+    if b == 0:  # (a release time can be 0 ms)
+        return 0.0 if h == 0 else 100.0
+    return (h - b) / b * 100
+
+
+def percentile(values: list[float], pct: int) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, math.ceil(pct / 100 * len(ordered)) - 1)]
+
+
 def paired(base: list[float], head: list[float]) -> tuple[float, float, float]:
-    diffs = [(h - b) / b * 100 for b, h in zip(base, head)]
+    diffs = [percent(b, h) for b, h in zip(base, head)]
     rng = random.Random(479)
     boots = sorted(statistics.median(rng.choices(diffs, k=len(diffs))) for _ in range(2000))
     return statistics.median(diffs), boots[50], boots[1949]
@@ -112,6 +129,7 @@ def main() -> int:
     workloads = {name: w for name, w in WORKLOADS.items() if args.workloads in name}
     if not workloads:
         parser.error(f"no workload matches {args.workloads!r}")
+    bound_ms = int(json.loads(RATCHET.read_text())["bound_ms"])
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         try:
@@ -128,7 +146,8 @@ def main() -> int:
                     for arm in ("base", "head") if rep % 2 == 0 else ("head", "base"):
                         exe = str(exes[(arm, profiled)])
                         env = PROFILER_ENV if profiled else None
-                        values = list(map(float, run([exe, *map(str, params)], env=env).split()))
+                        cmd = [exe, *map(str, params), str(bound_ms)]
+                        values = list(map(float, run(cmd, env=env).split()))
                         for index, metric in enumerate(METRICS):
                             if metric in IN_MIB:
                                 values[index] /= 2**20
@@ -157,11 +176,26 @@ def main() -> int:
                 f"{statistics.median(base):,.4g} -> {statistics.median(head):,.4g}<br>{delta}"
             )
         rows.append(f"| {workload} | " + " | ".join(cells) + " |")
+    # #491: the release promise, per workload, on head; the worst P95 is the evidence a lower
+    # bound in ci/release_ratchet.json needs (`p95_release_ms`)
+    release = METRICS.index("release ms")
+    p95 = {
+        w: percentile([s[release] for s in samples[(w, "head")]], RELEASE_PERCENTILE)
+        for w in workloads
+    }
+    late = {w: p for w, p in p95.items() if p > bound_ms}
+    worst = max(p95, key=lambda w: p95[w])
+    rows.append("")
+    rows.append(
+        f"Release bound (ci/release_ratchet.json): {bound_ms} ms; head P{RELEASE_PERCENTILE} "
+        f"release, worst workload: {p95[worst]:.0f} ms ({worst}) -- "
+        + (", ".join(f"**{w}: {p:.0f} ms, LATE**" for w, p in late.items()) or "held")
+    )
     table = "\n".join(rows) + "\n"
     print(table)
     if args.summary:
         args.summary.write_text(table)
-    return 0
+    return 1 if late else 0
 
 
 if __name__ == "__main__":

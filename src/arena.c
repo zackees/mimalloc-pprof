@@ -1502,6 +1502,19 @@ typedef struct mi_purge_holes_arg_s {
   mi_tld_t*    tld;      // the thread whose sweep this is (its own, or the parked one the scavenger is sweeping for)
 } mi_purge_holes_arg_t;
 
+static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size_t slice_count);
+static long mi_arena_purge_delay(void);
+
+// #486: a reserved page released after its window has been idle for the whole retention already;
+// purge its slices now instead of aging them again in the arena queue, which would hold them
+// for another two arena periods (and past the release bound, #491). Only if they are still free.
+static void mi_arena_purge_released(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
+  if (arena->memid.is_pinned || mi_arena_purge_delay() < 0) return;
+  if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);   // queued by the free: done already
+  }
+}
+
 static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   MI_UNUSED(slice_count);
   mi_purge_holes_arg_t* const parg = (mi_purge_holes_arg_t*)arg;
@@ -1533,8 +1546,11 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
     return true;
   }
   if (mi_page_all_free(page)) {
+    const bool reserved = (page->retired_at != 0);   // (an expired reserved page, see above)
+    const size_t page_slices = mi_page_full_size(page) / MI_ARENA_SLICE_SIZE;
     mi_bitmap_set(bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
     _mi_arenas_abandoned_page_free(page, NULL);
+    if (reserved) { mi_arena_purge_released(arena, slice_index, page_slices); }
     _mi_page_holes_count_page_freed();
     return true;
   }
@@ -1593,8 +1609,10 @@ static bool mi_arena_page_release_reserved_at(size_t slice_index, size_t slice_c
   // a reserved page has no live block, so no free can have arrived in it: `used` is exact
   if (page->retired_at != 0 && mi_page_all_free(page)) {
     if (rarg->force || !mi_arena_page_reserve_kept(page, rarg->now)) {
+      const size_t page_slices = mi_page_full_size(page) / MI_ARENA_SLICE_SIZE;
       mi_bitmap_set(rarg->bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
       _mi_arenas_abandoned_page_free(page, NULL);
+      mi_arena_purge_released(arena, slice_index, page_slices);
       return true;
     }
     rarg->pending = true;

@@ -1,11 +1,12 @@
 /* Small allocator A/B workload for ci/perf_ab.py (#479). One run = one process.
 
-   usage: perf_ab <threads> <generations> <min_size> <max_size> <ops_per_thread> <release_bound_ms>
+   usage: perf_ab <threads> <generations> <min_size> <max_size> <ops_per_thread> <pause_ms> <release_bound_ms>
 
    Each thread replays a seeded stream over 8 live slots (allocate 8 / free-oldest 6 /
    free-random 2, one write per 4 KiB). With generations > 1 each thread runs its stream as
    that many short-lived threads, each exiting while it still owns live slots that the next
-   one frees. Prints one line: ops/s, process cpu seconds, the workers' own cpu seconds (the
+   one frees. With pause_ms > 0 each thread instead runs its stream in BURSTS bursts, freeing
+   everything after each and idling pause_ms before the next (bursty reuse, #486). Prints one line: ops/s, process cpu seconds, the workers' own cpu seconds (the
    allocating threads, without the scavenger), minor page faults, peak RSS, and, after everything
    was freed while the worker threads stay alive and idle (a server between requests): RSS
    DRAIN_SHORT_MS later, RSS at the release bound (ci/release_ratchet.json, #491), and the release
@@ -24,6 +25,7 @@
 #include <unistd.h>
 
 #define SLOTS 8
+#define BURSTS 8
 #define DRAIN_SHORT_MS      500
 #define RELEASE_SAMPLE_MS   10
 #define RELEASE_TOLERANCE   (1L << 20)   /* 1 MiB: "released" = within this of RSS at twice the bound */
@@ -61,6 +63,7 @@ static double cpu_of(const struct rusage* ru) {
 static double thread_cpu(void) { struct rusage ru; getrusage(RUSAGE_THREAD, &ru); return cpu_of(&ru); }
 
 static int generations;
+static long pause_ms;
 static atomic_int drained, release_workers;
 
 static void* generation_main(void* arg) {
@@ -70,9 +73,20 @@ static void* generation_main(void* arg) {
   return NULL;  /* exits still owning st->slot[] */
 }
 
+static void free_slots(stream_t* st) {
+  for (int i = 0; i < SLOTS; i++) { mi_free(st->slot[i]); st->slot[i] = NULL; }
+}
+
 static void* worker_main(void* arg) {
   stream_t* st = (stream_t*)arg;
-  if (generations <= 1) { run_ops(st, st->ops); }
+  if (pause_ms > 0) {
+    for (int b = 0; b < BURSTS; b++) {
+      if (b > 0) usleep((useconds_t)(pause_ms * 1000));
+      run_ops(st, st->ops / BURSTS);
+      free_slots(st);
+    }
+  }
+  else if (generations <= 1) { run_ops(st, st->ops); }
   else {
     for (int g = 0; g < generations; g++) {
       pthread_t t;
@@ -80,7 +94,7 @@ static void* worker_main(void* arg) {
       pthread_join(t, NULL);
     }
   }
-  for (int i = 0; i < SLOTS; i++) { mi_free(st->slot[i]); st->slot[i] = NULL; }
+  free_slots(st);
   st->cpu += thread_cpu();
   atomic_fetch_add(&drained, 1);
   while (!atomic_load(&release_workers)) usleep(1000);   /* idle, but alive */
@@ -98,8 +112,9 @@ static long rss_bytes(void) {
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + (double)t.tv_nsec * 1e-9; }
 
 int main(int argc, char** argv) {
-  if (argc != 7) { fprintf(stderr, "usage: perf_ab threads generations min max ops release_bound_ms\n"); return 2; }
-  const long bound_ms = atol(argv[6]);
+  if (argc != 8) { fprintf(stderr, "usage: perf_ab threads generations min max ops pause_ms release_bound_ms\n"); return 2; }
+  pause_ms = atol(argv[6]);
+  const long bound_ms = atol(argv[7]);
   const long samples = 2 * bound_ms / RELEASE_SAMPLE_MS + 1;   /* RSS every RELEASE_SAMPLE_MS up to twice the bound */
   long* rss_at = (long*)calloc((size_t)samples, sizeof(long));
   const int threads = atoi(argv[1]);

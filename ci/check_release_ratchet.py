@@ -45,11 +45,13 @@ def allocator_bound_ms(types_h: str, options_c: str) -> int:
         raise SystemExit(
             "check_release_ratchet: the purge_delay default not found in src/options.c"
         )
-    mult = max(
+    pages = max(
         define(types_h, "MI_RETIRED_RELEASE_MULT"), define(types_h, "MI_PAGE_RESERVE_RELEASE_MULT")
     )
-    periods = define(types_h, "MI_ARENA_PURGE_PERIODS")
-    return (mult + periods) * int(match.group(1)) + define(types_h, "MI_RELEASE_SLACK_MS")
+    arena = define(types_h, "MI_ARENA_PURGE_PERIODS") * define(
+        types_h, "MI_ARENA_PURGE_MULT_DEFAULT"
+    )
+    return max(pages, arena) * int(match.group(1)) + define(types_h, "MI_RELEASE_SLACK_MS")
 
 
 def problems(head: Ratchet, base: Ratchet | None, floor_ms: int, override: bool) -> list[str]:
@@ -101,9 +103,9 @@ def selftest() -> int:
     ):
         print("selftest FAILED: the owner override does not allow raising")
         failed += 1
-    types_h = "#define MI_RETIRED_RELEASE_MULT (10)\n#define MI_PAGE_RESERVE_RELEASE_MULT (10)\n#define MI_ARENA_PURGE_PERIODS (2)\n#define MI_RELEASE_SLACK_MS (300)\n"
+    types_h = "#define MI_RETIRED_RELEASE_MULT (10)\n#define MI_PAGE_RESERVE_RELEASE_MULT (10)\n#define MI_ARENA_PURGE_PERIODS (2)\n#define MI_ARENA_PURGE_MULT_DEFAULT (4)\n#define MI_RELEASE_SLACK_MS (300)\n"
     options_c = "{ 100, MI_OPTION_UNINIT, MI_OPTION_LEGACY(purge_delay,reset_delay) },"
-    if allocator_bound_ms(types_h, options_c) != 1500:
+    if allocator_bound_ms(types_h, options_c) != 1300:
         print("selftest FAILED: allocator_bound_ms")
         failed += 1
     print("selftest ok" if failed == 0 else f"selftest: {failed} failure(s)")

@@ -305,13 +305,22 @@ terms of the MIT license. A copy of the license can be found in the file
 #endif
 
 // #491: the one bound on "freed memory that stays idle is back with the OS within N ms"
-// (`_mi_release_bound_ms`, src/page-holes.c): the slower of the two page releases above, the two purge periods the
-// arena purge then needs (#481), and MI_RELEASE_SLACK_MS for the scavenger to wake and run.
+// (`_mi_release_bound_ms`, src/page-holes.c): the slower of the two page releases above (a released
+// page is purged at once, #486) and the arena purge of freed memory (MI_ARENA_PURGE_PERIODS arena
+// periods, #481), plus MI_RELEASE_SLACK_MS for the scavenger to wake and run.
 // Tests poll up to it and perf-ab holds the release time to it (ci/release_ratchet.json).
 #ifndef MI_RELEASE_SLACK_MS
 #define MI_RELEASE_SLACK_MS               (300)
 #endif
 #define MI_ARENA_PURGE_PERIODS            (2)   // #481: a range is purged at the second deadline after its free
+
+// #486: freed arena memory stays resident for one to MI_ARENA_PURGE_PERIODS arena purge periods of
+// `arena_purge_mult` x `purge_delay` (400-800 ms by default) in case it is reused, then goes back
+// to the OS. Measured on perf-ab's bursty row (pauses of 300 ms): 1 (100-200 ms) refaulted every
+// burst (~120,000 minor faults), 4 about 1,300, with the same peak and release time.
+#ifndef MI_ARENA_PURGE_MULT_DEFAULT
+#define MI_ARENA_PURGE_MULT_DEFAULT       (4)
+#endif
 
 
 // ------------------------------------------------------

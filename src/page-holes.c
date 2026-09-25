@@ -843,9 +843,12 @@ void _mi_theap_unpublish_retired(mi_theap_t* theap) {
 // when some published page is not old enough yet, i.e. the scavenger should come back.
 // #491: see MI_RELEASE_SLACK_MS. Follows the `purge_delay` option, as the releases themselves do.
 long _mi_release_bound_ms(void) {
-  const long mult = (MI_RETIRED_RELEASE_MULT > MI_PAGE_RESERVE_RELEASE_MULT ? MI_RETIRED_RELEASE_MULT : MI_PAGE_RESERVE_RELEASE_MULT);
   const long delay = mi_option_get(mi_option_purge_delay);
-  return (delay < 0 ? -1 : (mult + MI_ARENA_PURGE_PERIODS) * delay + MI_RELEASE_SLACK_MS);   // -1: purging is off
+  const long arena_mult = mi_option_get(mi_option_arena_purge_mult);
+  if (delay < 0 || arena_mult < 0) return -1;   // purging is off
+  long mult = (MI_RETIRED_RELEASE_MULT > MI_PAGE_RESERVE_RELEASE_MULT ? MI_RETIRED_RELEASE_MULT : MI_PAGE_RESERVE_RELEASE_MULT);
+  if (MI_ARENA_PURGE_PERIODS * arena_mult > mult) { mult = MI_ARENA_PURGE_PERIODS * arena_mult; }
+  return mult * delay + MI_RELEASE_SLACK_MS;
 }
 
 bool _mi_pages_release_retired(mi_subproc_t* subproc) {

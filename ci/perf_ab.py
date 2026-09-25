@@ -36,16 +36,18 @@ FLAGS = [
     "-DMI_DHAT=OFF",
     "-DMI_OWNER_GATE=OFF",
 ]
-# name: (profiled, (threads, generations, min bytes, max bytes, ops per thread)). A profiled
-# row runs the MI_PPROF=ON build with sampling on at the default rate: it is the gate that a
-# memory strategy does not slow the profiler down.
+# name: (profiled, (threads, generations, min bytes, max bytes, ops per thread, pause ms)). A
+# profiled row runs the MI_PPROF=ON build with sampling on at the default rate: it is the gate
+# that a memory strategy does not slow the profiler down. A pause makes the row bursty (#486):
+# BURSTS bursts per thread, everything freed after each, then idle for the pause.
 WORKLOADS = {
-    "large-class/8": (False, (8, 1, 96 << 10, 512 << 10, 400000)),
-    "large-class-ephemeral/8": (False, (8, 8, 96 << 10, 512 << 10, 400000)),
-    "random-large/8": (False, (8, 1, 64 << 10, 4 << 20, 40000)),
-    "random-large/1": (False, (1, 1, 64 << 10, 4 << 20, 200000)),
-    "small/8 (control)": (False, (8, 1, 16, 1024, 5000000)),
-    "large-class/8 (profiler on)": (True, (8, 1, 96 << 10, 512 << 10, 400000)),
+    "large-class/8": (False, (8, 1, 96 << 10, 512 << 10, 400000, 0)),
+    "large-class-ephemeral/8": (False, (8, 8, 96 << 10, 512 << 10, 400000, 0)),
+    "random-large/8": (False, (8, 1, 64 << 10, 4 << 20, 40000, 0)),
+    "random-large-bursty/8": (False, (8, 1, 64 << 10, 4 << 20, 40000, 300)),
+    "random-large/1": (False, (1, 1, 64 << 10, 4 << 20, 200000, 0)),
+    "small/8 (control)": (False, (8, 1, 16, 1024, 5000000, 0)),
+    "large-class/8 (profiler on)": (True, (8, 1, 96 << 10, 512 << 10, 400000, 0)),
 }
 # what ci/perf_ab.c prints, in order; the byte counts are shown in MiB
 METRICS = (

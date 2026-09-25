@@ -187,19 +187,19 @@ These four scaling graphics use deterministic per-worker playback at 1, 2, 3, 4,
 and 8 workers. They request either exact powers of two from 64 KiB through 4 MiB or an
 unbiased uniformly random byte size over the same inclusive range. Both use the normal
 allocation API; “power-of-two” describes the requested size, not extra pointer alignment.
-The allocator rows show the empirical P5–P95 area and median from 40 paired runs.
-Within each metric every row—and both workloads—uses the same zero-based Y-axis domain and
-ticks, rounded upward from the maximum of all raw observations so outliers are not clipped.
-The four primary rows are TCMalloc, jemalloc, Microsoft mimalloc, and mimalloc-pprof; Bun
-mimalloc remains collected in a separately labelled supplemental row.
+Each chart overlays, on one panel, the median of 40 paired runs for all five allocators:
+TCMalloc, jemalloc, Microsoft mimalloc, Bun mimalloc, and mimalloc-pprof (drawn last and
+thicker). Within each metric both workloads share one zero-based Y axis, rounded upward
+from the largest raw observation so outliers are not clipped. The per-cell spread across
+runs is on the dashboard table and in `latest.json`, not on the chart.
 
-[![Power-of-two requested sizes: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Power-of-two requested sizes: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Power-of-two requested sizes: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Power-of-two requested sizes: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Uniformly random requested sizes: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Uniformly random requested sizes: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Uniformly random requested sizes: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Uniformly random requested sizes: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
 ### Short-lived threads
 
@@ -210,13 +210,13 @@ stream as 8 successive threads, and each thread exits while still owning live bl
 that the next one frees. Both share one Y axis per metric, so the gap between them is
 the cost of short-lived threads.
 
-[![Long-lived threads, 96-512 KiB: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Long-lived threads, 96-512 KiB: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Long-lived threads, 96-512 KiB: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Long-lived threads, 96-512 KiB: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Short-lived threads, 96-512 KiB: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Short-lived threads, 96-512 KiB: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Short-lived threads, 96-512 KiB: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Short-lived threads, 96-512 KiB: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
 Full methodology, per-cell tables and the other benchmark families are in
 [Performance](#performance) below and on the

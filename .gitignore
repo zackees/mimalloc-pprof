@@ -22,3 +22,7 @@ __pycache__/
 
 # uv run writes an (empty) lock file here; pyproject.toml has no [project] table, so it carries nothing
 uv.lock
+
+# clud: keep the shared settings, ignore the agent-harness state (e.g. /grind run records)
+.clud/*
+!.clud/settings.json

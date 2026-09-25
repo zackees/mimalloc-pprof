@@ -182,7 +182,9 @@ static inline bool mi_bitmap_is_set(mi_bitmap_t* bitmap, size_t idx) {
   return mi_bitmap_is_setN(bitmap, idx, 1);
 }
 
-static inline bool mi_bitmap_is_clear(mi_bitmap_t* bitmap, size_t idx) {
+// Maybe unused: called only from `mi_assert_internal` (src/arena.c) and the flat page map
+// (MI_PAGE_MAP_FLAT, src/page-map.c), so a release build with the 2-level page map has none.
+MI_DECL_MAYBE_UNUSED static inline bool mi_bitmap_is_clear(mi_bitmap_t* bitmap, size_t idx) {
   return mi_bitmap_is_clearN(bitmap, idx, 1);
 }
 
@@ -241,7 +243,8 @@ static inline mi_chunkbin_t mi_chunkbin_inc(mi_chunkbin_t bbin) {
   return (mi_chunkbin_t)((int)bbin + 1);
 }
 
-static inline mi_chunkbin_t mi_chunkbin_dec(mi_chunkbin_t bbin) {
+// Maybe unused: kept from upstream to pair with `mi_chunkbin_inc`; nothing in this tree (or upstream) calls it.
+MI_DECL_MAYBE_UNUSED static inline mi_chunkbin_t mi_chunkbin_dec(mi_chunkbin_t bbin) {
   mi_assert_internal(bbin > MI_CBIN_NONE);
   return (mi_chunkbin_t)((int)bbin - 1);
 }
@@ -310,7 +313,8 @@ static inline bool mi_bbitmap_is_setN(mi_bbitmap_t* bbitmap, size_t idx, size_t 
 }
 
 // Is a sequence of n bits already clear?
-static inline bool mi_bbitmap_is_clearN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
+// Maybe unused: called only from `mi_assert_internal` (src/arena.c), which a release build compiles out.
+MI_DECL_MAYBE_UNUSED static inline bool mi_bbitmap_is_clearN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   return mi_bbitmap_is_xsetN(MI_BIT_CLEAR, bbitmap, idx, n);
 }
 

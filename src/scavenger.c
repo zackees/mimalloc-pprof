@@ -546,11 +546,11 @@ static void mi_scav_fork_child_reset(void) {
 #if !defined(MI_SCAV_HAS_FORK_RESET)
 // futex / __ulock / WaitOnAddress hold no state of ours across fork()
 // #373: correct no-ops; unused on platforms whose wait primitive needs no init/fork reset
-mi_decl_maybe_unused static void mi_scav_fork_child_reset(void) { }
+MI_DECL_MAYBE_UNUSED static void mi_scav_fork_child_reset(void) { }
 #endif
 #if !defined(MI_SCAV_HAS_INIT)
 // #373: correct no-ops; unused on platforms whose wait primitive needs no init/fork reset
-mi_decl_maybe_unused static void mi_scav_init(void) { }
+MI_DECL_MAYBE_UNUSED static void mi_scav_init(void) { }
 #endif
 
 

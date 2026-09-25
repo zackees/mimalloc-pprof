@@ -185,7 +185,7 @@ static inline bool mi_bfield_atomic_try_clear_mask_optimistic(_Atomic(mi_bfield_
 // Returns `true` if the bit transitioned from 1 to 0
 // and `false` otherwise (leaving the bfield `b` as-is).
 // `all_clear` is set to true if the new bfield became zero (and false otherwise)
-mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear_optimistic(_Atomic(mi_bfield_t)* b, size_t idx, mi_bfield_t* previous) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bfield_atomic_try_clear_optimistic(_Atomic(mi_bfield_t)* b, size_t idx, mi_bfield_t* previous) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
   const mi_bfield_t mask = ((mi_bfield_t)1<<idx);
   return mi_bfield_atomic_try_clear_mask_optimistic(b, mask, previous, NULL);  // single bit never clears temporarily
@@ -194,7 +194,7 @@ mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear_optimistic(_A
 // Tries to clear a byte atomically. For performance, it assumes there is a good chance of success.  
 // Returns true if the byte atomically transitioned from 0xFF to 0
 // `all_clear` is set to true if the new bfield became zero (and false otherwise)
-mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear8_optimistic(_Atomic(mi_bfield_t)*b, size_t idx, mi_bfield_t* previous, bool* did_temp_clear_bits) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bfield_atomic_try_clear8_optimistic(_Atomic(mi_bfield_t)*b, size_t idx, mi_bfield_t* previous, bool* did_temp_clear_bits) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
   mi_assert_internal((idx%8)==0);
   const mi_bfield_t mask = ((mi_bfield_t)0xFF)<<idx;
@@ -576,16 +576,16 @@ static inline bool mi_bchunk_try_clearN(mi_bchunk_t* chunk, size_t cidx, size_t 
 // ------- mi_bchunk_try_find_and_clear ---------------------------------------
 
 #if MI_OPT_SIMD && defined(__AVX2__)
-mi_decl_maybe_unused static inline __m256i mi_mm256_zero(void) {
+MI_DECL_MAYBE_UNUSED static inline __m256i mi_mm256_zero(void) {
   return _mm256_setzero_si256();
 }
-mi_decl_maybe_unused static inline __m256i mi_mm256_ones(void) {
+MI_DECL_MAYBE_UNUSED static inline __m256i mi_mm256_ones(void) {
   return _mm256_set1_epi64x(~0);
 }
-mi_decl_maybe_unused static inline bool mi_mm256_is_ones(__m256i vec) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_mm256_is_ones(__m256i vec) {
   return _mm256_testc_si256(vec, _mm256_cmpeq_epi32(vec, vec));
 }
-mi_decl_maybe_unused static inline bool mi_mm256_is_zero( __m256i vec) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_mm256_is_zero( __m256i vec) {
   return _mm256_testz_si256(vec,vec);
 }
 #endif
@@ -710,7 +710,7 @@ static inline bool mi_bchunk_try_find_and_clear_1(mi_bchunk_t* chunk, size_t n, 
   return mi_bchunk_try_find_and_clear(chunk, pidx);
 }
 
-mi_decl_maybe_unused static inline bool mi_bchunk_try_find_and_clear8_at(mi_bchunk_t* chunk, size_t chunk_idx, size_t* pidx, bool* did_temp_clear_bits) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bchunk_try_find_and_clear8_at(mi_bchunk_t* chunk, size_t chunk_idx, size_t* pidx, bool* did_temp_clear_bits) {
   _Atomic(mi_bfield_t)* const bfield = &chunk->bfields[chunk_idx];  
   mi_bfield_t b = mi_atomic_load_relaxed(bfield);
   if (b==0) return false;

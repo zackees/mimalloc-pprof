@@ -138,7 +138,10 @@ static inline void** mi_prim_thread_pointer(void) {
 
 #if !MI_NO_THREAD_POINTER
 #define MI_HAS_TLS_SLOT  (1)
-static inline void* mi_prim_tls_slot(size_t slot) {
+// Maybe unused: the slot accessors are called only by the TLS models that use a fixed OS slot
+// (MI_TLS_MODEL_WIN32/FIXED, pthreads on Apple arm64, Bionic's thread id), not by the default
+// MI_TLS_MODEL_LOCAL on Linux.
+MI_DECL_MAYBE_UNUSED static inline void* mi_prim_tls_slot(size_t slot) {
   #if defined(_WIN32)
     #if (_M_X64 || _M_AMD64) && !defined(_M_ARM64EC)
       return (void*)__readgsqword((unsigned long)(slot*sizeof(void*)));   // direct load at offset from gs
@@ -159,7 +162,7 @@ static inline void* mi_prim_tls_slot(size_t slot) {
   #endif
 }
 
-static inline void mi_prim_tls_slot_set(size_t slot, void* value) {
+MI_DECL_MAYBE_UNUSED static inline void mi_prim_tls_slot_set(size_t slot, void* value) {
   #if defined(__GNUC__) || defined(__clang__)
   __atomic_store_n(&mi_prim_thread_pointer()[slot], value, __ATOMIC_RELAXED);
   #else
@@ -246,7 +249,8 @@ This incurs an extra check in the fast path (but can often be combined in an exi
 // Declared this way to optimize register spills and branches
 mi_decl_cold mi_decl_noinline mi_theap_t* _mi_theap_empty_get(void);
 
-static inline mi_theap_t* __mi_theap_empty(void) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline mi_theap_t* __mi_theap_empty(void) {
   #if __GNUC__
   __asm("");  // prevent conditional load
   return (mi_theap_t*)&_mi_theap_empty;

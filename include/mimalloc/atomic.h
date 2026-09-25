@@ -129,7 +129,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #define mi_atomic_decrement_acq_rel(p)           mi_atomic_sub_acq_rel(p,(uintptr_t)1)
 
 static inline intptr_t mi_atomic_addi(_Atomic(intptr_t)*p, intptr_t add);
-static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub);
+MI_DECL_MAYBE_UNUSED static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub);  // see its definition
 
 
 #if defined(MI_USE_C11_ATOMICS) || defined(__cplusplus) || !defined(_MSC_VER) || MI_HAS_C11_ATOMICS
@@ -412,7 +412,8 @@ static inline intptr_t mi_atomic_addi(_Atomic(intptr_t)*p, intptr_t add) {
 }
 
 // Atomically subtract a signed value; returns the previous value.
-static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub) {
+// Maybe unused: kept from upstream to complete the addi/subi pair; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub) {
   return (intptr_t)mi_atomic_addi(p, -sub);
 }
 

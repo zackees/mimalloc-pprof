@@ -49,7 +49,8 @@ static inline bool mi_page_queue_is_special(const mi_page_queue_t* pq) {
   return (pq->block_size > MI_LARGE_MAX_OBJ_SIZE);
 }
 
-static inline size_t mi_page_queue_count(const mi_page_queue_t* pq) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline size_t mi_page_queue_count(const mi_page_queue_t* pq) {
   return pq->count;
 }
 

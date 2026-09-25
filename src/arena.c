@@ -2585,8 +2585,14 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
         _mi_scavenger_wake(arena->subproc);
       }
     }
-    else {
-      // already an expiration was set
+    else if (mi_atomic_loadi64_relaxed(&arena->subproc->purge_expire) == 0) {
+      // #457: this arena is already armed but the subproc deadline is not (a settle raced
+      // this arena's 0 -> set). Re-arm it from the arena's own deadline so the purge runs.
+      mi_msecs_t sexpire0 = 0;
+      const mi_msecs_t aexpire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+      if (aexpire != 0 && mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &sexpire0, aexpire)) {
+        _mi_scavenger_wake(arena->subproc);
+      }
     }
     mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
   }
@@ -2808,7 +2814,7 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
         if (purged >= 0) {      // purged, or arena expire is not yet reached
           any_purged = true;
           if (purged >= 1) {    // purged
-            if (max_purge_count <= 1) {
+            if (max_purge_count <= 1 && !visit_all) {   // #457: a full pass must reach the settle below
               all_visited = false;
               break;
             }
@@ -2840,6 +2846,12 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       _mi_prim_thread_yield();
     }
   } while (!ran && force);
+  if (!ran && visit_all) {
+    // #457: another thread holds the guard. Retry shortly instead of leaving a past deadline
+    // (which the scavenger would spin on) or clearing it (which would orphan pending arenas).
+    mi_msecs_t expected = arenas_expire;
+    mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, now + (delay/10) + 1);
+  }
 }
 
 

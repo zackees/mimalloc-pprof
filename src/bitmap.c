@@ -1579,6 +1579,51 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
   return true;
 }
 
+// #493 (strategy 9): visit, in index order, each maximal run of at least `n` bits set in
+// `bitmap | bitmap2` (`bitmap2` may be NULL; both must have the same chunk count), where
+// `0 < n <= MI_BCHUNK_BITS`. Unlike the `forall_setc` visitors this leaves the bitmaps as they are:
+// the runs are only hints (the arena claims them atomically in `slices_free`), so the loads are
+// relaxed. A run never crosses a chunk, so it can be claimed with `mi_bbitmap_try_clearNC`.
+// Stops, returning false, as soon as `visit` returns false.
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
+  mi_assert_internal(n > 0 && n <= MI_BCHUNK_BITS);
+  mi_assert_internal(bitmap2 == NULL || mi_bitmap_chunk_count(bitmap2) == mi_bitmap_chunk_count(bitmap));
+  const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmap), MI_BFIELD_BITS);
+  for (size_t i = 0; i < chunkmap_max; i++) {
+    mi_bfield_t cmap_entry = mi_atomic_load_relaxed(&bitmap->chunkmap.bfields[i]);
+    if (bitmap2 != NULL) { cmap_entry |= mi_atomic_load_relaxed(&bitmap2->chunkmap.bfields[i]); }
+    size_t cmap_idx;
+    // for each chunk (corresponding to a set bit in a chunkmap entry)
+    while (mi_bfield_foreach_bit(&cmap_entry, &cmap_idx)) {
+      const size_t chunk_idx = i*MI_BFIELD_BITS + cmap_idx;
+      const size_t chunk_base = chunk_idx*MI_BCHUNK_BITS;
+      size_t run_start = 0;   // chunk-relative start of the current run
+      size_t run_len = 0;     // and its length so far (0 = none); a run can span bfields
+      for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
+        mi_bfield_t b = mi_atomic_load_relaxed(&bitmap->chunks[chunk_idx].bfields[j]);
+        if (bitmap2 != NULL) { b |= mi_atomic_load_relaxed(&bitmap2->chunks[chunk_idx].bfields[j]); }
+        size_t bidx;
+        while (mi_bfield_find_least_bit(b, &bidx)) {
+          const size_t rng = mi_ctz(~(b>>bidx));   // all the set bits from bidx
+          mi_assert_internal(rng >= 1 && bidx + rng <= MI_BFIELD_BITS);
+          const size_t start = j*MI_BFIELD_BITS + bidx;
+          if (run_len > 0 && run_start + run_len == start) {
+            run_len += rng;                          // continues the run of the previous bfield
+          }
+          else {
+            if (run_len >= n && !visit(chunk_base + run_start, run_len, arena, arg)) return false;
+            run_start = start;
+            run_len = rng;
+          }
+          b = b & ~mi_bfield_mask(rng, bidx);
+        }
+      }
+      if (run_len >= n && !visit(chunk_base + run_start, run_len, arena, arg)) return false;
+    }
+  }
+  return true;
+}
+
 
 /* --------------------------------------------------------------------------------
   binned bitmap's
@@ -1757,6 +1802,24 @@ bool mi_bbitmap_try_clearNC(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   }
   // note: we don't set the size class for an explicit try_clearN (only used by purging)
   return cleared;
+}
+
+// #493 (strategy 9): claim `n` bits at a known `idx` (not crossing a chunk) for an allocation of
+// `n` slices. Unlike the purge's `mi_bbitmap_try_clearNC` this keeps to the size bins, exactly as
+// `mi_bbitmap_try_find_and_clear_generic` does: only a chunk of the bin of `n`, or one not yet
+// binned, and a claim at the start of an unbinned chunk bins it -- so claiming a known range
+// never mixes page sizes in a chunk that the plain search keeps apart.
+bool mi_bbitmap_try_claimN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
+  if (n == 0 || n > MI_BCHUNK_BITS) return false;
+  const size_t chunk_idx = idx / MI_BCHUNK_BITS;
+  const size_t cidx = idx % MI_BCHUNK_BITS;
+  if (cidx + n > MI_BCHUNK_BITS || chunk_idx >= mi_bbitmap_chunk_count(bbitmap)) return false;
+  const mi_chunkbin_t bbin = mi_chunkbin_of(n);
+  const mi_chunkbin_t cbin = mi_bbitmap_debug_get_bin(bbitmap->chunkmap_bins, chunk_idx);
+  if (cbin != bbin && cbin != MI_CBIN_NONE) return false;
+  if (!mi_bbitmap_try_clearNC(bbitmap, idx, n)) return false;
+  if (cidx == 0 && cbin == MI_CBIN_NONE) { mi_bbitmap_set_chunk_bin(bbitmap, chunk_idx, bbin); }
+  return true;
 }
 
 

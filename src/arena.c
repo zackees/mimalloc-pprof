@@ -224,13 +224,72 @@ static size_t mi_page_full_size(mi_page_t* page) {
   Arena Allocation
 ----------------------------------------------------------- */
 
+// #493 (strategy 9): resident-first claiming. A freed range sits in `slices_purge` (young) or
+// `slices_purge_aged` for the #486 retention window: free, and still resident. The plain search
+// (`mi_bbitmap_try_find_and_clearN`) knows nothing of that and, measured on short-lived threads,
+// mostly handed out fresh or already purged slices while such ranges were waiting -- growing RSS
+// and zero-fill faulting the new range. So first try the queued runs, in index order.
+typedef struct mi_resident_claim_s {
+  size_t slice_count;   // wanted
+  size_t tries;         // queued runs tried so far (at most MI_RESIDENT_FIRST_MAX_TRIES)
+  size_t slice_index;   // out: the claimed range, when `claimed`
+  bool   claimed;
+} mi_resident_claim_t;
+
+static bool mi_arena_resident_claim_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  mi_resident_claim_t* const rc = (mi_resident_claim_t*)arg;
+  mi_assert_internal(slice_count >= rc->slice_count); MI_UNUSED(slice_count);
+  rc->tries++;
+  // The same atomic claim of `slices_free` the purge makes before it purges
+  // (`mi_arena_try_purge_range`): if we win, the purge cannot touch the range; if the purge or
+  // another thread holds any of it -- or it was allocated since it was queued -- this fails.
+  if (mi_bbitmap_try_claimN(arena->slices_free, slice_index, rc->slice_count)) {
+    rc->slice_index = slice_index;
+    rc->claimed = true;
+    return false;   // done
+  }
+  return (rc->tries < MI_RESIDENT_FIRST_MAX_TRIES);
+}
+
+static bool mi_arena_try_claim_resident(mi_arena_t* arena, size_t slice_count, size_t* slice_index) {
+  // A pinned arena is never purged (all of it is resident); a range of more than a chunk is
+  // beyond `mi_bbitmap_try_claimN`.
+  if (arena->memid.is_pinned || slice_count > MI_BCHUNK_BITS) return false;
+  // Nothing queued: `purge_expire` is armed after every queueing (`mi_arena_schedule_purge`) and
+  // only disarmed by a purge that leaves both queues empty, so 0 means empty but for a moment
+  // around a concurrent free or purge -- and then we merely take the plain search.
+  if (mi_atomic_loadi64_relaxed(&arena->purge_expire) == 0) return false;
+  if (!mi_option_is_enabled(mi_option_resident_first)) return false;
+  // young | aged: a range freed in two steps is one run even when half of it has aged
+  mi_resident_claim_t rc = { slice_count, 0, 0, false };
+  _mi_bitmap_forall_set_runsN(arena->slices_purge, arena->slices_purge_aged, slice_count, &mi_arena_resident_claim_visitor, arena, &rc);
+  if (rc.claimed) { *slice_index = rc.slice_index; }
+  return rc.claimed;
+}
+
+// #493: a claimed range is no longer waiting for a purge, so drop it from both queues. The purge
+// itself would only skip it (its claim of `slices_free` fails), but the stale bits would stay on
+// the queues to be retried by every purge -- and every resident-first scan above, where each one
+// costs a try. Only a read when nothing of the range is queued. Safe against the purge: we own the
+// range, so no free can queue it again, and a purge that already took the bits fails its claim.
+static void mi_arena_unqueue_purge(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
+  if (!mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);
+  }
+  if (!mi_bitmap_is_clearN(arena->slices_purge_aged, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge_aged, slice_index, slice_count);
+  }
+}
+
 static mi_decl_noinline void* mi_arena_try_alloc_at(
   mi_arena_t* arena, size_t slice_count, bool commit, size_t tseq, mi_memid_t* memid)
 {
   mi_assert_internal(arena!=NULL);
   mi_assert_internal(slice_count>0);
   size_t slice_index;
-  if (!mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  if (!mi_arena_try_claim_resident(arena, slice_count, &slice_index) &&
+      !mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  if (!arena->memid.is_pinned) { mi_arena_unqueue_purge(arena, slice_index, slice_count); }
 
   // claimed it!
   void* p = mi_arena_slice_start(arena, slice_index);

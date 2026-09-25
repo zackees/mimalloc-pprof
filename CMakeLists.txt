@@ -2052,6 +2052,19 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-arena-retention PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
   endif()
 
+  # test-resident-first (#493, strategy 9): a new page claims free arena slices that are still
+  # resident (queued for purge) before purged ones. Single-threaded; the scavenger is off so only
+  # the test's collects purge.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-resident-first test/test-resident-first.c)
+    target_compile_definitions(mimalloc-test-resident-first PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-resident-first PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-resident-first PRIVATE include)
+    target_link_libraries(mimalloc-test-resident-first PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-resident-first COMMAND mimalloc-test-resident-first)
+    set_tests_properties(test-resident-first PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
+  endif()
+
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of
   # docs/purge-all-implementation.md §11 (T1-T3, G1-G8, C1-C2) in one binary that is built for
   # BOTH MI_PPROF and BOTH MI_OWNER_GATE settings and branches on `#if MI_OWNER_GATE` for its

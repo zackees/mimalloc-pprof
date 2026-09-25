@@ -2572,7 +2572,10 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
     mi_arena_purge(arena, slice_index, slice_count);
   }
   else {
-    // schedule purge
+    // schedule purge. #457: queue the range BEFORE arming, so a purge that runs concurrently
+    // either sees the range (ages it, and re-arms) or has already cleared the deadline (so the
+    // CAS below arms it); in the other order the range could land in a queue with no deadline.
+    mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
     const mi_msecs_t expire = _mi_clock_now() + delay;
     mi_msecs_t expire0 = 0;
     if (mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire)) {
@@ -2594,7 +2597,6 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
         _mi_scavenger_wake(arena->subproc);
       }
     }
-    mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
   }
 }
 
@@ -2852,7 +2854,16 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       // per-arena expire (0 if none) and the scavenger's next wait is exact. A CAS, so a purge
       // scheduled concurrently with this walk is never clobbered.
       mi_msecs_t expected = arenas_expire;
-      mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
+      if (mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire) && next_expire == 0) {
+        // #457: a free may have armed an arena after we read it, and its own attempt to arm the
+        // subproc failed against the value we just replaced. Re-read so it is not orphaned.
+        for (size_t i = 0; i < max_arena; i++) {
+          mi_arena_t* const arena = mi_arena_from_index(subproc, i);
+          const mi_msecs_t aexpire = (arena == NULL ? 0 : mi_atomic_loadi64_relaxed(&arena->purge_expire));
+          mi_msecs_t zero = 0;
+          if (aexpire != 0) { mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &zero, aexpire); break; }
+        }
+      }
     }
   }
     if (!ran && force) {   // #272, see above

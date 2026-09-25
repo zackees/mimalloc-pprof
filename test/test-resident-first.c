@@ -115,6 +115,12 @@ static int run_case(const char* name, int check) {
 }
 
 int main(void) {
+  #if defined(MI_GUARDED) && MI_GUARDED
+  if (mi_option_get(mi_option_guarded_sample_rate) != 0) {   // takes the plain search: see `mi_arena_try_claim_resident`
+    fprintf(stderr, "skipped: guarded sampling is on, so resident-first is off\n");
+    return 0;
+  }
+  #endif
   // resident-first: C must reuse A's resident slices, not B's purged ones (wants a fresh arena)
   const long resident_first = mi_option_get(mi_option_resident_first);
   mi_option_set(mi_option_resident_first, 1);

@@ -260,6 +260,14 @@ static bool mi_arena_try_claim_resident(mi_arena_t* arena, size_t slice_count, s
   // around a concurrent free or purge -- and then we merely take the plain search.
   if (mi_atomic_loadi64_relaxed(&arena->purge_expire) == 0) return false;
   if (!mi_option_is_enabled(mi_option_resident_first)) return false;
+  #if MI_GUARDED
+  // A page of guarded blocks writes about half of its range (each block is followed by a guard
+  // OS page that is never written): carved over retained memory, the other half keeps the old
+  // tenant resident until the page goes. Measured with every allocation guarded
+  // (test-memory-gate, sample rate 1): +28 MiB while the retention window lasted. Guarded
+  // sampling is a debugging mode; it takes the plain search.
+  if (mi_option_get(mi_option_guarded_sample_rate) != 0) return false;
+  #endif
   // young | aged: a range freed in two steps is one run even when half of it has aged
   mi_resident_claim_t rc = { slice_count, 0, 0, false };
   _mi_bitmap_forall_set_runsN(arena->slices_purge, arena->slices_purge_aged, slice_count, &mi_arena_resident_claim_visitor, arena, &rc);

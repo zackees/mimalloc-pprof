@@ -802,8 +802,11 @@ void _mi_page_publish_retired(mi_page_t* page) {
   page->retired_at = _mi_clock_now();
   page->retired_slot = slot;
   mi_atomic_store_ptr_release(mi_page_t, slot, page);   // publishes the reset above to the scavenger
+  _mi_pages_release_schedule(mi_page_subproc(page));
+}
 
-  mi_subproc_t* const subproc = mi_page_subproc(page);
+// A retired (#483) or reserved (#493) page now waits for `_mi_pages_release_retired`.
+void _mi_pages_release_schedule(mi_subproc_t* subproc) {
   if (mi_atomic_load_relaxed(&subproc->retired_published) == 0 &&
       mi_atomic_exchange_acq_rel(&subproc->retired_published, (size_t)1) == 0) {
     _mi_scavenger_wake(subproc);   // a sleeping scavenger has nothing scheduled to notice this by
@@ -822,6 +825,7 @@ void _mi_page_unpublish_retired(mi_page_t* page) {
     _mi_prim_thread_yield();
   }
   page->retired_slot = NULL;
+  page->retired_at = 0;   // #493: a non-zero stamp on an unpublished page marks a reserved one
 }
 
 // A theap detached from its tld by a heap delete/destroy (`_mi_heap_detach_theaps`) has its pages
@@ -858,6 +862,23 @@ bool _mi_pages_release_retired(mi_subproc_t* subproc) {
         }
         mi_atomic_store_ptr_release(mi_page_t, slot, page);
       }
+    }
+  }
+  // #493: and the empty large pages reserved at thread exit (`_mi_arenas_page_reserve`) that no
+  // thread reclaimed within their window -- an idle process has no busy sweep to release them.
+  // Only the main heap: it is never freed while the scavenger runs, and its per-arena tracking
+  // lives in the arena itself, whereas another heap's can be freed by a concurrent
+  // `mi_heap_delete` (its own threads' sweeps and the delete itself release those). The purge
+  // guard keeps the empty-arena reclaim (src/arena-reclaim.c) from freeing an arena under the walk;
+  // when a user thread holds it for a forced purge, come back at the next tick.
+  mi_heap_t* const heap_main = mi_atomic_load_ptr_acquire(mi_heap_t, &subproc->heap_main);
+  if (heap_main != NULL) {
+    if (_mi_arenas_purge_guard_acquire()) {
+      if (_mi_arenas_release_reserved(heap_main, false)) { pending = true; }
+      _mi_arenas_purge_guard_release();
+    }
+    else {
+      pending = true;
     }
   }
   if (pending) { mi_atomic_store_release(&subproc->retired_published, (size_t)1); }

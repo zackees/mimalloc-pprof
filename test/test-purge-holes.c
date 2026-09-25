@@ -1727,7 +1727,8 @@ static bool test_idle_thread_releases_large_page(void) {
 // ---------------------------------------------------------------------------
 
 #if !defined(_WIN32)
-#define TAIL_SZ  (256 * 1024)   // 16 blocks fill a 4 MiB large page
+#define TAIL_SZ      (256 * 1024)   // 16 blocks fill a 4 MiB large page
+#define TAIL_NEW_SZ  (320 * 1024)   // #493: a bin no other case uses, so no history keeps its tail
 
 static void* tail_blocks[16];
 static void* tail_new;
@@ -1736,7 +1737,7 @@ static void tail_fill_page(void) {   // touch a whole large page, then free it
   for (int i = 0; i < 16; i++) { tail_blocks[i] = mi_malloc(TAIL_SZ); if (tail_blocks[i] != NULL) memset(tail_blocks[i], 1, TAIL_SZ); }
   for (int i = 0; i < 16; i++) { mi_free(tail_blocks[i]); }
 }
-static void tail_new_page(void) { tail_new = mi_malloc(TAIL_SZ); }   // one block in a new page
+static void tail_new_page(void) { tail_new = mi_malloc(TAIL_NEW_SZ); }   // one block in a new page
 
 static bool test_new_page_tail_not_resident(void) {
   const long delay = mi_option_get(mi_option_purge_delay);
@@ -1760,6 +1761,56 @@ static bool test_new_page_tail_not_resident(void) {
   fprintf(stderr, "(unformed tail: %zu of %zu OS pages resident) ", resident, total);
   if (total == 0) return true;   // no reused slices here: nothing to check
   return purging_enabled ? (resident * 4 < total) : true;
+}
+
+// #493 strategy 1: ... but what its bin's pages have been forming stays resident, so the new
+// owner does not refault it. One thread forms KEEP_FORMED blocks and frees them; the next forms
+// one block in a new page on the same slices: blocks [1, KEEP_FORMED) must still be resident.
+#define KEEP_SZ      (384 * 1024)   // 10 blocks per large page; a bin no other case uses
+#define KEEP_FORMED  (5)
+
+static void* keep_new;
+
+static void keep_form(void) {
+  void* p[KEEP_FORMED];
+  for (int i = 0; i < KEEP_FORMED; i++) { p[i] = mi_malloc(KEEP_SZ); if (p[i] != NULL) memset(p[i], 1, KEEP_SZ); }
+  for (int i = 0; i < KEEP_FORMED; i++) { mi_free(p[i]); }
+}
+static void keep_new_page(void) { keep_new = mi_malloc(KEEP_SZ); }
+
+static size_t resident_os_pages(uintptr_t lo, uintptr_t hi, size_t* total) {
+  const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
+  size_t resident = 0;
+  unsigned char vec[1024];
+  *total = 0;
+  for (uintptr_t a = lo; a < hi; a += sizeof(vec) * psize) {
+    const size_t n = ((hi - a) / psize < sizeof(vec) ? (hi - a) / psize : sizeof(vec));
+    if (mincore((void*)a, n * psize, vec) != 0) break;
+    for (size_t i = 0; i < n; i++) { resident += (vec[i] & 1); (*total)++; }
+  }
+  return resident;
+}
+
+static bool test_new_page_keeps_formed_extent(void) {
+  const long delay = mi_option_get(mi_option_purge_delay);
+  mi_option_set(mi_option_purge_delay, 60000);   // the arena must not purge the old slices first
+  run_one_thread(&keep_form);
+  run_one_thread(&keep_new_page);
+  mi_option_set(mi_option_purge_delay, delay);
+  if (keep_new == NULL) return false;
+  const mi_page_t* const page = _mi_ptr_page(keep_new);
+  const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
+  const uintptr_t start = (uintptr_t)mi_page_start(page);
+  const size_t keep = _mi_page_formed_estimate(mi_page_block_size(page)) + MI_FORMED_KEEP_MARGIN_BLOCKS;   // (debug padding can move it to another bin)
+  size_t kept_total, tail_total;
+  const size_t kept = resident_os_pages(_mi_align_up(start + page->block_size, psize), start + KEEP_FORMED * page->block_size, &kept_total);
+  const size_t tail = resident_os_pages(_mi_align_up(start + keep * page->block_size, psize),
+                                        _mi_align_down(start + page->reserved * page->block_size, psize), &tail_total);
+  mi_free(keep_new);
+  fprintf(stderr, "(estimate %zu blocks; formed part: %zu of %zu OS pages resident; beyond it: %zu of %zu) ",
+          keep - MI_FORMED_KEEP_MARGIN_BLOCKS, kept, kept_total, tail, tail_total);
+  if (!purging_enabled) return true;
+  return (kept * 2 >= kept_total) && (tail * 4 < tail_total || tail_total == 0);   // (0 kept without the estimate)
 }
 #endif
 
@@ -1965,6 +2016,7 @@ int main(void) {
   CHECK("large-holes-without-idle", test_large_holes_without_idle());
   #if !defined(_WIN32)
   CHECK("new-page-tail-not-resident", test_new_page_tail_not_resident());
+  CHECK("new-page-keeps-formed-extent", test_new_page_keeps_formed_extent());
   #endif
 
   // everything above is freed by now, so every hole must have been handed back

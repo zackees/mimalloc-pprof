@@ -1210,6 +1210,7 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(unabandon || (page->next==NULL && page->prev==NULL));
   mi_assert_internal(_mi_theap_can_touch(current_theapx));
+  _mi_page_note_formed(page);   // #493: also the pages that emptied on another thread
   #if MI_PPROF
   // #272 profiler-interaction invariant (1): no profiler record may be attached to a page that
   // is going back to the arena, because the slices it occupies can be decommitted by the

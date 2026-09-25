@@ -295,6 +295,16 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_RETIRED_RELEASE_MULT           (10)
 #endif
 
+// #493 strategy 1: a new large page on reused slices keeps as many blocks resident as its bin's
+// pages have been forming (a decaying maximum that loses 1/2^MI_FORMED_DECAY_SHIFT per sample)
+// plus MI_FORMED_KEEP_MARGIN_BLOCKS, and discards the rest (see `src/page-holes.c`).
+#ifndef MI_FORMED_DECAY_SHIFT
+#define MI_FORMED_DECAY_SHIFT             (3)
+#endif
+#ifndef MI_FORMED_KEEP_MARGIN_BLOCKS
+#define MI_FORMED_KEEP_MARGIN_BLOCKS      (1)
+#endif
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from

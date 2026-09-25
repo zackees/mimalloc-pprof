@@ -500,6 +500,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   mi_assert_internal(mi_page_all_free(page));
   MI_GATE_ASSERT_HELD(mi_page_theap(page));   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2)
 
+  if (mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE) { _mi_page_note_formed(page); }   // #493: before it is reset or freed
   if (page->retire_expire!=0) return;  // already retired, just keep it retired
   mi_page_set_has_interior_pointers(page, false);
 

@@ -130,8 +130,9 @@ def main() -> int:
                             if metric in IN_MIB:
                                 values[index] /= 2**20
                         samples[(workload, arm)].append(values)
-        finally:
-            run(["git", "worktree", "prune"], cwd=ROOT)
+        finally:  # unregister the trees while they still exist: a prune here would find nothing to prune
+            for tree in work.glob("src-*"):
+                run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
     rows = [
         f"`{args.base}` vs `{args.head}`, {args.reps} paired reps, alternating order. "
         "Median base -> head, then median paired difference [bootstrap 95%]; "

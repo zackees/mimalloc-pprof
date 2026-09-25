@@ -1991,6 +1991,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
     arena->numa_node = numa_node;
   }
   arena->purge_expire = 0;
+  arena->purge_expire_max = 0;
   arena->commit_fun = commit_fun;
   arena->commit_fun_arg = commit_fun_arg;
   arena->parent = parent;
@@ -2576,6 +2577,7 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
     mi_msecs_t expire0 = 0;
     if (mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire)) {
       // expiration was not yet set
+      mi_atomic_storei64_relaxed(&arena->purge_expire_max, expire + 9*delay);
       // maybe set the global arenas expire as well (if it wasn't set already)
       mi_assert_internal(expire0==0);
       // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
@@ -2589,9 +2591,12 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
       // #457: already armed. Move the deadline out, so the arena is purged once it has had no
       // frees for `delay`: memory freed during churn is about to be reused, and purging it
       // only makes the next allocation re-fault it (upstream v2 extended it on every free
-      // too). At most once per delay/10, so the shared line is rarely written.
-      if (expire - expire0 > delay/10) {
-        mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire);
+      // too). Never past 10*delay after arming, so constant churn still purges about once
+      // per second; and at most once per delay/10, so the shared line is rarely written.
+      const mi_msecs_t emax = mi_atomic_loadi64_relaxed(&arena->purge_expire_max);
+      const mi_msecs_t moved = (expire < emax ? expire : emax);
+      if (moved - expire0 > delay/10) {
+        mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, moved);
       }
       // #457: if a settle raced this arena's 0 -> set, the subproc deadline is 0 while this
       // arena is armed; re-arm it so the scavenger wakes for it.

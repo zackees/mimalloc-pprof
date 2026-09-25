@@ -542,6 +542,15 @@ int _mi_prim_reuse(void* start, size_t size) {
   return 0;
 }
 
+int _mi_prim_populate(void* start, size_t size) {
+  MI_UNUSED(start); MI_UNUSED(size);
+  #if defined(MADV_POPULATE_WRITE)   // Linux 5.14+; an older kernel returns EINVAL, which is harmless
+  return unix_madvise(start, size, MADV_POPULATE_WRITE);
+  #else
+  return 0;
+  #endif
+}
+
 int _mi_prim_decommit(void* start, size_t size, bool* needs_recommit) {
   int err = 0;
   #if 1

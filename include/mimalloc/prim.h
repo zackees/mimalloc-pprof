@@ -92,6 +92,10 @@ int _mi_prim_discard(void* addr, size_t size);
 // Returns error code or 0 on success. On most platforms this is a no-op.
 int _mi_prim_reuse(void* addr, size_t size);
 
+// #487: fault in `[addr,addr+size)` now, in one call, instead of one page fault per OS page when
+// it is first written. Contents are unchanged. Returns error code or 0; a no-op where unsupported.
+int _mi_prim_populate(void* addr, size_t size);
+
 // Protect memory. Returns error code or 0 on success.
 int _mi_prim_protect(void* addr, size_t size, bool protect);
 

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3bd36cfc of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit a8154caf of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -2686,6 +2686,21 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 #define MI_RETIRED_RELEASE_MULT           (10)
 #endif
 
+// #487: pre-faulting a large page's discarded unformed tail ahead of its owner. The owner posts
+// up to MI_PREFAULT_QUEUE requests (a full queue drops the new one) for the scavenger, each for
+// the next MI_PREFAULT_LOOKAHEAD_BLOCKS blocks it will form (see `src/page-holes.c`).
+#ifndef MI_PREFAULT_QUEUE
+#define MI_PREFAULT_QUEUE                 (8)
+#endif
+#ifndef MI_PREFAULT_LOOKAHEAD_BLOCKS
+#define MI_PREFAULT_LOOKAHEAD_BLOCKS      (2)
+#endif
+
+typedef struct mi_prefault_req_s {
+  uintptr_t start;   // OS-page aligned
+  size_t    size;    // a multiple of the OS page size
+} mi_prefault_req_t;
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from
@@ -3309,6 +3324,14 @@ struct mi_tld_s {
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
+
+  // #487: pre-fault requests, a single-producer (this thread) / single-consumer (the scavenger)
+  // ring. Slot `i % MI_PREFAULT_QUEUE` is written by the owner before its release-store of
+  // `prefault_tail`, and read by the scavenger before its release-store of `prefault_head`;
+  // both counters only grow (`tail - head` is the number pending).
+  mi_prefault_req_t     prefault_queue[MI_PREFAULT_QUEUE];
+  _Atomic(size_t)       prefault_head;        // next request the scavenger takes
+  _Atomic(size_t)       prefault_tail;        // next slot the owner fills
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept
@@ -5915,6 +5938,8 @@ void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner rese
 void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
 bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
 void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
+void          _mi_page_trim_unformed_tail(mi_page_t* page);                     // #484: discard a new page's resident unformed tail
+bool          _mi_prefault_drain(mi_subproc_t* subproc);                        // #487: scavenger; pre-fault the tails the owners posted, true if it did any
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
                                             size_t capacity, size_t k, size_t* first, size_t* last);
 bool          _mi_page_purge_holes_in_progress(void);            // is the calling thread inside a sweep of its own heaps?
@@ -10401,6 +10426,11 @@ int _mi_prim_discard(void* addr, size_t size);
 // may have been reset (`_mi_prim_reset`) or decommitted (`_mi_prim_decommit`) where `needs_recommit` was false.
 // Returns error code or 0 on success. On most platforms this is a no-op.
 int _mi_prim_reuse(void* addr, size_t size);
+
+// Pre-fault memory (#487): make the committed range resident and writable now, as if every
+// OS page in it had been written, without changing its contents. Returns error code or 0 on
+// success; a no-op (returning 0) where the platform has no such call.
+int _mi_prim_populate(void* addr, size_t size);
 
 // Protect memory. Returns error code or 0 on success.
 int _mi_prim_protect(void* addr, size_t size, bool protect);
@@ -18878,7 +18908,10 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // purge_epoch
   MI_ATOMIC_VAR_INIT(0),  // gate_flags
   0,                      // fork_gen (#293)
-  { 0 }                   // retired_pages (#483)
+  { 0 },                  // retired_pages (#483)
+  { { 0, 0 } },           // prefault_queue (#487)
+  MI_ATOMIC_VAR_INIT(0),  // prefault_head
+  MI_ATOMIC_VAR_INIT(0)   // prefault_tail
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -24732,6 +24765,9 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   // initialize an initial free list
   if (!mi_page_extend_free(theap,page)) return false;
   mi_assert(mi_page_immediate_available(page));
+  if (!page->memid.initially_zero && mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE) {
+    _mi_page_trim_unformed_tail(page);   // #484: a large page on reused slices
+  }
   return true;
 }
 
@@ -26194,6 +26230,81 @@ size_t _mi_page_unformed_purged_bytes(const mi_page_t* page) {
             ? (size_t)(page->unformed_purged_hi - page->unformed_purged_lo) : 0);
 }
 
+/* -----------------------------------------------------------
+  Pre-faulting the unformed tail  (#487)
+
+  A discarded tail costs its owner a page fault and a kernel zero-fill for every OS page it
+  forms blocks in, and it forms them inside `malloc`. So the owner asks for that work ahead of
+  time: whenever it hands back part of the tail (and right after the trim), it posts the next
+  MI_PREFAULT_LOOKAHEAD_BLOCKS blocks' worth of the tail to a per-thread ring on its tld, and
+  the scavenger pre-faults them (`_mi_prefault_drain`) -- so the owner finds them resident.
+
+  The scavenger ONLY calls `_mi_prim_populate`, which never changes contents, and it never
+  touches `unformed_purged_lo/hi`: the range stays "discarded" in the page's books, and the
+  owner's `_mi_page_unpurge_unformed_upto` still reuses it before forming blocks there (a
+  no-op on Linux, where populate exists at all). So it is safe whatever happened to the range
+  meanwhile -- the owner writing it, or the page freed and its slices handed to another page.
+  The ring is best effort: a full ring drops the request and the owner faults the pages
+  itself, exactly as without it.
+----------------------------------------------------------- */
+
+// How far ahead of the formed blocks a request reaches: whole blocks (an extension of a large
+// page forms one block at a time), rounded to OS pages.
+static size_t mi_page_prefault_window(const mi_page_t* page) {
+  return _mi_align_up(MI_PREFAULT_LOOKAHEAD_BLOCKS * mi_page_block_size(page), _mi_os_page_size());
+}
+
+// Post `[lo, hi)`, clamped to what is still discarded, to the owner's ring. Only the owner may
+// call this (the ring has one producer): anything else is dropped.
+static void mi_page_prefault_post(mi_page_t* page, uintptr_t lo, uintptr_t hi) {
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
+  const uintptr_t dlo = pstart + page->unformed_purged_lo;
+  const uintptr_t dhi = pstart + page->unformed_purged_hi;
+  if (lo < dlo) { lo = dlo; }
+  if (hi > dhi) { hi = dhi; }
+  if (lo >= hi) return;
+  if (!_mi_scavenger_is_running()) return;             // nobody would take it
+  mi_tld_t* const tld = mi_page_tld(page);
+  if (tld == NULL || tld->subproc != _mi_subproc_main()) return;   // the scavenger serves the main subproc only
+  if (tld->thread_id != _mi_thread_id()) return;       // not the producer
+  const size_t tail = mi_atomic_load_relaxed(&tld->prefault_tail);   // only we write it
+  const size_t head = mi_atomic_load_acquire(&tld->prefault_head);   // the scavenger is done with every slot below it
+  if (tail - head >= MI_PREFAULT_QUEUE) return;        // full: drop, never wait
+  mi_prefault_req_t* const req = &tld->prefault_queue[tail % MI_PREFAULT_QUEUE];
+  req->start = lo;
+  req->size  = (size_t)(hi - lo);
+  mi_atomic_store_release(&tld->prefault_tail, tail + 1);   // publishes `*req`
+  // Wake it only when the ring was empty: with requests still pending it is draining already
+  // (it loops without sleeping while a drain finds work).
+  if (tail == head) { _mi_scavenger_wake(tld->subproc); }
+}
+
+// The scavenger: pre-fault what the threads of `subproc` posted. The requests are copied out
+// under `tlds_lock` -- a tld is unlinked under that lock before its memory is freed
+// (`mi_tld_free`) -- but faulted in after it is released, so thread creation and exit never
+// wait on page faults. Takes at most MI_PREFAULT_QUEUE requests per call; returns whether it
+// took any, so the caller calls again before it sleeps.
+bool _mi_prefault_drain(mi_subproc_t* subproc) {
+  if (subproc == NULL) return false;
+  mi_prefault_req_t reqs[MI_PREFAULT_QUEUE];
+  size_t n = 0;
+  mi_lock(&subproc->tlds_lock) {
+    for (mi_tld_t* tld = subproc->tlds; tld != NULL && n < MI_PREFAULT_QUEUE; tld = tld->subproc_next) {
+      size_t head = mi_atomic_load_relaxed(&tld->prefault_head);         // only we write it
+      const size_t tail = mi_atomic_load_acquire(&tld->prefault_tail);   // pairs with the owner's release: the slots are written
+      while (head != tail && n < MI_PREFAULT_QUEUE) {
+        reqs[n++] = tld->prefault_queue[head % MI_PREFAULT_QUEUE];
+        head++;
+      }
+      mi_atomic_store_release(&tld->prefault_head, head);   // the slots are copied: the owner may reuse them
+    }
+  }
+  for (size_t i = 0; i < n; i++) {
+    _mi_prim_populate((void*)reqs[i].start, reqs[i].size);   // best effort: an error only means no pre-fault
+  }
+  return (n > 0);
+}
+
 // Discard the OS pages of the unformed tail that are not discarded already.
 static void mi_page_purge_unformed_tail(mi_page_t* page) {
   if (!mi_page_holes_madvisable(page)) return;
@@ -26224,6 +26335,20 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
 }
 
+// #484: a large page carved from slices an earlier page used is resident across its whole span,
+// though its owner has formed only its first blocks. Discard the rest at once, so a new page
+// costs what it uses: this is what made short-lived threads (a new theap, new pages, each
+// generation) hold far more than long-lived ones running the same requests.
+void _mi_page_trim_unformed_tail(mi_page_t* page) {
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  mi_page_purge_unformed_tail(page);
+  // the owner's next extensions will want the start of the tail back: fault it in ahead of them
+  if (_mi_page_unformed_purged_bytes(page) > 0) {
+    const uintptr_t lo = (uintptr_t)mi_page_start(page) + page->unformed_purged_lo;
+    mi_page_prefault_post(page, lo, lo + mi_page_prefault_window(page));
+  }
+}
+
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
 // in it is written to. `end` is an absolute address (`UINTPTR_MAX` for the whole tail); it is
 // rounded up to an OS page, as the discard covers whole OS pages.
@@ -26246,6 +26371,16 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
   else { page->unformed_purged_lo = (uint32_t)(rend - pstart); }
   mi_atomic_addi64_relaxed(&mi_holes_unformed_reuse_calls, 1);
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, -(int64_t)(rend - rlo));
+
+  // #487: the owner is forming blocks here (`mi_page_extend_free`; `_mi_page_unpurge_all` takes
+  // the whole tail and never gets this far). Ask for the next window ahead of `rend`. The post
+  // made when the tail started at `rlo` already asked for everything below `rlo + window`, so
+  // only the part beyond that is new.
+  if (rend < rhi) {
+    const size_t window = mi_page_prefault_window(page);
+    const uintptr_t asked = rlo + window;
+    mi_page_prefault_post(page, (asked > rend ? asked : rend), rend + window);
+  }
 }
 
 
@@ -30480,6 +30615,8 @@ static void mi_scavenger_run(void) {
     // directions (store-buffering) -- we see no parked thread, it sees a stale wake==1 and issues
     // no syscall, and that park is silently deferred to the safety timeout.
     mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (mi_scav_word_t)0);
+    // #487: first the pre-faults an owner is (soon) waiting on; while they keep coming, don't sleep
+    const bool prefaulted = _mi_prefault_drain(subproc);
     // Do the idle work of any thread that parked and handed us its theaps. This is the expensive
     // part and it is why the owner gets to skip it.
     const mi_msecs_t park_due = _mi_theap_sweep_parked(subproc);
@@ -30519,6 +30656,7 @@ static void mi_scavenger_run(void) {
       if (tick < timeout_ms) { timeout_ms = tick; }
     }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
+    if (prefaulted) continue;   // #487: a burst of posts: look again at once
     mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
   }
   // #272 profiler-interaction invariant (3): the scavenger must never initialise a theap of
@@ -33905,6 +34043,12 @@ int _mi_prim_reuse(void* addr, size_t size) {
   return 0;
 }
 
+// #487: no pre-fault here; the owner faults the memory in when it writes it.
+int _mi_prim_populate(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
 int _mi_prim_protect(void* addr, size_t size, bool protect) {
   DWORD oldprotect = 0;
   BOOL ok = VirtualProtect(addr, size, protect ? PAGE_NOACCESS : PAGE_READWRITE, &oldprotect);
@@ -35313,6 +35457,17 @@ int _mi_prim_reuse(void* start, size_t size) {
   return 0;
 }
 
+// #487: MADV_POPULATE_WRITE (Linux 5.14+) faults the range in writable without touching its
+// contents. An older kernel rejects the advice with EINVAL, which only means no pre-fault.
+int _mi_prim_populate(void* start, size_t size) {
+  #if defined(MADV_POPULATE_WRITE)
+  return unix_madvise(start, size, MADV_POPULATE_WRITE);
+  #else
+  MI_UNUSED(start); MI_UNUSED(size);
+  return 0;
+  #endif
+}
+
 int _mi_prim_decommit(void* start, size_t size, bool* needs_recommit) {
   int err = 0;
   #if 1
@@ -36129,6 +36284,12 @@ int _mi_prim_reuse(void* addr, size_t size) {
   return 0;
 }
 
+// #487: no pre-fault here (and no scavenger thread to issue one).
+int _mi_prim_populate(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
 // #272: nothing to release here; MI_PRIM_HAS_DISCARD is 0 on this platform, so
 // `_mi_os_discard` never calls this and never counts a purge.
 int _mi_prim_discard(void* addr, size_t size) {
@@ -36404,6 +36565,12 @@ int _mi_prim_reset(void* addr, size_t size) {
 }
 
 int _mi_prim_reuse(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
+// #487: no pre-fault here; the owner faults the memory in when it writes it.
+int _mi_prim_populate(void* addr, size_t size) {
   MI_UNUSED(addr); MI_UNUSED(size);
   return 0;
 }
@@ -37098,6 +37265,17 @@ int _mi_prim_reuse(void* start, size_t size) {
   return unix_madvise(start, size, MADV_FREE_REUSE);
   #endif
   return 0;
+}
+
+// #487: MADV_POPULATE_WRITE (Linux 5.14+) faults the range in writable without touching its
+// contents. An older kernel rejects the advice with EINVAL, which only means no pre-fault.
+int _mi_prim_populate(void* start, size_t size) {
+  #if defined(MADV_POPULATE_WRITE)
+  return unix_madvise(start, size, MADV_POPULATE_WRITE);
+  #else
+  MI_UNUSED(start); MI_UNUSED(size);
+  return 0;
+  #endif
 }
 
 int _mi_prim_decommit(void* start, size_t size, bool* needs_recommit) {

@@ -208,6 +208,92 @@
       "maxItems": 180,
       "description": "Every measured block is retained, not only summaries: 60 cells x 3 blocks.",
       "items": { "$ref": "#/$defs/rawSample" }
+    },
+    "churn": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional thread-churn side-car (#508): the large-class-ephemeral stream replayed at 8 workers, after which the child joins every worker thread and reads its own RSS at fixed offsets while the process stays alive and idle. Absent in rows published before it existed; it never changes the throughput matrix or its comparison key.",
+      "required": ["metric_schema_version", "pattern", "replays_pattern", "sampling", "cell_summaries"],
+      "properties": {
+        "metric_schema_version": { "const": "thread-churn-post-drain-rss-v1" },
+        "pattern": { "const": "thread-churn" },
+        "replays_pattern": { "const": "large-class-ephemeral" },
+        "sampling": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "method", "offsets_ms", "release_tolerance_bytes"],
+          "properties": {
+            "source": { "type": "string", "minLength": 1 },
+            "method": { "type": "string", "minLength": 1 },
+            "offsets_ms": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 1 },
+              "minItems": 1,
+              "description": "Milliseconds after the drain at which RSS is read; every deadline is measured from the drain instant."
+            },
+            "release_tolerance_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "release_ms is the first offset whose RSS is within this many bytes of the RSS at the last offset (perf-ab's definition, at offset resolution)."
+            }
+          }
+        },
+        "cell_summaries": {
+          "type": "array",
+          "description": "One summary per churn thread point x allocator, sorted by (thread_count, allocator_id).",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "thread_count",
+              "allocator_id",
+              "block_count",
+              "median_peak_rss_bytes",
+              "p05_peak_rss_bytes",
+              "p95_peak_rss_bytes",
+              "median_post_drain_rss_bytes",
+              "p05_post_drain_rss_bytes",
+              "p95_post_drain_rss_bytes",
+              "median_release_ms"
+            ],
+            "properties": {
+              "thread_count": { "type": "integer", "minimum": 1 },
+              "allocator_id": {
+                "enum": [
+                  "tcmalloc",
+                  "jemalloc",
+                  "upstream-mimalloc",
+                  "bun-mimalloc",
+                  "mimalloc-pprof"
+                ]
+              },
+              "block_count": { "type": "integer", "minimum": 1 },
+              "median_peak_rss_bytes": { "type": "integer", "minimum": 1 },
+              "p05_peak_rss_bytes": { "type": "integer", "minimum": 0 },
+              "p95_peak_rss_bytes": { "type": "integer", "minimum": 0 },
+              "median_post_drain_rss_bytes": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 0 },
+                "description": "One entry per sampling offset; linear-interpolated P50 across blocks."
+              },
+              "p05_post_drain_rss_bytes": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 0 }
+              },
+              "p95_post_drain_rss_bytes": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 0 }
+              },
+              "median_release_ms": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    "churn_raw_samples": {
+      "type": "array",
+      "description": "Every thread-churn child is retained, one per (thread point, block, allocator); each response carries the post-drain RSS series.",
+      "items": { "$ref": "#/$defs/rawSample" }
     }
   },
   "$defs": {
@@ -332,7 +418,22 @@
         "warmup_ns": { "type": "integer", "minimum": 0 },
         "elapsed_ns": { "type": "integer", "minimum": 1 },
         "teardown_ns": { "type": "integer", "minimum": 1 },
-        "throughput_operations_per_second": { "type": "number", "exclusiveMinimum": 0 }
+        "throughput_operations_per_second": { "type": "number", "exclusiveMinimum": 0 },
+        "post_drain_rss_bytes": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "description": "Thread-churn only: the child's own RSS at each post-drain offset, read after every worker thread was joined. Omitted for every other pattern."
+        },
+        "post_drain_sample_ns": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "description": "Thread-churn only: nanoseconds after the drain at which each post-drain RSS sample was actually read."
+        },
+        "live_worker_threads_at_first_sample": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Thread-churn only: worker and generation threads still running at the drain; a valid response reports zero."
+        }
       }
     }
   }

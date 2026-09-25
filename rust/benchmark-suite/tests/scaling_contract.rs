@@ -14,6 +14,10 @@ use benchmark_suite::scaling::{
     SCALING_PATTERNS, SCALING_RIGOR_LABEL, SCALING_SCHEMA_VERSION, SCALING_THREAD_POINTS,
 };
 use benchmark_suite::scaling::{merge_scaling_runs, scaling_thread_points_for_shard};
+use benchmark_suite::scaling::{
+    ScalingChildResponse, CHURN_BLOCKS, CHURN_POST_DRAIN_OFFSETS_MS, CHURN_RELEASE_TOLERANCE_BYTES,
+    CHURN_THREAD_POINTS, SCALING_CHURN_SCHEMA_VERSION,
+};
 
 /// Leak-detecting mock allocator. `Drop` asserts every block was released, so
 /// any oracle/executor drift shows up as a failure rather than a leak.
@@ -365,6 +369,84 @@ fn ephemeral_large_class_replays_the_control_on_short_lived_threads() {
 }
 
 #[test]
+fn thread_churn_replays_large_class_ephemeral_and_samples_after_join() {
+    let run_seed = 0x6d69_6d61_6c6c_6f63;
+    let run = |pattern: ScalingPattern| {
+        let adapter = MockAdapter::new("upstream-mimalloc");
+        let request = request_for(pattern, 8, 0, "upstream-mimalloc", 800);
+        let response = execute_scaling_child_request(&adapter, request.clone()).unwrap();
+        (request, response)
+    };
+    let counts = |response: &ScalingChildResponse| {
+        (
+            response.alloc_calls,
+            response.realloc_calls,
+            response.free_calls,
+            response.checksum,
+        )
+    };
+    let (churn_request, churn) = run(ScalingPattern::ThreadChurn);
+    let (_, ephemeral) = run(ScalingPattern::LargeClassEphemeral);
+
+    // The churn cell replays large-class-ephemeral's exact stream.
+    let expected = simulate_cell(ScalingPattern::ThreadChurn, run_seed, 8, 0, 800);
+    assert_eq!(
+        expected,
+        simulate_cell(ScalingPattern::LargeClassEphemeral, run_seed, 8, 0, 800)
+    );
+    assert_eq!(counts(&churn), counts(&ephemeral));
+    assert_eq!(
+        counts(&churn),
+        (
+            expected.alloc_calls,
+            expected.realloc_calls,
+            expected.free_calls,
+            expected.checksum
+        )
+    );
+
+    // It samples at every offset, no earlier than the offset, after the join.
+    assert_eq!(CHURN_POST_DRAIN_OFFSETS_MS.len(), 6);
+    assert_eq!(churn.post_drain_rss_bytes.len(), 6);
+    assert_eq!(churn.post_drain_sample_ns.len(), 6);
+    for (sample_ns, offset_ms) in churn
+        .post_drain_sample_ns
+        .iter()
+        .zip(CHURN_POST_DRAIN_OFFSETS_MS)
+    {
+        assert!(
+            *sample_ns >= offset_ms * 1_000_000,
+            "sample read at {sample_ns} ns, before its {offset_ms} ms offset"
+        );
+    }
+    assert_eq!(churn.live_worker_threads_at_first_sample, Some(0));
+    if cfg!(target_os = "linux") {
+        assert!(
+            churn.post_drain_rss_bytes.iter().all(|rss| *rss > 0),
+            "every post-drain sample must observe RSS on Linux"
+        );
+    }
+    churn
+        .validate_against(&churn_request)
+        .expect("a truthful thread-churn response validates");
+
+    let mut still_alive = churn.clone();
+    still_alive.live_worker_threads_at_first_sample = Some(1);
+    assert!(
+        still_alive.validate_against(&churn_request).is_err(),
+        "sampling while a worker is still alive must not validate"
+    );
+    let mut truncated = churn;
+    truncated.post_drain_rss_bytes.pop();
+    assert!(truncated.validate_against(&churn_request).is_err());
+
+    // Every other pattern carries no post-drain samples.
+    assert!(ephemeral.post_drain_rss_bytes.is_empty());
+    assert!(ephemeral.post_drain_sample_ns.is_empty());
+    assert_eq!(ephemeral.live_worker_threads_at_first_sample, None);
+}
+
+#[test]
 fn cross_thread_pattern_actually_hands_blocks_to_other_workers() {
     let adapter = MockAdapter::new("upstream-mimalloc");
     let request = request_for(ScalingPattern::CrossThread, 4, 0, "upstream-mimalloc", 400);
@@ -422,6 +504,9 @@ fn split_fixture(raw: &ScalingRawRun, shard_count: usize) -> Vec<ScalingRawRun> 
             shard
                 .samples
                 .retain(|value| threads.contains(&value.thread_count));
+            shard
+                .churn_samples
+                .retain(|value| threads.contains(&value.thread_count));
             shard.run.generated_at_utc = format!("2026-08-13T00:00:0{shard_index}Z");
             shard
         })
@@ -442,11 +527,26 @@ fn scaling_shards_are_deterministic_and_cover_the_matrix_once() {
 #[test]
 fn scaling_shards_merge_to_a_complete_valid_run() {
     let raw = sample_run();
-    let merged = merge_scaling_runs(split_fixture(&raw, 6)).unwrap();
+    let shards = split_fixture(&raw, 6);
+    // The churn side-car travels with the shard that owns its thread point.
+    for (index, shard) in shards.iter().enumerate() {
+        let threads = scaling_thread_points_for_shard(index, 6).unwrap();
+        let owns_churn = CHURN_THREAD_POINTS
+            .iter()
+            .any(|churn| threads.contains(churn));
+        assert_eq!(shard.churn_samples.is_empty(), !owns_churn, "{index}");
+    }
+    let merged = merge_scaling_runs(shards).unwrap();
     validate_scaling_raw_run(&merged).unwrap();
+    assert_eq!(merged.status, "complete");
     assert_eq!(merged.run.generated_at_utc, raw.run.generated_at_utc);
     assert_eq!(merged.calibrations.len(), raw.calibrations.len());
     assert_eq!(merged.samples.len(), raw.samples.len());
+    assert_eq!(merged.churn_samples, raw.churn_samples);
+
+    // Fewer shards route churn the same way.
+    let merged = merge_scaling_runs(split_fixture(&raw, 2)).unwrap();
+    assert_eq!(merged.churn_samples, raw.churn_samples);
 }
 
 #[test]
@@ -478,6 +578,144 @@ fn scaling_merge_rejects_mismatch_missing_and_overlap() {
     let mut shards = split_fixture(&raw, 6);
     shards.push(shards[0].clone());
     assert!(merge_scaling_runs(shards).unwrap_err().contains("overlap"));
+
+    // A second copy of the churn cell in another shard is an overlap too.
+    let mut shards = split_fixture(&raw, 6);
+    shards[0].churn_samples = raw.churn_samples.clone();
+    assert!(merge_scaling_runs(shards).unwrap_err().contains("overlap"));
+
+    // Without its churn side-car the merged run is not complete.
+    let mut shards = split_fixture(&raw, 6);
+    for shard in &mut shards {
+        shard.churn_samples.clear();
+    }
+    assert_eq!(merge_scaling_runs(shards).unwrap().status, "incomplete");
+}
+
+#[test]
+fn churn_side_car_is_required_and_summarised() {
+    let raw = sample_run();
+    validate_scaling_raw_run(&raw).expect("fixture carries a complete churn side-car");
+    assert_eq!(
+        raw.churn_samples.len(),
+        CHURN_THREAD_POINTS.len() * CHURN_BLOCKS as usize * 5
+    );
+    let report = build_scaling_report(&raw).expect("fixture builds a report");
+    validate_scaling_report(&report).expect("report with churn side-car is publishable");
+    assert_eq!(report.churn_raw_samples, raw.churn_samples);
+    let churn = report.churn.as_ref().expect("report carries the churn side-car");
+    assert_eq!(churn.metric_schema_version, SCALING_CHURN_SCHEMA_VERSION);
+    assert_eq!(churn.pattern, ScalingPattern::ThreadChurn.as_str());
+    assert_eq!(
+        churn.replays_pattern,
+        ScalingPattern::LargeClassEphemeral.as_str()
+    );
+    assert_eq!(churn.sampling.offsets_ms, CHURN_POST_DRAIN_OFFSETS_MS.to_vec());
+    assert_eq!(
+        churn.sampling.release_tolerance_bytes,
+        CHURN_RELEASE_TOLERANCE_BYTES
+    );
+    assert_eq!(churn.cell_summaries.len(), 5);
+    for summary in &churn.cell_summaries {
+        assert_eq!(summary.thread_count, 8);
+        assert_eq!(summary.block_count, CHURN_BLOCKS);
+        assert_eq!(summary.median_post_drain_rss_bytes.len(), 6);
+        assert_eq!(summary.p05_post_drain_rss_bytes.len(), 6);
+        assert_eq!(summary.p95_post_drain_rss_bytes.len(), 6);
+    }
+    assert!(
+        churn
+            .cell_summaries
+            .windows(2)
+            .all(|pair| pair[0].allocator_id < pair[1].allocator_id),
+        "summaries are sorted by (thread_count, allocator_id)"
+    );
+    assert_eq!(
+        report.history_projection().churn.as_ref(),
+        Some(churn),
+        "history carries the churn side-car"
+    );
+
+    // release_ms by hand from jemalloc's raw samples: the first offset whose
+    // RSS is within the tolerance of the RSS at the last offset, then the
+    // linear-interpolated median across blocks.
+    fn linear_median(sorted: &[u64]) -> u64 {
+        let h = (sorted.len() - 1) as f64 * 0.5;
+        let lower = h.floor() as usize;
+        let upper = h.ceil() as usize;
+        let span = (sorted[upper] - sorted[lower]) as f64;
+        (sorted[lower] as f64 + span * (h - lower as f64)).round() as u64
+    }
+    let allocator = "jemalloc";
+    let mine = raw
+        .churn_samples
+        .iter()
+        .filter(|sample| sample.allocator_id == allocator)
+        .collect::<Vec<_>>();
+    assert_eq!(mine.len(), CHURN_BLOCKS as usize);
+    let mut release = mine
+        .iter()
+        .map(|sample| {
+            let rss = &sample.response.post_drain_rss_bytes;
+            let last = *rss.last().unwrap();
+            let index = rss
+                .iter()
+                .position(|value| *value <= last + CHURN_RELEASE_TOLERANCE_BYTES)
+                .unwrap();
+            CHURN_POST_DRAIN_OFFSETS_MS[index]
+        })
+        .collect::<Vec<_>>();
+    release.sort_unstable();
+    let mut first_offset = mine
+        .iter()
+        .map(|sample| sample.response.post_drain_rss_bytes[0])
+        .collect::<Vec<_>>();
+    first_offset.sort_unstable();
+    let summary = churn
+        .cell_summaries
+        .iter()
+        .find(|summary| summary.allocator_id == allocator)
+        .expect("jemalloc churn summary");
+    assert_eq!(summary.median_release_ms, linear_median(&release));
+    assert_eq!(
+        summary.median_post_drain_rss_bytes[0],
+        linear_median(&first_offset)
+    );
+    let distinct_release = churn
+        .cell_summaries
+        .iter()
+        .map(|summary| summary.median_release_ms)
+        .collect::<HashSet<_>>();
+    assert!(
+        distinct_release.len() > 1,
+        "the fixture must separate allocators by release time"
+    );
+
+    // A fresh run must carry the complete side-car.
+    let mut missing = raw.clone();
+    missing.churn_samples.clear();
+    assert!(validate_scaling_raw_run(&missing).is_err());
+
+    let mut still_alive = raw.clone();
+    still_alive.churn_samples[0].response.live_worker_threads_at_first_sample = Some(1);
+    assert!(validate_scaling_raw_run(&still_alive).is_err());
+
+    let mut duplicated = raw.clone();
+    duplicated.churn_samples.push(raw.churn_samples[0].clone());
+    assert!(validate_scaling_raw_run(&duplicated).is_err());
+
+    let mut recalibrated = raw.clone();
+    recalibrated.churn_samples[0].operations_per_worker += 1;
+    assert!(validate_scaling_raw_run(&recalibrated).is_err());
+
+    // Rows of every other pattern serialize without the new fields.
+    let text = serde_json::to_string(&raw.samples[0]).unwrap();
+    assert!(!text.contains("post_drain") && !text.contains("live_worker_threads"));
+
+    let mut unordered = report.clone();
+    let summaries = &mut unordered.churn.as_mut().unwrap().cell_summaries;
+    summaries.swap(0, 1);
+    assert!(validate_scaling_report(&unordered).is_err());
 }
 
 #[test]

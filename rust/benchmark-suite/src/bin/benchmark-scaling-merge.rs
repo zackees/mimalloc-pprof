@@ -64,6 +64,9 @@ fn selftest() -> Result<(), String> {
             shard
                 .samples
                 .retain(|value| threads.contains(&value.thread_count));
+            shard
+                .churn_samples
+                .retain(|value| threads.contains(&value.thread_count));
             Ok(shard)
         })
         .collect::<Result<Vec<_>, String>>()?;

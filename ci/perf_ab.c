@@ -5,8 +5,9 @@
    Each thread replays a seeded stream over 8 live slots (allocate 8 / free-oldest 6 /
    free-random 2, one write per 4 KiB). With generations > 1 each thread runs its stream as
    that many short-lived threads, each exiting while it still owns live slots that the next
-   one frees. Prints one line: ops/s, cpu seconds, peak RSS, and RSS 500 ms after everything
-   was freed while the worker threads stay alive and idle (a server between requests).
+   one frees. Prints one line: ops/s, cpu seconds, peak RSS, and RSS DRAIN_SHORT_MS and
+   DRAIN_LONG_MS after everything was freed while the worker threads stay alive and idle (a
+   server between requests): the first reads the arena purge, the second a retention window.
    Linux only (getrusage + /proc/self/statm). */
 #include <mimalloc.h>
 #include <pthread.h>
@@ -20,6 +21,8 @@
 #include <unistd.h>
 
 #define SLOTS 8
+#define DRAIN_SHORT_MS 500
+#define DRAIN_LONG_MS  2000
 
 typedef struct { uint64_t rng; size_t lo, hi; long ops; void* slot[SLOTS]; int fifo[4096]; size_t head, tail; } stream_t;
 
@@ -71,6 +74,14 @@ static void* worker_main(void* arg) {
   return NULL;
 }
 
+static long rss_bytes(void) {
+  long pages = 0, resident = 0;
+  FILE* f = fopen("/proc/self/statm", "r");
+  if (f == NULL || fscanf(f, "%ld %ld", &pages, &resident) != 2) exit(1);
+  fclose(f);
+  return resident * sysconf(_SC_PAGESIZE);
+}
+
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + (double)t.tv_nsec * 1e-9; }
 
 int main(int argc, char** argv) {
@@ -87,15 +98,14 @@ int main(int argc, char** argv) {
   for (int i = 0; i < threads; i++) pthread_create(&t[i], NULL, &worker_main, &st[i]);
   while (atomic_load(&drained) < threads) usleep(100);
   const double elapsed = now_s() - start;
-  usleep(500 * 1000);  /* let the deferred purge run */
+  usleep(DRAIN_SHORT_MS * 1000);  /* let the deferred purge run */
   struct rusage ru; getrusage(RUSAGE_SELF, &ru);
-  long pages = 0, resident = 0;
-  FILE* f = fopen("/proc/self/statm", "r");
-  if (f == NULL || fscanf(f, "%ld %ld", &pages, &resident) != 2) return 1;
-  fclose(f);
+  const long rss_short = rss_bytes();
+  usleep((DRAIN_LONG_MS - DRAIN_SHORT_MS) * 1000);
+  const long rss_long = rss_bytes();
   const double cpu = (double)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) + (double)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) * 1e-6;
-  printf("%.1f %.4f %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu,
-         ru.ru_maxrss * 1024L, resident * sysconf(_SC_PAGESIZE));
+  printf("%.1f %.4f %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu,
+         ru.ru_maxrss * 1024L, rss_short, rss_long);
   atomic_store(&release_workers, 1);
   for (int i = 0; i < threads; i++) pthread_join(t[i], NULL);
   free(st); free(t);

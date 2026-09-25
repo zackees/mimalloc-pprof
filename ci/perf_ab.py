@@ -41,7 +41,7 @@ FLAGS = [
 # "chart" is how the README scaling charts build mimalloc-pprof (profiler and memory events
 # compiled in, both off at run time, #478): a regression only that build shows is still one.
 # (Names of equal length: see `build`.)
-BUILDS = {
+BUILDS: dict[str, tuple[list[str], dict[str, str]]] = {
     "plain": ([], {}),
     "pprof": (["-DMI_PPROF=ON"], {"MIMALLOC_PROF": "1"}),
     "chart": (["-DMI_PPROF=ON", "-DMI_MEMEVT=ON"], {}),

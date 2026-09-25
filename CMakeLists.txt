@@ -2009,6 +2009,23 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-thread-idle-rss PROPERTIES TIMEOUT 120)
   endif()
 
+  # test-arena-purge-rearm (#457): the DEFERRED arena purge. Workers free large blocks and
+  # then only idle, so the memory can come back only through the scavenger's `purge_delay`
+  # deadline; the 20 ms delay makes that observable in-process.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-purge-rearm test/test-arena-purge-rearm.c)
+    target_compile_definitions(mimalloc-test-arena-purge-rearm PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-purge-rearm PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-purge-rearm PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-purge-rearm PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-arena-purge-rearm PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-arena-purge-rearm COMMAND mimalloc-test-arena-purge-rearm)
+    set_tests_properties(test-arena-purge-rearm PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20")
+  endif()
+
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of
   # docs/purge-all-implementation.md §11 (T1-T3, G1-G8, C1-C2) in one binary that is built for
   # BOTH MI_PPROF and BOTH MI_OWNER_GATE settings and branches on `#if MI_OWNER_GATE` for its
@@ -2213,7 +2230,7 @@ endif()
 #
 #   * process-wide peak RSS / current RSS -- test-memory-gate (the committed baselines are
 #     min-of-8 peak RSS), test-degenerate (RSS must not grow per iteration),
-#     test-process-rss and test-thread-idle-rss (RSS must fall after a thread idles).
+#     test-process-rss, test-thread-idle-rss and test-arena-purge-rearm (RSS must fall after a thread idles).
 #     Under memory pressure from a parallel wave the kernel's reclaim decisions, not the
 #     allocator's, decide those numbers.
 #   * a wall-clock deadline -- test-park-handoff* wait a bounded time for a hole sweep to
@@ -2253,6 +2270,7 @@ set(mi_serial_tests
   test-degenerate
   test-process-rss
   test-thread-idle-rss
+  test-arena-purge-rearm
   test-park-handoff
   test-park-handoff-no-scavenger
   test-park-handoff-eager

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 16e58348 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f0a6135c of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -27093,6 +27093,11 @@ void _mi_theap_purge_large_holes(mi_theap_t* theap) {
   mi_tld_t* const tld = theap->tld;
   if (tld == NULL || tld->holes_sweeping || !mi_option_is_enabled(mi_option_purge_holes)) return;
   const mi_msecs_t now = _mi_clock_now();
+  // #478: a thread's first call starts its clock instead of sweeping at once. Otherwise every new
+  // thread swept the abandoned pages it will reclaim in a moment -- a dead thread's pages look
+  // "unchanged since the last tick" -- and then refaulted them: with short-lived threads (the
+  // README's ephemeral chart) that was ~28x the minor faults and ~10% of the throughput.
+  if (tld->holes_busy_last == 0) { tld->holes_busy_last = now; return; }
   if (now - tld->holes_busy_last < (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000)) return;
   tld->holes_busy_last = now;
   const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);

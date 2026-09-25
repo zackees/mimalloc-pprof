@@ -1787,6 +1787,45 @@ static bool pace_churn(void** ptrs, size_t n, size_t sz) {
   return true;
 }
 
+// #478: a new thread's first busy tick only starts its clock. Before, every new thread swept the
+// abandoned large pages at its first slow-path malloc, and a page a dead thread left behind looks
+// "unchanged since the last tick" to it (the signature an earlier thread recorded) -- so it was
+// discarded and then refaulted when reclaimed. Thread A leaves such a page (live blocks with
+// freed holes); B and C each live one tick, far shorter than the interval, on another size class
+// (so neither reclaims A's page): B's tick would record the signature, C's would discard.
+#define FIRST_SWEEP_ALLOCS  (3000)            // several generic-malloc admin ticks (every 1000th)
+#define FIRST_SWEEP_A_SIZE  (200 * 1024)      // A's page
+#define FIRST_SWEEP_BC_SIZE (320 * 1024)      // another large size class
+#define FIRST_SWEEP_A_COUNT (16)
+
+static void* first_sweep_a_blocks[FIRST_SWEEP_A_COUNT];
+
+static void first_sweep_thread_a(void) {   // leaves an abandoned page with holes
+  for (int i = 0; i < FIRST_SWEEP_A_COUNT; i++) {
+    first_sweep_a_blocks[i] = mi_malloc(FIRST_SWEEP_A_SIZE);
+    if (first_sweep_a_blocks[i] != NULL) { memset(first_sweep_a_blocks[i], 1, FIRST_SWEEP_A_SIZE); }
+  }
+  for (int i = 0; i < FIRST_SWEEP_A_COUNT; i += 2) { mi_free(first_sweep_a_blocks[i]); first_sweep_a_blocks[i] = NULL; }
+}
+
+static void first_sweep_thread(void) {     // one short life with a few admin ticks
+  for (int i = 0; i < FIRST_SWEEP_ALLOCS; i++) { void* p = mi_malloc(FIRST_SWEEP_BC_SIZE); mi_free(p); }
+}
+
+static bool test_new_thread_does_not_sweep_at_once(void) {
+  const long interval = mi_option_get(mi_option_purge_holes_min_interval);
+  mi_option_set(mi_option_purge_holes_min_interval, PACE_INTERVAL_MS);   // far longer than B and C live
+  run_one_thread(&first_sweep_thread_a);
+  run_one_thread(&first_sweep_thread);                                    // B
+  const int64_t before = hole_stats().discards;
+  run_one_thread(&first_sweep_thread);                                    // C
+  const int64_t discarded = hole_stats().discards - before;
+  mi_option_set(mi_option_purge_holes_min_interval, interval);
+  for (int i = 1; i < FIRST_SWEEP_A_COUNT; i += 2) { mi_free(first_sweep_a_blocks[i]); first_sweep_a_blocks[i] = NULL; }
+  fprintf(stderr, "(discards by a short-lived thread: %lld) ", (long long)discarded);
+  return (!purging_enabled || discarded == 0);
+}
+
 static bool test_owner_sweep_pacing(void) {
   enum { N = 1024, SZ = 512 };
   void** ptrs = (void**)calloc(N, sizeof(void*));
@@ -2169,6 +2208,7 @@ int main(void) {
   CHECK("sweep-does-not-unpurge-on-collect", test_sweep_no_unpurge_on_collect());
   CHECK("sweep-full-every-bounds-a-missed-hole", test_sweep_full_every());
   CHECK("owner-sweeps-are-paced", test_owner_sweep_pacing());
+  CHECK("new-thread-does-not-sweep-at-once", test_new_thread_does_not_sweep_at_once());
   #if !defined(_WIN32)
   CHECK("idle-thread-releases-large-page", test_idle_thread_releases_large_page());
   CHECK("reserved-page-is-released", test_reserved_page_is_released());

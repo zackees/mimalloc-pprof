@@ -1347,6 +1347,7 @@ void          _mi_page_holes_reset_ineligible(void);
 void          _mi_page_purge_holes_begin(mi_tld_t* tld);         // around each pass of a sweep; `tld` is the thread being swept
 void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
+void          _mi_theap_purge_large_holes(mi_theap_t* theap, bool paced);   // #477: owner-only, busy time and thread exit (src/page-holes.c)
 void          _mi_purge_holes_of(mi_tld_t* tld, bool force);     // the sweep itself (src/page-holes.c); #366: `force` skips the interval pacing and reads MI_GATE_FLAG_RECLAIM_IGNORED
 void          _mi_page_holes_assert_valid(const mi_page_t* page);   // MI_DEBUG hole invariants, called from `_mi_page_is_valid`
 
@@ -1415,7 +1416,7 @@ void          _mi_page_holes_report_print(const mi_holes_report_t* rep);
 void          _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep);
 void          _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep);
 void          _mi_purge_holes_report_collect(mi_holes_report_t* rep);
-void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld);   // src/arena.c
+void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld, size_t bin_lo, size_t bin_hi);   // src/arena.c: bins [lo,hi)
 
 // The free-arena reclaim (src/arena-reclaim.c, phase F of `mi_purge_all_ex`): give back the
 // arenas that are completely free. The report is filled in even when it is a no-op.
@@ -1432,28 +1433,36 @@ void          _mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages);    
 bool          _mi_arenas_purge_guard_acquire(void);   // src/arena.c: the guard held across a reclaim
 void          _mi_arenas_purge_guard_release(void);   // src/arena.c
 
-// The base of the OS-page bitmap: the start of the first OS page that the block area of
-// this page overlaps. It is OS-page aligned by construction, so bit `k` always names the
-// OS-page-aligned range `[base + k*os_page_size, base + (k+1)*os_page_size)`.
-static inline uintptr_t mi_page_purge_base(const mi_page_t* page) {
-  return _mi_align_down((uintptr_t)mi_page_start(page), _mi_os_page_size());
+// The unit one purge bit covers: the OS page, doubled until the block area fits
+// MI_PAGE_PURGE_BITS (#477). Only a large page on a 4 KiB OS page needs more than one OS
+// page (16 KiB); its blocks are over 84 KiB, so a free block still covers whole units.
+static inline size_t mi_page_purge_unit(const mi_page_t* page) {
+  const uintptr_t start = (uintptr_t)mi_page_start(page);
+  const uintptr_t end = start + mi_page_size(page);
+  size_t unit = _mi_os_page_size();
+  while (_mi_divide_up((size_t)(end - _mi_align_down(start, unit)), unit) > MI_PAGE_PURGE_BITS) { unit *= 2; }
+  return unit;
 }
 
-// the number of OS pages the block area spans = the number of bits this page needs
+// The base of the purge bitmap: the start of the first purge unit that the block area of
+// this page overlaps. It is unit (hence OS-page) aligned by construction, so bit `k` always
+// names the range `[base + k*unit, base + (k+1)*unit)`.
+static inline uintptr_t mi_page_purge_base(const mi_page_t* page) {
+  return _mi_align_down((uintptr_t)mi_page_start(page), mi_page_purge_unit(page));
+}
+
+// the number of purge units the block area spans = the number of bits this page needs
 static inline size_t mi_page_purge_bits(const mi_page_t* page) {
   const uintptr_t base = mi_page_purge_base(page);
   const uintptr_t end = (uintptr_t)mi_page_start(page) + mi_page_size(page);
-  return _mi_divide_up((size_t)(end - base), _mi_os_page_size());
+  return _mi_divide_up((size_t)(end - base), mi_page_purge_unit(page));
 }
 
-// Eligible when the page's OS pages fit the bitmap. This does not depend on the block size
-// at all: a discard covers a whole OS page, so any number of small free blocks can together
-// cover one (and a page whose free runs never cover a whole OS page simply discards nothing).
-// Small and medium pages always fit; a large (4 MiB) page fits from a 16 KiB OS page up
-// (exactly 256 bits at 16 KiB, 64 at 64 KiB) and needs 1024 bits -- so stays ineligible --
-// on a 4 KiB OS page; a huge page is a singleton (one block) so there is nothing to purge
-// in it. The bit count is `ceil(block_area / os_page_size)` with no header page; see
-// `MI_PAGE_PURGE_BITS` in `types.h` for why there is no `+1`.
+// Eligible when the page's purge units fit the bitmap, which `mi_page_purge_unit` makes true
+// for every small, medium and large page (#477). This does not depend on the block size: a
+// discard covers a whole unit, so any number of small free blocks can together cover one (and
+// a page whose free runs never cover a whole unit simply discards nothing). A huge page is a
+// singleton (one block) so there is nothing to purge in it.
 // Pinned memory (large/huge OS pages) cannot be madvise'd away, and an arena with a custom
 // commit function owns its own commit/decommit -- like every other purge site
 // (`mi_arena_schedule_purge`, `_mi_os_purge_ex`), we stay away from both.
@@ -1483,7 +1492,7 @@ static inline bool mi_page_os_page_purged(const mi_page_t* page, size_t k) {
 // overlapping it is free, so a block lost memory exactly when it overlaps a discarded OS page.
 static inline bool mi_page_block_index_is_purged(const mi_page_t* page, size_t idx) {
   if (!mi_page_has_purged(page)) return false;
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t base = mi_page_purge_base(page);
   const uintptr_t lo = (uintptr_t)mi_page_start(page) + (idx * page->block_size);
   const size_t kfirst = (size_t)(lo - base) / os_size;
@@ -1534,7 +1543,7 @@ static inline void mi_page_purged_clear(mi_page_t* page, size_t k) {
 
 // the OS pages that the block at index `idx` overlaps (relative to `mi_page_purge_base`)
 static inline void mi_page_block_os_pages(const mi_page_t* page, size_t idx, size_t* kfirst, size_t* klast) {
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t base = mi_page_purge_base(page);
   const uintptr_t lo = (uintptr_t)mi_page_start(page) + (idx * page->block_size);
   *kfirst = (size_t)(lo - base) / os_size;
@@ -1544,7 +1553,7 @@ static inline void mi_page_block_os_pages(const mi_page_t* page, size_t idx, siz
 // the blocks that overlap OS page `k`, or `false` if that OS page is not entirely inside
 // the block area (see `_mi_page_purge_os_page_blocks`)
 static inline bool mi_page_os_page_blocks(const mi_page_t* page, size_t k, size_t* first, size_t* last) {
-  return _mi_page_purge_os_page_blocks(_mi_os_page_size(), page->block_size, (uintptr_t)mi_page_start(page),
+  return _mi_page_purge_os_page_blocks(mi_page_purge_unit(page), page->block_size, (uintptr_t)mi_page_start(page),
                                        page->capacity, k, first, last);
 }
 

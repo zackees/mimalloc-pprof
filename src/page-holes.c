@@ -417,7 +417,7 @@ static bool mi_page_holes_discard(mi_page_t* page, uintptr_t dstart, size_t dsiz
 // the range can still overlap a hole we are not touching: those stay purged.
 static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool discarded) {
   mi_assert_internal(k0 <= k1 && k1 < MI_PAGE_PURGE_BITS);
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t dstart = mi_page_purge_base(page) + (k0 * os_size);
   const size_t dsize = ((k1 - k0) + 1) * os_size;
   if (discarded) { _mi_os_reuse(mi_page_subproc(page), (void*)dstart, dsize); }
@@ -575,7 +575,7 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
 static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   if (page->free == NULL) return true;                    // nothing to take off the free list
 
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const size_t nbits = mi_page_purge_bits(page);
   mi_assert_internal(nbits <= MI_PAGE_PURGE_BITS);
   if (nbits > MI_PAGE_PURGE_BITS) return true;
@@ -731,7 +731,7 @@ bool _mi_page_unpurge_run(mi_page_t* page) {
 void _mi_page_unpurge_all(mi_page_t* page) {
   _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);   // the unformed tail goes back as well
   if (!mi_page_has_purged(page)) return;
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t base = mi_page_purge_base(page);
   size_t k = 0;
   while (k < MI_PAGE_PURGE_BITS) {
@@ -807,6 +807,36 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
   mi_tld_t* const tld = theap->tld;
   _mi_page_purge_holes_begin(tld);
   _mi_theap_visit_pages(theap, &mi_theap_page_purge_holes, true /* include full pages */, tld, NULL);
+  _mi_page_purge_holes_end(tld);
+}
+
+// #477: the idle sweep never runs on a thread that never goes idle, so the OWNER also sweeps
+// its large-class pages -- the ones whose free blocks are big enough to be worth a discard --
+// from its generic-malloc housekeeping (`paced`: at most once per `purge_holes_min_interval`,
+// which also hands its retired empty pages back to the arena and sweeps the heap's abandoned
+// large pages, where every large page goes the moment it is full), and once more at thread
+// exit, before they are abandoned.
+void _mi_theap_purge_large_holes(mi_theap_t* theap, bool paced) {
+  mi_tld_t* const tld = theap->tld;
+  if (tld == NULL || tld->holes_sweeping || !mi_option_is_enabled(mi_option_purge_holes)) return;
+  if (paced) {
+    const mi_msecs_t now = _mi_clock_now();
+    if (now - tld->holes_busy_last < (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000)) return;
+    tld->holes_busy_last = now;
+    _mi_theap_collect_retired(theap, true);
+  }
+  const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
+  const size_t bin_hi = _mi_bin(MI_LARGE_MAX_OBJ_SIZE) + 1;
+  if (paced) { _mi_arenas_purge_abandoned_holes(_mi_theap_heap(theap), tld, bin_lo, bin_hi); }
+  _mi_page_purge_holes_begin(tld);
+  for (size_t bin = bin_lo; bin < bin_hi; bin++) {
+    mi_page_queue_t* const pq = &theap->pages[bin];
+    for (mi_page_t* page = pq->first; page != NULL; ) {
+      mi_page_t* const next = page->next;   // the visit may free the page
+      mi_theap_page_purge_holes(theap, pq, page, tld, NULL);
+      page = next;
+    }
+  }
   _mi_page_purge_holes_end(tld);
 }
 
@@ -893,7 +923,7 @@ void _mi_purge_holes_of(mi_tld_t* tld, bool force) {
     }
     for (size_t i = 0; i < heap_count; i++) {
       if (mi_tld_reclaim_requested(tld)) break;   // #366: unless the claimant asked for completion
-      _mi_arenas_purge_abandoned_holes(heaps[i], tld);
+      _mi_arenas_purge_abandoned_holes(heaps[i], tld, 0, MI_ARENA_BIN_COUNT);
     }
   }
 }
@@ -1018,7 +1048,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
     return;
   }
 
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   const uintptr_t pend = pstart + (cap * bs);
   const uintptr_t base = mi_page_purge_base(page);

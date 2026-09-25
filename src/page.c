@@ -1130,6 +1130,7 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
       _mi_deferred_free(theap, false);         // call potential deferred free routines      
       _mi_theap_collect_retired(theap, false); // free retired pages      
     }
+    _mi_theap_purge_large_holes(theap, true);  // #477: release large-page holes while busy
   }
   return theap;
 }

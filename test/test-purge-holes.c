@@ -467,10 +467,9 @@ static bool test_abandoned(void) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. large pages (4MB, for blocks over ~84KB). Whether they fit the OS-page bitmap depends
-//    on the OS page size: 4MB/4KB = 1024 bits does not fit, 4MB/16KB = 256 bits does. So we
-//    assert what the page itself reports: either it is eligible and its holes are discarded,
-//    or it is ineligible and the sweep counts it (and discards nothing). Either way its data
+// 6. large pages (4MB, for blocks over ~84KB). Since #477 one purge bit covers as many OS
+//    pages as the page needs to fit the bitmap, so every large page is eligible on every OS
+//    page size and its holes are discarded; only a singleton page (32-bit) has none. Its data
 //    must survive.
 // ---------------------------------------------------------------------------
 
@@ -493,6 +492,10 @@ static bool test_large_pages(void) {
   }
   eligible = mi_page_can_purge_holes(_mi_ptr_page(ptrs[0]));
   singleton = (_mi_ptr_page(ptrs[0])->reserved <= 1);
+  if (!singleton && !eligible) {
+    fprintf(stderr, "\n  a large page is not eligible for hole purging (#477)\n");
+    ok_all = false;
+  }
   for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
 
   before = hole_stats();
@@ -1630,6 +1633,48 @@ static void run_one_thread(void (*fun)(void)) {
 #endif
 
 // ---------------------------------------------------------------------------
+// #477: large pages give their holes back without any idle call -- while the owner stays
+//       busy (its generic-malloc housekeeping, paced by `purge_holes_min_interval`), and when
+//       the thread exits still owning them.
+// ---------------------------------------------------------------------------
+
+static void* large_keep[LARGE_N];
+
+// One block short of a full page: a full large page is abandoned at once, out of its owner's reach.
+static void large_page_with_holes(void) {   // keep the even blocks, free the odd ones
+  for (size_t i = 0; i < LARGE_N - 1; i++) {
+    large_keep[i] = mi_malloc(LARGE_SZ);
+    if (large_keep[i] != NULL) pattern_fill(large_keep[i], LARGE_SZ, i);
+  }
+  for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(large_keep[i]); large_keep[i] = NULL; }
+}
+
+static bool large_survivors_ok_and_free(void) {
+  bool ok = true;
+  for (size_t i = 0; i < LARGE_N; i += 2) {
+    if (large_keep[i] == NULL || pattern_check(large_keep[i], LARGE_SZ, i) != LARGE_SZ) ok = false;
+    mi_free(large_keep[i]);
+    large_keep[i] = NULL;
+  }
+  return ok;
+}
+
+static bool test_large_holes_without_idle(void) {
+  hole_stats_t before = hole_stats();
+  large_page_with_holes();
+  const mi_msecs_t start = _mi_clock_now();
+  while (_mi_clock_now() - start < 300) { mi_free(mi_malloc(2 * LARGE_SZ)); }   // busy, never idle
+  bool ok = expect_purged(before, "large-busy");
+  if (!large_survivors_ok_and_free()) { fprintf(stderr, "\n  large-busy: CORRUPT survivor\n"); ok = false; }
+
+  before = hole_stats();
+  run_one_thread(&large_page_with_holes);   // exits still owning the even blocks
+  if (!expect_purged(before, "large-exit")) ok = false;
+  if (!large_survivors_ok_and_free()) { fprintf(stderr, "\n  large-exit: CORRUPT survivor\n"); ok = false; }
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
 // 12. `purge_holes_min_interval` paces the OWNER's own sweeps, not only the
 //     scavenger's claim of a parked thread's tld.
 //
@@ -1825,6 +1870,7 @@ int main(void) {
   CHECK("sweep-does-not-unpurge-on-collect", test_sweep_no_unpurge_on_collect());
   CHECK("sweep-full-every-bounds-a-missed-hole", test_sweep_full_every());
   CHECK("owner-sweeps-are-paced", test_owner_sweep_pacing());
+  CHECK("large-holes-without-idle", test_large_holes_without_idle());
 
   // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);

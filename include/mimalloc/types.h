@@ -949,7 +949,6 @@ typedef struct mi_arena_s {
   bool                is_auto_reserved;     // created by mi_arena_reserve, not a public reserve/manage API
   mi_decl_align(8)                          // needed on some 32-bit platforms
   _Atomic(mi_msecs_t) purge_expire;         // expiration time when slices can be purged from `slices_purge`.
-  _Atomic(mi_msecs_t) purge_expire_max;     // #457: frees move `purge_expire` out, but never past this
   mi_commit_fun_t*    commit_fun;           // custom commit/decommit memory
   void*               commit_fun_arg;       // user argument for a custom commit function
 
@@ -960,6 +959,7 @@ typedef struct mi_arena_s {
   mi_bitmap_t*        slices_committed;     // is the slice committed? (i.e. accessible)
   mi_bitmap_t*        slices_dirty;         // is the slice potentially non-zero?
   mi_bitmap_t*        slices_purge;         // slices that can be purged
+  mi_bitmap_t*        slices_purge_aged;    // #457: ... and were already queued at the previous purge deadline
   mi_page_t*          pages_meta;           // pre-allocated `slice_count` page meta info -- only used if `MI_PAGE_META_IS_SEPARATED!=0`
   mi_arena_pages_t    pages_main;           // arena page bitmaps for the main heap are allocated up front as well
 

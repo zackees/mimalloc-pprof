@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit d0507738 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2e592491 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -3340,6 +3340,7 @@ typedef struct mi_arena_s {
   bool                is_auto_reserved;     // created by mi_arena_reserve, not a public reserve/manage API
   mi_decl_align(8)                          // needed on some 32-bit platforms
   _Atomic(mi_msecs_t) purge_expire;         // expiration time when slices can be purged from `slices_purge`.
+  _Atomic(mi_msecs_t) purge_expire_max;     // #457: frees move `purge_expire` out, but never past this
   mi_commit_fun_t*    commit_fun;           // custom commit/decommit memory
   void*               commit_fun_arg;       // user argument for a custom commit function
 
@@ -12773,6 +12774,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
     arena->numa_node = numa_node;
   }
   arena->purge_expire = 0;
+  arena->purge_expire_max = 0;
   arena->commit_fun = commit_fun;
   arena->commit_fun_arg = commit_fun_arg;
   arena->parent = parent;
@@ -13358,6 +13360,7 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
     mi_msecs_t expire0 = 0;
     if (mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire)) {
       // expiration was not yet set
+      mi_atomic_storei64_relaxed(&arena->purge_expire_max, expire + 9*delay);
       // maybe set the global arenas expire as well (if it wasn't set already)
       mi_assert_internal(expire0==0);
       // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a)
@@ -13371,9 +13374,12 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
       // #457: already armed. Move the deadline out, so the arena is purged once it has had no
       // frees for `delay`: memory freed during churn is about to be reused, and purging it
       // only makes the next allocation re-fault it (upstream v2 extended it on every free
-      // too). At most once per delay/10, so the shared line is rarely written.
-      if (expire - expire0 > delay/10) {
-        mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire);
+      // too). Never past 10*delay after arming, so constant churn still purges about once
+      // per second; and at most once per delay/10, so the shared line is rarely written.
+      const mi_msecs_t emax = mi_atomic_loadi64_relaxed(&arena->purge_expire_max);
+      const mi_msecs_t moved = (expire < emax ? expire : emax);
+      if (moved - expire0 > delay/10) {
+        mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, moved);
       }
       // #457: if a settle raced this arena's 0 -> set, the subproc deadline is 0 while this
       // arena is armed; re-arm it so the scavenger wakes for it.

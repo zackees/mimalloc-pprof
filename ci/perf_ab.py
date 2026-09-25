@@ -2,7 +2,7 @@
 """Paired A/B of two allocator revisions on a few large-block workloads (#479).
 
 Builds the minimal static library at --base and --head (every observability flag named
-OFF; a second build with MI_PPROF=ON for the profiler rows, run with MIMALLOC_PROF=1), links
+OFF; the BUILDS table adds flags for the profiler and chart-build rows), links
 ci/perf_ab.c against each, and runs every workload --reps times with the arm
 order alternating inside each repetition. Prints a markdown table of medians and the
 median paired difference with a bootstrap 95% interval; a direction is only claimed when
@@ -36,18 +36,27 @@ FLAGS = [
     "-DMI_DHAT=OFF",
     "-DMI_OWNER_GATE=OFF",
 ]
-# name: (profiled, (threads, generations, min bytes, max bytes, ops per thread, pause ms)). A
-# profiled row runs the MI_PPROF=ON build with sampling on at the default rate: it is the gate
-# that a memory strategy does not slow the profiler down. A pause makes the row bursty (#486):
-# BURSTS bursts per thread, everything freed after each, then idle for the pause.
+# The builds a row can run on: extra CMake flags over FLAGS, and extra environment. "pprof"
+# samples at the default rate: the gate that a memory strategy does not slow the profiler down.
+# "chart" is how the README scaling charts build mimalloc-pprof (profiler and memory events
+# compiled in, both off at run time, #478): a regression only that build shows is still one.
+# (Names of equal length: see `build`.)
+BUILDS: dict[str, tuple[list[str], dict[str, str]]] = {
+    "plain": ([], {}),
+    "pprof": (["-DMI_PPROF=ON"], {"MIMALLOC_PROF": "1"}),
+    "chart": (["-DMI_PPROF=ON", "-DMI_MEMEVT=ON"], {}),
+}
+# name: (build, (threads, generations, min bytes, max bytes, ops per thread, pause ms)). A pause
+# makes the row bursty (#486): BURSTS bursts per thread, everything freed after each, then idle.
 WORKLOADS = {
-    "large-class/8": (False, (8, 1, 96 << 10, 512 << 10, 400000, 0)),
-    "large-class-ephemeral/8": (False, (8, 8, 96 << 10, 512 << 10, 400000, 0)),
-    "random-large/8": (False, (8, 1, 64 << 10, 4 << 20, 40000, 0)),
-    "random-large-bursty/8": (False, (8, 1, 64 << 10, 4 << 20, 40000, 300)),
-    "random-large/1": (False, (1, 1, 64 << 10, 4 << 20, 200000, 0)),
-    "small/8 (control)": (False, (8, 1, 16, 1024, 5000000, 0)),
-    "large-class/8 (profiler on)": (True, (8, 1, 96 << 10, 512 << 10, 400000, 0)),
+    "large-class/8": ("plain", (8, 1, 96 << 10, 512 << 10, 400000, 0)),
+    "large-class-ephemeral/8": ("plain", (8, 8, 96 << 10, 512 << 10, 400000, 0)),
+    "random-large/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 0)),
+    "random-large-bursty/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 300)),
+    "random-large/1": ("plain", (1, 1, 64 << 10, 4 << 20, 200000, 0)),
+    "small/8 (control)": ("plain", (8, 1, 16, 1024, 5000000, 0)),
+    "large-class/8 (profiler on)": ("pprof", (8, 1, 96 << 10, 512 << 10, 400000, 0)),
+    "large-class-ephemeral/8 (chart build)": ("chart", (8, 8, 96 << 10, 512 << 10, 400000, 0)),
 }
 # what ci/perf_ab.c prints, in order; the byte counts are shown in MiB
 METRICS = (
@@ -64,23 +73,21 @@ IN_MIB = {"peak RSS MiB", "RSS 0.5 s after drain MiB", "RSS at release bound MiB
 # #491: the promise "idle memory is back within bound_ms"; perf-ab fails when head breaks it
 RATCHET = ROOT / "ci/release_ratchet.json"
 RELEASE_PERCENTILE = 95
-PROFILER_ENV = {**os.environ, "MIMALLOC_PROF": "1"}
 
 
 def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
     return subprocess.run(cmd, cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout
 
 
-def build(arm: str, ref: str, work: Path, profiled: bool) -> Path:
-    # Paths named by arm ("base"/"head") and build ("pprof"/"plain"), never by ref: every
+def build(arm: str, ref: str, work: Path, kind: str) -> Path:
+    # Paths named by arm ("base"/"head") and build (BUILDS), never by ref: every
     # executable path then has the same length, and so does the process's initial stack. A
     # longer argv/environment shifts stack alignment, the likely reason identical binaries
     # differed by 17% on the small-object row of #494's null run.
-    tree, out = work / f"src-{arm}", work / f"bin-{arm}-{'pprof' if profiled else 'plain'}"
+    tree, out = work / f"src-{arm}", work / f"bin-{arm}-{kind}"
     if not tree.exists():
         run(["git", "worktree", "add", "--detach", str(tree), ref], cwd=ROOT)
-    flags = [f if f != "-DMI_PPROF=OFF" or not profiled else "-DMI_PPROF=ON" for f in FLAGS]
-    run(["cmake", "-S", str(tree), "-B", str(out), *flags])
+    run(["cmake", "-S", str(tree), "-B", str(out), *FLAGS, *BUILDS[kind][0]])
     run(["cmake", "--build", str(out), "--target", "mimalloc-static", "--parallel"])
     exe = out / "perf_ab"
     lib = next(out.glob("libmimalloc*.a"))
@@ -118,6 +125,15 @@ def paired(base: list[float], head: list[float]) -> tuple[float, float, float]:
     return statistics.median(diffs), boots[50], boots[1949]
 
 
+def cpu_model() -> str:
+    # an effect can depend on the CPU the runner happens to get (#478: -6.5% on some runners,
+    # 0 on others), so every table says which one it came from
+    for line in Path("/proc/cpuinfo").read_text().splitlines():
+        if line.startswith("model name"):
+            return line.split(":", 1)[1].strip()
+    return "unknown CPU"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True)
@@ -136,18 +152,18 @@ def main() -> int:
         work = Path(tmp)
         try:
             exes = {
-                (arm, profiled): build(arm, ref, work, profiled)
+                (arm, kind): build(arm, ref, work, kind)
                 for arm, ref in (("base", args.base), ("head", args.head))
-                for profiled in sorted({p for p, _ in workloads.values()})
+                for kind in sorted({k for k, _ in workloads.values()})
             }
             samples: dict[tuple[str, str], list[list[float]]] = {
                 (w, a): [] for w in workloads for a in ("base", "head")
             }
             for rep in range(args.reps):
-                for workload, (profiled, params) in workloads.items():
+                for workload, (kind, params) in workloads.items():
                     for arm in ("base", "head") if rep % 2 == 0 else ("head", "base"):
-                        exe = str(exes[(arm, profiled)])
-                        env = PROFILER_ENV if profiled else None
+                        exe = str(exes[(arm, kind)])
+                        env = {**os.environ, **BUILDS[kind][1]}
                         cmd = [exe, *map(str, params), str(bound_ms)]
                         values = list(map(float, run(cmd, env=env).split()))
                         for index, metric in enumerate(METRICS):
@@ -158,7 +174,7 @@ def main() -> int:
             for tree in work.glob("src-*"):
                 run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
     rows = [
-        f"`{args.base}` vs `{args.head}`, {args.reps} paired reps, alternating order. "
+        f"`{args.base}` vs `{args.head}` on {cpu_model()}, {args.reps} paired reps, alternating order. "
         "Median base -> head, then median paired difference [bootstrap 95%]; "
         "**bold** when the interval excludes 0.",
         "",

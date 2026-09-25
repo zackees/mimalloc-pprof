@@ -850,7 +850,8 @@ if(MI_USE_CXX)
   # Ported anyway per the issue: harmless (the file's `#ifdef __cplusplus` branches already
   # target this), and keeps the CMake shape identical to Bun's should this tree's extern "C"
   # wrapping ever change.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c PROPERTIES LANGUAGE CXX )
+  # test-arena-purge-rearm.c (#491): calls `_mi_release_bound_ms` from internal.h, the same case.
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c PROPERTIES LANGUAGE CXX )
 endif()
 
 

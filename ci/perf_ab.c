@@ -5,10 +5,12 @@
    Each thread replays a seeded stream over 8 live slots (allocate 8 / free-oldest 6 /
    free-random 2, one write per 4 KiB). With generations > 1 each thread runs its stream as
    that many short-lived threads, each exiting while it still owns live slots that the next
-   one frees. Prints one line: ops/s, cpu seconds, peak RSS, and RSS DRAIN_SHORT_MS and
+   one frees. Prints one line: ops/s, process cpu seconds, the workers' own cpu seconds (the
+   allocating threads, without the scavenger), minor page faults, peak RSS, and RSS DRAIN_SHORT_MS and
    DRAIN_LONG_MS after everything was freed while the worker threads stay alive and idle (a
    server between requests): the first reads the arena purge, the second a retention window.
    Linux only (getrusage + /proc/self/statm). */
+#define _GNU_SOURCE   /* RUSAGE_THREAD */
 #include <mimalloc.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -24,7 +26,7 @@
 #define DRAIN_SHORT_MS 500
 #define DRAIN_LONG_MS  2000
 
-typedef struct { uint64_t rng; size_t lo, hi; long ops; void* slot[SLOTS]; int fifo[4096]; size_t head, tail; } stream_t;
+typedef struct { uint64_t rng; size_t lo, hi; long ops; void* slot[SLOTS]; int fifo[4096]; size_t head, tail; double cpu; } stream_t;
 
 static uint64_t next(uint64_t* s) {
   uint64_t z = (*s += 0x9e3779b97f4a7c15ull);
@@ -49,12 +51,20 @@ static void run_ops(stream_t* st, long n) {
   }
 }
 
+static double cpu_of(const struct rusage* ru) {
+  return (double)(ru->ru_utime.tv_sec + ru->ru_stime.tv_sec) + (double)(ru->ru_utime.tv_usec + ru->ru_stime.tv_usec) * 1e-6;
+}
+
+/* the calling thread's cpu so far: a worker adds it to its stream just before it exits or idles */
+static double thread_cpu(void) { struct rusage ru; getrusage(RUSAGE_THREAD, &ru); return cpu_of(&ru); }
+
 static int generations;
 static atomic_int drained, release_workers;
 
 static void* generation_main(void* arg) {
   stream_t* st = (stream_t*)arg;
   run_ops(st, st->ops / generations);
+  st->cpu += thread_cpu();
   return NULL;  /* exits still owning st->slot[] */
 }
 
@@ -69,6 +79,7 @@ static void* worker_main(void* arg) {
     }
   }
   for (int i = 0; i < SLOTS; i++) { mi_free(st->slot[i]); st->slot[i] = NULL; }
+  st->cpu += thread_cpu();
   atomic_fetch_add(&drained, 1);
   while (!atomic_load(&release_workers)) usleep(1000);   /* idle, but alive */
   return NULL;
@@ -103,9 +114,10 @@ int main(int argc, char** argv) {
   const long rss_short = rss_bytes();
   usleep((DRAIN_LONG_MS - DRAIN_SHORT_MS) * 1000);
   const long rss_long = rss_bytes();
-  const double cpu = (double)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) + (double)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) * 1e-6;
-  printf("%.1f %.4f %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu,
-         ru.ru_maxrss * 1024L, rss_short, rss_long);
+  double owner_cpu = 0;
+  for (int i = 0; i < threads; i++) owner_cpu += st[i].cpu;
+  printf("%.1f %.4f %.4f %ld %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu_of(&ru),
+         owner_cpu, ru.ru_minflt, ru.ru_maxrss * 1024L, rss_short, rss_long);
   atomic_store(&release_workers, 1);
   for (int i = 0; i < threads; i++) pthread_join(t[i], NULL);
   free(st); free(t);

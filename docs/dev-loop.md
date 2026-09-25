@@ -112,3 +112,83 @@ survive without deliberately wiping them first.
 If Docker Desktop is unavailable, the documented fallback is a host-side soldr
 cross-build followed by a slim Linux runtime container. It is slower because
 the build runs on the Windows filesystem; run the Docker recovery tool first.
+
+## Memory gate: fast local loop (#517)
+
+Memory measurements are fine to take locally: a peak RSS on this box is stable to about
++-0.1 MB run to run. Timing and performance measurements are not -- a local number says
+nothing about the runner, so CPU-cost questions go through the `perf-ab` label workflow.
+
+Why this loop exists: #501 raised the memory gate's minimum peak from 58.2 MB to
+61-63.7 MB and nobody noticed, because minimal-lane pushes skip the gate (#514, #517).
+Check it yourself before pushing anything that touches the arena, purge or page paths.
+
+One warm Release build, then rebuild only the gate binary:
+
+```bash
+cmake -S . -B build-mem -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DMI_PPROF=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON -DMI_BUILD_TESTS=ON
+ninja -C build-mem mimalloc-test-memory-gate
+```
+
+Take the minimum of 3-4 runs and check it against the committed baseline:
+
+```bash
+rm -f gate-*.json
+for i in 1 2 3 4; do
+  MI_BENCH_JSON=gate-$i.json build-mem/mimalloc-test-memory-gate > /dev/null
+done
+uv run ci/memory_gate.py check gate-*.json
+```
+
+`check` warns that it got fewer than 8 runs; that is expected here. CI takes the minimum
+of 8 runs and compares it with `ci/memory-baselines/linux-pprof1.json`, allowing +5%
+(`PEAK_TOLERANCE`). With four runs the minimum is already within the noise of CI's.
+
+Per-scenario numbers: `check` prints a table of the high-water mark after each scenario
+(from each run's `scenarios` array), so the scenario whose line first jumps is the one that
+moved the peak. To iterate on a single workload, set `MI_GATE_SCENARIO` to one of
+`thread_churn`, `sawtooth`, `cross_thread_free`, `rolling_heaps` or `huge_churn`: the
+warm-up still runs, then only that scenario, in a few seconds.
+
+```bash
+MI_GATE_SCENARIO=thread_churn MI_BENCH_JSON=one.json build-mem/mimalloc-test-memory-gate
+```
+
+A filtered run is not comparable to the baseline (the full battery's peak includes every
+scenario), so `memory_gate.py check` refuses it with exit 2. Read its `scenarios` entry or
+stdout line and compare it with the same filtered run on another commit.
+
+Toggle a feature at run time before rebuilding anything:
+
+| Variable | Effect |
+| --- | --- |
+| `MIMALLOC_RESIDENT_FIRST=0` | plain arena search only, no resident-first claiming (#493) |
+| `MIMALLOC_ARENA_PURGE_MULT=<n>` | purge delay multiplier for arenas (#486) |
+| `MIMALLOC_PAGE_RESERVE=0` | do not keep an exiting thread's empty large pages (#493) |
+| `MIMALLOC_PURGE_HOLES=0` | no hole purging on `mi_on_thread_idle` |
+
+Compile-time knobs are `#ifndef` defines (CLAUDE.md rule 9), so override them through
+the C flags into a separate build dir, e.g.
+`-DCMAKE_C_FLAGS=-DMI_RESIDENT_FIRST_MIN_SLICES=<n>`.
+
+To bisect across merges, use ONE scratch worktree and one build dir inside it, not a
+fresh checkout per commit:
+
+```bash
+git worktree add ../mimalloc-bisect <sha>
+# configure ../mimalloc-bisect/build-mem once, as above; then per step:
+git -C ../mimalloc-bisect checkout <next-sha>
+ninja -C ../mimalloc-bisect/build-mem mimalloc-test-memory-gate
+```
+
+The exact regression check for #514 is a ctest in the same build:
+
+```bash
+ninja -C build-mem mimalloc-test-resident-first-churn
+ctest --test-dir build-mem -R test-resident-first-churn --output-on-failure
+```
+
+It runs the gate's thread-churn pattern with the scavenger off and asserts that no fresh
+(never-dirty) arena slice is claimed after the warm-up round, using the `MI_DIAGNOSTICS`
+claim counters (`_mi_arena_claim_counters`). It needs `-DMI_DIAGNOSTICS=ON`.

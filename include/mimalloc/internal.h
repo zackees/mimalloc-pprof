@@ -1355,6 +1355,21 @@ void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner rese
 void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
 bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
 long          _mi_release_bound_ms(void);                                       // #491: idle memory is back with the OS within this many ms
+
+// #517: arena slice claims by kind, counted process-wide in `mi_arena_try_alloc_at` when
+// MI_DIAGNOSTICS=1. `plain_fresh` is a plain-search claim that includes at least one slice that
+// was never dirty (never handed out before); its `_slices` counts only those never-dirty slices.
+typedef struct mi_arena_claim_counters_s {
+  size_t resident_first_claims;
+  size_t resident_first_slices;
+  size_t plain_reused_claims;
+  size_t plain_reused_slices;
+  size_t plain_fresh_claims;
+  size_t plain_fresh_slices;
+} mi_arena_claim_counters_t;
+bool          _mi_arena_claim_counters(mi_arena_claim_counters_t* out);   // false (and *out zeroed) when not compiled in (MI_DIAGNOSTICS=0)
+void          _mi_arena_claim_counters_reset(void);
+
 void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
 void          _mi_pages_release_schedule(mi_subproc_t* subproc);  // #483/#493: a retired or reserved page waits for the scavenger's release
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,

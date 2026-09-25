@@ -201,6 +201,23 @@ mimalloc remains collected in a separately labelled supplemental row.
 
 [![Uniformly random requested sizes: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
+### Short-lived threads
+
+Every chart above keeps its worker threads alive for the whole run. These two workloads
+replay one identical 96–512 KiB request stream (the size classes a mimalloc large page
+serves); only thread lifetime differs. In the short-lived variant each worker runs its
+stream as 8 successive threads, and each thread exits while still owning live blocks
+that the next one frees. Both share one Y axis per metric, so the gap between them is
+the cost of short-lived threads.
+
+[![Long-lived threads, 96-512 KiB: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Long-lived threads, 96-512 KiB: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Short-lived threads, 96-512 KiB: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Short-lived threads, 96-512 KiB: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
 Full methodology, per-cell tables and the other benchmark families are in
 [Performance](#performance) below and on the
 [dashboard](https://zackees.github.io/mimalloc-pprof/#scaling).

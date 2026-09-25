@@ -1,8 +1,9 @@
 use std::alloc::{alloc, dealloc, realloc, Layout};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::thread::ThreadId;
 
 use benchmark_suite::execution::AllocatorAdapter;
 use benchmark_suite::model::{AllocatorIdentity, RunnerMetadata, ToolchainMetadata};
@@ -20,6 +21,10 @@ struct MockAdapter {
     id: &'static str,
     layouts: Mutex<HashMap<usize, Layout>>,
     frees: AtomicU64,
+    /// Threads that allocated, and the allocating thread of each live block.
+    alloc_threads: Mutex<HashSet<ThreadId>>,
+    owners: Mutex<HashMap<usize, ThreadId>>,
+    foreign_frees: AtomicU64,
 }
 
 impl MockAdapter {
@@ -28,6 +33,9 @@ impl MockAdapter {
             id,
             layouts: Mutex::new(HashMap::new()),
             frees: AtomicU64::new(0),
+            alloc_threads: Mutex::new(HashSet::new()),
+            owners: Mutex::new(HashMap::new()),
+            foreign_frees: AtomicU64::new(0),
         }
     }
 }
@@ -61,6 +69,12 @@ impl AllocatorAdapter for MockAdapter {
             .lock()
             .unwrap()
             .insert(pointer.as_ptr() as usize, layout);
+        let thread = std::thread::current().id();
+        self.alloc_threads.lock().unwrap().insert(thread);
+        self.owners
+            .lock()
+            .unwrap()
+            .insert(pointer.as_ptr() as usize, thread);
         Ok(pointer)
     }
     fn calloc(&self, count: usize, size: usize) -> Result<NonNull<u8>, String> {
@@ -98,6 +112,14 @@ impl AllocatorAdapter for MockAdapter {
             .unwrap()
             .remove(&(pointer.as_ptr() as usize))
             .expect("mock free of an unknown pointer");
+        let owner = self
+            .owners
+            .lock()
+            .unwrap()
+            .remove(&(pointer.as_ptr() as usize));
+        if owner.is_some_and(|owner| owner != std::thread::current().id()) {
+            self.foreign_frees.fetch_add(1, Ordering::Relaxed);
+        }
         self.frees.fetch_add(1, Ordering::Relaxed);
         unsafe { dealloc(pointer.as_ptr(), layout) };
     }
@@ -309,6 +331,37 @@ fn execution_matches_the_derived_oracle_for_every_pattern_and_thread_point() {
             assert!(response.free_calls > 0 && response.alloc_calls > 0);
         }
     }
+}
+
+#[test]
+fn ephemeral_large_class_replays_the_control_on_short_lived_threads() {
+    let run = |pattern: ScalingPattern| {
+        let adapter = MockAdapter::new("upstream-mimalloc");
+        let request = request_for(pattern, 1, 0, "upstream-mimalloc", 800);
+        let response = execute_scaling_child_request(&adapter, request).unwrap();
+        let threads = adapter.alloc_threads.lock().unwrap().len();
+        let foreign = adapter.foreign_frees.load(Ordering::Relaxed);
+        (
+            (response.alloc_calls, response.free_calls, response.checksum),
+            threads,
+            foreign,
+        )
+    };
+    let (control, control_threads, control_foreign) = run(ScalingPattern::LargeClassPersistent);
+    let (ephemeral, ephemeral_threads, ephemeral_foreign) =
+        run(ScalingPattern::LargeClassEphemeral);
+    assert_eq!(
+        control, ephemeral,
+        "thread lifetime must be the only variable"
+    );
+    assert_eq!((control_threads, control_foreign), (1, 0));
+    // Every generation is its own thread (ThreadIds are never reused), and
+    // blocks outlive the thread that allocated them.
+    assert!(ephemeral_threads >= ScalingPattern::LargeClassEphemeral.generations() as usize);
+    assert!(
+        ephemeral_foreign > 0,
+        "no block outlived its allocating thread"
+    );
 }
 
 #[test]

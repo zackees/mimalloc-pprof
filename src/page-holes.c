@@ -568,9 +568,11 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
   if (rend <= rlo) return;   // nothing of the discarded tail is needed yet
 
   _mi_os_reuse(mi_page_subproc(page), (void*)rlo, (size_t)(rend - rlo));
-  // #487: these blocks are formatted right now; fault them in with one call rather than one
-  // fault per OS page as they are written
-  (void)_mi_prim_populate((void*)rlo, (size_t)(rend - rlo));
+  // #487: the blocks being formatted now (from the current end of the formed area) are faulted
+  // in with one call rather than one fault per OS page as they are written
+  const uintptr_t formed = _mi_align_down(pstart + (size_t)page->capacity * page->block_size, _mi_os_page_size());
+  const uintptr_t plo = (formed > rlo ? formed : rlo);
+  if (rend > plo) { (void)_mi_prim_populate((void*)plo, (size_t)(rend - plo)); }
   if (rend >= rhi) { page->unformed_purged_lo = 0; page->unformed_purged_hi = 0; }
   else { page->unformed_purged_lo = (uint32_t)(rend - pstart); }
   mi_atomic_addi64_relaxed(&mi_holes_unformed_reuse_calls, 1);

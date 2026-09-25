@@ -1347,7 +1347,7 @@ void          _mi_page_holes_reset_ineligible(void);
 void          _mi_page_purge_holes_begin(mi_tld_t* tld);         // around each pass of a sweep; `tld` is the thread being swept
 void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
-void          _mi_theap_purge_large_holes(mi_theap_t* theap);   // #477: the owner's paced busy-time sweep (src/page-holes.c)
+void          _mi_theap_purge_large_holes(mi_theap_t* theap, bool at_exit);   // #477: the owner's paced busy-time sweep, or its exit sweep (src/page-holes.c)
 void          _mi_purge_holes_of(mi_tld_t* tld, bool force);     // the sweep itself (src/page-holes.c); #366: `force` skips the interval pacing and reads MI_GATE_FLAG_RECLAIM_IGNORED
 void          _mi_page_holes_assert_valid(const mi_page_t* page);   // MI_DEBUG hole invariants, called from `_mi_page_is_valid`
 

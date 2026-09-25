@@ -182,6 +182,7 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
 }
 
 void _mi_theap_collect_abandon(mi_theap_t* theap) {
+  _mi_theap_purge_large_holes(theap, true);   // #477: before its large pages are abandoned
   mi_theap_collect_ex(theap, MI_ABANDON);
 }
 

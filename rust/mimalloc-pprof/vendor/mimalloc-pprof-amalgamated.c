@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit aab24b0a of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2765bd1c of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -5902,7 +5902,7 @@ void          _mi_page_holes_reset_ineligible(void);
 void          _mi_page_purge_holes_begin(mi_tld_t* tld);         // around each pass of a sweep; `tld` is the thread being swept
 void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
-void          _mi_theap_purge_large_holes(mi_theap_t* theap, bool at_exit);   // #477: the owner's paced busy-time sweep, or its exit sweep (src/page-holes.c)
+void          _mi_theap_purge_large_holes(mi_theap_t* theap);   // #477: the owner's paced busy-time sweep (src/page-holes.c)
 void          _mi_purge_holes_of(mi_tld_t* tld, bool force);     // the sweep itself (src/page-holes.c); #366: `force` skips the interval pacing and reads MI_GATE_FLAG_RECLAIM_IGNORED
 void          _mi_page_holes_assert_valid(const mi_page_t* page);   // MI_DEBUG hole invariants, called from `_mi_page_is_valid`
 
@@ -25001,7 +25001,7 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
       _mi_deferred_free(theap, false);         // call potential deferred free routines      
       _mi_theap_collect_retired(theap, false); // free retired pages      
     }
-    _mi_theap_purge_large_holes(theap, false); // #477: release large-page holes while busy
+    _mi_theap_purge_large_holes(theap);        // #477: release large-page holes while busy
   }
   return theap;
 }
@@ -26474,18 +26474,16 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
 // once per `purge_holes_min_interval`. `holes_busy` makes it leave any page that was used since
 // the previous tick: its free blocks are about to be reused, and discarding them now would only
 // make the next allocation re-fault them.
-void _mi_theap_purge_large_holes(mi_theap_t* theap, bool at_exit) {
+void _mi_theap_purge_large_holes(mi_theap_t* theap) {
   mi_tld_t* const tld = theap->tld;
   if (tld == NULL || tld->holes_sweeping || !mi_option_is_enabled(mi_option_purge_holes)) return;
+  const mi_msecs_t now = _mi_clock_now();
+  if (now - tld->holes_busy_last < (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000)) return;
+  tld->holes_busy_last = now;
   const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
   const size_t bin_hi = _mi_bin(MI_LARGE_MAX_OBJ_SIZE) + 1;
-  if (!at_exit) {
-    const mi_msecs_t now = _mi_clock_now();
-    if (now - tld->holes_busy_last < (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000)) return;
-    tld->holes_busy_last = now;
-    tld->holes_busy = true;
-    _mi_arenas_purge_abandoned_holes(_mi_theap_heap(theap), tld, bin_lo, bin_hi);
-  }
+  tld->holes_busy = true;
+  _mi_arenas_purge_abandoned_holes(_mi_theap_heap(theap), tld, bin_lo, bin_hi);
   _mi_page_purge_holes_begin(tld);
   for (size_t bin = bin_lo; bin < bin_hi; bin++) {
     for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {
@@ -32152,7 +32150,6 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
 }
 
 void _mi_theap_collect_abandon(mi_theap_t* theap) {
-  _mi_theap_purge_large_holes(theap, true);   // #477: before its large pages are abandoned
   mi_theap_collect_ex(theap, MI_ABANDON);
 }
 

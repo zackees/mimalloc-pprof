@@ -1038,6 +1038,24 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
   // initialize the page start
   uint8_t* const start = slice_start + block_start;
   mi_assert_internal(start > (uint8_t*)page);
+
+  // #493: the slack past the last block, `[start + reserved*block_size, page end)`, is never used
+  // by this page -- and nothing discards it while the page lives: the hole sweep and the retired
+  // page release (#483) stop at the block area. On reused (dirty) memory it can still be resident
+  // from the range's previous life, as a block of a page with another block size. Resident-first
+  // claiming reuses exactly such memory, and an idle thread's retired large pages then pinned up
+  // to a block of stale memory each for good (PR #501: +34% RSS at the release bound). So give it
+  // back now. Only a large page's slack reaches MI_PAGE_SLACK_DISCARD_MIN, so this is at most one
+  // discard per large page carved from dirty memory. The commit state stays as it is.
+  if (memid.memkind == MI_MEM_ARENA && !memid.initially_zero && memid.initially_committed &&
+      !memid.is_pinned && !os_align && mi_memid_arena(memid)->commit_fun == NULL)
+  {
+    uint8_t* const slack_lo = (uint8_t*)_mi_align_up((uintptr_t)(start + (reserved * block_size)), _mi_os_page_size());
+    uint8_t* const slack_hi = (uint8_t*)_mi_align_down((uintptr_t)(slice_start + page_noguard_size), _mi_os_page_size());
+    if (slack_hi > slack_lo && (size_t)(slack_hi - slack_lo) >= MI_PAGE_SLACK_DISCARD_MIN) {
+      _mi_os_discard(_mi_theap_subproc(theap), slack_lo, (size_t)(slack_hi - slack_lo));
+    }
+  }
   const size_t offset = start - (uint8_t*)page;
   mi_assert_internal((offset % MI_MAX_ALIGN_SIZE) == 0 && (offset / MI_MAX_ALIGN_SIZE) <= UINT32_MAX);
   page->page_ma_offset = (uint32_t)(offset / MI_MAX_ALIGN_SIZE);

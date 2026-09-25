@@ -1502,6 +1502,7 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
             // break early: reset the non-visited bits
             if (b!=0) {
               mi_atomic_or_relaxed(&chunk->bfields[j], b);
+              mi_bitmap_chunkmap_set(bitmap, chunk_idx);   // #493: see the restore in `_mi_bitmap_forall_setc_rangesn`
             }
             return false;
           }
@@ -1556,6 +1557,7 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
               mi_assert_internal((notyet_visited & skipped) == 0);
               if ((notyet_visited | skipped) != 0) {
                 mi_atomic_or_relaxed(&chunk->bfields[j], notyet_visited | skipped);
+                mi_bitmap_chunkmap_set(bitmap, chunk_idx);   // #493: see below
               }
               return false;
             }
@@ -1572,6 +1574,11 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
         if (skipped != 0) {
           //  restore non-visited entries
           mi_atomic_or_relaxed(&chunk->bfields[j], skipped);
+          // #493: and the chunkmap bit, like every other setter. Between our exchange and this
+          // restore the chunk can read all clear, and a concurrent `mi_bitmap_clearN` in it (the
+          // arena clears claimed ranges out of the purge queues) then clears the chunkmap bit
+          // -- leaving the restored bits where no visitor looks: queued, never purged.
+          mi_bitmap_chunkmap_set(bitmap, chunk_idx);
         }
       }
     }
@@ -1805,10 +1812,14 @@ bool mi_bbitmap_try_clearNC(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
 }
 
 // #493 (strategy 9): claim `n` bits at a known `idx` (not crossing a chunk) for an allocation of
-// `n` slices. Unlike the purge's `mi_bbitmap_try_clearNC` this keeps to the size bins, exactly as
-// `mi_bbitmap_try_find_and_clear_generic` does: only a chunk of the bin of `n`, or one not yet
-// binned, and a claim at the start of an unbinned chunk bins it -- so claiming a known range
-// never mixes page sizes in a chunk that the plain search keeps apart.
+// `n` slices. Unlike the purge's `mi_bbitmap_try_clearNC` this keeps to the size bins the way
+// `mi_bbitmap_try_find_and_clear_generic` does: a chunk of the bin of `n`; or an unbinned chunk
+// at its start, which the claim then bins; or an unbinned chunk whose first slice is in use
+// (already mixed, like the arena's first chunk behind its meta data, where the plain search
+// claims unbinned too). Never the middle of an unbinned chunk that starts free: the plain search
+// would claim its start and bin it, while a page left in the middle unbinned lets every size
+// class share the chunk -- the fragmentation the bins exist to stop, and the fresh memory it
+// costs (PR #501: the guarded memory gate's peak). The bin reads are hints, as in the search.
 bool mi_bbitmap_try_claimN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   if (n == 0 || n > MI_BCHUNK_BITS) return false;
   const size_t chunk_idx = idx / MI_BCHUNK_BITS;
@@ -1816,9 +1827,13 @@ bool mi_bbitmap_try_claimN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   if (cidx + n > MI_BCHUNK_BITS || chunk_idx >= mi_bbitmap_chunk_count(bbitmap)) return false;
   const mi_chunkbin_t bbin = mi_chunkbin_of(n);
   const mi_chunkbin_t cbin = mi_bbitmap_debug_get_bin(bbitmap->chunkmap_bins, chunk_idx);
-  if (cbin != bbin && cbin != MI_CBIN_NONE) return false;
+  const bool bin_start = (cbin == MI_CBIN_NONE && cidx == 0);
+  if (cbin != bbin && !bin_start) {
+    if (cbin != MI_CBIN_NONE) return false;                                        // another size class
+    if (mi_bchunk_is_xsetN(MI_BIT_SET, &bbitmap->chunks[chunk_idx], 0, 1)) return false;   // starts free
+  }
   if (!mi_bbitmap_try_clearNC(bbitmap, idx, n)) return false;
-  if (cidx == 0 && cbin == MI_CBIN_NONE) { mi_bbitmap_set_chunk_bin(bbitmap, chunk_idx, bbin); }
+  if (bin_start) { mi_bbitmap_set_chunk_bin(bbitmap, chunk_idx, bbin); }
   return true;
 }
 

@@ -999,6 +999,10 @@ static void* mi_block_ptr_set_guarded(mi_block_t* block, size_t obj_size, size_t
   mi_assert_internal(_mi_is_aligned(block, os_page_size));
   mi_assert_internal(_mi_is_aligned(guard_page, os_page_size));
   if (!page->memid.is_pinned && _mi_is_aligned(guard_page, os_page_size)) {
+    // #493: a guard page never holds data. On memory reused from an earlier page (resident-first
+    // claims, reclaimed pages) it can still be resident with that tenant's contents: discard it,
+    // so a guarded block costs one resident OS page, not two.
+    _mi_os_discard(mi_page_subproc(page), guard_page, os_page_size);
     const bool ok = _mi_os_protect(guard_page, os_page_size);
     if mi_unlikely(!ok) {
       _mi_warning_message("failed to set a guard page behind an object (object %p of size %zu)\n", block, block_size);

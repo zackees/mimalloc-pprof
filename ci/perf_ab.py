@@ -125,6 +125,15 @@ def paired(base: list[float], head: list[float]) -> tuple[float, float, float]:
     return statistics.median(diffs), boots[50], boots[1949]
 
 
+def cpu_model() -> str:
+    # an effect can depend on the CPU the runner happens to get (#478: -6.5% on some runners,
+    # 0 on others), so every table says which one it came from
+    for line in Path("/proc/cpuinfo").read_text().splitlines():
+        if line.startswith("model name"):
+            return line.split(":", 1)[1].strip()
+    return "unknown CPU"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True)
@@ -165,7 +174,7 @@ def main() -> int:
             for tree in work.glob("src-*"):
                 run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
     rows = [
-        f"`{args.base}` vs `{args.head}`, {args.reps} paired reps, alternating order. "
+        f"`{args.base}` vs `{args.head}` on {cpu_model()}, {args.reps} paired reps, alternating order. "
         "Median base -> head, then median paired difference [bootstrap 95%]; "
         "**bold** when the interval excludes 0.",
         "",

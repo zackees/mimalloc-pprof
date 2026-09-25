@@ -558,6 +558,13 @@ mi_decl_maybe_unused static void mi_scav_init(void) { }
 // Scavenger thread body (shared across platforms)
 // -----------------------------------------------------------------------------
 
+// The longest the scavenger sleeps with nothing scheduled, and the period of its safety-net pass
+// over every arena (#457). A build may override it (e.g. `-DMI_SCAVENGER_MAX_WAIT_MS=5000`,
+// including the Rust crate's build script).
+#ifndef MI_SCAVENGER_MAX_WAIT_MS
+#define MI_SCAVENGER_MAX_WAIT_MS  (30000)
+#endif
+
 static void mi_scavenger_run(void) {
   {   // #366: see `_mi_scavenger_tld`
     mi_theap_t* const own = _mi_theap_default();
@@ -580,22 +587,22 @@ static void mi_scavenger_run(void) {
     mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
     mi_msecs_t timeout_ms;
     if (expire == 0) {
-      // Nothing scheduled: park until woken. Every 30s a full pass re-derives the deadline
+      // Nothing scheduled: park until woken. Every MI_SCAVENGER_MAX_WAIT_MS a full pass re-derives the deadline
       // from the arenas themselves, so a per-arena expiry that never reached the subproc
       // is still purged (#457); the bound also guarantees stop() takes effect.
       const mi_msecs_t now = _mi_clock_now();
-      if (now - full_pass >= 30000) {
+      if (now - full_pass >= MI_SCAVENGER_MAX_WAIT_MS) {
         full_pass = now;
         _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
         continue;
       }
-      timeout_ms = 30000 - (now - full_pass);
+      timeout_ms = MI_SCAVENGER_MAX_WAIT_MS - (now - full_pass);
     }
     else {
       const mi_msecs_t now = _mi_clock_now();
       if (expire > now) {
         timeout_ms = expire - now;
-        if (timeout_ms > 30000) timeout_ms = 30000;
+        if (timeout_ms > MI_SCAVENGER_MAX_WAIT_MS) timeout_ms = MI_SCAVENGER_MAX_WAIT_MS;
       }
       else {
         // A full pass always settles subproc->purge_expire to the earliest pending arena
@@ -607,6 +614,11 @@ static void mi_scavenger_run(void) {
     }
     // a park passed over for its minimum interval is swept when its window ends, not at the safety timeout
     if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
+    // #483: empty large pages their owners abandoned are freed once they stay unused for a tick
+    if (_mi_arenas_free_empty_abandoned(subproc)) {
+      const long tick = mi_option_get_clamp(mi_option_purge_delay, 1, MI_SCAVENGER_MAX_WAIT_MS);
+      if (tick < timeout_ms) { timeout_ms = tick; }
+    }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
     mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
   }

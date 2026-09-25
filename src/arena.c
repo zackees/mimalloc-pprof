@@ -1272,8 +1272,7 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(!mi_page_all_free(page));
-  mi_assert_internal(page->next==NULL && page->prev == NULL);
+  mi_assert_internal(page->next==NULL && page->prev == NULL);   // may be empty: a retired large page (#483)
   mi_assert_internal(_mi_theap_can_touch(current_theap));  // adapted from 942b8342 (issue #271): was mi_theap_matches_thread + an assert requiring current_theap's own heap to match, which does not hold for a detached theap that _mi_theap_abandon (theap.c) is abandoning on behalf of its (foreign) owning thread
   // mi_assert_internal(current_theap == _mi_page_associated_theap(page));
 
@@ -1470,6 +1469,61 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
   mi_bitmap_set(bitmap, slice_index);     // back in the map *before* unowning: unown may free the page
   mi_abandoned_page_unown(page, NULL);
   return true;
+}
+
+// #483: an emptied large page is abandoned rather than retired (`_mi_page_retire`), so an idle
+// owner cannot keep it resident. The scavenger, which owns no theap, frees such pages through the
+// same claim protocol once they have stayed empty and untouched for a whole tick; a page its
+// owner re-adopts in the meantime is never freed.
+void _mi_arenas_note_empty_abandoned(mi_subproc_t* subproc) {
+  if (mi_atomic_load_relaxed(&subproc->empty_abandoned) == 0 &&
+      mi_atomic_exchange_acq_rel(&subproc->empty_abandoned, (size_t)1) == 0) {
+    _mi_scavenger_wake(subproc);
+  }
+}
+
+typedef struct mi_empty_abandoned_arg_s { mi_bitmap_t* bitmap; bool pending; } mi_empty_abandoned_arg_t;
+
+static bool mi_arena_free_empty_abandoned_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  MI_UNUSED(slice_count);
+  mi_empty_abandoned_arg_t* const ea = (mi_empty_abandoned_arg_t*)arg;
+  mi_bitmap_t* const bitmap = ea->bitmap;
+  if (!mi_bitmap_clear(bitmap, slice_index)) return true;   // someone else has the page
+  mi_page_t* const page = mi_arena_page_at_slice(arena, slice_index);
+  if (!mi_page_claim_ownership(page)) { mi_bitmap_set(bitmap, slice_index); return true; }
+  _mi_page_free_collect_no_unpurge(page, true);
+  bool keep = !mi_page_all_free(page);
+  if (!keep) {   // empty: free it only if it was already empty and untouched at the previous tick
+    const uint64_t sig = (uint64_t)(uintptr_t)page->free ^ mi_page_sweep_state(page);
+    keep = (page->swept_state != sig);
+    page->swept_state = sig;
+    if (keep) { ea->pending = true; }   // still pending: tick again
+  }
+  mi_bitmap_set(bitmap, slice_index);   // back in the map before freeing or unowning
+  if (keep) { mi_abandoned_page_unown(page, NULL); }
+  else { _mi_arenas_abandoned_page_free(page, NULL); }
+  return true;
+}
+
+bool _mi_arenas_free_empty_abandoned(mi_subproc_t* subproc) {
+  if (mi_atomic_exchange_acq_rel(&subproc->empty_abandoned, (size_t)0) == 0) return false;
+  mi_empty_abandoned_arg_t ea = { NULL, false };
+  mi_lock(&subproc->heaps_lock) {
+    for (mi_heap_t* heap = subproc->heaps; heap != NULL; heap = heap->next) {
+      if (mi_atomic_load_acquire(&heap->releasing) != 0) continue;
+      mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
+        mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
+        for (size_t bin = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1); arena_pages != NULL && bin <= _mi_bin(MI_LARGE_MAX_OBJ_SIZE) && bin < MI_ARENA_BIN_COUNT; bin++) {
+          if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
+          ea.bitmap = mi_arena_pages_abandoned(arena_pages, bin);
+          if (ea.bitmap != NULL) { (void)_mi_bitmap_forall_set(ea.bitmap, &mi_arena_free_empty_abandoned_at, arena, &ea); }
+        }
+      }
+      mi_forall_arenas_end();
+    }
+  }
+  if (ea.pending) { mi_atomic_store_release(&subproc->empty_abandoned, (size_t)1); }
+  return ea.pending;
 }
 
 // note: this only reaches the *mapped* abandoned pages (the ones in `pages_abandoned`).

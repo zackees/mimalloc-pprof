@@ -1417,6 +1417,8 @@ void          _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep);
 void          _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep);
 void          _mi_purge_holes_report_collect(mi_holes_report_t* rep);
 void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld, size_t bin_lo, size_t bin_hi);   // src/arena.c: bins [lo,hi)
+void          _mi_arenas_note_empty_abandoned(mi_subproc_t* subproc);   // #483: an empty large page was abandoned
+bool          _mi_arenas_free_empty_abandoned(mi_subproc_t* subproc);   // #483: the scavenger's pass; true if some remain
 
 // The free-arena reclaim (src/arena-reclaim.c, phase F of `mi_purge_all_ex`): give back the
 // arenas that are completely free. The report is filled in even when it is a no-op.

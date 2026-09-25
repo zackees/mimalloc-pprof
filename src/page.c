@@ -348,6 +348,15 @@ void _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page)
   mi_assert_expensive(_mi_page_is_valid(page));
 }
 
+// hand the page to the arena's abandoned pages, even when it is empty (`_mi_page_abandon` frees those)
+static void mi_page_abandon_keep(mi_page_t* page, mi_page_queue_t* pq) {
+  mi_page_queue_remove(pq, page);
+  mi_theap_t* theap = page->theap;
+  mi_page_set_theap(page, NULL);
+  page->theap = theap; // don't actually set theap to NULL so we can reclaim_on_free within the same theap
+  _mi_arenas_page_abandon(page, theap);
+}
+
 void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 3/5.
   // no allocation to serve here either (see `mi_theap_page_collect`): un-purging would fault a run
@@ -357,12 +366,7 @@ void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
     _mi_page_free(page, pq);
   }
   else {
-    mi_page_queue_remove(pq, page);
-    mi_theap_t* theap = page->theap;
-    mi_page_set_theap(page, NULL);
-    page->theap = theap; // don't actually set theap to NULL so we can reclaim_on_free within the same theap
-    _mi_arenas_page_abandon(page, theap);
-    // _mi_arenas_collect(false, false, theap->tld); // allow purging
+    mi_page_abandon_keep(page, pq);
   }
 }
 
@@ -512,11 +516,16 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   mi_page_queue_t* pq = mi_page_queue_of(page);
   #if MI_RETIRE_CYCLES > 0
   const size_t bsize = mi_page_block_size(page);
-  // #483: never a large page: a retired page is freed only by its owner's next allocations, so a
-  // thread that goes idle would keep it resident for good. Freed now, the arena's aged purge
-  // returns it, and an allocation that comes back soon finds its slices still resident.
-  if mi_likely(bsize <= MI_MEDIUM_MAX_OBJ_SIZE && !mi_page_queue_is_special(pq)) {  // not large, full or huge queue?
+  if mi_likely( /* bsize < MI_MAX_RETIRE_SIZE && */ !mi_page_queue_is_special(pq)) {  // not full or huge queue?
     if (pq->last==page && pq->first==page) { // the only page in the queue?
+      if (bsize > MI_MEDIUM_MAX_OBJ_SIZE) {
+        // #483: a large page is abandoned instead of retired. A retired page is freed only by its
+        // owner's next allocations, so an idle thread kept it resident for good; abandoned, its
+        // owner re-adopts it cheaply, and the scavenger frees it once it stays unused.
+        mi_page_abandon_keep(page, pq);
+        _mi_arenas_note_empty_abandoned(mi_page_subproc(page));
+        return;
+      }
       mi_theap_t* theap = mi_page_theap(page);
       #if MI_STAT>0
       mi_theap_stat_counter_increase(theap, pages_retire, 1);

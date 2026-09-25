@@ -1679,6 +1679,47 @@ static bool test_large_holes_without_idle(void) {
   return ok;
 }
 
+// #483: a thread that stays alive but stops allocating must not keep an emptied large page
+//       resident: nothing can sweep its pages, so the page must go back to the arena, whose
+//       deferred purge returns it.
+// ---------------------------------------------------------------------------
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+static volatile int idle_ready, idle_release;
+static uint8_t* idle_block;
+
+static void* idle_thread(void* arg) {
+  (void)arg;
+  idle_block = (uint8_t*)mi_malloc(256 * 1024);   // a large page, the only one of its class
+  if (idle_block != NULL) { memset(idle_block, 1, 256 * 1024); mi_free(idle_block); }
+  idle_ready = 1;
+  while (!idle_release) { usleep(1000); }          // alive, but never allocates again
+  return NULL;
+}
+
+static bool test_idle_thread_releases_large_page(void) {
+  const long delay = mi_option_get(mi_option_purge_delay);
+  mi_option_set(mi_option_purge_delay, 20);
+  pthread_t t;
+  if (pthread_create(&t, NULL, &idle_thread, NULL) != 0) return false;
+  while (!idle_ready) { usleep(1000); }
+  usleep(400 * 1000);   // 20 purge periods
+  const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
+  unsigned char vec[64];
+  size_t resident = 0;
+  if (idle_block != NULL && mincore((void*)_mi_align_down((uintptr_t)idle_block, psize), 64 * psize, vec) == 0) {
+    for (size_t i = 0; i < 64; i++) { resident += (vec[i] & 1); }
+  }
+  idle_release = 1;
+  pthread_join(t, NULL);
+  mi_option_set(mi_option_purge_delay, delay);
+  fprintf(stderr, "(freed block: %zu of 64 OS pages resident) ", resident);
+  return resident * 4 < 64;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // 12. `purge_holes_min_interval` paces the OWNER's own sweeps, not only the
 //     scavenger's claim of a parked thread's tld.
@@ -1875,6 +1916,9 @@ int main(void) {
   CHECK("sweep-does-not-unpurge-on-collect", test_sweep_no_unpurge_on_collect());
   CHECK("sweep-full-every-bounds-a-missed-hole", test_sweep_full_every());
   CHECK("owner-sweeps-are-paced", test_owner_sweep_pacing());
+  #if !defined(_WIN32)
+  CHECK("idle-thread-releases-large-page", test_idle_thread_releases_large_page());
+  #endif
   CHECK("large-holes-without-idle", test_large_holes_without_idle());
 
   // everything above is freed by now, so every hole must have been handed back

@@ -40,7 +40,7 @@ WORKLOADS = {
     "random-large/1": (1, 1, 64 << 10, 4 << 20, 200000),
     "small/8 (control)": (8, 1, 16, 1024, 5000000),
 }
-METRICS = ("ops/s", "cpu s", "peak RSS MiB", "RSS after drain MiB")
+METRICS = ("ops/s", "cpu s", "peak RSS MiB", "RSS 0.5 s after drain MiB", "RSS 2 s after drain MiB")
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> str:
@@ -95,8 +95,10 @@ def main() -> int:
                 for workload, params in WORKLOADS.items():
                     for arm in ("base", "head") if rep % 2 == 0 else ("head", "base"):
                         line = run([str(arms[arm]), *map(str, params)]).split()
-                        ops, cpu, peak, after = map(float, line)
-                        samples[(workload, arm)].append((ops, cpu, peak / 2**20, after / 2**20))
+                        ops, cpu, peak, short, long = map(float, line)
+                        samples[(workload, arm)].append(
+                            (ops, cpu, peak / 2**20, short / 2**20, long / 2**20)
+                        )
         finally:
             run(["git", "worktree", "prune"], cwd=ROOT)
     rows = [

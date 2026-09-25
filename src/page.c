@@ -519,6 +519,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
       mi_theap_stat_counter_increase(theap, pages_retire, 1);
       #endif
       page->retire_expire = (bsize <= MI_SMALL_MAX_OBJ_SIZE ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
+      if (bsize > MI_MEDIUM_MAX_OBJ_SIZE) { _mi_page_publish_retired(page); }   // #483: so an idle owner cannot pin it
       mi_assert_internal(pq >= theap->pages);
       const size_t index = pq - theap->pages;
       mi_assert_internal(index < MI_BIN_FULL && index < MI_BIN_HUGE);
@@ -704,6 +705,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   if (page->free != NULL) return true;
   #endif
   if (page->capacity >= page->reserved) return true;
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: before forming blocks in it
 
   size_t page_size;
   //uint8_t* page_start =

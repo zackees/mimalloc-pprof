@@ -1228,6 +1228,7 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
   // until it is MADV_FREE_REUSE'd. This function is the single choke point for a page going
   // back to the arena (`_mi_page_free` and the abandoned-page free in `free.c` both land here).
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: first, so the scavenger cannot discard it meanwhile
   _mi_page_unpurge_all(page);
 
   // all we need from the heap, before the page is unpublished from it (see

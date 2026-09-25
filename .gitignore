@@ -22,3 +22,6 @@ __pycache__/
 
 # uv run writes an (empty) lock file here; pyproject.toml has no [project] table, so it carries nothing
 uv.lock
+
+# clud agent-harness state (/grind run records etc.): local only, never committed
+.clud/

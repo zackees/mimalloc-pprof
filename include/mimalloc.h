@@ -648,7 +648,7 @@ typedef enum mi_option_e {
   mi_option_deprecated_max_segment_reclaim,  // max. percentage of the abandoned segments can be reclaimed per try (=10%)
   mi_option_destroy_on_exit,            // if set, release all memory on exit; sometimes used for dynamic unloading but can be unsafe
   mi_option_arena_reserve,              // initial memory size for arena reservation (= 1 GiB on 64-bit) (internally, this value is in KiB; use `mi_option_get_size`)
-  mi_option_arena_purge_mult,           // multiplier for `purge_delay` for the purging delay for arenas (=10)
+  mi_option_arena_purge_mult,           // multiplier for `purge_delay` for the purging delay for arenas (=4, #486)
   mi_option_deprecated_purge_extend_delay,
   mi_option_disallow_arena_alloc,       // 1 = do not use arena's for allocation (except if using specific arena id's)
   mi_option_retry_on_oom,               // retry on out-of-memory for N milli seconds (=400), set to 0 to disable retries. (only on windows)

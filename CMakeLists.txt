@@ -2036,7 +2036,20 @@ if (MI_BUILD_TESTS)
     target_include_directories(mimalloc-test-arena-purge-aged PRIVATE include)
     target_link_libraries(mimalloc-test-arena-purge-aged PRIVATE mimalloc-static ${mi_libraries})
     add_test(NAME test-arena-purge-aged COMMAND mimalloc-test-arena-purge-aged)
-    set_tests_properties(test-arena-purge-aged PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
+    # (arena_purge_mult 1: the test steps in 60 ms periods, and the #497 case needs one arena period per step)
+    set_tests_properties(test-arena-purge-aged PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0;MIMALLOC_ARENA_PURGE_MULT=1")
+  endif()
+
+  # test-arena-retention (#486): freed arena memory stays resident for its retention window, then
+  # goes back to the OS. Single-threaded; the scavenger is off so only the test's collects purge.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-retention test/test-arena-retention.c)
+    target_compile_definitions(mimalloc-test-arena-retention PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-retention PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-retention PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-retention PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-arena-retention COMMAND mimalloc-test-arena-retention)
+    set_tests_properties(test-arena-retention PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
   endif()
 
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of

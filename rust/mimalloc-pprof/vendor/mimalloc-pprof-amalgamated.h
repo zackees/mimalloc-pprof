@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f54afa94 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fe4dfe18 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -693,6 +693,7 @@ typedef enum mi_option_e {
   mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=64); 0 disables
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin". Bun parity (#338)
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
+  mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

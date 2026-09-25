@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f54afa94 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fe4dfe18 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -708,6 +708,7 @@ typedef enum mi_option_e {
   mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=64); 0 disables
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin". Bun parity (#338)
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
+  mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -2721,6 +2722,16 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 // burst (~120,000 minor faults), 4 about 1,300, with the same peak and release time.
 #ifndef MI_ARENA_PURGE_MULT_DEFAULT
 #define MI_ARENA_PURGE_MULT_DEFAULT       (4)
+#endif
+
+// #493 (strategy 9): a new page first tries to claim free slices that are still resident (queued
+// for purge, see above) before the plain free-slice search, which knows nothing of residency and
+// would often fault in fresh or purged memory instead. At most this many queued runs long enough
+// for the page are tried per allocation: a failed try is a run that another thread, the purge, or
+// an earlier allocation took (a stale queue bit), and after a handful of those the queue is
+// mostly stale, so the plain search is the better bet. Keeps the extra cost per page small.
+#ifndef MI_RESIDENT_FIRST_MAX_TRIES
+#define MI_RESIDENT_FIRST_MAX_TRIES       (8)
 #endif
 
 
@@ -10793,6 +10804,10 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
 // Ranges will never cross chunk boundaries (and `slice_count <= MI_BCHUNK_BITS`).
 bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
 
+// #493: visit each maximal run of at least `n <= MI_BCHUNK_BITS` bits set in `bitmap | bitmap2`
+// (`bitmap2` may be NULL), in index order, WITHOUT clearing them. Runs never cross a chunk.
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
+
 // Count all set bits in given range in the bitmap.
 size_t mi_bitmap_popcountN( mi_bitmap_t* bitmap, size_t idx, size_t n);
 
@@ -10888,6 +10903,10 @@ MI_DECL_MAYBE_UNUSED static inline bool mi_bbitmap_is_clearN(mi_bbitmap_t* bbitm
 // Try to atomically transition `n` bits from all set to all clear. Returns `true` on succes.
 // `n` cannot cross chunk boundaries, where `n <= MI_CHUNK_BITS`.
 bool mi_bbitmap_try_clearNC(mi_bbitmap_t* bbitmap, size_t idx, size_t n);
+
+// #493: like `mi_bbitmap_try_clearNC`, but as an allocation of `n` slices: respects (and assigns)
+// the chunk size bins the way the find-and-clear searches do. `n <= MI_BCHUNK_BITS`.
+bool mi_bbitmap_try_claimN(mi_bbitmap_t* bbitmap, size_t idx, size_t n);
 
 
 // Specialized versions for common bit sequence sizes
@@ -11113,13 +11132,72 @@ static size_t mi_page_full_size(mi_page_t* page) {
   Arena Allocation
 ----------------------------------------------------------- */
 
+// #493 (strategy 9): resident-first claiming. A freed range sits in `slices_purge` (young) or
+// `slices_purge_aged` for the #486 retention window: free, and still resident. The plain search
+// (`mi_bbitmap_try_find_and_clearN`) knows nothing of that and, measured on short-lived threads,
+// mostly handed out fresh or already purged slices while such ranges were waiting -- growing RSS
+// and zero-fill faulting the new range. So first try the queued runs, in index order.
+typedef struct mi_resident_claim_s {
+  size_t slice_count;   // wanted
+  size_t tries;         // queued runs tried so far (at most MI_RESIDENT_FIRST_MAX_TRIES)
+  size_t slice_index;   // out: the claimed range, when `claimed`
+  bool   claimed;
+} mi_resident_claim_t;
+
+static bool mi_arena_resident_claim_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  mi_resident_claim_t* const rc = (mi_resident_claim_t*)arg;
+  mi_assert_internal(slice_count >= rc->slice_count); MI_UNUSED(slice_count);
+  rc->tries++;
+  // The same atomic claim of `slices_free` the purge makes before it purges
+  // (`mi_arena_try_purge_range`): if we win, the purge cannot touch the range; if the purge or
+  // another thread holds any of it -- or it was allocated since it was queued -- this fails.
+  if (mi_bbitmap_try_claimN(arena->slices_free, slice_index, rc->slice_count)) {
+    rc->slice_index = slice_index;
+    rc->claimed = true;
+    return false;   // done
+  }
+  return (rc->tries < MI_RESIDENT_FIRST_MAX_TRIES);
+}
+
+static bool mi_arena_try_claim_resident(mi_arena_t* arena, size_t slice_count, size_t* slice_index) {
+  // A pinned arena is never purged (all of it is resident); a range of more than a chunk is
+  // beyond `mi_bbitmap_try_claimN`.
+  if (arena->memid.is_pinned || slice_count > MI_BCHUNK_BITS) return false;
+  // Nothing queued: `purge_expire` is armed after every queueing (`mi_arena_schedule_purge`) and
+  // only disarmed by a purge that leaves both queues empty, so 0 means empty but for a moment
+  // around a concurrent free or purge -- and then we merely take the plain search.
+  if (mi_atomic_loadi64_relaxed(&arena->purge_expire) == 0) return false;
+  if (!mi_option_is_enabled(mi_option_resident_first)) return false;
+  // young | aged: a range freed in two steps is one run even when half of it has aged
+  mi_resident_claim_t rc = { slice_count, 0, 0, false };
+  _mi_bitmap_forall_set_runsN(arena->slices_purge, arena->slices_purge_aged, slice_count, &mi_arena_resident_claim_visitor, arena, &rc);
+  if (rc.claimed) { *slice_index = rc.slice_index; }
+  return rc.claimed;
+}
+
+// #493: a claimed range is no longer waiting for a purge, so drop it from both queues. The purge
+// itself would only skip it (its claim of `slices_free` fails), but the stale bits would stay on
+// the queues to be retried by every purge -- and every resident-first scan above, where each one
+// costs a try. Only a read when nothing of the range is queued. Safe against the purge: we own the
+// range, so no free can queue it again, and a purge that already took the bits fails its claim.
+static void mi_arena_unqueue_purge(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
+  if (!mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);
+  }
+  if (!mi_bitmap_is_clearN(arena->slices_purge_aged, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge_aged, slice_index, slice_count);
+  }
+}
+
 static mi_decl_noinline void* mi_arena_try_alloc_at(
   mi_arena_t* arena, size_t slice_count, bool commit, size_t tseq, mi_memid_t* memid)
 {
   mi_assert_internal(arena!=NULL);
   mi_assert_internal(slice_count>0);
   size_t slice_index;
-  if (!mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  if (!mi_arena_try_claim_resident(arena, slice_count, &slice_index) &&
+      !mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  if (!arena->memid.is_pinned) { mi_arena_unqueue_purge(arena, slice_index, slice_count); }
 
   // claimed it!
   void* p = mi_arena_slice_start(arena, slice_index);
@@ -16174,6 +16252,51 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
   return true;
 }
 
+// #493 (strategy 9): visit, in index order, each maximal run of at least `n` bits set in
+// `bitmap | bitmap2` (`bitmap2` may be NULL; both must have the same chunk count), where
+// `0 < n <= MI_BCHUNK_BITS`. Unlike the `forall_setc` visitors this leaves the bitmaps as they are:
+// the runs are only hints (the arena claims them atomically in `slices_free`), so the loads are
+// relaxed. A run never crosses a chunk, so it can be claimed with `mi_bbitmap_try_clearNC`.
+// Stops, returning false, as soon as `visit` returns false.
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
+  mi_assert_internal(n > 0 && n <= MI_BCHUNK_BITS);
+  mi_assert_internal(bitmap2 == NULL || mi_bitmap_chunk_count(bitmap2) == mi_bitmap_chunk_count(bitmap));
+  const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmap), MI_BFIELD_BITS);
+  for (size_t i = 0; i < chunkmap_max; i++) {
+    mi_bfield_t cmap_entry = mi_atomic_load_relaxed(&bitmap->chunkmap.bfields[i]);
+    if (bitmap2 != NULL) { cmap_entry |= mi_atomic_load_relaxed(&bitmap2->chunkmap.bfields[i]); }
+    size_t cmap_idx;
+    // for each chunk (corresponding to a set bit in a chunkmap entry)
+    while (mi_bfield_foreach_bit(&cmap_entry, &cmap_idx)) {
+      const size_t chunk_idx = i*MI_BFIELD_BITS + cmap_idx;
+      const size_t chunk_base = chunk_idx*MI_BCHUNK_BITS;
+      size_t run_start = 0;   // chunk-relative start of the current run
+      size_t run_len = 0;     // and its length so far (0 = none); a run can span bfields
+      for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
+        mi_bfield_t b = mi_atomic_load_relaxed(&bitmap->chunks[chunk_idx].bfields[j]);
+        if (bitmap2 != NULL) { b |= mi_atomic_load_relaxed(&bitmap2->chunks[chunk_idx].bfields[j]); }
+        size_t bidx;
+        while (mi_bfield_find_least_bit(b, &bidx)) {
+          const size_t rng = mi_ctz(~(b>>bidx));   // all the set bits from bidx
+          mi_assert_internal(rng >= 1 && bidx + rng <= MI_BFIELD_BITS);
+          const size_t start = j*MI_BFIELD_BITS + bidx;
+          if (run_len > 0 && run_start + run_len == start) {
+            run_len += rng;                          // continues the run of the previous bfield
+          }
+          else {
+            if (run_len >= n && !visit(chunk_base + run_start, run_len, arena, arg)) return false;
+            run_start = start;
+            run_len = rng;
+          }
+          b = b & ~mi_bfield_mask(rng, bidx);
+        }
+      }
+      if (run_len >= n && !visit(chunk_base + run_start, run_len, arena, arg)) return false;
+    }
+  }
+  return true;
+}
+
 
 /* --------------------------------------------------------------------------------
   binned bitmap's
@@ -16352,6 +16475,24 @@ bool mi_bbitmap_try_clearNC(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   }
   // note: we don't set the size class for an explicit try_clearN (only used by purging)
   return cleared;
+}
+
+// #493 (strategy 9): claim `n` bits at a known `idx` (not crossing a chunk) for an allocation of
+// `n` slices. Unlike the purge's `mi_bbitmap_try_clearNC` this keeps to the size bins, exactly as
+// `mi_bbitmap_try_find_and_clear_generic` does: only a chunk of the bin of `n`, or one not yet
+// binned, and a claim at the start of an unbinned chunk bins it -- so claiming a known range
+// never mixes page sizes in a chunk that the plain search keeps apart.
+bool mi_bbitmap_try_claimN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
+  if (n == 0 || n > MI_BCHUNK_BITS) return false;
+  const size_t chunk_idx = idx / MI_BCHUNK_BITS;
+  const size_t cidx = idx % MI_BCHUNK_BITS;
+  if (cidx + n > MI_BCHUNK_BITS || chunk_idx >= mi_bbitmap_chunk_count(bbitmap)) return false;
+  const mi_chunkbin_t bbin = mi_chunkbin_of(n);
+  const mi_chunkbin_t cbin = mi_bbitmap_debug_get_bin(bbitmap->chunkmap_bins, chunk_idx);
+  if (cbin != bbin && cbin != MI_CBIN_NONE) return false;
+  if (!mi_bbitmap_try_clearNC(bbitmap, idx, n)) return false;
+  if (cidx == 0 && cbin == MI_CBIN_NONE) { mi_bbitmap_set_chunk_bin(bbitmap, chunk_idx, bbin); }
+  return true;
 }
 
 
@@ -22049,6 +22190,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 64,     MI_OPTION_UNINIT, MI_OPTION(purge_holes_full_every) }   // every N'th sweep walks every page regardless of the skip check; 0 disables (Bun's default)
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(snapshot_on_exit) }       // write a heap snapshot on process exit (=0). 1=on, 2=on+blocks. Bun parity (#338)
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(page_reserve) }           // #493: reserve an exiting thread's empty large pages for the next thread (MIMALLOC_PAGE_RESERVE); 0 frees them as upstream
+  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(resident_first) }         // #493: claim free-but-resident (queued for purge) arena slices first (MIMALLOC_RESIDENT_FIRST); 0 = the plain search only
 };
 
 static void mi_option_init(mi_option_desc_t* desc);

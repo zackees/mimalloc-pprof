@@ -613,8 +613,11 @@ mi_options! {
     /// 1 = pages, 2 = pages + per-block free maps. Path from `MIMALLOC_SNAPSHOT_PATH`, else
     /// `mimalloc-snapshot.<pid>.bin`.
     mi_option_snapshot_on_exit = 60;
+    /// **Fork addition (#493).** At thread exit, keep an empty large page for the next thread
+    /// of the heap instead of freeing it (=1); 0 frees it as upstream does.
+    mi_option_page_reserve = 61;
     /// Sentinel: one past the last real option.
-    _mi_option_last = 61;
+    _mi_option_last = 62;
 }
 
 /// `MI_SNAPSHOT_BLOCKS` (include/mimalloc.h, #338): include per-block free bitmaps for the

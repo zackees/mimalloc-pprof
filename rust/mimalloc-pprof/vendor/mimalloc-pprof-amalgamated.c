@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 54f5ae1c of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit d0507738 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -13367,12 +13367,19 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
         _mi_scavenger_wake(arena->subproc);
       }
     }
-    else if (mi_atomic_loadi64_relaxed(&arena->subproc->purge_expire) == 0) {
-      // #457: this arena is already armed but the subproc deadline is not (a settle raced
-      // this arena's 0 -> set). Re-arm it from the arena's own deadline so the purge runs.
+    else {
+      // #457: already armed. Move the deadline out, so the arena is purged once it has had no
+      // frees for `delay`: memory freed during churn is about to be reused, and purging it
+      // only makes the next allocation re-fault it (upstream v2 extended it on every free
+      // too). At most once per delay/10, so the shared line is rarely written.
+      if (expire - expire0 > delay/10) {
+        mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire);
+      }
+      // #457: if a settle raced this arena's 0 -> set, the subproc deadline is 0 while this
+      // arena is armed; re-arm it so the scavenger wakes for it.
       mi_msecs_t sexpire0 = 0;
-      const mi_msecs_t aexpire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
-      if (aexpire != 0 && mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &sexpire0, aexpire)) {
+      if (mi_atomic_loadi64_relaxed(&arena->subproc->purge_expire) == 0 &&
+          mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &sexpire0, expire)) {
         _mi_scavenger_wake(arena->subproc);
       }
     }

@@ -1847,6 +1847,155 @@ static bool layout_is_predictable(void) {
   #endif
 }
 
+// ---------------------------------------------------------------------------
+// #493: a thread that exits with an empty large page reserves it for the next thread of the
+//       heap, which reclaims it as is -- instead of carving a NEW page over the same, still
+//       resident slices, whose unformed tail then stays resident too. And a reserved page that
+//       nobody reclaims goes back after MI_PAGE_RESERVE_RELEASE_MULT purge delays.
+// ---------------------------------------------------------------------------
+#define RESERVE_SZ        (400 * 1024)   // the 448 KiB large bin: no other case in this file uses it
+#define RESERVE_N         (3)            // blocks thread A forms (well short of a full page)
+#define RESERVE_WINDOW_MS (1000)         // purge delay for the reuse case: nothing may release the page meanwhile
+
+static void*      reserve_a_block;       // thread A's first block
+static mi_page_t* reserve_a_page;
+static size_t     reserve_a_bin;         // the stats bin of A's page
+static bool       reserve_a_singleton;
+static mi_page_t* reserve_b_page;
+
+static void reserve_thread_a(void) {     // form a few blocks, touch them, free them all, exit
+  void* p[RESERVE_N];
+  for (size_t i = 0; i < RESERVE_N; i++) {
+    p[i] = mi_malloc(RESERVE_SZ);
+    if (p[i] != NULL) memset(p[i], 1, RESERVE_SZ);
+  }
+  reserve_a_block = p[0];
+  if (p[0] != NULL) {
+    reserve_a_page = _mi_ptr_page(p[0]);
+    reserve_a_bin = _mi_page_stats_bin(reserve_a_page);
+    reserve_a_singleton = mi_page_is_singleton(reserve_a_page);
+  }
+  for (size_t i = 0; i < RESERVE_N; i++) { mi_free(p[i]); }
+}
+
+static void reserve_thread_b(void) {     // one block of the same size class, then exit
+  void* p = mi_malloc(RESERVE_SZ);
+  reserve_b_page = (p != NULL ? _mi_ptr_page(p) : NULL);
+  if (p != NULL) memset(p, 2, RESERVE_SZ);
+  mi_free(p);
+}
+
+static void reserve_reset(void) {
+  reserve_a_block = NULL; reserve_a_page = NULL; reserve_a_bin = 0;
+  reserve_a_singleton = false; reserve_b_page = NULL;
+}
+
+// Pages ever created in A's size class. Page equality alone could pass by accident: a page freed
+// at A's exit and carved anew by B over the same slices sits at the same address. A reused page
+// is never CREATED, so the bin's `total` (which only grows, and which B merges into its heap's
+// stats when it exits) is the signal that cannot.
+static int64_t reserve_pages_created(void) {
+  mi_stats_t_decl(st);
+  if (!mi_stats_get(&st)) return -1;
+  return st.page_bins[reserve_a_bin].total;
+}
+
+static bool test_dead_thread_page_is_reused(void) {
+  if (!layout_is_predictable()) {
+    fprintf(stderr, "(skipped: every allocation is guarded) ");
+    return true;
+  }
+  const long delay = mi_option_get(mi_option_purge_delay);
+  const long reserve = mi_option_get(mi_option_page_reserve);
+  bool ok = true;
+  mi_collect(true);   // start with nothing reserved
+  mi_option_set(mi_option_purge_delay, RESERVE_WINDOW_MS);
+
+  // (a) on: B's block lies in A's page, and B created no page of that size class
+  mi_option_set(mi_option_page_reserve, 1);
+  reserve_reset();
+  run_one_thread(&reserve_thread_a);
+  if (reserve_a_block == NULL) { fprintf(stderr, "\n  thread A could not allocate\n"); ok = false; goto done; }
+  if (reserve_a_singleton) { fprintf(stderr, "(skipped: %d KiB blocks get a singleton page in this build) ", RESERVE_SZ / 1024); goto done; }
+  {
+    const int64_t before = reserve_pages_created();
+    run_one_thread(&reserve_thread_b);
+    const int64_t after = reserve_pages_created();
+    if (reserve_b_page != reserve_a_page) {
+      fprintf(stderr, "\n  thread B's block is not in the page thread A left behind (%p vs %p)\n",
+              (void*)reserve_b_page, (void*)reserve_a_page);
+      ok = false;
+    }
+    if (before < 0 || after != before) {
+      fprintf(stderr, "\n  thread B created %lld page(s) in the %d KiB class instead of reusing A's\n",
+              (long long)(after - before), RESERVE_SZ / 1024);
+      ok = false;
+    }
+  }
+
+  // (b) off: the page is freed at A's exit, as upstream does; where B lands is not our business
+  mi_collect(true);   // hand back the page (a) left reserved (B's exit reserved it again)
+  mi_option_set(mi_option_page_reserve, 0);
+  reserve_reset();
+  run_one_thread(&reserve_thread_a);
+  run_one_thread(&reserve_thread_b);
+
+done:
+  mi_option_set(mi_option_page_reserve, reserve);
+  mi_option_set(mi_option_purge_delay, delay);
+  mi_collect(true);
+  return ok;
+}
+
+#if !defined(_WIN32)
+#define RESERVE_DELAY_MS  (20)   // purge delay for the release case: the window is MI_PAGE_RESERVE_RELEASE_MULT of these
+
+// Nobody reclaims the reserved page: after its window the scavenger (this process allocates
+// nothing meanwhile, so there is no busy sweep) hands it back to the arena, whose deferred purge
+// then returns its memory. Polled with a generous bound, not a fixed short sleep.
+static bool test_reserved_page_is_released(void) {
+  if (!layout_is_predictable()) {
+    fprintf(stderr, "(skipped: every allocation is guarded) ");
+    return true;
+  }
+  const long delay = mi_option_get(mi_option_purge_delay);
+  const long reserve = mi_option_get(mi_option_page_reserve);
+  bool ok = true;
+  mi_collect(true);
+  mi_option_set(mi_option_purge_delay, RESERVE_DELAY_MS);
+  mi_option_set(mi_option_page_reserve, 1);
+  reserve_reset();
+  run_one_thread(&reserve_thread_a);   // exits: its page, blocks touched, is now reserved
+  if (reserve_a_block == NULL) { fprintf(stderr, "\n  thread A could not allocate\n"); ok = false; goto done; }
+  if (reserve_a_singleton) { fprintf(stderr, "(skipped: singleton page) "); goto done; }
+  {
+    const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
+    const mi_msecs_t bound = (mi_msecs_t)MI_PAGE_RESERVE_RELEASE_MULT * RESERVE_DELAY_MS * 20;
+    const mi_msecs_t start = _mi_clock_now();
+    size_t resident = 64;
+    for (;;) {
+      unsigned char vec[64];
+      resident = 0;
+      if (mincore((void*)_mi_align_down((uintptr_t)reserve_a_block, psize), 64 * psize, vec) == 0) {
+        for (size_t i = 0; i < 64; i++) { resident += (vec[i] & 1); }
+      }
+      if (resident * 4 < 64 || _mi_clock_now() - start > bound) break;
+      usleep(10 * 1000);
+    }
+    fprintf(stderr, "(reserved page: %zu of 64 OS pages resident after %lld ms) ",
+            resident, (long long)(_mi_clock_now() - start));
+    if (resident * 4 >= 64) {
+      fprintf(stderr, "\n  the reserved page was not released within %lld ms\n", (long long)bound);
+      ok = false;
+    }
+  }
+done:
+  mi_option_set(mi_option_page_reserve, reserve);
+  mi_option_set(mi_option_purge_delay, delay);
+  return ok;
+}
+#endif
+
 int main(void) {
   mi_version();
   purging_enabled = mi_option_is_enabled(mi_option_purge_holes);
@@ -1918,7 +2067,9 @@ int main(void) {
   CHECK("owner-sweeps-are-paced", test_owner_sweep_pacing());
   #if !defined(_WIN32)
   CHECK("idle-thread-releases-large-page", test_idle_thread_releases_large_page());
+  CHECK("reserved-page-is-released", test_reserved_page_is_released());
   #endif
+  CHECK("dead-thread-page-is-reused", test_dead_thread_page_is_reused());
   CHECK("large-holes-without-idle", test_large_holes_without_idle());
 
   // everything above is freed by now, so every hole must have been handed back

@@ -1289,6 +1289,9 @@ pub mod options {
         /// **Fork addition (Bun parity, #338).** Write a heap snapshot at process exit: 0 = off,
         /// 1 = pages, 2 = pages + per-block free maps (`MIMALLOC_SNAPSHOT_PATH` names the file).
         pub const SNAPSHOT_ON_EXIT: Self = Self(sys::mi_option_snapshot_on_exit);
+        /// **Fork addition (#493).** At thread exit, keep an empty large page for the next
+        /// thread of the heap instead of freeing it; 0 frees it as upstream does.
+        pub const PAGE_RESERVE: Self = Self(sys::mi_option_page_reserve);
 
         /// Upstream: milliseconds to delay purging, which the scavenger also honours.
         pub const PURGE_DELAY: Self = Self(sys::mi_option_purge_delay);

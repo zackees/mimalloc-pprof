@@ -792,7 +792,7 @@ and the `mi_purge_holes_stats_t` gauges.
 | `mi_option_is_enabled` / `_enable` / `_disable` / `_set_enabled` / `_set_enabled_default` | ✅ | `options::is_enabled` / `enable` / `disable` / `set_enabled` / `set_enabled_default` |
 | `mi_options_print_out` | ✅ | `options::print` |
 
-The fourteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the environment:
+The fifteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the environment:
 
 | Option | Default | What it does |
 |---|---|---|
@@ -810,6 +810,7 @@ The fourteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the envi
 | `purge_holes_min_interval` | `100` | ms floor between sweeps of one thread's heaps |
 | `purge_holes_full_every` | `64` | every N-th sweep walks every page; 0 disables |
 | `snapshot_on_exit` | `0` | write a heap snapshot at process exit; `1` = on, `2` = with per-block freemaps (needs `MI_DIAGNOSTICS`) |
+| `page_reserve` | `1` | at thread exit, keep an empty large page for the next thread instead of freeing it; released after `MI_PAGE_RESERVE_RELEASE_MULT` (10) purge delays; 0 frees it (#493) |
 
 Because they are positional, a stale Rust mirror of this enum would silently set the
 *wrong* option — which is why `tests/t19_layout.rs` checks every value against the C

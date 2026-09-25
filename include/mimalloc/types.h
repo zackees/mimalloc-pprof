@@ -294,6 +294,15 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MI_RETIRED_RELEASE_MULT
 #define MI_RETIRED_RELEASE_MULT           (10)
 #endif
+// #493: an empty large page that a thread leaves behind at its exit is reserved (abandoned into
+// the arena, blocks formed and resident) for the next thread of the heap instead of freed; one
+// that nobody reclaims for this many purge delays goes back to the arena. The same value as
+// MI_RETIRED_RELEASE_MULT on purpose: both answer "how long may an emptied large page stay
+// resident in case its size class is wanted again", and the two must not disagree, or an idle
+// process would keep its reserved pages longer (or shorter) than its retired ones.
+#ifndef MI_PAGE_RESERVE_RELEASE_MULT
+#define MI_PAGE_RESERVE_RELEASE_MULT      (10)
+#endif
 
 
 // ------------------------------------------------------
@@ -533,6 +542,9 @@ typedef struct mi_page_s {
   // #483: a retired large page published for the scavenger (`_mi_page_retire`): the owner's tld
   // slot holding it (NULL when not published) and when it was retired. Whoever clears the slot
   // owns the page's memory until it puts it back.
+  // #493: `retired_at` doubles as the reserve stamp. It is cleared when a page is unpublished,
+  // so on an abandoned page (never published) a non-zero value means "reserved at that time"
+  // (`_mi_arenas_page_reserve`), and reclaiming the page clears it again.
   _Atomic(struct mi_page_s*)* retired_slot;
   mi_msecs_t                retired_at;
 } mi_page_t;
@@ -807,7 +819,7 @@ struct mi_subproc_s {
   mi_decl_align(8)   // a LITERAL: MSVC's __declspec(align()) rejects `MI_SIZE_SIZE` (a parenthesized
                      // expression) with C2059, and 8 over-aligns the 4-byte word harmlessly
   _Atomic(mi_scav_word_t) scavenger_wake;               // wait word signalled when a purge is scheduled (the scavenger thread waits on this)
-  _Atomic(size_t)       retired_published;              // #483: 1 when some tld may hold a retired large page for the scavenger (appended at the tail, see above)
+  _Atomic(size_t)       retired_published;              // #483: 1 when some tld may hold a retired large page for the scavenger (appended at the tail, see above); #493: or the main heap a reserved one
 };
 
 

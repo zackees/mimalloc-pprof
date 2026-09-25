@@ -830,6 +830,9 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   // initialize an initial free list
   if (!mi_page_extend_free(theap,page)) return false;
   mi_assert(mi_page_immediate_available(page));
+  if (!page->memid.initially_zero && mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE) {
+    _mi_page_trim_unformed_tail(page);   // #484: a large page on reused slices
+  }
   return true;
 }
 

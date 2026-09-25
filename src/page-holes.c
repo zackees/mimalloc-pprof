@@ -540,6 +540,14 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
 }
 
+// #484: a large page carved from slices an earlier page used is resident across its whole span,
+// though its owner has formed only its first blocks. Discard the rest at once, so a new page
+// costs what it uses: this is what made short-lived threads (a new theap, new pages, each
+// generation) hold far more than long-lived ones running the same requests.
+void _mi_page_trim_unformed_tail(mi_page_t* page) {
+  if (mi_option_is_enabled(mi_option_purge_holes)) { mi_page_purge_unformed_tail(page); }
+}
+
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
 // in it is written to. `end` is an absolute address (`UINTPTR_MAX` for the whole tail); it is
 // rounded up to an OS page, as the discard covers whole OS pages.

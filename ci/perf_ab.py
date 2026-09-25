@@ -57,6 +57,12 @@ WORKLOADS = {
     "small/8 (control)": ("plain", (8, 1, 16, 1024, 5000000, 0)),
     "large-class/8 (profiler on)": ("pprof", (8, 1, 96 << 10, 512 << 10, 400000, 0)),
     "large-class-ephemeral/8 (chart build)": ("chart", (8, 8, 96 << 10, 512 << 10, 400000, 0)),
+    # the README chart's generation length (~12.5k ops per short-lived thread at 8 workers, #478):
+    # a per-thread start/exit cost weighs 4x more than in the row above
+    "large-class-ephemeral/8 short generations (chart build)": (
+        "chart",
+        (8, 8, 96 << 10, 512 << 10, 100000, 0),
+    ),
 }
 # what ci/perf_ab.c prints, in order; the byte counts are shown in MiB
 METRICS = (

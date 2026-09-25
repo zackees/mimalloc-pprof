@@ -823,18 +823,16 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
 // once per `purge_holes_min_interval`. `holes_busy` makes it leave any page that was used since
 // the previous tick: its free blocks are about to be reused, and discarding them now would only
 // make the next allocation re-fault them.
-void _mi_theap_purge_large_holes(mi_theap_t* theap, bool at_exit) {
+void _mi_theap_purge_large_holes(mi_theap_t* theap) {
   mi_tld_t* const tld = theap->tld;
   if (tld == NULL || tld->holes_sweeping || !mi_option_is_enabled(mi_option_purge_holes)) return;
+  const mi_msecs_t now = _mi_clock_now();
+  if (now - tld->holes_busy_last < (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000)) return;
+  tld->holes_busy_last = now;
   const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
   const size_t bin_hi = _mi_bin(MI_LARGE_MAX_OBJ_SIZE) + 1;
-  if (!at_exit) {
-    const mi_msecs_t now = _mi_clock_now();
-    if (now - tld->holes_busy_last < (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000)) return;
-    tld->holes_busy_last = now;
-    tld->holes_busy = true;
-    _mi_arenas_purge_abandoned_holes(_mi_theap_heap(theap), tld, bin_lo, bin_hi);
-  }
+  tld->holes_busy = true;
+  _mi_arenas_purge_abandoned_holes(_mi_theap_heap(theap), tld, bin_lo, bin_hi);
   _mi_page_purge_holes_begin(tld);
   for (size_t bin = bin_lo; bin < bin_hi; bin++) {
     for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {

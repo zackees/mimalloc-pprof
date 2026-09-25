@@ -332,6 +332,16 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_RESIDENT_FIRST_MAX_TRIES       (8)
 #endif
 
+// #517: resident-first (#493) is only tried for claims of at least this many slices (default 16
+// = 1 MiB with 64 KiB slices: large and singleton pages). A small or medium page taking the first
+// queued run that fits bypasses the size-binned chunk layout of the plain search, so other size
+// classes' reusable runs are consumed and those classes spill into fresh chunks: the memory gate
+// peak rose 58.2 -> 61-63.7 MB (#514). Measured: >=16 restores 58.3 MB; #501's short-lived-thread
+// win comes from 4 MiB large pages (64 slices), which stay covered.
+#ifndef MI_RESIDENT_FIRST_MIN_SLICES
+#define MI_RESIDENT_FIRST_MIN_SLICES      (16)
+#endif
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from

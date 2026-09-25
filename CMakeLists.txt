@@ -851,7 +851,8 @@ if(MI_USE_CXX)
   # target this), and keeps the CMake shape identical to Bun's should this tree's extern "C"
   # wrapping ever change.
   # test-arena-purge-rearm.c (#491): calls `_mi_release_bound_ms` from internal.h, the same case.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c PROPERTIES LANGUAGE CXX )
+  # test-resident-first-churn.c (#517): calls `_mi_arena_claim_counters` from internal.h, the same case.
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -2063,6 +2064,25 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-resident-first PRIVATE mimalloc-static ${mi_libraries})
     add_test(NAME test-resident-first COMMAND mimalloc-test-resident-first)
     set_tests_properties(test-resident-first PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
+  endif()
+
+  # test-resident-first-churn (#517): the memory gate's thread-churn scenario must not claim
+  # never-dirty (fresh) arena slices once warmed up; small/medium claims taking resident-first
+  # runs did (#514). Asserts on the MI_DIAGNOSTICS claim counters, so it needs that build.
+  # (MIMALLOC_PURGE_ZEROES=0: a purge that zeroes a range clears its dirty bits, which would
+  # make its next claim count as fresh.)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN AND MI_DIAGNOSTICS)
+    add_executable(mimalloc-test-resident-first-churn test/test-resident-first-churn.c)
+    target_compile_definitions(mimalloc-test-resident-first-churn PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-resident-first-churn PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-resident-first-churn PRIVATE include)
+    target_link_libraries(mimalloc-test-resident-first-churn PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-resident-first-churn PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-resident-first-churn COMMAND mimalloc-test-resident-first-churn)
+    set_tests_properties(test-resident-first-churn PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
   endif()
 
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of

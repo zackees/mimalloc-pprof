@@ -1338,6 +1338,10 @@ void          _mi_page_unpurge_all(mi_page_t* page);
 size_t        _mi_page_purged_count(const mi_page_t* page);
 void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   // hand the discarded unformed tail back below `end` (an absolute address)
 size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            // the bytes of this page's unformed tail that are discarded right now
+void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner resets a retired large page and publishes it for the scavenger
+void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
+bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
+void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
                                             size_t capacity, size_t k, size_t* first, size_t* last);
 bool          _mi_page_purge_holes_in_progress(void);            // is the calling thread inside a sweep of its own heaps?
@@ -1417,8 +1421,6 @@ void          _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep);
 void          _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep);
 void          _mi_purge_holes_report_collect(mi_holes_report_t* rep);
 void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld, size_t bin_lo, size_t bin_hi);   // src/arena.c: bins [lo,hi)
-void          _mi_arenas_note_empty_abandoned(mi_subproc_t* subproc);   // #483: an empty large page was abandoned
-bool          _mi_arenas_free_empty_abandoned(mi_subproc_t* subproc);   // #483: the scavenger's pass; true if some remain
 
 // The free-arena reclaim (src/arena-reclaim.c, phase F of `mi_purge_all_ex`): give back the
 // arenas that are completely free. The report is filled in even when it is a no-op.

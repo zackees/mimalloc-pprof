@@ -760,6 +760,112 @@ void _mi_page_unpurge_all(mi_page_t* page) {
 
 
 /* -----------------------------------------------------------
+  Retired large pages of idle threads  (#483)
+
+  `_mi_page_retire` keeps the only page of a size class on its theap when it empties, and only
+  the owner's own later allocations free it (`_mi_theap_collect_retired`). A thread that stays
+  alive but stops allocating would pin its emptied 4 MiB large pages forever. So when a large
+  page retires, the owner resets it to "nothing formed" (`capacity == 0`, `free == NULL`: the
+  memory stays resident, so a reuse re-forms blocks without faulting, and the alloc fast path
+  can never reach a block of it) and publishes it in a slot of its tld. The scavenger discards
+  the whole block area of a page that stays published for MI_RETIRED_RELEASE_MULT purge delays,
+  as an unformed tail -- which `mi_page_extend_free` already hands back before forming a block.
+
+  The slot is the lock: whoever takes the page out of the slot owns the page's memory until it
+  puts it back. The scavenger takes it by swapping in MI_RETIRED_SLOT_BUSY (not NULL, or the
+  owner could publish another page into that slot meanwhile) for exactly one discard. The owner
+  takes it back for good (`_mi_page_unpublish_retired`) before it forms a block in the page or
+  returns the page to the arena, waiting out the scavenger's one discard if it has to.
+----------------------------------------------------------- */
+
+#define MI_RETIRED_SLOT_BUSY  ((mi_page_t*)1)   // the scavenger holds this slot's page for one discard
+
+// Owner only (from `_mi_page_retire`): reset an emptied large page and publish it for the
+// scavenger. When every slot is taken the page simply stays retired as upstream keeps it.
+void _mi_page_publish_retired(mi_page_t* page) {
+  mi_assert_internal(mi_page_all_free(page));
+  mi_assert_internal(page->retired_slot == NULL);
+  if (page->retired_slot != NULL) return;
+  mi_tld_t* const tld = mi_page_theap(page)->tld;
+  // only the owner ever fills an empty slot, so one it sees empty stays empty until it fills it
+  _Atomic(mi_page_t*)* slot = NULL;
+  for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {
+    if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[i]) == NULL) { slot = &tld->retired_pages[i]; break; }
+  }
+  if (slot == NULL) return;   // all slots full: leave it unpublished
+
+  _mi_page_unpurge_all(page);   // holes describe formed blocks, and there will be none
+  page->free = NULL;            // nothing formed: every block of the page is unformed tail now
+  page->local_free = NULL;
+  page->capacity = 0;
+  page->free_is_zero = false;
+  page->retired_at = _mi_clock_now();
+  page->retired_slot = slot;
+  mi_atomic_store_ptr_release(mi_page_t, slot, page);   // publishes the reset above to the scavenger
+
+  mi_subproc_t* const subproc = mi_page_subproc(page);
+  if (mi_atomic_load_relaxed(&subproc->retired_published) == 0 &&
+      mi_atomic_exchange_acq_rel(&subproc->retired_published, (size_t)1) == 0) {
+    _mi_scavenger_wake(subproc);   // a sleeping scavenger has nothing scheduled to notice this by
+  }
+}
+
+// Take a published page back from the scavenger for good: before a block is formed in it or it
+// is returned to the arena. If the scavenger holds the slot, that is for one discard only.
+void _mi_page_unpublish_retired(mi_page_t* page) {
+  _Atomic(mi_page_t*)* const slot = page->retired_slot;
+  if (slot == NULL) return;
+  mi_page_t* expected = page;
+  while (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &expected, NULL)) {
+    mi_assert_internal(expected == MI_RETIRED_SLOT_BUSY);
+    expected = page;
+    _mi_prim_thread_yield();
+  }
+  page->retired_slot = NULL;
+}
+
+// A theap detached from its tld by a heap delete/destroy (`_mi_heap_detach_theaps`) has its pages
+// freed only later -- possibly after its thread exited and freed the tld, slots and all. So it takes
+// its published pages back now, while the tld is certainly alive.
+void _mi_theap_unpublish_retired(mi_theap_t* theap) {
+  for (size_t bin = 0; bin <= MI_BIN_FULL; bin++) {
+    for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {
+      if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }
+    }
+  }
+}
+
+// Scavenger: discard the memory of every published page retired for long enough. Returns true
+// when some published page is not old enough yet, i.e. the scavenger should come back.
+bool _mi_pages_release_retired(mi_subproc_t* subproc) {
+  if (mi_atomic_exchange_acq_rel(&subproc->retired_published, (size_t)0) == 0) return false;
+  const long delay = mi_option_get(mi_option_purge_delay);
+  if (delay < 0) return false;   // purging disabled
+  const mi_msecs_t min_age = (mi_msecs_t)delay * MI_RETIRED_RELEASE_MULT;
+  const mi_msecs_t now = _mi_clock_now();
+  bool pending = false;
+  mi_lock(&subproc->tlds_lock) {   // keeps every registered tld (and so its slots) alive
+    for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
+      for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {
+        _Atomic(mi_page_t*)* const slot = &tld->retired_pages[i];
+        mi_page_t* page = mi_atomic_load_ptr_relaxed(mi_page_t, slot);
+        if (page == NULL || page == MI_RETIRED_SLOT_BUSY) continue;
+        if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &page, MI_RETIRED_SLOT_BUSY)) continue;   // the owner took it back
+        // the page's memory is ours until we put it back
+        if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not discarded already)
+          if (now - page->retired_at < min_age) { pending = true; }
+          else { mi_page_purge_unformed_tail(page); }      // `capacity == 0`: the whole block area
+        }
+        mi_atomic_store_ptr_release(mi_page_t, slot, page);
+      }
+    }
+  }
+  if (pending) { mi_atomic_store_release(&subproc->retired_published, (size_t)1); }
+  return pending;
+}
+
+
+/* -----------------------------------------------------------
   The idle sweep
 
   Visit every page (INCLUDING the full queue, which a normal collect skips -- see

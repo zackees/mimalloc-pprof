@@ -286,6 +286,15 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_PAGE_PURGE_BITS                (256)
 #define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
 
+// #483: a thread publishes up to this many retired (emptied) large pages; the scavenger discards
+// the memory of one that stays retired for MI_RETIRED_RELEASE_MULT purge delays.
+#ifndef MI_RETIRED_PAGE_SLOTS
+#define MI_RETIRED_PAGE_SLOTS             (16)
+#endif
+#ifndef MI_RETIRED_RELEASE_MULT
+#define MI_RETIRED_RELEASE_MULT           (10)
+#endif
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from
@@ -398,6 +407,10 @@ typedef uintptr_t  mi_encoded_t;
 
 // thread id's
 typedef size_t     mi_threadid_t;
+
+// Milliseconds as in `int64_t` to avoid overflows (declared here rather than with the
+// thread-local data below because `mi_page_t::retired_at` uses it, #483)
+typedef int64_t    mi_msecs_t;
 
 // free lists contain blocks
 typedef struct mi_block_s {
@@ -516,6 +529,12 @@ typedef struct mi_page_s {
   // was allocated or freed in it since, so the sweep has nothing new to discard (see
   // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". Cold, like `purged` above.
   uint64_t                  swept_state;
+
+  // #483: a retired large page published for the scavenger (`_mi_page_retire`): the owner's tld
+  // slot holding it (NULL when not published) and when it was retired. Whoever clears the slot
+  // owns the page's memory until it puts it back.
+  _Atomic(struct mi_page_s*)* retired_slot;
+  mi_msecs_t                retired_at;
 } mi_page_t;
 
 // An impossible `(capacity,used)` (`used > capacity` never holds): "this page has no sweep state".
@@ -756,7 +775,6 @@ struct mi_subproc_s {
   mi_lock_t             arena_reserve_lock;             // lock to ensure arena's get reserved one at a time
   mi_decl_align(8)                                      // needed on some 32-bit platforms
   _Atomic(int64_t)      purge_expire;                   // expiration is set if any arenas can be purged
-  _Atomic(size_t)       empty_abandoned;                // #483: empty large pages may be abandoned; the scavenger frees them
 
   _Atomic(mi_heap_t*)   heap_main;                      // main heap for this sub process
   mi_heap_t*            heaps;                          // heaps belonging to this sub-process
@@ -789,15 +807,13 @@ struct mi_subproc_s {
   mi_decl_align(8)   // a LITERAL: MSVC's __declspec(align()) rejects `MI_SIZE_SIZE` (a parenthesized
                      // expression) with C2059, and 8 over-aligns the 4-byte word harmlessly
   _Atomic(mi_scav_word_t) scavenger_wake;               // wait word signalled when a purge is scheduled (the scavenger thread waits on this)
+  _Atomic(size_t)       retired_published;              // #483: 1 when some tld may hold a retired large page for the scavenger (appended at the tail, see above)
 };
 
 
 // ------------------------------------------------------
 // Thread Local data
 // ------------------------------------------------------
-
-// Milliseconds as in `int64_t` to avoid overflows
-typedef int64_t  mi_msecs_t;
 
 // Allocation sampling profiler per-thread state (MI_PPROF).
 typedef struct mi_profiler_tld_s {
@@ -901,6 +917,7 @@ struct mi_tld_s {
   _Atomic(size_t)       purge_epoch;          // `mi_purge_all` walk progress / registry cutoff
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
+  _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept

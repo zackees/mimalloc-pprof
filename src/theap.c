@@ -529,6 +529,7 @@ void _mi_heap_detach_theaps( mi_heap_t* heap ) {
             if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
                                 else { mi_assert_internal(tld->theaps == theap); tld->theaps = theap->tnext; }
             theap->tnext = theap->tprev = NULL;
+            _mi_theap_unpublish_retired(theap);   // #483: while its tld is certainly alive
             mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
             mi_lock_release(&tld->theaps_lock);
           }

@@ -348,15 +348,6 @@ void _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page)
   mi_assert_expensive(_mi_page_is_valid(page));
 }
 
-// hand the page to the arena's abandoned pages, even when it is empty (`_mi_page_abandon` frees those)
-static void mi_page_abandon_keep(mi_page_t* page, mi_page_queue_t* pq) {
-  mi_page_queue_remove(pq, page);
-  mi_theap_t* theap = page->theap;
-  mi_page_set_theap(page, NULL);
-  page->theap = theap; // don't actually set theap to NULL so we can reclaim_on_free within the same theap
-  _mi_arenas_page_abandon(page, theap);
-}
-
 void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 3/5.
   // no allocation to serve here either (see `mi_theap_page_collect`): un-purging would fault a run
@@ -366,7 +357,12 @@ void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
     _mi_page_free(page, pq);
   }
   else {
-    mi_page_abandon_keep(page, pq);
+    mi_page_queue_remove(pq, page);
+    mi_theap_t* theap = page->theap;
+    mi_page_set_theap(page, NULL);
+    page->theap = theap; // don't actually set theap to NULL so we can reclaim_on_free within the same theap
+    _mi_arenas_page_abandon(page, theap);
+    // _mi_arenas_collect(false, false, theap->tld); // allow purging
   }
 }
 
@@ -518,19 +514,12 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   const size_t bsize = mi_page_block_size(page);
   if mi_likely( /* bsize < MI_MAX_RETIRE_SIZE && */ !mi_page_queue_is_special(pq)) {  // not full or huge queue?
     if (pq->last==page && pq->first==page) { // the only page in the queue?
-      if (bsize > MI_MEDIUM_MAX_OBJ_SIZE) {
-        // #483: a large page is abandoned instead of retired. A retired page is freed only by its
-        // owner's next allocations, so an idle thread kept it resident for good; abandoned, its
-        // owner re-adopts it cheaply, and the scavenger frees it once it stays unused.
-        mi_page_abandon_keep(page, pq);
-        _mi_arenas_note_empty_abandoned(mi_page_subproc(page));
-        return;
-      }
       mi_theap_t* theap = mi_page_theap(page);
       #if MI_STAT>0
       mi_theap_stat_counter_increase(theap, pages_retire, 1);
       #endif
       page->retire_expire = (bsize <= MI_SMALL_MAX_OBJ_SIZE ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
+      if (bsize > MI_MEDIUM_MAX_OBJ_SIZE) { _mi_page_publish_retired(page); }   // #483: so an idle owner cannot pin it
       mi_assert_internal(pq >= theap->pages);
       const size_t index = pq - theap->pages;
       mi_assert_internal(index < MI_BIN_FULL && index < MI_BIN_HUGE);
@@ -716,6 +705,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   if (page->free != NULL) return true;
   #endif
   if (page->capacity >= page->reserved) return true;
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: before forming blocks in it
 
   size_t page_size;
   //uint8_t* page_start =

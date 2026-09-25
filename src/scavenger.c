@@ -614,8 +614,8 @@ static void mi_scavenger_run(void) {
     }
     // a park passed over for its minimum interval is swept when its window ends, not at the safety timeout
     if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
-    // #483: empty large pages their owners abandoned are freed once they stay unused for a tick
-    if (_mi_arenas_free_empty_abandoned(subproc)) {
+    // #483: retired large pages of idle threads are released once they stay retired long enough
+    if (_mi_pages_release_retired(subproc)) {
       const long tick = mi_option_get_clamp(mi_option_purge_delay, 1, MI_SCAVENGER_MAX_WAIT_MS);
       if (tick < timeout_ms) { timeout_ms = tick; }
     }

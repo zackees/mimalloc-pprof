@@ -43,7 +43,9 @@ static const mi_page_t mi_page_empty = {
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
   { 0 },                  // purged: no discarded OS pages
   0, 0,                   // unformed_purged_lo / _hi: nothing of the unformed tail is discarded
-  MI_PAGE_SWEPT_NONE      // swept_state: never swept
+  MI_PAGE_SWEPT_NONE,     // swept_state: never swept
+  NULL,                   // retired_slot: not published (#483)
+  0                       // retired_at
 };
 
 #define MI_PAGE_EMPTY() ((mi_page_t*)&mi_page_empty)
@@ -123,7 +125,8 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // sweeper
   MI_ATOMIC_VAR_INIT(0),  // purge_epoch
   MI_ATOMIC_VAR_INIT(0),  // gate_flags
-  0                       // fork_gen (#293)
+  0,                      // fork_gen (#293)
+  { 0 }                   // retired_pages (#483)
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -350,6 +353,11 @@ static void mi_tld_unregister(mi_tld_t* tld) {
 mi_decl_noinline static void mi_tld_free(mi_tld_t* tld) {
   if (tld==NULL) return;
   mi_tld_unregister(tld);   // #272
+  #if MI_DEBUG>1
+  for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {   // #483: every published page was taken back (freed or detached) first
+    mi_assert_internal(mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[i]) == NULL);
+  }
+  #endif
   mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
   tld->thread_id = (mi_threadid_t)(~0);          // it is best to set an invalid tid for tld_main as sometimes the same thread-id
                                                  // is reused by the OS after a thread has terminated. (see issue #1287)

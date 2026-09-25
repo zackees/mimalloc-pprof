@@ -2742,6 +2742,8 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
     const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
     if (expire == 0) continue;                 // nothing queued for this arena
     any_scheduled = true;
+    bool aged = false;                         // #457: the caller is idle, so everything queued counts as aged
+    _mi_bitmap_forall_setc_ranges(arena->slices_purge, &mi_arena_age_purge_visitor, arena, &aged);
     if (expire > now) { mi_atomic_storei64_release(&arena->purge_expire, now); }
   }
   if (!any_scheduled) return;

@@ -110,7 +110,10 @@ int main(void) {
   fprintf(stderr, "test-arena-purge-rearm: held %zu MiB, residual after %d ms idle %zu MiB\n",
           held >> 20, POLL_ITERS * POLL_MS, residual >> 20);
 #if MI_TEST_RSS_ASSERTED
-  if (residual > held / 8) {
+  /* held/4, not tighter: RSS also moves for reasons outside the purge queue (runs with 0 bytes
+     still queued have read up to ~24 MiB on a loaded runner), while the orphaned deadline this
+     test exists for keeps ~190 of ~200 MiB resident. */
+  if (residual > held / 4) {
     fprintf(stderr, "test-arena-purge-rearm: FAILED -- the deferred arena purge did not return the "
                     "freed memory; its deadline was orphaned (#457)\n");
     return 1;

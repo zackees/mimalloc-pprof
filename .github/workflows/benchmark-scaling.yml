@@ -4,7 +4,8 @@ name: benchmark-scaling
 # publishes through the same sealed branch/Pages pipeline. Coverage mode:
 # Six legacy patterns use 3 coverage blocks; the four deterministic large-size
 # distributions (#424, and the long-/short-lived-thread pair from #478) use 40 paired
-# repetitions for empirical P5-P95 bands.
+# repetitions; the charts overlay every allocator's median (#507) and the P5/P95
+# spread stays in latest.json and the dashboard table.
 # The sweep doubled with the dense thread points (issue #211 WP4), grew another
 # 25% with the Bun row (#325), which also adds a fifth benchmark-child build, and grew
 # another 50% with the two named workloads (#216). The 2026 live run measured 3m01s of

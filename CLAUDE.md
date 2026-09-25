@@ -132,6 +132,11 @@ See
    #438. This does **not** waive same-build C/Rust layout checks, ordinary memory safety,
    or the separate retained `mi_arena_id_t` use-after-free risk in arena reclamation.
 
+9. **No magic numbers (owner rule, 2026-09-25).** A tuning constant (a time, size, count or
+   threshold) is a named `#define` guarded by `#ifndef`, so a build can override it
+   (`-DMI_SCAVENGER_MAX_WAIT_MS=5000`, including from the Rust crate's build script). Make it an
+   `mi_option` when it should be settable at run time, from C or Rust. Never write the value inline.
+
 ## Repo facts
 
 - Branch layout: `main` is the **v3** line (crate 1.0.x, overlay pinned to `upstream/dev3`

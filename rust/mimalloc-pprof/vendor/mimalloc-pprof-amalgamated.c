@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3eea8d0a of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 70cd7efd of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -2704,6 +2704,15 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 #ifndef MI_PAGE_RESERVE_RELEASE_MULT
 #define MI_PAGE_RESERVE_RELEASE_MULT      (10)
 #endif
+
+// #491: the one bound on "freed memory that stays idle is back with the OS within N ms"
+// (`_mi_release_bound_ms`): the slower of the two page releases above, the two purge periods the
+// arena purge then needs (#481), and MI_RELEASE_SLACK_MS for the scavenger to wake and run.
+// Tests poll up to it and perf-ab holds the release time to it (ci/release_ratchet.json).
+#ifndef MI_RELEASE_SLACK_MS
+#define MI_RELEASE_SLACK_MS               (300)
+#endif
+#define MI_ARENA_PURGE_PERIODS            (2)   // #481: a range is purged at the second deadline after its free
 
 
 // ------------------------------------------------------
@@ -5860,6 +5869,13 @@ static inline size_t mi_page_size(const mi_page_t* page) {
 static inline uint8_t* mi_page_area(const mi_page_t* page, size_t* size) {
   if (size) { *size = mi_page_size(page); }
   return mi_page_start(page);
+}
+
+// #491: see MI_RELEASE_SLACK_MS. Follows the `purge_delay` option, as the releases themselves do.
+static inline long _mi_release_bound_ms(void) {
+  const long mult = (MI_RETIRED_RELEASE_MULT > MI_PAGE_RESERVE_RELEASE_MULT ? MI_RETIRED_RELEASE_MULT : MI_PAGE_RESERVE_RELEASE_MULT);
+  const long delay = mi_option_get(mi_option_purge_delay);
+  return (delay < 0 ? -1 : (mult + MI_ARENA_PURGE_PERIODS) * delay + MI_RELEASE_SLACK_MS);   // -1: purging is off
 }
 
 static inline size_t mi_page_info_size(void) {

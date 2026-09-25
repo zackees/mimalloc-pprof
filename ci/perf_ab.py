@@ -176,17 +176,19 @@ def main() -> int:
                 f"{statistics.median(base):,.4g} -> {statistics.median(head):,.4g}<br>{delta}"
             )
         rows.append(f"| {workload} | " + " | ".join(cells) + " |")
-    # #491: the release promise, per workload, on head
+    # #491: the release promise, per workload, on head; the worst P95 is the evidence a lower
+    # bound in ci/release_ratchet.json needs (`p95_release_ms`)
     release = METRICS.index("release ms")
-    late = {
-        w: p
+    p95 = {
+        w: percentile([s[release] for s in samples[(w, "head")]], RELEASE_PERCENTILE)
         for w in workloads
-        if (p := percentile([s[release] for s in samples[(w, "head")]], RELEASE_PERCENTILE))
-        > bound_ms
     }
+    late = {w: p for w, p in p95.items() if p > bound_ms}
+    worst = max(p95, key=lambda w: p95[w])
     rows.append("")
     rows.append(
-        f"Release bound (ci/release_ratchet.json): {bound_ms} ms at P{RELEASE_PERCENTILE} on head -- "
+        f"Release bound (ci/release_ratchet.json): {bound_ms} ms; head P{RELEASE_PERCENTILE} "
+        f"release, worst workload: {p95[worst]:.0f} ms ({worst}) -- "
         + (", ".join(f"**{w}: {p:.0f} ms, LATE**" for w, p in late.items()) or "held")
     )
     table = "\n".join(rows) + "\n"

@@ -1267,13 +1267,6 @@ static inline uint8_t* mi_page_area(const mi_page_t* page, size_t* size) {
   return mi_page_start(page);
 }
 
-// #491: see MI_RELEASE_SLACK_MS. Follows the `purge_delay` option, as the releases themselves do.
-static inline long _mi_release_bound_ms(void) {
-  const long mult = (MI_RETIRED_RELEASE_MULT > MI_PAGE_RESERVE_RELEASE_MULT ? MI_RETIRED_RELEASE_MULT : MI_PAGE_RESERVE_RELEASE_MULT);
-  const long delay = mi_option_get(mi_option_purge_delay);
-  return (delay < 0 ? -1 : (mult + MI_ARENA_PURGE_PERIODS) * delay + MI_RELEASE_SLACK_MS);   // -1: purging is off
-}
-
 static inline size_t mi_page_info_size(void) {
   return _mi_align_up(sizeof(mi_page_t), MI_MAX_ALIGN_SIZE);
 }
@@ -1361,6 +1354,7 @@ size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            
 void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner resets a retired large page and publishes it for the scavenger
 void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
 bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
+long          _mi_release_bound_ms(void);                                       // #491: idle memory is back with the OS within this many ms
 void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
 void          _mi_pages_release_schedule(mi_subproc_t* subproc);  // #483/#493: a retired or reserved page waits for the scavenger's release
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,

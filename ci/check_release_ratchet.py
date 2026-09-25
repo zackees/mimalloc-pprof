@@ -39,7 +39,7 @@ def define(text: str, name: str) -> int:
 
 
 def allocator_bound_ms(types_h: str, options_c: str) -> int:
-    """`_mi_release_bound_ms()` (include/mimalloc/internal.h) at the default purge_delay."""
+    """`_mi_release_bound_ms()` (src/page-holes.c) at the default purge_delay."""
     match = re.search(r"\{\s*(\d+),\s*MI_OPTION_UNINIT,\s*MI_OPTION_LEGACY\(purge_delay", options_c)
     if match is None:
         raise SystemExit(

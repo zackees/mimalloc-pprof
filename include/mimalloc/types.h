@@ -305,7 +305,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #endif
 
 // #491: the one bound on "freed memory that stays idle is back with the OS within N ms"
-// (`_mi_release_bound_ms`): the slower of the two page releases above, the two purge periods the
+// (`_mi_release_bound_ms`, src/page-holes.c): the slower of the two page releases above, the two purge periods the
 // arena purge then needs (#481), and MI_RELEASE_SLACK_MS for the scavenger to wake and run.
 // Tests poll up to it and perf-ab holds the release time to it (ci/release_ratchet.json).
 #ifndef MI_RELEASE_SLACK_MS

@@ -566,6 +566,7 @@ static void mi_scavenger_run(void) {
   // Use the main subproc directly: this thread never allocates, so don't
   // initialise a theap/tld via _mi_subproc()'s TLS path.
   mi_subproc_t* const subproc = _mi_subproc_main();
+  mi_msecs_t full_pass = _mi_clock_now();   // last safety-net pass over every arena
   while (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) {
     // Clear with an RMW, not a plain store: it must be totally ordered against the parker's
     // coalescing `exchange(wake, 1)` in `_mi_scavenger_wake`. With a store, our clear and the later
@@ -579,10 +580,16 @@ static void mi_scavenger_run(void) {
     mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
     mi_msecs_t timeout_ms;
     if (expire == 0) {
-      // Nothing scheduled: park until woken. The 30s bound is a pure safety
-      // net so stop() is guaranteed to take effect and any per-arena expiry
-      // that did not propagate to subproc is still eventually purged.
-      timeout_ms = 30000;
+      // Nothing scheduled: park until woken. Every 30s a full pass re-derives the deadline
+      // from the arenas themselves, so a per-arena expiry that never reached the subproc
+      // is still purged (#457); the bound also guarantees stop() takes effect.
+      const mi_msecs_t now = _mi_clock_now();
+      if (now - full_pass >= 30000) {
+        full_pass = now;
+        _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
+        continue;
+      }
+      timeout_ms = 30000 - (now - full_pass);
     }
     else {
       const mi_msecs_t now = _mi_clock_now();
@@ -591,13 +598,10 @@ static void mi_scavenger_run(void) {
         if (timeout_ms > 30000) timeout_ms = 30000;
       }
       else {
+        // A full pass always settles subproc->purge_expire to the earliest pending arena
+        // expire (0 if none), or to a short retry when another thread holds the purge guard.
+        // Never clear it here: that orphaned arenas that were re-armed meanwhile (#457).
         _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
-        // _mi_arenas_try_purge sets subproc->purge_expire to the earliest still-pending
-        // per-arena expire once every arena is visited. If it left the stale past value
-        // (its CAS lost to a concurrent schedule), clear it so the next iteration parks on
-        // the 30s safety net instead of spinning. CAS so a concurrently scheduled future
-        // expire is never clobbered.
-        mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expire, (mi_msecs_t)0);
         continue;
       }
     }

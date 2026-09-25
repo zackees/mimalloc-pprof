@@ -1559,7 +1559,7 @@ void _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep) {
       if (mi_bitmap_is_set(arena->slices_committed, i)) { rep->arena_committed_bytes += MI_ARENA_SLICE_SIZE; }
       if (!mi_bbitmap_is_setN(arena->slices_free, i, 1)) continue;   // in a page (or reserved meta): not slack
       if (mi_bitmap_is_set(arena->slices_dirty, i)) { rep->arena_free_dirty_bytes += MI_ARENA_SLICE_SIZE; }
-      if (mi_bitmap_is_set(arena->slices_purge, i)) { rep->arena_purge_pending_bytes += MI_ARENA_SLICE_SIZE; }
+      if (mi_bitmap_is_set(arena->slices_purge, i) || mi_bitmap_is_set(arena->slices_purge_aged, i)) { rep->arena_purge_pending_bytes += MI_ARENA_SLICE_SIZE; }
     }
   }
   mi_forall_arenas_end();
@@ -1775,7 +1775,7 @@ static size_t mi_arena_info_slices_needed(size_t slice_count, size_t* bitmap_bas
   if (slice_count == 0) slice_count = MI_BCHUNK_BITS;
   mi_assert_internal((slice_count % MI_BCHUNK_BITS) == 0);
   const size_t base_size = _mi_align_up(sizeof(mi_arena_t), MI_BCHUNK_SIZE);
-  const size_t bitmaps_count = 4; // commit, dirty, purge, and pages (the abandoned bitmaps are allocated on demand, Bun parity P10b #317)
+  const size_t bitmaps_count = 5; // commit, dirty, purge, purge_aged (#457), and pages (the abandoned bitmaps are allocated on demand, Bun parity P10b #317)
   const size_t bitmaps_size = bitmaps_count * mi_bitmap_size(slice_count, NULL) + mi_bbitmap_size(slice_count, NULL); // + free
   #if MI_PAGE_META_IS_SEPARATED
   const size_t pages_size = slice_count * sizeof(mi_page_t);
@@ -2002,6 +2002,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   arena->slices_committed = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_dirty = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_purge = mi_arena_bitmap_init(slice_count, &base);
+  arena->slices_purge_aged = mi_arena_bitmap_init(slice_count, &base);
   arena->pages_main.pages = mi_arena_bitmap_init(slice_count, &base);
   // Allocated on first abandon (Bun parity P10b, #317, ported from oven-sh/mimalloc @
   // 787be2a8, MIT); the arena's own memory is not yet fully zeroed at this point in every
@@ -2571,7 +2572,10 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
     mi_arena_purge(arena, slice_index, slice_count);
   }
   else {
-    // schedule purge
+    // schedule purge. #457: queue the range BEFORE arming, so a purge that runs concurrently
+    // either sees the range (ages it, and re-arms) or has already cleared the deadline (so the
+    // CAS below arms it); in the other order the range could land in a queue with no deadline.
+    mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
     const mi_msecs_t expire = _mi_clock_now() + delay;
     mi_msecs_t expire0 = 0;
     if (mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire)) {
@@ -2585,10 +2589,14 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
         _mi_scavenger_wake(arena->subproc);
       }
     }
-    else {
-      // already an expiration was set
+    else if (mi_atomic_loadi64_relaxed(&arena->subproc->purge_expire) == 0) {
+      // #457: this arena is already armed but the subproc deadline is not (a settle raced
+      // this arena's 0 -> set). Re-arm it so the scavenger wakes for it.
+      mi_msecs_t sexpire0 = 0;
+      if (mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &sexpire0, expire0)) {
+        _mi_scavenger_wake(arena->subproc);
+      }
     }
-    mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
   }
 }
 
@@ -2597,6 +2605,7 @@ typedef struct mi_purge_visit_info_s {
   mi_msecs_t delay;
   bool all_purged;
   bool any_purged;
+  bool take_young;   // #457: forced purge -- ranges freed again since they were aged are purged too
 } mi_purge_visit_info_t;
 
 static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
@@ -2615,8 +2624,17 @@ static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size
   }
 }
 
+// #457: move a range queued in this period into the aged queue (see `mi_arena_try_purge`)
+static bool mi_arena_age_purge_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  *(bool*)arg = true;
+  mi_bitmap_setN(arena->slices_purge_aged, slice_index, slice_count, NULL);
+  return true;
+}
+
 static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   mi_purge_visit_info_t* vinfo = (mi_purge_visit_info_t*)arg;
+  // #457: freed again since it was aged, so it is young again: `slices_purge` still has it
+  if (!vinfo->take_young && !mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count)) return true;
   // try to purge: first claim the free blocks
   if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
     vinfo->any_purged = true;
@@ -2656,15 +2674,22 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
   mi_atomic_storei64_release(&arena->purge_expire, (mi_msecs_t)0);
   mi_subproc_stat_counter_increase(arena->subproc, arena_purges, 1);
 
-  // go through all purge info's  (with max MI_BFIELD_BITS ranges at a time)
-  // this also clears those ranges atomically (so any newly freed blocks will get purged next
-  // time around)
-  mi_purge_visit_info_t vinfo = { now, mi_arena_purge_delay(), true /*all?*/, false /*any?*/};
-
+  // #457: two generations. Purge only what was already queued at the previous deadline, is
+  // still free, and was not freed again since: memory freed moments ago is about to be reused,
+  // and purging it would only make the next allocation re-fault it. Then age this period's
+  // queue and re-arm, so idle memory goes back between one and two `delay`s after its free.
+  // A forced purge (`mi_collect(true)`, `mi_purge_all`) takes both queues right away.
+  // The visitors clear each range atomically as they go (so a concurrent free is kept for next time).
+  const long delay = mi_arena_purge_delay();
+  mi_purge_visit_info_t vinfo = { now, delay, true /*all?*/, false /*any?*/, force /*young?*/ };
   // we purge by at least `minslices` to not fragment transparent huge pages for example
   const size_t minslices = mi_slice_count_of_size(_mi_os_minimal_purge_size());
-  _mi_bitmap_forall_setc_rangesn(arena->slices_purge, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
-
+  if (force) { _mi_bitmap_forall_setc_rangesn(arena->slices_purge, minslices, &mi_arena_try_purge_visitor, arena, &vinfo); }
+  _mi_bitmap_forall_setc_rangesn(arena->slices_purge_aged, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
+  bool aged = false;
+  _mi_bitmap_forall_setc_ranges(arena->slices_purge, &mi_arena_age_purge_visitor, arena, &aged);
+  mi_msecs_t expire0 = 0;
+  if (aged && delay > 0) { mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, now + delay); }
   return (vinfo.any_purged ? 1 : -1);
 }
 
@@ -2719,6 +2744,8 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
     const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
     if (expire == 0) continue;                 // nothing queued for this arena
     any_scheduled = true;
+    bool aged = false;                         // #457: the caller is idle, so everything queued counts as aged
+    _mi_bitmap_forall_setc_ranges(arena->slices_purge, &mi_arena_age_purge_visitor, arena, &aged);
     if (expire > now) { mi_atomic_storei64_release(&arena->purge_expire, now); }
   }
   if (!any_scheduled) return;
@@ -2808,7 +2835,7 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
         if (purged >= 0) {      // purged, or arena expire is not yet reached
           any_purged = true;
           if (purged >= 1) {    // purged
-            if (max_purge_count <= 1) {
+            if (max_purge_count <= 1 && !visit_all) {   // #457: a full pass must reach the settle below
               all_visited = false;
               break;
             }
@@ -2827,7 +2854,16 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       // per-arena expire (0 if none) and the scavenger's next wait is exact. A CAS, so a purge
       // scheduled concurrently with this walk is never clobbered.
       mi_msecs_t expected = arenas_expire;
-      mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
+      if (mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire) && next_expire == 0) {
+        // #457: a free may have armed an arena after we read it, and its own attempt to arm the
+        // subproc failed against the value we just replaced. Re-read so it is not orphaned.
+        for (size_t i = 0; i < max_arena; i++) {
+          mi_arena_t* const arena = mi_arena_from_index(subproc, i);
+          const mi_msecs_t aexpire = (arena == NULL ? 0 : mi_atomic_loadi64_relaxed(&arena->purge_expire));
+          mi_msecs_t zero = 0;
+          if (aexpire != 0) { mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &zero, aexpire); break; }
+        }
+      }
     }
   }
     if (!ran && force) {   // #272, see above
@@ -2840,6 +2876,12 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       _mi_prim_thread_yield();
     }
   } while (!ran && force);
+  if (!ran && visit_all) {
+    // #457: another thread holds the guard. Retry shortly instead of leaving a past deadline
+    // (which the scavenger would spin on) or clearing it (which would orphan pending arenas).
+    mi_msecs_t expected = arenas_expire;
+    mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, now + (delay/10) + 1);
+  }
 }
 
 

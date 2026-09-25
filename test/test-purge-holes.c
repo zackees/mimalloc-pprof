@@ -1679,6 +1679,51 @@ static bool test_large_holes_without_idle(void) {
   return ok;
 }
 
+// #484: a new thread's large page, carved from slices an exited thread used, must not keep
+//       the old tenant's memory resident beyond what the new owner formed. Threads run one
+//       at a time, so the test is deterministic but still goes through thread exit and a
+//       fresh theap.
+// ---------------------------------------------------------------------------
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#define TAIL_SZ  (256 * 1024)   // 16 blocks fill a 4 MiB large page
+
+static void* tail_blocks[16];
+static void* tail_new;
+
+static void tail_fill_page(void) {   // touch a whole large page, then free it
+  for (int i = 0; i < 16; i++) { tail_blocks[i] = mi_malloc(TAIL_SZ); if (tail_blocks[i] != NULL) memset(tail_blocks[i], 1, TAIL_SZ); }
+  for (int i = 0; i < 16; i++) { mi_free(tail_blocks[i]); }
+}
+static void tail_new_page(void) { tail_new = mi_malloc(TAIL_SZ); }   // one block in a new page
+
+static bool test_new_page_tail_not_resident(void) {
+  const long delay = mi_option_get(mi_option_purge_delay);
+  mi_option_set(mi_option_purge_delay, 60000);   // the arena must not purge the old slices first
+  run_one_thread(&tail_fill_page);
+  run_one_thread(&tail_new_page);
+  mi_option_set(mi_option_purge_delay, delay);
+  if (tail_new == NULL) return false;
+  const mi_page_t* const page = _mi_ptr_page(tail_new);
+  const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
+  const uintptr_t lo = _mi_align_up((uintptr_t)mi_page_start(page) + page->capacity * page->block_size, psize);
+  const uintptr_t hi = _mi_align_down((uintptr_t)mi_page_start(page) + page->reserved * page->block_size, psize);
+  size_t resident = 0, total = 0;
+  unsigned char vec[1024];
+  for (uintptr_t a = lo; a < hi; a += sizeof(vec) * psize) {
+    const size_t n = ((hi - a) / psize < sizeof(vec) ? (hi - a) / psize : sizeof(vec));
+    if (mincore((void*)a, n * psize, vec) != 0) break;
+    for (size_t i = 0; i < n; i++) { resident += (vec[i] & 1); total++; }
+  }
+  mi_free(tail_new);
+  fprintf(stderr, "(unformed tail: %zu of %zu OS pages resident) ", resident, total);
+  if (total == 0) return true;   // no reused slices here: nothing to check
+  return purging_enabled ? (resident * 4 < total) : true;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // 12. `purge_holes_min_interval` paces the OWNER's own sweeps, not only the
 //     scavenger's claim of a parked thread's tld.
@@ -1876,6 +1921,9 @@ int main(void) {
   CHECK("sweep-full-every-bounds-a-missed-hole", test_sweep_full_every());
   CHECK("owner-sweeps-are-paced", test_owner_sweep_pacing());
   CHECK("large-holes-without-idle", test_large_holes_without_idle());
+  #if !defined(_WIN32)
+  CHECK("new-page-tail-not-resident", test_new_page_tail_not_resident());
+  #endif
 
   // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);

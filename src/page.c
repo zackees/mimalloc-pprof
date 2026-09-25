@@ -512,7 +512,10 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   mi_page_queue_t* pq = mi_page_queue_of(page);
   #if MI_RETIRE_CYCLES > 0
   const size_t bsize = mi_page_block_size(page);
-  if mi_likely( /* bsize < MI_MAX_RETIRE_SIZE && */ !mi_page_queue_is_special(pq)) {  // not full or huge queue?
+  // #483: never a large page: a retired page is freed only by its owner's next allocations, so a
+  // thread that goes idle would keep it resident for good. Freed now, the arena's aged purge
+  // returns it, and an allocation that comes back soon finds its slices still resident.
+  if mi_likely(bsize <= MI_MEDIUM_MAX_OBJ_SIZE && !mi_page_queue_is_special(pq)) {  // not large, full or huge queue?
     if (pq->last==page && pq->first==page) { // the only page in the queue?
       mi_theap_t* theap = mi_page_theap(page);
       #if MI_STAT>0

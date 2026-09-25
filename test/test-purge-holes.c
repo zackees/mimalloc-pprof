@@ -1687,6 +1687,32 @@ static bool test_large_holes_without_idle(void) {
 #if !defined(_WIN32)
 #include <sys/mman.h>
 #include <unistd.h>
+
+// #491: a release test polls up to the release bound instead of sleeping a fixed time, so it
+// fails only when the memory really is late. The bound is the allocator's promise; the margin
+// is for a loaded runner that delays the scavenger, and the time it took is reported either way.
+#define RELEASE_POLL_MS      (5)
+#define RELEASE_TEST_MARGIN  (4)
+
+// Poll until fewer than a quarter of the `os_pages` OS pages at `p` are resident, or the bound
+// (times the margin) passes. Returns the milliseconds it took; `*resident` is the last count.
+static long poll_until_released(const void* p, size_t os_pages, size_t* resident) {
+  const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
+  const mi_msecs_t limit = (mi_msecs_t)_mi_release_bound_ms() * RELEASE_TEST_MARGIN;
+  const mi_msecs_t start = _mi_clock_now();
+  unsigned char vec[64];
+  if (os_pages > sizeof(vec)) { os_pages = sizeof(vec); }
+  for (;;) {
+    *resident = 0;
+    if (mincore((void*)_mi_align_down((uintptr_t)p, psize), os_pages * psize, vec) == 0) {
+      for (size_t i = 0; i < os_pages; i++) { *resident += (vec[i] & 1); }
+    }
+    const mi_msecs_t elapsed = _mi_clock_now() - start;
+    if (*resident * 4 < os_pages || elapsed > limit) return (long)elapsed;
+    usleep(RELEASE_POLL_MS * 1000);
+  }
+}
+
 static volatile int idle_ready, idle_release;
 static uint8_t* idle_block;
 
@@ -1705,17 +1731,13 @@ static bool test_idle_thread_releases_large_page(void) {
   pthread_t t;
   if (pthread_create(&t, NULL, &idle_thread, NULL) != 0) return false;
   while (!idle_ready) { usleep(1000); }
-  usleep(400 * 1000);   // 20 purge periods
-  const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
-  unsigned char vec[64];
-  size_t resident = 0;
-  if (idle_block != NULL && mincore((void*)_mi_align_down((uintptr_t)idle_block, psize), 64 * psize, vec) == 0) {
-    for (size_t i = 0; i < 64; i++) { resident += (vec[i] & 1); }
-  }
+  size_t resident = 64;
+  const long took = (idle_block != NULL ? poll_until_released(idle_block, 64, &resident) : -1);
+  const long bound = _mi_release_bound_ms();
   idle_release = 1;
   pthread_join(t, NULL);
   mi_option_set(mi_option_purge_delay, delay);
-  fprintf(stderr, "(freed block: %zu of 64 OS pages resident) ", resident);
+  fprintf(stderr, "(freed block: %zu of 64 OS pages resident after %ld ms; bound %ld ms) ", resident, took, bound);
   return resident * 4 < 64;
 }
 #endif
@@ -1952,7 +1974,7 @@ done:
 
 // Nobody reclaims the reserved page: after its window the scavenger (this process allocates
 // nothing meanwhile, so there is no busy sweep) hands it back to the arena, whose deferred purge
-// then returns its memory. Polled with a generous bound, not a fixed short sleep.
+// then returns its memory. Polled up to the release bound (#491), not a fixed sleep.
 static bool test_reserved_page_is_released(void) {
   if (!layout_is_predictable()) {
     fprintf(stderr, "(skipped: every allocation is guarded) ");
@@ -1969,23 +1991,12 @@ static bool test_reserved_page_is_released(void) {
   if (reserve_a_block == NULL) { fprintf(stderr, "\n  thread A could not allocate\n"); ok = false; goto done; }
   if (reserve_a_singleton) { fprintf(stderr, "(skipped: singleton page) "); goto done; }
   {
-    const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
-    const mi_msecs_t bound = (mi_msecs_t)MI_PAGE_RESERVE_RELEASE_MULT * RESERVE_DELAY_MS * 20;
-    const mi_msecs_t start = _mi_clock_now();
     size_t resident = 64;
-    for (;;) {
-      unsigned char vec[64];
-      resident = 0;
-      if (mincore((void*)_mi_align_down((uintptr_t)reserve_a_block, psize), 64 * psize, vec) == 0) {
-        for (size_t i = 0; i < 64; i++) { resident += (vec[i] & 1); }
-      }
-      if (resident * 4 < 64 || _mi_clock_now() - start > bound) break;
-      usleep(10 * 1000);
-    }
-    fprintf(stderr, "(reserved page: %zu of 64 OS pages resident after %lld ms) ",
-            resident, (long long)(_mi_clock_now() - start));
+    const long took = poll_until_released(reserve_a_block, 64, &resident);
+    fprintf(stderr, "(reserved page: %zu of 64 OS pages resident after %ld ms; bound %ld ms) ",
+            resident, took, _mi_release_bound_ms());
     if (resident * 4 >= 64) {
-      fprintf(stderr, "\n  the reserved page was not released within %lld ms\n", (long long)bound);
+      fprintf(stderr, "\n  the reserved page was not released within %ld ms\n", took);
       ok = false;
     }
   }

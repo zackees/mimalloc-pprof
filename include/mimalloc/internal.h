@@ -1267,6 +1267,13 @@ static inline uint8_t* mi_page_area(const mi_page_t* page, size_t* size) {
   return mi_page_start(page);
 }
 
+// #491: see MI_RELEASE_SLACK_MS. Follows the `purge_delay` option, as the releases themselves do.
+static inline long _mi_release_bound_ms(void) {
+  const long mult = (MI_RETIRED_RELEASE_MULT > MI_PAGE_RESERVE_RELEASE_MULT ? MI_RETIRED_RELEASE_MULT : MI_PAGE_RESERVE_RELEASE_MULT);
+  const long delay = mi_option_get(mi_option_purge_delay);
+  return (delay < 0 ? -1 : (mult + MI_ARENA_PURGE_PERIODS) * delay + MI_RELEASE_SLACK_MS);   // -1: purging is off
+}
+
 static inline size_t mi_page_info_size(void) {
   return _mi_align_up(sizeof(mi_page_t), MI_MAX_ALIGN_SIZE);
 }

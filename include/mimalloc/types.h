@@ -279,10 +279,10 @@ terms of the MIT license. A copy of the license can be found in the file
 //   4 KiB  OS page: small (64 KiB) = 16 bits, medium (512 KiB) = 128, large (4 MiB) = 1024
 //   16 KiB OS page: small = 4, medium = 32, large = 256  (fits, exactly at the limit)
 //   64 KiB OS page: small = 1, medium = 8,  large = 64
-// -- i.e. every small and medium page always, and a large page on a 16 KiB or larger OS
-// page. A large page on a 4 KiB OS page needs 1024 bits and stays ineligible. The check is
-// at runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in
-// `src/page-holes.c`), never at compile time: `_mi_os_page_size()` is not a constant.
+// -- i.e. every small and medium page, and a large page from a 16 KiB OS page up. A large
+// page on a 4 KiB OS page would need 1024 bits, so there one bit covers 16 KiB instead
+// (`mi_page_purge_unit`, #477). The unit is computed at runtime, never at compile time:
+// `_mi_os_page_size()` is not a constant.
 #define MI_PAGE_PURGE_BITS                (256)
 #define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
 
@@ -884,7 +884,9 @@ struct mi_tld_s {
   // go through `mi_atomic_addi64_relaxed`, the 64-bit primitive, exactly as `mi_stat_counter_t`.
   size_t                holes_sweep_seq;      // idle sweeps of this thread's heaps so far (`purge_holes_full_every`)
   mi_msecs_t            holes_sweep_last;     // when the last one ran (`purge_holes_min_interval` pacing)
+  mi_msecs_t            holes_busy_last;      // when the owner last swept its large pages while busy (#477)
   bool                  holes_sweeping;       // a sweep of this thread's heaps is in progress right now
+  bool                  holes_busy;           // ... and it is the owner's busy-time sweep (#477): leave pages used this period
   bool                  holes_sweep_full;     // ... and it ignores `page->swept_state` (every N'th sweep)
   size_t                holes_sweep_skipped;  // per-pass counters, folded into the process-wide ones by
   size_t                holes_sweep_visited;  // `_mi_page_purge_holes_end` (a per-page atomic would cost real time)

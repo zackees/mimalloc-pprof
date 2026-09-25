@@ -1475,7 +1475,7 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
 // note: this only reaches the *mapped* abandoned pages (the ones in `pages_abandoned`).
 // A page abandoned while full is not mapped; it has no free blocks at that point, and once
 // enough blocks are freed in it, `_mi_arenas_page_try_reabandon_to_mapped` puts it in the map.
-void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
+void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld, size_t bin_lo, size_t bin_hi) {
   if (heap == NULL || tld == NULL) return;
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   _mi_page_purge_holes_begin(tld);
@@ -1484,7 +1484,7 @@ void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
     if (arena_pages != NULL) {
       // pages_abandoned[] is MI_ARENA_BIN_COUNT wide, not MI_BIN_COUNT: bins above the
       // singleton bins have no abandoned bitmap (upstream ad1bcdbf, to shrink arena meta).
-      for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
+      for (size_t bin = bin_lo; bin < bin_hi && bin < MI_ARENA_BIN_COUNT; bin++) {
         if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
         mi_bitmap_t* const bitmap = mi_arena_pages_abandoned(arena_pages, bin);
         if (bitmap == NULL) continue;

@@ -131,8 +131,16 @@ See
    Appending fields to `mi_purge_all_report_t` is therefore not, by itself, a blocker for
    #438. This does **not** waive same-build C/Rust layout checks, ordinary memory safety,
    or the separate retained `mi_arena_id_t` use-after-free risk in arena reclamation.
+9. **Never suppress `-Wunused-function` file-wide** (no `#pragma GCC/clang diagnostic
+   ignored`, including in the xtask amalgamation). Mark the individual `static` function
+   `MI_DECL_MAYBE_UNUSED` (defined in `include/mimalloc.h`) with a comment saying why a
+   translation unit may not call it. `ci/check_no_diagnostic_suppression.py` enforces this.
 
-9. **No magic numbers (owner rule, 2026-09-25).** A tuning constant (a time, size, count or
+10. **Macros are UPPER_CASE** (owner rule, 2026-09-25). `ci/check_macro_case.py` fails on any new
+    lower-case `#define`; `ci/macro_case_baseline.txt` grandfathers the ones inherited from upstream
+    and may only shrink.
+
+11. **No magic numbers (owner rule, 2026-09-25).** A tuning constant (a time, size, count or
    threshold) is a named `#define` guarded by `#ifndef`, so a build can override it
    (`-DMI_SCAVENGER_MAX_WAIT_MS=5000`, including from the Rust crate's build script). Make it an
    `mi_option` when it should be settable at run time, from C or Rust. Never write the value inline.

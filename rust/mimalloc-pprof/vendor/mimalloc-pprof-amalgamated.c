@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 9c154e51 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3bd36cfc of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -2677,6 +2677,15 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 #define MI_PAGE_PURGE_BITS                (256)
 #define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
 
+// #483: a thread publishes up to this many retired (emptied) large pages; the scavenger discards
+// the memory of one that stays retired for MI_RETIRED_RELEASE_MULT purge delays.
+#ifndef MI_RETIRED_PAGE_SLOTS
+#define MI_RETIRED_PAGE_SLOTS             (16)
+#endif
+#ifndef MI_RETIRED_RELEASE_MULT
+#define MI_RETIRED_RELEASE_MULT           (10)
+#endif
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from
@@ -2789,6 +2798,10 @@ typedef uintptr_t  mi_encoded_t;
 
 // thread id's
 typedef size_t     mi_threadid_t;
+
+// Milliseconds as in `int64_t` to avoid overflows (declared here rather than with the
+// thread-local data below because `mi_page_t::retired_at` uses it, #483)
+typedef int64_t    mi_msecs_t;
 
 // free lists contain blocks
 typedef struct mi_block_s {
@@ -2907,6 +2920,12 @@ typedef struct mi_page_s {
   // was allocated or freed in it since, so the sweep has nothing new to discard (see
   // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". Cold, like `purged` above.
   uint64_t                  swept_state;
+
+  // #483: a retired large page published for the scavenger (`_mi_page_retire`): the owner's tld
+  // slot holding it (NULL when not published) and when it was retired. Whoever clears the slot
+  // owns the page's memory until it puts it back.
+  _Atomic(struct mi_page_s*)* retired_slot;
+  mi_msecs_t                retired_at;
 } mi_page_t;
 
 // An impossible `(capacity,used)` (`used > capacity` never holds): "this page has no sweep state".
@@ -3147,7 +3166,6 @@ struct mi_subproc_s {
   mi_lock_t             arena_reserve_lock;             // lock to ensure arena's get reserved one at a time
   mi_decl_align(8)                                      // needed on some 32-bit platforms
   _Atomic(int64_t)      purge_expire;                   // expiration is set if any arenas can be purged
-  _Atomic(size_t)       empty_abandoned;                // #483: empty large pages may be abandoned; the scavenger frees them
 
   _Atomic(mi_heap_t*)   heap_main;                      // main heap for this sub process
   mi_heap_t*            heaps;                          // heaps belonging to this sub-process
@@ -3180,15 +3198,13 @@ struct mi_subproc_s {
   mi_decl_align(8)   // a LITERAL: MSVC's __declspec(align()) rejects `MI_SIZE_SIZE` (a parenthesized
                      // expression) with C2059, and 8 over-aligns the 4-byte word harmlessly
   _Atomic(mi_scav_word_t) scavenger_wake;               // wait word signalled when a purge is scheduled (the scavenger thread waits on this)
+  _Atomic(size_t)       retired_published;              // #483: 1 when some tld may hold a retired large page for the scavenger (appended at the tail, see above)
 };
 
 
 // ------------------------------------------------------
 // Thread Local data
 // ------------------------------------------------------
-
-// Milliseconds as in `int64_t` to avoid overflows
-typedef int64_t  mi_msecs_t;
 
 // Allocation sampling profiler per-thread state (MI_PPROF).
 typedef struct mi_profiler_tld_s {
@@ -3292,6 +3308,7 @@ struct mi_tld_s {
   _Atomic(size_t)       purge_epoch;          // `mi_purge_all` walk progress / registry cutoff
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
+  _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept
@@ -5894,6 +5911,10 @@ void          _mi_page_unpurge_all(mi_page_t* page);
 size_t        _mi_page_purged_count(const mi_page_t* page);
 void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   // hand the discarded unformed tail back below `end` (an absolute address)
 size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            // the bytes of this page's unformed tail that are discarded right now
+void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner resets a retired large page and publishes it for the scavenger
+void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
+bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
+void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
                                             size_t capacity, size_t k, size_t* first, size_t* last);
 bool          _mi_page_purge_holes_in_progress(void);            // is the calling thread inside a sweep of its own heaps?
@@ -5973,8 +5994,6 @@ void          _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep);
 void          _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep);
 void          _mi_purge_holes_report_collect(mi_holes_report_t* rep);
 void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld, size_t bin_lo, size_t bin_hi);   // src/arena.c: bins [lo,hi)
-void          _mi_arenas_note_empty_abandoned(mi_subproc_t* subproc);   // #483: an empty large page was abandoned
-bool          _mi_arenas_free_empty_abandoned(mi_subproc_t* subproc);   // #483: the scavenger's pass; true if some remain
 
 // The free-arena reclaim (src/arena-reclaim.c, phase F of `mi_purge_all_ex`): give back the
 // arenas that are completely free. The report is filled in even when it is a no-op.
@@ -12025,6 +12044,7 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
   // until it is MADV_FREE_REUSE'd. This function is the single choke point for a page going
   // back to the arena (`_mi_page_free` and the abandoned-page free in `free.c` both land here).
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: first, so the scavenger cannot discard it meanwhile
   _mi_page_unpurge_all(page);
 
   // all we need from the heap, before the page is unpublished from it (see
@@ -12069,7 +12089,8 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(page->next==NULL && page->prev == NULL);   // may be empty: a retired large page (#483)
+  mi_assert_internal(!mi_page_all_free(page));
+  mi_assert_internal(page->next==NULL && page->prev == NULL);
   mi_assert_internal(_mi_theap_can_touch(current_theap));  // adapted from 942b8342 (issue #271): was mi_theap_matches_thread + an assert requiring current_theap's own heap to match, which does not hold for a detached theap that _mi_theap_abandon (theap.c) is abandoning on behalf of its (foreign) owning thread
   // mi_assert_internal(current_theap == _mi_page_associated_theap(page));
 
@@ -12266,61 +12287,6 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
   mi_bitmap_set(bitmap, slice_index);     // back in the map *before* unowning: unown may free the page
   mi_abandoned_page_unown(page, NULL);
   return true;
-}
-
-// #483: an emptied large page is abandoned rather than retired (`_mi_page_retire`), so an idle
-// owner cannot keep it resident. The scavenger, which owns no theap, frees such pages through the
-// same claim protocol once they have stayed empty and untouched for a whole tick; a page its
-// owner re-adopts in the meantime is never freed.
-void _mi_arenas_note_empty_abandoned(mi_subproc_t* subproc) {
-  if (mi_atomic_load_relaxed(&subproc->empty_abandoned) == 0 &&
-      mi_atomic_exchange_acq_rel(&subproc->empty_abandoned, (size_t)1) == 0) {
-    _mi_scavenger_wake(subproc);
-  }
-}
-
-typedef struct mi_empty_abandoned_arg_s { mi_bitmap_t* bitmap; bool pending; } mi_empty_abandoned_arg_t;
-
-static bool mi_arena_free_empty_abandoned_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
-  MI_UNUSED(slice_count);
-  mi_empty_abandoned_arg_t* const ea = (mi_empty_abandoned_arg_t*)arg;
-  mi_bitmap_t* const bitmap = ea->bitmap;
-  if (!mi_bitmap_clear(bitmap, slice_index)) return true;   // someone else has the page
-  mi_page_t* const page = mi_arena_page_at_slice(arena, slice_index);
-  if (!mi_page_claim_ownership(page)) { mi_bitmap_set(bitmap, slice_index); return true; }
-  _mi_page_free_collect_no_unpurge(page, true);
-  bool keep = !mi_page_all_free(page);
-  if (!keep) {   // empty: free it only if it was already empty and untouched at the previous tick
-    const uint64_t sig = (uint64_t)(uintptr_t)page->free ^ mi_page_sweep_state(page);
-    keep = (page->swept_state != sig);
-    page->swept_state = sig;
-    if (keep) { ea->pending = true; }   // still pending: tick again
-  }
-  mi_bitmap_set(bitmap, slice_index);   // back in the map before freeing or unowning
-  if (keep) { mi_abandoned_page_unown(page, NULL); }
-  else { _mi_arenas_abandoned_page_free(page, NULL); }
-  return true;
-}
-
-bool _mi_arenas_free_empty_abandoned(mi_subproc_t* subproc) {
-  if (mi_atomic_exchange_acq_rel(&subproc->empty_abandoned, (size_t)0) == 0) return false;
-  mi_empty_abandoned_arg_t ea = { NULL, false };
-  mi_lock(&subproc->heaps_lock) {
-    for (mi_heap_t* heap = subproc->heaps; heap != NULL; heap = heap->next) {
-      if (mi_atomic_load_acquire(&heap->releasing) != 0) continue;
-      mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
-        mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
-        for (size_t bin = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1); arena_pages != NULL && bin <= _mi_bin(MI_LARGE_MAX_OBJ_SIZE) && bin < MI_ARENA_BIN_COUNT; bin++) {
-          if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
-          ea.bitmap = mi_arena_pages_abandoned(arena_pages, bin);
-          if (ea.bitmap != NULL) { (void)_mi_bitmap_forall_set(ea.bitmap, &mi_arena_free_empty_abandoned_at, arena, &ea); }
-        }
-      }
-      mi_forall_arenas_end();
-    }
-  }
-  if (ea.pending) { mi_atomic_store_release(&subproc->empty_abandoned, (size_t)1); }
-  return ea.pending;
 }
 
 // note: this only reaches the *mapped* abandoned pages (the ones in `pages_abandoned`).
@@ -18829,7 +18795,9 @@ static const mi_page_t mi_page_empty = {
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
   { 0 },                  // purged: no discarded OS pages
   0, 0,                   // unformed_purged_lo / _hi: nothing of the unformed tail is discarded
-  MI_PAGE_SWEPT_NONE      // swept_state: never swept
+  MI_PAGE_SWEPT_NONE,     // swept_state: never swept
+  NULL,                   // retired_slot: not published (#483)
+  0                       // retired_at
 };
 
 #define MI_PAGE_EMPTY() ((mi_page_t*)&mi_page_empty)
@@ -18909,7 +18877,8 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // sweeper
   MI_ATOMIC_VAR_INIT(0),  // purge_epoch
   MI_ATOMIC_VAR_INIT(0),  // gate_flags
-  0                       // fork_gen (#293)
+  0,                      // fork_gen (#293)
+  { 0 }                   // retired_pages (#483)
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -19136,6 +19105,11 @@ static void mi_tld_unregister(mi_tld_t* tld) {
 mi_decl_noinline static void mi_tld_free(mi_tld_t* tld) {
   if (tld==NULL) return;
   mi_tld_unregister(tld);   // #272
+  #if MI_DEBUG>1
+  for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {   // #483: every published page was taken back (freed or detached) first
+    mi_assert_internal(mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[i]) == NULL);
+  }
+  #endif
   mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
   tld->thread_id = (mi_threadid_t)(~0);          // it is best to set an invalid tid for tld_main as sometimes the same thread-id
                                                  // is reused by the OS after a thread has terminated. (see issue #1287)
@@ -24276,15 +24250,6 @@ void _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page)
   mi_assert_expensive(_mi_page_is_valid(page));
 }
 
-// hand the page to the arena's abandoned pages, even when it is empty (`_mi_page_abandon` frees those)
-static void mi_page_abandon_keep(mi_page_t* page, mi_page_queue_t* pq) {
-  mi_page_queue_remove(pq, page);
-  mi_theap_t* theap = page->theap;
-  mi_page_set_theap(page, NULL);
-  page->theap = theap; // don't actually set theap to NULL so we can reclaim_on_free within the same theap
-  _mi_arenas_page_abandon(page, theap);
-}
-
 void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b) -- HOOK 3/5.
   // no allocation to serve here either (see `mi_theap_page_collect`): un-purging would fault a run
@@ -24294,7 +24259,12 @@ void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
     _mi_page_free(page, pq);
   }
   else {
-    mi_page_abandon_keep(page, pq);
+    mi_page_queue_remove(pq, page);
+    mi_theap_t* theap = page->theap;
+    mi_page_set_theap(page, NULL);
+    page->theap = theap; // don't actually set theap to NULL so we can reclaim_on_free within the same theap
+    _mi_arenas_page_abandon(page, theap);
+    // _mi_arenas_collect(false, false, theap->tld); // allow purging
   }
 }
 
@@ -24446,19 +24416,12 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   const size_t bsize = mi_page_block_size(page);
   if mi_likely( /* bsize < MI_MAX_RETIRE_SIZE && */ !mi_page_queue_is_special(pq)) {  // not full or huge queue?
     if (pq->last==page && pq->first==page) { // the only page in the queue?
-      if (bsize > MI_MEDIUM_MAX_OBJ_SIZE) {
-        // #483: a large page is abandoned instead of retired. A retired page is freed only by its
-        // owner's next allocations, so an idle thread kept it resident for good; abandoned, its
-        // owner re-adopts it cheaply, and the scavenger frees it once it stays unused.
-        mi_page_abandon_keep(page, pq);
-        _mi_arenas_note_empty_abandoned(mi_page_subproc(page));
-        return;
-      }
       mi_theap_t* theap = mi_page_theap(page);
       #if MI_STAT>0
       mi_theap_stat_counter_increase(theap, pages_retire, 1);
       #endif
       page->retire_expire = (bsize <= MI_SMALL_MAX_OBJ_SIZE ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
+      if (bsize > MI_MEDIUM_MAX_OBJ_SIZE) { _mi_page_publish_retired(page); }   // #483: so an idle owner cannot pin it
       mi_assert_internal(pq >= theap->pages);
       const size_t index = pq - theap->pages;
       mi_assert_internal(index < MI_BIN_FULL && index < MI_BIN_HUGE);
@@ -24644,6 +24607,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   if (page->free != NULL) return true;
   #endif
   if (page->capacity >= page->reserved) return true;
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: before forming blocks in it
 
   size_t page_size;
   //uint8_t* page_start =
@@ -26476,6 +26440,112 @@ void _mi_page_unpurge_all(mi_page_t* page) {
     }
   }
   _mi_page_purged_reset(page);
+}
+
+
+/* -----------------------------------------------------------
+  Retired large pages of idle threads  (#483)
+
+  `_mi_page_retire` keeps the only page of a size class on its theap when it empties, and only
+  the owner's own later allocations free it (`_mi_theap_collect_retired`). A thread that stays
+  alive but stops allocating would pin its emptied 4 MiB large pages forever. So when a large
+  page retires, the owner resets it to "nothing formed" (`capacity == 0`, `free == NULL`: the
+  memory stays resident, so a reuse re-forms blocks without faulting, and the alloc fast path
+  can never reach a block of it) and publishes it in a slot of its tld. The scavenger discards
+  the whole block area of a page that stays published for MI_RETIRED_RELEASE_MULT purge delays,
+  as an unformed tail -- which `mi_page_extend_free` already hands back before forming a block.
+
+  The slot is the lock: whoever takes the page out of the slot owns the page's memory until it
+  puts it back. The scavenger takes it by swapping in MI_RETIRED_SLOT_BUSY (not NULL, or the
+  owner could publish another page into that slot meanwhile) for exactly one discard. The owner
+  takes it back for good (`_mi_page_unpublish_retired`) before it forms a block in the page or
+  returns the page to the arena, waiting out the scavenger's one discard if it has to.
+----------------------------------------------------------- */
+
+#define MI_RETIRED_SLOT_BUSY  ((mi_page_t*)1)   // the scavenger holds this slot's page for one discard
+
+// Owner only (from `_mi_page_retire`): reset an emptied large page and publish it for the
+// scavenger. When every slot is taken the page simply stays retired as upstream keeps it.
+void _mi_page_publish_retired(mi_page_t* page) {
+  mi_assert_internal(mi_page_all_free(page));
+  mi_assert_internal(page->retired_slot == NULL);
+  if (page->retired_slot != NULL) return;
+  mi_tld_t* const tld = mi_page_theap(page)->tld;
+  // only the owner ever fills an empty slot, so one it sees empty stays empty until it fills it
+  _Atomic(mi_page_t*)* slot = NULL;
+  for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {
+    if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[i]) == NULL) { slot = &tld->retired_pages[i]; break; }
+  }
+  if (slot == NULL) return;   // all slots full: leave it unpublished
+
+  _mi_page_unpurge_all(page);   // holes describe formed blocks, and there will be none
+  page->free = NULL;            // nothing formed: every block of the page is unformed tail now
+  page->local_free = NULL;
+  page->capacity = 0;
+  page->free_is_zero = false;
+  page->retired_at = _mi_clock_now();
+  page->retired_slot = slot;
+  mi_atomic_store_ptr_release(mi_page_t, slot, page);   // publishes the reset above to the scavenger
+
+  mi_subproc_t* const subproc = mi_page_subproc(page);
+  if (mi_atomic_load_relaxed(&subproc->retired_published) == 0 &&
+      mi_atomic_exchange_acq_rel(&subproc->retired_published, (size_t)1) == 0) {
+    _mi_scavenger_wake(subproc);   // a sleeping scavenger has nothing scheduled to notice this by
+  }
+}
+
+// Take a published page back from the scavenger for good: before a block is formed in it or it
+// is returned to the arena. If the scavenger holds the slot, that is for one discard only.
+void _mi_page_unpublish_retired(mi_page_t* page) {
+  _Atomic(mi_page_t*)* const slot = page->retired_slot;
+  if (slot == NULL) return;
+  mi_page_t* expected = page;
+  while (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &expected, NULL)) {
+    mi_assert_internal(expected == MI_RETIRED_SLOT_BUSY);
+    expected = page;
+    _mi_prim_thread_yield();
+  }
+  page->retired_slot = NULL;
+}
+
+// A theap detached from its tld by a heap delete/destroy (`_mi_heap_detach_theaps`) has its pages
+// freed only later -- possibly after its thread exited and freed the tld, slots and all. So it takes
+// its published pages back now, while the tld is certainly alive.
+void _mi_theap_unpublish_retired(mi_theap_t* theap) {
+  for (size_t bin = 0; bin <= MI_BIN_FULL; bin++) {
+    for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {
+      if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }
+    }
+  }
+}
+
+// Scavenger: discard the memory of every published page retired for long enough. Returns true
+// when some published page is not old enough yet, i.e. the scavenger should come back.
+bool _mi_pages_release_retired(mi_subproc_t* subproc) {
+  if (mi_atomic_exchange_acq_rel(&subproc->retired_published, (size_t)0) == 0) return false;
+  const long delay = mi_option_get(mi_option_purge_delay);
+  if (delay < 0) return false;   // purging disabled
+  const mi_msecs_t min_age = (mi_msecs_t)delay * MI_RETIRED_RELEASE_MULT;
+  const mi_msecs_t now = _mi_clock_now();
+  bool pending = false;
+  mi_lock(&subproc->tlds_lock) {   // keeps every registered tld (and so its slots) alive
+    for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
+      for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {
+        _Atomic(mi_page_t*)* const slot = &tld->retired_pages[i];
+        mi_page_t* page = mi_atomic_load_ptr_relaxed(mi_page_t, slot);
+        if (page == NULL || page == MI_RETIRED_SLOT_BUSY) continue;
+        if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &page, MI_RETIRED_SLOT_BUSY)) continue;   // the owner took it back
+        // the page's memory is ours until we put it back
+        if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not discarded already)
+          if (now - page->retired_at < min_age) { pending = true; }
+          else { mi_page_purge_unformed_tail(page); }      // `capacity == 0`: the whole block area
+        }
+        mi_atomic_store_ptr_release(mi_page_t, slot, page);
+      }
+    }
+  }
+  if (pending) { mi_atomic_store_release(&subproc->retired_published, (size_t)1); }
+  return pending;
 }
 
 
@@ -30443,8 +30513,8 @@ static void mi_scavenger_run(void) {
     }
     // a park passed over for its minimum interval is swept when its window ends, not at the safety timeout
     if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
-    // #483: empty large pages their owners abandoned are freed once they stay unused for a tick
-    if (_mi_arenas_free_empty_abandoned(subproc)) {
+    // #483: retired large pages of idle threads are released once they stay retired long enough
+    if (_mi_pages_release_retired(subproc)) {
       const long tick = mi_option_get_clamp(mi_option_purge_delay, 1, MI_SCAVENGER_MAX_WAIT_MS);
       if (tick < timeout_ms) { timeout_ms = tick; }
     }
@@ -32578,6 +32648,7 @@ void _mi_heap_detach_theaps( mi_heap_t* heap ) {
             if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
                                 else { mi_assert_internal(tld->theaps == theap); tld->theaps = theap->tnext; }
             theap->tnext = theap->tprev = NULL;
+            _mi_theap_unpublish_retired(theap);   // #483: while its tld is certainly alive
             mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
             mi_lock_release(&tld->theaps_lock);
           }

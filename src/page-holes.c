@@ -540,6 +540,24 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
 }
 
+// #493: the slack past a page's last block, `[start + reserved*block_size, end of its slices)`, is
+// never formed, so no tail or hole discard reaches it. On a page carved from reused memory (the
+// resident-first claim, #501) it still holds the previous tenant's blocks, and an idle thread's
+// retired page kept that resident for good. It is given back with the rest of such a page when
+// the page is released for idling, not when the page is created: under churn the arena hands
+// those slices to the next page right away, and discarding them then only makes it refault them.
+static void mi_page_discard_slack(mi_page_t* page) {
+  if (page->memid.memkind != MI_MEM_ARENA || !mi_page_holes_madvisable(page)) return;
+  const size_t os_size = _mi_os_page_size();
+  uint8_t* const pstart = mi_page_start(page);
+  uint8_t* hi = mi_page_slice_start(page) + page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE;
+  const size_t committed = mi_page_slice_committed(page);   // 0: the whole page is committed
+  if (committed > 0 && hi > mi_page_slice_start(page) + committed) { hi = mi_page_slice_start(page) + committed; }   // never beyond what is committed
+  const uintptr_t lo = _mi_align_up((uintptr_t)pstart + (size_t)page->reserved * mi_page_block_size(page), os_size);
+  const uintptr_t ahi = _mi_align_down((uintptr_t)hi, os_size);
+  if (ahi > lo) { _mi_os_discard(mi_page_subproc(page), (void*)lo, (size_t)(ahi - lo)); }
+}
+
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
 // in it is written to. `end` is an absolute address (`UINTPTR_MAX` for the whole tail); it is
 // rounded up to an OS page, as the discard covers whole OS pages.
@@ -868,7 +886,7 @@ bool _mi_pages_release_retired(mi_subproc_t* subproc) {
         // the page's memory is ours until we put it back
         if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not discarded already)
           if (now - page->retired_at < min_age) { pending = true; }
-          else { mi_page_purge_unformed_tail(page); }      // `capacity == 0`: the whole block area
+          else { mi_page_purge_unformed_tail(page); mi_page_discard_slack(page); }   // `capacity == 0`: the whole block area, and past it
         }
         mi_atomic_store_ptr_release(mi_page_t, slot, page);
       }

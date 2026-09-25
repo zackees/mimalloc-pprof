@@ -332,15 +332,6 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_RESIDENT_FIRST_MAX_TRIES       (8)
 #endif
 
-// #493: a page carved from reused (dirty) arena memory discards the slack past its last block
-// (see `mi_arenas_page_alloc_fresh`) when the slack is at least this big. A small, medium or
-// singleton page's slack is always below one slice (it is less than one of its blocks, at most
-// 64 KiB), so only 4 MiB large pages -- whose slack can be up to a 512 KiB block -- pay the
-// one discard call, and they are the ones an idle thread keeps (retired, #483).
-#ifndef MI_PAGE_SLACK_DISCARD_MIN
-#define MI_PAGE_SLACK_DISCARD_MIN         (MI_ARENA_SLICE_SIZE)
-#endif
-
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from

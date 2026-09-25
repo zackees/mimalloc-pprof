@@ -138,6 +138,12 @@ fn sync_support_headers(paths: &Paths) {
 
 /// Amalgamate `src/static.c` (and everything it transitively `#include`s
 /// with quotes) into one self-contained translation unit.
+///
+/// No diagnostic pragma is prepended. Inlining turns every header's `static`
+/// helpers into main-file definitions, which clang then checks with
+/// `-Wunused-function`; each helper a translation unit may legitimately not call
+/// is marked `MI_DECL_MAYBE_UNUSED` at its definition instead, with a comment
+/// saying why. `ci/check_no_diagnostic_suppression.py` enforces both halves.
 fn amalgamate_c(paths: &Paths) -> String {
     let mut visited = HashSet::new();
     let mut body = String::new();
@@ -149,21 +155,8 @@ fn amalgamate_c(paths: &Paths) -> String {
         PragmaOnce::Strip,
     );
     let header = generated_header(paths, "src/static.c", "amalgamate-c");
-    format!("{header}{AMALGAMATED_C_PREAMBLE}{body}")
+    format!("{header}{body}")
 }
-
-/// Emitted at the top of the amalgamated .c only. Inlining turns every header's
-/// `static` helpers into main-file definitions, and clang (which exempts functions
-/// defined in headers) then reports each one the TU happens not to call as
-/// `-Wunused-function`. That is an artifact of amalgamation: the real per-file
-/// builds under CMake keep the warning (fatal on the -Werror lanes), so genuinely
-/// dead code is still caught there.
-const AMALGAMATED_C_PREAMBLE: &str = "\
-#if defined(__clang__) || defined(__GNUC__)
-#pragma GCC diagnostic ignored \"-Wunused-function\"
-#endif
-
-";
 
 /// Amalgamate the public headers (in this fixed order, sharing one dedup set
 /// so the extension headers' own `#include "mimalloc.h"` does not duplicate
@@ -451,13 +444,24 @@ mod tests {
         windows,
         ignore = "needs the source tree at the build-time path; run on Linux"
     )]
-    fn amalgamated_c_suppresses_only_amalgamation_artifacts() {
+    fn amalgamated_sources_do_not_suppress_unused_function() {
         let paths = Paths::discover();
         let fresh = amalgamate_c(&paths);
-        let body = strip_stamp(&fresh);
+        // The sources keep a few narrowly scoped, platform-specific pragmas (for example
+        // `-Wattributes` in src/alloc-override.c), so this checks for the one warning
+        // that must never be silenced file-wide rather than for any pragma at all.
+        let unused_function_suppressions: Vec<usize> = fresh
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.contains("diagnostic ignored") && line.contains("-Wunused-function")
+            })
+            .map(|(i, _)| i + 1)
+            .collect();
         assert!(
-            body.starts_with(AMALGAMATED_C_PREAMBLE),
-            "amalgamated .c must open with the -Wunused-function preamble"
+            unused_function_suppressions.is_empty(),
+            "amalgamated .c suppresses -Wunused-function at lines {unused_function_suppressions:?}; \
+             mark the function MI_DECL_MAYBE_UNUSED instead"
         );
         assert!(
             !strip_stamp(&amalgamate_h(&paths)).contains("diagnostic ignored"),

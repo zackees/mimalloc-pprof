@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3bd36cfc of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 7e49e1e2 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -37,6 +37,17 @@ terms of the MIT license. A copy of the license can be found in the file
   #define mi_decl_nodiscard    _Check_return_
 #else
   #define mi_decl_nodiscard
+#endif
+
+// Marks a `static` function that a translation unit may legitimately not call (for
+// example, one used only on some platforms or configurations); every use carries a
+// comment saying why. Defined here, not in internal.h, so every header can use it.
+#if (defined(__GNUC__) && (__GNUC__ >= 7)) || defined(__clang__)  // includes clang and icc
+  #define MI_DECL_MAYBE_UNUSED    __attribute__((unused))
+#elif defined(__cplusplus) && (__cplusplus >= 201703L)            // c++17
+  #define MI_DECL_MAYBE_UNUSED    [[maybe_unused]]
+#else
+  #define MI_DECL_MAYBE_UNUSED
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -547,19 +558,20 @@ mi_decl_nodiscard mi_decl_export                  void* mi_theap_rezalloc(mi_the
 // Fast constant size allocations.
 // ------------------------------------------------------
 
-static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexcept {
+// Maybe unused: public inline API for applications; the library itself never calls these.
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_malloc_small(size); } else { return mi_malloc(size); }
 }
-static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_zalloc_small(size); } else { return mi_zalloc(size); }
 }
-static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_malloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
 }
-static inline mi_decl_restrict void* mi_theap_zalloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_theap_zalloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_zalloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
 }
-static inline void mi_free_csize(void* p, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline void mi_free_csize(void* p, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { mi_free_small(p); } else { mi_free(p); }
 }
 

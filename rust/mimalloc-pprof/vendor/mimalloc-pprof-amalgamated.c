@@ -1,8 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3bd36cfc of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
-
-#if defined(__clang__) || defined(__GNUC__)
-#pragma GCC diagnostic ignored "-Wunused-function"
-#endif
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 7e49e1e2 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -56,6 +52,17 @@ terms of the MIT license. A copy of the license can be found in the file
   #define mi_decl_nodiscard    _Check_return_
 #else
   #define mi_decl_nodiscard
+#endif
+
+// Marks a `static` function that a translation unit may legitimately not call (for
+// example, one used only on some platforms or configurations); every use carries a
+// comment saying why. Defined here, not in internal.h, so every header can use it.
+#if (defined(__GNUC__) && (__GNUC__ >= 7)) || defined(__clang__)  // includes clang and icc
+  #define MI_DECL_MAYBE_UNUSED    __attribute__((unused))
+#elif defined(__cplusplus) && (__cplusplus >= 201703L)            // c++17
+  #define MI_DECL_MAYBE_UNUSED    [[maybe_unused]]
+#else
+  #define MI_DECL_MAYBE_UNUSED
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -566,19 +573,20 @@ mi_decl_nodiscard mi_decl_export                  void* mi_theap_rezalloc(mi_the
 // Fast constant size allocations.
 // ------------------------------------------------------
 
-static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexcept {
+// Maybe unused: public inline API for applications; the library itself never calls these.
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_malloc_small(size); } else { return mi_malloc(size); }
 }
-static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_zalloc_small(size); } else { return mi_zalloc(size); }
 }
-static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_malloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
 }
-static inline mi_decl_restrict void* mi_theap_zalloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_theap_zalloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_zalloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
 }
-static inline void mi_free_csize(void* p, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline void mi_free_csize(void* p, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { mi_free_small(p); } else { mi_free(p); }
 }
 
@@ -1848,7 +1856,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #define mi_atomic_decrement_acq_rel(p)           mi_atomic_sub_acq_rel(p,(uintptr_t)1)
 
 static inline intptr_t mi_atomic_addi(_Atomic(intptr_t)*p, intptr_t add);
-static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub);
+MI_DECL_MAYBE_UNUSED static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub);  // see its definition
 
 
 #if defined(MI_USE_C11_ATOMICS) || defined(__cplusplus) || !defined(_MSC_VER) || MI_HAS_C11_ATOMICS
@@ -2131,7 +2139,8 @@ static inline intptr_t mi_atomic_addi(_Atomic(intptr_t)*p, intptr_t add) {
 }
 
 // Atomically subtract a signed value; returns the previous value.
-static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub) {
+// Maybe unused: kept from upstream to complete the addi/subi pair; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub) {
   return (intptr_t)mi_atomic_addi(p, -sub);
 }
 
@@ -4572,13 +4581,8 @@ _mcgen_PASTE2(McTemplateU0xx_, MCGEN_EVENTWRITETRANSFER)(
 #define mi_likely(x)       (x)
 #endif
 
-#if (defined(__GNUC__) && (__GNUC__ >= 7)) || defined(__clang__) // includes clang and icc
-#define mi_decl_maybe_unused    __attribute__((unused))
-#elif __cplusplus >= 201703L    // c++17
-#define mi_decl_maybe_unused    [[maybe_unused]]
-#else
-#define mi_decl_maybe_unused
-#endif
+// `MI_DECL_MAYBE_UNUSED` is defined in mimalloc.h (reached through types.h -> mimalloc-stats.h)
+// so that headers included before this one can use it too.
 
 #ifndef __has_builtin
 #define __has_builtin(x)    0
@@ -4741,7 +4745,9 @@ bool          _mi_meta_is_meta_page(const mi_subproc_t* subproc, const mi_page_t
 // (the only kind a meta-allocator page ever is -- mi_heap_t/mi_theap_t are always small,
 // arena-sized allocations, never OS/oversized) its arena's `subproc` field is set once at
 // arena creation and outlives every heap in it, so this never touches page->heap/page->theap.
-static inline bool _mi_meta_is_meta_page_safe(const mi_page_t* page) {
+// Maybe unused: only the profiler (MI_PPROF) and memory-events/DHAT (MI_MEMEVT || MI_DHAT)
+// hooks call it, so the minimal build has no caller.
+MI_DECL_MAYBE_UNUSED static inline bool _mi_meta_is_meta_page_safe(const mi_page_t* page) {
   mi_arena_t* const arena = mi_memid_arena(page->memid);
   return (arena != NULL && _mi_meta_is_meta_page(arena->subproc, page));
 }
@@ -5302,20 +5308,22 @@ void __mi_stat_counter_increase_mt(mi_stat_counter_t* stat, size_t amount);
 
 mi_decl_noinline bool _mi_pthread_key_create(pthread_key_t* pkey, void (*destruct)(void*), void* init);
 
-static inline void* mi_pthread_key_get(pthread_key_t key) {
+// Maybe unused: these are called only when thread locals are pthread keys -- MI_TLS_MODEL_PTHREADS
+// (prim-tls.h) or macOS (src/threadlocal.c) -- not with the default Linux `__thread` model.
+MI_DECL_MAYBE_UNUSED static inline void* mi_pthread_key_get(pthread_key_t key) {
   #if !MI_PTHREADS_GET_INVALID_KEY_IS_NULL
   if mi_unlikely(key==MI_PTHREAD_KEY_INVALID) return NULL;
   #endif
   return pthread_getspecific(key);
 }
 
-static inline bool mi_pthread_key_set(pthread_key_t* pkey, void* val) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_pthread_key_set(pthread_key_t* pkey, void* val) {
   if mi_likely(*pkey!=MI_PTHREAD_KEY_INVALID) { pthread_setspecific(*pkey,val); return true; }
   else if (val!=NULL) { return _mi_pthread_key_create(pkey,NULL,val); }
   else return true;
 }
 
-static inline void mi_pthread_key_delete(pthread_key_t* pkey) {
+MI_DECL_MAYBE_UNUSED static inline void mi_pthread_key_delete(pthread_key_t* pkey) {
   const pthread_key_t key = *pkey;
   if (key!=MI_PTHREAD_KEY_INVALID) {
     *pkey = MI_PTHREAD_KEY_INVALID;
@@ -5433,7 +5441,9 @@ static inline size_t _mi_clamp(size_t sz, size_t min, size_t max) {
 }
 
 // Is memory zero initialized?
-static inline bool mi_mem_is_zero(const void* p, size_t size) {
+// Maybe unused: every caller is an expensive assertion or an `MI_DEBUG > 1` check, so a
+// release build has none.
+MI_DECL_MAYBE_UNUSED static inline bool mi_mem_is_zero(const void* p, size_t size) {
   for (size_t i = 0; i < size; i++) {
     if (((uint8_t*)p)[i] != 0) return false;
   }
@@ -5644,7 +5654,8 @@ static inline bool mi_theap_is_detached(mi_theap_t* theap) {
   return (theap!=NULL && theap->tld->thread_id == MI_THREADID_DETACHED);
 }
 
-static inline bool mi_theap_matches_thread(mi_theap_t* theap) {
+// Maybe unused: called only from `mi_assert`/`mi_assert_internal`, which a release build compiles out.
+MI_DECL_MAYBE_UNUSED static inline bool mi_theap_matches_thread(mi_theap_t* theap) {
   const mi_threadid_t tid = _mi_thread_id();
   return (theap==NULL || theap->tld->thread_id == tid || mi_theap_is_detached(theap));
 }
@@ -5657,7 +5668,8 @@ static inline bool mi_theap_matches_thread(mi_theap_t* theap) {
 // is not the theap's own owning thread. Bun's version also allows the park state the
 // background scavenger sets while sweeping a parked thread's theaps; that state does not
 // exist in this tree (#272), so that clause is omitted here.
-static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
+// Maybe unused: called only from `mi_assert_internal` (src/arena.c), which a release build compiles out.
+MI_DECL_MAYBE_UNUSED static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
   if (theap == NULL || theap->tld == NULL) return true;
   if (mi_atomic_load_ptr_relaxed(mi_heap_t, &theap->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`
   if (theap->tld->thread_id == _mi_thread_id()) return true;
@@ -5689,7 +5701,10 @@ static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
 // this function -- a parked thread's fast-path free that ends up retiring a page (via
 // `_mi_page_retire`) still races the scavenger's walk on that path. `mi_free_block_local` carries
 // a permanent debug-only assert as a detector for that residual instead (see its definition).
-static inline void _mi_park_leave_if_parked(mi_theap_t* theap) {
+//
+// Maybe unused: both callers (src/page.c, src/free.c) are compiled only when `!MI_OWNER_GATE`;
+// a gated build has none.
+MI_DECL_MAYBE_UNUSED static inline void _mi_park_leave_if_parked(mi_theap_t* theap) {
   if (theap == NULL) return;
   mi_tld_t* const tld = theap->tld;
   if mi_likely(tld == NULL || mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_RUNNING) return;
@@ -5735,7 +5750,9 @@ static inline mi_page_t* _mi_checked_ptr_page(const void* p) {
   return (valid ? page : NULL);
 }
 
-static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
+// Maybe unused: `_mi_ptr_page` calls it only when `!(MI_DEBUG || MI_SECURE || MI_FREE_IS_CHECKED)`;
+// debug, secure and checked-free builds use `_mi_checked_ptr_page` instead.
+MI_DECL_MAYBE_UNUSED static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
   return _mi_ptr_page_ex(p, NULL);
 }
 
@@ -5777,7 +5794,8 @@ static inline mi_submap_t _mi_page_map_at(const mi_page_map_t* pmap, size_t idx)
   return mi_atomic_load_ptr_relaxed(mi_page_t*, &pmap->submaps[idx]);
 }
 
-static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
+// Maybe unused: see the flat page-map variant above.
+MI_DECL_MAYBE_UNUSED static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
   const mi_page_map_t* pmap = _mi_page_map();
   size_t sub_idx;
   const size_t idx = _mi_page_map_index(p, &sub_idx);
@@ -5838,7 +5856,8 @@ static inline bool mi_page_contains_address(const mi_page_t* page, const void* p
   return (start <= (uint8_t*)p && (uint8_t*)p < start + psize);
 }
 
-static inline bool mi_page_is_in_arena(const mi_page_t* page) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline bool mi_page_is_in_arena(const mi_page_t* page) {
   return (page->memid.memkind == MI_MEM_ARENA);
 }
 
@@ -6082,7 +6101,9 @@ static inline bool mi_page_block_index_is_purged(const mi_page_t* page, size_t i
 
 // is `block` free-but-discarded? A purged block is on no free list, so a free-list walk
 // (as `free.c`'s double-free check does) cannot see that it is already free.
-static inline bool mi_page_block_is_purged(const mi_page_t* page, const void* block) {
+// Maybe unused: its callers are that check (MI_CHECK_DOUBLE_FREE) and `MI_DEBUG > 1` asserts in
+// src/page-holes.c, so a plain release build has none.
+MI_DECL_MAYBE_UNUSED static inline bool mi_page_block_is_purged(const mi_page_t* page, const void* block) {
   if (!mi_page_has_purged(page)) return false;
   mi_assert_internal((const uint8_t*)block >= mi_page_start(page));
   const size_t idx = ((size_t)((const uint8_t*)block - mi_page_start(page))) / page->block_size;
@@ -6189,7 +6210,8 @@ static inline bool mi_page_is_mostly_used(const mi_page_t* page) {
 }
 
 // is more than (n-1)/n'th of a page in use?
-static inline bool mi_page_is_used_at_frac(const mi_page_t* page, uint16_t n) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline bool mi_page_is_used_at_frac(const mi_page_t* page, uint16_t n) {
   if (page==NULL) return true;
   uint16_t frac = page->reserved / n;
   return (page->reserved - page->used <= frac);
@@ -6305,7 +6327,8 @@ static inline mi_theap_t* mi_page_theap(const mi_page_t* page) {
   return page->theap;
 }
 
-static inline mi_tld_t* mi_page_tld(const mi_page_t* page) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline mi_tld_t* mi_page_tld(const mi_page_t* page) {
   mi_assert_internal(!mi_page_is_abandoned(page));
   mi_assert_internal(page->theap != NULL);
   return page->theap->tld;
@@ -6362,13 +6385,15 @@ static inline mi_block_t* mi_page_thread_free(const mi_page_t* page) {
 }
 
 // are there any available blocks?
-static inline bool mi_page_has_any_available(const mi_page_t* page) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline bool mi_page_has_any_available(const mi_page_t* page) {
   mi_assert_internal(page != NULL && page->reserved > 0);
   return (page->used < page->reserved || (mi_page_thread_free(page) != NULL));
 }
 
 // Owned?
-static inline bool mi_page_is_owned(const mi_page_t* page) {
+// Maybe unused: called only from `mi_assert_internal`, which a release build compiles out.
+MI_DECL_MAYBE_UNUSED static inline bool mi_page_is_owned(const mi_page_t* page) {
   return mi_tf_is_owned(mi_atomic_load_relaxed(&((mi_page_t*)page)->xthread_free));
 }
 
@@ -6455,13 +6480,17 @@ We also pass a separate `null` value to be used as `NULL` or otherwise
 `(k2<<<k1)+k1` would appear (too) often as a sentinel value.
 ------------------------------------------------------------------- */
 
-static inline bool mi_is_in_same_page(const void* p, const void* q) {
+// Maybe unused (this and the two below): the encoded free list (MI_ENCODE_FREELIST), the
+// double-free check (MI_CHECK_DOUBLE_FREE) and the padding canary (MI_PADDING) are their
+// only callers (plus, for `mi_ptr_decode`, the macOS zone enumerator), and a plain release
+// build enables none of them.
+MI_DECL_MAYBE_UNUSED static inline bool mi_is_in_same_page(const void* p, const void* q) {
   mi_page_t* page = _mi_ptr_page(p);
   return mi_page_contains_address(page,q);
   // return (_mi_ptr_page(p) == _mi_ptr_page(q));
 }
 
-static inline void* mi_ptr_decode(const void* null, const mi_encoded_t x, const uintptr_t* keys) {
+MI_DECL_MAYBE_UNUSED static inline void* mi_ptr_decode(const void* null, const mi_encoded_t x, const uintptr_t* keys) {
   void* p = (void*)(mi_rotr(x - keys[0], keys[0]) ^ keys[1]);
   return (p==null ? NULL : p);
 }
@@ -6471,7 +6500,7 @@ static inline mi_encoded_t mi_ptr_encode(const void* null, const void* p, const 
   return mi_rotl(x ^ keys[1], keys[0]) + keys[0];
 }
 
-static inline uint32_t mi_ptr_encode_canary(const void* null, const void* p, const uintptr_t* keys) {
+MI_DECL_MAYBE_UNUSED static inline uint32_t mi_ptr_encode_canary(const void* null, const void* p, const uintptr_t* keys) {
   const uint32_t x = (uint32_t)(mi_ptr_encode(null,p,keys));
   // make the lowest byte 0 to prevent spurious read overflows which could be a security issue (issue #951)
   #if MI_BIG_ENDIAN
@@ -6895,7 +6924,10 @@ static inline void** mi_prim_thread_pointer(void) {
 
 #if !MI_NO_THREAD_POINTER
 #define MI_HAS_TLS_SLOT  (1)
-static inline void* mi_prim_tls_slot(size_t slot) {
+// Maybe unused: the slot accessors are called only by the TLS models that use a fixed OS slot
+// (MI_TLS_MODEL_WIN32/FIXED, pthreads on Apple arm64, Bionic's thread id), not by the default
+// MI_TLS_MODEL_LOCAL on Linux.
+MI_DECL_MAYBE_UNUSED static inline void* mi_prim_tls_slot(size_t slot) {
   #if defined(_WIN32)
     #if (_M_X64 || _M_AMD64) && !defined(_M_ARM64EC)
       return (void*)__readgsqword((unsigned long)(slot*sizeof(void*)));   // direct load at offset from gs
@@ -6916,7 +6948,7 @@ static inline void* mi_prim_tls_slot(size_t slot) {
   #endif
 }
 
-static inline void mi_prim_tls_slot_set(size_t slot, void* value) {
+MI_DECL_MAYBE_UNUSED static inline void mi_prim_tls_slot_set(size_t slot, void* value) {
   #if defined(__GNUC__) || defined(__clang__)
   __atomic_store_n(&mi_prim_thread_pointer()[slot], value, __ATOMIC_RELAXED);
   #else
@@ -7003,7 +7035,8 @@ This incurs an extra check in the fast path (but can often be combined in an exi
 // Declared this way to optimize register spills and branches
 mi_decl_cold mi_decl_noinline mi_theap_t* _mi_theap_empty_get(void);
 
-static inline mi_theap_t* __mi_theap_empty(void) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline mi_theap_t* __mi_theap_empty(void) {
   #if __GNUC__
   __asm("");  // prevent conditional load
   return (mi_theap_t*)&_mi_theap_empty;
@@ -10679,7 +10712,9 @@ static inline bool mi_bitmap_is_set(mi_bitmap_t* bitmap, size_t idx) {
   return mi_bitmap_is_setN(bitmap, idx, 1);
 }
 
-static inline bool mi_bitmap_is_clear(mi_bitmap_t* bitmap, size_t idx) {
+// Maybe unused: called only from `mi_assert_internal` (src/arena.c) and the flat page map
+// (MI_PAGE_MAP_FLAT, src/page-map.c), so a release build with the 2-level page map has none.
+MI_DECL_MAYBE_UNUSED static inline bool mi_bitmap_is_clear(mi_bitmap_t* bitmap, size_t idx) {
   return mi_bitmap_is_clearN(bitmap, idx, 1);
 }
 
@@ -10738,7 +10773,8 @@ static inline mi_chunkbin_t mi_chunkbin_inc(mi_chunkbin_t bbin) {
   return (mi_chunkbin_t)((int)bbin + 1);
 }
 
-static inline mi_chunkbin_t mi_chunkbin_dec(mi_chunkbin_t bbin) {
+// Maybe unused: kept from upstream to pair with `mi_chunkbin_inc`; nothing in this tree (or upstream) calls it.
+MI_DECL_MAYBE_UNUSED static inline mi_chunkbin_t mi_chunkbin_dec(mi_chunkbin_t bbin) {
   mi_assert_internal(bbin > MI_CBIN_NONE);
   return (mi_chunkbin_t)((int)bbin - 1);
 }
@@ -10807,7 +10843,8 @@ static inline bool mi_bbitmap_is_setN(mi_bbitmap_t* bbitmap, size_t idx, size_t 
 }
 
 // Is a sequence of n bits already clear?
-static inline bool mi_bbitmap_is_clearN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
+// Maybe unused: called only from `mi_assert_internal` (src/arena.c), which a release build compiles out.
+MI_DECL_MAYBE_UNUSED static inline bool mi_bbitmap_is_clearN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   return mi_bbitmap_is_xsetN(MI_BIT_CLEAR, bbitmap, idx, n);
 }
 
@@ -14544,7 +14581,7 @@ static inline bool mi_bfield_atomic_try_clear_mask_optimistic(_Atomic(mi_bfield_
 // Returns `true` if the bit transitioned from 1 to 0
 // and `false` otherwise (leaving the bfield `b` as-is).
 // `all_clear` is set to true if the new bfield became zero (and false otherwise)
-mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear_optimistic(_Atomic(mi_bfield_t)* b, size_t idx, mi_bfield_t* previous) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bfield_atomic_try_clear_optimistic(_Atomic(mi_bfield_t)* b, size_t idx, mi_bfield_t* previous) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
   const mi_bfield_t mask = ((mi_bfield_t)1<<idx);
   return mi_bfield_atomic_try_clear_mask_optimistic(b, mask, previous, NULL);  // single bit never clears temporarily
@@ -14553,7 +14590,7 @@ mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear_optimistic(_A
 // Tries to clear a byte atomically. For performance, it assumes there is a good chance of success.  
 // Returns true if the byte atomically transitioned from 0xFF to 0
 // `all_clear` is set to true if the new bfield became zero (and false otherwise)
-mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear8_optimistic(_Atomic(mi_bfield_t)*b, size_t idx, mi_bfield_t* previous, bool* did_temp_clear_bits) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bfield_atomic_try_clear8_optimistic(_Atomic(mi_bfield_t)*b, size_t idx, mi_bfield_t* previous, bool* did_temp_clear_bits) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
   mi_assert_internal((idx%8)==0);
   const mi_bfield_t mask = ((mi_bfield_t)0xFF)<<idx;
@@ -14935,16 +14972,16 @@ static inline bool mi_bchunk_try_clearN(mi_bchunk_t* chunk, size_t cidx, size_t 
 // ------- mi_bchunk_try_find_and_clear ---------------------------------------
 
 #if MI_OPT_SIMD && defined(__AVX2__)
-mi_decl_maybe_unused static inline __m256i mi_mm256_zero(void) {
+MI_DECL_MAYBE_UNUSED static inline __m256i mi_mm256_zero(void) {
   return _mm256_setzero_si256();
 }
-mi_decl_maybe_unused static inline __m256i mi_mm256_ones(void) {
+MI_DECL_MAYBE_UNUSED static inline __m256i mi_mm256_ones(void) {
   return _mm256_set1_epi64x(~0);
 }
-mi_decl_maybe_unused static inline bool mi_mm256_is_ones(__m256i vec) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_mm256_is_ones(__m256i vec) {
   return _mm256_testc_si256(vec, _mm256_cmpeq_epi32(vec, vec));
 }
-mi_decl_maybe_unused static inline bool mi_mm256_is_zero( __m256i vec) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_mm256_is_zero( __m256i vec) {
   return _mm256_testz_si256(vec,vec);
 }
 #endif
@@ -15069,7 +15106,7 @@ static inline bool mi_bchunk_try_find_and_clear_1(mi_bchunk_t* chunk, size_t n, 
   return mi_bchunk_try_find_and_clear(chunk, pidx);
 }
 
-mi_decl_maybe_unused static inline bool mi_bchunk_try_find_and_clear8_at(mi_bchunk_t* chunk, size_t chunk_idx, size_t* pidx, bool* did_temp_clear_bits) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bchunk_try_find_and_clear8_at(mi_bchunk_t* chunk, size_t chunk_idx, size_t* pidx, bool* did_temp_clear_bits) {
   _Atomic(mi_bfield_t)* const bfield = &chunk->bfields[chunk_idx];  
   mi_bfield_t b = mi_atomic_load_relaxed(bfield);
   if (b==0) return false;
@@ -20274,7 +20311,9 @@ static inline mi_hooks_tld_t* _mi_hooks_tld_peek(void) {
 // zeroed here) instead of NULL. `local` must live at least as long as every use of the
 // returned pointer. See the file comment above for when this is (and is not) the right
 // choice over a plain peek.
-static inline mi_hooks_tld_t* _mi_hooks_tld_peek_or_local(mi_hooks_tld_t* local) {
+// Maybe unused: its only callers are the memory-events/DHAT slow paths (src/memory-events.c,
+// src/dhat.c), compiled only with MI_MEMEVT or MI_DHAT; the profiler uses the plain peek.
+MI_DECL_MAYBE_UNUSED static inline mi_hooks_tld_t* _mi_hooks_tld_peek_or_local(mi_hooks_tld_t* local) {
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
   if (hooks != NULL) return hooks;
   _mi_memzero(local, sizeof(*local));
@@ -23493,7 +23532,8 @@ static inline bool mi_page_queue_is_special(const mi_page_queue_t* pq) {
   return (pq->block_size > MI_LARGE_MAX_OBJ_SIZE);
 }
 
-static inline size_t mi_page_queue_count(const mi_page_queue_t* pq) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline size_t mi_page_queue_count(const mi_page_queue_t* pq) {
   return pq->count;
 }
 
@@ -30445,11 +30485,11 @@ static void mi_scav_fork_child_reset(void) {
 #if !defined(MI_SCAV_HAS_FORK_RESET)
 // futex / __ulock / WaitOnAddress hold no state of ours across fork()
 // #373: correct no-ops; unused on platforms whose wait primitive needs no init/fork reset
-mi_decl_maybe_unused static void mi_scav_fork_child_reset(void) { }
+MI_DECL_MAYBE_UNUSED static void mi_scav_fork_child_reset(void) { }
 #endif
 #if !defined(MI_SCAV_HAS_INIT)
 // #373: correct no-ops; unused on platforms whose wait primitive needs no init/fork reset
-mi_decl_maybe_unused static void mi_scav_init(void) { }
+MI_DECL_MAYBE_UNUSED static void mi_scav_init(void) { }
 #endif
 
 

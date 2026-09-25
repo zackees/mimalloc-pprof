@@ -22,3 +22,6 @@ __pycache__/
 
 # uv run writes an (empty) lock file here; pyproject.toml has no [project] table, so it carries nothing
 uv.lock
+
+# clud /grind run records: local only, never committed
+.clud/grind/

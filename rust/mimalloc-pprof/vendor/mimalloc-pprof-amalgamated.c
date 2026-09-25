@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f0a6135c of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 97209db8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -2732,6 +2732,16 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 // mostly stale, so the plain search is the better bet. Keeps the extra cost per page small.
 #ifndef MI_RESIDENT_FIRST_MAX_TRIES
 #define MI_RESIDENT_FIRST_MAX_TRIES       (8)
+#endif
+
+// #517: resident-first (#493) is only tried for claims of at least this many slices (default 16
+// = 1 MiB with 64 KiB slices: large and singleton pages). A small or medium page taking the first
+// queued run that fits bypasses the size-binned chunk layout of the plain search, so other size
+// classes' reusable runs are consumed and those classes spill into fresh chunks: the memory gate
+// peak rose 58.2 -> 61-63.7 MB (#514). Measured: >=16 restores 58.3 MB; #501's short-lived-thread
+// win comes from 4 MiB large pages (64 slices), which stay covered.
+#ifndef MI_RESIDENT_FIRST_MIN_SLICES
+#define MI_RESIDENT_FIRST_MIN_SLICES      (16)
 #endif
 
 
@@ -5979,6 +5989,21 @@ void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner rese
 void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
 bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
 long          _mi_release_bound_ms(void);                                       // #491: idle memory is back with the OS within this many ms
+
+// #517: arena slice claims by kind, counted process-wide in `mi_arena_try_alloc_at` when
+// MI_DIAGNOSTICS=1. `plain_fresh` is a plain-search claim that includes at least one slice that
+// was never dirty (never handed out before); its `_slices` counts only those never-dirty slices.
+typedef struct mi_arena_claim_counters_s {
+  size_t resident_first_claims;
+  size_t resident_first_slices;
+  size_t plain_reused_claims;
+  size_t plain_reused_slices;
+  size_t plain_fresh_claims;
+  size_t plain_fresh_slices;
+} mi_arena_claim_counters_t;
+bool          _mi_arena_claim_counters(mi_arena_claim_counters_t* out);   // false (and *out zeroed) when not compiled in (MI_DIAGNOSTICS=0)
+void          _mi_arena_claim_counters_reset(void);
+
 void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
 void          _mi_pages_release_schedule(mi_subproc_t* subproc);  // #483/#493: a retired or reserved page waits for the scavenger's release
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
@@ -11141,6 +11166,7 @@ static size_t mi_page_full_size(mi_page_t* page) {
 // (`mi_bbitmap_try_find_and_clearN`) knows nothing of that and, measured on short-lived threads,
 // mostly handed out fresh or already purged slices while such ranges were waiting -- growing RSS
 // and zero-fill faulting the new range. So first try the queued runs, in index order.
+// Limited to claims of at least MI_RESIDENT_FIRST_MIN_SLICES slices (#517).
 typedef struct mi_resident_claim_s {
   size_t slice_count;   // wanted
   size_t tries;         // queued runs tried so far (at most MI_RESIDENT_FIRST_MAX_TRIES)
@@ -11164,6 +11190,8 @@ static bool mi_arena_resident_claim_visitor(size_t slice_index, size_t slice_cou
 }
 
 static bool mi_arena_try_claim_resident(mi_arena_t* arena, size_t slice_count, size_t* slice_index) {
+  // Small and medium pages keep the size-binned plain search (MI_RESIDENT_FIRST_MIN_SLICES, #517).
+  if (slice_count < MI_RESIDENT_FIRST_MIN_SLICES) return false;
   // A pinned arena is never purged (all of it is resident); a range of more than a chunk is
   // beyond `mi_bbitmap_try_claimN`.
   if (arena->memid.is_pinned || slice_count > MI_BCHUNK_BITS) return false;
@@ -11201,15 +11229,77 @@ static void mi_arena_unqueue_purge(mi_arena_t* arena, size_t slice_index, size_t
   }
 }
 
+// #517: slice claims by kind (see `mi_arena_claim_counters_t`). Diagnostics builds only.
+#if MI_DIAGNOSTICS
+static _Atomic(size_t) mi_arena_claims_resident_first;
+static _Atomic(size_t) mi_arena_claims_resident_first_slices;
+static _Atomic(size_t) mi_arena_claims_plain_reused;
+static _Atomic(size_t) mi_arena_claims_plain_reused_slices;
+static _Atomic(size_t) mi_arena_claims_plain_fresh;
+static _Atomic(size_t) mi_arena_claims_plain_fresh_slices;
+
+// Must run before the claim sets the range's dirty bits: a never-dirty slice is a fresh one.
+static void mi_arena_count_claim(mi_arena_t* arena, size_t slice_index, size_t slice_count, bool resident) {
+  if (resident) {
+    mi_atomic_add_relaxed(&mi_arena_claims_resident_first, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_resident_first_slices, slice_count);
+    return;
+  }
+  const size_t dirty = mi_bitmap_popcountN(arena->slices_dirty, slice_index, slice_count);
+  mi_assert_internal(dirty <= slice_count);
+  const size_t fresh = slice_count - dirty;
+  if (fresh > 0) {
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_fresh, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_fresh_slices, fresh);
+  }
+  else {
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_reused, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_reused_slices, slice_count);
+  }
+}
+#endif
+
+bool _mi_arena_claim_counters(mi_arena_claim_counters_t* out) {
+  if (out == NULL) return false;
+  #if MI_DIAGNOSTICS
+  out->resident_first_claims = mi_atomic_load_relaxed(&mi_arena_claims_resident_first);
+  out->resident_first_slices = mi_atomic_load_relaxed(&mi_arena_claims_resident_first_slices);
+  out->plain_reused_claims   = mi_atomic_load_relaxed(&mi_arena_claims_plain_reused);
+  out->plain_reused_slices   = mi_atomic_load_relaxed(&mi_arena_claims_plain_reused_slices);
+  out->plain_fresh_claims    = mi_atomic_load_relaxed(&mi_arena_claims_plain_fresh);
+  out->plain_fresh_slices    = mi_atomic_load_relaxed(&mi_arena_claims_plain_fresh_slices);
+  return true;
+  #else
+  _mi_memzero(out, sizeof(*out));
+  return false;
+  #endif
+}
+
+void _mi_arena_claim_counters_reset(void) {
+  #if MI_DIAGNOSTICS
+  mi_atomic_store_relaxed(&mi_arena_claims_resident_first, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_resident_first_slices, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_reused, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_reused_slices, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_fresh, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_fresh_slices, (size_t)0);
+  #endif
+}
+
 static mi_decl_noinline void* mi_arena_try_alloc_at(
   mi_arena_t* arena, size_t slice_count, bool commit, size_t tseq, mi_memid_t* memid)
 {
   mi_assert_internal(arena!=NULL);
   mi_assert_internal(slice_count>0);
   size_t slice_index;
-  if (!mi_arena_try_claim_resident(arena, slice_count, &slice_index) &&
-      !mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  const bool resident = mi_arena_try_claim_resident(arena, slice_count, &slice_index);
+  if (!resident && !mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
   if (!arena->memid.is_pinned) { mi_arena_unqueue_purge(arena, slice_index, slice_count); }
+  #if MI_DIAGNOSTICS
+  mi_arena_count_claim(arena, slice_index, slice_count, resident);   // before the dirty bits are set below
+  #else
+  MI_UNUSED(resident);
+  #endif
 
   // claimed it!
   void* p = mi_arena_slice_start(arena, slice_index);

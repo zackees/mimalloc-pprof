@@ -1634,8 +1634,8 @@ static void run_one_thread(void (*fun)(void)) {
 
 // ---------------------------------------------------------------------------
 // #477: large pages give their holes back without any idle call -- while the owner stays
-//       busy (its generic-malloc housekeeping, paced by `purge_holes_min_interval`), and when
-//       the thread exits still owning them.
+//       busy (its generic-malloc housekeeping, paced by `purge_holes_min_interval`), and after
+//       a thread exits still owning them (another busy thread sweeps the abandoned page).
 // ---------------------------------------------------------------------------
 
 static void* large_keep[LARGE_N];
@@ -1659,16 +1659,21 @@ static bool large_survivors_ok_and_free(void) {
   return ok;
 }
 
+static void stay_busy(void) {   // allocate through the generic path, never idle
+  const mi_msecs_t start = _mi_clock_now();
+  while (_mi_clock_now() - start < 300) { mi_free(mi_malloc(2 * LARGE_SZ)); }
+}
+
 static bool test_large_holes_without_idle(void) {
   hole_stats_t before = hole_stats();
   large_page_with_holes();
-  const mi_msecs_t start = _mi_clock_now();
-  while (_mi_clock_now() - start < 300) { mi_free(mi_malloc(2 * LARGE_SZ)); }   // busy, never idle
+  stay_busy();
   bool ok = expect_purged(before, "large-busy");
   if (!large_survivors_ok_and_free()) { fprintf(stderr, "\n  large-busy: CORRUPT survivor\n"); ok = false; }
 
   before = hole_stats();
   run_one_thread(&large_page_with_holes);   // exits still owning the even blocks
+  stay_busy();
   if (!expect_purged(before, "large-exit")) ok = false;
   if (!large_survivors_ok_and_free()) { fprintf(stderr, "\n  large-exit: CORRUPT survivor\n"); ok = false; }
   return ok;

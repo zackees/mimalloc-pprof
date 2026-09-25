@@ -689,6 +689,12 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   if (mi_page_all_free(page)) return;                     // the page itself is about to be freed
   if (mi_option_get(mi_option_purge_delay) < 0) return;   // purging disabled
+  if (tld->holes_busy) {
+    // #477: a page allocated from or freed to since the last busy tick (its free-list head or
+    // `used` moved) is left alone; it is swept once it stays unchanged for a whole tick.
+    const uint64_t sig = (uint64_t)(uintptr_t)page->free ^ mi_page_sweep_state(page);
+    if (page->swept_state != sig) { page->swept_state = sig; return; }
+  }
   mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
   if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }
 
@@ -811,33 +817,31 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
 }
 
 // #477: the idle sweep never runs on a thread that never goes idle, so the OWNER also sweeps
-// its large-class pages -- the ones whose free blocks are big enough to be worth a discard --
-// from its generic-malloc housekeeping (`paced`: at most once per `purge_holes_min_interval`,
-// which also hands its retired empty pages back to the arena and sweeps the heap's abandoned
-// large pages, where every large page goes the moment it is full), and once more at thread
-// exit, before they are abandoned.
-void _mi_theap_purge_large_holes(mi_theap_t* theap, bool paced) {
+// the large-class pages -- the ones whose free blocks are big enough to be worth a discard --
+// of its theap and of the heap's abandoned pages (every large page is abandoned the moment it
+// is full, and a thread's pages at its exit) from its generic-malloc housekeeping, at most
+// once per `purge_holes_min_interval`. `holes_busy` makes it leave any page that was used since
+// the previous tick: its free blocks are about to be reused, and discarding them now would only
+// make the next allocation re-fault them.
+void _mi_theap_purge_large_holes(mi_theap_t* theap) {
   mi_tld_t* const tld = theap->tld;
   if (tld == NULL || tld->holes_sweeping || !mi_option_is_enabled(mi_option_purge_holes)) return;
-  if (paced) {
-    const mi_msecs_t now = _mi_clock_now();
-    if (now - tld->holes_busy_last < (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000)) return;
-    tld->holes_busy_last = now;
-    _mi_theap_collect_retired(theap, true);
-  }
+  const mi_msecs_t now = _mi_clock_now();
+  if (now - tld->holes_busy_last < (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000)) return;
+  tld->holes_busy_last = now;
   const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
   const size_t bin_hi = _mi_bin(MI_LARGE_MAX_OBJ_SIZE) + 1;
-  if (paced) { _mi_arenas_purge_abandoned_holes(_mi_theap_heap(theap), tld, bin_lo, bin_hi); }
+  tld->holes_busy = true;
+  _mi_arenas_purge_abandoned_holes(_mi_theap_heap(theap), tld, bin_lo, bin_hi);
   _mi_page_purge_holes_begin(tld);
   for (size_t bin = bin_lo; bin < bin_hi; bin++) {
-    mi_page_queue_t* const pq = &theap->pages[bin];
-    for (mi_page_t* page = pq->first; page != NULL; ) {
-      mi_page_t* const next = page->next;   // the visit may free the page
-      mi_theap_page_purge_holes(theap, pq, page, tld, NULL);
-      page = next;
+    for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {
+      _mi_page_free_collect_no_unpurge(page, true);
+      if (!mi_page_all_free(page)) { _mi_page_purge_holes(page, tld); }   // an empty page is left to page retirement
     }
   }
   _mi_page_purge_holes_end(tld);
+  tld->holes_busy = false;
 }
 
 // Purge the holes in every page this thread may safely touch:

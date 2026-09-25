@@ -886,6 +886,7 @@ struct mi_tld_s {
   mi_msecs_t            holes_sweep_last;     // when the last one ran (`purge_holes_min_interval` pacing)
   mi_msecs_t            holes_busy_last;      // when the owner last swept its large pages while busy (#477)
   bool                  holes_sweeping;       // a sweep of this thread's heaps is in progress right now
+  bool                  holes_busy;           // ... and it is the owner's busy-time sweep (#477): leave pages used this period
   bool                  holes_sweep_full;     // ... and it ignores `page->swept_state` (every N'th sweep)
   size_t                holes_sweep_skipped;  // per-pass counters, folded into the process-wide ones by
   size_t                holes_sweep_visited;  // `_mi_page_purge_holes_end` (a per-page atomic would cost real time)

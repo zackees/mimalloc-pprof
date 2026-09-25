@@ -574,6 +574,8 @@ static void mi_scavenger_run(void) {
   // initialise a theap/tld via _mi_subproc()'s TLS path.
   mi_subproc_t* const subproc = _mi_subproc_main();
   mi_msecs_t full_pass = _mi_clock_now();   // last safety-net pass over every arena
+  mi_msecs_t holes_last = 0;                // #510: last pass over the abandoned large pages
+  bool holes_pending = false;               // ... and it asked for another visit one interval later
   while (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) {
     // Clear with an RMW, not a plain store: it must be totally ordered against the parker's
     // coalescing `exchange(wake, 1)` in `_mi_scavenger_wake`. With a store, our clear and the later
@@ -614,6 +616,26 @@ static void mi_scavenger_run(void) {
     }
     // a park passed over for its minimum interval is swept when its window ends, not at the safety timeout
     if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
+    // #510: holes in abandoned large pages left unclaimed for a whole `purge_holes_min_interval`
+    // are discarded here, off every allocation path (see `_mi_pages_sweep_abandoned_holes`). The
+    // passes are paced at that interval, and the pacing is what makes its two visits mean
+    // "unclaimed for an interval". Once nothing large is abandoned, or the passes stay fruitless over
+    // an unchanged abandoned set (MI_SCAV_HOLES_QUIET_PASSES), an idle process sleeps as before.
+    {
+      const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 1, MI_SCAVENGER_MAX_WAIT_MS);
+      const mi_msecs_t now = _mi_clock_now();
+      if (now - holes_last >= interval) {
+        // never two visits closer than the interval, paced or not: that is what "unclaimed for an
+        // interval" rests on (a wake for a purge deadline must not turn into an early discard)
+        holes_pending = _mi_pages_sweep_abandoned_holes(subproc);
+        holes_last = now;
+        if (holes_pending && interval < timeout_ms) { timeout_ms = interval; }
+      }
+      else if (holes_pending) {
+        const mi_msecs_t left = interval - (now - holes_last);
+        if (left < timeout_ms) { timeout_ms = left; }
+      }
+    }
     // #483: retired large pages of idle threads are released once they stay retired long enough
     if (_mi_pages_release_retired(subproc)) {
       const long tick = mi_option_get_clamp(mi_option_purge_delay, 1, MI_SCAVENGER_MAX_WAIT_MS);

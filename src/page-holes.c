@@ -915,6 +915,101 @@ bool _mi_pages_release_retired(mi_subproc_t* subproc) {
 
 
 /* -----------------------------------------------------------
+  Holes in abandoned large pages nobody claims  (#510)
+
+  #504 (#478) made a thread's first busy tick in `_mi_theap_purge_large_holes` only start its
+  clock: a new thread no longer sweeps -- and then refaults -- the dead thread's abandoned large
+  pages it is about to reclaim. The price was that the holes in abandoned large pages which NO
+  thread reclaims were no longer discarded by anyone, and the short-lived-thread peak went up.
+
+  So the scavenger does that sweep instead, off every allocation path. It visits the main heap's
+  abandoned large-class pages once per `purge_holes_min_interval` (the caller paces it), with
+  `holes_busy` set: `_mi_page_purge_holes` then only records a page's `free ^ (capacity,used)`
+  signature on the first visit and discards on a later one only if that signature did not move
+  (#477). Paced at the interval, that is exactly "unclaimed and untouched for a whole interval":
+  a page a new thread reclaims within the interval keeps its memory, and one left behind for
+  good has its holes given back one interval later.
+
+  The sweeping tld is a file-static stand-in, `mi_scav_holes_tld`: the scavenger has no tld of its
+  own and must never create one (profiler-interaction invariant (3), src/scavenger.c). Of a tld,
+  this path -- `_mi_arenas_purge_abandoned_holes`, `mi_arena_page_purge_holes_at` (src/arena.c),
+  `_mi_page_purge_holes_begin/_end`, `_mi_page_purge_holes` and `mi_page_purge_holes_walk` --
+  reads or writes only `holes_sweeping`, `holes_busy`, `holes_sweep_full`, `holes_sweep_skipped`,
+  `holes_sweep_visited`, `park_reclaim` and `gate_flags`; no page is reached through the tld --
+  every one is claimed through the arena ownership protocol. The stand-in has no
+  theaps (so nothing can park, reclaim or allocate through it: `park_reclaim`/`gate_flags` stay
+  0), it lives in BSS (CLAUDE.md rule 4: nothing on this path allocates), and it is only ever
+  touched while holding the arenas' purge guard -- which the walk needs anyway (the empty-arena
+  reclaim must not free an arena under it) and which is exclusive, so one sweep at a time owns
+  its plain fields. The guard is also what `_mi_arenas_fork_child` resets, so a fork() that lands
+  mid-sweep hands the stand-in to the child's next sweep, which re-initialises its flags.
+
+  The return value paces the scavenger: true asks for another visit one interval later. An idle
+  process that keeps an abandoned large page for good (a dead thread's long-lived block) must not
+  wake every interval for it forever, so once MI_SCAV_HOLES_QUIET_PASSES passes in a row discarded
+  nothing and the number of abandoned large pages did not change, it answers false and the
+  scavenger falls back to its other wake-ups (each of which still runs a pass). A thread exit or a
+  reclaim changes that number, and the pacing resumes.
+----------------------------------------------------------- */
+
+// Passes in a row that discard nothing, over an unchanged abandoned set, before the scavenger stops
+// pacing them: two record/walk rounds of the two-visit rule (#477) with nothing to show for it.
+#ifndef MI_SCAV_HOLES_QUIET_PASSES
+#define MI_SCAV_HOLES_QUIET_PASSES  (4)
+#endif
+
+static mi_tld_t mi_scav_holes_tld = mi_init_struct_zero;   // see above: the scavenger's sweeping stand-in
+static size_t   mi_scav_holes_abandoned_last;               // abandoned large pages at the previous pass (under the guard)
+static size_t   mi_scav_holes_quiet;                        // passes in a row with no discard over that same count (under the guard)
+
+static size_t mi_scav_holes_discards(void) {
+  return (mi_holes_load(&mi_holes_discard_calls) + mi_holes_load(&mi_holes_unformed_discard_calls));
+}
+
+// One two-visit pass; the caller paces it at `purge_holes_min_interval`. Always sweeps when any
+// large-class page of the main heap is abandoned; returns true while another visit one interval
+// later is worth pacing (see above).
+bool _mi_pages_sweep_abandoned_holes(mi_subproc_t* subproc) {
+  if (subproc == NULL) return false;
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return false;
+  if (mi_option_get(mi_option_purge_delay) < 0) return false;   // purging disabled
+  // Only the main heap, for the reason in `_mi_pages_release_retired`: it is never freed while
+  // the scavenger runs, whereas another heap can be deleted under the walk.
+  mi_heap_t* const heap_main = mi_atomic_load_ptr_acquire(mi_heap_t, &subproc->heap_main);
+  if (heap_main == NULL) return false;
+  const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);   // the bins `_mi_theap_purge_large_holes` sweeps
+  const size_t bin_hi = _mi_bin(MI_LARGE_MAX_OBJ_SIZE) + 1;
+  size_t abandoned = 0;
+  for (size_t bin = bin_lo; bin < bin_hi && bin < MI_ARENA_BIN_COUNT; bin++) {   // not MI_BIN_COUNT, as in src/arena.c
+    abandoned += mi_atomic_load_relaxed(&heap_main->abandoned_count[bin]);
+  }
+  if (abandoned == 0) return false;
+
+  // The purge guard keeps the empty-arena reclaim (src/arena-reclaim.c) from freeing an arena
+  // under the walk and makes us the stand-in's only user; when a user thread holds it for a forced
+  // purge, come back at the next visit.
+  if (!_mi_arenas_purge_guard_acquire()) return true;
+  mi_tld_t* const tld = &mi_scav_holes_tld;
+  tld->holes_sweeping = false;    // (still set only if a fork() landed mid-sweep, see above)
+  tld->holes_sweep_full = false;
+  tld->holes_busy = true;         // two visits: record a page's signature, discard only if it held (#477)
+  const size_t discards0 = mi_scav_holes_discards();
+  _mi_arenas_purge_abandoned_holes(heap_main, tld, bin_lo, bin_hi);   // begin/end and the claim protocol
+  tld->holes_busy = false;
+  if (mi_scav_holes_discards() != discards0 || abandoned != mi_scav_holes_abandoned_last) {
+    mi_scav_holes_quiet = 0;
+  }
+  else if (mi_scav_holes_quiet < MI_SCAV_HOLES_QUIET_PASSES) {
+    mi_scav_holes_quiet++;
+  }
+  mi_scav_holes_abandoned_last = abandoned;
+  const bool pace = (mi_scav_holes_quiet < MI_SCAV_HOLES_QUIET_PASSES);
+  _mi_arenas_purge_guard_release();
+  return pace;
+}
+
+
+/* -----------------------------------------------------------
   The idle sweep
 
   Visit every page (INCLUDING the full queue, which a normal collect skips -- see

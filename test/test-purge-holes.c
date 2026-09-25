@@ -1814,6 +1814,12 @@ static void first_sweep_thread(void) {     // one short life with a few admin ti
 
 static bool test_new_thread_does_not_sweep_at_once(void) {
   const long interval = mi_option_get(mi_option_purge_holes_min_interval);
+  // #510: the scavenger now sweeps abandoned large pages too, and a discard of its own (in a page an
+  // earlier case left behind) landing during C would be counted against C. This case is about the
+  // owner's first tick only; the scavenger's two-visit pass has its own case below.
+  const long scavenger = mi_option_get(mi_option_scavenger);
+  mi_option_set(mi_option_scavenger, 0);
+  mi_scavenger_stop();
   mi_option_set(mi_option_purge_holes_min_interval, PACE_INTERVAL_MS);   // far longer than B and C live
   run_one_thread(&first_sweep_thread_a);
   run_one_thread(&first_sweep_thread);                                    // B
@@ -1821,9 +1827,134 @@ static bool test_new_thread_does_not_sweep_at_once(void) {
   run_one_thread(&first_sweep_thread);                                    // C
   const int64_t discarded = hole_stats().discards - before;
   mi_option_set(mi_option_purge_holes_min_interval, interval);
+  mi_option_set(mi_option_scavenger, scavenger);   // an enabled scavenger restarts on demand
   for (int i = 1; i < FIRST_SWEEP_A_COUNT; i += 2) { mi_free(first_sweep_a_blocks[i]); first_sweep_a_blocks[i] = NULL; }
   fprintf(stderr, "(discards by a short-lived thread: %lld) ", (long long)discarded);
   return (!purging_enabled || discarded == 0);
+}
+
+// #510: since #504 no new thread sweeps a dead thread's abandoned large pages, so the scavenger
+// does -- `_mi_pages_sweep_abandoned_holes`, one two-visit pass per call. The first visit to a
+// page only records its signature (a new thread may be about to reclaim it); a later visit
+// discards its holes only if the page stayed unclaimed AND unchanged in between. The test drives
+// the pass itself, with the background scavenger stopped (a concurrent visit would make the
+// visit count nondeterministic) and the interval long enough that no owner tick of this thread
+// sweeps meanwhile. Thread A's page (odd blocks live, even blocks freed) is the unclaimed page.
+#define SCAV_SWEEP_SETTLE_VISITS (2)   // visits that drain whatever earlier cases left abandoned
+
+static bool layout_is_predictable(void);   // defined below, with the MI_GUARDED adaptation
+
+// Visit the abandoned pages until none of the pages that were there before this case can still
+// discard: two visits record-then-discard every one of them, and after that an unchanged page
+// alternates between recording and a walk that finds nothing new.
+static void scav_sweep_settle(void) {
+  for (int i = 0; i < SCAV_SWEEP_SETTLE_VISITS; i++) { (void)_mi_pages_sweep_abandoned_holes(_mi_subproc_main()); }
+}
+
+// A's odd blocks were memset to 1 by A; a discard that wrongly covered one reads back zeros
+// (`purge_holes_eager_zero`, set in `main`).
+static bool scav_sweep_a_intact(void) {
+  for (int i = 1; i < FIRST_SWEEP_A_COUNT; i += 2) {
+    const uint8_t* const p = (const uint8_t*)first_sweep_a_blocks[i];
+    if (p == NULL) continue;
+    for (size_t j = 0; j < FIRST_SWEEP_A_SIZE; j++) {
+      if (p[j] != 1) {
+        fprintf(stderr, "\n  block %d of the abandoned page lost its data at byte %zu\n", i, j);
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static void scav_sweep_free_a(void) {
+  for (int i = 1; i < FIRST_SWEEP_A_COUNT; i += 2) { mi_free(first_sweep_a_blocks[i]); first_sweep_a_blocks[i] = NULL; }
+}
+
+// Free one live block in every page A's blocks landed in: each such page's `used` (and free
+// list) moves, and so its signature does.
+static void scav_sweep_touch_a_pages(void) {
+  mi_page_t* last = NULL;
+  for (int i = 1; i < FIRST_SWEEP_A_COUNT; i += 2) {
+    void* const p = first_sweep_a_blocks[i];
+    if (p == NULL) continue;
+    mi_page_t* const page = _mi_ptr_page(p);
+    if (page == last) continue;
+    last = page;
+    mi_free(p);
+    first_sweep_a_blocks[i] = NULL;
+  }
+}
+
+static bool test_scavenger_sweeps_unclaimed_abandoned_page(void) {
+  const long scavenger = mi_option_get(mi_option_scavenger);
+  const long interval  = mi_option_get(mi_option_purge_holes_min_interval);
+  mi_option_set(mi_option_scavenger, 0);                                  // stays stopped: we are the scavenger
+  mi_scavenger_stop();
+  mi_option_set(mi_option_purge_holes_min_interval, PACE_INTERVAL_MS);   // no owner tick of this thread meanwhile
+  // with every allocation guarded, the test cannot keep a page to itself (see `layout_is_predictable`):
+  // a discard is then not guaranteed, but a premature one is still wrong
+  const bool expect_discard = purging_enabled && layout_is_predictable();
+  bool ok = true;
+
+  // phase 1: unclaimed and unchanged -- the first visit records, the second discards
+  scav_sweep_settle();
+  run_one_thread(&first_sweep_thread_a);
+  const int64_t d0 = hole_stats().discards;
+  (void)_mi_pages_sweep_abandoned_holes(_mi_subproc_main());
+  const int64_t d1 = hole_stats().discards;
+  (void)_mi_pages_sweep_abandoned_holes(_mi_subproc_main());
+  const int64_t d2 = hole_stats().discards;
+  if (d1 != d0) {
+    fprintf(stderr, "\n  the first visit discarded at once: %lld -> %lld\n", (long long)d0, (long long)d1);
+    ok = false;
+  }
+  if (expect_discard && d2 <= d1) {
+    fprintf(stderr, "\n  the second visit to an unchanged page discarded nothing\n");
+    ok = false;
+  }
+  if (!purging_enabled && d2 != d1) {
+    fprintf(stderr, "\n  discarded with purge_holes off: %lld -> %lld\n", (long long)d1, (long long)d2);
+    ok = false;
+  }
+  if (!scav_sweep_a_intact()) { ok = false; }
+  scav_sweep_free_a();
+
+  // phase 2: a page that changes between two visits is not discarded at the second one, only
+  // once it then holds still for a whole visit
+  scav_sweep_settle();
+  run_one_thread(&first_sweep_thread_a);
+  const int64_t e0 = hole_stats().discards;
+  (void)_mi_pages_sweep_abandoned_holes(_mi_subproc_main());
+  const int64_t e1 = hole_stats().discards;
+  scav_sweep_touch_a_pages();
+  (void)_mi_pages_sweep_abandoned_holes(_mi_subproc_main());
+  const int64_t e2 = hole_stats().discards;
+  (void)_mi_pages_sweep_abandoned_holes(_mi_subproc_main());
+  const int64_t e3 = hole_stats().discards;
+  if (e1 != e0) {
+    fprintf(stderr, "\n  the first visit discarded at once: %lld -> %lld\n", (long long)e0, (long long)e1);
+    ok = false;
+  }
+  if (e2 != e1) {
+    fprintf(stderr, "\n  a page changed since the first visit was discarded: %lld -> %lld\n", (long long)e1, (long long)e2);
+    ok = false;
+  }
+  if (expect_discard && e3 <= e2) {
+    fprintf(stderr, "\n  the visit after the page held still discarded nothing\n");
+    ok = false;
+  }
+  if (!purging_enabled && e3 != e2) {
+    fprintf(stderr, "\n  discarded with purge_holes off: %lld -> %lld\n", (long long)e2, (long long)e3);
+    ok = false;
+  }
+  if (!scav_sweep_a_intact()) { ok = false; }
+  scav_sweep_free_a();
+
+  mi_option_set(mi_option_purge_holes_min_interval, interval);
+  mi_option_set(mi_option_scavenger, scavenger);   // an enabled scavenger restarts on demand
+  fprintf(stderr, "(discards: first visit %lld, second visit %lld) ", (long long)(d1 - d0), (long long)(d2 - d1));
+  return ok;
 }
 
 static bool test_owner_sweep_pacing(void) {
@@ -2209,6 +2340,7 @@ int main(void) {
   CHECK("sweep-full-every-bounds-a-missed-hole", test_sweep_full_every());
   CHECK("owner-sweeps-are-paced", test_owner_sweep_pacing());
   CHECK("new-thread-does-not-sweep-at-once", test_new_thread_does_not_sweep_at_once());
+  CHECK("scavenger-sweeps-unclaimed-abandoned-page", test_scavenger_sweeps_unclaimed_abandoned_page());
   #if !defined(_WIN32)
   CHECK("idle-thread-releases-large-page", test_idle_thread_releases_large_page());
   CHECK("reserved-page-is-released", test_reserved_page_is_released());

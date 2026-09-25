@@ -1354,6 +1354,7 @@ size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            
 void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner resets a retired large page and publishes it for the scavenger
 void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
 bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
+bool          _mi_pages_sweep_abandoned_holes(mi_subproc_t* subproc);   // #510: scavenger; one two-visit pass over heap_main's abandoned large pages; true to be visited again an interval later
 long          _mi_release_bound_ms(void);                                       // #491: idle memory is back with the OS within this many ms
 void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
 void          _mi_pages_release_schedule(mi_subproc_t* subproc);  // #483/#493: a retired or reserved page waits for the scavenger's release

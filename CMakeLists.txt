@@ -2052,6 +2052,24 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-arena-retention PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
   endif()
 
+  # test-arena-retention-small (#506): small-object pages emptied by remote frees go back to the OS
+  # within the short retention window, while a large page keeps #500's long one. The scavenger is
+  # off so only the test's collects purge; the 50 ms delay puts the short window at 50-100 ms, the
+  # probe at 150 ms and the long window's opening at 200 ms, wide enough not to need RUN_SERIAL.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-retention-small test/test-arena-retention-small.c)
+    target_compile_definitions(mimalloc-test-arena-retention-small PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-retention-small PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-retention-small PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-retention-small PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-arena-retention-small PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-arena-retention-small COMMAND mimalloc-test-arena-retention-small)
+    set_tests_properties(test-arena-retention-small PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=50;MIMALLOC_SCAVENGER=0")
+  endif()
+
   # test-resident-first (#493, strategy 9): a new page claims free arena slices that are still
   # resident (queued for purge) before purged ones. Single-threaded; the scavenger is off so only
   # the test's collects purge.

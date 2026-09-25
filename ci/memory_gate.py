@@ -42,6 +42,22 @@ With no JSON paths, `check` locates the built `mimalloc-test-memory-gate` binary
 runs it RUNS_EXPECTED times (see run_gate_binary), and checks those results -- this
 is what makes `python ci/memory_gate.py check` alone reproduce the CI job locally.
 
+Per scenario (#517): the binary samples the gated high-water mark after each scenario,
+and `check` prints that as a table for the representative run -- with a baseline column
+and a `<- moved` marker when the committed baseline has per-scenario numbers too -- so a
+red gate names the scenario that moved instead of leaving it to a hand bisection.
+
+Fast local loop on one workload: set `MI_GATE_SCENARIO=<name>` (one of `thread_churn`,
+`sawtooth`, `cross_thread_free`, `rolling_heaps`, `huge_churn`) and run the binary
+directly, e.g.
+
+    MI_GATE_SCENARIO=thread_churn MI_BENCH_JSON=out.json build/mimalloc-test-memory-gate
+
+The warm-up and baseline sample still run; then only that scenario does. Such a run is
+not comparable to a committed baseline (the full battery's peak includes every
+scenario), so `check` and `update` refuse it with exit 2 -- read its `scenarios` entry
+or stdout line instead, and compare it against the same filtered run on another commit.
+
 Exit codes: 0 pass, 1 regression, 2 usage/IO error, 3 (`where` only) no baseline yet.
 """
 
@@ -69,22 +85,21 @@ class Counters(TypedDict):
     pages_end: int
 
 
-class Result(TypedDict):
-    """One run of test-memory-gate. Mirrors the JSON that MI_BENCH_JSON writes.
+class Scenario(TypedDict):
+    """One entry of test-memory-gate.c's per-scenario samples (#517).
 
-    Two optional keys are written by the *caller* rather than by test-memory-gate.c and
-    so are read through `identity()` instead of being declared here (this project pins
-    pyright to pythonVersion 3.9, where `NotRequired` does not exist): `arch` and
-    `compiler`. What they distinguish is invisible to the binary: an arm64 macOS run from
-    a soldr-cross-built bundle and an arm64 macOS run from an Xcode-built tree report the
-    same `platform` on the same runner while being different toolchains with legitimately
-    different peaks (#277 phase B).
-
-    Declared rather than left as dict[str, Any] because every field here is indexed by
-    string literal below. A typo in one of those keys would previously have been a
-    runtime KeyError inside a CI gate -- i.e. a gate that fails for the wrong reason,
-    or (worse, on a path that catches it) one that passes without checking anything.
+    `peak_mb` is the gated high-water mark *as it stood after this scenario finished* --
+    process-wide and cumulative, so a scenario's own contribution is its delta from the
+    previous entry, not its absolute value.
     """
+
+    name: str
+    peak_mb: float
+    current_rss_mb: float
+
+
+class _RequiredResult(TypedDict):
+    """The fields every test-memory-gate JSON has carried since schema 1."""
 
     schema: int
     platform: str
@@ -98,6 +113,32 @@ class Result(TypedDict):
     peak_minus_profiler_mb: float
     purged_gb: float
     counters: Counters
+
+
+class Result(_RequiredResult, total=False):
+    """One run of test-memory-gate. Mirrors the JSON that MI_BENCH_JSON writes.
+
+    `scenarios` and `scenario_filter` (#517) are optional: runs and committed baselines
+    recorded before per-scenario reporting lack them. They are declared through this
+    `total=False` subclass rather than `NotRequired[...]` because this project pins
+    pyright to pythonVersion 3.9, where `typing.NotRequired` does not exist.
+
+    Two further optional keys are written by the *caller* rather than by
+    test-memory-gate.c and so are read through `identity()` instead of being declared
+    here: `arch` and `compiler`. What they distinguish is invisible to the binary: an
+    arm64 macOS run from a soldr-cross-built bundle and an arm64 macOS run from an
+    Xcode-built tree report the
+    same `platform` on the same runner while being different toolchains with legitimately
+    different peaks (#277 phase B).
+
+    Declared rather than left as dict[str, Any] because every field here is indexed by
+    string literal below. A typo in one of those keys would previously have been a
+    runtime KeyError inside a CI gate -- i.e. a gate that fails for the wrong reason,
+    or (worse, on a path that catches it) one that passes without checking anything.
+    """
+
+    scenarios: list[Scenario]
+    scenario_filter: str | None
 
 
 # Peak memory tolerance, applied to the minimum of RUNS_EXPECTED runs.
@@ -354,6 +395,66 @@ def report_runs(peaks: list[float], spread: float, *, gated: bool = True) -> Non
         )
 
 
+def refuse_filtered(result: Result) -> bool:
+    """Print the refusal for a MI_GATE_SCENARIO-restricted run; True if it was one.
+
+    A filtered run executes only one scenario after the baseline, so its peak omits every
+    other scenario's contribution and would read as an improvement against the full
+    battery's baseline -- or, recorded by `update`, as a baseline no real run can meet.
+    """
+    name = result.get("scenario_filter")
+    if name is None:
+        return False
+    print(
+        f"REFUSING: this run was restricted to scenario {name} (MI_GATE_SCENARIO) "
+        "and is not comparable to a baseline"
+    )
+    return True
+
+
+def report_scenarios(result: Result, base: Result | None) -> str | None:
+    """Print the representative run's per-scenario table; return the scenario that moved.
+
+    Each row's peak is the process-wide high-water mark after that scenario, so the delta
+    column (from the previous row) is what the scenario itself added. The first row has
+    no delta: the JSON does not carry the pre-scenario baseline sample's peak in a form
+    comparable to it, so only its absolute peak is shown.
+
+    When the baseline file has `scenarios` too, a baseline column is added and the FIRST
+    scenario whose peak exceeds its same-named baseline peak by more than PEAK_TOLERANCE
+    is marked `<- moved` and returned. Later rows inherit an earlier row's excess (the
+    peak is cumulative), which is why only the first is marked.
+    """
+    scenarios = result.get("scenarios", [])
+    if not scenarios:
+        print("  per-scenario: not reported by this run (binary predates #517)")
+        return None
+    base_scenarios: list[Scenario] = base.get("scenarios", []) if base is not None else []
+    base_peaks = {s["name"]: s["peak_mb"] for s in base_scenarios}
+    with_base = bool(base_peaks)
+    header = f"  {'scenario':<20} {'peak MB':>9} {'delta MB':>9} {'rss MB':>9}"
+    if with_base:
+        header += f" {'baseline MB':>11}"
+    print(header)
+    moved: str | None = None
+    previous: float | None = None
+    for s in scenarios:
+        name, peak = s["name"], s["peak_mb"]
+        delta = "-" if previous is None else f"{peak - previous:+.1f}"
+        row = f"  {name:<20} {peak:>9.1f} {delta:>9} {s['current_rss_mb']:>9.1f}"
+        if with_base:
+            base_peak = base_peaks.get(name)
+            base_text = "-" if base_peak is None else f"{base_peak:.1f}"
+            row += f" {base_text:>11}"
+            over = base_peak is not None and peak > base_peak * (1.0 + PEAK_TOLERANCE)
+            if moved is None and over:
+                moved = name
+                row += "  <- moved"
+        print(row)
+        previous = peak
+    return moved
+
+
 def control(
     result_paths: list[str], *, arch: str | None = None, compiler: str | None = None
 ) -> int:
@@ -405,10 +506,14 @@ def check(
         )
         return 2
 
+    if refuse_filtered(result):
+        return 2
+
     bpath = baseline_path(result)
     if not bpath.exists():
         print(f"No baseline at {bpath}.")
         report_runs(peaks, spread)
+        report_scenarios(result, None)
         print(
             "This platform/arch/compiler/config ({}) has never been recorded. "
             "Create it with:".format("+".join(baseline_key(result)))
@@ -446,15 +551,18 @@ def check(
         )
     )
     report_runs(peaks, spread, gated=not _control)
+    moved = report_scenarios(result, base)
 
     if peak > allowed:
         failures.append(
-            "{} regressed: {:.1f} MB vs baseline {:.1f} MB (+{:.1f}%, allowed +{:.0f}%)".format(
+            "{} regressed: {:.1f} MB vs baseline {:.1f} MB (+{:.1f}%, allowed +{:.0f}%) -- "
+            "see the per-scenario table above for which scenario moved{}".format(
                 metric,
                 peak,
                 base_peak,
                 100.0 * (peak - base_peak) / base_peak if base_peak else float("inf"),
                 100.0 * PEAK_TOLERANCE,
+                f" (first over its baseline: {moved})" if moved else "",
             )
         )
 
@@ -525,6 +633,8 @@ def update(result_paths: list[str], *, arch: str | None = None, compiler: str | 
     result, peaks, spread = load_runs(result_paths, arch, compiler)
     if result.get("inject_leak", 0):
         print("REFUSING to baseline a run with MI_BENCH_INJECT_LEAK set.")
+        return 2
+    if refuse_filtered(result):
         return 2
     BASELINE_DIR.mkdir(parents=True, exist_ok=True)
     bpath = baseline_path(result)

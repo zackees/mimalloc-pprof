@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
 import memory_gate
 
@@ -231,6 +232,124 @@ class ToleranceTest(unittest.TestCase):
         rc, out = self._check([1.0, 1.0 + 2 * memory_gate.PEAK_TOLERANCE])
         self.assertEqual(rc, 0)  # min is inside the tolerance ...
         self.assertIn("raise RUNS_EXPECTED", out)  # ... but the spread is not credible
+
+
+#: test-memory-gate.c's gate_scenarios[] names, in table order.
+SCENARIO_NAMES = ("thread_churn", "sawtooth", "cross_thread_free", "rolling_heaps", "huge_churn")
+
+
+def _scenarios(*peaks: float) -> list[dict[str, object]]:
+    """Per-scenario samples in test-memory-gate.c's table order, one peak each."""
+    return [
+        {"name": name, "peak_mb": peak, "current_rss_mb": peak / 2.0}
+        for name, peak in zip(SCENARIO_NAMES, peaks)
+    ]
+
+
+class PerScenarioTest(unittest.TestCase):
+    """#517: the gate reports which scenario moved, and refuses a MI_GATE_SCENARIO run.
+
+    #514 had to bisect #501's memory-gate regression by hand because the gate only ever
+    reported one process-wide peak. These tests pin the per-scenario table, the legacy
+    (pre-#517 JSON) path, and the refusal that keeps a single-scenario local run from
+    being compared against -- or recorded as -- a full-battery baseline.
+    """
+
+    def _run(
+        self, results: list[memory_gate.Result], baseline_dir: Path | None = None
+    ) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths: list[str] = []
+            for i, result in enumerate(results):
+                path = Path(tmp) / f"r{i}.json"
+                path.write_text(json.dumps(result), encoding="utf-8")
+                paths.append(str(path))
+            out = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                if baseline_dir is not None:
+                    stack.enter_context(
+                        mock.patch.object(memory_gate, "BASELINE_DIR", baseline_dir)
+                    )
+                stack.enter_context(contextlib.redirect_stdout(out))
+                rc = memory_gate.check(paths)
+        return rc, out.getvalue()
+
+    def _linux_base_peak(self) -> float:
+        record = json.loads((BASELINES / "linux-pprof1.json").read_text(encoding="utf-8"))
+        return float(record["peak_mb"])
+
+    def test_a_run_with_scenarios_passes_and_names_them(self) -> None:
+        base = self._linux_base_peak()
+        result = _result(
+            platform="linux",
+            peak_mb=base,
+            scenario_filter=None,
+            scenarios=_scenarios(base - 4.0, base - 3.0, base - 2.0, base - 1.0, base),
+        )
+        rc, out = self._run([result])
+        self.assertEqual(rc, 0)
+        for name in SCENARIO_NAMES:
+            self.assertIn(name, out)
+        self.assertNotIn("<- moved", out)
+
+    def test_a_legacy_run_without_scenarios_still_passes(self) -> None:
+        rc, out = self._run([_result(platform="linux", peak_mb=self._linux_base_peak())])
+        self.assertEqual(rc, 0)
+        self.assertIn("PASS", out)
+
+    def test_a_scenario_filtered_run_is_refused(self) -> None:
+        base = self._linux_base_peak()
+        result = _result(
+            platform="linux",
+            peak_mb=base * 0.5,
+            scenario_filter="thread_churn",
+            scenarios=_scenarios(base * 0.5),
+        )
+        rc, out = self._run([result])
+        self.assertEqual(rc, 2)
+        self.assertIn("REFUSING", out)
+        self.assertIn("MI_GATE_SCENARIO", out)
+
+    def test_update_refuses_a_scenario_filtered_run(self) -> None:
+        # A one-scenario peak recorded as the baseline would make every full run fail.
+        result = _result(platform="linux", scenario_filter="sawtooth", scenarios=_scenarios(10.0))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "r.json"
+            path.write_text(json.dumps(result), encoding="utf-8")
+            baseline_dir = Path(tmp) / "baselines"
+            out = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(memory_gate, "BASELINE_DIR", baseline_dir))
+                stack.enter_context(contextlib.redirect_stdout(out))
+                rc = memory_gate.update([str(path)])
+            self.assertFalse(baseline_dir.exists())
+        self.assertEqual(rc, 2)
+        self.assertIn("REFUSING", out.getvalue())
+
+    def test_a_failing_run_marks_the_scenario_that_moved(self) -> None:
+        # The baseline's scenarios are 20/30/40/50/60 MB. The run matches through
+        # sawtooth, then cross_thread_free jumps past its tolerance; every later row
+        # inherits that excess (the peak is cumulative), so only the first is marked.
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline_dir = Path(tmp)
+            baseline = _result(
+                platform="linux",
+                peak_mb=60.0,
+                scenarios=_scenarios(20.0, 30.0, 40.0, 50.0, 60.0),
+            )
+            (baseline_dir / "linux-pprof1.json").write_text(json.dumps(baseline), encoding="utf-8")
+            result = _result(
+                platform="linux",
+                peak_mb=80.0,
+                scenario_filter=None,
+                scenarios=_scenarios(20.0, 30.5, 60.0, 70.0, 80.0),
+            )
+            rc, out = self._run([result], baseline_dir)
+        self.assertEqual(rc, 1)
+        moved = [line for line in out.splitlines() if "<- moved" in line]
+        self.assertEqual(len(moved), 1, out)
+        self.assertIn("cross_thread_free", moved[0])
+        self.assertIn("per-scenario table above", out)
 
 
 if __name__ == "__main__":

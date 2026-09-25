@@ -376,6 +376,54 @@ static void scenario_huge_churn(void) {
   }
 }
 
+/* ---- the scenario table ----------------------------------------------- */
+/* Per-scenario reporting (#517). The gated number is a process-wide high-water mark, so
+   one end-of-run peak says THAT memory moved but not WHERE: #514 had to bisect by hand
+   to learn that the thread-churn scenario alone carried #501's regression. Sampling after
+   each scenario records the high-water mark as it stood when that scenario finished, so
+   the scenario whose line first jumps is the one that moved it.
+
+   MI_GATE_SCENARIO=<name> runs the warm-up and baseline as usual and then only the named
+   scenario -- a fast local loop for one workload. Such a run is not comparable to a
+   committed baseline (ci/memory_gate.py refuses it), because the full battery's peak
+   includes every scenario's contribution. */
+
+#define MI_GATE_SCENARIOS 5
+
+typedef struct gate_scenario_s {
+  const char* name;
+  void      (*run)(void);
+} gate_scenario_t;
+
+static const gate_scenario_t gate_scenarios[MI_GATE_SCENARIOS] = {
+  { "thread_churn",      scenario_thread_churn },
+  { "sawtooth",          scenario_sawtooth },
+  { "cross_thread_free", scenario_cross_thread_free },
+  { "rolling_heaps",     scenario_rolling_heaps },
+  { "huge_churn",        scenario_huge_churn },
+};
+
+typedef struct scenario_result_s {
+  const char* name;
+  size_t      peak;         /* the gated number: process-wide high-water mark so far */
+  size_t      current_rss;
+} scenario_result_t;
+
+/* Resolve MI_GATE_SCENARIO. Returns the table entry's own name (so the JSON never echoes
+   raw environment text), or NULL when the variable is unset or empty. An unknown name is
+   a usage error: exit 2 before doing any work, listing the valid names. */
+static const char* scenario_filter_from_env(void) {
+  const char* want = getenv("MI_GATE_SCENARIO");
+  if (want == NULL || want[0] == 0) return NULL;
+  for (int i = 0; i < MI_GATE_SCENARIOS; i++) {
+    if (strcmp(want, gate_scenarios[i].name) == 0) return gate_scenarios[i].name;
+  }
+  fprintf(stderr, "test-memory-gate: unknown MI_GATE_SCENARIO=%s; valid names:", want);
+  for (int i = 0; i < MI_GATE_SCENARIOS; i++) { fprintf(stderr, " %s", gate_scenarios[i].name); }
+  fprintf(stderr, "\n");
+  exit(2);
+}
+
 /* ---- JSON ------------------------------------------------------------- */
 
 static const char* platform_tag(void) {
@@ -388,7 +436,9 @@ static const char* platform_tag(void) {
 #endif
 }
 
-static void emit_json(const char* path, const sample_t* base, const sample_t* end) {
+static void emit_json(const char* path, const sample_t* base, const sample_t* end,
+                      const char* scenario_filter, const scenario_result_t* scenarios,
+                      int scenario_count) {
   FILE* f = fopen(path, "w");
   if (f == NULL) { fprintf(stderr, "warning: cannot open %s for writing\n", path); return; }
   fprintf(f,
@@ -408,8 +458,7 @@ static void emit_json(const char* path, const sample_t* base, const sample_t* en
     "    \"threads_start\": %lld, \"threads_end\": %lld,\n"
     "    \"theaps_start\": %lld,  \"theaps_end\": %lld,\n"
     "    \"pages_start\": %lld,   \"pages_end\": %lld\n"
-    "  }\n"
-    "}\n",
+    "  },\n",
     platform_tag(), gated_metric(),
 #if MI_PPROF
     1,
@@ -423,13 +472,30 @@ static void emit_json(const char* path, const sample_t* base, const sample_t* en
     base->threads_live, end->threads_live,
     base->theaps_live,  end->theaps_live,
     base->pages_live,   end->pages_live);
+  /* The filter is always one of gate_scenarios[].name (scenario_filter_from_env returns
+     the table's own string), so it needs no JSON escaping. */
+  if (scenario_filter != NULL) { fprintf(f, "  \"scenario_filter\": \"%s\",\n", scenario_filter); }
+  else                         { fprintf(f, "  \"scenario_filter\": null,\n"); }
+  fprintf(f, "  \"scenarios\": [");
+  for (int i = 0; i < scenario_count; i++) {
+    fprintf(f, "%s\n    {\"name\": \"%s\", \"peak_mb\": %.1f, \"current_rss_mb\": %.1f}",
+            (i == 0 ? "" : ","), scenarios[i].name,
+            as_mb(scenarios[i].peak), as_mb(scenarios[i].current_rss));
+  }
+  fprintf(f, "%s]\n", (scenario_count > 0 ? "\n  " : ""));
+  fprintf(f, "}\n");
   fclose(f);
 }
 
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
+  const char* scenario_filter = scenario_filter_from_env();
   printf("test-memory-gate: platform=%s gated=%s inject_leak=%llu\n",
          platform_tag(), gated_metric(), (unsigned long long)MI_BENCH_INJECT_LEAK);
+  if (scenario_filter != NULL) {
+    printf("  MI_GATE_SCENARIO=%s: only this scenario runs after the baseline "
+           "(not comparable to a committed baseline)\n", scenario_filter);
+  }
 
   /* Warm up so the baseline is steady state, not first-touch arena reservation. */
   scenario_thread_churn();
@@ -441,11 +507,22 @@ int main(void) {
 
   arm_injection();   /* after the baseline, never before -- see inject_leak() */
 
-  scenario_thread_churn();
-  scenario_sawtooth();
-  scenario_cross_thread_free();
-  scenario_rolling_heaps();
-  scenario_huge_churn();
+  /* With MI_GATE_SCENARIO unset this is the same work in the same order as always: every
+     scenario in table order, each followed by a sample of the high-water mark so far. */
+  scenario_result_t scenarios[MI_GATE_SCENARIOS];
+  int scenario_count = 0;
+  for (int i = 0; i < MI_GATE_SCENARIOS; i++) {
+    const gate_scenario_t* sc = &gate_scenarios[i];
+    if (scenario_filter != NULL && strcmp(scenario_filter, sc->name) != 0) continue;
+    sc->run();
+    sample_t after; take_sample(&after);
+    scenarios[scenario_count].name        = sc->name;
+    scenarios[scenario_count].peak        = after.peak;
+    scenarios[scenario_count].current_rss = after.current_rss;
+    printf("  scenario %-18s peak=%.1f MB rss=%.1f MB\n",
+           sc->name, as_mb(after.peak), as_mb(after.current_rss));
+    scenario_count++;
+  }
   mi_collect(true);
 
   sample_t end; take_sample(&end);
@@ -455,7 +532,10 @@ int main(void) {
          as_mb(end.profiler_arena), as_mb(end.peak - (end.profiler_arena < end.peak ? end.profiler_arena : 0)));
 
   const char* json = getenv("MI_BENCH_JSON");
-  if (json != NULL) { emit_json(json, &base, &end); printf("  wrote %s\n", json); }
+  if (json != NULL) {
+    emit_json(json, &base, &end, scenario_filter, scenarios, scenario_count);
+    printf("  wrote %s\n", json);
+  }
 
   /* Inline assertions, so this is a real test even with no CI around it. The engine's
      own counters are the precise detector -- they are exact and platform-independent,

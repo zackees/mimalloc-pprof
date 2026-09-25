@@ -2026,6 +2026,18 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-arena-purge-rearm PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20")
   endif()
 
+  # test-arena-purge-aged (#497): an aged purge run that is partly young again must still purge
+  # its other part. Single-threaded; the scavenger is off so only the test's collects purge.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-purge-aged test/test-arena-purge-aged.c)
+    target_compile_definitions(mimalloc-test-arena-purge-aged PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-purge-aged PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-purge-aged PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-purge-aged PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-arena-purge-aged COMMAND mimalloc-test-arena-purge-aged)
+    set_tests_properties(test-arena-purge-aged PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
+  endif()
+
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of
   # docs/purge-all-implementation.md §11 (T1-T3, G1-G8, C1-C2) in one binary that is built for
   # BOTH MI_PPROF and BOTH MI_OWNER_GATE settings and branches on `#if MI_OWNER_GATE` for its

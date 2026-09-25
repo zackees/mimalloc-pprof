@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 01ecb281 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f54afa94 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -666,7 +666,7 @@ typedef enum mi_option_e {
   mi_option_deprecated_max_segment_reclaim,  // max. percentage of the abandoned segments can be reclaimed per try (=10%)
   mi_option_destroy_on_exit,            // if set, release all memory on exit; sometimes used for dynamic unloading but can be unsafe
   mi_option_arena_reserve,              // initial memory size for arena reservation (= 1 GiB on 64-bit) (internally, this value is in KiB; use `mi_option_get_size`)
-  mi_option_arena_purge_mult,           // multiplier for `purge_delay` for the purging delay for arenas (=10)
+  mi_option_arena_purge_mult,           // multiplier for `purge_delay` for the purging delay for arenas (=4, #486)
   mi_option_deprecated_purge_extend_delay,
   mi_option_disallow_arena_alloc,       // 1 = do not use arena's for allocation (except if using specific arena id's)
   mi_option_retry_on_oom,               // retry on out-of-memory for N milli seconds (=400), set to 0 to disable retries. (only on windows)
@@ -2706,13 +2706,22 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 #endif
 
 // #491: the one bound on "freed memory that stays idle is back with the OS within N ms"
-// (`_mi_release_bound_ms`, src/page-holes.c): the slower of the two page releases above, the two purge periods the
-// arena purge then needs (#481), and MI_RELEASE_SLACK_MS for the scavenger to wake and run.
+// (`_mi_release_bound_ms`, src/page-holes.c): the slower of the two page releases above (a released
+// page is purged at once, #486) and the arena purge of freed memory (MI_ARENA_PURGE_PERIODS arena
+// periods, #481), plus MI_RELEASE_SLACK_MS for the scavenger to wake and run.
 // Tests poll up to it and perf-ab holds the release time to it (ci/release_ratchet.json).
 #ifndef MI_RELEASE_SLACK_MS
 #define MI_RELEASE_SLACK_MS               (300)
 #endif
 #define MI_ARENA_PURGE_PERIODS            (2)   // #481: a range is purged at the second deadline after its free
+
+// #486: freed arena memory stays resident for one to MI_ARENA_PURGE_PERIODS arena purge periods of
+// `arena_purge_mult` x `purge_delay` (400-800 ms by default) in case it is reused, then goes back
+// to the OS. Measured on perf-ab's bursty row (pauses of 300 ms): 1 (100-200 ms) refaulted every
+// burst (~120,000 minor faults), 4 about 1,300, with the same peak and release time.
+#ifndef MI_ARENA_PURGE_MULT_DEFAULT
+#define MI_ARENA_PURGE_MULT_DEFAULT       (4)
+#endif
 
 
 // ------------------------------------------------------
@@ -12382,6 +12391,19 @@ typedef struct mi_purge_holes_arg_s {
   mi_tld_t*    tld;      // the thread whose sweep this is (its own, or the parked one the scavenger is sweeping for)
 } mi_purge_holes_arg_t;
 
+static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size_t slice_count);
+static long mi_arena_purge_delay(void);
+
+// #486: a reserved page released after its window has been idle for the whole retention already;
+// purge its slices now instead of aging them again in the arena queue, which would hold them
+// for another two arena periods (and past the release bound, #491). Only if they are still free.
+static void mi_arena_purge_released(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
+  if (arena->memid.is_pinned || mi_arena_purge_delay() < 0) return;
+  if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);   // queued by the free: done already
+  }
+}
+
 static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   MI_UNUSED(slice_count);
   mi_purge_holes_arg_t* const parg = (mi_purge_holes_arg_t*)arg;
@@ -12413,8 +12435,11 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
     return true;
   }
   if (mi_page_all_free(page)) {
+    const bool reserved = (page->retired_at != 0);   // (an expired reserved page, see above)
+    const size_t page_slices = mi_page_full_size(page) / MI_ARENA_SLICE_SIZE;
     mi_bitmap_set(bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
     _mi_arenas_abandoned_page_free(page, NULL);
+    if (reserved) { mi_arena_purge_released(arena, slice_index, page_slices); }
     _mi_page_holes_count_page_freed();
     return true;
   }
@@ -12473,8 +12498,10 @@ static bool mi_arena_page_release_reserved_at(size_t slice_index, size_t slice_c
   // a reserved page has no live block, so no free can have arrived in it: `used` is exact
   if (page->retired_at != 0 && mi_page_all_free(page)) {
     if (rarg->force || !mi_arena_page_reserve_kept(page, rarg->now)) {
+      const size_t page_slices = mi_page_full_size(page) / MI_ARENA_SLICE_SIZE;
       mi_bitmap_set(rarg->bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
       _mi_arenas_abandoned_page_free(page, NULL);
+      mi_arena_purge_released(arena, slice_index, page_slices);
       return true;
     }
     rarg->pending = true;
@@ -21976,7 +22003,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { 10,  MI_OPTION_UNINIT, MI_OPTION(deprecated_max_segment_reclaim)},       // max. percentage of the abandoned segments to be reclaimed per try.
   { 0,   MI_OPTION_UNINIT, MI_OPTION(destroy_on_exit)},           // release all OS memory on process exit; careful with dangling pointer or after-exit frees!
   { MI_DEFAULT_ARENA_RESERVE, MI_OPTION_UNINIT, MI_OPTION(arena_reserve) }, // reserve memory N KiB at a time (=1GiB) (use `option_get_size`)
-  { 1,   MI_OPTION_UNINIT, MI_OPTION(arena_purge_mult) },         // purge delay multiplier for arena's
+  { MI_ARENA_PURGE_MULT_DEFAULT, MI_OPTION_UNINIT, MI_OPTION(arena_purge_mult) },   // purge delay multiplier for arena's (#486: the retention of freed arena memory)
   { 1,   MI_OPTION_UNINIT, MI_OPTION_LEGACY(deprecated_purge_extend_delay, decommit_extend_delay) },
   { MI_DEFAULT_DISALLOW_ARENA_ALLOC,   MI_OPTION_UNINIT, MI_OPTION(disallow_arena_alloc) }, // 1 = do not use arena's for allocation (except if using specific arena id's)
   { 400, MI_OPTION_UNINIT, MI_OPTION(retry_on_oom) },             // windows only: retry on out-of-memory for N milli seconds (=400), set to 0 to disable retries.
@@ -26757,9 +26784,12 @@ void _mi_theap_unpublish_retired(mi_theap_t* theap) {
 // when some published page is not old enough yet, i.e. the scavenger should come back.
 // #491: see MI_RELEASE_SLACK_MS. Follows the `purge_delay` option, as the releases themselves do.
 long _mi_release_bound_ms(void) {
-  const long mult = (MI_RETIRED_RELEASE_MULT > MI_PAGE_RESERVE_RELEASE_MULT ? MI_RETIRED_RELEASE_MULT : MI_PAGE_RESERVE_RELEASE_MULT);
   const long delay = mi_option_get(mi_option_purge_delay);
-  return (delay < 0 ? -1 : (mult + MI_ARENA_PURGE_PERIODS) * delay + MI_RELEASE_SLACK_MS);   // -1: purging is off
+  const long arena_mult = mi_option_get(mi_option_arena_purge_mult);
+  if (delay < 0 || arena_mult < 0) return -1;   // purging is off
+  long mult = (MI_RETIRED_RELEASE_MULT > MI_PAGE_RESERVE_RELEASE_MULT ? MI_RETIRED_RELEASE_MULT : MI_PAGE_RESERVE_RELEASE_MULT);
+  if (MI_ARENA_PURGE_PERIODS * arena_mult > mult) { mult = MI_ARENA_PURGE_PERIODS * arena_mult; }
+  return mult * delay + MI_RELEASE_SLACK_MS;
 }
 
 bool _mi_pages_release_retired(mi_subproc_t* subproc) {

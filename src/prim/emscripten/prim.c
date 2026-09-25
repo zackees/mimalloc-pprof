@@ -128,6 +128,12 @@ int _mi_prim_reuse(void* addr, size_t size) {
   return 0;
 }
 
+// #487: no pre-fault here; the owner faults the memory in when it writes it.
+int _mi_prim_populate(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
 // #272: nothing to release here; MI_PRIM_HAS_DISCARD is 0 on this platform, so
 // `_mi_os_discard` never calls this and never counts a purge.
 int _mi_prim_discard(void* addr, size_t size) {

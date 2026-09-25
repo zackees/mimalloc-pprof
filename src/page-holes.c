@@ -510,6 +510,81 @@ size_t _mi_page_unformed_purged_bytes(const mi_page_t* page) {
             ? (size_t)(page->unformed_purged_hi - page->unformed_purged_lo) : 0);
 }
 
+/* -----------------------------------------------------------
+  Pre-faulting the unformed tail  (#487)
+
+  A discarded tail costs its owner a page fault and a kernel zero-fill for every OS page it
+  forms blocks in, and it forms them inside `malloc`. So the owner asks for that work ahead of
+  time: whenever it hands back part of the tail (and right after the trim), it posts the next
+  MI_PREFAULT_LOOKAHEAD_BLOCKS blocks' worth of the tail to a per-thread ring on its tld, and
+  the scavenger pre-faults them (`_mi_prefault_drain`) -- so the owner finds them resident.
+
+  The scavenger ONLY calls `_mi_prim_populate`, which never changes contents, and it never
+  touches `unformed_purged_lo/hi`: the range stays "discarded" in the page's books, and the
+  owner's `_mi_page_unpurge_unformed_upto` still reuses it before forming blocks there (a
+  no-op on Linux, where populate exists at all). So it is safe whatever happened to the range
+  meanwhile -- the owner writing it, or the page freed and its slices handed to another page.
+  The ring is best effort: a full ring drops the request and the owner faults the pages
+  itself, exactly as without it.
+----------------------------------------------------------- */
+
+// How far ahead of the formed blocks a request reaches: whole blocks (an extension of a large
+// page forms one block at a time), rounded to OS pages.
+static size_t mi_page_prefault_window(const mi_page_t* page) {
+  return _mi_align_up(MI_PREFAULT_LOOKAHEAD_BLOCKS * mi_page_block_size(page), _mi_os_page_size());
+}
+
+// Post `[lo, hi)`, clamped to what is still discarded, to the owner's ring. Only the owner may
+// call this (the ring has one producer): anything else is dropped.
+static void mi_page_prefault_post(mi_page_t* page, uintptr_t lo, uintptr_t hi) {
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
+  const uintptr_t dlo = pstart + page->unformed_purged_lo;
+  const uintptr_t dhi = pstart + page->unformed_purged_hi;
+  if (lo < dlo) { lo = dlo; }
+  if (hi > dhi) { hi = dhi; }
+  if (lo >= hi) return;
+  if (!_mi_scavenger_is_running()) return;             // nobody would take it
+  mi_tld_t* const tld = mi_page_tld(page);
+  if (tld == NULL || tld->subproc != _mi_subproc_main()) return;   // the scavenger serves the main subproc only
+  if (tld->thread_id != _mi_thread_id()) return;       // not the producer
+  const size_t tail = mi_atomic_load_relaxed(&tld->prefault_tail);   // only we write it
+  const size_t head = mi_atomic_load_acquire(&tld->prefault_head);   // the scavenger is done with every slot below it
+  if (tail - head >= MI_PREFAULT_QUEUE) return;        // full: drop, never wait
+  mi_prefault_req_t* const req = &tld->prefault_queue[tail % MI_PREFAULT_QUEUE];
+  req->start = lo;
+  req->size  = (size_t)(hi - lo);
+  mi_atomic_store_release(&tld->prefault_tail, tail + 1);   // publishes `*req`
+  // Wake it only when the ring was empty: with requests still pending it is draining already
+  // (it loops without sleeping while a drain finds work).
+  if (tail == head) { _mi_scavenger_wake(tld->subproc); }
+}
+
+// The scavenger: pre-fault what the threads of `subproc` posted. The requests are copied out
+// under `tlds_lock` -- a tld is unlinked under that lock before its memory is freed
+// (`mi_tld_free`) -- but faulted in after it is released, so thread creation and exit never
+// wait on page faults. Takes at most MI_PREFAULT_QUEUE requests per call; returns whether it
+// took any, so the caller calls again before it sleeps.
+bool _mi_prefault_drain(mi_subproc_t* subproc) {
+  if (subproc == NULL) return false;
+  mi_prefault_req_t reqs[MI_PREFAULT_QUEUE];
+  size_t n = 0;
+  mi_lock(&subproc->tlds_lock) {
+    for (mi_tld_t* tld = subproc->tlds; tld != NULL && n < MI_PREFAULT_QUEUE; tld = tld->subproc_next) {
+      size_t head = mi_atomic_load_relaxed(&tld->prefault_head);         // only we write it
+      const size_t tail = mi_atomic_load_acquire(&tld->prefault_tail);   // pairs with the owner's release: the slots are written
+      while (head != tail && n < MI_PREFAULT_QUEUE) {
+        reqs[n++] = tld->prefault_queue[head % MI_PREFAULT_QUEUE];
+        head++;
+      }
+      mi_atomic_store_release(&tld->prefault_head, head);   // the slots are copied: the owner may reuse them
+    }
+  }
+  for (size_t i = 0; i < n; i++) {
+    _mi_prim_populate((void*)reqs[i].start, reqs[i].size);   // best effort: an error only means no pre-fault
+  }
+  return (n > 0);
+}
+
 // Discard the OS pages of the unformed tail that are not discarded already.
 static void mi_page_purge_unformed_tail(mi_page_t* page) {
   if (!mi_page_holes_madvisable(page)) return;
@@ -545,7 +620,13 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
 // costs what it uses: this is what made short-lived threads (a new theap, new pages, each
 // generation) hold far more than long-lived ones running the same requests.
 void _mi_page_trim_unformed_tail(mi_page_t* page) {
-  if (mi_option_is_enabled(mi_option_purge_holes)) { mi_page_purge_unformed_tail(page); }
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  mi_page_purge_unformed_tail(page);
+  // the owner's next extensions will want the start of the tail back: fault it in ahead of them
+  if (_mi_page_unformed_purged_bytes(page) > 0) {
+    const uintptr_t lo = (uintptr_t)mi_page_start(page) + page->unformed_purged_lo;
+    mi_page_prefault_post(page, lo, lo + mi_page_prefault_window(page));
+  }
 }
 
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
@@ -570,6 +651,16 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
   else { page->unformed_purged_lo = (uint32_t)(rend - pstart); }
   mi_atomic_addi64_relaxed(&mi_holes_unformed_reuse_calls, 1);
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, -(int64_t)(rend - rlo));
+
+  // #487: the owner is forming blocks here (`mi_page_extend_free`; `_mi_page_unpurge_all` takes
+  // the whole tail and never gets this far). Ask for the next window ahead of `rend`. The post
+  // made when the tail started at `rlo` already asked for everything below `rlo + window`, so
+  // only the part beyond that is new.
+  if (rend < rhi) {
+    const size_t window = mi_page_prefault_window(page);
+    const uintptr_t asked = rlo + window;
+    mi_page_prefault_post(page, (asked > rend ? asked : rend), rend + window);
+  }
 }
 
 

@@ -126,7 +126,10 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // purge_epoch
   MI_ATOMIC_VAR_INIT(0),  // gate_flags
   0,                      // fork_gen (#293)
-  { 0 }                   // retired_pages (#483)
+  { 0 },                  // retired_pages (#483)
+  { { 0, 0 } },           // prefault_queue (#487)
+  MI_ATOMIC_VAR_INIT(0),  // prefault_head
+  MI_ATOMIC_VAR_INIT(0)   // prefault_tail
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {

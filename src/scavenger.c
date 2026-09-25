@@ -581,6 +581,8 @@ static void mi_scavenger_run(void) {
     // directions (store-buffering) -- we see no parked thread, it sees a stale wake==1 and issues
     // no syscall, and that park is silently deferred to the safety timeout.
     mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (mi_scav_word_t)0);
+    // #487: first the pre-faults an owner is (soon) waiting on; while they keep coming, don't sleep
+    const bool prefaulted = _mi_prefault_drain(subproc);
     // Do the idle work of any thread that parked and handed us its theaps. This is the expensive
     // part and it is why the owner gets to skip it.
     const mi_msecs_t park_due = _mi_theap_sweep_parked(subproc);
@@ -620,6 +622,7 @@ static void mi_scavenger_run(void) {
       if (tick < timeout_ms) { timeout_ms = tick; }
     }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
+    if (prefaulted) continue;   // #487: a burst of posts: look again at once
     mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
   }
   // #272 profiler-interaction invariant (3): the scavenger must never initialise a theap of

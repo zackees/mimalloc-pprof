@@ -92,6 +92,11 @@ int _mi_prim_discard(void* addr, size_t size);
 // Returns error code or 0 on success. On most platforms this is a no-op.
 int _mi_prim_reuse(void* addr, size_t size);
 
+// Pre-fault memory (#487): make the committed range resident and writable now, as if every
+// OS page in it had been written, without changing its contents. Returns error code or 0 on
+// success; a no-op (returning 0) where the platform has no such call.
+int _mi_prim_populate(void* addr, size_t size);
+
 // Protect memory. Returns error code or 0 on success.
 int _mi_prim_protect(void* addr, size_t size, bool protect);
 

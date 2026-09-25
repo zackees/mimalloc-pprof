@@ -295,6 +295,21 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_RETIRED_RELEASE_MULT           (10)
 #endif
 
+// #487: pre-faulting a large page's discarded unformed tail ahead of its owner. The owner posts
+// up to MI_PREFAULT_QUEUE requests (a full queue drops the new one) for the scavenger, each for
+// the next MI_PREFAULT_LOOKAHEAD_BLOCKS blocks it will form (see `src/page-holes.c`).
+#ifndef MI_PREFAULT_QUEUE
+#define MI_PREFAULT_QUEUE                 (8)
+#endif
+#ifndef MI_PREFAULT_LOOKAHEAD_BLOCKS
+#define MI_PREFAULT_LOOKAHEAD_BLOCKS      (2)
+#endif
+
+typedef struct mi_prefault_req_s {
+  uintptr_t start;   // OS-page aligned
+  size_t    size;    // a multiple of the OS page size
+} mi_prefault_req_t;
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from
@@ -918,6 +933,14 @@ struct mi_tld_s {
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
+
+  // #487: pre-fault requests, a single-producer (this thread) / single-consumer (the scavenger)
+  // ring. Slot `i % MI_PREFAULT_QUEUE` is written by the owner before its release-store of
+  // `prefault_tail`, and read by the scavenger before its release-store of `prefault_head`;
+  // both counters only grow (`tail - head` is the number pending).
+  mi_prefault_req_t     prefault_queue[MI_PREFAULT_QUEUE];
+  _Atomic(size_t)       prefault_head;        // next request the scavenger takes
+  _Atomic(size_t)       prefault_tail;        // next slot the owner fills
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept

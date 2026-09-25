@@ -1,14 +1,15 @@
 /* Small allocator A/B workload for ci/perf_ab.py (#479). One run = one process.
 
-   usage: perf_ab <threads> <generations> <min_size> <max_size> <ops_per_thread>
+   usage: perf_ab <threads> <generations> <min_size> <max_size> <ops_per_thread> <release_bound_ms>
 
    Each thread replays a seeded stream over 8 live slots (allocate 8 / free-oldest 6 /
    free-random 2, one write per 4 KiB). With generations > 1 each thread runs its stream as
    that many short-lived threads, each exiting while it still owns live slots that the next
    one frees. Prints one line: ops/s, process cpu seconds, the workers' own cpu seconds (the
-   allocating threads, without the scavenger), minor page faults, peak RSS, and RSS DRAIN_SHORT_MS and
-   DRAIN_LONG_MS after everything was freed while the worker threads stay alive and idle (a
-   server between requests): the first reads the arena purge, the second a retention window.
+   allocating threads, without the scavenger), minor page faults, peak RSS, and, after everything
+   was freed while the worker threads stay alive and idle (a server between requests): RSS
+   DRAIN_SHORT_MS later, RSS at the release bound (ci/release_ratchet.json, #491), and the release
+   time -- the first sample within RELEASE_TOLERANCE of RSS at twice the bound.
    Linux only (getrusage + /proc/self/statm). */
 #define _GNU_SOURCE   /* RUSAGE_THREAD */
 #include <mimalloc.h>
@@ -23,8 +24,9 @@
 #include <unistd.h>
 
 #define SLOTS 8
-#define DRAIN_SHORT_MS 500
-#define DRAIN_LONG_MS  2000
+#define DRAIN_SHORT_MS      500
+#define RELEASE_SAMPLE_MS   10
+#define RELEASE_TOLERANCE   (1L << 20)   /* 1 MiB: "released" = within this of RSS at twice the bound */
 
 typedef struct { uint64_t rng; size_t lo, hi; long ops; void* slot[SLOTS]; int fifo[4096]; size_t head, tail; double cpu; } stream_t;
 
@@ -96,7 +98,10 @@ static long rss_bytes(void) {
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + (double)t.tv_nsec * 1e-9; }
 
 int main(int argc, char** argv) {
-  if (argc != 6) { fprintf(stderr, "usage: perf_ab threads generations min max ops\n"); return 2; }
+  if (argc != 7) { fprintf(stderr, "usage: perf_ab threads generations min max ops release_bound_ms\n"); return 2; }
+  const long bound_ms = atol(argv[6]);
+  const long samples = 2 * bound_ms / RELEASE_SAMPLE_MS + 1;   /* RSS every RELEASE_SAMPLE_MS up to twice the bound */
+  long* rss_at = (long*)calloc((size_t)samples, sizeof(long));
   const int threads = atoi(argv[1]);
   generations = atoi(argv[2]);
   stream_t* st = (stream_t*)calloc((size_t)threads, sizeof(stream_t));
@@ -109,17 +114,26 @@ int main(int argc, char** argv) {
   for (int i = 0; i < threads; i++) pthread_create(&t[i], NULL, &worker_main, &st[i]);
   while (atomic_load(&drained) < threads) usleep(100);
   const double elapsed = now_s() - start;
-  usleep(DRAIN_SHORT_MS * 1000);  /* let the deferred purge run */
-  struct rusage ru; getrusage(RUSAGE_SELF, &ru);
-  const long rss_short = rss_bytes();
-  usleep((DRAIN_LONG_MS - DRAIN_SHORT_MS) * 1000);
-  const long rss_long = rss_bytes();
+  struct rusage ru; getrusage(RUSAGE_SELF, &ru);   /* (re-read at DRAIN_SHORT_MS) */
+  long rss_short = 0;
+  const double drained_at = now_s();
+  for (long i = 0; i < samples; i++) {   /* sample i at drained_at + i * RELEASE_SAMPLE_MS, without drift */
+    const double wait = drained_at + (double)(i * RELEASE_SAMPLE_MS) * 1e-3 - now_s();
+    if (wait > 0) usleep((useconds_t)(wait * 1e6));
+    rss_at[i] = rss_bytes();
+    if (i * RELEASE_SAMPLE_MS == DRAIN_SHORT_MS) { getrusage(RUSAGE_SELF, &ru); rss_short = rss_at[i]; }
+  }
+  const long rss_final = rss_at[samples - 1];
+  long release_ms = 0;
+  while (release_ms / RELEASE_SAMPLE_MS < samples - 1 && rss_at[release_ms / RELEASE_SAMPLE_MS] > rss_final + RELEASE_TOLERANCE) {
+    release_ms += RELEASE_SAMPLE_MS;
+  }
   double owner_cpu = 0;
   for (int i = 0; i < threads; i++) owner_cpu += st[i].cpu;
-  printf("%.1f %.4f %.4f %ld %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu_of(&ru),
-         owner_cpu, ru.ru_minflt, ru.ru_maxrss * 1024L, rss_short, rss_long);
+  printf("%.1f %.4f %.4f %ld %ld %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu_of(&ru),
+         owner_cpu, ru.ru_minflt, ru.ru_maxrss * 1024L, rss_short, rss_at[bound_ms / RELEASE_SAMPLE_MS], release_ms);
   atomic_store(&release_workers, 1);
   for (int i = 0; i < threads; i++) pthread_join(t[i], NULL);
-  free(st); free(t);
+  free(st); free(t); free(rss_at);
   return 0;
 }

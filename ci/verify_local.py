@@ -900,6 +900,8 @@ def run_lint(ctx: RunCtx) -> bool:
         ["uv", "run", "ci/check_no_diagnostic_suppression.py"],
         ["uv", "run", "ci/check_macro_case.py", "--selftest"],
         ["uv", "run", "ci/check_macro_case.py"],
+        ["uv", "run", "ci/check_release_ratchet.py", "--selftest"],
+        ["uv", "run", "ci/check_release_ratchet.py", "--base", "origin/main"],
     ):
         rc, _ = run_logged(cmd, cwd=ROOT, log=ctx.log)
         ok = ok and rc == 0

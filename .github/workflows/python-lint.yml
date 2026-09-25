@@ -82,6 +82,15 @@ jobs:
           set -euo pipefail
           python3 ci/check_macro_case.py --selftest
           python3 ci/check_macro_case.py
+      # #491: the release-time bound may only go down, with perf-ab evidence (ci/release_ratchet.json).
+      - name: Release-time ratchet
+        env:
+          BASE: ${{ github.base_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          python3 ci/check_release_ratchet.py --selftest
+          git fetch --depth=1 origin "$BASE"
+          python3 ci/check_release_ratchet.py --base FETCH_HEAD
       - name: Selective macOS lane helpers (#339)
         run: |
           set -euo pipefail

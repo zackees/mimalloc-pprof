@@ -88,6 +88,14 @@ def selftest() -> int:
             1,
         ),  # below the allocator's floor
         ({"bound_ms": 2000, "margin": 0.9, "p95_release_ms": None}, 0),  # unchanged
+        (
+            {"bound_ms": 1300, "margin": 0.9, "p95_release_ms": 1170},
+            0,
+        ),  # #509: evidence exactly at margin * bound
+        (
+            {"bound_ms": 1300, "margin": 0.9, "p95_release_ms": 1171},
+            1,
+        ),  # #509: one ms over the margin
     ]
     failed = 0
     for head, want in cases:

@@ -12,6 +12,10 @@ name: benchmark-scaling
 # sweep in a 10m00s job before the distribution workloads were added. The 30-minute
 # measurement job has an owner-approved 120-minute bound (#424). Six thread-point
 # shards run serially on one Linux VM; the reporting job merges their raw outputs.
+# The shard holding 8 workers also runs the thread-churn side-car (#508): 40 paired
+# runs x 5 allocators, each child idling about 3 s after the drain while it samples RSS,
+# which adds about 11 minutes inside the existing 120-minute measure bound; that shard
+# gets CHURN_CELL_BUDGET_SECONDS on top of the per-shard HARD_LIMIT_SECONDS for it.
 # ci/check_benchmark_scaling_workflow.py pins the thread points and pattern ids in
 # rust/benchmark-suite/src/scaling.rs to the ones ci/benchmark_report.py validates, so
 # the two halves of the contract cannot drift apart silently.

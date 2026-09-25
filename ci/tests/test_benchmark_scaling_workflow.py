@@ -52,6 +52,28 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(policy.ScalingWorkflowError, "SCALING_THREAD_POINTS"):
             policy.validate_source_contract(drifted)
 
+    def test_rust_churn_contract_drifting_from_python_is_rejected(self) -> None:
+        # #508: the thread-churn side-car's schema and post-drain offsets are
+        # declared in scaling.rs and benchmark_report.py; a one-sided edit must fail.
+        source = policy.SCALING_SOURCE.read_text(encoding="utf-8")
+        renamed = source.replace(
+            f'SCALING_CHURN_SCHEMA_VERSION: &str = "{report.SCALING_CHURN_SCHEMA}"',
+            'SCALING_CHURN_SCHEMA_VERSION: &str = "thread-churn-post-drain-rss-v2"',
+        )
+        self.assertNotEqual(renamed, source)
+        with self.assertRaisesRegex(policy.ScalingWorkflowError, "SCALING_CHURN_SCHEMA_VERSION"):
+            policy.validate_source_contract(renamed)
+        offsets = ", ".join(str(offset) for offset in report.CHURN_OFFSETS_MS)
+        drifted = source.replace(
+            f"CHURN_POST_DRAIN_OFFSETS_MS: [u64; {len(report.CHURN_OFFSETS_MS)}] = [{offsets}]",
+            "CHURN_POST_DRAIN_OFFSETS_MS: [u64; 2] = [100, 3000]",
+        )
+        self.assertNotEqual(drifted, source)
+        with self.assertRaisesRegex(policy.ScalingWorkflowError, "CHURN_POST_DRAIN_OFFSETS_MS"):
+            policy.validate_source_contract(drifted)
+        self.assertIn("churn schema renamed on one side", policy.SOURCE_MUTATIONS)
+        self.assertIn("churn offsets diverge", policy.SOURCE_MUTATIONS)
+
     def test_rust_pattern_dropped_from_the_sweep_is_rejected(self) -> None:
         # #216: Larson/xmalloc-test join the four sparse patterns. Dropping one
         # from the array while trimming its length still leaves the name list

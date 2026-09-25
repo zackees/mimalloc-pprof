@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from pathlib import Path
+from typing import cast
 from urllib.parse import unquote, urlsplit
 
 import benchmark_report as report
@@ -31,8 +32,21 @@ RAW_SVG = re.compile(
 )
 MARKDOWN_LINK = re.compile(r"\]\(([^)]+)\)")
 HTML_SOURCE = re.compile(r'(?:src|srcset)="([^"]+)"')
-EXPECTED_SVGS = frozenset((*report.SCALING_PANELS.values(), *report.DISTRIBUTION_PANELS.values()))
+EXPECTED_SVGS = frozenset(
+    (
+        *report.SCALING_PANELS.values(),
+        *report.DISTRIBUTION_PANELS.values(),
+        report.CHURN_PANEL,
+        report.LARSON_RSS_PANEL,
+    )
+)
 RAW_BASE = "https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/"
+#: The dashboard section the thread-churn chart links to (#508).
+CHURN_ANCHOR = "thread-churn"
+#: The larson peak-RSS chart (#506) clicks through to the scaling section.
+LARSON_RSS_LINK = (
+    f"{RAW_BASE}{report.LARSON_RSS_PANEL})](https://zackees.github.io/mimalloc-pprof/#scaling)"
+)
 
 
 def readme_errors(readme: Path) -> list[str]:
@@ -51,6 +65,10 @@ def readme_errors(readme: Path) -> list[str]:
         errors.append(f"README scaling images linked more than once: {repeated}")
     if source.count("#requested-size-distributions") != len(report.DISTRIBUTION_PANELS):
         errors.append("README distribution graphics must target the dashboard section")
+    if source.count(f"#{CHURN_ANCHOR}") != 1:
+        errors.append("README thread-churn graphic must target the dashboard section once")
+    if source.count(LARSON_RSS_LINK) != 1:
+        errors.append("README larson peak-RSS graphic must target the dashboard scaling section")
 
     for match in (*MARKDOWN_LINK.finditer(source), *HTML_SOURCE.finditer(source)):
         target = match.group(1).strip().split(" ", 1)[0].strip("<>")
@@ -100,6 +118,14 @@ def publication_errors(site: Path) -> list[str]:
         run = report.object_value(scaling.get("run"), "latest.scaling.run")
         if run.get("source_ref") != "refs/heads/main":
             errors.append("latest.json scaling run is not from main")
+        churn = scaling.get("churn")
+        churn_schema = (
+            cast("dict[str, object]", churn).get("metric_schema_version")
+            if isinstance(churn, dict)
+            else None
+        )
+        if churn_schema != report.SCALING_CHURN_SCHEMA:
+            errors.append("latest.json scaling report has no thread-churn side-car")
         if not errors:
             # The strict validator checks every five-allocator cell and its raw
             # 3- or 40-repetition sample count, percentile values, and provenance.
@@ -112,6 +138,8 @@ def publication_errors(site: Path) -> list[str]:
         html = index.read_text(encoding="utf-8")
         if 'id="requested-size-distributions"' not in html:
             errors.append("dashboard is missing the requested-size-distributions anchor")
+        if f'id="{CHURN_ANCHOR}"' not in html:
+            errors.append("dashboard is missing the thread-churn anchor")
         for name in sorted(EXPECTED_SVGS):
             if f'src="{name}"' not in html:
                 errors.append(f"dashboard is missing the {name} graphic")

@@ -161,7 +161,10 @@ Aggregate throughput at 1, 2, 3, 4, 6, and 8 workers, for four allocation
 patterns plus two named cross-project workloads, Larson and xmalloc-test
 (clean-room reimplementations of their published shapes, for comparison with
 mimalloc-bench). Each pattern is a seeded random operation stream, so all five
-allocators replay one identical stream inside each paired block.
+allocators replay one identical stream inside each paired block. Larson also
+has a peak-RSS chart (the median of its blocks, one line per allocator),
+because it is the only named workload that exercises remote frees of
+small-object pages (#506).
 
 > **Coverage mode: reduced statistical rigor (3 blocks per cell).** These panels
 > trade statistical rigor for thread coverage — no confidence intervals, no noise
@@ -178,6 +181,8 @@ allocators replay one identical stream inside each paired block.
 [![Cross-thread producer/consumer handoff: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-cross-thread.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
 [![Larson server workload: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-larson.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+
+[![Larson server workload: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-larson-rss.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
 [![xmalloc-test producer/consumer workload: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-xmalloc-test.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
@@ -217,6 +222,23 @@ the cost of short-lived threads.
 [![Short-lived threads, 96-512 KiB: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
 [![Short-lived threads, 96-512 KiB: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+### RSS after the work stops
+
+Peak RSS says how much memory a run needed; this chart shows how much each allocator
+still holds once the run is over. At 8 workers, each worker runs the short-lived 96–512 KiB
+stream above as 8 successive threads; then every thread is joined and the process stays
+alive and idle while its RSS is sampled in-process at 0.1, 0.5, 1, 1.5, 2 and 3 s. The
+process has to stay alive because at exit every allocator's memory is gone; the
+interesting case is a server between requests. Each line is one allocator's median over
+40 paired runs, and the legend gives its median peak and its time to release: the first
+sample within 1 MiB of the 3 s RSS, the same definition the perf-ab gate uses. This is
+where the memory-return work of #479 shows: never orphaning the arena purge deadline (#481),
+letting idle threads return their large pages (#488), reserving a finished thread's pages
+for the next thread (#496), the 400–800 ms retention window (#500), and the 1.3 s release
+bound (#491, #499, #509), which the 1.5 s sample is the first to cover.
+
+[![RSS after the work stops, thread churn at 8 workers: median RSS of all five allocators at 0.1-3 s after every thread was joined, with time to release](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-thread-churn-rss.svg)](https://zackees.github.io/mimalloc-pprof/#thread-churn)
 
 Full methodology, per-cell tables and the other benchmark families are in
 [Performance](#performance) below and on the
@@ -281,7 +303,7 @@ full jemalloc trade-off is in
 **Contents**
 
 - [Feature comparison](#feature-comparison) — every feature of this fork, Microsoft mimalloc, Bun's mimalloc and jemalloc, side by side *(above)*
-- [Thread scaling](#thread-scaling-by-allocation-pattern) — how the five allocators scale from 1 to 16 threads *(above)*
+- [Thread scaling](#thread-scaling-by-allocation-pattern) — how the five allocators scale from 1 to 8 threads, and the RSS each holds after short-lived threads finish *(above)*
 - [Memory returned after idle](#memory-returned-after-idle) — what each allocator hands back when a burst of work drains, and what hole purging is worth *(above)*
 - [At a glance](#at-a-glance--why-use-this-version) — what you get over upstream mimalloc, in one screen
 - [Integration](#integration) — pprof, exact stats and DHAT in Rust and C, plus the full API table

@@ -2,9 +2,11 @@ name: perf-ab
 
 # Small paired A/B of the allocator at this ref against a base ref (#479, #493): memory (peak
 # RSS, RSS after drain), CPU (ops/s, process and worker-thread cpu seconds) and minor page
-# faults on a few large-block workloads, a small-object control and a profiler-on row. It runs on PRs labelled `perf-ab` (against the PR base) or by
-# dispatch; the table lands in the job summary and is pasted into the PR. Runs on a hosted
-# runner so no developer machine is timed.
+# faults on a few large-block workloads, a small-object control, a profiler-on row and the
+# Larson & Krishnan server workload (`larson` rows, #506). It runs on PRs labelled `perf-ab` (against the PR base) or by
+# dispatch; the table lands in the job summary and is pasted into the PR. A dispatch can set
+# `head_env` to run the head arm with an allocator option changed, to attribute a cost (#506).
+# Runs on a hosted runner so no developer machine is timed.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -20,6 +22,10 @@ on:
         default: "7"
       workloads:
         description: "Only the workloads whose name contains this text (empty = all)"
+        type: string
+        default: ""
+      head_env:
+        description: "Space-separated KEY=VALUE pairs applied to the head arm only (#506)"
         type: string
         default: ""
 
@@ -41,4 +47,10 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.sha || inputs.base }}
           REPS: ${{ inputs.reps || '7' }}
           WORKLOADS: ${{ inputs.workloads }}
-        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" --summary "$GITHUB_STEP_SUMMARY"
+          HEAD_ENV: ${{ inputs.head_env }}
+        run: |
+          head_env_args=()
+          read -r -a pairs <<< "$HEAD_ENV"
+          for pair in "${pairs[@]}"; do head_env_args+=(--head-env "$pair"); done
+          python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" \
+            "${head_env_args[@]}" --summary "$GITHUB_STEP_SUMMARY"

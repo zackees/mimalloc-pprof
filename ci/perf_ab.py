@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Paired A/B of two allocator revisions on a few large-block workloads (#479).
+"""Paired A/B of two allocator revisions (#479).
 
-Builds the minimal static library at --base and --head (every observability flag named
-OFF; the BUILDS table adds flags for the profiler and chart-build rows), links
-ci/perf_ab.c against each, and runs every workload --reps times with the arm
-order alternating inside each repetition. Prints a markdown table of medians and the
-median paired difference with a bootstrap 95% interval; a direction is only claimed when
-the interval excludes zero. Linux only. Meant for a CI runner, not a busy dev machine.
+The workloads are a few large-block streams, a small-object control, and Larson &
+Krishnan's server workload (the `larson` rows, #506: small blocks whose tables rotate
+between threads, so most frees are remote). Builds the minimal static library at --base
+and --head (every observability flag named OFF; the BUILDS table adds flags for the
+profiler and chart-build rows), links ci/perf_ab.c against each, and runs every workload
+--reps times with the arm order alternating inside each repetition. --head-env KEY=VALUE
+(repeatable) sets extra environment on the head arm only, e.g. an allocator option, to
+attribute a difference to it; the table header names it. Prints a markdown table of
+medians and the median paired difference with a bootstrap 95% interval; a direction is
+only claimed when the interval excludes zero. Linux only. Meant for a CI runner, not a
+busy dev machine.
 
     python3 ci/perf_ab.py --base origin/main --head HEAD [--reps 7] [--workloads random] [--summary out.md]
+    python3 ci/perf_ab.py --base HEAD --head HEAD --workloads larson --head-env MIMALLOC_ARENA_PURGE_MULT=1
 """
 
 from __future__ import annotations
@@ -46,23 +52,32 @@ BUILDS: dict[str, tuple[list[str], dict[str, str]]] = {
     "pprof": (["-DMI_PPROF=ON"], {"MIMALLOC_PROF": "1"}),
     "chart": (["-DMI_PPROF=ON", "-DMI_MEMEVT=ON"], {}),
 }
-# name: (build, (threads, generations, min bytes, max bytes, ops per thread, pause ms)). A pause
-# makes the row bursty (#486): BURSTS bursts per thread, everything freed after each, then idle.
+# name: (build, (threads, generations, min bytes, max bytes, ops per thread, pause ms, larson
+# slots)). A pause makes the row bursty (#486): BURSTS bursts per thread, everything freed after
+# each, then idle. Larson slots > 0 make the row Larson & Krishnan's server workload (#506, as
+# ScalingPattern::Larson in rust/benchmark-suite/src/scaling.rs): a table of that many small
+# blocks per thread, rotated between threads every round so later frees are remote; generations
+# and pause are ignored there. 0 = the stream modes above.
 WORKLOADS = {
-    "large-class/8": ("plain", (8, 1, 96 << 10, 512 << 10, 400000, 0)),
-    "large-class-ephemeral/8": ("plain", (8, 8, 96 << 10, 512 << 10, 400000, 0)),
-    "random-large/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 0)),
-    "random-large-bursty/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 300)),
-    "random-large/1": ("plain", (1, 1, 64 << 10, 4 << 20, 200000, 0)),
-    "small/8 (control)": ("plain", (8, 1, 16, 1024, 5000000, 0)),
-    "large-class/8 (profiler on)": ("pprof", (8, 1, 96 << 10, 512 << 10, 400000, 0)),
-    "large-class-ephemeral/8 (chart build)": ("chart", (8, 8, 96 << 10, 512 << 10, 400000, 0)),
+    "large-class/8": ("plain", (8, 1, 96 << 10, 512 << 10, 400000, 0, 0)),
+    "large-class-ephemeral/8": ("plain", (8, 8, 96 << 10, 512 << 10, 400000, 0, 0)),
+    "random-large/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 0, 0)),
+    "random-large-bursty/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 300, 0)),
+    "random-large/1": ("plain", (1, 1, 64 << 10, 4 << 20, 200000, 0, 0)),
+    "small/8 (control)": ("plain", (8, 1, 16, 1024, 5000000, 0, 0)),
+    "large-class/8 (profiler on)": ("pprof", (8, 1, 96 << 10, 512 << 10, 400000, 0, 0)),
+    "large-class-ephemeral/8 (chart build)": ("chart", (8, 8, 96 << 10, 512 << 10, 400000, 0, 0)),
     # the README chart's generation length (~12.5k ops per short-lived thread at 8 workers, #478):
     # a per-thread start/exit cost weighs 4x more than in the row above
     "large-class-ephemeral/8 short generations (chart build)": (
         "chart",
-        (8, 8, 96 << 10, 512 << 10, 100000, 0),
+        (8, 8, 96 << 10, 512 << 10, 100000, 0, 0),
     ),
+    # Larson & Krishnan's server workload (#506): 8-1000 B blocks, 5000 per table
+    "larson/1": ("plain", (1, 1, 8, 1000, 2000000, 0, 5000)),
+    "larson/8": ("plain", (8, 1, 8, 1000, 2000000, 0, 5000)),
+    # the README chart builds mimalloc-pprof this way (#478)
+    "larson/8 (chart build)": ("chart", (8, 1, 8, 1000, 2000000, 0, 5000)),
 }
 # what ci/perf_ab.c prints, in order; the byte counts are shown in MiB
 METRICS = (
@@ -149,10 +164,24 @@ def main() -> int:
         "--workloads", default="", help="only the workloads whose name contains this text"
     )
     parser.add_argument("--summary", type=Path)
+    parser.add_argument(
+        "--head-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra environment for the head arm only (repeatable), e.g. "
+        "MIMALLOC_ARENA_PURGE_MULT=1 to attribute a cost to one option (#506)",
+    )
     args = parser.parse_args()
     workloads = {name: w for name, w in WORKLOADS.items() if args.workloads in name}
     if not workloads:
         parser.error(f"no workload matches {args.workloads!r}")
+    head_env: dict[str, str] = {}
+    for pair in args.head_env:
+        key, sep, value = pair.partition("=")
+        if not sep or not key:
+            parser.error(f"--head-env wants KEY=VALUE, got {pair!r}")
+        head_env[key] = value
     bound_ms = int(json.loads(RATCHET.read_text())["bound_ms"])
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -170,7 +199,10 @@ def main() -> int:
                     for arm in ("base", "head") if rep % 2 == 0 else ("head", "base"):
                         exe = str(exes[(arm, kind)])
                         env = {**os.environ, **BUILDS[kind][1]}
-                        cmd = [exe, *map(str, params), str(bound_ms)]
+                        if arm == "head":
+                            env.update(head_env)
+                        *stream, larson_slots = params
+                        cmd = [exe, *map(str, stream), str(bound_ms), str(larson_slots)]
                         values = list(map(float, run(cmd, env=env).split()))
                         for index, metric in enumerate(METRICS):
                             if metric in IN_MIB:
@@ -179,8 +211,11 @@ def main() -> int:
         finally:  # unregister the trees while they still exist: a prune here would find nothing to prune
             for tree in work.glob("src-*"):
                 run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
+    shown_env = " ".join(f"{k}={v}" for k, v in head_env.items())
+    head_label = f"`{args.head}`" + (f" (head env: {shown_env})" if head_env else "")
     rows = [
-        f"`{args.base}` vs `{args.head}` on {cpu_model()}, {args.reps} paired reps, alternating order. "
+        f"`{args.base}` vs {head_label} on {cpu_model()}, {args.reps} paired reps, "
+        "alternating order. "
         "Median base -> head, then median paired difference [bootstrap 95%]; "
         "**bold** when the interval excludes 0.",
         "",

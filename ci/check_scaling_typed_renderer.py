@@ -14,6 +14,11 @@ TYPED_FUNCTIONS = frozenset(
         "distribution_global_domain",
         "distribution_stack_svg",
         "render_scaling_html",
+        "churn_release_svg",
+        "median_overlay_svg",
+        "pattern_rss_domain",
+        "has_complete_pattern_rss",
+        "larson_rss_svg",
     }
 )
 
@@ -128,6 +133,11 @@ def selftest() -> None:
 def distribution_global_domain(scaling: ScalingView, metric: str): pass
 def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str): pass
 def render_scaling_html(scaling: ScalingView): pass
+def churn_release_svg(scaling: ScalingView): pass
+def median_overlay_svg(scaling: ScalingView, pattern: str, metric: str): pass
+def pattern_rss_domain(scaling: ScalingView, pattern: str): pass
+def has_complete_pattern_rss(scaling: ScalingView, pattern: str): pass
+def larson_rss_svg(scaling: ScalingView): pass
 """
     assert not check_source(good + support)
     messages = [violation.message for violation in check_source(bad + support)]
@@ -138,6 +148,24 @@ def render_scaling_html(scaling: ScalingView): pass
     assert any(
         "helper uses dynamic string-key" in violation.message
         for violation in check_source(helper_bad)
+    )
+    # #508: the thread-churn panel reads its side-car through ScalingView, not the raw dict.
+    churn_bad = (good + support).replace(
+        "def churn_release_svg(scaling: ScalingView): pass",
+        "def churn_release_svg(scaling: ScalingView):\n    return scaling['churn']",
+    )
+    assert any(
+        "churn_release_svg uses dynamic string-key" in violation.message
+        for violation in check_source(churn_bad)
+    )
+    # #506: the larson peak-RSS panel reads the RSS side-car through ScalingView too.
+    larson_bad = (good + support).replace(
+        "def larson_rss_svg(scaling: ScalingView): pass",
+        "def larson_rss_svg(scaling: ScalingView):\n    return scaling['rss']",
+    )
+    assert any(
+        "larson_rss_svg uses dynamic string-key" in violation.message
+        for violation in check_source(larson_bad)
     )
 
 

@@ -19,8 +19,10 @@ from typing import Any, Callable, NoReturn, cast
 import yaml
 
 from benchmark_report import (
+    CHURN_OFFSETS_MS,
     DISTRIBUTION_BLOCKS,
     SCALING_BLOCKS,
+    SCALING_CHURN_SCHEMA,
     SCALING_PATTERN_IDS,
     SCALING_RSS_SCHEMA,
     SCALING_SCHEMA,
@@ -252,6 +254,13 @@ RUST_SCHEMA = re.compile(r'pub const SCALING_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<s
 RUST_RSS_SCHEMA = re.compile(
     r'pub const SCALING_RSS_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<schema>[^"]*)";'
 )
+RUST_CHURN_SCHEMA = re.compile(
+    r'pub const SCALING_CHURN_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<schema>[^"]*)";'
+)
+RUST_CHURN_OFFSETS = re.compile(
+    r"pub const CHURN_POST_DRAIN_OFFSETS_MS:\s*\[u64;\s*(?P<length>\d+)\]\s*=\s*"
+    r"\[(?P<offsets>[^\]]*)\];"
+)
 RUST_PATTERNS = re.compile(
     r"pub const SCALING_PATTERNS:\s*\[ScalingPattern;\s*(?P<length>\d+)\]\s*=\s*"
     r"\[(?P<body>[^\]]*)\];"
@@ -305,6 +314,27 @@ def validate_source_contract(source: str) -> None:
     rss_match = RUST_RSS_SCHEMA.search(source)
     if rss_match is None or rss_match.group("schema") != SCALING_RSS_SCHEMA:
         fail(f"scaling.rs: SCALING_RSS_SCHEMA_VERSION must be {SCALING_RSS_SCHEMA!r}")
+    # #508: the thread-churn side-car's schema and post-drain offsets are
+    # declared on both sides too; the offsets index every post-drain RSS list.
+    churn_match = RUST_CHURN_SCHEMA.search(source)
+    if churn_match is None or churn_match.group("schema") != SCALING_CHURN_SCHEMA:
+        fail(f"scaling.rs: SCALING_CHURN_SCHEMA_VERSION must be {SCALING_CHURN_SCHEMA!r}")
+    offsets_match = RUST_CHURN_OFFSETS.search(source)
+    if offsets_match is None:
+        fail("scaling.rs: CHURN_POST_DRAIN_OFFSETS_MS is missing or no longer a [u64; N] literal")
+    raw_offsets = [
+        item.strip() for item in offsets_match.group("offsets").split(",") if item.strip()
+    ]
+    if not all(item.isdigit() for item in raw_offsets):
+        fail("scaling.rs: CHURN_POST_DRAIN_OFFSETS_MS must be literal decimal milliseconds")
+    offsets = tuple(int(item) for item in raw_offsets)
+    if int(offsets_match.group("length")) != len(offsets):
+        fail("scaling.rs: CHURN_POST_DRAIN_OFFSETS_MS array length disagrees with its elements")
+    if offsets != tuple(CHURN_OFFSETS_MS):
+        fail(
+            "scaling.rs: CHURN_POST_DRAIN_OFFSETS_MS is "
+            f"{list(offsets)} but benchmark_report.py declares {list(CHURN_OFFSETS_MS)}"
+        )
 
     patterns_match = RUST_PATTERNS.search(source)
     if patterns_match is None:
@@ -448,6 +478,15 @@ SOURCE_MUTATIONS: dict[str, Callable[[str], str]] = {
     "rss schema renamed on one side": lambda text: text.replace(
         f'SCALING_RSS_SCHEMA_VERSION: &str = "{SCALING_RSS_SCHEMA}"',
         'SCALING_RSS_SCHEMA_VERSION: &str = "throughput-scaling-rss-v2"',
+    ),
+    "churn schema renamed on one side": lambda text: text.replace(
+        f'SCALING_CHURN_SCHEMA_VERSION: &str = "{SCALING_CHURN_SCHEMA}"',
+        'SCALING_CHURN_SCHEMA_VERSION: &str = "thread-churn-post-drain-rss-v2"',
+    ),
+    "churn offsets diverge": lambda text: text.replace(
+        f"CHURN_POST_DRAIN_OFFSETS_MS: [u64; {len(CHURN_OFFSETS_MS)}] = "
+        f"[{', '.join(str(offset) for offset in CHURN_OFFSETS_MS)}]",
+        "CHURN_POST_DRAIN_OFFSETS_MS: [u64; 2] = [100, 3000]",
     ),
     "thread points declared out of order": lambda text: text.replace(
         f"[{', '.join(str(p) for p in SCALING_THREAD_POINTS)}]",

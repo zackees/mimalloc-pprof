@@ -46,6 +46,9 @@ DEFAULT_PATTERNS = ("sparse-tiny-hot", "sparse-mixed-general")
 #: unlucky run.
 DEFAULT_MIN_RATIO = 0.75
 
+#: Bytes per MiB, for the informational thread-churn report.
+BYTES_PER_MIB = 1 << 20
+
 
 def cells(scaling: Mapping[str, object]) -> list[dict[str, object]]:
     summaries = scaling.get("cell_summaries")
@@ -75,11 +78,46 @@ def top_thread_speedups(
     return top, out
 
 
+def report_churn(scaling: Mapping[str, object]) -> None:
+    """Print the thread-churn side-car (#508). Informational only: never a verdict.
+
+    The side-car measures how fast each allocator hands memory back after its
+    threads exit; it has no parity floor, so a malformed or absent one is skipped
+    rather than failing a throughput gate it has nothing to do with.
+    """
+    churn = scaling.get("churn")
+    if not isinstance(churn, dict):
+        return
+    rows = cells(cast("Mapping[str, object]", churn))
+    if not rows:
+        print("  thread-churn side-car: no readable cell summaries")
+        return
+    print("  thread-churn side-car (informational):")
+    for c in rows:
+        allocator = c.get("allocator_id")
+        threads = c.get("thread_count")
+        release = c.get("median_release_ms")
+        post_drain = c.get("median_post_drain_rss_bytes")
+        if not isinstance(allocator, str):
+            continue
+        release_text = f"{release} ms" if isinstance(release, (int, float)) else "n/a"
+        final_text = "n/a"
+        if isinstance(post_drain, list) and post_drain:
+            last = cast("list[object]", post_drain)[-1]
+            if isinstance(last, (int, float)):
+                final_text = f"{float(last) / BYTES_PER_MIB:.1f} MiB"
+        print(
+            f"    {allocator} @{threads} threads: release {release_text}, "
+            f"RSS at last offset {final_text}"
+        )
+
+
 def check(latest: Mapping[str, object], patterns: tuple[str, ...], min_ratio: float) -> int:
     scaling = latest.get("scaling")
     if not isinstance(scaling, dict):
         print("check_scaling_parity: no scaling section in this report; nothing to compare")
         return 0
+    report_churn(cast("Mapping[str, object]", scaling))
     problems: list[str] = []
     checked = 0
     for pattern in patterns:
@@ -152,6 +190,43 @@ def selftest() -> int:
     if check(healthy, ("sparse-tiny-hot",), DEFAULT_MIN_RATIO) != 0:
         print("FAIL: a healthy run was flagged")
         ok = False
+    # #508: the thread-churn side-car is informational and must never move the verdict.
+    churn: dict[str, object] = {
+        "metric_schema_version": "thread-churn-post-drain-rss-v1",
+        "pattern": "thread-churn",
+        "cell_summaries": [
+            {
+                "thread_count": 8,
+                "allocator_id": allocator,
+                "median_release_ms": 500,
+                "median_post_drain_rss_bytes": [64 * BYTES_PER_MIB] * 6,
+            }
+            for allocator in (FORK, *REFERENCES)
+        ],
+    }
+    regressed_churn = {"scaling": {**section(1.30), "churn": churn}}
+    if check(regressed_churn, ("sparse-tiny-hot",), DEFAULT_MIN_RATIO) != 1:
+        print("FAIL: a churn side-car hid the regression")
+        ok = False
+    healthy_churn = {"scaling": {**section(2.55), "churn": churn}}
+    if check(healthy_churn, ("sparse-tiny-hot",), DEFAULT_MIN_RATIO) != 0:
+        print("FAIL: a churn side-car turned a healthy run red")
+        ok = False
+    malformed_churns: tuple[object, ...] = (
+        {**churn, "cell_summaries": "not a list"},
+        {**churn, "cell_summaries": [{"allocator_id": FORK, "median_post_drain_rss_bytes": 7}]},
+        "not an object",
+    )
+    for malformed in malformed_churns:
+        for fork_speedup, expected in ((1.30, 1), (2.55, 0)):
+            verdict = check(
+                {"scaling": {**section(fork_speedup), "churn": malformed}},
+                ("sparse-tiny-hot",),
+                DEFAULT_MIN_RATIO,
+            )
+            if verdict != expected:
+                print(f"FAIL: a malformed churn side-car changed the verdict to {verdict}")
+                ok = False
     # A run with no scaling section must not fail: sections are carried forward and a
     # metric that has not been measured at these pins is legitimately absent (#376).
     if check({}, ("sparse-tiny-hot",), DEFAULT_MIN_RATIO) != 0:

@@ -6,6 +6,7 @@ from __future__ import annotations
 # ruff: noqa: I001
 
 import copy
+import dataclasses
 import gzip
 import json
 import math
@@ -1502,6 +1503,8 @@ class BenchmarkReportTests(unittest.TestCase):
                 "https://zackees.github.io/mimalloc-pprof/#requested-size-distributions",
             )
         )
+        # #506: the larson peak-RSS overlay clicks through to the scaling section.
+        expected[report.LARSON_RSS_PANEL] = "https://zackees.github.io/mimalloc-pprof/#scaling"
         for image, destination in expected.items():
             raw = (
                 f"https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/{image}"
@@ -1840,6 +1843,283 @@ class BenchmarkReportTests(unittest.TestCase):
         ]
         return value
 
+    def with_complete_churn(self, latest: dict[str, object]) -> dict[str, object]:
+        """Add a consistent #508 thread-churn side-car to a complete scaling
+        report: 40 paired blocks x every allocator at 8 workers, each series
+        decreasing to its own floor and releasing at its own offset, with the
+        summaries derived by the contract rules."""
+        value = self.with_complete_scaling(latest)
+        scaling = value["scaling"]
+        allocators = value["allocators"]
+        assert isinstance(scaling, dict) and isinstance(allocators, list)
+        allocator_sources = {
+            str(item["allocator_id"]): (str(item["source_sha"]), str(item["child_binary_sha256"]))
+            for item in allocators
+            if isinstance(item, dict)
+        }
+        mib = 1024 * 1024
+        offsets = report.CHURN_OFFSETS_MS
+        tolerance = report.CHURN_RELEASE_TOLERANCE_BYTES
+
+        def quantile(values: list[int], probability: float) -> int:
+            return math.floor(report.latency_type7(values, probability) + 0.5)
+
+        def release_ms(rss: list[int]) -> int:
+            return next(
+                offset for offset, value in zip(offsets, rss) if value <= rss[-1] + tolerance
+            )
+
+        raw: list[dict[str, object]] = []
+        summaries: list[dict[str, object]] = []
+        for threads in report.CHURN_THREAD_POINTS:
+            for index, allocator in enumerate(report.ALLOCATOR_IDS):
+                source_sha, child_sha = allocator_sources[allocator]
+                # Allocator `index` releases at offset `index`; before that
+                # each read is 16 MiB above the floor per remaining step.
+                release_index = index % len(offsets)
+                floor = (40 + 7 * index) * mib
+                for block in range(report.CHURN_BLOCKS):
+                    rss: list[int] = []
+                    for step in range(len(offsets)):
+                        held = (release_index - step) * 16 * mib if step < release_index else 0
+                        # Within the 1 MiB tolerance once released: 64 KiB per step.
+                        tail = (len(offsets) - 1 - step) * 65536
+                        rss.append(floor + block * 4096 + held + tail)
+                    raw.append(
+                        {
+                            "metric_schema_version": report.SCALING_SCHEMA,
+                            "block_id": block,
+                            "ordinal": index,
+                            "pattern": report.CHURN_PATTERN_ID,
+                            "thread_count": threads,
+                            "allocator_id": allocator,
+                            "allocator_source_sha": source_sha,
+                            "child_binary_sha256": child_sha,
+                            "operations_per_worker": 4096,
+                            "peak_rss_bytes": (200 + 10 * index) * mib + block * 65536,
+                            "reproduction_command": "benchmark-scaling-run --run-seed 1",
+                            "response": {
+                                "protocol_version": "throughput-scaling-sparse-child-v2",
+                                "metric_schema_version": report.SCALING_SCHEMA,
+                                "allocator_id": allocator,
+                                "thread_count": threads,
+                                "alloc_calls": 1000,
+                                "realloc_calls": 0,
+                                "free_calls": 1000,
+                                "operation_count": 2000,
+                                "checksum": 12345,
+                                "remote_free_calls": 0,
+                                "producer_fallback_frees": 0,
+                                "setup_ns": 1,
+                                "warmup_ns": 0,
+                                "elapsed_ns": 750_000_000,
+                                "teardown_ns": 1,
+                                "throughput_operations_per_second": 1_000_000.0,
+                                "post_drain_rss_bytes": rss,
+                                "post_drain_sample_ns": [
+                                    offset * 1_000_000 + 50_000 + block for offset in offsets
+                                ],
+                                "live_worker_threads_at_first_sample": 0,
+                            },
+                        }
+                    )
+        # The contract orders summaries by (thread_count, allocator_id).
+        cells = sorted(
+            (threads, allocator)
+            for threads in report.CHURN_THREAD_POINTS
+            for allocator in report.ALLOCATOR_IDS
+        )
+        for threads, allocator in cells:
+            cell = [
+                item
+                for item in raw
+                if item["thread_count"] == threads and item["allocator_id"] == allocator
+            ]
+            peaks = [cast(int, item["peak_rss_bytes"]) for item in cell]
+            series = [
+                cast(list[int], cast(dict[str, object], item["response"])["post_drain_rss_bytes"])
+                for item in cell
+            ]
+            columns = [[rss[step] for rss in series] for step in range(len(offsets))]
+            summaries.append(
+                {
+                    "thread_count": threads,
+                    "allocator_id": allocator,
+                    "block_count": report.CHURN_BLOCKS,
+                    "median_peak_rss_bytes": quantile(peaks, 0.50),
+                    "p05_peak_rss_bytes": quantile(peaks, 0.05),
+                    "p95_peak_rss_bytes": quantile(peaks, 0.95),
+                    "median_post_drain_rss_bytes": [quantile(c, 0.50) for c in columns],
+                    "p05_post_drain_rss_bytes": [quantile(c, 0.05) for c in columns],
+                    "p95_post_drain_rss_bytes": [quantile(c, 0.95) for c in columns],
+                    "median_release_ms": quantile([release_ms(rss) for rss in series], 0.50),
+                }
+            )
+        scaling["churn"] = {
+            "metric_schema_version": report.SCALING_CHURN_SCHEMA,
+            "pattern": report.CHURN_PATTERN_ID,
+            "replays_pattern": report.CHURN_REPLAYS_PATTERN,
+            "sampling": {
+                "source": "in-process /proc/self/smaps_rollup Rss",
+                "method": "read at fixed offsets after every worker thread was joined",
+                "offsets_ms": list(offsets),
+                "release_tolerance_bytes": tolerance,
+            },
+            "cell_summaries": summaries,
+        }
+        scaling["churn_raw_samples"] = raw
+        return value
+
+    def test_churn_chart_overlays_every_allocator_median(self) -> None:
+        # #508: the #507 overlay look -- one panel, one median line per
+        # allocator, the fork last and thickest, and no P5-P95 area.
+        latest = self.with_complete_churn(self.load_latest())
+        report.validate_latest(latest, "churn fixture")
+        scaling = report.validate_scaling_report(latest["scaling"], "churn fixture")
+        view = report.scaling_view_from_validated(scaling)
+        self.assertTrue(report.has_complete_churn(view))
+        svg = report.churn_release_svg(view).decode()
+        self.assertEqual(svg.count(f'fill="{report.SCALING_INK["plot"]}"'), 1)
+        self.assertEqual(svg.count("<path "), len(report.ALLOCATOR_IDS))
+        strokes = re.findall(r'<path [^>]*stroke="(#[0-9a-f]+)" stroke-width="([\d.]+)"', svg)
+        self.assertEqual(len(strokes), len(report.ALLOCATOR_IDS))
+        colors = {color for color, _width in strokes}
+        for allocator in report.ALLOCATOR_IDS:
+            self.assertIn(report.SCALING_SERIES[allocator], colors)
+            self.assertIn(report.allocator_label(allocator), svg)
+        last_color, last_width = strokes[-1]
+        self.assertEqual(last_color, report.SCALING_SERIES["mimalloc-pprof"])
+        for _color, width in strokes[:-1]:
+            self.assertGreater(float(last_width), float(width))
+        for offset in report.CHURN_OFFSETS_MS:
+            self.assertIn(f">{offset / 1000:g} s</text>", svg)
+        self.assertIn(">0 s</text>", svg)
+        self.assertIn("RSS after the work stops", svg)
+        self.assertIn(f"median of n={report.CHURN_BLOCKS}", svg)
+        self.assertIn(f'data-samples="{report.CHURN_BLOCKS}"', svg)
+        self.assertIn("<title>", svg)
+        self.assertIn("<desc>", svg)
+        self.assertNotIn("<polygon", svg)
+        self.assertNotIn("fill-opacity", svg)
+        self.assertNotIn("P5", svg)
+        # The fixture's fork (last allocator) releases at the fifth offset.
+        self.assertIn("mimalloc-pprof: peak ", svg)
+        self.assertIn(", released by 2 s", svg)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / report.CHURN_PANEL
+            path.write_text(svg, encoding="utf-8")
+            report.validate_svg(path)
+
+    def test_complete_churn_publishes_its_chart_and_keeps_history_compact(self) -> None:
+        latest = self.with_complete_churn(self.load_latest())
+        history = report.history_row(latest)
+        scaling_history = history["scaling"]
+        assert isinstance(scaling_history, dict)
+        self.assertIn("churn", scaling_history)
+        self.assertNotIn("churn_raw_samples", scaling_history)
+        report.validate_history_row(history, "churn history")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            self.assertIn(
+                '<h2 id="thread-churn">RSS after the work stops (thread churn)</h2>', page
+            )
+            self.assertIn(f'<img src="{report.CHURN_PANEL}"', page)
+            self.assertIn("<th>Release time P50</th>", page)
+            panel = (site / report.CHURN_PANEL).read_text(encoding="utf-8")
+            self.assertNotIn("pending", panel)
+            self.assertEqual(panel.count("<path "), len(report.ALLOCATOR_IDS))
+
+    def test_churn_validator_rejects_bad_samples(self) -> None:
+        def churn_of(latest: dict[str, object]) -> dict[str, object]:
+            scaling = latest["scaling"]
+            assert isinstance(scaling, dict)
+            return cast(dict[str, object], scaling)
+
+        def first_response(scaling: dict[str, object]) -> dict[str, object]:
+            raw = scaling["churn_raw_samples"]
+            assert isinstance(raw, list) and isinstance(raw[0], dict)
+            return cast(dict[str, object], raw[0]["response"])
+
+        scaling = churn_of(self.with_complete_churn(self.load_latest()))
+        churn = scaling["churn"]
+        assert isinstance(churn, dict)
+        summary = churn["cell_summaries"][0]
+        assert isinstance(summary, dict)
+        self.assertLess(summary["median_peak_rss_bytes"], summary["p95_peak_rss_bytes"])
+        summary["median_peak_rss_bytes"] += 1
+        with self.assertRaisesRegex(report.ReportError, "churn summary differs from raw"):
+            report.validate_scaling_report(scaling, "tampered churn summary")
+
+        scaling = churn_of(self.with_complete_churn(self.load_latest()))
+        first_response(scaling)["live_worker_threads_at_first_sample"] = 1
+        with self.assertRaisesRegex(report.ReportError, "every worker must be joined"):
+            report.validate_scaling_report(scaling, "live workers")
+
+        scaling = churn_of(self.with_complete_churn(self.load_latest()))
+        sample_ns = first_response(scaling)["post_drain_sample_ns"]
+        assert isinstance(sample_ns, list)
+        sample_ns[1] = report.CHURN_OFFSETS_MS[1] * 1_000_000 - 1
+        with self.assertRaisesRegex(report.ReportError, "precedes its offset"):
+            report.validate_scaling_report(scaling, "early read")
+
+        scaling = churn_of(self.with_complete_churn(self.load_latest()))
+        raw = scaling["churn_raw_samples"]
+        assert isinstance(raw, list)
+        del raw[-1]
+        with self.assertRaisesRegex(report.ReportError, "churn_raw_samples: expected"):
+            report.validate_scaling_report(scaling, "missing block")
+
+        scaling = churn_of(self.with_complete_churn(self.load_latest()))
+        raw = scaling["churn_raw_samples"]
+        assert isinstance(raw, list) and isinstance(raw[-1], dict)
+        raw[-1]["block_id"] = 0
+        with self.assertRaisesRegex(report.ReportError, "duplicate sample"):
+            report.validate_scaling_report(scaling, "duplicated block")
+
+        scaling = churn_of(self.with_complete_churn(self.load_latest()))
+        del scaling["churn_raw_samples"]
+        with self.assertRaisesRegex(report.ReportError, "published together"):
+            report.validate_scaling_report(scaling, "churn without raw samples")
+
+        scaling = churn_of(self.with_complete_scaling(self.load_latest()))
+        main_raw = scaling["raw_samples"]
+        assert isinstance(main_raw, list) and isinstance(main_raw[0], dict)
+        response = main_raw[0]["response"]
+        assert isinstance(response, dict)
+        response["post_drain_rss_bytes"] = [1] * len(report.CHURN_OFFSETS_MS)
+        with self.assertRaisesRegex(report.ReportError, "churn-only"):
+            report.validate_scaling_report(scaling, "post-drain fields on another pattern")
+
+    def test_report_without_churn_still_validates_and_renders_pending_churn_panel(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        report.validate_latest(latest, "pre-churn fixture")
+        scaling = report.validate_scaling_report(latest["scaling"], "pre-churn fixture")
+        view = report.scaling_view_from_validated(scaling)
+        self.assertEqual(view.churn_cells, ())
+        self.assertFalse(report.has_complete_churn(view))
+        html = report.render_scaling_html(view)
+        self.assertIn('<h2 id="thread-churn">', html)
+        self.assertNotIn(report.CHURN_PANEL, html)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            self.assertIn('id="thread-churn"', page)
+            self.assertIn(report.CHURN_PENDING_REASON, page)
+            panel = (site / report.CHURN_PANEL).read_text(encoding="utf-8")
+            self.assertIn("pending", panel)
+            self.assertIn(report.CHURN_PENDING_REASON, panel)
+            self.assertIn(report.SCALING_INK["background"], panel)
+            report.validate_svg(site / report.CHURN_PANEL)
+
     def test_complete_scaling_publishes_one_dark_panel_per_pattern(self) -> None:
         latest = self.with_complete_scaling(self.load_latest())
         report.validate_latest(latest, "scaling fixture")
@@ -1943,6 +2223,119 @@ class BenchmarkReportTests(unittest.TestCase):
                     for _color, width in strokes[:-1]:
                         self.assertGreater(float(last_width), float(width))
 
+    def larson_rss_domain_max(self, svg: str) -> float:
+        match = re.search(r'data-y-domain-max="([^"]+)"', svg)
+        assert match is not None
+        return float(match.group(1))
+
+    def test_larson_rss_chart_overlays_every_allocator_median(self) -> None:
+        # #506: larson's peak RSS on the #507 overlay -- one panel, one median
+        # line per allocator in the draw order, the fork last and thickest, no
+        # P5-P95 area, and the sample count of a 3-block legacy pattern.
+        self.assertIn(report.LARSON_RSS_PANEL, report.SVG_FILES)
+        self.assertIn(report.LARSON_RSS_PANEL, report.SITE_FILES)
+        self.assertEqual(report.ROLES[report.LARSON_RSS_PANEL], "larson-rss-panel")
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = report.validate_scaling_report(latest["scaling"], "larson fixture")
+        view = report.scaling_view_from_validated(scaling)
+        self.assertTrue(report.has_complete_pattern_rss(view, "larson"))
+        svg = report.larson_rss_svg(view).decode()
+        self.assertEqual(svg.count(f'fill="{report.SCALING_INK["plot"]}"'), 1)
+        self.assertEqual(svg.count("<path "), len(report.ALLOCATOR_IDS))
+        strokes = re.findall(r'<path [^>]*stroke="(#[0-9a-f]+)" stroke-width="([\d.]+)"', svg)
+        self.assertEqual(
+            [color for color, _width in strokes],
+            [report.SCALING_SERIES[allocator] for allocator in report.DISTRIBUTION_DRAW_ORDER],
+        )
+        last_color, last_width = strokes[-1]
+        self.assertEqual(last_color, report.SCALING_SERIES["mimalloc-pprof"])
+        for _color, width in strokes[:-1]:
+            self.assertGreater(float(last_width), float(width))
+        for allocator in report.ALLOCATOR_IDS:
+            self.assertIn(report.allocator_label(allocator), svg)
+        self.assertEqual(report.scaling_blocks_for_pattern("larson"), report.SCALING_BLOCKS)
+        self.assertIn(f"median of n={report.SCALING_BLOCKS}", svg)
+        self.assertNotIn(f"median of n={report.DISTRIBUTION_BLOCKS}", svg)
+        self.assertIn(f'data-samples="{report.SCALING_BLOCKS}"', svg)
+        self.assertIn(report.SCALING_PANEL_TITLES["larson"], svg)
+        self.assertIn("peak RSS (bytes; lower is better)", svg)
+        self.assertNotIn("<polygon", svg)
+        self.assertNotIn("fill-opacity", svg)
+        self.assertNotIn("P5", svg)
+        # The fixture's largest larson RSS is (32 + 4 * 8 + 4) MiB.
+        largest = (32 + 4 * report.SCALING_THREAD_POINTS[-1] + len(report.ALLOCATOR_IDS) - 1) * (
+            1024 * 1024
+        )
+        self.assertGreaterEqual(self.larson_rss_domain_max(svg), largest)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / report.LARSON_RSS_PANEL
+            path.write_text(svg, encoding="utf-8")
+            report.validate_svg(path)
+
+    def test_larson_rss_domain_keeps_outliers_and_falls_back_to_the_side_car(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = report.validate_scaling_report(latest["scaling"], "larson outlier fixture")
+        raw = scaling["raw_samples"]
+        assert isinstance(raw, list)
+        outlier = next(
+            item
+            for item in raw
+            if isinstance(item, dict)
+            and item.get("pattern") == "larson"
+            and item.get("allocator_id") == "bun-mimalloc"
+        )
+        outlier["peak_rss_bytes"] = 9_900_000_000
+        view = report.scaling_view_from_validated(scaling)
+        self.assertGreaterEqual(
+            self.larson_rss_domain_max(report.larson_rss_svg(view).decode()), 9_900_000_000
+        )
+        # Without raw observations the side-car's per-cell maxima set the domain.
+        rss_only = dataclasses.replace(
+            view,
+            raw_observations=(),
+            rss_cells=tuple(
+                dataclasses.replace(cell, maximum=7_700_000_000)
+                if cell.pattern == "larson" and cell.allocator_id == "jemalloc"
+                else cell
+                for cell in view.rss_cells
+            ),
+        )
+        self.assertGreaterEqual(
+            self.larson_rss_domain_max(report.larson_rss_svg(rss_only).decode()), 7_700_000_000
+        )
+
+    def test_larson_rss_chart_is_published_next_to_larson_throughput(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            panel = (site / report.LARSON_RSS_PANEL).read_text(encoding="utf-8")
+            self.assertNotIn("pending", panel)
+            self.assertEqual(panel.count("<path "), len(report.ALLOCATOR_IDS))
+            page = (site / "index.html").read_text(encoding="utf-8")
+            throughput = page.index(f'<img src="{report.SCALING_PANELS["larson"]}"')
+            rss = page.index(f'<img src="{report.LARSON_RSS_PANEL}"')
+            following = page.index(f'<img src="{report.SCALING_PANELS["xmalloc-test"]}"')
+            self.assertLess(throughput, rss)
+            self.assertLess(rss, following)
+            self.assertLess(rss, page.index('<h2 id="requested-size-distributions">'))
+
+    def test_a_scaling_run_without_larson_rss_cells_renders_the_panel_pending(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = report.validate_scaling_report(latest["scaling"], "larson-less fixture")
+        view = report.scaling_view_from_validated(scaling)
+        older = dataclasses.replace(
+            view, rss_cells=tuple(cell for cell in view.rss_cells if cell.pattern != "larson")
+        )
+        self.assertFalse(report.has_complete_pattern_rss(older, "larson"))
+        self.assertNotIn(report.LARSON_RSS_PANEL, report.render_scaling_html(older))
+        no_side_car = dataclasses.replace(view, rss_cells=())
+        self.assertFalse(report.has_complete_pattern_rss(no_side_car, "larson"))
+        self.assertNotIn(report.LARSON_RSS_PANEL, report.render_scaling_html(no_side_car))
+
     def test_scaling_report_rejects_raw_values_that_disagree_with_summaries(self) -> None:
         latest = self.with_complete_scaling(self.load_latest())
         scaling = latest["scaling"]
@@ -1993,11 +2386,17 @@ class BenchmarkReportTests(unittest.TestCase):
             self.write_json(source, latest)
             site = root / "site"
             report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
-            for name in report.SCALING_PANELS.values():
+            for name in (
+                *report.SCALING_PANELS.values(),
+                report.CHURN_PANEL,
+                report.LARSON_RSS_PANEL,
+            ):
                 panel = (site / name).read_text(encoding="utf-8")
                 self.assertIn(report.SCALING_INK["background"], panel)
                 self.assertIn("pending", panel)
                 report.validate_svg(site / name)
+            self.assertIn(report.CHURN_PANEL, report.SVG_FILES)
+            self.assertEqual(report.ROLES[report.CHURN_PANEL], "churn-panel")
 
     def test_scaling_report_rejects_downgraded_rigor_and_incomplete_matrices(self) -> None:
         latest = self.with_complete_scaling(self.load_latest())
@@ -2135,6 +2534,13 @@ class BenchmarkReportTests(unittest.TestCase):
                 else:
                     self.assertIn("pending", panel)
                     self.assertIn(report.SCALING_INK["background"], panel)
+            # #506: this lineage carries no larson RSS cells, so its chart is pending.
+            larson_rss = (site / report.LARSON_RSS_PANEL).read_text(encoding="utf-8")
+            self.assertIn("pending", larson_rss)
+            self.assertIn(report.LARSON_RSS_PENDING_REASON, larson_rss)
+            report.validate_svg(site / report.LARSON_RSS_PANEL)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            self.assertNotIn(f'<img src="{report.LARSON_RSS_PANEL}"', page)
 
     def test_mixed_pattern_scaling_lineage_is_rejected(self) -> None:
         """A pattern set that belongs to neither the legacy four nor the

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit c13bf7d4 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 989e68fe of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -10380,6 +10380,10 @@ int _mi_prim_discard(void* addr, size_t size);
 // may have been reset (`_mi_prim_reset`) or decommitted (`_mi_prim_decommit`) where `needs_recommit` was false.
 // Returns error code or 0 on success. On most platforms this is a no-op.
 int _mi_prim_reuse(void* addr, size_t size);
+
+// #487: fault in `[addr,addr+size)` now, in one call, instead of one page fault per OS page when
+// it is first written. Contents are unchanged. Returns error code or 0; a no-op where unsupported.
+int _mi_prim_populate(void* addr, size_t size);
 
 // Protect memory. Returns error code or 0 on success.
 int _mi_prim_protect(void* addr, size_t size, bool protect);
@@ -26202,7 +26206,7 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
 // under churn the page grows back into the tail and re-faults it (perf-ab on #485: -32..-51%
 // peak RSS for +11..+72% CPU on large-block churn).
 void _mi_page_trim_unformed_tail(mi_page_t* page) {
-  if (mi_option_get(mi_option_purge_holes) >= 2) { mi_page_purge_unformed_tail(page); }
+  if (mi_option_is_enabled(mi_option_purge_holes)) { mi_page_purge_unformed_tail(page); }
 }
 
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
@@ -26223,6 +26227,9 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
   if (rend <= rlo) return;   // nothing of the discarded tail is needed yet
 
   _mi_os_reuse(mi_page_subproc(page), (void*)rlo, (size_t)(rend - rlo));
+  // #487: these blocks are formatted right now; fault them in with one call rather than one
+  // fault per OS page as they are written
+  (void)_mi_prim_populate((void*)rlo, (size_t)(rend - rlo));
   if (rend >= rhi) { page->unformed_purged_lo = 0; page->unformed_purged_hi = 0; }
   else { page->unformed_purged_lo = (uint32_t)(rend - pstart); }
   mi_atomic_addi64_relaxed(&mi_holes_unformed_reuse_calls, 1);
@@ -33767,6 +33774,11 @@ int _mi_prim_reuse(void* addr, size_t size) {
   return 0;
 }
 
+int _mi_prim_populate(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
 int _mi_prim_protect(void* addr, size_t size, bool protect) {
   DWORD oldprotect = 0;
   BOOL ok = VirtualProtect(addr, size, protect ? PAGE_NOACCESS : PAGE_READWRITE, &oldprotect);
@@ -35175,6 +35187,15 @@ int _mi_prim_reuse(void* start, size_t size) {
   return 0;
 }
 
+int _mi_prim_populate(void* start, size_t size) {
+  MI_UNUSED(start); MI_UNUSED(size);
+  #if defined(MADV_POPULATE_WRITE)   // Linux 5.14+; an older kernel returns EINVAL, which is harmless
+  return unix_madvise(start, size, MADV_POPULATE_WRITE);
+  #else
+  return 0;
+  #endif
+}
+
 int _mi_prim_decommit(void* start, size_t size, bool* needs_recommit) {
   int err = 0;
   #if 1
@@ -35991,6 +36012,11 @@ int _mi_prim_reuse(void* addr, size_t size) {
   return 0;
 }
 
+int _mi_prim_populate(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
 // #272: nothing to release here; MI_PRIM_HAS_DISCARD is 0 on this platform, so
 // `_mi_os_discard` never calls this and never counts a purge.
 int _mi_prim_discard(void* addr, size_t size) {
@@ -36266,6 +36292,11 @@ int _mi_prim_reset(void* addr, size_t size) {
 }
 
 int _mi_prim_reuse(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
+int _mi_prim_populate(void* addr, size_t size) {
   MI_UNUSED(addr); MI_UNUSED(size);
   return 0;
 }
@@ -36960,6 +36991,15 @@ int _mi_prim_reuse(void* start, size_t size) {
   return unix_madvise(start, size, MADV_FREE_REUSE);
   #endif
   return 0;
+}
+
+int _mi_prim_populate(void* start, size_t size) {
+  MI_UNUSED(start); MI_UNUSED(size);
+  #if defined(MADV_POPULATE_WRITE)   // Linux 5.14+; an older kernel returns EINVAL, which is harmless
+  return unix_madvise(start, size, MADV_POPULATE_WRITE);
+  #else
+  return 0;
+  #endif
 }
 
 int _mi_prim_decommit(void* start, size_t size, bool* needs_recommit) {

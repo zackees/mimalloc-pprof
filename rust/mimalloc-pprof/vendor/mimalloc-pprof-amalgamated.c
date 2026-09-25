@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 7e49e1e2 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit d9b852e7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -13485,10 +13485,30 @@ static bool mi_arena_age_purge_visitor(size_t slice_index, size_t slice_count, m
   return true;
 }
 
+static void mi_arena_try_purge_run(mi_arena_t* arena, size_t slice_index, size_t slice_count, mi_purge_visit_info_t* vinfo);
+
 static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   mi_purge_visit_info_t* vinfo = (mi_purge_visit_info_t*)arg;
-  // #457: freed again since it was aged, so it is young again: `slices_purge` still has it
-  if (!vinfo->take_young && !mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count)) return true;
+  // #457: a slice freed again since it was aged is young again (`slices_purge` still has it) and
+  // waits for its own deadline. #497: only that slice -- the run handed to us is a maximal run of
+  // aged bits, already cleared, so skipping all of it would lose the parts that did stay free
+  // for the whole period (they are in neither queue after this).
+  if (!vinfo->take_young && !mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count)) {
+    for (size_t i = 0; i < slice_count; ) {
+      if (mi_bitmap_is_set(arena->slices_purge, slice_index + i)) { i++; continue; }
+      size_t n = 1;
+      while (i + n < slice_count && !mi_bitmap_is_set(arena->slices_purge, slice_index + i + n)) { n++; }
+      mi_arena_try_purge_run(arena, slice_index + i, n, vinfo);
+      i += n;
+    }
+    return true;
+  }
+  mi_arena_try_purge_run(arena, slice_index, slice_count, vinfo);
+  return true; // continue
+}
+
+// Purge `[slice_index, slice_index + slice_count)` where its slices are free.
+static void mi_arena_try_purge_run(mi_arena_t* arena, size_t slice_index, size_t slice_count, mi_purge_visit_info_t* vinfo) {
   // try to purge: first claim the free blocks
   if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
     vinfo->any_purged = true;
@@ -13505,7 +13525,6 @@ static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, m
   }
   // don't clear the purge bits as that is done atomically be the _bitmap_forall_set_ranges
   // mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);
-  return true; // continue
 }
 
 // returns

@@ -851,7 +851,8 @@ if(MI_USE_CXX)
   # target this), and keeps the CMake shape identical to Bun's should this tree's extern "C"
   # wrapping ever change.
   # test-arena-purge-rearm.c (#491): calls `_mi_release_bound_ms` from internal.h, the same case.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c PROPERTIES LANGUAGE CXX )
+  # test-retain-feedback.c (#493): the same.
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-retain-feedback.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -2063,6 +2064,19 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-resident-first PRIVATE mimalloc-static ${mi_libraries})
     add_test(NAME test-resident-first COMMAND mimalloc-test-resident-first)
     set_tests_properties(test-resident-first PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
+  endif()
+
+  # test-retain-feedback (#493, strategy 4): while freed arena memory keeps being refaulted right
+  # after its purge the retention window grows, and it drops back to the base window once idle.
+  # Single-threaded; the scavenger is off so only the test's collects purge.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-retain-feedback test/test-retain-feedback.c)
+    target_compile_definitions(mimalloc-test-retain-feedback PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-retain-feedback PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-retain-feedback PRIVATE include)
+    target_link_libraries(mimalloc-test-retain-feedback PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-retain-feedback COMMAND mimalloc-test-retain-feedback)
+    set_tests_properties(test-retain-feedback PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
   endif()
 
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of

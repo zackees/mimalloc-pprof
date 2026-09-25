@@ -332,6 +332,27 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_RESIDENT_FIRST_MAX_TRIES       (8)
 #endif
 
+// #493 (strategy 4): refault feedback on the arena retention window (`mi_option_retain_feedback`).
+// Once per arena purge period the purge compares the bytes it released in the period before with
+// the bytes that were claimed back from purged (dirty, no longer queued) slices since: when at
+// least MI_REFAULT_HIGH_PERCENT of what it purged came straight back, the purge was premature and
+// each arena deadline is held for one more base period (up to MI_RETAIN_BOOST_MAX extra periods,
+// so at most (1 + MI_RETAIN_BOOST_MAX) x the base window); under MI_REFAULT_LOW_PERCENT it steps
+// back down. 50/10 leave a wide dead band so a steady workload does not oscillate: "half of it
+// came straight back" is a clear refault pattern, while a tenth is what a quiet phase leaves.
+// 3 caps a busy process's window at 4 x the base (1.6-3.2 s at the defaults), bounding the extra
+// resident memory it can hold; an idle one gets no boost at all (a base period without any arena
+// claim drops it at once, see arena.c), so the idle release bound does not move.
+#ifndef MI_REFAULT_HIGH_PERCENT
+#define MI_REFAULT_HIGH_PERCENT           (50)
+#endif
+#ifndef MI_REFAULT_LOW_PERCENT
+#define MI_REFAULT_LOW_PERCENT            (10)
+#endif
+#ifndef MI_RETAIN_BOOST_MAX
+#define MI_RETAIN_BOOST_MAX               (3)
+#endif
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from
@@ -848,6 +869,14 @@ struct mi_subproc_s {
                      // expression) with C2059, and 8 over-aligns the 4-byte word harmlessly
   _Atomic(mi_scav_word_t) scavenger_wake;               // wait word signalled when a purge is scheduled (the scavenger thread waits on this)
   _Atomic(size_t)       retired_published;              // #483: 1 when some tld may hold a retired large page for the scavenger (appended at the tail, see above); #493: or the main heap a reserved one
+  // #493 (strategy 4): refault feedback on the arena retention (`mi_arena_retain_evaluate`, arena.c).
+  // Appended at the tail, see above. The counters are bumped in the arena claim and purge paths only.
+  _Atomic(size_t)       retain_claims;                  // arena claims since the last evaluation
+  _Atomic(size_t)       retain_refault_bytes;           // ... of slices that were dirty but not queued: purged, now faulted in again
+  _Atomic(size_t)       retain_purged_bytes;            // bytes the arena purge released since the last evaluation
+  _Atomic(size_t)       retain_boost;                   // extra base periods each arena purge deadline is held (0..MI_RETAIN_BOOST_MAX)
+  mi_decl_align(8)                                      // needed on some 32-bit platforms
+  mi_msecs_t            retain_eval_next;               // time of the next evaluation (only under the arena purge guard)
 };
 
 
@@ -1007,6 +1036,7 @@ typedef struct mi_arena_s {
   int                 numa_node;            // associated NUMA node
   bool                is_exclusive;         // only allow allocations if specifically for this arena
   bool                is_auto_reserved;     // created by mi_arena_reserve, not a public reserve/manage API
+  uint8_t             purge_skips;          // #493: base deadlines held back in a row by the retain boost (only under the arena purge guard)
   mi_decl_align(8)                          // needed on some 32-bit platforms
   _Atomic(mi_msecs_t) purge_expire;         // expiration time when slices can be purged from `slices_purge`.
   mi_commit_fun_t*    commit_fun;           // custom commit/decommit memory

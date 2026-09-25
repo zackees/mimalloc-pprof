@@ -6,9 +6,11 @@
    free-random 2, one write per 4 KiB). With generations > 1 each thread runs its stream as
    that many short-lived threads, each exiting while it still owns live slots that the next
    one frees. Prints one line: ops/s, cpu seconds, peak RSS, and RSS 500 ms after everything
-   was freed. Linux only (getrusage + /proc/self/statm). */
+   was freed while the worker threads stay alive and idle (a server between requests).
+   Linux only (getrusage + /proc/self/statm). */
 #include <mimalloc.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +47,7 @@ static void run_ops(stream_t* st, long n) {
 }
 
 static int generations;
+static atomic_int drained, release_workers;
 
 static void* generation_main(void* arg) {
   stream_t* st = (stream_t*)arg;
@@ -63,6 +66,8 @@ static void* worker_main(void* arg) {
     }
   }
   for (int i = 0; i < SLOTS; i++) { mi_free(st->slot[i]); st->slot[i] = NULL; }
+  atomic_fetch_add(&drained, 1);
+  while (!atomic_load(&release_workers)) usleep(1000);   /* idle, but alive */
   return NULL;
 }
 
@@ -80,7 +85,7 @@ int main(int argc, char** argv) {
   }
   const double start = now_s();
   for (int i = 0; i < threads; i++) pthread_create(&t[i], NULL, &worker_main, &st[i]);
-  for (int i = 0; i < threads; i++) pthread_join(t[i], NULL);
+  while (atomic_load(&drained) < threads) usleep(100);
   const double elapsed = now_s() - start;
   usleep(500 * 1000);  /* let the deferred purge run */
   struct rusage ru; getrusage(RUSAGE_SELF, &ru);
@@ -91,6 +96,8 @@ int main(int argc, char** argv) {
   const double cpu = (double)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) + (double)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) * 1e-6;
   printf("%.1f %.4f %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu,
          ru.ru_maxrss * 1024L, resident * sysconf(_SC_PAGESIZE));
+  atomic_store(&release_workers, 1);
+  for (int i = 0; i < threads; i++) pthread_join(t[i], NULL);
   free(st); free(t);
   return 0;
 }

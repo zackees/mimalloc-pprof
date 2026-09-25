@@ -34,11 +34,11 @@ FLAGS = [
 ]
 # name: (threads, generations, min bytes, max bytes, ops per thread)
 WORKLOADS = {
-    "large-class/8": (8, 1, 96 << 10, 512 << 10, 20000),
-    "large-class-ephemeral/8": (8, 8, 96 << 10, 512 << 10, 20000),
-    "random-large/8": (8, 1, 64 << 10, 4 << 20, 4000),
-    "random-large/1": (1, 1, 64 << 10, 4 << 20, 20000),
-    "small/8 (control)": (8, 1, 16, 1024, 2000000),
+    "large-class/8": (8, 1, 96 << 10, 512 << 10, 400000),
+    "large-class-ephemeral/8": (8, 8, 96 << 10, 512 << 10, 400000),
+    "random-large/8": (8, 1, 64 << 10, 4 << 20, 40000),
+    "random-large/1": (1, 1, 64 << 10, 4 << 20, 200000),
+    "small/8 (control)": (8, 1, 16, 1024, 5000000),
 }
 METRICS = ("ops/s", "cpu s", "peak RSS MiB", "RSS after drain MiB")
 
@@ -117,7 +117,7 @@ def main() -> int:
             if low > 0 or high < 0:
                 delta = f"**{delta}**"
             cells.append(
-                f"{statistics.median(base):,.1f} -> {statistics.median(head):,.1f}<br>{delta}"
+                f"{statistics.median(base):,.4g} -> {statistics.median(head):,.4g}<br>{delta}"
             )
         rows.append(f"| {workload} | " + " | ".join(cells) + " |")
     table = "\n".join(rows) + "\n"

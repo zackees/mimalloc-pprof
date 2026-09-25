@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit bc17ef85 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 469b40ab of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -2732,15 +2732,6 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 // mostly stale, so the plain search is the better bet. Keeps the extra cost per page small.
 #ifndef MI_RESIDENT_FIRST_MAX_TRIES
 #define MI_RESIDENT_FIRST_MAX_TRIES       (8)
-#endif
-
-// #493: a page carved from reused (dirty) arena memory discards the slack past its last block
-// (see `mi_arenas_page_alloc_fresh`) when the slack is at least this big. A small, medium or
-// singleton page's slack is always below one slice (it is less than one of its blocks, at most
-// 64 KiB), so only 4 MiB large pages -- whose slack can be up to a 512 KiB block -- pay the
-// one discard call, and they are the ones an idle thread keeps (retired, #483).
-#ifndef MI_PAGE_SLACK_DISCARD_MIN
-#define MI_PAGE_SLACK_DISCARD_MIN         (MI_ARENA_SLICE_SIZE)
 #endif
 
 
@@ -11960,23 +11951,6 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
   uint8_t* const start = slice_start + block_start;
   mi_assert_internal(start > (uint8_t*)page);
 
-  // #493: the slack past the last block, `[start + reserved*block_size, page end)`, is never used
-  // by this page -- and nothing discards it while the page lives: the hole sweep and the retired
-  // page release (#483) stop at the block area. On reused (dirty) memory it can still be resident
-  // from the range's previous life, as a block of a page with another block size. Resident-first
-  // claiming reuses exactly such memory, and an idle thread's retired large pages then pinned up
-  // to a block of stale memory each for good (PR #501: +34% RSS at the release bound). So give it
-  // back now. Only a large page's slack reaches MI_PAGE_SLACK_DISCARD_MIN, so this is at most one
-  // discard per large page carved from dirty memory. The commit state stays as it is.
-  if (memid.memkind == MI_MEM_ARENA && !memid.initially_zero && memid.initially_committed &&
-      !memid.is_pinned && !os_align && mi_memid_arena(memid)->commit_fun == NULL)
-  {
-    uint8_t* const slack_lo = (uint8_t*)_mi_align_up((uintptr_t)(start + (reserved * block_size)), _mi_os_page_size());
-    uint8_t* const slack_hi = (uint8_t*)_mi_align_down((uintptr_t)(slice_start + page_noguard_size), _mi_os_page_size());
-    if (slack_hi > slack_lo && (size_t)(slack_hi - slack_lo) >= MI_PAGE_SLACK_DISCARD_MIN) {
-      _mi_os_discard(_mi_theap_subproc(theap), slack_lo, (size_t)(slack_hi - slack_lo));
-    }
-  }
   const size_t offset = start - (uint8_t*)page;
   mi_assert_internal((offset % MI_MAX_ALIGN_SIZE) == 0 && (offset / MI_MAX_ALIGN_SIZE) <= UINT32_MAX);
   page->page_ma_offset = (uint32_t)(offset / MI_MAX_ALIGN_SIZE);
@@ -26669,6 +26643,24 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
 }
 
+// #493: the slack past a page's last block, `[start + reserved*block_size, end of its slices)`, is
+// never formed, so no tail or hole discard reaches it. On a page carved from reused memory (the
+// resident-first claim, #501) it still holds the previous tenant's blocks, and an idle thread's
+// retired page kept that resident for good. It is given back with the rest of such a page when
+// the page is released for idling, not when the page is created: under churn the arena hands
+// those slices to the next page right away, and discarding them then only makes it refault them.
+static void mi_page_discard_slack(mi_page_t* page) {
+  if (page->memid.memkind != MI_MEM_ARENA || !mi_page_holes_madvisable(page)) return;
+  const size_t os_size = _mi_os_page_size();
+  uint8_t* const pstart = mi_page_start(page);
+  uint8_t* hi = mi_page_slice_start(page) + page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE;
+  const size_t committed = mi_page_slice_committed(page);   // 0: the whole page is committed
+  if (committed > 0 && hi > mi_page_slice_start(page) + committed) { hi = mi_page_slice_start(page) + committed; }   // never beyond what is committed
+  const uintptr_t lo = _mi_align_up((uintptr_t)pstart + (size_t)page->reserved * mi_page_block_size(page), os_size);
+  const uintptr_t ahi = _mi_align_down((uintptr_t)hi, os_size);
+  if (ahi > lo) { _mi_os_discard(mi_page_subproc(page), (void*)lo, (size_t)(ahi - lo)); }
+}
+
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
 // in it is written to. `end` is an absolute address (`UINTPTR_MAX` for the whole tail); it is
 // rounded up to an OS page, as the discard covers whole OS pages.
@@ -26997,7 +26989,7 @@ bool _mi_pages_release_retired(mi_subproc_t* subproc) {
         // the page's memory is ours until we put it back
         if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not discarded already)
           if (now - page->retired_at < min_age) { pending = true; }
-          else { mi_page_purge_unformed_tail(page); }      // `capacity == 0`: the whole block area
+          else { mi_page_purge_unformed_tail(page); mi_page_discard_slack(page); }   // `capacity == 0`: the whole block area, and past it
         }
         mi_atomic_store_ptr_release(mi_page_t, slot, page);
       }

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fe4dfe18 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit bc17ef85 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -2732,6 +2732,15 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 // mostly stale, so the plain search is the better bet. Keeps the extra cost per page small.
 #ifndef MI_RESIDENT_FIRST_MAX_TRIES
 #define MI_RESIDENT_FIRST_MAX_TRIES       (8)
+#endif
+
+// #493: a page carved from reused (dirty) arena memory discards the slack past its last block
+// (see `mi_arenas_page_alloc_fresh`) when the slack is at least this big. A small, medium or
+// singleton page's slack is always below one slice (it is less than one of its blocks, at most
+// 64 KiB), so only 4 MiB large pages -- whose slack can be up to a 512 KiB block -- pay the
+// one discard call, and they are the ones an idle thread keeps (retired, #483).
+#ifndef MI_PAGE_SLACK_DISCARD_MIN
+#define MI_PAGE_SLACK_DISCARD_MIN         (MI_ARENA_SLICE_SIZE)
 #endif
 
 
@@ -9573,6 +9582,10 @@ static void* mi_block_ptr_set_guarded(mi_block_t* block, size_t obj_size, size_t
   mi_assert_internal(_mi_is_aligned(block, os_page_size));
   mi_assert_internal(_mi_is_aligned(guard_page, os_page_size));
   if (!page->memid.is_pinned && _mi_is_aligned(guard_page, os_page_size)) {
+    // #493: a guard page never holds data. On memory reused from an earlier page (resident-first
+    // claims, reclaimed pages) it can still be resident with that tenant's contents: discard it,
+    // so a guarded block costs one resident OS page, not two.
+    _mi_os_discard(mi_page_subproc(page), guard_page, os_page_size);
     const bool ok = _mi_os_protect(guard_page, os_page_size);
     if mi_unlikely(!ok) {
       _mi_warning_message("failed to set a guard page behind an object (object %p of size %zu)\n", block, block_size);
@@ -11946,6 +11959,24 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
   // initialize the page start
   uint8_t* const start = slice_start + block_start;
   mi_assert_internal(start > (uint8_t*)page);
+
+  // #493: the slack past the last block, `[start + reserved*block_size, page end)`, is never used
+  // by this page -- and nothing discards it while the page lives: the hole sweep and the retired
+  // page release (#483) stop at the block area. On reused (dirty) memory it can still be resident
+  // from the range's previous life, as a block of a page with another block size. Resident-first
+  // claiming reuses exactly such memory, and an idle thread's retired large pages then pinned up
+  // to a block of stale memory each for good (PR #501: +34% RSS at the release bound). So give it
+  // back now. Only a large page's slack reaches MI_PAGE_SLACK_DISCARD_MIN, so this is at most one
+  // discard per large page carved from dirty memory. The commit state stays as it is.
+  if (memid.memkind == MI_MEM_ARENA && !memid.initially_zero && memid.initially_committed &&
+      !memid.is_pinned && !os_align && mi_memid_arena(memid)->commit_fun == NULL)
+  {
+    uint8_t* const slack_lo = (uint8_t*)_mi_align_up((uintptr_t)(start + (reserved * block_size)), _mi_os_page_size());
+    uint8_t* const slack_hi = (uint8_t*)_mi_align_down((uintptr_t)(slice_start + page_noguard_size), _mi_os_page_size());
+    if (slack_hi > slack_lo && (size_t)(slack_hi - slack_lo) >= MI_PAGE_SLACK_DISCARD_MIN) {
+      _mi_os_discard(_mi_theap_subproc(theap), slack_lo, (size_t)(slack_hi - slack_lo));
+    }
+  }
   const size_t offset = start - (uint8_t*)page;
   mi_assert_internal((offset % MI_MAX_ALIGN_SIZE) == 0 && (offset / MI_MAX_ALIGN_SIZE) <= UINT32_MAX);
   page->page_ma_offset = (uint32_t)(offset / MI_MAX_ALIGN_SIZE);
@@ -16175,6 +16206,7 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
             // break early: reset the non-visited bits
             if (b!=0) {
               mi_atomic_or_relaxed(&chunk->bfields[j], b);
+              mi_bitmap_chunkmap_set(bitmap, chunk_idx);   // #493: see the restore in `_mi_bitmap_forall_setc_rangesn`
             }
             return false;
           }
@@ -16229,6 +16261,7 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
               mi_assert_internal((notyet_visited & skipped) == 0);
               if ((notyet_visited | skipped) != 0) {
                 mi_atomic_or_relaxed(&chunk->bfields[j], notyet_visited | skipped);
+                mi_bitmap_chunkmap_set(bitmap, chunk_idx);   // #493: see below
               }
               return false;
             }
@@ -16245,6 +16278,11 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
         if (skipped != 0) {
           //  restore non-visited entries
           mi_atomic_or_relaxed(&chunk->bfields[j], skipped);
+          // #493: and the chunkmap bit, like every other setter. Between our exchange and this
+          // restore the chunk can read all clear, and a concurrent `mi_bitmap_clearN` in it (the
+          // arena clears claimed ranges out of the purge queues) then clears the chunkmap bit
+          // -- leaving the restored bits where no visitor looks: queued, never purged.
+          mi_bitmap_chunkmap_set(bitmap, chunk_idx);
         }
       }
     }
@@ -16478,10 +16516,14 @@ bool mi_bbitmap_try_clearNC(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
 }
 
 // #493 (strategy 9): claim `n` bits at a known `idx` (not crossing a chunk) for an allocation of
-// `n` slices. Unlike the purge's `mi_bbitmap_try_clearNC` this keeps to the size bins, exactly as
-// `mi_bbitmap_try_find_and_clear_generic` does: only a chunk of the bin of `n`, or one not yet
-// binned, and a claim at the start of an unbinned chunk bins it -- so claiming a known range
-// never mixes page sizes in a chunk that the plain search keeps apart.
+// `n` slices. Unlike the purge's `mi_bbitmap_try_clearNC` this keeps to the size bins the way
+// `mi_bbitmap_try_find_and_clear_generic` does: a chunk of the bin of `n`; or an unbinned chunk
+// at its start, which the claim then bins; or an unbinned chunk whose first slice is in use
+// (already mixed, like the arena's first chunk behind its meta data, where the plain search
+// claims unbinned too). Never the middle of an unbinned chunk that starts free: the plain search
+// would claim its start and bin it, while a page left in the middle unbinned lets every size
+// class share the chunk -- the fragmentation the bins exist to stop, and the fresh memory it
+// costs (PR #501: the guarded memory gate's peak). The bin reads are hints, as in the search.
 bool mi_bbitmap_try_claimN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   if (n == 0 || n > MI_BCHUNK_BITS) return false;
   const size_t chunk_idx = idx / MI_BCHUNK_BITS;
@@ -16489,9 +16531,13 @@ bool mi_bbitmap_try_claimN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   if (cidx + n > MI_BCHUNK_BITS || chunk_idx >= mi_bbitmap_chunk_count(bbitmap)) return false;
   const mi_chunkbin_t bbin = mi_chunkbin_of(n);
   const mi_chunkbin_t cbin = mi_bbitmap_debug_get_bin(bbitmap->chunkmap_bins, chunk_idx);
-  if (cbin != bbin && cbin != MI_CBIN_NONE) return false;
+  const bool bin_start = (cbin == MI_CBIN_NONE && cidx == 0);
+  if (cbin != bbin && !bin_start) {
+    if (cbin != MI_CBIN_NONE) return false;                                        // another size class
+    if (mi_bchunk_is_xsetN(MI_BIT_SET, &bbitmap->chunks[chunk_idx], 0, 1)) return false;   // starts free
+  }
   if (!mi_bbitmap_try_clearNC(bbitmap, idx, n)) return false;
-  if (cidx == 0 && cbin == MI_CBIN_NONE) { mi_bbitmap_set_chunk_bin(bbitmap, chunk_idx, bbin); }
+  if (bin_start) { mi_bbitmap_set_chunk_bin(bbitmap, chunk_idx, bbin); }
   return true;
 }
 

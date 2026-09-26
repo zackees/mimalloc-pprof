@@ -26,6 +26,20 @@ validation. Required check names stay visible in internal minimal mode, includin
 six macOS build matrix rows, whose costly steps are skipped there. The existing
 selective Darwin PR lane still builds and runs when its path/label decision says so.
 
+**The memory gate runs on every allocator-touching PR, minimal lane included (#518).**
+`c-unit.yml`'s `decide (memory gate lane)` runs on every PR and asks
+`ci/memory_gate_lane_decide.py` whether the diff (`git diff base...head`) touches `src/`,
+`include/`, `CMakeLists.txt` or the gate's own files (`test/test-memory-gate.c`,
+`ci/memory_gate.py`, `ci/memory-baselines/`, the decide script, `c-unit.yml`). If so,
+`memory-gate (minimal lane, linux pprof)` configures the `release` build row's flags,
+builds only `mimalloc-test-memory-gate`, runs it 8 times and runs
+`ci/memory_gate.py check` against `linux-pprof1.json` -- a few minutes on one runner. It
+does not run when the full lane is selected (`ci-test`, `ci-full`, external author):
+`run-linux` runs the same gate there, with the leak positive control. `PR test gate
+(c-unit)` requires the decision and, when selected, the gate (`ci/pr_ci_gate.py`
+`SELECTIVE_JOBS`). This exists because #501 regressed the gate (58.2 -> 61-63.7 MB, #514)
+and minimal mode let it merge unseen. Push and release-dispatch runs are unchanged.
+
 Every gate below is a **hard failure when its mode selects it**. Where a gate can have a
 *positive control* — a deliberately broken input it must catch — it has one, because a
 gate that has never been observed to fire proves nothing.

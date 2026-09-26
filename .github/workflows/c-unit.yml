@@ -99,13 +99,93 @@ jobs:
   pr-test-gate:
     name: PR test gate (c-unit)
     if: ${{ always() && github.event_name == 'pull_request' }}
-    needs: [pr-ci-mode, resolve-candidate, build, build-bun-objects, build-windows-native, run-linux, run-linux-serial, coverage, run-windows-native, fastpath-identity, isa-baseline-arm64]
+    needs: [pr-ci-mode, resolve-candidate, memory-gate-decide, memory-gate, build, build-bun-objects, build-windows-native, run-linux, run-linux-serial, coverage, run-windows-native, fastpath-identity, isa-baseline-arm64]
     uses: ./.github/workflows/pr-ci-gate.yml
     with:
       workflow: c-unit
       needs-json: ${{ toJSON(needs) }}
       ci-test: ${{ contains(github.event.pull_request.labels.*.name, 'ci-test') }}
       ci-full: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
+
+  # ------------------------------------------------------------------------------------
+  # The memory gate on EVERY allocator-touching PR, minimal lane included (#518).
+  # ------------------------------------------------------------------------------------
+  #
+  # #501 regressed the gate (58.2 -> 61-63.7 MB, #514) and it was only caught after
+  # merge: internal PRs run the minimal lane, and the gate lived only in `run-linux`,
+  # which minimal mode skips. `memory-gate-decide` runs on every PR and asks
+  # `ci/memory_gate_lane_decide.py` whether the diff touches `src/`, `include/`,
+  # `CMakeLists.txt` or the gate's own files; if so, and the full lane is NOT selected
+  # (its `run-linux` runs the same gate plus the leak control), `memory-gate` builds the
+  # one target the gate needs and runs it. `PR test gate (c-unit)` requires both when
+  # selected (ci/pr_ci_gate.py SELECTIVE_JOBS), so a skipped selected gate is red.
+  memory-gate-decide:
+    name: decide (memory gate lane)
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
+          fetch-depth: 0
+      - id: decide
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          EXTERNAL: ${{ needs.pr-ci-mode.outputs.external }}
+        run: |
+          set -euo pipefail
+          python3 ci/memory_gate_lane_decide.py --base "$BASE" --head "$HEAD_SHA" \
+            --labels "$LABELS" --external "$EXTERNAL" | tee decision.txt
+          { echo "### memory gate lane"; cat decision.txt; } >> "$GITHUB_STEP_SUMMARY"
+
+  memory-gate:
+    name: memory-gate (minimal lane, linux pprof)
+    needs: [resolve-candidate, memory-gate-decide]
+    if: needs.memory-gate-decide.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-candidate.outputs.sha }}
+      - uses: astral-sh/setup-uv@v3
+      - name: Configure -- the `release` build row's flags, which the baseline was recorded from
+        run: |
+          set -euo pipefail
+          cmake -B build -DMI_PPROF=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON -DMI_WARNINGS_AS_ERRORS=ON | tee configure.log
+          grep -qE "Compiler defines *:.*MI_DIAGNOSTICS=1" configure.log
+      - name: Build only the gate binary
+        run: cmake --build build --parallel --target mimalloc-test-memory-gate
+      - name: Memory gate -- 8 runs, min against linux-pprof1.json
+        # Identical to `run-linux`'s step: RUNS_EXPECTED (ci/memory_gate.py) is 8, and the
+        # rc handling is the same. `set +e` because GitHub invokes `bash -e`.
+        run: |
+          set +e
+          set -uo pipefail
+          exe="$GITHUB_WORKSPACE/build/mimalloc-test-memory-gate"
+          for i in 1 2 3 4 5 6 7 8; do
+            MI_BENCH_JSON="result-$i.json" "$exe" > /dev/null
+          done
+          cat result-1.json
+          uv run ci/memory_gate.py check result-*.json
+          rc=$?
+          if [ $rc -eq 2 ]; then
+            echo "::warning::No committed baseline for this platform yet -- bootstrap it from this run's artifact."
+            exit 0
+          fi
+          exit $rc
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-gate-minimal-lane
+          path: result-*.json
+          if-no-files-found: warn
+          retention-days: 7
 
   # ------------------------------------------------------------------------------------
   # STAGE 1 -- every configuration, built exactly once, in parallel.

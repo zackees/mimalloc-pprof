@@ -27,7 +27,9 @@ def expanded_job_names(filename: str) -> list[str]:
             "decide",
             "run-macos-x64-selective",
             "run-macos-x64-recovery",
-        }
+        },
+        # #518: PR-only, path-selected; a full dispatch never runs them.
+        "c-unit.yml": {"memory-gate-decide", "memory-gate"},
     }.get(filename, set())
     names: list[str] = []
     for job_id, job in jobs.items():

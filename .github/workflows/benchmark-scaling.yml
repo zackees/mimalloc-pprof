@@ -6,6 +6,10 @@ name: benchmark-scaling
 # distributions (#424, and the long-/short-lived-thread pair from #478) use 40 paired
 # repetitions; the charts overlay every allocator's median (#507) and the P5/P95
 # spread stays in latest.json and the dashboard table.
+# #508 adds `thread-churn` on the 8-worker shard: large-class-ephemeral's stream replayed
+# at that cell's frozen operation count, then every thread joined and the child idles 3 s
+# sampling its own RSS (40 paired runs; ~11 minutes, mostly that mandated idle, which the
+# runner budgets explicitly as `thread_churn_idle_allowance_seconds`).
 # The sweep doubled with the dense thread points (issue #211 WP4), grew another
 # 25% with the Bun row (#325), which also adds a fifth benchmark-child build, and grew
 # another 50% with the two named workloads (#216). The 2026 live run measured 3m01s of

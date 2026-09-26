@@ -227,9 +227,10 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
 // Ranges will never cross chunk boundaries (and `slice_count <= MI_BCHUNK_BITS`).
 bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
 
-// #493: visit each maximal run of at least `n <= MI_BCHUNK_BITS` bits set in `bitmap | bitmap2`
-// (`bitmap2` may be NULL), in index order, WITHOUT clearing them. Runs never cross a chunk.
-bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
+// #493: visit each maximal run of at least `n <= MI_BCHUNK_BITS` bits set in the union of the
+// `count` bitmaps (all of one size; #506: the arena's four purge queues), in index order,
+// WITHOUT clearing them. Runs never cross a chunk.
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* const* bitmaps, size_t count, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
 
 // Count all set bits in given range in the bitmap.
 size_t mi_bitmap_popcountN( mi_bitmap_t* bitmap, size_t idx, size_t n);

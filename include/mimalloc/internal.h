@@ -443,6 +443,7 @@ void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /
 void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271)
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 bool          _mi_arenas_page_reserve(mi_page_t* page, mi_theap_t* current_theap);   // #493: keep an empty large page for the next thread; false: the caller frees it
+void          _mi_realloc_free_old(const mi_page_t* page, void* p, bool grown);        // #506: free the block a moving realloc left behind
 bool          _mi_arenas_release_reserved(mi_heap_t* heap, bool force);             // #493: free the reserved pages past their window (all if `force`); true while one is not
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);

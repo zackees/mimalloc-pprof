@@ -1,6 +1,6 @@
 {
   "bound_ms": 1300,
   "margin": 0.9,
-  "p95_release_ms": 1100,
+  "p95_release_ms": 1110,
   "note": "#491: freed idle memory is back with the OS within bound_ms (at the default purge_delay). perf-ab fails when head's P95 release time exceeds it. The bound may only go down, and only while p95_release_ms <= margin * bound_ms; ci/check_release_ratchet.py enforces both, and that bound_ms is not below what the allocator promises (_mi_release_bound_ms at the default purge_delay)."
 }

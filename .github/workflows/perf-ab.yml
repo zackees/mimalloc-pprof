@@ -2,9 +2,11 @@ name: perf-ab
 
 # Small paired A/B of the allocator at this ref against a base ref (#479, #493): memory (peak
 # RSS, RSS after drain), CPU (ops/s, process and worker-thread cpu seconds) and minor page
-# faults on a few large-block workloads, a small-object control and a profiler-on row. It runs on PRs labelled `perf-ab` (against the PR base) or by
+# faults on a few large-block workloads, a small-object control, the Larson server workload (#506)
+# and a profiler-on row. It runs on PRs labelled `perf-ab` (against the PR base) or by
 # dispatch; the table lands in the job summary and is pasted into the PR. Runs on a hosted
-# runner so no developer machine is timed.
+# runner so no developer machine is timed. A dispatch can set allocator options on the head arm
+# only (`head_env`): with base = the same commit, that attributes a cost to one option (#506).
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -20,6 +22,10 @@ on:
         default: "7"
       workloads:
         description: "Only the workloads whose name contains this text (empty = all)"
+        type: string
+        default: ""
+      head_env:
+        description: "KEY=VALUE pairs (space separated) set on the head arm only, e.g. MIMALLOC_ARENA_PURGE_MULT=1"
         type: string
         default: ""
 
@@ -41,4 +47,5 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.sha || inputs.base }}
           REPS: ${{ inputs.reps || '7' }}
           WORKLOADS: ${{ inputs.workloads }}
-        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" --summary "$GITHUB_STEP_SUMMARY"
+          HEAD_ENV: ${{ inputs.head_env }}
+        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --summary "$GITHUB_STEP_SUMMARY"

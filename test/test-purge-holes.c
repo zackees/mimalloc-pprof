@@ -1694,6 +1694,38 @@ static bool test_large_holes_without_idle(void) {
 #define RELEASE_POLL_MS      (5)
 #define RELEASE_TEST_MARGIN  (4)
 
+// macOS: the allocator releases memory with MADV_FREE_REUSABLE (src/prim/unix/prim.c), which
+// takes the pages out of the process footprint at once but leaves them mapped in, so XNU's
+// `mincore` keeps reporting them resident until memory pressure -- residency cannot observe the
+// release there, however long a test waits. On macOS the release tests below therefore wait for
+// the allocator to decommit the range instead, as counted by the `purged` statistic (every OS
+// purge, decommit or reset, adds to it). Everywhere else they keep reading residency.
+#if defined(__APPLE__)
+#define RELEASE_BY_COUNTER   (1)
+#else
+#define RELEASE_BY_COUNTER   (0)
+#endif
+
+#if RELEASE_BY_COUNTER
+static int64_t purged_bytes(void) {   // monotonic, process-wide: bytes the allocator purged
+  mi_stats_t_decl(st);
+  if (!mi_stats_get(&st)) return -1;
+  return st.purged.total;
+}
+
+// Poll until at least `want` bytes were purged since the `since` snapshot, or the bound (times
+// the margin) passes. Returns the milliseconds it took; `*got` is the last delta.
+static long poll_until_purged(int64_t since, int64_t want, int64_t* got) {
+  const mi_msecs_t limit = (mi_msecs_t)_mi_release_bound_ms() * RELEASE_TEST_MARGIN;
+  const mi_msecs_t start = _mi_clock_now();
+  for (;;) {
+    *got = purged_bytes() - since;
+    const mi_msecs_t elapsed = _mi_clock_now() - start;
+    if (*got >= want || elapsed > limit) return (long)elapsed;
+    usleep(RELEASE_POLL_MS * 1000);
+  }
+}
+#else
 // Poll until fewer than a quarter of the `os_pages` OS pages at `p` are resident, or the bound
 // (times the margin) passes. Returns the milliseconds it took; `*resident` is the last count.
 static long poll_until_released(const void* p, size_t os_pages, size_t* resident) {
@@ -1712,14 +1744,17 @@ static long poll_until_released(const void* p, size_t os_pages, size_t* resident
     usleep(RELEASE_POLL_MS * 1000);
   }
 }
+#endif
+
+#define IDLE_BLOCK_SIZE  (256 * 1024)   // a large page, the only one of its class
 
 static volatile int idle_ready, idle_release;
 static uint8_t* idle_block;
 
 static void* idle_thread(void* arg) {
   (void)arg;
-  idle_block = (uint8_t*)mi_malloc(256 * 1024);   // a large page, the only one of its class
-  if (idle_block != NULL) { memset(idle_block, 1, 256 * 1024); mi_free(idle_block); }
+  idle_block = (uint8_t*)mi_malloc(IDLE_BLOCK_SIZE);
+  if (idle_block != NULL) { memset(idle_block, 1, IDLE_BLOCK_SIZE); mi_free(idle_block); }
   idle_ready = 1;
   while (!idle_release) { usleep(1000); }          // alive, but never allocates again
   return NULL;
@@ -1728,17 +1763,33 @@ static void* idle_thread(void* arg) {
 static bool test_idle_thread_releases_large_page(void) {
   const long delay = mi_option_get(mi_option_purge_delay);
   mi_option_set(mi_option_purge_delay, 20);
+  #if RELEASE_BY_COUNTER
+  mi_collect(true);                                // nothing queued but what this case frees
+  const int64_t purged_before = purged_bytes();
+  #endif
   pthread_t t;
   if (pthread_create(&t, NULL, &idle_thread, NULL) != 0) return false;
   while (!idle_ready) { usleep(1000); }
+  #if RELEASE_BY_COUNTER
+  // at least three quarters of the block decommitted -- the residency check's quarter, in bytes
+  const int64_t want = IDLE_BLOCK_SIZE - (IDLE_BLOCK_SIZE / 4);
+  int64_t purged = 0;
+  const long took = (idle_block != NULL ? poll_until_purged(purged_before, want, &purged) : -1);
+  #else
   size_t resident = 64;
   const long took = (idle_block != NULL ? poll_until_released(idle_block, 64, &resident) : -1);
+  #endif
   const long bound = _mi_release_bound_ms();
   idle_release = 1;
   pthread_join(t, NULL);
   mi_option_set(mi_option_purge_delay, delay);
+  #if RELEASE_BY_COUNTER
+  fprintf(stderr, "(freed block: %lld of %d bytes purged after %ld ms; bound %ld ms) ", (long long)purged, IDLE_BLOCK_SIZE, took, bound);
+  return (idle_block != NULL && purged >= want);
+  #else
   fprintf(stderr, "(freed block: %zu of 64 OS pages resident after %ld ms; bound %ld ms) ", resident, took, bound);
   return resident * 4 < 64;
+  #endif
 }
 #endif
 
@@ -2026,10 +2077,26 @@ static bool test_reserved_page_is_released(void) {
   mi_option_set(mi_option_purge_delay, RESERVE_DELAY_MS);
   mi_option_set(mi_option_page_reserve, 1);
   reserve_reset();
+  #if RELEASE_BY_COUNTER
+  const int64_t purged_before = purged_bytes();
+  #endif
   run_one_thread(&reserve_thread_a);   // exits: its page, blocks touched, is now reserved
   if (reserve_a_block == NULL) { fprintf(stderr, "\n  thread A could not allocate\n"); ok = false; goto done; }
   if (reserve_a_singleton) { fprintf(stderr, "(skipped: singleton page) "); goto done; }
   {
+    #if RELEASE_BY_COUNTER
+    // at least three quarters of the blocks A touched decommitted
+    const int64_t touched = (int64_t)RESERVE_N * RESERVE_SZ;
+    const int64_t want = touched - (touched / 4);
+    int64_t purged = 0;
+    const long took = poll_until_purged(purged_before, want, &purged);
+    fprintf(stderr, "(reserved page: %lld of %lld touched bytes purged after %ld ms; bound %ld ms) ",
+            (long long)purged, (long long)touched, took, _mi_release_bound_ms());
+    if (purged < want) {
+      fprintf(stderr, "\n  the reserved page was not released within %ld ms\n", took);
+      ok = false;
+    }
+    #else
     size_t resident = 64;
     const long took = poll_until_released(reserve_a_block, 64, &resident);
     fprintf(stderr, "(reserved page: %zu of 64 OS pages resident after %ld ms; bound %ld ms) ",
@@ -2038,6 +2105,7 @@ static bool test_reserved_page_is_released(void) {
       fprintf(stderr, "\n  the reserved page was not released within %ld ms\n", took);
       ok = false;
     }
+    #endif
   }
 done:
   mi_option_set(mi_option_page_reserve, reserve);
@@ -2060,6 +2128,7 @@ static uint8_t* slack_old_hi;
 static volatile int slack_ready, slack_release;
 static uint8_t* slack_new;
 static uintptr_t slack_lo, slack_hi;   // the new page's slack over A's written blocks (set while the block is live)
+static size_t slack_page_span;         // the new page's whole slice range, in bytes
 
 static void slack_fill_page(void) {
   void* p[SLACK_OLD_COUNT];
@@ -2077,11 +2146,12 @@ static void slack_fill_page(void) {
 static void* slack_idle_thread(void* arg) {
   (void)arg;
   slack_new = (uint8_t*)mi_malloc(SLACK_NEW_SIZE);
-  slack_lo = slack_hi = 0;
+  slack_lo = slack_hi = 0; slack_page_span = 0;
   if (slack_new != NULL) {
     const mi_page_t* const page = _mi_ptr_page(slack_new);
     const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
     const uintptr_t page_end = (uintptr_t)mi_page_slice_start(page) + page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE;
+    slack_page_span = page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE;
     slack_lo = _mi_align_up((uintptr_t)mi_page_start(page) + (size_t)page->reserved * mi_page_block_size(page), psize);
     slack_hi = _mi_align_down(((uintptr_t)slack_old_hi < page_end ? (uintptr_t)slack_old_hi : page_end), psize);   // A's written blocks in it
     memset(slack_new, 2, SLACK_NEW_SIZE);
@@ -2105,13 +2175,27 @@ static bool test_retired_page_slack_released(void) {
   slack_ready = 0; slack_release = 0;
   if (pthread_create(&t, NULL, &slack_idle_thread, NULL) != 0) { ok = false; goto done; }
   while (!slack_ready) { usleep(1000); }
+  #if RELEASE_BY_COUNTER
+  const int64_t purged_before = purged_bytes();   // the page is carved and retired, not yet released
+  #endif
   {
-    const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
     const uintptr_t lo = slack_lo, hi = slack_hi;
     if (slack_new == NULL || (uint8_t*)slack_new < slack_old_lo || (uint8_t*)slack_new >= slack_old_hi || hi <= lo) {
       fprintf(stderr, "(skipped: the new page did not land on the old one's written blocks) ");
     }
     else {
+      #if RELEASE_BY_COUNTER
+      // The retired page, slack included, goes back to the arena and is decommitted as a whole:
+      // at least three quarters of its slice range must be purged. (Asking for the page rather
+      // than just the slack keeps the purge of A's leftover slices from passing this.)
+      const int64_t want = (int64_t)(slack_page_span - (slack_page_span / 4));
+      int64_t purged = 0;
+      const long took = poll_until_purged(purged_before, want, &purged);
+      fprintf(stderr, "(slack: %lld of %zu page bytes purged after %ld ms; slack is %zu bytes) ",
+              (long long)purged, slack_page_span, took, (size_t)(hi - lo));
+      ok = (purged >= want);
+      #else
+      const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
       const mi_msecs_t limit = (mi_msecs_t)_mi_release_bound_ms() * RELEASE_TEST_MARGIN;
       const mi_msecs_t start = _mi_clock_now();
       size_t resident = 0, total = 0;
@@ -2128,6 +2212,7 @@ static bool test_retired_page_slack_released(void) {
       }
       fprintf(stderr, "(slack: %zu of %zu OS pages resident after %lld ms) ", resident, total, (long long)(_mi_clock_now() - start));
       ok = (resident == 0);
+      #endif
     }
   }
   slack_release = 1;

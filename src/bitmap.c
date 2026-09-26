@@ -1592,13 +1592,16 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
 // the runs are only hints (the arena claims them atomically in `slices_free`), so the loads are
 // relaxed. A run never crosses a chunk, so it can be claimed with `mi_bbitmap_try_clearNC`.
 // Stops, returning false, as soon as `visit` returns false.
-bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* const* bitmaps, size_t count, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
   mi_assert_internal(n > 0 && n <= MI_BCHUNK_BITS);
-  mi_assert_internal(bitmap2 == NULL || mi_bitmap_chunk_count(bitmap2) == mi_bitmap_chunk_count(bitmap));
-  const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmap), MI_BFIELD_BITS);
+  mi_assert_internal(count > 0);
+  const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmaps[0]), MI_BFIELD_BITS);
   for (size_t i = 0; i < chunkmap_max; i++) {
-    mi_bfield_t cmap_entry = mi_atomic_load_relaxed(&bitmap->chunkmap.bfields[i]);
-    if (bitmap2 != NULL) { cmap_entry |= mi_atomic_load_relaxed(&bitmap2->chunkmap.bfields[i]); }
+    mi_bfield_t cmap_entry = 0;
+    for (size_t k = 0; k < count; k++) {
+      mi_assert_internal(mi_bitmap_chunk_count(bitmaps[k]) == mi_bitmap_chunk_count(bitmaps[0]));
+      cmap_entry |= mi_atomic_load_relaxed(&bitmaps[k]->chunkmap.bfields[i]);
+    }
     size_t cmap_idx;
     // for each chunk (corresponding to a set bit in a chunkmap entry)
     while (mi_bfield_foreach_bit(&cmap_entry, &cmap_idx)) {
@@ -1607,8 +1610,8 @@ bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size
       size_t run_start = 0;   // chunk-relative start of the current run
       size_t run_len = 0;     // and its length so far (0 = none); a run can span bfields
       for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
-        mi_bfield_t b = mi_atomic_load_relaxed(&bitmap->chunks[chunk_idx].bfields[j]);
-        if (bitmap2 != NULL) { b |= mi_atomic_load_relaxed(&bitmap2->chunks[chunk_idx].bfields[j]); }
+        mi_bfield_t b = 0;
+        for (size_t k = 0; k < count; k++) { b |= mi_atomic_load_relaxed(&bitmaps[k]->chunks[chunk_idx].bfields[j]); }
         size_t bidx;
         while (mi_bfield_find_least_bit(b, &bidx)) {
           const size_t rng = mi_ctz(~(b>>bidx));   // all the set bits from bidx

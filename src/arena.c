@@ -271,9 +271,11 @@ static bool mi_arena_try_claim_resident(mi_arena_t* arena, size_t slice_count, s
   // sampling is a debugging mode; it takes the plain search.
   if (mi_option_get(mi_option_guarded_sample_rate) != 0) return false;
   #endif
-  // young | aged: a range freed in two steps is one run even when half of it has aged
+  // young | aged: a range freed in two steps is one run even when half of it has aged; and both
+  // queues (#506): a freed medium page next to a freed large one is one resident run too
+  mi_bitmap_t* const queues[4] = { arena->slices_purge, arena->slices_purge_aged, arena->slices_purge_short, arena->slices_purge_short_aged };
   mi_resident_claim_t rc = { slice_count, 0, 0, false };
-  _mi_bitmap_forall_set_runsN(arena->slices_purge, arena->slices_purge_aged, slice_count, &mi_arena_resident_claim_visitor, arena, &rc);
+  _mi_bitmap_forall_set_runsN(queues, 4, slice_count, &mi_arena_resident_claim_visitor, arena, &rc);
   if (rc.claimed) { *slice_index = rc.slice_index; }
   return rc.claimed;
 }

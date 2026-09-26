@@ -9,6 +9,10 @@ median paired difference with a bootstrap 95% interval; a direction is only clai
 the interval excludes zero. Linux only. Meant for a CI runner, not a busy dev machine.
 
     python3 ci/perf_ab.py --base origin/main --head HEAD [--reps 7] [--workloads random] [--summary out.md]
+        [--head-env MIMALLOC_ARENA_PURGE_MULT=1]
+
+--head-env sets allocator options on the head arm only: base and head at the same ref then
+attribute a cost to one option (#506).
 """
 
 from __future__ import annotations
@@ -46,22 +50,29 @@ BUILDS: dict[str, tuple[list[str], dict[str, str]]] = {
     "pprof": (["-DMI_PPROF=ON"], {"MIMALLOC_PROF": "1"}),
     "chart": (["-DMI_PPROF=ON", "-DMI_MEMEVT=ON"], {}),
 }
-# name: (build, (threads, generations, min bytes, max bytes, ops per thread, pause ms)). A pause
-# makes the row bursty (#486): BURSTS bursts per thread, everything freed after each, then idle.
+# name: (build, (threads, generations, min bytes, max bytes, ops per thread, pause ms, table slots)).
+# A pause makes the row bursty (#486): BURSTS bursts per thread, everything freed after each, then
+# idle. Table slots make it the Larson server workload (#506): one shared table of that many blocks
+# per thread, rotating between the threads, so later frees are remote (see ci/perf_ab.c).
+LARSON_SLOTS = 5000  # the benchmark suite's larson live set per thread (mimalloc-bench's `larson ... 5000 ...`)
 WORKLOADS = {
-    "large-class/8": ("plain", (8, 1, 96 << 10, 512 << 10, 400000, 0)),
-    "large-class-ephemeral/8": ("plain", (8, 8, 96 << 10, 512 << 10, 400000, 0)),
-    "random-large/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 0)),
-    "random-large-bursty/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 300)),
-    "random-large/1": ("plain", (1, 1, 64 << 10, 4 << 20, 200000, 0)),
-    "small/8 (control)": ("plain", (8, 1, 16, 1024, 5000000, 0)),
-    "large-class/8 (profiler on)": ("pprof", (8, 1, 96 << 10, 512 << 10, 400000, 0)),
-    "large-class-ephemeral/8 (chart build)": ("chart", (8, 8, 96 << 10, 512 << 10, 400000, 0)),
+    "large-class/8": ("plain", (8, 1, 96 << 10, 512 << 10, 400000, 0, 0)),
+    "large-class-ephemeral/8": ("plain", (8, 8, 96 << 10, 512 << 10, 400000, 0, 0)),
+    "random-large/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 0, 0)),
+    "random-large-bursty/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 300, 0)),
+    "random-large/1": ("plain", (1, 1, 64 << 10, 4 << 20, 200000, 0, 0)),
+    "small/8 (control)": ("plain", (8, 1, 16, 1024, 5000000, 0, 0)),
+    # #506: the README's larson chart (8-1000 B); its peak RSS regressed with no row to show it
+    "larson/1": ("plain", (1, 1, 8, 1000, 8000000, 0, LARSON_SLOTS)),
+    "larson/8": ("plain", (8, 1, 8, 1000, 4000000, 0, LARSON_SLOTS)),
+    "larson/8 (chart build)": ("chart", (8, 1, 8, 1000, 4000000, 0, LARSON_SLOTS)),
+    "large-class/8 (profiler on)": ("pprof", (8, 1, 96 << 10, 512 << 10, 400000, 0, 0)),
+    "large-class-ephemeral/8 (chart build)": ("chart", (8, 8, 96 << 10, 512 << 10, 400000, 0, 0)),
     # the README chart's generation length (~12.5k ops per short-lived thread at 8 workers, #478):
     # a per-thread start/exit cost weighs 4x more than in the row above
     "large-class-ephemeral/8 short generations (chart build)": (
         "chart",
-        (8, 8, 96 << 10, 512 << 10, 100000, 0),
+        (8, 8, 96 << 10, 512 << 10, 100000, 0, 0),
     ),
 }
 # what ci/perf_ab.c prints, in order; the byte counts are shown in MiB
@@ -131,6 +142,16 @@ def paired(base: list[float], head: list[float]) -> tuple[float, float, float]:
     return statistics.median(diffs), boots[50], boots[1949]
 
 
+def parse_env(text: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for pair in text.split():
+        key, sep, value = pair.partition("=")
+        if not sep or not key:
+            raise SystemExit(f"--head-env: expected KEY=VALUE, got {pair!r}")
+        env[key] = value
+    return env
+
+
 def cpu_model() -> str:
     # an effect can depend on the CPU the runner happens to get (#478: -6.5% on some runners,
     # 0 on others), so every table says which one it came from
@@ -149,7 +170,13 @@ def main() -> int:
         "--workloads", default="", help="only the workloads whose name contains this text"
     )
     parser.add_argument("--summary", type=Path)
+    parser.add_argument(
+        "--head-env",
+        default="",
+        help="KEY=VALUE pairs (space separated) set on the head arm only, e.g. MIMALLOC_ARENA_PURGE_MULT=1",
+    )
     args = parser.parse_args()
+    head_env = parse_env(args.head_env)
     workloads = {name: w for name, w in WORKLOADS.items() if args.workloads in name}
     if not workloads:
         parser.error(f"no workload matches {args.workloads!r}")
@@ -169,7 +196,11 @@ def main() -> int:
                 for workload, (kind, params) in workloads.items():
                     for arm in ("base", "head") if rep % 2 == 0 else ("head", "base"):
                         exe = str(exes[(arm, kind)])
-                        env = {**os.environ, **BUILDS[kind][1]}
+                        env = {
+                            **os.environ,
+                            **BUILDS[kind][1],
+                            **(head_env if arm == "head" else {}),
+                        }
                         cmd = [exe, *map(str, params), str(bound_ms)]
                         values = list(map(float, run(cmd, env=env).split()))
                         for index, metric in enumerate(METRICS):
@@ -180,7 +211,9 @@ def main() -> int:
             for tree in work.glob("src-*"):
                 run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
     rows = [
-        f"`{args.base}` vs `{args.head}` on {cpu_model()}, {args.reps} paired reps, alternating order. "
+        f"`{args.base}` vs `{args.head}`"
+        + (f" with `{args.head_env.strip()}` on head" if head_env else "")
+        + f" on {cpu_model()}, {args.reps} paired reps, alternating order. "
         "Median base -> head, then median paired difference [bootstrap 95%]; "
         "**bold** when the interval excludes 0.",
         "",

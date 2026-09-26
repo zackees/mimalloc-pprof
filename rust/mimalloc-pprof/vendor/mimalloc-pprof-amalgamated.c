@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 97209db8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 02873f98 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -27977,14 +27977,18 @@ int mi_purge_all_ex(mi_purge_flags_t flags, size_t wait_ms, mi_purge_all_report_
   // A. arenas: everything due (or, forced, everything purgeable) goes back to the OS first
   mi_purge_all_arenas(force);
 
+  // The caller's tld is used for hole-sweep bookkeeping in B as well as for its own
+  // sweep in C. In a gated build it may be PARKED between allocator calls, allowing
+  // the scavenger to claim it unless we enter the owner gate for both phases.
+  MI_GATE_ENTER(my_theap);
+
   // B. abandoned pages of every heap of every subproc
+  MI_GATE_ASSERT_HELD(my_theap);
   mi_purge_all_abandoned(my_tld);
 
-  // C. our own tld, through the OWNER door: `mi_theap_collect` is a public (gated) entry, and
-  //    the hole sweep is not, so both run under one enter / one leave of our own gate -- in a
-  //    gated build we are PARKED between allocator calls and the scavenger could otherwise be
-  //    sweeping these very free lists. (Ungated: the macros expand to nothing; we are RUNNING.)
-  MI_GATE_ENTER(my_theap);
+  // C. our own tld, through the OWNER door: `mi_theap_collect` is a public (gated) entry,
+  //    and the hole sweep is not. Both remain under the gate entered before B.
+  //    (Ungated: the macros expand to nothing; we are RUNNING.)
   mi_theap_collect(my_theap, force);
   _mi_purge_holes_of(my_tld, force);
   MI_GATE_LEAVE(my_tld);

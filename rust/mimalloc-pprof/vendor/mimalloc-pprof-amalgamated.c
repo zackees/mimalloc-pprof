@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 331e4547 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit bedf926e of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -709,6 +709,7 @@ typedef enum mi_option_e {
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin". Bun parity (#338)
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
   mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
+  mi_option_large_span,                 // size a new large page (blocks of ~84-512 KiB) from its size class's demand on the thread: compact first, growing to 4 MiB (=1). 0 = always 4 MiB (upstream) (#532)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -2762,6 +2763,51 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 #define MI_RESIDENT_FIRST_MIN_SLICES      (16)
 #endif
 
+// #532: a large page (blocks of ~84-512 KiB) is sized from what its size class ("bin") demands on
+// the theap that creates it, not fixed at MI_LARGE_PAGE_SIZE (src/large-span.c). Every thread used
+// to hold one 4 MiB page per large bin it touched, 98-99% of it never formed (#529, E4): about
+// 44 MiB per worker whatever its live bytes. A bin's page starts at a compact span; the span grows
+// geometrically up to MI_LARGE_PAGE_SIZE while that theap keeps filling the bin's pages, and decays
+// again when it stops. The accounting is per theap and per bin, kept in slow paths only (page full,
+// page creation); no thread count and no clock go into it. Compile-time opt-out: MI_LARGE_SPAN=0;
+// run-time: `mi_option_large_span` (MIMALLOC_LARGE_SPAN=0). Both give every large page 4 MiB.
+#ifndef MI_LARGE_SPAN
+#define MI_LARGE_SPAN                     (MI_ENABLE_LARGE_PAGES)
+#endif
+// the span of a bin's page before the theap has shown any demand beyond one page: 16 slices is
+// 1 MiB with 64 KiB slices (= MI_RESIDENT_FIRST_MIN_SLICES, so resident-first still applies), which
+// two blocks of every large bin fit in (see MI_LARGE_SPAN_MIN_BLOCKS)
+#ifndef MI_LARGE_SPAN_COMPACT_SLICES
+#define MI_LARGE_SPAN_COMPACT_SLICES      (16)
+#endif
+// each demand step multiplies the span by 2^MI_LARGE_SPAN_GROW_SHIFT (1: 1 -> 2 -> 4 MiB)
+#ifndef MI_LARGE_SPAN_GROW_SHIFT
+#define MI_LARGE_SPAN_GROW_SHIFT          (1)
+#endif
+// ... and it steps back down after this many page requests in a row for which the bin's previous
+// page never filled (a request comes when a bin has no page with a free block left on the theap);
+// at most 15 (it is counted in 4 bits, see mi_large_span_bin_t)
+#ifndef MI_LARGE_SPAN_DECAY_REQUESTS
+#define MI_LARGE_SPAN_DECAY_REQUESTS      (4)
+#endif
+// a span always holds at least this many blocks, even when the page meta and a guard page sit in
+// it (an OS-allocated fallback page, MI_SECURE>=5): a page with one block would be a singleton
+#ifndef MI_LARGE_SPAN_MIN_BLOCKS
+#define MI_LARGE_SPAN_MIN_BLOCKS          (2)
+#endif
+// capacity of the per-theap table (the large bins: 11 with 64 KiB slices, fewer on 32-bit); a bin
+// past it just gets MI_LARGE_PAGE_SIZE
+#define MI_LARGE_SPAN_BINS                (16)
+
+#if MI_LARGE_SPAN
+// The demand accounting of one large bin on one theap (src/large-span.c), packed in one byte:
+// bits 0-2 the level (the span is MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT),
+// capped at MI_LARGE_PAGE_SIZE), bit 3 "a page of the bin filled up since the last page request",
+// bits 4-7 the page requests in a row without one. One byte because `mi_theap_t` sits just under
+// the 8 KiB meta-allocator size class (8144 bytes): 16 more bytes keep it there, 64 would not.
+typedef uint8_t mi_large_span_bin_t;
+#endif
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from
@@ -3160,6 +3206,9 @@ struct mi_theap_s {
   mi_page_queue_t       pages[MI_BIN_COUNT];                 // queue of pages for each size class (or "bin")
   mi_memid_t            memid;                               // provenance of the theap struct itself (meta or os)
   mi_stats_t            stats;                               // thread-local statistics
+  #if MI_LARGE_SPAN
+  mi_large_span_bin_t   large_span[MI_LARGE_SPAN_BINS];      // #532: per large bin demand accounting (src/large-span.c); last, so no fast-path offset moves
+  #endif
 };
 
 
@@ -4994,6 +5043,10 @@ bool          _mi_arenas_release_reserved(mi_heap_t* heap, bool force);         
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
 void          _mi_arena_pages_free(mi_arena_pages_t* arena_pages);  // Bun parity P10b, #317: frees the on-demand abandoned bitmaps then `arena_pages` itself
+
+// "large-span.c" (#532): demand-sized large-page spans (stubs when MI_LARGE_SPAN=0)
+size_t        _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead);  // the span of the theap's next page of this large bin (a page request)
+void          _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page);             // a page of the theap filled up
 
 // "page-map.c"
 bool          _mi_page_map_init(void);
@@ -11908,6 +11961,11 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
         mi_theap_stat_counter_increase(theap, pages_reclaim_on_alloc, 1);
 
         _mi_page_free_collect(page, false);  // update `used` count
+        // #532 (from #443's 8b569e56): the page was found by BIN, and the pages of a large bin do
+        // not all have one span (src/large-span.c). The caller's `slice_count` is only what a FRESH
+        // page of this bin would get; validating the claimed page over it would run past the end
+        // of a smaller page, into slices that belong to no page. Validate the page's own range.
+        (void)mi_page_arena_pages(page, &slice_index, &slice_count, NULL);
         mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
         mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
         mi_assert_internal(mi_bitmap_is_setN(arena->slices_dirty, slice_index, slice_count));
@@ -12248,7 +12306,17 @@ mi_page_t* _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t bl
   }
   #if MI_ENABLE_LARGE_PAGES
   else if (block_size <= MI_LARGE_MAX_OBJ_SIZE) {
+    #if MI_LARGE_SPAN
+    // #532: the span comes from the bin's demand on this theap (src/large-span.c). The overhead is
+    // the worst case (an OS fallback page carries its meta in front, MI_SECURE>=5 a guard page).
+    size_t overhead = mi_page_block_start(block_size, false);
+    #if MI_SECURE>=5
+    overhead += _mi_os_secure_guard_page_size();
+    #endif
+    page = mi_arenas_page_regular_alloc(theap, _mi_large_span_slices(theap, block_size, overhead), block_size);
+    #else
     page = mi_arenas_page_regular_alloc(theap, mi_slice_count_of_size(MI_LARGE_PAGE_SIZE), block_size);
+    #endif
   }
   #endif
   else {
@@ -19596,6 +19664,9 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   MI_PAGE_QUEUES_EMPTY,
   MI_MEMID_STATIC,
   MI_STATS_NULL,          // stats
+  #if MI_LARGE_SPAN
+  { 0 },                  // large_span (#532): every bin starts compact
+  #endif
 };
 
 #undef MI_STAT_COUNT
@@ -22501,6 +22572,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(snapshot_on_exit) }       // write a heap snapshot on process exit (=0). 1=on, 2=on+blocks. Bun parity (#338)
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(page_reserve) }           // #493: reserve an exiting thread's empty large pages for the next thread (MIMALLOC_PAGE_RESERVE); 0 frees them as upstream
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(resident_first) }         // #493: claim free-but-resident (queued for purge) arena slices first (MIMALLOC_RESIDENT_FIRST); 0 = the plain search only
+  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(large_span) }             // #532: demand-sized large-page spans (MIMALLOC_LARGE_SPAN); 0 = every large page is MI_LARGE_PAGE_SIZE
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
@@ -25062,6 +25134,9 @@ static void mi_page_to_full(mi_page_t* page, mi_page_queue_t* pq) {
   mi_assert_internal(!mi_page_is_in_full(page));
 
   mi_theap_t* theap = mi_page_theap(page);
+  #if MI_LARGE_SPAN
+  _mi_large_span_on_full(theap, page);   // #532: demand beyond this page (src/large-span.c)
+  #endif
   if (theap->allow_page_abandon) {
     // abandon full pages (this is the usual case in order to allow for sharing of memory between theaps)
     _mi_page_abandon(page, pq);
@@ -27871,6 +27946,142 @@ void mi_purge_holes_report(void) mi_attr_noexcept {
   _mi_page_holes_report_print(&rep);
 }
 /* ---- end inlined: src/page-holes.c ---- */
+/* ---- begin inlined: src/large-span.c ---- */
+/* ----------------------------------------------------------------------------
+Copyright (c) 2026, the mimalloc-pprof authors
+This is free software; you can redistribute it and/or modify it under the
+terms of the MIT license. A copy of the license can be found in the file
+"LICENSE" at the root of this distribution.
+-----------------------------------------------------------------------------*/
+
+/* -----------------------------------------------------------
+  Demand-sized large-page spans  (#532, supersedes #443)
+
+  Upstream gives every page of a large bin (blocks of ~84-512 KiB) the same 4 MiB span
+  (MI_LARGE_PAGE_SIZE). Each thread holds one such page per large bin it uses, so a thread that
+  touches all eleven bins holds ~44 MiB of large pages whether it keeps 5 or 50 MiB of blocks in
+  them. #529 (E4) measured it: 98-99% of that memory was never formed into blocks, and it was
+  resident all the same (2 MiB transparent huge pages fault it in with the first block, and a
+  page carved over resident slices keeps the previous tenant's bytes). At a fixed live budget the
+  peak grew ~49 MiB per added worker.
+
+  So a new large page is sized from what its bin demands on the theap that asks for it:
+
+  - Accounting, per theap and per large bin, in slow paths only:
+      * `_mi_large_span_on_full` (page.c, `mi_page_to_full`): a page of the bin filled up;
+      * `_mi_large_span_slices` (arena.c, `_mi_arenas_page_alloc`): a page request, which comes
+        only when the bin has no page with a free block left on the theap.
+    Nothing is allocated (rule 4) and the malloc/free fast paths are untouched (rule 6): the
+    state is a small table at the end of `mi_theap_t`.
+  - Policy: a request after a page of the bin filled up is demand beyond the pages the theap has,
+    so the span steps up (x 2^MI_LARGE_SPAN_GROW_SHIFT, up to MI_LARGE_PAGE_SIZE). A request
+    without one means the bin's last page emptied and went away; after
+    MI_LARGE_SPAN_DECAY_REQUESTS of those in a row the span steps back down. A bin's first page is
+    compact (MI_LARGE_SPAN_COMPACT_SLICES). A bin a theap keeps filling (perf-ab's large-class
+    rows) reaches and keeps the full span; a bin with a few live blocks stays compact.
+  - Deterministic per theap: no thread count, no clock. (#443 chose the span from the number of
+    live threads at the time the page was created; the owner rejected that.)
+
+  A consequence every reader of a large page must respect: the pages of one bin no longer all have
+  the same span, so a page found by bin does not imply its size. Everything reads the span from the
+  page itself (`page->memid`, `mi_page_arena_pages`); `mi_arenas_page_try_find_abandoned` used to
+  validate a reclaimed page over the size a fresh page of the caller would get, and now reads the
+  page's own (the out-of-range read #443 found, test/test-large-span.c case c).
+----------------------------------------------------------- */
+
+
+#if MI_LARGE_SPAN
+
+// the table index of a large block size, or MI_LARGE_SPAN_BINS if it is not a large one
+static size_t mi_large_span_index(size_t block_size) {
+  if (block_size <= MI_MEDIUM_MAX_OBJ_SIZE || block_size > MI_LARGE_MAX_OBJ_SIZE) return MI_LARGE_SPAN_BINS;
+  const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
+  const size_t bin = _mi_bin(block_size);
+  mi_assert_internal(bin >= bin_lo);
+  const size_t idx = bin - bin_lo;
+  mi_assert_internal(idx < MI_LARGE_SPAN_BINS);   // MI_LARGE_SPAN_BINS must cover every large bin
+  return (idx < MI_LARGE_SPAN_BINS ? idx : MI_LARGE_SPAN_BINS);
+}
+
+#if MI_LARGE_SPAN_DECAY_REQUESTS < 1 || MI_LARGE_SPAN_DECAY_REQUESTS > 15
+#error "MI_LARGE_SPAN_DECAY_REQUESTS must be 1..15 (a 4-bit count, see mi_large_span_bin_t)"
+#endif
+#if MI_LARGE_SPAN_GROW_SHIFT < 1 || MI_LARGE_SPAN_COMPACT_SLICES < 1
+#error "MI_LARGE_SPAN_GROW_SHIFT and MI_LARGE_SPAN_COMPACT_SLICES must be at least 1"
+#endif
+
+// the fields of the one-byte state of a bin (see mi_large_span_bin_t in types.h)
+#define MI_LARGE_SPAN_LEVEL_MASK   (0x07)
+#define MI_LARGE_SPAN_FULL_BIT     (0x08)
+#define MI_LARGE_SPAN_QUIET_SHIFT  (4)
+
+static size_t mi_large_span_level(mi_large_span_bin_t b) { return (b & MI_LARGE_SPAN_LEVEL_MASK); }
+static size_t mi_large_span_quiet(mi_large_span_bin_t b) { return (b >> MI_LARGE_SPAN_QUIET_SHIFT); }
+static mi_large_span_bin_t mi_large_span_pack(size_t level, size_t quiet) {
+  mi_assert_internal(level <= MI_LARGE_SPAN_LEVEL_MASK && quiet < 16);
+  return (mi_large_span_bin_t)((quiet << MI_LARGE_SPAN_QUIET_SHIFT) | level);   // (the full bit clear)
+}
+
+// the span of `level`, uncapped (the shift is bounded: a level only grows while below the full span)
+static size_t mi_large_span_level_slices(size_t level) {
+  return ((size_t)MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT));
+}
+
+void _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page) {
+  if (theap == NULL) return;
+  const size_t idx = mi_large_span_index(mi_page_block_size(page));
+  if (idx >= MI_LARGE_SPAN_BINS) return;
+  theap->large_span[idx] |= MI_LARGE_SPAN_FULL_BIT;
+}
+
+// A page request of a large bin on `theap`: account it, and return the span (in slices) of the
+// page to create for it if no abandoned page of the bin is reclaimed instead. `overhead` is what a
+// page of `block_size` spends besides its blocks in the worst case (meta in front, guard page).
+size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+  if (theap == NULL || MI_LARGE_SPAN_COMPACT_SLICES >= full) return full;
+  if (!mi_option_is_enabled(mi_option_large_span)) return full;
+  const size_t idx = mi_large_span_index(block_size);
+  if (idx >= MI_LARGE_SPAN_BINS) return full;
+
+  const mi_large_span_bin_t b = theap->large_span[idx];
+  size_t level = mi_large_span_level(b);
+  size_t quiet = mi_large_span_quiet(b);
+  if ((b & MI_LARGE_SPAN_FULL_BIT) != 0) {
+    // the bin filled a page since its last request: demand beyond what the theap holds
+    if (mi_large_span_level_slices(level) < full && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; }
+    quiet = 0;
+  }
+  else if (level > 0) {
+    // the bin's last page emptied and went away without filling up
+    quiet++;
+    if (quiet >= MI_LARGE_SPAN_DECAY_REQUESTS) {
+      level--;
+      quiet = 0;
+    }
+  }
+  theap->large_span[idx] = mi_large_span_pack(level, quiet);
+
+  size_t slices = mi_large_span_level_slices(level);
+  const size_t min_slices = mi_slice_count_of_size(MI_LARGE_SPAN_MIN_BLOCKS * block_size + overhead);
+  if (slices < min_slices) { slices = min_slices; }
+  if (slices > full) { slices = full; }
+  return slices;
+}
+
+#else // !MI_LARGE_SPAN: every large page gets MI_LARGE_PAGE_SIZE (and the hook sites compile out)
+
+size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  MI_UNUSED(theap); MI_UNUSED(block_size); MI_UNUSED(overhead);
+  return mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+}
+
+void _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page) {
+  MI_UNUSED(theap); MI_UNUSED(page);
+}
+
+#endif // MI_LARGE_SPAN
+/* ---- end inlined: src/large-span.c ---- */
 /* ---- begin inlined: src/purge-all.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2026, the mimalloc-pprof contributors

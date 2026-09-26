@@ -4779,6 +4779,14 @@ SCALING_INK = {
 }
 RSS_FLOOR_STROKE = 2.0
 RSS_FLOOR_DASH = "9 6"
+# The floor's legend entry: its label is right-aligned this far above the plot, and its
+# dashed swatch sits left of the label. The per-character width is an estimate for the
+# 12 px label, so the swatch lands just clear of the text.
+RSS_FLOOR_LEGEND_RISE = 16
+RSS_FLOOR_LEGEND_CHAR_WIDTH = 5.8
+RSS_FLOOR_LEGEND_GAP = 8
+RSS_FLOOR_LEGEND_SWATCH = 26
+RSS_FLOOR_LEGEND_SWATCH_LIFT = 4
 # One fixed color per allocator, reused identically on every panel.
 SCALING_SERIES = {
     "mimalloc-pprof": "#58a6ff",
@@ -5158,13 +5166,15 @@ def distribution_global_domain(
     return readable_ceiling(max(values))
 
 
-def rss_floor_legend(right: float, y: float) -> list[str]:
+def rss_floor_legend(right: float, plot_top: float) -> list[str]:
     """#534: the floor's legend entry, right-aligned above a memory chart's plot."""
-    swatch_right = right - 5.8 * len(RSS_FLOOR_LABEL) - 8
+    y = plot_top - RSS_FLOOR_LEGEND_RISE
+    swatch_y = y - RSS_FLOOR_LEGEND_SWATCH_LIFT
+    swatch_right = right - RSS_FLOOR_LEGEND_CHAR_WIDTH * len(RSS_FLOOR_LABEL) - RSS_FLOOR_LEGEND_GAP
     return [
-        f'<line x1="{swatch_right - 26:.1f}" y1="{y - 4:.1f}" x2="{swatch_right:.1f}" '
-        f'y2="{y - 4:.1f}" stroke="{SCALING_INK["floor"]}" stroke-width="{RSS_FLOOR_STROKE:g}" '
-        f'stroke-dasharray="{RSS_FLOOR_DASH}"/>',
+        f'<line x1="{swatch_right - RSS_FLOOR_LEGEND_SWATCH:.1f}" y1="{swatch_y:.1f}" '
+        f'x2="{swatch_right:.1f}" y2="{swatch_y:.1f}" stroke="{SCALING_INK["floor"]}" '
+        f'stroke-width="{RSS_FLOOR_STROKE:g}" stroke-dasharray="{RSS_FLOOR_DASH}"/>',
         svg_text(right, y, RSS_FLOOR_LABEL, fill=SCALING_INK["floor"], size=12, anchor="end"),
     ]
 
@@ -5333,7 +5343,7 @@ def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str) -> b
             f'stroke-width="{RSS_FLOOR_STROKE:g}" stroke-dasharray="{RSS_FLOOR_DASH}" '
             'fill="none" data-series="floor"/>'
         )
-        parts.extend(rss_floor_legend(width - DISTRIBUTION_RIGHT, top - 16))
+        parts.extend(rss_floor_legend(width - DISTRIBUTION_RIGHT, top))
     for allocator in DISTRIBUTION_DRAW_ORDER:
         color = SCALING_SERIES[allocator]
         stroke_width = (
@@ -5537,7 +5547,7 @@ def thread_churn_svg(scaling: ScalingView, bound_ms: int) -> bytes:
             f'stroke="{SCALING_INK["floor"]}" stroke-width="{RSS_FLOOR_STROKE:g}" '
             f'stroke-dasharray="{RSS_FLOOR_DASH}" data-series="floor"/>'
         )
-        parts.extend(rss_floor_legend(width - DISTRIBUTION_RIGHT, top - 16))
+        parts.extend(rss_floor_legend(width - DISTRIBUTION_RIGHT, top))
     for allocator in DISTRIBUTION_DRAW_ORDER:
         color = SCALING_SERIES[allocator]
         stroke_width = (

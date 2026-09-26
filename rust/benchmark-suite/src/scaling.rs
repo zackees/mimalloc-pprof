@@ -51,7 +51,7 @@ pub const SCALING_CHILD_PROTOCOL_VERSION: &str = "throughput-scaling-sparse-chil
 pub const SCALING_RSS_SCHEMA_VERSION: &str = "throughput-scaling-rss-v2";
 /// #534: the `floor_summaries` entry of the thread-churn chart. After the
 /// drain nothing is live, so its floor is the baseline alone.
-pub const SCALING_RSS_FLOOR_THREAD_CHURN: &str = "thread-churn";
+pub const SCALING_RSS_FLOOR_THREAD_CHURN: &str = ScalingPattern::ThreadChurn.as_str();
 /// Coverage mode: three blocks is the minimum that still permits a paired
 /// comparison and still exposes a single wild outlier through min/max.
 pub const SCALING_BLOCKS: u32 = 3;

@@ -241,7 +241,9 @@ Full methodology, per-cell tables and the other benchmark families are in
 Throughput is half the question; the other half is whether the memory comes back when a
 burst of work drains. One churn workload — 150k × 512 B + 100k × 1 KiB + 50k × 2 KiB
 blocks, a scattered 1-in-20 kept alive, the rest freed — under four of the five pinned
-allocators, then 10 s of idle:
+allocators, then 10 s of idle. The grey dashed line is the theoretical minimum: the
+process's RSS before it allocated anything plus the bytes it still holds, which no
+allocator can go below.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-idle-rss-dark.svg" />
@@ -257,7 +259,8 @@ allocators, then 10 s of idle:
 
 **Hole purging's own contribution, isolated.** One binary, the scavenger on in both runs,
 `MIMALLOC_PURGE_HOLES` the only changed variable. Returning whole pages is worth 18 %;
-discarding the free runs *inside* still-used pages is worth 74 %.
+discarding the free runs *inside* still-used pages is worth 74 %. The grey dashed line is
+the same theoretical minimum as above, measured in this binary.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-rss-dark.svg" />
@@ -920,11 +923,12 @@ third is what survives them:
   before it blocks. Bun's fork behaves identically, because this is Bun's mechanism.
 - **jemalloc can return this memory if you ask; it does not after idle — by
   default.** Its decay is advanced by allocation activity, not by time spent idle, so
-  the default-config line is flat for the whole window. The dashed line is the *same*
+  the default-config line is flat for the whole window. The orange dashed line is the *same*
   jemalloc given an explicit `mallctl("arena.<all>.purge")` on the same 100 ms tick:
   **74 %**. Its opt-in `background_thread:true` is measured too, and it lands on
   jemalloc's own boundary — the default `dirty_decay_ms` is 10 s, exactly this
-  window — so the committed run returns **0 %** inside 10 s and **74 %** over 30 s.
+  window — so in the committed run it returned **73 %** inside 10 s in only 1 of its 3
+  repetitions (0 % in the other two), and **74 %** over 30 s in all three.
   Both are in the diagnostics; the 30 s row is the one that settles what that thread
   can do. The claim is therefore a narrow one, and worth stating as such: jemalloc's
   *default* configuration keeps sitting on this memory for as long as the process
@@ -976,7 +980,7 @@ pair is the **best** of 3 (the rule that is most generous to every allocator, in
 the ones this fork is measured against). Each SVG names its own, and neither pair was
 rendered from the other's data.
 
-Both were measured at commit `be13eadf` with
+Both were measured at commit `da59442f` with
 [`ci/bench_hole_purging.py`](ci/bench_hole_purging.py): 150k 512 B + 100k 1 KiB +
 50k 2 KiB blocks, a scattered 1-in-20 kept alive, then idled for 10 s calling
 `mi_on_thread_idle()` every 100 ms — median of 3 runs, pinned to 4 CPUs. The table's

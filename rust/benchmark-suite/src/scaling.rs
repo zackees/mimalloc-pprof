@@ -50,6 +50,21 @@ pub const SCALING_BLOCKS: u32 = 3;
 /// The distribution workloads publish empirical P5--P95 bands. Forty paired
 /// observations is the minimum full-run sample count; smoke remains one.
 pub const DISTRIBUTION_BLOCKS: u32 = 40;
+/// #508: the `thread-churn` workload. It replays `large-class-ephemeral`'s
+/// stream at one worker count, joins every worker thread, and then keeps the
+/// child alive and idle while it samples its own RSS at fixed offsets after
+/// the drain. It is not a sweep cell: it runs only at this worker count and
+/// publishes into its own side-car of the scaling report.
+pub const THREAD_CHURN_SCHEMA_VERSION: &str = "thread-churn-rss-v1";
+pub const THREAD_CHURN_THREADS: u32 = 8;
+pub const THREAD_CHURN_BLOCKS: u32 = DISTRIBUTION_BLOCKS;
+/// When the child samples its RSS, in milliseconds after the drain. 1500 is
+/// the release bound #491 introduced; 3000 is the "final" RSS the release time
+/// is measured against.
+pub const THREAD_CHURN_POST_DRAIN_OFFSETS_MS: [u64; 6] = [100, 500, 1000, 1500, 2000, 3000];
+/// perf-ab's definition (`ci/perf_ab.c` `RELEASE_TOLERANCE`): memory counts
+/// as released at the first sample within this many bytes of the final RSS.
+pub const THREAD_CHURN_RELEASE_TOLERANCE_BYTES: u64 = 1 << 20;
 /// Fixed literal worker counts. These are deliberately not topology-resolved;
 /// the runner records its own topology as metadata and labels oversubscription.
 /// Dense sweep up to 2x the 4-vCPU hosted runner's logical cores; the 6/8
@@ -174,7 +189,28 @@ pub enum ScalingPattern {
     /// live slots are still allocated; the next generation frees them, so only
     /// thread lifetime differs from the control (#478).
     LargeClassEphemeral,
+    /// `LargeClassEphemeral`'s exact stream (same seed tag, same plan), after
+    /// which every worker thread is joined and the child stays alive and idle,
+    /// sampling its own RSS at `THREAD_CHURN_POST_DRAIN_OFFSETS_MS` (#508).
+    /// Deliberately absent from `SCALING_PATTERNS`: it runs only at
+    /// `THREAD_CHURN_THREADS` workers and has its own report side-car.
+    ThreadChurn,
 }
+
+/// Every pattern a child request may name: the sweep plus `thread-churn`.
+const REQUESTABLE_PATTERNS: [ScalingPattern; 11] = [
+    ScalingPattern::TinyHot,
+    ScalingPattern::MixedGeneral,
+    ScalingPattern::LargeBuffers,
+    ScalingPattern::CrossThread,
+    ScalingPattern::Larson,
+    ScalingPattern::XmallocTest,
+    ScalingPattern::PowerOfTwoLarge,
+    ScalingPattern::RandomLarge,
+    ScalingPattern::LargeClassPersistent,
+    ScalingPattern::LargeClassEphemeral,
+    ScalingPattern::ThreadChurn,
+];
 
 pub const SCALING_PATTERNS: [ScalingPattern; 10] = [
     ScalingPattern::TinyHot,
@@ -209,11 +245,12 @@ impl ScalingPattern {
             Self::RandomLarge => "random-large",
             Self::LargeClassPersistent => "large-class-persistent",
             Self::LargeClassEphemeral => "large-class-ephemeral",
+            Self::ThreadChurn => "thread-churn",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        SCALING_PATTERNS
+        REQUESTABLE_PATTERNS
             .into_iter()
             .find(|pattern| pattern.as_str() == value)
     }
@@ -232,7 +269,10 @@ impl ScalingPattern {
             Self::RandomLarge => 0x0000_0008_726e_6408,
             // Deliberately one tag for both: the ephemeral workload must replay
             // the control's exact stream so thread lifetime is the only variable.
-            Self::LargeClassPersistent | Self::LargeClassEphemeral => 0x0000_0009_6c63_6c09,
+            // `ThreadChurn` shares it too: it is the ephemeral stream plus an idle tail.
+            Self::LargeClassPersistent | Self::LargeClassEphemeral | Self::ThreadChurn => {
+                0x0000_0009_6c63_6c09
+            }
         }
     }
 
@@ -252,6 +292,7 @@ impl ScalingPattern {
             Self::RandomLarge => "normal allocations with unbiased uniform integer requested sizes from 64 KiB through 4 MiB; eight live slots per worker, page-touched",
             Self::LargeClassPersistent => "unbiased uniform requested sizes from 96 KiB through 512 KiB on long-lived workers; eight live slots per worker, page-touched",
             Self::LargeClassEphemeral => "the large-class-persistent stream, run by each worker as 8 short-lived threads that exit still owning live blocks, which the next thread frees",
+            Self::ThreadChurn => "the large-class-ephemeral stream; then every worker thread is joined and the process stays alive and idle while it samples its own RSS at fixed times after the drain",
         }
     }
 
@@ -361,19 +402,21 @@ impl ScalingPattern {
                 page_touch: true,
                 mode: PatternMode::Slots,
             },
-            Self::LargeClassPersistent | Self::LargeClassEphemeral => PatternSpec {
-                min_size: 96 * 1024,
-                max_size: 512 * 1024,
-                log_uniform: false,
-                capacity: 8,
-                weight_alloc: 8,
-                weight_free_oldest: 6,
-                weight_free_random: 2,
-                weight_realloc: 0,
-                cross_thread: false,
-                page_touch: true,
-                mode: PatternMode::Slots,
-            },
+            Self::LargeClassPersistent | Self::LargeClassEphemeral | Self::ThreadChurn => {
+                PatternSpec {
+                    min_size: 96 * 1024,
+                    max_size: 512 * 1024,
+                    log_uniform: false,
+                    capacity: 8,
+                    weight_alloc: 8,
+                    weight_free_oldest: 6,
+                    weight_free_random: 2,
+                    weight_realloc: 0,
+                    cross_thread: false,
+                    page_touch: true,
+                    mode: PatternMode::Slots,
+                }
+            }
         }
     }
 
@@ -384,13 +427,20 @@ impl ScalingPattern {
                 | Self::RandomLarge
                 | Self::LargeClassPersistent
                 | Self::LargeClassEphemeral
+                | Self::ThreadChurn
         )
+    }
+
+    /// Whether the child stays alive after the drain and samples its own RSS
+    /// at `THREAD_CHURN_POST_DRAIN_OFFSETS_MS`.
+    pub const fn samples_after_drain(self) -> bool {
+        matches!(self, Self::ThreadChurn)
     }
 
     /// Short-lived threads each worker's stream is split across; 1 means the
     /// worker thread runs the whole stream itself.
     pub const fn generations(self) -> u32 {
-        if matches!(self, Self::LargeClassEphemeral) {
+        if matches!(self, Self::LargeClassEphemeral | Self::ThreadChurn) {
             8
         } else {
             1
@@ -933,7 +983,10 @@ impl ScalingChildRequest {
         if ScalingPattern::parse(&self.pattern).is_none() {
             return Err("scaling child request names an unknown pattern".into());
         }
-        if !SCALING_THREAD_POINTS.contains(&self.thread_count) {
+        if !SCALING_THREAD_POINTS.contains(&self.thread_count)
+            || (self.pattern()? == ScalingPattern::ThreadChurn
+                && self.thread_count != THREAD_CHURN_THREADS)
+        {
             return Err("scaling child request uses an undeclared thread count".into());
         }
         if self.operations_per_worker == 0
@@ -977,7 +1030,58 @@ pub struct ScalingChildResponse {
     pub elapsed_ns: u64,
     pub teardown_ns: u64,
     pub throughput_operations_per_second: f64,
+    /// `thread-churn` only (#508): nanoseconds from the drain -- every worker
+    /// joined -- to each RSS sample, one per `THREAD_CHURN_POST_DRAIN_OFFSETS_MS`
+    /// entry and never earlier than it. Empty, and absent from the JSON, for
+    /// every other pattern, so earlier rows keep their exact shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_drain_offsets_ns: Vec<u64>,
+    /// The child's own resident set (`/proc/self/statm`) at each of those
+    /// offsets, in bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_drain_rss_bytes: Vec<u64>,
 }
+
+impl ScalingChildResponse {
+    /// The post-drain samples are exactly one per fixed offset, taken no
+    /// earlier than it and in order, for `thread-churn`, and absent otherwise.
+    pub fn validate_post_drain(&self, pattern: ScalingPattern) -> Result<(), String> {
+        if !pattern.samples_after_drain() {
+            if self.post_drain_offsets_ns.is_empty() && self.post_drain_rss_bytes.is_empty() {
+                return Ok(());
+            }
+            return Err(format!(
+                "{} does not sample RSS after the drain",
+                pattern.as_str()
+            ));
+        }
+        let expected = THREAD_CHURN_POST_DRAIN_OFFSETS_MS.len();
+        if self.post_drain_offsets_ns.len() != expected
+            || self.post_drain_rss_bytes.len() != expected
+        {
+            return Err(format!(
+                "thread-churn must report exactly {expected} post-drain RSS samples"
+            ));
+        }
+        let mut previous = 0u64;
+        for ((observed, target_ms), rss) in self
+            .post_drain_offsets_ns
+            .iter()
+            .zip(THREAD_CHURN_POST_DRAIN_OFFSETS_MS)
+            .zip(&self.post_drain_rss_bytes)
+        {
+            if *observed < target_ms * NANOS_PER_MILLI || *observed <= previous || *rss == 0 {
+                return Err(
+                    "thread-churn post-drain samples are early, out of order, or empty".into(),
+                );
+            }
+            previous = *observed;
+        }
+        Ok(())
+    }
+}
+
+const NANOS_PER_MILLI: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1125,7 +1229,7 @@ impl ScalingChildResponse {
         {
             return Err("scaling child response contradicts its derived plan".into());
         }
-        Ok(())
+        self.validate_post_drain(pattern)
     }
 }
 
@@ -1213,6 +1317,18 @@ impl LiveTelemetry {
 pub fn execute_scaling_child_request<A: AllocatorAdapter>(
     adapter: &A,
     request: ScalingChildRequest,
+) -> Result<ScalingChildResponse, String> {
+    execute_scaling_child_request_with_rss_probe(adapter, request, &mut read_self_rss_bytes)
+}
+
+/// `execute_scaling_child_request` with the post-drain RSS reader supplied by
+/// the caller. Production passes `read_self_rss_bytes`; a test passes a probe
+/// that also checks what is true of the process at the moment it is sampled.
+/// Only `thread-churn` calls it, and only after every worker has been joined.
+pub fn execute_scaling_child_request_with_rss_probe<A: AllocatorAdapter>(
+    adapter: &A,
+    request: ScalingChildRequest,
+    rss_probe: &mut dyn FnMut() -> Result<u64, String>,
 ) -> Result<ScalingChildResponse, String> {
     request.validate()?;
     if adapter.allocator_id() != request.allocator.allocator_id
@@ -1331,6 +1447,14 @@ pub fn execute_scaling_child_request<A: AllocatorAdapter>(
         }
         Ok(tallies)
     })?;
+    // Every worker -- and every generation thread inside it -- has been
+    // joined above, so the process is now idle. Sample before anything else
+    // here allocates, so the harness does not disturb what it measures.
+    let (post_drain_offsets_ns, post_drain_rss_bytes) = if pattern.samples_after_drain() {
+        sample_after_drain(rss_probe)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let teardown_started = Instant::now();
     let mut counts = ScalingCounts::default();
     let mut remote_free_calls = 0u64;
@@ -1376,7 +1500,68 @@ pub fn execute_scaling_child_request<A: AllocatorAdapter>(
         teardown_ns,
         throughput_operations_per_second: operation_count as f64 * 1_000_000_000.0
             / elapsed_ns as f64,
+        post_drain_offsets_ns,
+        post_drain_rss_bytes,
     })
+}
+
+/// Sleep to each `THREAD_CHURN_POST_DRAIN_OFFSETS_MS` offset, measured from
+/// one instant so the offsets do not drift, and read RSS there. The readings
+/// go into fixed arrays first: nothing is allocated between the drain and the
+/// last sample.
+fn sample_after_drain(
+    rss_probe: &mut dyn FnMut() -> Result<u64, String>,
+) -> Result<(Vec<u64>, Vec<u64>), String> {
+    const SAMPLES: usize = THREAD_CHURN_POST_DRAIN_OFFSETS_MS.len();
+    let mut offsets = [0u64; SAMPLES];
+    let mut rss = [0u64; SAMPLES];
+    let drained = Instant::now();
+    for (index, target_ms) in THREAD_CHURN_POST_DRAIN_OFFSETS_MS.into_iter().enumerate() {
+        let target = Duration::from_millis(target_ms);
+        let elapsed = drained.elapsed();
+        if target > elapsed {
+            std::thread::sleep(target - elapsed);
+        }
+        offsets[index] = drained.elapsed().as_nanos() as u64;
+        rss[index] = rss_probe()?;
+    }
+    Ok((offsets.to_vec(), rss.to_vec()))
+}
+
+/// `_SC_PAGESIZE` on Linux (glibc and musl alike).
+#[cfg(target_os = "linux")]
+const LINUX_SC_PAGESIZE: std::os::raw::c_int = 30;
+/// Longer than `/proc/self/statm` can be: seven decimal page counts.
+const STATM_BUFFER_BYTES: usize = 256;
+
+/// This process's resident set in bytes, from `/proc/self/statm` exactly as
+/// `ci/perf_ab.c` reads it. The path and the read buffer live on the stack, so
+/// sampling allocates nothing through the allocator under test.
+#[cfg(target_os = "linux")]
+pub fn read_self_rss_bytes() -> Result<u64, String> {
+    extern "C" {
+        fn sysconf(name: std::os::raw::c_int) -> std::os::raw::c_long;
+    }
+    let mut buffer = [0u8; STATM_BUFFER_BYTES];
+    let length = std::fs::File::open("/proc/self/statm")
+        .and_then(|mut file| file.read(&mut buffer))
+        .map_err(|error| format!("read /proc/self/statm: {error}"))?;
+    let resident_pages = std::str::from_utf8(&buffer[..length])
+        .ok()
+        .and_then(|text| text.split_ascii_whitespace().nth(1))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or("/proc/self/statm has no resident page count")?;
+    let page_bytes = unsafe { sysconf(LINUX_SC_PAGESIZE) };
+    if page_bytes <= 0 {
+        return Err("sysconf(_SC_PAGESIZE) failed".into());
+    }
+    Ok(resident_pages * page_bytes as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_self_rss_bytes() -> Result<u64, String> {
+    let _ = STATM_BUFFER_BYTES;
+    Err("post-drain RSS sampling reads /proc/self/statm and is Linux-only".into())
 }
 
 /// Live blocks for one worker, indexed by planner slot. Held outside the
@@ -1568,6 +1753,8 @@ fn execute_larson_rotation<A: AllocatorAdapter>(
         teardown_ns,
         throughput_operations_per_second: operation_count as f64 * 1_000_000_000.0
             / elapsed_ns as f64,
+        post_drain_offsets_ns: Vec::new(),
+        post_drain_rss_bytes: Vec::new(),
     })
 }
 
@@ -2156,6 +2343,11 @@ pub struct ScalingRawRun {
     pub allocators: Vec<AllocatorBuildIdentity>,
     pub calibrations: Vec<ScalingCalibration>,
     pub samples: Vec<ScalingRawSample>,
+    /// `thread-churn` (#508): `THREAD_CHURN_BLOCKS` paired blocks at
+    /// `THREAD_CHURN_THREADS` workers, recorded by the shard that measures that
+    /// worker count. Kept out of `samples` because it is not a sweep cell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thread_churn_samples: Vec<ScalingRawSample>,
 }
 
 pub fn merge_scaling_runs(mut shards: Vec<ScalingRawRun>) -> Result<ScalingRawRun, String> {
@@ -2201,9 +2393,18 @@ pub fn merge_scaling_runs(mut shards: Vec<ScalingRawRun>) -> Result<ScalingRawRu
         {
             return Err("scaling shards overlap on a matrix cell".into());
         }
+        if !merged.thread_churn_samples.is_empty() && !shard.thread_churn_samples.is_empty() {
+            return Err("scaling shards overlap on the thread-churn workload".into());
+        }
         merged.calibrations.extend(shard.calibrations);
         merged.samples.extend(shard.samples);
+        merged
+            .thread_churn_samples
+            .extend(shard.thread_churn_samples);
     }
+    merged
+        .thread_churn_samples
+        .sort_by_key(|value| (value.block_id, value.ordinal));
     merged
         .calibrations
         .sort_by_key(|value| (value.pattern.clone(), value.thread_count));
@@ -2240,6 +2441,8 @@ pub fn merge_scaling_runs(mut shards: Vec<ScalingRawRun>) -> Result<ScalingRawRu
             })
         })
     });
+    let complete = complete
+        && merged.thread_churn_samples.len() == THREAD_CHURN_BLOCKS as usize * ALLOCATOR_IDS.len();
     merged.status = if complete { "complete" } else { "incomplete" }.into();
     if complete {
         validate_scaling_raw_run(&merged)?;
@@ -2330,6 +2533,184 @@ pub struct ScalingRssReport {
     pub cell_summaries: Vec<ScalingRssCellSummary>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadChurnSampling {
+    pub peak_source: String,
+    pub post_drain_source: String,
+    pub release_definition: String,
+}
+
+/// One allocator's `thread-churn` distribution: P5/P50/P95 of the peak and of
+/// each post-drain sample (one entry per `post_drain_offsets_ms`), and of the
+/// per-run release time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadChurnCellSummary {
+    pub allocator_id: String,
+    pub block_count: u32,
+    pub median_peak_rss_bytes: u64,
+    pub p05_peak_rss_bytes: u64,
+    pub p95_peak_rss_bytes: u64,
+    pub median_post_drain_rss_bytes: Vec<u64>,
+    pub p05_post_drain_rss_bytes: Vec<u64>,
+    pub p95_post_drain_rss_bytes: Vec<u64>,
+    pub median_release_ms: u64,
+    pub p95_release_ms: u64,
+}
+
+/// The `thread-churn` side-car (#508): RSS after the work stops. Optional in
+/// the report, like `rss`, so rows published before it keep their shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadChurnReport {
+    pub metric_schema_version: String,
+    pub source_pattern: String,
+    pub thread_count: u32,
+    pub generations: u32,
+    pub block_count: u32,
+    pub post_drain_offsets_ms: Vec<u64>,
+    pub release_tolerance_bytes: u64,
+    pub sampling: ThreadChurnSampling,
+    pub cell_summaries: Vec<ThreadChurnCellSummary>,
+    pub raw_samples: Vec<ScalingRawSample>,
+}
+
+pub fn thread_churn_sampling() -> ThreadChurnSampling {
+    ThreadChurnSampling {
+        peak_source: "external /proc/<pid>/smaps_rollup Rss polled from child spawn through exit, the same peak the sweep publishes".into(),
+        post_drain_source: "the child's own /proc/self/statm resident pages x page size, read in-process after every worker thread was joined, at fixed offsets from that instant".into(),
+        release_definition: "per run, the first post-drain offset whose RSS is within release_tolerance_bytes of the last sample's (perf-ab's definition); P50/P95 across runs".into(),
+    }
+}
+
+/// Per-run release time: the first offset within the tolerance of the final
+/// sample. The final sample always qualifies, so this is total.
+pub fn thread_churn_release_ms(post_drain_rss_bytes: &[u64]) -> u64 {
+    let last = post_drain_rss_bytes.last().copied().unwrap_or(0);
+    post_drain_rss_bytes
+        .iter()
+        .zip(THREAD_CHURN_POST_DRAIN_OFFSETS_MS)
+        .find(|(rss, _)| **rss <= last.saturating_add(THREAD_CHURN_RELEASE_TOLERANCE_BYTES))
+        .map(|(_, offset)| offset)
+        .unwrap_or(THREAD_CHURN_POST_DRAIN_OFFSETS_MS[THREAD_CHURN_POST_DRAIN_OFFSETS_MS.len() - 1])
+}
+
+fn percentiles_u64(mut values: Vec<u64>) -> (u64, u64, u64) {
+    values.sort_unstable();
+    (
+        quantile_u64_sorted(&values, 0.05),
+        quantile_u64_sorted(&values, 0.50),
+        quantile_u64_sorted(&values, 0.95),
+    )
+}
+
+pub fn build_thread_churn_report(samples: &[ScalingRawSample]) -> ThreadChurnReport {
+    let mut cell_summaries = Vec::new();
+    for allocator in ALLOCATOR_IDS {
+        let runs = samples
+            .iter()
+            .filter(|sample| sample.allocator_id == allocator)
+            .collect::<Vec<_>>();
+        let (p05_peak, median_peak, p95_peak) =
+            percentiles_u64(runs.iter().map(|sample| sample.peak_rss_bytes).collect());
+        let mut p05_post = Vec::new();
+        let mut median_post = Vec::new();
+        let mut p95_post = Vec::new();
+        for index in 0..THREAD_CHURN_POST_DRAIN_OFFSETS_MS.len() {
+            let (p05, median, p95) = percentiles_u64(
+                runs.iter()
+                    .map(|sample| sample.response.post_drain_rss_bytes[index])
+                    .collect(),
+            );
+            p05_post.push(p05);
+            median_post.push(median);
+            p95_post.push(p95);
+        }
+        let (_, median_release, p95_release) = percentiles_u64(
+            runs.iter()
+                .map(|sample| thread_churn_release_ms(&sample.response.post_drain_rss_bytes))
+                .collect(),
+        );
+        cell_summaries.push(ThreadChurnCellSummary {
+            allocator_id: allocator.into(),
+            block_count: runs.len() as u32,
+            median_peak_rss_bytes: median_peak,
+            p05_peak_rss_bytes: p05_peak,
+            p95_peak_rss_bytes: p95_peak,
+            median_post_drain_rss_bytes: median_post,
+            p05_post_drain_rss_bytes: p05_post,
+            p95_post_drain_rss_bytes: p95_post,
+            median_release_ms: median_release,
+            p95_release_ms: p95_release,
+        });
+    }
+    ThreadChurnReport {
+        metric_schema_version: THREAD_CHURN_SCHEMA_VERSION.into(),
+        source_pattern: ScalingPattern::LargeClassEphemeral.as_str().into(),
+        thread_count: THREAD_CHURN_THREADS,
+        generations: ScalingPattern::ThreadChurn.generations(),
+        block_count: THREAD_CHURN_BLOCKS,
+        post_drain_offsets_ms: THREAD_CHURN_POST_DRAIN_OFFSETS_MS.to_vec(),
+        release_tolerance_bytes: THREAD_CHURN_RELEASE_TOLERANCE_BYTES,
+        sampling: thread_churn_sampling(),
+        cell_summaries,
+        raw_samples: samples.to_vec(),
+    }
+}
+
+pub fn validate_thread_churn_report(report: &ThreadChurnReport) -> Result<(), String> {
+    if report.metric_schema_version != THREAD_CHURN_SCHEMA_VERSION
+        || report.source_pattern != ScalingPattern::LargeClassEphemeral.as_str()
+        || report.thread_count != THREAD_CHURN_THREADS
+        || report.generations != ScalingPattern::ThreadChurn.generations()
+        || report.block_count != THREAD_CHURN_BLOCKS
+        || report.post_drain_offsets_ms != THREAD_CHURN_POST_DRAIN_OFFSETS_MS.to_vec()
+        || report.release_tolerance_bytes != THREAD_CHURN_RELEASE_TOLERANCE_BYTES
+        || report.sampling != thread_churn_sampling()
+        || report.raw_samples.len() != THREAD_CHURN_BLOCKS as usize * ALLOCATOR_IDS.len()
+    {
+        return Err(
+            "thread-churn side-car has an invalid schema, protocol, or sample count".into(),
+        );
+    }
+    for sample in &report.raw_samples {
+        validate_sample_identity(sample)?;
+        sample
+            .response
+            .validate_post_drain(ScalingPattern::ThreadChurn)?;
+    }
+    let rebuilt = build_thread_churn_report(&report.raw_samples);
+    if rebuilt.cell_summaries != report.cell_summaries {
+        return Err("thread-churn summaries differ from their raw samples".into());
+    }
+    for summary in &report.cell_summaries {
+        let ordered = |low: u64, middle: u64, high: u64| low <= middle && middle <= high;
+        if summary.block_count != THREAD_CHURN_BLOCKS
+            || summary.median_peak_rss_bytes == 0
+            || !ordered(
+                summary.p05_peak_rss_bytes,
+                summary.median_peak_rss_bytes,
+                summary.p95_peak_rss_bytes,
+            )
+            || summary.median_release_ms > summary.p95_release_ms
+            || (0..THREAD_CHURN_POST_DRAIN_OFFSETS_MS.len()).any(|index| {
+                !ordered(
+                    summary.p05_post_drain_rss_bytes[index],
+                    summary.median_post_drain_rss_bytes[index],
+                    summary.p95_post_drain_rss_bytes[index],
+                )
+            })
+        {
+            return Err(format!(
+                "thread-churn summary for {} is invalid",
+                summary.allocator_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn rss_sampling() -> ScalingRssSampling {
     ScalingRssSampling {
         source: "external /proc/<pid>/smaps_rollup Rss, parsed as integer kB * 1024".into(),
@@ -2360,6 +2741,10 @@ pub struct ScalingMetricReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rss: Option<ScalingRssReport>,
     pub raw_samples: Vec<ScalingRawSample>,
+    /// `thread-churn` side-car (#508). Absent in rows published before it;
+    /// deliberately not carried into history rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_churn: Option<ThreadChurnReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2534,18 +2919,13 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
     for sample in &raw.samples {
         let pattern = ScalingPattern::parse(&sample.pattern)
             .ok_or_else(|| "scaling sample names an unknown pattern".to_string())?;
-        if !SCALING_THREAD_POINTS.contains(&sample.thread_count) {
-            return Err("scaling sample uses an undeclared thread count".into());
+        if !SCALING_PATTERNS.contains(&pattern) {
+            return Err(format!(
+                "scaling sample names {}, which is not a sweep pattern",
+                sample.pattern
+            ));
         }
-        if !ALLOCATOR_IDS.contains(&sample.allocator_id.as_str())
-            || sample.metric_schema_version != SCALING_SCHEMA_VERSION
-            || sample.ordinal >= ALLOCATOR_IDS.len() as u8
-            || sample.reproduction_command.is_empty()
-            || !is_lower_hex(&sample.allocator_source_sha, 40)
-            || !is_lower_hex(&sample.child_binary_sha256, 64)
-        {
-            return Err("scaling sample has invalid identity fields".into());
-        }
+        validate_sample_identity(sample)?;
         let key = (sample.pattern.clone(), sample.thread_count);
         let calibration = frozen
             .get(&key)
@@ -2584,7 +2964,6 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
                 sample.operations_per_worker,
             )
         });
-        let response = &sample.response;
         let metadata = simulate_plan_metadata(
             pattern,
             raw.run_seed,
@@ -2592,44 +2971,22 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
             sample.block_id,
             sample.operations_per_worker,
         );
-        // The published number is throughput, so it is re-derived too; checking
-        // only that it is finite would let an arbitrary value reach the chart.
-        let expected_throughput =
-            expected.operation_count() as f64 * 1_000_000_000.0 / response.elapsed_ns as f64;
-        let tolerance = (expected_throughput.abs() * 1e-12).max(f64::EPSILON);
-        if response.alloc_calls != expected.alloc_calls
-            || response.realloc_calls != expected.realloc_calls
-            || response.free_calls != expected.free_calls
-            || response.operation_count != expected.operation_count()
-            || response.checksum != expected.checksum
+        if !response_matches_plan(sample, pattern, &expected, &metadata)
             || (pattern.is_distribution()
-                && (response.worker_seeds != metadata.worker_seeds
-                    || response.size_histogram != metadata.size_histogram
-                    || response.peak_live_requested_bytes != metadata.peak_live_requested_bytes
-                    || sample.live_requested_bytes_at_diagnostic_peak_rss
-                        > metadata.peak_live_requested_bytes
+                && (sample.live_requested_bytes_at_diagnostic_peak_rss
+                    > metadata.peak_live_requested_bytes
                     || sample.diagnostic_peak_live_requested_bytes == 0
                     || sample.diagnostic_peak_live_requested_bytes
                         > metadata.peak_live_requested_bytes
                     || sample.live_requested_bytes_at_diagnostic_peak_rss
                         > sample.diagnostic_peak_live_requested_bytes))
-            || response.thread_count != sample.thread_count
-            || response.allocator_id != sample.allocator_id
-            || response.protocol_version != SCALING_CHILD_PROTOCOL_VERSION
-            || response.metric_schema_version != SCALING_SCHEMA_VERSION
-            || response.elapsed_ns == 0
-            || !response.throughput_operations_per_second.is_finite()
-            || response.throughput_operations_per_second <= 0.0
-            || (response.throughput_operations_per_second - expected_throughput).abs() > tolerance
-            || (!pattern.spec().cross_thread
-                && (response.remote_free_calls != 0 || response.producer_fallback_frees != 0))
-            || (pattern.spec().cross_thread && response.remote_free_calls > response.free_calls)
         {
             return Err(format!(
                 "scaling sample for {}/{} on {} contradicts its derived plan",
                 sample.pattern, sample.thread_count, sample.allocator_id
             ));
         }
+        sample.response.validate_post_drain(pattern)?;
         blocks
             .entry((
                 sample.pattern.clone(),
@@ -2666,6 +3023,158 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
                 "scaling block {key:?} is not a complete paired block of five allocators"
             ));
         }
+    }
+    let source = frozen
+        .get(&(
+            ScalingPattern::LargeClassEphemeral.as_str().to_string(),
+            THREAD_CHURN_THREADS,
+        ))
+        .ok_or("scaling raw run has no large-class-ephemeral calibration for thread-churn")?;
+    validate_thread_churn_samples(
+        raw.run_seed,
+        &raw.thread_churn_samples,
+        source.operations_per_worker,
+        THREAD_CHURN_BLOCKS,
+    )
+}
+
+/// Identity fields every raw sample carries, whatever it measured.
+fn validate_sample_identity(sample: &ScalingRawSample) -> Result<(), String> {
+    if !SCALING_THREAD_POINTS.contains(&sample.thread_count) {
+        return Err("scaling sample uses an undeclared thread count".into());
+    }
+    if !ALLOCATOR_IDS.contains(&sample.allocator_id.as_str())
+        || sample.metric_schema_version != SCALING_SCHEMA_VERSION
+        || sample.ordinal >= ALLOCATOR_IDS.len() as u8
+        || sample.reproduction_command.is_empty()
+        || !is_lower_hex(&sample.allocator_source_sha, 40)
+        || !is_lower_hex(&sample.child_binary_sha256, 64)
+    {
+        return Err("scaling sample has invalid identity fields".into());
+    }
+    Ok(())
+}
+
+/// The child's response against the plan re-derived from the seed chain.
+/// The published number is throughput, so it is re-derived too; checking only
+/// that it is finite would let an arbitrary value reach the chart.
+fn response_matches_plan(
+    sample: &ScalingRawSample,
+    pattern: ScalingPattern,
+    expected: &ScalingCounts,
+    metadata: &ScalingPlanMetadata,
+) -> bool {
+    let response = &sample.response;
+    let expected_throughput =
+        expected.operation_count() as f64 * 1_000_000_000.0 / response.elapsed_ns as f64;
+    let tolerance = (expected_throughput.abs() * 1e-12).max(f64::EPSILON);
+    !(response.alloc_calls != expected.alloc_calls
+        || response.realloc_calls != expected.realloc_calls
+        || response.free_calls != expected.free_calls
+        || response.operation_count != expected.operation_count()
+        || response.checksum != expected.checksum
+        || (pattern.is_distribution()
+            && (response.worker_seeds != metadata.worker_seeds
+                || response.size_histogram != metadata.size_histogram
+                || response.peak_live_requested_bytes != metadata.peak_live_requested_bytes))
+        || response.thread_count != sample.thread_count
+        || response.allocator_id != sample.allocator_id
+        || response.protocol_version != SCALING_CHILD_PROTOCOL_VERSION
+        || response.metric_schema_version != SCALING_SCHEMA_VERSION
+        || response.elapsed_ns == 0
+        || !response.throughput_operations_per_second.is_finite()
+        || response.throughput_operations_per_second <= 0.0
+        || (response.throughput_operations_per_second - expected_throughput).abs() > tolerance
+        || (!pattern.spec().cross_thread
+            && (response.remote_free_calls != 0 || response.producer_fallback_frees != 0))
+        || (pattern.spec().cross_thread && response.remote_free_calls > response.free_calls))
+}
+
+/// `thread-churn` samples: complete paired blocks at `THREAD_CHURN_THREADS`,
+/// each replaying large-class-ephemeral's plan at that cell's frozen operation
+/// count -- the same counts and checksum as the sweep's own block -- with one
+/// post-drain RSS sample per fixed offset. `blocks` is `THREAD_CHURN_BLOCKS`
+/// for a complete run.
+pub fn validate_thread_churn_samples(
+    run_seed: u64,
+    samples: &[ScalingRawSample],
+    operations_per_worker: u64,
+    blocks: u32,
+) -> Result<(), String> {
+    let pattern = ScalingPattern::ThreadChurn;
+    if samples.len() != blocks as usize * ALLOCATOR_IDS.len() {
+        return Err(format!(
+            "thread-churn has {} samples, expected {} paired blocks of {} allocators",
+            samples.len(),
+            blocks,
+            ALLOCATOR_IDS.len()
+        ));
+    }
+    let mut seen: BTreeSet<(u32, &str)> = BTreeSet::new();
+    let mut ordinals: BTreeMap<u32, BTreeSet<u8>> = BTreeMap::new();
+    let mut plans: BTreeMap<u32, (ScalingCounts, ScalingPlanMetadata)> = BTreeMap::new();
+    for sample in samples {
+        validate_sample_identity(sample)?;
+        if sample.pattern != pattern.as_str()
+            || sample.thread_count != THREAD_CHURN_THREADS
+            || sample.block_id >= blocks
+        {
+            return Err("thread-churn sample names another pattern, worker count, or block".into());
+        }
+        if sample.operations_per_worker != operations_per_worker {
+            return Err(
+                "thread-churn did not replay large-class-ephemeral's frozen operation count".into(),
+            );
+        }
+        if sample.peak_rss_bytes == 0
+            || sample.diagnostic_peak_rss_bytes != 0
+            || sample.live_requested_bytes_at_diagnostic_peak_rss != 0
+            || sample.diagnostic_peak_live_requested_bytes != 0
+        {
+            return Err(format!(
+                "thread-churn sample on {} has no peak RSS or carries a diagnostic replay",
+                sample.allocator_id
+            ));
+        }
+        let (expected, metadata) = plans.entry(sample.block_id).or_insert_with(|| {
+            (
+                simulate_cell(
+                    pattern,
+                    run_seed,
+                    THREAD_CHURN_THREADS,
+                    sample.block_id,
+                    operations_per_worker,
+                ),
+                simulate_plan_metadata(
+                    pattern,
+                    run_seed,
+                    THREAD_CHURN_THREADS,
+                    sample.block_id,
+                    operations_per_worker,
+                ),
+            )
+        });
+        if !response_matches_plan(sample, pattern, expected, metadata) {
+            return Err(format!(
+                "thread-churn sample on {} contradicts its derived plan",
+                sample.allocator_id
+            ));
+        }
+        sample.response.validate_post_drain(pattern)?;
+        if !seen.insert((sample.block_id, sample.allocator_id.as_str())) {
+            return Err("thread-churn has a duplicate sample".into());
+        }
+        ordinals
+            .entry(sample.block_id)
+            .or_default()
+            .insert(sample.ordinal);
+    }
+    if ordinals.len() != blocks as usize
+        || ordinals
+            .values()
+            .any(|seen| seen.len() != ALLOCATOR_IDS.len())
+    {
+        return Err("thread-churn blocks are not complete paired blocks of five allocators".into());
     }
     Ok(())
 }
@@ -2780,6 +3289,7 @@ pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, 
             cell_summaries: rss_cell_summaries,
         }),
         raw_samples: raw.samples.clone(),
+        thread_churn: Some(build_thread_churn_report(&raw.thread_churn_samples)),
     })
 }
 
@@ -2912,7 +3422,13 @@ pub fn validate_scaling_report(report: &ScalingMetricReport) -> Result<(), Strin
             }
         }
     }
-    Ok(())
+    // A fresh report always carries the thread-churn side-car; only rows
+    // published before #508 lack it, and those are never re-validated here.
+    let thread_churn = report
+        .thread_churn
+        .as_ref()
+        .ok_or("scaling report is missing its thread-churn side-car")?;
+    validate_thread_churn_report(thread_churn)
 }
 
 /// Build a complete, internally consistent raw run without spawning children.
@@ -3130,10 +3646,97 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                             throughput_operations_per_second: operation_count as f64
                                 * 1_000_000_000.0
                                 / elapsed_ns as f64,
+                            post_drain_offsets_ns: Vec::new(),
+                            post_drain_rss_bytes: Vec::new(),
                         },
                     });
                 }
             }
+        }
+    }
+    let mut thread_churn_samples = Vec::new();
+    for block_id in 0..THREAD_CHURN_BLOCKS {
+        let pattern = ScalingPattern::ThreadChurn;
+        let expected = simulate_cell(
+            pattern,
+            run_seed,
+            THREAD_CHURN_THREADS,
+            block_id,
+            operations_per_worker,
+        );
+        let metadata = simulate_plan_metadata(
+            pattern,
+            run_seed,
+            THREAD_CHURN_THREADS,
+            block_id,
+            operations_per_worker,
+        );
+        for (ordinal, allocator) in ALLOCATOR_IDS.into_iter().enumerate() {
+            let identity = allocators
+                .iter()
+                .find(|value| value.allocator_id == allocator)
+                .ok_or_else(|| format!("fixture is missing {allocator}"))?;
+            // Synthetic release curves (MiB at each offset): the fork gives its
+            // memory back by the bound, the others hold more of it, so the
+            // renderer and the release-time table see distinct shapes.
+            let retained_mib: [u64; 6] = match allocator {
+                "mimalloc-pprof" => [150, 90, 30, 6, 5, 5],
+                "bun-mimalloc" => [170, 170, 160, 150, 140, 140],
+                "upstream-mimalloc" => [175, 175, 175, 170, 170, 170],
+                "tcmalloc" => [190, 190, 190, 190, 190, 190],
+                _ => [120, 100, 90, 90, 90, 90],
+            };
+            let jitter = u64::from(block_id % 3) * 4096;
+            let elapsed_ns = SCALING_TARGET_BLOCK_NS + u64::from(block_id) * 1_000_000;
+            thread_churn_samples.push(ScalingRawSample {
+                metric_schema_version: SCALING_SCHEMA_VERSION.into(),
+                block_id,
+                ordinal: ordinal as u8,
+                pattern: pattern.as_str().into(),
+                thread_count: THREAD_CHURN_THREADS,
+                allocator_id: allocator.into(),
+                allocator_source_sha: identity.source_sha.clone(),
+                child_binary_sha256: identity.child_binary_sha256.clone(),
+                operations_per_worker,
+                peak_rss_bytes: (200 + ordinal as u64 * 6 + u64::from(block_id % 5)) * 1024 * 1024,
+                diagnostic_peak_rss_bytes: 0,
+                live_requested_bytes_at_diagnostic_peak_rss: 0,
+                diagnostic_peak_live_requested_bytes: 0,
+                reproduction_command: format!(
+                    "benchmark-scaling-run --run-seed {run_seed} # thread-churn/{THREAD_CHURN_THREADS}"
+                ),
+                response: ScalingChildResponse {
+                    protocol_version: SCALING_CHILD_PROTOCOL_VERSION.into(),
+                    metric_schema_version: SCALING_SCHEMA_VERSION.into(),
+                    allocator_id: allocator.into(),
+                    thread_count: THREAD_CHURN_THREADS,
+                    alloc_calls: expected.alloc_calls,
+                    realloc_calls: expected.realloc_calls,
+                    free_calls: expected.free_calls,
+                    operation_count: expected.operation_count(),
+                    checksum: expected.checksum,
+                    worker_seeds: metadata.worker_seeds.clone(),
+                    size_histogram: metadata.size_histogram.clone(),
+                    peak_live_requested_bytes: metadata.peak_live_requested_bytes,
+                    remote_free_calls: 0,
+                    producer_fallback_frees: 0,
+                    setup_ns: 1,
+                    warmup_ns: 0,
+                    elapsed_ns,
+                    teardown_ns: 1,
+                    throughput_operations_per_second: expected.operation_count() as f64
+                        * 1_000_000_000.0
+                        / elapsed_ns as f64,
+                    post_drain_offsets_ns: THREAD_CHURN_POST_DRAIN_OFFSETS_MS
+                        .iter()
+                        .map(|offset| offset * NANOS_PER_MILLI + 50_000 + u64::from(block_id))
+                        .collect(),
+                    post_drain_rss_bytes: retained_mib
+                        .iter()
+                        .map(|mib| mib * 1024 * 1024 + jitter)
+                        .collect(),
+                },
+            });
         }
     }
     Ok(ScalingRawRun {
@@ -3154,6 +3757,7 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
         allocators,
         calibrations,
         samples,
+        thread_churn_samples,
     })
 }
 

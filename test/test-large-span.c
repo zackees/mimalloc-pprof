@@ -12,6 +12,9 @@
        out-of-range read: `mi_arenas_page_try_find_abandoned` checked the caller's span, which
        runs past a compact page into slices of no page; an MI_DEBUG_INTERNAL build aborts on it.)
    (d) the opt-out: with `mi_option_large_span` off every large page is 4 MiB again.
+   (e) one overflow is not demand: a bin that once holds one block more than its compact page
+       gets a second compact page, not a larger one (the growth hysteresis,
+       MI_LARGE_SPAN_GROW_REQUESTS).
 
    Deterministic: structural checks on the pages the blocks land in (`page->memid`, `reserved`,
    `capacity`), no RSS and no timing. ctest turns the scavenger and the hole sweep off so no
@@ -42,6 +45,7 @@
 #define SIZE_C      (300 * 1024)
 #define SIZE_DECAY  (100 * 1024)
 #define SIZE_OFF    (400 * 1024)
+#define SIZE_BLIP   (250 * 1024)
 #define MAX_BLOCKS  (512)
 
 /* ---- portable threading (from test/test-memory-gate.c) ------------------- */
@@ -268,6 +272,27 @@ static void case_c(void) {
   thread_join(grower);
 }
 
+/* ---- (e) one overflow does not grow the span -------------------------------- */
+
+static void case_blip(void) {
+  #if MI_LARGE_SPAN
+  void* blocks[MAX_BLOCKS];
+  size_t n = 0;
+  void* const first = mi_malloc(SIZE_BLIP);
+  assert(first != NULL);
+  blocks[n++] = first;
+  const mi_page_t* const page = _mi_ptr_page(first);
+  while (n < MAX_BLOCKS && page->used < page->reserved) { blocks[n] = mi_malloc(SIZE_BLIP); assert(blocks[n] != NULL); n++; }
+  void* const extra = mi_malloc(SIZE_BLIP);   // the compact page is full: one page request, after a full page
+  assert(extra != NULL);
+  fprintf(stderr, "(e) %zu blocks fill the first page (span %zu); the one more lands in a page of span %zu\n",
+          n, span_of(first), span_of(extra));
+  CHECK(span_is_compact(first) && span_is_compact(extra), "(e) one overflow should not grow the span (%zu -> %zu slices)", span_of(first), span_of(extra));
+  mi_free(extra);
+  free_all(blocks, n);
+  #endif
+}
+
 /* ---- (d) the opt-out ----------------------------------------------------- */
 
 static void case_off(void) {
@@ -306,6 +331,7 @@ int main(void) {
   case_decay();
   case_c();
   case_off();
+  case_blip();
   #endif
   if (failures > 0) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
   fprintf(stderr, "ok\n");

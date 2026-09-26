@@ -24,12 +24,13 @@ terms of the MIT license. A copy of the license can be found in the file
         only when the bin has no page with a free block left on the theap.
     Nothing is allocated (rule 4) and the malloc/free fast paths are untouched (rule 6): the
     state is a small table at the end of `mi_theap_t`.
-  - Policy: a request after a page of the bin filled up is demand beyond the pages the theap has,
-    so the span steps up (x 2^MI_LARGE_SPAN_GROW_SHIFT, up to MI_LARGE_PAGE_SIZE). A request
-    without one means the bin's last page emptied and went away; after
-    MI_LARGE_SPAN_DECAY_REQUESTS of those in a row the span steps back down. A bin's first page is
-    compact (MI_LARGE_SPAN_COMPACT_SLICES). A bin a theap keeps filling (perf-ab's large-class
-    rows) reaches and keeps the full span; a bin with a few live blocks stays compact.
+  - Policy: a request after a page of the bin filled up is demand beyond the pages the theap has;
+    a request without one means the bin's last page emptied and went away. The bin counts them
+    against each other (+1 / -1): at MI_LARGE_SPAN_GROW_REQUESTS the span steps up
+    (x 2^MI_LARGE_SPAN_GROW_SHIFT, up to MI_LARGE_PAGE_SIZE), at -MI_LARGE_SPAN_DECAY_REQUESTS it
+    steps back down. A bin's first page is compact (MI_LARGE_SPAN_COMPACT_SLICES). A bin a theap
+    keeps filling reaches and keeps the full span; a bin with a few live blocks stays compact, and
+    one extra block now and then (a compact page of the top bins holds two) does not grow it.
   - Deterministic per theap: no thread count, no clock. (#443 chose the span from the number of
     live threads at the time the page was created; the owner rejected that.)
 
@@ -56,23 +57,27 @@ static size_t mi_large_span_index(size_t block_size) {
   return (idx < MI_LARGE_SPAN_BINS ? idx : MI_LARGE_SPAN_BINS);
 }
 
-#if MI_LARGE_SPAN_DECAY_REQUESTS < 1 || MI_LARGE_SPAN_DECAY_REQUESTS > 15
-#error "MI_LARGE_SPAN_DECAY_REQUESTS must be 1..15 (a 4-bit count, see mi_large_span_bin_t)"
+#if MI_LARGE_SPAN_GROW_REQUESTS < 1 || MI_LARGE_SPAN_GROW_REQUESTS > 7 || MI_LARGE_SPAN_DECAY_REQUESTS < 1 || MI_LARGE_SPAN_DECAY_REQUESTS > 8
+#error "MI_LARGE_SPAN_GROW_REQUESTS must be 1..7 and MI_LARGE_SPAN_DECAY_REQUESTS 1..8 (a 4-bit signed count, see mi_large_span_bin_t)"
 #endif
 #if MI_LARGE_SPAN_GROW_SHIFT < 1 || MI_LARGE_SPAN_COMPACT_SLICES < 1
 #error "MI_LARGE_SPAN_GROW_SHIFT and MI_LARGE_SPAN_COMPACT_SLICES must be at least 1"
 #endif
 
-// the fields of the one-byte state of a bin (see mi_large_span_bin_t in types.h)
-#define MI_LARGE_SPAN_LEVEL_MASK   (0x07)
-#define MI_LARGE_SPAN_FULL_BIT     (0x08)
-#define MI_LARGE_SPAN_QUIET_SHIFT  (4)
+// the fields of the one-byte state of a bin (see mi_large_span_bin_t in types.h); all zero is a
+// bin that has seen nothing: compact, no pressure
+#define MI_LARGE_SPAN_LEVEL_MASK      (0x07)
+#define MI_LARGE_SPAN_FULL_BIT        (0x08)
+#define MI_LARGE_SPAN_PRESSURE_SHIFT  (4)
 
 static size_t mi_large_span_level(mi_large_span_bin_t b) { return (b & MI_LARGE_SPAN_LEVEL_MASK); }
-static size_t mi_large_span_quiet(mi_large_span_bin_t b) { return (b >> MI_LARGE_SPAN_QUIET_SHIFT); }
-static mi_large_span_bin_t mi_large_span_pack(size_t level, size_t quiet) {
-  mi_assert_internal(level <= MI_LARGE_SPAN_LEVEL_MASK && quiet < 16);
-  return (mi_large_span_bin_t)((quiet << MI_LARGE_SPAN_QUIET_SHIFT) | level);   // (the full bit clear)
+static long mi_large_span_pressure(mi_large_span_bin_t b) {
+  const long p = (long)(b >> MI_LARGE_SPAN_PRESSURE_SHIFT);   // 0..15
+  return (p >= 8 ? p - 16 : p);                               // -8..7
+}
+static mi_large_span_bin_t mi_large_span_pack(size_t level, long pressure) {
+  mi_assert_internal(level <= MI_LARGE_SPAN_LEVEL_MASK && pressure >= -8 && pressure <= 7);
+  return (mi_large_span_bin_t)((((unsigned long)pressure & 0x0F) << MI_LARGE_SPAN_PRESSURE_SHIFT) | level);   // (the full bit clear)
 }
 
 // the span of `level`, uncapped (the shift is bounded: a level only grows while below the full span)
@@ -99,21 +104,27 @@ size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhe
 
   const mi_large_span_bin_t b = theap->large_span[idx];
   size_t level = mi_large_span_level(b);
-  size_t quiet = mi_large_span_quiet(b);
+  long pressure = mi_large_span_pressure(b);
   if ((b & MI_LARGE_SPAN_FULL_BIT) != 0) {
-    // the bin filled a page since its last request: demand beyond what the theap holds
-    if (mi_large_span_level_slices(level) < full && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; }
-    quiet = 0;
+    // a page of the bin filled up since its last request: demand beyond what the theap holds
+    pressure++;
+    if (pressure >= MI_LARGE_SPAN_GROW_REQUESTS) {
+      if (mi_large_span_level_slices(level) < full && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; }
+      pressure = 0;
+    }
   }
   else if (level > 0) {
     // the bin's last page emptied and went away without filling up
-    quiet++;
-    if (quiet >= MI_LARGE_SPAN_DECAY_REQUESTS) {
+    pressure--;
+    if (pressure <= -MI_LARGE_SPAN_DECAY_REQUESTS) {
       level--;
-      quiet = 0;
+      pressure = 0;
     }
   }
-  theap->large_span[idx] = mi_large_span_pack(level, quiet);
+  else if (pressure > 0) {
+    pressure--;   // (at the compact span only a pending step up can fade)
+  }
+  theap->large_span[idx] = mi_large_span_pack(level, pressure);
 
   size_t slices = mi_large_span_level_slices(level);
   const size_t min_slices = mi_slice_count_of_size(MI_LARGE_SPAN_MIN_BLOCKS * block_size + overhead);

@@ -381,9 +381,17 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MI_LARGE_SPAN_GROW_SHIFT
 #define MI_LARGE_SPAN_GROW_SHIFT          (1)
 #endif
-// ... and it steps back down after this many page requests in a row for which the bin's previous
-// page never filled (a request comes when a bin has no page with a free block left on the theap);
-// at most 15 (it is counted in 4 bits, see mi_large_span_bin_t)
+// A page request comes when a bin has no page with a free block left on the theap. It is "full"
+// when a page of the bin filled up since the previous request (demand beyond what the theap holds)
+// and "quiet" otherwise (the bin's last page emptied and went away). The bin keeps a pressure
+// count, +1 per full and -1 per quiet request: the span steps up once it reaches
+// MI_LARGE_SPAN_GROW_REQUESTS and down once it reaches -MI_LARGE_SPAN_DECAY_REQUESTS. So a bin
+// that keeps filling its pages grows (every second request), while a single overflow -- one more
+// live block than a compact page holds, once -- does not (#532: on perf-ab's large-class rows the
+// top bins, two blocks per compact page, grew to 4 MiB on every such blip). At most 7 and 8.
+#ifndef MI_LARGE_SPAN_GROW_REQUESTS
+#define MI_LARGE_SPAN_GROW_REQUESTS       (2)
+#endif
 #ifndef MI_LARGE_SPAN_DECAY_REQUESTS
 #define MI_LARGE_SPAN_DECAY_REQUESTS      (4)
 #endif
@@ -400,8 +408,9 @@ terms of the MIT license. A copy of the license can be found in the file
 // The demand accounting of one large bin on one theap (src/large-span.c), packed in one byte:
 // bits 0-2 the level (the span is MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT),
 // capped at MI_LARGE_PAGE_SIZE), bit 3 "a page of the bin filled up since the last page request",
-// bits 4-7 the page requests in a row without one. One byte because `mi_theap_t` sits just under
-// the 8 KiB meta-allocator size class (8144 bytes): 16 more bytes keep it there, 64 would not.
+// bits 4-7 the pressure count, 4-bit two's complement (see MI_LARGE_SPAN_GROW_REQUESTS; 0 = none). One byte because
+// `mi_theap_t` sits just under the 8 KiB meta-allocator size class (8144 bytes): 16 more bytes
+// keep it there, 64 would not.
 typedef uint8_t mi_large_span_bin_t;
 #endif
 

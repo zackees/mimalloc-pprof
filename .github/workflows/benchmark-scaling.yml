@@ -19,22 +19,55 @@ name: benchmark-scaling
 # ci/check_benchmark_scaling_workflow.py pins the thread points and pattern ids in
 # rust/benchmark-suite/src/scaling.rs to the ones ci/benchmark_report.py validates, so
 # the two halves of the contract cannot drift apart silently.
+# #528 (#422 step 0, P4 + P5): `mode: diagnostic` is a manual experiment, never a
+# publication. `diagnostic_env` reaches the mimalloc-pprof child alone and
+# `diagnostic_cppdefs` rebuilds the mimalloc-pprof library alone (-DMI_EXTRA_CPPDEFS); the
+# other four allocators are the unchanged same-run references. `diagnostic_patterns` /
+# `diagnostic_threads` narrow the sweep, and `blocks` is every selected cell's paired-block
+# count. sparse-large-buffers also gets the live-telemetry replay, and every replay records
+# phase-marked RSS (setup, warmup, measured, drain, teardown). Only the raw artifacts upload:
+# the raw run carries the diagnostic record and status `diagnostic`, which
+# benchmark-scaling-validate refuses, and nothing below validation, rendering or publication
+# runs outside `mode: full`. Example:
+#   gh workflow run benchmark-scaling.yml -f mode=diagnostic -f blocks=1 \
+#     -f diagnostic_env=MIMALLOC_PURGE_DELAY=10 -f diagnostic_patterns=sparse-large-buffers \
+#     -f diagnostic_threads=1,4
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "full (3 legacy blocks + 40 distribution repetitions) or smoke (1 each, artifact only)"
+        description: "full (3 legacy blocks + 40 distribution repetitions), smoke (1 each, artifact only) or diagnostic (#528: artifact only, never published)"
         type: choice
-        options: [full, smoke]
+        options: [full, smoke, diagnostic]
         default: full
       run_seed:
         description: "Explicit seed (empty derives and records one)"
         required: false
         type: string
       blocks:
-        description: "Legacy blocks per cell (full 3; smoke 1; distribution full is fixed at 40)"
+        description: "Legacy blocks per cell (full 3; smoke 1; distribution full is fixed at 40); diagnostic: every selected cell's blocks, 1-40"
         type: number
         default: 3
+        required: false
+      diagnostic_env:
+        description: "diagnostic only: KEY=VALUE pairs (space separated) for the mimalloc-pprof child only, e.g. MIMALLOC_PURGE_DELAY=10"
+        type: string
+        default: ""
+        required: false
+      diagnostic_cppdefs:
+        description: "diagnostic only: defines (NAME or NAME=VALUE, ';' or space separated) the mimalloc-pprof library alone is built with, as -DMI_EXTRA_CPPDEFS, e.g. MI_ENABLE_LARGE_PAGES=0"
+        type: string
+        default: ""
+        required: false
+      diagnostic_patterns:
+        description: "diagnostic only: sweep patterns to run (comma separated; empty = all, plus thread-churn)"
+        type: string
+        default: ""
+        required: false
+      diagnostic_threads:
+        description: "diagnostic only: worker counts to run (comma separated; empty = all), e.g. 1,4"
+        type: string
+        default: ""
         required: false
   schedule:
     # #208: daily. This landed weekly-first so one live run could prove its budget before
@@ -65,6 +98,25 @@ jobs:
       - uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
+      - name: validate dispatch inputs
+        # #528: before anything is built. The diagnostic inputs must be empty outside
+        # `mode: diagnostic`; benchmark-scaling-run re-checks the same grammar.
+        env:
+          INPUT_MODE: ${{ inputs.mode || 'full' }}
+          INPUT_BLOCKS: ${{ inputs.blocks || 3 }}
+          DIAGNOSTIC_ENV: ${{ inputs.diagnostic_env }}
+          DIAGNOSTIC_CPPDEFS: ${{ inputs.diagnostic_cppdefs }}
+          DIAGNOSTIC_PATTERNS: ${{ inputs.diagnostic_patterns }}
+          DIAGNOSTIC_THREADS: ${{ inputs.diagnostic_threads }}
+        run: |
+          set -euo pipefail
+          python3 ci/scaling_diagnostic.py validate \
+            --mode "$INPUT_MODE" \
+            --blocks "$INPUT_BLOCKS" \
+            --env "$DIAGNOSTIC_ENV" \
+            --cppdefs "$DIAGNOSTIC_CPPDEFS" \
+            --patterns "$DIAGNOSTIC_PATTERNS" \
+            --threads "$DIAGNOSTIC_THREADS"
       - uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
         with:
           cache-preset: full
@@ -78,11 +130,16 @@ jobs:
             rust/target/release/archives
             rust/target/release/build
             rust/target/release/sources
-          key: benchmark-allocators-${{ runner.os }}-${{ hashFiles('rust/benchmark-suite/allocators/allocator-lock.json', 'rust/benchmark-suite/allocators/patches/**', 'include/**', 'src/**', 'CMakeLists.txt', 'ci/build_benchmark_allocators.py') }}
+          # #528: a diagnostic build with extra defines never shares a tree with a default
+          # build (a restored CMake cache would keep MI_EXTRA_CPPDEFS).
+          key: benchmark-allocators-${{ runner.os }}-cppdefs[${{ inputs.diagnostic_cppdefs }}]-${{ hashFiles('rust/benchmark-suite/allocators/allocator-lock.json', 'rust/benchmark-suite/allocators/patches/**', 'include/**', 'src/**', 'CMakeLists.txt', 'ci/build_benchmark_allocators.py') }}
       - name: build native allocator libraries
+        env:
+          DIAGNOSTIC_CPPDEFS: ${{ inputs.diagnostic_cppdefs }}
         run: |
           set -euxo pipefail
-          python3 ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
+          python3 ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)" \
+            --fork-cppdefs "$DIAGNOSTIC_CPPDEFS"
       - name: build benchmark suite
         run: |
           set -euxo pipefail
@@ -142,19 +199,24 @@ jobs:
           SCALING_MODE: ${{ inputs.mode || 'full' }}
           SCALING_BLOCKS: ${{ inputs.blocks || 3 }}
           SCALING_RUN_SEED: ${{ needs.build.outputs.run_seed }}
+          DIAGNOSTIC_ENV: ${{ inputs.diagnostic_env }}
+          DIAGNOSTIC_PATTERNS: ${{ inputs.diagnostic_patterns }}
+          DIAGNOSTIC_THREADS: ${{ inputs.diagnostic_threads }}
         run: |
           set -euxo pipefail
           cd rust
           MODE="$SCALING_MODE"
           BLOCKS="$SCALING_BLOCKS"
-          SMOKE_FLAG=""
+          MODE_FLAGS=()
           if [ "$MODE" = "smoke" ]; then
             test "$BLOCKS" = "1"
-            SMOKE_FLAG="--reduced-smoke"
+            MODE_FLAGS=(--reduced-smoke)
+          elif [ "$MODE" = "diagnostic" ]; then
+            MODE_FLAGS=(--diagnostic --diagnostic-env "$DIAGNOSTIC_ENV" --patterns "$DIAGNOSTIC_PATTERNS" --thread-points "$DIAGNOSTIC_THREADS")
           fi
           for SHARD in 0 1 2 3 4 5; do
             target/release/benchmark-scaling-run \
-              $SMOKE_FLAG \
+              "${MODE_FLAGS[@]}" \
               --blocks "$BLOCKS" \
               --run-seed "$SCALING_RUN_SEED" \
               --shard-index "$SHARD" \
@@ -221,6 +283,13 @@ jobs:
           rust/target/release/benchmark-scaling-merge \
             "${INPUTS[@]}" \
             --report-out "$RUNNER_TEMP/scaling-raw-run.json"
+      - name: summarize diagnostic run
+        # #528: the run's label (build and environment) and per-phase RSS, in the job
+        # summary. Refuses a raw run that is not status `diagnostic`.
+        if: (inputs.mode || 'full') == 'diagnostic'
+        run: |
+          set -euo pipefail
+          python3 ci/scaling_diagnostic.py summarize --raw "$RUNNER_TEMP/scaling-raw-run.json" >> "$GITHUB_STEP_SUMMARY"
       - name: validate and overlay complete scaling report
         if: (inputs.mode || 'full') == 'full'
         run: |

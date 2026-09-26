@@ -107,5 +107,41 @@ class BunAllocatorRowTests(unittest.TestCase):
             self.assertTrue(destination.is_file())
 
 
+class ForkCppdefsTests(unittest.TestCase):
+    """#528: a benchmark-scaling diagnostic rebuilds the mimalloc-pprof library alone."""
+
+    def commands(self, allocator_id: str) -> list[list[str]]:
+        record = next(record for record in locked_records() if record["id"] == allocator_id)
+        return [
+            builder.expand_command(command, Path("/src"), Path("/build"), 4)
+            for command in record["build"]["commands"]
+        ]
+
+    def test_defines_reach_only_the_fork_configure_command(self) -> None:
+        fork = self.commands("mimalloc-pprof")
+        extended = builder.with_fork_cppdefs(
+            "mimalloc-pprof", fork, ["MI_ENABLE_LARGE_PAGES=0", "MI_X"]
+        )
+        configure = next(index for index, command in enumerate(fork) if "-S" in command)
+        self.assertEqual(
+            extended[configure],
+            [*fork[configure], "-DMI_EXTRA_CPPDEFS=MI_ENABLE_LARGE_PAGES=0;MI_X"],
+        )
+        self.assertEqual(
+            [c for i, c in enumerate(extended) if i != configure],
+            [c for i, c in enumerate(fork) if i != configure],
+        )
+        self.assertNotIn("-DMI_EXTRA_CPPDEFS=MI_ENABLE_LARGE_PAGES=0;MI_X", fork[configure])
+        for other in ("upstream-mimalloc", "bun-mimalloc", "jemalloc", "tcmalloc"):
+            commands = self.commands(other)
+            self.assertEqual(
+                builder.with_fork_cppdefs(other, commands, ["MI_ENABLE_LARGE_PAGES=0"]), commands
+            )
+
+    def test_a_default_build_is_unchanged(self) -> None:
+        fork = self.commands("mimalloc-pprof")
+        self.assertEqual(builder.with_fork_cppdefs("mimalloc-pprof", fork, []), fork)
+
+
 if __name__ == "__main__":
     unittest.main()

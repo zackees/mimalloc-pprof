@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use benchmark_suite::scaling::{
     merge_scaling_runs, scaling_thread_points_for_shard, synthetic_scaling_fixture,
-    validate_scaling_raw_run, ScalingRawRun, SCALING_THREAD_POINTS,
+    validate_scaling_raw_run, ScalingRawRun, SCALING_THREAD_POINTS, THREAD_CHURN_THREADS,
 };
 
 fn main() {
@@ -64,6 +64,10 @@ fn selftest() -> Result<(), String> {
             shard
                 .samples
                 .retain(|value| threads.contains(&value.thread_count));
+            // thread-churn is recorded by the shard that measures its worker count.
+            if !threads.contains(&THREAD_CHURN_THREADS) {
+                shard.thread_churn_samples.clear();
+            }
             Ok(shard)
         })
         .collect::<Result<Vec<_>, String>>()?;

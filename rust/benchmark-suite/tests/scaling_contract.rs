@@ -12,6 +12,7 @@ use benchmark_suite::scaling::{
     stream_seed, validate_scaling_raw_run, validate_scaling_report, PlannedAction, ScalingCounts,
     ScalingPattern, ScalingRawRun, WorkerPlanner, SCALING_BLOCKS, SCALING_CHILD_PROTOCOL_VERSION,
     SCALING_PATTERNS, SCALING_RIGOR_LABEL, SCALING_SCHEMA_VERSION, SCALING_THREAD_POINTS,
+    THREAD_CHURN_BLOCKS, THREAD_CHURN_POST_DRAIN_OFFSETS_MS, THREAD_CHURN_THREADS,
 };
 use benchmark_suite::scaling::{merge_scaling_runs, scaling_thread_points_for_shard};
 
@@ -422,6 +423,10 @@ fn split_fixture(raw: &ScalingRawRun, shard_count: usize) -> Vec<ScalingRawRun> 
             shard
                 .samples
                 .retain(|value| threads.contains(&value.thread_count));
+            // thread-churn runs on the shard that measures its worker count.
+            if !threads.contains(&THREAD_CHURN_THREADS) {
+                shard.thread_churn_samples.clear();
+            }
             shard.run.generated_at_utc = format!("2026-08-13T00:00:0{shard_index}Z");
             shard
         })
@@ -478,6 +483,84 @@ fn scaling_merge_rejects_mismatch_missing_and_overlap() {
     let mut shards = split_fixture(&raw, 6);
     shards.push(shards[0].clone());
     assert!(merge_scaling_runs(shards).unwrap_err().contains("overlap"));
+
+    // thread-churn is recorded by exactly one shard.
+    let mut shards = split_fixture(&raw, 6);
+    shards[0].thread_churn_samples = raw.thread_churn_samples.clone();
+    assert!(merge_scaling_runs(shards)
+        .unwrap_err()
+        .contains("thread-churn"));
+
+    // A merge without the thread-churn blocks is not complete.
+    let mut shards = split_fixture(&raw, 6);
+    for shard in &mut shards {
+        shard.thread_churn_samples.clear();
+    }
+    assert_eq!(merge_scaling_runs(shards).unwrap().status, "incomplete");
+}
+
+#[test]
+fn complete_raw_run_requires_the_thread_churn_blocks() {
+    let raw = sample_run();
+    assert_eq!(
+        raw.thread_churn_samples.len(),
+        THREAD_CHURN_BLOCKS as usize * 5
+    );
+    let mut missing = raw.clone();
+    missing.thread_churn_samples.clear();
+    assert!(validate_scaling_raw_run(&missing)
+        .unwrap_err()
+        .contains("thread-churn"));
+    // A thread-churn sample must not hide in the sweep matrix.
+    let mut smuggled = raw.clone();
+    let sample = smuggled.thread_churn_samples.pop().unwrap();
+    smuggled.samples.push(sample);
+    assert!(validate_scaling_raw_run(&smuggled).is_err());
+    // The ephemeral cell's frozen count is what thread-churn must replay.
+    let mut moved = raw.clone();
+    moved
+        .calibrations
+        .iter_mut()
+        .find(|value| {
+            value.pattern == ScalingPattern::LargeClassEphemeral.as_str()
+                && value.thread_count == THREAD_CHURN_THREADS
+        })
+        .unwrap()
+        .operations_per_worker += 1;
+    assert!(validate_scaling_raw_run(&moved).is_err());
+}
+
+#[test]
+fn report_carries_a_thread_churn_side_car_derived_from_its_raw_samples() {
+    let raw = sample_run();
+    let report = build_scaling_report(&raw).unwrap();
+    let churn = report.thread_churn.as_ref().expect("thread-churn side-car");
+    assert_eq!(churn.cell_summaries.len(), 5);
+    assert_eq!(
+        churn.post_drain_offsets_ms,
+        THREAD_CHURN_POST_DRAIN_OFFSETS_MS.to_vec()
+    );
+    let fork = churn
+        .cell_summaries
+        .iter()
+        .find(|summary| summary.allocator_id == "mimalloc-pprof")
+        .unwrap();
+    // The fixture's fork releases by the 1.5 s sample; tcmalloc never falls.
+    assert_eq!(fork.median_release_ms, 1500);
+    assert_eq!(fork.median_post_drain_rss_bytes.len(), 6);
+    let history = report.history_projection();
+    let text = serde_json::to_string(&history).unwrap();
+    assert!(!text.contains("thread_churn"), "history rows stay compact");
+
+    let mut tampered = report.clone();
+    tampered.thread_churn.as_mut().unwrap().cell_summaries[0].median_release_ms += 1;
+    assert!(validate_scaling_report(&tampered).is_err());
+    let mut dropped = report.clone();
+    dropped.thread_churn = None;
+    assert!(validate_scaling_report(&dropped).is_err());
+    let mut offsets = report.clone();
+    offsets.thread_churn.as_mut().unwrap().post_drain_offsets_ms[0] = 50;
+    assert!(validate_scaling_report(&offsets).is_err());
 }
 
 #[test]

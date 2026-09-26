@@ -15,10 +15,11 @@ use crate::runner::{
 };
 use crate::scaling::{
     run_scaling_child, run_scaling_child_with_plan, simulate_cell, validate_scaling_raw_run,
-    ScalingCalibration, ScalingChildRequest, ScalingChildResponse, ScalingPattern, ScalingRawRun,
-    ScalingRawSample, ScalingTopology, SCALING_BLOCKS, SCALING_CHILD_PROTOCOL_VERSION,
-    SCALING_MAX_BLOCK_NS, SCALING_MIN_BLOCK_NS, SCALING_PATTERNS, SCALING_SCHEMA_VERSION,
-    SCALING_TARGET_BLOCK_NS, SCALING_THREAD_POINTS,
+    validate_thread_churn_samples, ScalingCalibration, ScalingChildRequest, ScalingChildResponse,
+    ScalingPattern, ScalingRawRun, ScalingRawSample, ScalingTopology, SCALING_BLOCKS,
+    SCALING_CHILD_PROTOCOL_VERSION, SCALING_MAX_BLOCK_NS, SCALING_MIN_BLOCK_NS, SCALING_PATTERNS,
+    SCALING_SCHEMA_VERSION, SCALING_TARGET_BLOCK_NS, SCALING_THREAD_POINTS, THREAD_CHURN_BLOCKS,
+    THREAD_CHURN_POST_DRAIN_OFFSETS_MS, THREAD_CHURN_THREADS,
 };
 use crate::scenarios::Topology;
 
@@ -28,6 +29,19 @@ use crate::scenarios::Topology;
 // sealing, and upload. The two distribution workloads include separate
 // diagnostic replays in addition to their 40 timed repetitions.
 const HARD_LIMIT_SECONDS: f64 = 25.0 * 60.0;
+/// #508: `thread-churn` keeps every child alive and idle for the last
+/// post-drain offset (3 s) after its work -- 40 paired blocks x 5 allocators =
+/// 600 s of fixed, mandated sleep that no calibration can shorten. The shard
+/// that runs it (the one measuring `THREAD_CHURN_THREADS`) is allowed exactly
+/// that idle time on top of `HARD_LIMIT_SECONDS`; its measured work still has
+/// to fit the unchanged 25 minutes. Evidence (run 36202884622): that shard
+/// projected 1011 s, the six shards together measured 57 min of the measure
+/// job's 120-minute timeout, so ~11 more minutes of idle still fit it.
+fn thread_churn_idle_allowance_seconds() -> f64 {
+    let last_offset_ms =
+        THREAD_CHURN_POST_DRAIN_OFFSETS_MS[THREAD_CHURN_POST_DRAIN_OFFSETS_MS.len() - 1];
+    f64::from(THREAD_CHURN_BLOCKS) * ALLOCATOR_IDS.len() as f64 * last_offset_ms as f64 / 1000.0
+}
 const CALIBRATION_ATTEMPTS: u32 = 12;
 const DISTRIBUTION_MIN_BLOCK_NS: u64 = 25_000_000;
 const DISTRIBUTION_TARGET_BLOCK_NS: u64 = 50_000_000;
@@ -377,6 +391,115 @@ fn run(options: Options) -> Result<(), String> {
         }
     }
 
+    // #508: thread-churn, on the shard that measures its worker count. It
+    // replays large-class-ephemeral's stream at the operation count that cell
+    // just froze, so the two share one plan -- same counts, same checksum --
+    // and thread-churn needs no calibration of its own.
+    let mut thread_churn_samples = Vec::new();
+    let runs_thread_churn = shard_thread_points.contains(&THREAD_CHURN_THREADS);
+    if runs_thread_churn {
+        let pattern = ScalingPattern::ThreadChurn;
+        let source = calibrations
+            .iter()
+            .find(|value: &&ScalingCalibration| {
+                value.pattern == ScalingPattern::LargeClassEphemeral.as_str()
+                    && value.thread_count == THREAD_CHURN_THREADS
+            })
+            .ok_or("thread-churn found no large-class-ephemeral calibration to replay")?;
+        let operations_per_worker = source.operations_per_worker;
+        let blocks = if options.reduced_smoke {
+            1
+        } else {
+            THREAD_CHURN_BLOCKS
+        };
+        let started = Instant::now();
+        for order in balanced_block_orders(blocks, options.run_seed)? {
+            let plan = simulate_cell(
+                pattern,
+                options.run_seed,
+                THREAD_CHURN_THREADS,
+                order.block_id,
+                operations_per_worker,
+            );
+            for (ordinal, allocator_id) in order.allocator_ids.iter().enumerate() {
+                let child = children
+                    .iter()
+                    .find(|value| value.allocator.allocator_id == *allocator_id)
+                    .ok_or_else(|| format!("missing scaling allocator {allocator_id}"))?;
+                let request_path = request_dir.join(format!(
+                    "{}-{}-block-{:04}-ordinal-{}-{}.json",
+                    pattern.as_str(),
+                    THREAD_CHURN_THREADS,
+                    order.block_id,
+                    ordinal,
+                    allocator_id
+                ));
+                let request = ScalingChildRequest {
+                    protocol_version: SCALING_CHILD_PROTOCOL_VERSION.into(),
+                    metric_schema_version: SCALING_SCHEMA_VERSION.into(),
+                    run_seed: options.run_seed,
+                    pattern: pattern.as_str().into(),
+                    thread_count: THREAD_CHURN_THREADS,
+                    block_id: order.block_id,
+                    ordinal: ordinal as u8,
+                    operations_per_worker,
+                    warmup_operations_per_worker: options.warmup_operations,
+                    allocator: child.allocator.clone(),
+                    runner: runner.clone(),
+                    toolchain: child.toolchain.clone(),
+                    reproduction_command: format!(
+                        "MIMALLOC_PROF=0 MIMALLOC_MEMORY_EVENTS=0 '{}' --scaling < '{}'",
+                        child.program.display(),
+                        request_path.display()
+                    ),
+                    live_telemetry_path: None,
+                };
+                write_new_json(request_path, &request)?;
+                let (response, peak_rss_bytes, _live_at_peak) =
+                    run_scaling_child_with_plan(child, &request, options.timeout, &plan)?;
+                let sample = ScalingRawSample {
+                    metric_schema_version: SCALING_SCHEMA_VERSION.into(),
+                    block_id: order.block_id,
+                    ordinal: ordinal as u8,
+                    pattern: pattern.as_str().into(),
+                    thread_count: THREAD_CHURN_THREADS,
+                    allocator_id: allocator_id.clone(),
+                    allocator_source_sha: child.allocator.source_sha.clone(),
+                    child_binary_sha256: child.allocator.child_binary_sha256.clone(),
+                    operations_per_worker,
+                    peak_rss_bytes,
+                    diagnostic_peak_rss_bytes: 0,
+                    live_requested_bytes_at_diagnostic_peak_rss: 0,
+                    diagnostic_peak_live_requested_bytes: 0,
+                    reproduction_command: request.reproduction_command.clone(),
+                    response,
+                };
+                write_json_line(&mut raw_jsonl, &sample)?;
+                thread_churn_samples.push(sample);
+            }
+        }
+        let churn_wall = started.elapsed();
+        block_wall = block_wall.saturating_add(churn_wall);
+        projected_block_wall = projected_block_wall
+            .saturating_add(churn_wall.mul_f64(f64::from(THREAD_CHURN_BLOCKS) / f64::from(blocks)));
+        validate_thread_churn_samples(
+            options.run_seed,
+            &thread_churn_samples,
+            operations_per_worker,
+            blocks,
+        )?;
+        write_json_line(
+            &mut diagnostics,
+            &json!({
+                "event": "thread-churn-complete",
+                "threads": THREAD_CHURN_THREADS,
+                "operations_per_worker": operations_per_worker,
+                "samples": thread_churn_samples.len(),
+                "wall_seconds": churn_wall.as_secs_f64(),
+            }),
+        )?;
+    }
+
     let observed_wall = runner_started.elapsed();
     let fixed_wall = observed_wall.saturating_sub(calibration_wall + block_wall);
     let projected_full_seconds = provenance.build_elapsed_seconds
@@ -384,6 +507,12 @@ fn run(options: Options) -> Result<(), String> {
         + projected_block_wall.as_secs_f64()
         + fixed_wall.as_secs_f64()
         + 1.0;
+    let hard_limit_seconds = HARD_LIMIT_SECONDS
+        + if runs_thread_churn {
+            thread_churn_idle_allowance_seconds()
+        } else {
+            0.0
+        };
     write_new_json(
         options.output_dir.join("runtime-projection.json"),
         &json!({
@@ -394,13 +523,14 @@ fn run(options: Options) -> Result<(), String> {
             "native_build_elapsed_seconds": provenance.build_elapsed_seconds,
             "projected_repetitions_by_pattern": SCALING_PATTERNS.map(|pattern| (pattern.as_str(), pattern.full_blocks())),
             "projected_full_suite_seconds": projected_full_seconds,
-            "hard_limit_seconds": HARD_LIMIT_SECONDS,
-            "fits_limit": projected_full_seconds <= HARD_LIMIT_SECONDS,
+            "hard_limit_seconds": hard_limit_seconds,
+            "thread_churn_idle_allowance_seconds": hard_limit_seconds - HARD_LIMIT_SECONDS,
+            "fits_limit": projected_full_seconds <= hard_limit_seconds,
         }),
     )?;
-    if projected_full_seconds > HARD_LIMIT_SECONDS {
+    if projected_full_seconds > hard_limit_seconds {
         let reason = format!(
-            "projected complete scaling runtime {projected_full_seconds:.1}s exceeds the {HARD_LIMIT_SECONDS:.0}s budget"
+            "projected complete scaling runtime {projected_full_seconds:.1}s exceeds the {hard_limit_seconds:.0}s budget"
         );
         write_new_json(
             options.output_dir.join("scaling-invalid.json"),
@@ -424,6 +554,7 @@ fn run(options: Options) -> Result<(), String> {
         allocators: publication_allocators(&lock, &provenance)?,
         calibrations,
         samples,
+        thread_churn_samples,
     };
     if !options.reduced_smoke && options.shard_count == 1 {
         validate_scaling_raw_run(&raw)?;

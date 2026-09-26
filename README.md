@@ -218,6 +218,18 @@ the cost of short-lived threads.
 
 [![Short-lived threads, 96-512 KiB: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
+### RSS after the work stops
+
+Peak RSS is only half of it. This chart runs the short-lived-thread stream again at 8
+workers, then joins every worker thread and keeps the process alive and idle, like a
+server between requests. Each process reads its own RSS 0.1, 0.5, 1, 1.5, 2 and 3 s
+after the last thread was joined. Each line is one allocator's median of 40 paired runs,
+and the dashed line is the release bound perf-ab enforces. The table under the chart gives
+each allocator's peak and its time to release: the first sample within 1 MiB of the 3 s
+one, the same definition perf-ab uses.
+
+[![RSS after the work stops: median resident memory of all five allocators at fixed times after every worker thread was joined, with a time-to-release table](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-thread-churn-rss.svg)](https://zackees.github.io/mimalloc-pprof/#thread-churn)
+
 Full methodology, per-cell tables and the other benchmark families are in
 [Performance](#performance) below and on the
 [dashboard](https://zackees.github.io/mimalloc-pprof/#scaling).

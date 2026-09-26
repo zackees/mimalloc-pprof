@@ -75,11 +75,58 @@ def top_thread_speedups(
     return top, out
 
 
+#: The post-drain sample that sits on the #491 release bound (1.5 s), reported for the
+#: thread-churn side-car (#508).
+THREAD_CHURN_BOUND_MS = 1500
+MIB = 1024 * 1024
+
+
+def thread_churn_lines(scaling: Mapping[str, object]) -> list[str]:
+    """One informational line per allocator from the thread-churn side-car (#508): RSS
+    at the 1.5 s sample and the median release time, compared inside this run.
+
+    Informational only: memory return is gated by perf-ab, not here, and a scaling
+    section recorded before #508 has no side-car at all."""
+
+    churn = scaling.get("thread_churn")
+    if not isinstance(churn, dict):
+        return []
+    churn = cast("dict[str, object]", churn)
+    offsets = churn.get("post_drain_offsets_ms")
+    summaries = churn.get("cell_summaries")
+    if not isinstance(offsets, list) or not isinstance(summaries, list):
+        return []
+    offsets = cast("list[object]", offsets)
+    if THREAD_CHURN_BOUND_MS not in offsets:
+        return []
+    position = offsets.index(THREAD_CHURN_BOUND_MS)
+    lines: list[str] = []
+    for summary in cast("list[object]", summaries):
+        if not isinstance(summary, dict):
+            continue
+        summary = cast("dict[str, object]", summary)
+        medians = summary.get("median_post_drain_rss_bytes")
+        release = summary.get("median_release_ms")
+        allocator = summary.get("allocator_id")
+        if not isinstance(medians, list) or not isinstance(release, int):
+            continue
+        at_bound = cast("list[object]", medians)[position]
+        if not isinstance(at_bound, int):
+            continue
+        lines.append(
+            f"  thread-churn {allocator}: {at_bound / MIB:.1f} MiB at "
+            f"{THREAD_CHURN_BOUND_MS / 1000:g} s after the drain, released by {release} ms"
+        )
+    return lines
+
+
 def check(latest: Mapping[str, object], patterns: tuple[str, ...], min_ratio: float) -> int:
     scaling = latest.get("scaling")
     if not isinstance(scaling, dict):
         print("check_scaling_parity: no scaling section in this report; nothing to compare")
         return 0
+    for line in thread_churn_lines(cast("Mapping[str, object]", scaling)):
+        print(line)
     problems: list[str] = []
     checked = 0
     for pattern in patterns:
@@ -156,6 +203,38 @@ def selftest() -> int:
     # metric that has not been measured at these pins is legitimately absent (#376).
     if check({}, ("sparse-tiny-hot",), DEFAULT_MIN_RATIO) != 0:
         print("FAIL: a report with no scaling section was treated as a regression")
+        ok = False
+    # #508: the thread-churn side-car is reported, never gated here: a run carrying it
+    # still passes or fails on speedup alone, and the report names each allocator.
+    churn = {
+        "post_drain_offsets_ms": [100, 500, 1000, 1500, 2000, 3000],
+        "cell_summaries": [
+            {
+                "allocator_id": FORK,
+                "median_post_drain_rss_bytes": [m * MIB for m in (150, 90, 30, 6, 5, 5)],
+                "median_release_ms": 1500,
+            },
+            {
+                "allocator_id": "tcmalloc",
+                "median_post_drain_rss_bytes": [190 * MIB] * 6,
+                "median_release_ms": 100,
+            },
+        ],
+    }
+    with_churn = {"scaling": {**section(2.55), "thread_churn": churn}}
+    lines = thread_churn_lines(cast("Mapping[str, object]", with_churn["scaling"]))
+    if len(lines) != 2 or "6.0 MiB at 1.5 s" not in lines[0] or FORK not in lines[0]:
+        print(f"FAIL: thread-churn side-car was not reported: {lines}")
+        ok = False
+    if check(with_churn, ("sparse-tiny-hot",), DEFAULT_MIN_RATIO) != 0:
+        print("FAIL: a thread-churn side-car turned a healthy run red")
+        ok = False
+    regressed_with_churn = {"scaling": {**section(1.30), "thread_churn": churn}}
+    if check(regressed_with_churn, ("sparse-tiny-hot",), DEFAULT_MIN_RATIO) != 1:
+        print("FAIL: a thread-churn side-car hid the scaling regression")
+        ok = False
+    if thread_churn_lines({"thread_churn": {"post_drain_offsets_ms": [100]}}):
+        print("FAIL: a side-car without the bound sample produced a line")
         ok = False
     print("check_scaling_parity --selftest:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

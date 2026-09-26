@@ -1,6 +1,6 @@
 /* Small allocator A/B workload for ci/perf_ab.py (#479). One run = one process.
 
-   usage: perf_ab <threads> <generations> <min_size> <max_size> <ops_per_thread> <pause_ms> <table_slots> <sizes> <release_bound_ms>
+   usage: perf_ab <threads> <generations> <min_size> <max_size> <ops_per_thread> <pause_ms> <table_slots> <sizes> <slots> <release_bound_ms>
           perf_ab probe <size>...
 
    <sizes> is how a request size is drawn from [min_size, max_size]: "uniform" (every byte count
@@ -8,8 +8,9 @@
    suite's sparse-large-buffers draw -- an octave uniformly, then a uniform offset inside it,
    clamped to the range; see draw_size).
 
-   Each thread replays a seeded stream over 8 live slots (allocate 8 / free-oldest 6 /
-   free-random 2, one write per 4 KiB). With generations > 1 each thread runs its stream as
+   Each thread replays a seeded stream over <slots> live slots -- 8 in every row but the #422
+   fixed-budget ones (#529), at most MAX_SLOTS -- (allocate 8 / free-oldest 6 / free-random 2, one
+   write per 4 KiB). With generations > 1 each thread runs its stream as
    that many short-lived threads, each exiting while it still owns live slots that the next
    one frees. With pause_ms > 0 each thread instead runs its stream in BURSTS bursts, freeing
    everything after each and idling pause_ms before the next (bursty reuse, #486). With
@@ -21,10 +22,16 @@
    chart's harness (its planner's VecDeque, which the override routes through the allocator under
    test), each table also appends every draw's slot to a log that grows by doubling mi_realloc from
    table_slots entries: the growing-buffer pattern of any Rust Vec. Prints one line: ops/s, process cpu seconds, the workers' own cpu seconds (the
-   allocating threads, without the scavenger), minor page faults, peak RSS, and, after everything
+   allocating threads, without the scavenger), minor page faults, peak RSS (VmHWM: see
+   peak_rss_bytes), and, after everything
    was freed while the worker threads stay alive and idle (a server between requests): RSS
    DRAIN_SHORT_MS later, RSS at the release bound (ci/release_ratchet.json, #491), and the release
    time -- the first sample within RELEASE_TOLERANCE of RSS at twice the bound.
+   With PERF_AB_HOLES_REPORT set in the environment (#529, #422 E4; perf_ab.py --holes-report runs
+   it untimed, in an MI_DIAGNOSTICS=ON build) every worker, once all of them have finished their
+   stream and while each still holds its live slots, prints to stderr in turn its live bytes, the
+   process RSS, the mi_purge_holes_stats_get counters and mi_purge_holes_report() (its own pages,
+   the arena slack, and the arena layout walk).
    `perf_ab probe` (#527) allocates nothing timed: for each size it prints the bin and page kind the
    linked allocator gives that request, so a size-class edge is confirmed, not assumed (see probe).
    Linux only (getrusage + /proc/self/statm). */
@@ -40,7 +47,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SLOTS 8
+#define MAX_SLOTS 64   /* the #422 fixed aggregate budget (#529): all 64 slots on one worker */
 #define BURSTS 8
 #define LARSON_ROUNDS 8   /* as the benchmark suite's LarsonRotation { rounds: 8 } */
 #define DRAIN_SHORT_MS      500
@@ -53,7 +60,7 @@
 #define PROBE_MEDIUM_PAGE   (512L << 10)
 #define PROBE_LARGE_PAGE    (4L << 20)
 
-typedef struct { uint64_t rng; size_t lo, hi; int log_sizes; long ops; void* slot[SLOTS]; int fifo[4096]; size_t head, tail; double cpu; int index; } stream_t;
+typedef struct { uint64_t rng; size_t lo, hi; int log_sizes; long ops; int slots; void* slot[MAX_SLOTS]; size_t size[MAX_SLOTS]; int fifo[4096]; size_t head, tail; double cpu; int index; } stream_t;
 
 /* #506: one Larson table; a round of draws on it runs on one thread at a time (the round barrier) */
 typedef struct { uint64_t rng; void** slot; size_t* log; size_t log_len, log_cap; } table_t;
@@ -83,15 +90,16 @@ static size_t draw_size(stream_t* st) {
 static void run_ops(stream_t* st, long n) {
   for (long i = 0; i < n; i++) {
     const uint64_t choice = next(&st->rng) % 16;
-    int slot = (int)(next(&st->rng) % SLOTS);
+    int slot = (int)(next(&st->rng) % (uint64_t)st->slots);
     if (choice >= 8 && choice < 14 && st->head != st->tail) slot = st->fifo[st->head++ % 4096];  /* free oldest */
-    if (choice >= 8) { mi_free(st->slot[slot]); st->slot[slot] = NULL; continue; }
+    if (choice >= 8) { mi_free(st->slot[slot]); st->slot[slot] = NULL; st->size[slot] = 0; continue; }
     mi_free(st->slot[slot]);
     const size_t size = draw_size(st);
     char* p = (char*)mi_malloc(size);
     if (p == NULL) { fprintf(stderr, "allocation failed\n"); exit(1); }
     for (size_t off = 0; off < size; off += 4096) p[off] = (char)off;
     st->slot[slot] = p;
+    st->size[slot] = size;
     st->fifo[st->tail++ % 4096] = slot;
   }
 }
@@ -109,6 +117,11 @@ static int threads, table_slots;
 static table_t* tables;
 static pthread_barrier_t round_barrier;
 static atomic_int drained, release_workers;
+static int holes_report;   /* PERF_AB_HOLES_REPORT (#529) */
+static pthread_barrier_t report_barrier;
+static pthread_mutex_t report_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static long rss_bytes(void);
 
 static void* generation_main(void* arg) {
   stream_t* st = (stream_t*)arg;
@@ -118,7 +131,7 @@ static void* generation_main(void* arg) {
 }
 
 static void free_slots(stream_t* st) {
-  for (int i = 0; i < SLOTS; i++) { mi_free(st->slot[i]); st->slot[i] = NULL; }
+  for (int i = 0; i < st->slots; i++) { mi_free(st->slot[i]); st->slot[i] = NULL; st->size[i] = 0; }
 }
 
 /* one round of Larson draws on `tb`: free a random slot's block, allocate a new one into it */
@@ -138,6 +151,32 @@ static void larson_round(table_t* tb, size_t lo, size_t hi, long n) {
     }
     tb->log[tb->log_len++] = k;
   }
+}
+
+/* #529 (#422 E4): the allocator-internal snapshot. Every worker first waits until all have finished
+   their stream, so nothing churns while one looks; then, one at a time, each prints what it still
+   holds and mi_purge_holes_report() -- which reads only the calling thread's own pages (plus the
+   arenas, the same for every worker), hence one report per worker. Untimed: perf_ab.py runs it
+   in a separate replay. */
+static void report_holes(stream_t* st) {
+  size_t live = 0;
+  int held = 0;
+  for (int i = 0; i < st->slots; i++) { if (st->slot[i] != NULL) { live += st->size[i]; held++; } }
+  pthread_barrier_wait(&report_barrier);
+  pthread_mutex_lock(&report_lock);
+  mi_purge_holes_stats_t hs;
+  mi_purge_holes_stats_get(&hs);
+  fprintf(stderr, "\n=== worker %d of %d: %d live slots, %zu live requested bytes; process RSS %ld bytes\n"
+          "purge_holes stats: discarded now %zu B in %zu blocks, ever %zu B, %zu discard calls, %zu pages freed, "
+          "unformed discarded now %zu B (ever %zu B), %zu pages skipped, %zu full sweeps\n",
+          st->index, threads, held, live, rss_bytes(),
+          hs.purged_bytes, hs.purged_blocks, hs.purged_bytes_total, hs.discard_calls, hs.pages_freed,
+          hs.unformed_bytes, hs.unformed_bytes_total, hs.pages_skipped, hs.full_sweeps);
+  fflush(stderr);
+  mi_purge_holes_report();
+  fflush(stderr);
+  pthread_mutex_unlock(&report_lock);
+  pthread_barrier_wait(&report_barrier);
 }
 
 static void* worker_main(void* arg) {
@@ -166,6 +205,7 @@ static void* worker_main(void* arg) {
       pthread_join(t, NULL);
     }
   }
+  if (holes_report) report_holes(st);
   free_slots(st);
   st->cpu += thread_cpu();
   atomic_fetch_add(&drained, 1);
@@ -179,6 +219,23 @@ static long rss_bytes(void) {
   if (f == NULL || fscanf(f, "%ld %ld", &pages, &resident) != 2) exit(1);
   fclose(f);
   return resident * sysconf(_SC_PAGESIZE);
+}
+
+/* The process's own peak RSS: VmHWM, the high-water mark of this process image. Not getrusage's
+   ru_maxrss: Linux carries that across execve from the image it replaces -- the forked
+   perf_ab.py interpreter, ~16 MiB -- so every row whose true peak is below that read the parent's
+   RSS as its peak (#529: all the 1-worker exact-size rows showed 15.69 MiB). */
+static long peak_rss_bytes(void) {
+  char line[256];
+  long kib = -1;
+  FILE* f = fopen("/proc/self/status", "r");
+  if (f == NULL) exit(1);
+  while (fgets(line, sizeof(line), f) != NULL) {
+    if (sscanf(line, "VmHWM: %ld kB", &kib) == 1) break;
+  }
+  fclose(f);
+  if (kib < 0) exit(1);
+  return kib * 1024L;
 }
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + (double)t.tv_nsec * 1e-9; }
@@ -229,22 +286,27 @@ static int probe(int count, char** sizes) {
 
 int main(int argc, char** argv) {
   if (argc >= 2 && strcmp(argv[1], "probe") == 0) return probe(argc - 2, argv + 2);
-  if (argc != 10) { fprintf(stderr, "usage: perf_ab threads generations min max ops pause_ms table_slots uniform|log release_bound_ms\n       perf_ab probe size...\n"); return 2; }
+  if (argc != 11) { fprintf(stderr, "usage: perf_ab threads generations min max ops pause_ms table_slots uniform|log slots release_bound_ms\n       perf_ab probe size...\n"); return 2; }
   pause_ms = atol(argv[6]);
   table_slots = atoi(argv[7]);
   if (strcmp(argv[8], "uniform") != 0 && strcmp(argv[8], "log") != 0) { fprintf(stderr, "sizes: uniform or log, got %s\n", argv[8]); return 2; }
   const int log_sizes = (strcmp(argv[8], "log") == 0);
-  const long bound_ms = atol(argv[9]);
+  const int slots = atoi(argv[9]);
+  if (slots < 1 || slots > MAX_SLOTS) { fprintf(stderr, "slots: 1..%d, got %s\n", MAX_SLOTS, argv[9]); return 2; }
+  const long bound_ms = atol(argv[10]);
   const long samples = 2 * bound_ms / RELEASE_SAMPLE_MS + 1;   /* RSS every RELEASE_SAMPLE_MS up to twice the bound */
   long* rss_at = (long*)calloc((size_t)samples, sizeof(long));
   threads = atoi(argv[1]);
   generations = atoi(argv[2]);
+  holes_report = (getenv("PERF_AB_HOLES_REPORT") != NULL);
+  if (holes_report) pthread_barrier_init(&report_barrier, NULL, (unsigned)threads);
   stream_t* st = (stream_t*)calloc((size_t)threads, sizeof(stream_t));
   pthread_t* t = (pthread_t*)calloc((size_t)threads, sizeof(pthread_t));
   for (int i = 0; i < threads; i++) {
     st[i].rng = 0x5eed0000ull + (uint64_t)i;
     st[i].lo = (size_t)atol(argv[3]); st[i].hi = (size_t)atol(argv[4]); st[i].ops = atol(argv[5]);
     st[i].log_sizes = log_sizes;
+    st[i].slots = slots;
     st[i].index = i;
   }
   if (table_slots > 0) {   /* allocated before the clock starts, and by libc: not the allocator under test */
@@ -262,13 +324,13 @@ int main(int argc, char** argv) {
   while (atomic_load(&drained) < threads) usleep(100);
   const double elapsed = now_s() - start;
   struct rusage ru; getrusage(RUSAGE_SELF, &ru);   /* (re-read at DRAIN_SHORT_MS) */
-  long rss_short = 0;
+  long rss_short = 0, rss_peak = 0;
   const double drained_at = now_s();
   for (long i = 0; i < samples; i++) {   /* sample i at drained_at + i * RELEASE_SAMPLE_MS, without drift */
     const double wait = drained_at + (double)(i * RELEASE_SAMPLE_MS) * 1e-3 - now_s();
     if (wait > 0) usleep((useconds_t)(wait * 1e6));
     rss_at[i] = rss_bytes();
-    if (i * RELEASE_SAMPLE_MS == DRAIN_SHORT_MS) { getrusage(RUSAGE_SELF, &ru); rss_short = rss_at[i]; }
+    if (i * RELEASE_SAMPLE_MS == DRAIN_SHORT_MS) { getrusage(RUSAGE_SELF, &ru); rss_short = rss_at[i]; rss_peak = peak_rss_bytes(); }
   }
   const long rss_final = rss_at[samples - 1];
   long release_ms = 0;
@@ -278,7 +340,7 @@ int main(int argc, char** argv) {
   double owner_cpu = 0;
   for (int i = 0; i < threads; i++) owner_cpu += st[i].cpu;
   printf("%.1f %.4f %.4f %ld %ld %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu_of(&ru),
-         owner_cpu, ru.ru_minflt, ru.ru_maxrss * 1024L, rss_short, rss_at[bound_ms / RELEASE_SAMPLE_MS], release_ms);
+         owner_cpu, ru.ru_minflt, rss_peak, rss_short, rss_at[bound_ms / RELEASE_SAMPLE_MS], release_ms);
   atomic_store(&release_workers, 1);
   for (int i = 0; i < threads; i++) pthread_join(t[i], NULL);
   if (table_slots > 0) {
@@ -286,6 +348,7 @@ int main(int argc, char** argv) {
     free(tables);
     pthread_barrier_destroy(&round_barrier);
   }
+  if (holes_report) pthread_barrier_destroy(&report_barrier);
   free(st); free(t); free(rss_at);
   return 0;
 }

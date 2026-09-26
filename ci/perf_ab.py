@@ -19,6 +19,11 @@ The #422 diagnostic rows (exact sizes, size-class edges, the sparse-large-buffer
 in "(#422)") run only when --workloads names them, e.g. --workloads '#422' or '80 KiB|512 KiB';
 the default selection is the gating rows alone. With a diagnostic row or --head-cppdefs, the
 table also shows each probed size's bin and page kind on both arms (`perf_ab probe`).
+
+--holes-report (#529, #422 E4) adds the allocator-internal snapshot: after the timed reps, each
+selected row runs once more per arm, untimed, in an MI_DIAGNOSTICS=ON build of that arm, and
+every worker prints mi_purge_holes_report() while it still holds its live slots (see
+ci/perf_ab.c); the text is appended to the table, one collapsed block per row and arm.
 """
 
 from __future__ import annotations
@@ -57,7 +62,11 @@ BUILDS: dict[str, tuple[list[str], dict[str, str]]] = {
     "plain": ([], {}),
     "pprof": (["-DMI_PPROF=ON"], {"MIMALLOC_PROF": "1"}),
     "chart": (["-DMI_PPROF=ON", "-DMI_MEMEVT=ON"], {}),
+    # #529: only the untimed --holes-report replay; MI_DIAGNOSTICS adds the arena layout walk
+    "diags": (["-DMI_DIAGNOSTICS=ON"], {}),
 }
+HOLES_KIND = "diags"
+HOLES_ENV = {"PERF_AB_HOLES_REPORT": "1"}
 
 
 class Params(NamedTuple):
@@ -71,6 +80,7 @@ class Params(NamedTuple):
     pause_ms: int = 0
     table_slots: int = 0
     sizes: str = "uniform"  # or "log": log-uniform over [min_size, max_size] (#527)
+    slots: int = 8  # live slots per thread (#529: the fixed-budget rows split FIXED_BUDGET_SLOTS)
 
 
 # name: (build, Params). A pause makes the row bursty (#486): BURSTS bursts per thread, everything
@@ -129,6 +139,11 @@ DIAGNOSTIC_SIZES = {
 # rust/benchmark-suite ScalingPattern::LargeBuffers: 64 KiB-4 MiB log-uniform over 8 live slots
 # (alloc 8 / free-oldest 6 / free-random 2, page-touched), which is ci/perf_ab.c's stream shape
 SPARSE_LARGE_BUFFERS = (64 * KIB, 4 * MIB)
+# #529 (#422 E4 / H3): a fixed AGGREGATE budget of live slots, split over the workers, so the
+# live payload stays the same while the worker count grows; RSS that still grows with the workers
+# is per-thread retention. At 8 workers it is the sparse twin's 8 slots per worker.
+FIXED_BUDGET_SLOTS = 64
+FIXED_BUDGET_THREADS = (1, 2, 4, 8)
 DIAGNOSTIC_WORKLOADS: dict[str, tuple[str, Params]] = {
     **{
         f"size {label}/{t} {DIAGNOSTIC_TAG}": (
@@ -144,6 +159,20 @@ DIAGNOSTIC_WORKLOADS: dict[str, tuple[str, Params]] = {
             Params(t, 1, *SPARSE_LARGE_BUFFERS, DIAGNOSTIC_OPS // t, sizes="log"),
         )
         for t in DIAGNOSTIC_THREADS
+    },
+    **{
+        f"sparse-large-buffers {FIXED_BUDGET_SLOTS}-slot budget/{t} {DIAGNOSTIC_TAG}": (
+            "plain",
+            Params(
+                t,
+                1,
+                *SPARSE_LARGE_BUFFERS,
+                DIAGNOSTIC_OPS // t,
+                sizes="log",
+                slots=FIXED_BUDGET_SLOTS // t,
+            ),
+        )
+        for t in FIXED_BUDGET_THREADS
     },
 }
 # what ci/perf_ab.c prints, in order; the byte counts are shown in MiB
@@ -165,6 +194,31 @@ RELEASE_PERCENTILE = 95
 
 def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
     return subprocess.run(cmd, cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout
+
+
+def run_stderr(cmd: list[str], env: dict[str, str]) -> str:
+    """#529: a --holes-report child; its report is on stderr, its stdout line is not used."""
+    return subprocess.run(cmd, env=env, check=True, capture_output=True, text=True).stderr
+
+
+def holes_rows(reports: dict[tuple[str, str], str]) -> list[str]:
+    rows = [
+        "",
+        "Allocator-internal snapshot (`--holes-report`, #529): one untimed run per row and arm in "
+        "an MI_DIAGNOSTICS=ON build; every worker's `mi_purge_holes_report()` once all workers "
+        "finished their stream, while each still holds its live slots.",
+    ]
+    for (workload, arm), text in reports.items():
+        rows += [
+            "",
+            f"<details><summary>{workload}: {arm}</summary>",
+            "",
+            "```text",
+            text.strip(),
+            "```",
+            "</details>",
+        ]
+    return rows
 
 
 def build(arm: str, ref: str, work: Path, kind: str, cppdefs: list[str]) -> Path:
@@ -331,6 +385,12 @@ def main() -> int:
     )
     parser.add_argument("--summary", type=Path)
     parser.add_argument(
+        "--holes-report",
+        action="store_true",
+        help="after the timed reps, one untimed MI_DIAGNOSTICS=ON run per row and arm printing "
+        "every worker's mi_purge_holes_report() (#529)",
+    )
+    parser.add_argument(
         "--head-env",
         default="",
         help="KEY=VALUE pairs (space separated) set on the head arm only, e.g. MIMALLOC_ARENA_PURGE_MULT=1",
@@ -351,10 +411,13 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         try:
+            kinds = {k for k, _ in workloads.values()}
+            if args.holes_report:
+                kinds.add(HOLES_KIND)
             exes = {
                 (arm, kind): build(arm, ref, work, kind, cppdefs if arm == "head" else [])
                 for arm, ref in (("base", args.base), ("head", args.head))
-                for kind in sorted({k for k, _ in workloads.values()})
+                for kind in sorted(kinds)
             }
             sizes = probe_sizes(workloads, cppdefs)
             probe_kind = min(k for _, k in exes)  # a bin is the same in every BUILDS kind
@@ -380,6 +443,13 @@ def main() -> int:
                             if metric in IN_MIB:
                                 values[index] /= 2**20
                         samples[(workload, arm)].append(values)
+            reports: dict[tuple[str, str], str] = {}
+            if args.holes_report:  # untimed, after every timed rep
+                for workload, (_kind, params) in workloads.items():
+                    for arm in ("base", "head"):
+                        env = {**os.environ, **HOLES_ENV, **(head_env if arm == "head" else {})}
+                        cmd = [str(exes[(arm, HOLES_KIND)]), *map(str, params), str(bound_ms)]
+                        reports[(workload, arm)] = run_stderr(cmd, env)
         finally:  # unregister the trees while they still exist: a prune here would find nothing to prune
             for tree in work.glob("src-*"):
                 run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
@@ -414,6 +484,8 @@ def main() -> int:
     )
     if sizes:
         rows += probe_rows(sizes, probes["base"], probes["head"])
+    if reports:
+        rows += holes_rows(reports)
     table = "\n".join(rows) + "\n"
     print(table)
     if args.summary:

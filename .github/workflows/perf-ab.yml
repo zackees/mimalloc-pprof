@@ -11,6 +11,8 @@ name: perf-ab
 # -DMI_EXTRA_CPPDEFS=<value>, and the table's first line says so (#527). The #422 diagnostic rows
 # (exact sizes, size-class edges, the sparse-large-buffers twin; names end in "(#422)") never run
 # on a PR: a dispatch selects them through `workloads`, e.g. "#422" or "80 KiB|512 KiB".
+# `holes_report` (#529, #422 E4) appends an untimed allocator-internal snapshot per row and arm:
+# every worker's mi_purge_holes_report() in an MI_DIAGNOSTICS=ON build (see ci/perf_ab.py).
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -36,6 +38,10 @@ on:
         description: "Defines (NAME or NAME=VALUE, ';' or space separated) the head arm's library is built with, as -DMI_EXTRA_CPPDEFS, e.g. MI_ENABLE_LARGE_PAGES=0"
         type: string
         default: ""
+      holes_report:
+        description: "After the timed reps, one untimed MI_DIAGNOSTICS=ON run per row and arm printing every worker's mi_purge_holes_report() (#529)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -57,4 +63,5 @@ jobs:
           WORKLOADS: ${{ inputs.workloads }}
           HEAD_ENV: ${{ inputs.head_env }}
           HEAD_CPPDEFS: ${{ inputs.head_cppdefs }}
-        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" --summary "$GITHUB_STEP_SUMMARY"
+          HOLES_REPORT: ${{ inputs.holes_report && '--holes-report' || '' }}
+        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" $HOLES_REPORT --summary "$GITHUB_STEP_SUMMARY"

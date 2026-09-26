@@ -1,4 +1,5 @@
-"""perf-ab's head-only define input and the #422 diagnostic rows (#527)."""
+"""perf-ab's head-only define input and the #422 diagnostic rows (#527), the fixed-budget rows
+and the --holes-report snapshot (#529)."""
 
 # pyright: reportMissingTypeStubs=false
 
@@ -83,7 +84,7 @@ def run_main(
     children: list[list[str]] = []
 
     def build(arm: str, ref: str, work: Path, kind: str, cppdefs: list[str]) -> Path:
-        builds.append((arm, cppdefs))
+        builds.append((arm, cppdefs) if kind != perf_ab.HOLES_KIND else (f"{arm}:{kind}", cppdefs))
         return work / f"bin-{arm}-{kind}" / "perf_ab"
 
     def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
@@ -96,8 +97,14 @@ def run_main(
         children.append(cmd)
         return "1 1 1 1 1048576 1048576 1048576 0\n"
 
+    def run_stderr(cmd: list[str], env: dict[str, str]) -> str:
+        assert env["PERF_AB_HOLES_REPORT"] == "1"
+        children.append(cmd)
+        return f"holes report of {cmd[0]}\n"
+
     monkeypatch.setattr(perf_ab, "build", build)
     monkeypatch.setattr(perf_ab, "run", run)
+    monkeypatch.setattr(perf_ab, "run_stderr", run_stderr)
     monkeypatch.setattr(perf_ab, "cpu_model", lambda: "test CPU")
     summary = tmp_path / "summary.md"
     argv_full = ["perf_ab.py", "--base", "B", "--head", "H", "--reps", "1", "--summary"]
@@ -139,7 +146,7 @@ def test_probe_table_marks_the_arms_that_differ(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     table, _, children = run_main(tmp_path, monkeypatch, "--workloads", "sparse-large-buffers/1")
-    assert children[0][-2] == "log"
+    assert children[0][-3:-1] == ["log", "8"]
     assert "| 81,921 | **bin 50, 81,921 B block, 8/page, large** |" in table
     assert "**bin 50, 81,921 B block, 8/page, singleton**" in table
     # every diagnostic size is probed once a diagnostic row runs
@@ -202,7 +209,11 @@ def test_sparse_twin_matches_the_benchmark_suite() -> None:
     weights = (fields["weight_alloc"], fields["weight_free_oldest"], fields["weight_free_random"])
     assert weights == ("8", "6", "2")
     assert fields["weight_realloc"] == "0"
-    twins = [p for _, p in perf_ab.DIAGNOSTIC_WORKLOADS.values() if p.sizes == "log"]
+    twins = [
+        p
+        for name, (_, p) in perf_ab.DIAGNOSTIC_WORKLOADS.items()
+        if p.sizes == "log" and "budget" not in name
+    ]
     assert {p.threads for p in twins} == set(perf_ab.DIAGNOSTIC_THREADS)
     assert all((p.min_size, p.max_size) == perf_ab.SPARSE_LARGE_BUFFERS for p in twins)
 
@@ -215,3 +226,57 @@ def test_workflow_passes_head_cppdefs_through_the_environment() -> None:
     assert step["env"]["HEAD_CPPDEFS"] == "${{ inputs.head_cppdefs }}"
     assert '--head-cppdefs "$HEAD_CPPDEFS"' in step["run"]
     assert "${{" not in step["run"]  # inputs reach the shell as data, never as script
+
+
+def test_fixed_budget_rows_hold_the_aggregate_live_slots() -> None:
+    rows = {n: p for n, (_, p) in perf_ab.DIAGNOSTIC_WORKLOADS.items() if "budget" in n}
+    assert {p.threads for p in rows.values()} == set(perf_ab.FIXED_BUDGET_THREADS)
+    for p in rows.values():
+        assert p.threads * p.slots == perf_ab.FIXED_BUDGET_SLOTS
+        assert (p.min_size, p.max_size, p.sizes) == (*perf_ab.SPARSE_LARGE_BUFFERS, "log")
+    # the child's slot array bounds the budget
+    source = (ROOT / "ci/perf_ab.c").read_text()
+    limit = re.search(r"#define MAX_SLOTS (\d+)", source)
+    assert limit is not None and int(limit.group(1)) >= perf_ab.FIXED_BUDGET_SLOTS
+    # "sparse-large-buffers/1" still selects the twin alone
+    assert list(perf_ab.select("sparse-large-buffers/1")) == [
+        f"sparse-large-buffers/1 {perf_ab.DIAGNOSTIC_TAG}"
+    ]
+
+
+def test_holes_report_is_an_extra_untimed_run_per_row_and_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table, builds, children = run_main(
+        tmp_path,
+        monkeypatch,
+        "--workloads",
+        "sparse-large-buffers/4",
+        "--head-cppdefs",
+        "MI_ENABLE_LARGE_PAGES=0",
+        "--holes-report",
+    )
+    kind = perf_ab.HOLES_KIND
+    assert (f"head:{kind}", ["MI_ENABLE_LARGE_PAGES=0"]) in builds
+    assert (f"base:{kind}", []) in builds
+    reported = [c for c in children if f"-{kind}" in c[0]]
+    assert len(reported) == 2  # one per arm, after the timed rep
+    assert children[-2:] == reported
+    assert "<details><summary>sparse-large-buffers/4 (#422): head</summary>" in table
+    assert "bin-head-diags/perf_ab" in table and "bin-base-diags/perf_ab" in table
+
+
+def test_no_holes_report_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    table, builds, _ = run_main(tmp_path, monkeypatch, "--workloads", "small")
+    assert not any(":" in arm for arm, _ in builds)
+    assert "<details>" not in table
+
+
+def test_workflow_passes_holes_report_as_a_flag() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    inputs = workflow[True]["workflow_dispatch"]["inputs"]
+    assert inputs["holes_report"]["type"] == "boolean"
+    assert inputs["holes_report"]["default"] is False
+    step = workflow["jobs"]["ab"]["steps"][-1]
+    assert step["env"]["HOLES_REPORT"] == "${{ inputs.holes_report && '--holes-report' || '' }}"
+    assert " $HOLES_REPORT " in step["run"]

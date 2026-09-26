@@ -1353,6 +1353,8 @@ void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
     _mi_fprintf(NULL, NULL, "      'in pages' misses pages owned by OTHER threads' theaps -- this walk cannot read them.\n");
   }
 
+  _mi_arena_layout_print(&rep->arena_layout);   // #519: prints nothing unless MI_DIAGNOSTICS
+
   _mi_fprintf(NULL, NULL, "%10s %8s %10s %10s %18s %13s %13s\n",
               "size_class", "pages", "live_MB", "free_MB", "undiscardable_MB", "discarded_MB", "avg_live_blocks_per_pinned_ospage");
   _mi_memzero(&total, sizeof(total));
@@ -1462,7 +1464,10 @@ void _mi_purge_holes_report_collect(mi_holes_report_t* rep) {
     }
     // The committed partition is a property of the subprocess's arenas, not of a heap, so count it
     // once: every heap of this thread reaches the same arenas.
-    if (heap_count > 0) { _mi_arenas_holes_committed(heaps[0], rep); }
+    if (heap_count > 0) {
+      _mi_arenas_holes_committed(heaps[0], rep);
+      (void)_mi_arena_layout_walk(heaps[0]->subproc, NULL, &rep->arena_layout);   // #519: zeroed unless MI_DIAGNOSTICS
+    }
   }
   MI_GATE_LEAVE(tld);
 }

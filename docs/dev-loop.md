@@ -192,3 +192,12 @@ ctest --test-dir build-mem -R test-resident-first-churn --output-on-failure
 It runs the gate's thread-churn pattern with the scavenger off and asserts that no fresh
 (never-dirty) arena slice is claimed after the warm-up round, using the `MI_DIAGNOSTICS`
 claim counters (`_mi_arena_claim_counters`). It needs `-DMI_DIAGNOSTICS=ON`.
+
+To see *where* the memory went, call `mi_purge_holes_report()` (or
+`_mi_purge_holes_report_collect` for the numbers) in the same `MI_DIAGNOSTICS` build: its
+"arena layout" section (#519, `src/arena-layout.c`) classifies every arena data slice as
+in use / fresh / free-dirty / queued / queued-aged from the arena bitmaps and, per chunk
+size class (`mi_chunkbin_t`), counts the runs of each kind with power-of-two run-length
+histograms. #514's signature was queued runs growing while small/medium claims spilled into
+fresh chunks; that shows up here without a bisect. Without `MI_DIAGNOSTICS` the section is
+absent and `mi_holes_report_t.arena_layout` stays zero.

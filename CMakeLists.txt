@@ -104,6 +104,7 @@ set(mi_sources
     src/page.c
     src/page-map.c
     src/page-holes.c
+    src/large-span.c
     src/purge-all.c
     src/profile.c
     src/random.c
@@ -488,7 +489,7 @@ if(MI_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND
   foreach(f IN ITEMS src/profile.c src/profile-stack.c src/profile-maps.c src/memory-events.c
                       src/dhat.c src/dhat-stack.c src/scavenger.c src/page-holes.c
                       src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c
-                      src/arena-layout.c)
+                      src/arena-layout.c src/large-span.c)
     if(f IN_LIST mi_sources)
       list(APPEND mi_strict_fork_sources ${f})
     endif()
@@ -855,6 +856,7 @@ if(MI_USE_CXX)
   # test-arena-purge-rearm.c (#491): calls `_mi_release_bound_ms` from internal.h, the same case.
   # test-resident-first-churn.c (#517): calls `_mi_arena_claim_counters` from internal.h, the same case.
   # test-arena-layout.c (#519): calls `_mi_arena_layout_walk` from internal.h, the same case.
+  # test-large-span.c (#532): reads `_mi_ptr_page` / `mi_page_t` from internal.h, the same case.
   set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-large-span.c PROPERTIES LANGUAGE CXX )
 endif()
 

@@ -157,6 +157,9 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   MI_PAGE_QUEUES_EMPTY,
   MI_MEMID_STATIC,
   MI_STATS_NULL,          // stats
+  #if MI_LARGE_SPAN
+  { 0 },                  // large_span (#532): every bin starts compact
+  #endif
 };
 
 #undef MI_STAT_COUNT

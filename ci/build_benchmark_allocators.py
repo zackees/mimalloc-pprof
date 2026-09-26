@@ -28,6 +28,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import cast
 
+from scaling_diagnostic import DiagnosticInputError, parse_cppdefs
+
 EXPECTED_IDS = (
     "tcmalloc",
     "jemalloc",
@@ -1085,8 +1087,31 @@ def mimalloc_option_comparison(
     }
 
 
+# #528: the one allocator a benchmark-scaling diagnostic may rebuild with extra defines.
+DIAGNOSTIC_ALLOCATOR = "mimalloc-pprof"
+
+
+def with_fork_cppdefs(
+    allocator_id: str, commands: list[list[str]], cppdefs: Sequence[str]
+) -> list[list[str]]:
+    """The resolved build commands, with `-DMI_EXTRA_CPPDEFS=<defines>` on the
+    mimalloc-pprof CMake configure command (the one given a `-S` source) when a
+    diagnostic names defines. Every other allocator, and a default build, is unchanged."""
+    if not cppdefs or allocator_id != DIAGNOSTIC_ALLOCATOR:
+        return commands
+    configure = [index for index, command in enumerate(commands) if "-S" in command]
+    if len(configure) != 1:
+        raise LockfileError(f"{allocator_id} must have exactly one CMake configure command")
+    extended = [list(command) for command in commands]
+    extended[configure[0]].append(f"-DMI_EXTRA_CPPDEFS={';'.join(cppdefs)}")
+    return extended
+
+
 def build_records(
-    records: Iterable[Mapping[str, object]], build_root: Path, jobs: int
+    records: Iterable[Mapping[str, object]],
+    build_root: Path,
+    jobs: int,
+    fork_cppdefs: Sequence[str] = (),
 ) -> dict[str, object]:
     producer_started = time.perf_counter()
     records = list(records)
@@ -1102,7 +1127,11 @@ def build_records(
         build_dir.mkdir(parents=True, exist_ok=True)
         build = require_mapping(record.get("build"), f"{allocator_id}.build")
         commands = require_commands(build.get("commands"), f"{allocator_id}.build.commands")
-        resolved = [expand_command(command, source_dir, build_dir, jobs) for command in commands]
+        resolved = with_fork_cppdefs(
+            allocator_id,
+            [expand_command(command, source_dir, build_dir, jobs) for command in commands],
+            fork_cppdefs,
+        )
         expected_generated_lock = build.get("generated_lock_sha256")
         generated_lock_verified = expected_generated_lock is None
         required_tool = build.get("required_tool_version")
@@ -1209,7 +1238,7 @@ def build_records(
     build_elapsed_seconds = time.perf_counter() - producer_started
     if not (0.0 <= build_elapsed_seconds < float("inf")):
         raise ArchiveError("producer build elapsed time is not finite and nonnegative")
-    return {
+    provenance: dict[str, object] = {
         "schema_version": 1,
         "build_elapsed_seconds": build_elapsed_seconds,
         "lockfile_sha256": sha256_file(default_lockfile()),
@@ -1225,6 +1254,11 @@ def build_records(
         "mimalloc_option_comparison": mimalloc_option_comparison(records),
         "allocators": builds,
     }
+    # #528: only a diagnostic build records this, and only a diagnostic
+    # benchmark-scaling-run accepts a provenance that carries it.
+    if fork_cppdefs:
+        provenance["diagnostic_cppdefs"] = list(fork_cppdefs)
+    return provenance
 
 
 def tree_sha256(root: Path) -> str:
@@ -1354,16 +1388,26 @@ def main() -> int:
     parser.add_argument(
         "--jobs", type=int, default=1, help="parallel jobs forwarded to native build tools"
     )
+    parser.add_argument(
+        "--fork-cppdefs",
+        default="",
+        help="#528 diagnostic only: defines (NAME or NAME=VALUE, ';' or space separated) the "
+        "mimalloc-pprof library alone is built with, as -DMI_EXTRA_CPPDEFS",
+    )
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be at least one")
+    try:
+        fork_cppdefs = parse_cppdefs(args.fork_cppdefs)
+    except DiagnosticInputError as error:
+        parser.error(str(error))
     if args.selftest:
         return selftest()
     records = read_lockfile(args.lockfile)
     if args.build_root is None:
         print(f"PASS {args.lockfile}: validated {len(records)} immutable allocator records")
         return 0
-    provenance = build_records(records, args.build_root.resolve(), args.jobs)
+    provenance = build_records(records, args.build_root.resolve(), args.jobs, fork_cppdefs)
     output = args.build_root / "allocator-provenance.json"
     output.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"PASS built {len(records)} allocators; wrote {output}")

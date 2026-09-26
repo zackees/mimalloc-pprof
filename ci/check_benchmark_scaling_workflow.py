@@ -54,6 +54,24 @@ JOBS = {
 MAXIMUM_BUILD_TIMEOUT_MINUTES = 30
 MEASURE_TIMEOUT_MINUTES = 120  # #424: approved single-host measurement envelope.
 EXPECTED_BLOCKS = 3
+# #528: the diagnostic dispatch inputs, and the steps that must stay behind `mode: full`.
+DIAGNOSTIC_INPUTS = (
+    "diagnostic_env",
+    "diagnostic_cppdefs",
+    "diagnostic_patterns",
+    "diagnostic_threads",
+)
+INPUTS = {"mode", "run_seed", "blocks", *DIAGNOSTIC_INPUTS}
+MODES = ["full", "smoke", "diagnostic"]
+FULL_ONLY = "(inputs.mode || 'full') == 'full'"
+FULL_ONLY_STEPS = (
+    "validate and overlay complete scaling report",
+    "render sealed site",
+    "upload validation artifact",
+    "upload site artifact",
+)
+PUBLISH_ELIGIBLE = "needs.assemble.outputs.publish_eligible == 'true'"
+PUBLISH_JOBS = ("publish-branch", "package-pages", "deploy-pages", "publication-audit")
 
 
 class ScalingWorkflowError(RuntimeError):
@@ -102,11 +120,15 @@ def validate(workflow: Mapping[str, object]) -> None:
         fail("workflow.on.schedule: expected daily cron '23 7 * * *' (#208)")
     dispatch = mapping(triggers.get("workflow_dispatch"), "workflow.on.workflow_dispatch")
     inputs = mapping(dispatch.get("inputs"), "workflow.on.workflow_dispatch.inputs")
-    if set(inputs) != {"mode", "run_seed", "blocks"}:
-        fail("workflow dispatch inputs must be exactly mode/run_seed/blocks")
+    if set(inputs) != INPUTS:
+        fail(f"workflow dispatch inputs must be exactly {sorted(INPUTS)}")
     mode = mapping(inputs["mode"], "workflow input mode")
-    if mode.get("options") != ["full", "smoke"] or mode.get("default") != "full":
-        fail("workflow input mode must default to full with full/smoke choices")
+    if mode.get("options") != MODES or mode.get("default") != "full":
+        fail(f"workflow input mode must default to full with {MODES} choices")
+    for name in DIAGNOSTIC_INPUTS:
+        value = mapping(inputs[name], f"workflow input {name}")
+        if value.get("type") != "string" or value.get("default") != "":
+            fail(f"workflow input {name} must be a string defaulting to empty")
     blocks_input = mapping(inputs["blocks"], "workflow input blocks")
     if blocks_input.get("default") != EXPECTED_BLOCKS:
         fail(f"workflow input blocks must default to {EXPECTED_BLOCKS}")
@@ -153,19 +175,12 @@ def validate(workflow: Mapping[str, object]) -> None:
         fail("scaling measurement must execute the prebuilt binary directly")
     if " &" in run or "parallel" in run or "xargs" in run:
         fail("scaling allocators must execute sequentially")
-    for step_name in (
-        "determine run seed",
-        "run sparse scaling sweep",
-        "compute publication eligibility",
-    ):
-        owner = (
-            build_steps
-            if step_name == "determine run seed"
-            else (measure_steps if step_name == "run sparse scaling sweep" else assemble_steps)
-        )
-        step = mapping(owner.get(step_name), step_name)
-        if "${{ inputs." in str(step.get("run", "")):
-            fail(f"{step_name}: workflow inputs must enter shell through env, not source text")
+    # Every step, not a named few: the #528 diagnostic inputs are free text.
+    for job_name, value in jobs.items():
+        for step_name, step in steps_by_name(mapping(value, job_name)).items():
+            if "${{ inputs." in str(step.get("run", "")):
+                fail(f"{step_name}: workflow inputs must enter shell through env, not source text")
+    validate_diagnostic_mode(build, build_steps, measure_steps, assemble_steps)
     seed_step = mapping(build_steps.get("determine run seed"), "determine run seed")
     seed_env = mapping(seed_step.get("env"), "determine run seed.env")
     if "INPUT_RUN_SEED" not in seed_env or "*[!0-9]*" not in str(seed_step.get("run", "")):
@@ -215,9 +230,22 @@ def validate(workflow: Mapping[str, object]) -> None:
     eligibility_run = eligibility.get("run")
     if not isinstance(eligibility_run, str):
         fail("eligibility step needs a shell policy")
-    for required in ("refs/heads/main", "full", f"-eq {EXPECTED_BLOCKS}"):
+    for required in ("refs/heads/main", '[ "$SCALING_MODE" = "full" ]', f"-eq {EXPECTED_BLOCKS}"):
         if required not in eligibility_run:
             fail(f"eligibility step is missing {required!r}")
+    # #528: validation, rendering and the site artifact are `mode: full` only, so a
+    # diagnostic (or smoke) run can produce nothing the publication jobs could consume.
+    for step_name in FULL_ONLY_STEPS:
+        condition = mapping(assemble_steps.get(step_name), step_name).get("if")
+        if not isinstance(condition, str) or not condition.startswith(FULL_ONLY):
+            fail(f"{step_name} must run only in mode: full ({FULL_ONLY})")
+    audit_job = mapping(jobs["artifact-audit"], "artifact-audit")
+    if audit_job.get("if") != "needs.assemble.outputs.mode == 'full'":
+        fail("artifact-audit must run only in mode: full")
+    for job_name in PUBLISH_JOBS:
+        condition = mapping(jobs[job_name], job_name).get("if")
+        if not isinstance(condition, str) or not condition.startswith(PUBLISH_ELIGIBLE):
+            fail(f"{job_name} must be gated on {PUBLISH_ELIGIBLE}")
 
     publish = mapping(jobs["publish-branch"], "publish-branch")
     if mapping(publish.get("permissions"), "publish permissions") != {"contents": "write"}:
@@ -243,6 +271,72 @@ def validate(workflow: Mapping[str, object]) -> None:
     for required in ("validate-revision", "audit-pages"):
         if required not in audit_text:
             fail(f"publication audit is missing {required}")
+
+
+def validate_diagnostic_mode(
+    build: Mapping[str, object],
+    build_steps: Mapping[str, dict[str, object]],
+    measure_steps: Mapping[str, dict[str, object]],
+    assemble_steps: Mapping[str, dict[str, object]],
+) -> None:
+    """#528: the diagnostic inputs are validated before any build, reach only the
+    mimalloc-pprof build and child, and never share the allocator cache."""
+
+    check = mapping(build_steps.get("validate dispatch inputs"), "validate dispatch inputs")
+    check_env = mapping(check.get("env"), "validate dispatch inputs.env")
+    check_run = str(check.get("run", ""))
+    if "ci/scaling_diagnostic.py validate" not in check_run:
+        fail("validate dispatch inputs must run ci/scaling_diagnostic.py validate")
+    for name in DIAGNOSTIC_INPUTS:
+        if f"${{{{ inputs.{name} }}}}" not in check_env.values():
+            fail(f"validate dispatch inputs must receive {name} through env")
+    names = [
+        str(mapping(step, "build step").get("name", ""))
+        for step in cast(list[object], build["steps"])
+    ]
+    if names.index("validate dispatch inputs") > names.index("build native allocator libraries"):
+        fail("dispatch inputs must be validated before the allocators are built")
+
+    native = mapping(
+        build_steps.get("build native allocator libraries"), "build native allocator libraries"
+    )
+    native_env = mapping(native.get("env"), "build native allocator libraries.env")
+    if native_env.get("DIAGNOSTIC_CPPDEFS") != "${{ inputs.diagnostic_cppdefs }}" or (
+        '--fork-cppdefs "$DIAGNOSTIC_CPPDEFS"' not in str(native.get("run", ""))
+    ):
+        fail("diagnostic_cppdefs must reach the builder as --fork-cppdefs through env")
+    cache = next(
+        (
+            step
+            for step in cast(list[object], build["steps"])
+            if "actions/cache@" in str(mapping(step, "build step").get("uses", ""))
+        ),
+        None,
+    )
+    cache_with = mapping(mapping(cache, "allocator cache").get("with"), "allocator cache.with")
+    if "${{ inputs.diagnostic_cppdefs }}" not in str(cache_with.get("key", "")):
+        fail("the allocator cache key must include diagnostic_cppdefs")
+
+    sweep = mapping(measure_steps.get("run sparse scaling sweep"), "run sparse scaling sweep")
+    sweep_env = mapping(sweep.get("env"), "run sparse scaling sweep.env")
+    sweep_run = str(sweep.get("run", ""))
+    for variable, name, flag in (
+        ("DIAGNOSTIC_ENV", "diagnostic_env", "--diagnostic-env"),
+        ("DIAGNOSTIC_PATTERNS", "diagnostic_patterns", "--patterns"),
+        ("DIAGNOSTIC_THREADS", "diagnostic_threads", "--thread-points"),
+    ):
+        if sweep_env.get(variable) != f"${{{{ inputs.{name} }}}}" or (
+            f'{flag} "${variable}"' not in sweep_run
+        ):
+            fail(f"{name} must reach benchmark-scaling-run as {flag} through env")
+    if "--diagnostic " not in sweep_run or '[ "$MODE" = "diagnostic" ]' not in sweep_run:
+        fail("the sweep must pass --diagnostic exactly when mode is diagnostic")
+
+    summary = mapping(assemble_steps.get("summarize diagnostic run"), "summarize diagnostic run")
+    if summary.get("if") != "(inputs.mode || 'full') == 'diagnostic'" or (
+        "ci/scaling_diagnostic.py summarize" not in str(summary.get("run", ""))
+    ):
+        fail("a diagnostic run must be summarized, and only a diagnostic run")
 
 
 RUST_THREAD_POINTS = re.compile(
@@ -446,7 +540,12 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
         0
     ].__setitem__("uses", "actions/checkout@v4"),
     "setup-soldr cache preset weakened": lambda wf: cast(
-        dict[str, Any], cast(list[dict[str, Any]], _build_job(wf)["steps"])[1]["with"]
+        dict[str, Any],
+        next(
+            step
+            for step in cast(list[dict[str, Any]], _build_job(wf)["steps"])
+            if "setup-soldr@" in str(step.get("uses", ""))
+        )["with"],
     ).__setitem__("cache-preset", "foundation"),
     "allocators run in parallel": lambda wf: _step(
         wf, "run sparse scaling sweep", "measure"
@@ -485,6 +584,67 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
     "publication audit weakened": lambda wf: _step(
         wf, "audit scaling publication", "publication-audit"
     ).__setitem__("run", "echo ok"),
+    # #528: a diagnostic run must never reach publication.
+    "diagnostic mode made publication-eligible": lambda wf: _step(
+        wf, "compute publication eligibility", "assemble"
+    ).__setitem__(
+        "run",
+        str(_step(wf, "compute publication eligibility", "assemble")["run"]).replace(
+            '[ "$SCALING_MODE" = "full" ]', '[ "$SCALING_MODE" != "smoke" ]'
+        ),
+    ),
+    "site rendered in diagnostic mode": lambda wf: _step(
+        wf, "render sealed site", "assemble"
+    ).__setitem__("if", "(inputs.mode || 'full') != 'smoke'"),
+    "site artifact uploaded in diagnostic mode": lambda wf: _step(
+        wf, "upload site artifact", "assemble"
+    ).__setitem__("if", "success()"),
+    "artifact audit runs in every mode": lambda wf: cast(dict[str, Any], wf["jobs"])[
+        "artifact-audit"
+    ].pop("if"),
+    "publish job ungated": lambda wf: cast(dict[str, Any], wf["jobs"])[
+        "publish-branch"
+    ].__setitem__("if", "always()"),
+    "diagnostic mode choice removed": lambda wf: cast(
+        dict[str, Any],
+        cast(dict[str, Any], _triggers(wf)["workflow_dispatch"])["inputs"]["mode"],
+    ).__setitem__("options", ["full", "smoke"]),
+    "diagnostic env input dropped": lambda wf: cast(
+        dict[str, Any], cast(dict[str, Any], _triggers(wf)["workflow_dispatch"])["inputs"]
+    ).pop("diagnostic_env"),
+    "diagnostic inputs not validated": lambda wf: _build_job(wf).__setitem__(
+        "steps",
+        [
+            step
+            for step in cast(list[dict[str, Any]], _build_job(wf)["steps"])
+            if step.get("name") != "validate dispatch inputs"
+        ],
+    ),
+    "fork cppdefs interpolated into shell": lambda wf: _step(
+        wf, "build native allocator libraries"
+    ).__setitem__(
+        "run",
+        "python3 ci/build_benchmark_allocators.py --fork-cppdefs ${{ inputs.diagnostic_cppdefs }}",
+    ),
+    "allocator cache shared across cppdefs": lambda wf: cast(
+        dict[str, Any],
+        next(
+            step
+            for step in cast(list[dict[str, Any]], _build_job(wf)["steps"])
+            if "actions/cache@" in str(step.get("uses", ""))
+        )["with"],
+    ).__setitem__("key", "benchmark-allocators-${{ runner.os }}"),
+    "diagnostic env not passed to the runner": lambda wf: _step(
+        wf, "run sparse scaling sweep", "measure"
+    ).__setitem__(
+        "run",
+        str(_step(wf, "run sparse scaling sweep", "measure")["run"]).replace(
+            '--diagnostic-env "$DIAGNOSTIC_ENV" ', ""
+        ),
+    ),
+    "diagnostic run not summarized": lambda wf: _step(
+        wf, "summarize diagnostic run", "assemble"
+    ).__setitem__("if", "always()"),
 }
 
 

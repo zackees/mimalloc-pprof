@@ -80,6 +80,12 @@ pub struct ProducerProvenance {
     pub build_elapsed_seconds: f64,
     pub mimalloc_option_comparison: MimallocOptionComparison,
     pub allocators: Vec<AllocatorProvenance>,
+    /// #528: defines the mimalloc-pprof library was built with through
+    /// `MI_EXTRA_CPPDEFS` (`ci/build_benchmark_allocators.py --fork-cppdefs`).
+    /// Absent from a default build; only a diagnostic scaling run accepts a
+    /// provenance that carries any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_cppdefs: Vec<String>,
 }
 
 impl ProducerProvenance {

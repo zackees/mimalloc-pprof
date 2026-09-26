@@ -9,6 +9,12 @@ this process's resident set size (`/proc/self/status` VmRSS). Run with
 and `MIMALLOC_PURGE_HOLES_MIN_INTERVAL` at their defaults), median of 3 runs each, pinned
 to CPUs 0-3.
 
+The chart also draws the workload's theoretical minimum as a grey dashed line (#534):
+the process's RSS before the workload allocates anything, plus the requested bytes it
+still holds while idling (the scattered survivors and the block table). No allocator
+can sit below it. The driver measures both operands itself and reports them on a
+`FLOOR,<baseline kB>,<live bytes>` line; a report JSON without them renders no line.
+
 The workload itself is a small, self-contained C program embedded in this script (kept
 out of `test/` on purpose -- it is a benchmark driver, not a correctness test) that links
 directly against `mimalloc.h`'s `mi_malloc`/`mi_free`/`mi_on_thread_idle` API, so no
@@ -20,7 +26,8 @@ Usage:
 
 Outputs (under --out-dir):
     hole-purging-rss.csv          -- the median run's (config, t_seconds, rss_mb) samples
-    hole-purging-report.json      -- raw mi_purge_holes_stats_t fields + peak RSS, both configs
+    hole-purging-report.json      -- raw mi_purge_holes_stats_t fields + peak RSS + the floor
+                                     operands (baseline kB, live bytes), both configs
     hole-purging-rss-{light,dark}.svg   -- the RSS-over-time line chart (default action)
     hole-purging-table-{light,dark}.svg -- the hole-characteristics table (--table)
 
@@ -65,13 +72,26 @@ class StatsDict(TypedDict, total=False):
     full_sweeps: int
 
 
-class RunSummary(TypedDict):
-    """One config's ("off" or "on") half of hole-purging-report.json."""
+class RunSummaryMeasurements(TypedDict):
+    """The fields every hole-purging-report.json has carried since it was introduced."""
 
     stats: StatsDict
     peak_rss_mb: float
     tail_mean_rss_mb: float
     report_text: str
+
+
+class RunSummary(RunSummaryMeasurements, total=False):
+    """One config's ("off" or "on") half of hole-purging-report.json.
+
+    The two floor operands (#534) are optional so a report measured before them still
+    loads and renders -- without a floor line rather than with a made-up one.
+    """
+
+    #: VmRSS at the top of the driver's main(), before the workload allocates anything.
+    baseline_rss_kb: int
+    #: Requested bytes the program still holds while idling: survivors + block table.
+    live_requested_bytes: int
 
 
 class ReportJson(TypedDict):
@@ -101,6 +121,9 @@ CHURN_C_SOURCE = r"""
    tick, the only thing that makes hole purging (or the scavenger) run at all. */
 
 typedef struct { size_t size; size_t count; } size_class_t;
+
+/* One block in every BENCH_KEEP_ONE_IN survives the free pass. */
+#define BENCH_KEEP_ONE_IN 20
 
 static long vm_rss_kb(void) {
   FILE* f = fopen("/proc/self/status", "r");
@@ -137,6 +160,9 @@ static void report_capture(const char* msg, void* arg) {
 }
 
 int main(int argc, char** argv) {
+  /* The floor's baseline: this process before the workload allocates anything --
+     read first, before the block table exists. */
+  const long baseline_kb = vm_rss_kb();
   int seconds = (argc > 1) ? atoi(argv[1]) : 10;
   int tick_ms = 100;
 
@@ -153,6 +179,10 @@ int main(int argc, char** argv) {
   void** blocks = (void**)malloc(total * sizeof(void*));
   if (blocks == NULL) { fprintf(stderr, "out of memory allocating block table\n"); return 1; }
 
+  /* The floor's live data, in requested bytes: the block table (touched below, held
+     to the end) plus every block the free pass keeps. */
+  size_t live_requested_bytes = total * sizeof(void*);
+
   /* Allocate every block, size classes interleaved so survivors land scattered
      across pages of every class rather than clustered by allocation order. */
   size_t idx = 0;
@@ -167,6 +197,7 @@ int main(int argc, char** argv) {
     }
     blocks[idx] = mi_malloc(classes[class_cursor].size);
     if (blocks[idx] != NULL) memset(blocks[idx], 0xAB, classes[class_cursor].size);
+    if (idx % BENCH_KEEP_ONE_IN == 0) live_requested_bytes += classes[class_cursor].size;
     remaining[class_cursor]--;
     class_cursor = (class_cursor + 1) % n_classes;
     idx++;
@@ -174,15 +205,15 @@ int main(int argc, char** argv) {
 
   /* Keep 1-in-20 alive (scattered survivors); free the rest. */
   for (size_t i = 0; i < total; i++) {
-    if (i % 20 != 0) {
+    if (i % BENCH_KEEP_ONE_IN != 0) {
       mi_free(blocks[i]);
       blocks[i] = NULL;
     }
   }
 
-  long baseline_kb = vm_rss_kb();
-  fprintf(stderr, "# allocated %zu blocks, freed %zu, baseline VmRSS %ld kB\n",
-          total, total - (total + 19) / 20, baseline_kb);
+  long post_free_kb = vm_rss_kb();
+  fprintf(stderr, "# allocated %zu blocks, freed %zu, post-free VmRSS %ld kB\n",
+          total, total - (total + BENCH_KEEP_ONE_IN - 1) / BENCH_KEEP_ONE_IN, post_free_kb);
 
   /* Idle loop: this is the only thing that makes purge_holes (or the plain
      scavenger) do anything at all. */
@@ -195,6 +226,8 @@ int main(int argc, char** argv) {
     mi_on_thread_idle();
     elapsed_ms += tick_ms;
   }
+
+  printf("FLOOR,%ld,%zu\n", baseline_kb, live_requested_bytes);
 
   mi_purge_holes_stats_t st;
   mi_purge_holes_stats_get(&st);
@@ -222,7 +255,7 @@ int main(int argc, char** argv) {
 
   /* Keep survivors reachable until here so they cannot be freed early by an
      optimizer that thinks the table is dead; then release everything. */
-  for (size_t i = 0; i < total; i += 20) mi_free(blocks[i]);
+  for (size_t i = 0; i < total; i += BENCH_KEEP_ONE_IN) mi_free(blocks[i]);
   free(blocks);
   return 0;
 }
@@ -239,6 +272,9 @@ class RunResult:
     samples: list[Sample]
     stats: StatsDict
     report_text: str
+    #: The driver's FLOOR line; `None` when it printed none.
+    baseline_rss_kb: int | None = None
+    live_requested_bytes: int | None = None
 
     @property
     def mean_rss_kb_tail(self) -> float:
@@ -282,14 +318,24 @@ def run_once(exe: Path, holes_on: bool, seconds: int) -> RunResult:
     env["PATH"] = os.environ.get("PATH", env["PATH"])
     cmd = ["taskset", "-c", "0-3", str(exe), str(seconds)]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True, env=env)
+    return parse_driver_output(proc.stdout)
+
+
+def parse_driver_output(stdout: str) -> RunResult:
+    """Parse one driver run's stdout: CSV samples, the FLOOR line, stats, report."""
     samples: list[Sample] = []
     stats: StatsDict = {}
     report_lines: list[str] = []
     in_report = False
-    for line in proc.stdout.splitlines():
+    baseline_kb: int | None = None
+    live_bytes: int | None = None
+    for line in stdout.splitlines():
         if line.startswith("CSV,"):
             _, t_ms, rss_kb = line.split(",")
             samples.append(Sample(int(t_ms), int(rss_kb)))
+        elif line.startswith("FLOOR,"):
+            _, baseline, live = line.split(",")
+            baseline_kb, live_bytes = int(baseline), int(live)
         elif line.startswith("STATS_JSON:"):
             stats = json.loads(line[len("STATS_JSON:") :])
         elif line == "REPORT_BEGIN":
@@ -298,7 +344,13 @@ def run_once(exe: Path, holes_on: bool, seconds: int) -> RunResult:
             in_report = False
         elif in_report:
             report_lines.append(line)
-    return RunResult(samples=samples, stats=stats, report_text="\n".join(report_lines))
+    return RunResult(
+        samples=samples,
+        stats=stats,
+        report_text="\n".join(report_lines),
+        baseline_rss_kb=baseline_kb,
+        live_requested_bytes=live_bytes,
+    )
 
 
 def median_run(runs: list[RunResult]) -> RunResult:
@@ -324,7 +376,35 @@ def measure(exe: Path, seconds: int, runs: int) -> dict[str, RunResult]:
                 " was not honored"
             )
         results[label] = picked
+    floor = floor_mb(summarize_run(results["off"]), summarize_run(results["on"]))
+    if floor is None:
+        raise SystemExit("refusing to publish: the driver printed no FLOOR line")
+    for label, run in results.items():
+        lowest = min(s.rss_kb for s in run.samples) / 1024.0
+        if floor > lowest:
+            raise SystemExit(
+                f"refusing to publish: the theoretical minimum {floor:.1f} MB is above "
+                f"{label}'s lowest RSS sample {lowest:.1f} MB -- a measurement bug"
+            )
     return results
+
+
+def floor_mb(*summaries: RunSummary) -> float | None:
+    """The theoretical minimum RSS in MB: baseline RSS + live requested bytes (#534).
+
+    Allocator-independent, so one line for the whole chart: the lowest baseline+live
+    of the charted runs, which keeps it a true floor under every one of them. `None`
+    when any run lacks the operands (a report measured before #534): no floor is
+    better than one that could sit above a series it was never measured for.
+    """
+    values: list[float] = []
+    for summary in summaries:
+        baseline_kb = summary.get("baseline_rss_kb")
+        live_bytes = summary.get("live_requested_bytes")
+        if baseline_kb is None or live_bytes is None:
+            return None
+        values.append(baseline_kb / 1024.0 + live_bytes / (1024.0 * 1024.0))
+    return min(values) if values else None
 
 
 # ---------------------------------------------------------------------------
@@ -379,14 +459,26 @@ def nice_ticks(maximum: float) -> list[float]:
     return [i * step for i in range(int(top / step) + 1)]
 
 
+#: The floor line's label, on the chart and in its legend.
+FLOOR_LABEL = "live data (theoretical minimum)"
+#: Rough advance width of the floor label in the 12px legend font, so the legend row
+#: can be shifted left to fit it. Deliberately generous (an SVG has no layout engine).
+FLOOR_LEGEND_TEXT_PX = 200
+
+
 def render_line_chart(
     off_samples: list[Sample],
     on_samples: list[Sample],
     theme: Theme,
     source_line: str,
+    floor: float | None = None,
 ) -> str:
+    """The RSS-over-idle chart. `floor` (MB), when given, is drawn as the neutral dashed
+    "live data (theoretical minimum)" line and is always inside the Y domain."""
     max_t = max(off_samples[-1].t_ms, on_samples[-1].t_ms)
     max_rss = max(max(s.rss_kb for s in off_samples), max(s.rss_kb for s in on_samples)) / 1024.0
+    if floor is not None:
+        max_rss = max(max_rss, floor)
     ticks = nice_ticks(max_rss)
     top = ticks[-1]
 
@@ -470,6 +562,22 @@ def render_line_chart(
             f'text-anchor="{anchor}" fill="{theme.muted}">{label}</text>'
         )
 
+    # The floor goes under the series, so a series that touches it stays visible.
+    if floor is not None:
+        floor_y = y_of(floor)
+        parts.append(
+            f'<line data-series="floor" x1="{PAD_LEFT}" y1="{floor_y:.2f}" '
+            f'x2="{WIDTH - PAD_RIGHT}" y2="{floor_y:.2f}" stroke="{theme.muted}" '
+            'stroke-width="1.5" stroke-dasharray="4,4"/>'
+        )
+        # Above the line unless that would climb into the header; below it then.
+        label_y = floor_y - 6 if floor_y - 6 > PAD_TOP + 12 else floor_y + 14
+        parts.append(
+            f'<text x="{WIDTH - PAD_RIGHT - 4}" y="{label_y:.2f}" font-size="11" '
+            f'text-anchor="end" fill="{theme.muted}">'
+            f"{escape(FLOOR_LABEL)}: {floor:.1f} MB</text>"
+        )
+
     parts.append(
         f'<path d="{off_path}" fill="none" stroke="{theme.off_line}" stroke-width="2" '
         'stroke-linejoin="round" stroke-linecap="round"/>'
@@ -517,6 +625,8 @@ def render_line_chart(
 
     # Legend (top-right), in addition to the direct labels.
     leg_x = WIDTH - PAD_RIGHT - 150
+    if floor is not None:
+        leg_x -= FLOOR_LEGEND_TEXT_PX + 20  # room for the third entry, same right edge
     leg_y = 64  # own row, below the title (26) and source line (44) -- never collides
     parts.append(
         f'<line x1="{leg_x}" y1="{leg_y}" x2="{leg_x + 20}" y2="{leg_y}" '
@@ -532,6 +642,15 @@ def render_line_chart(
     parts.append(
         f'<text x="{leg_x + 96}" y="{leg_y + 4}" font-size="12" fill="{theme.muted}">on</text>'
     )
+    if floor is not None:
+        parts.append(
+            f'<line x1="{leg_x + 140}" y1="{leg_y}" x2="{leg_x + 160}" y2="{leg_y}" '
+            f'stroke="{theme.muted}" stroke-width="1.5" stroke-dasharray="4,4"/>'
+        )
+        parts.append(
+            f'<text x="{leg_x + 166}" y="{leg_y + 4}" font-size="12" fill="{theme.muted}">'
+            f"{escape(FLOOR_LABEL)}</text>"
+        )
 
     parts.append("</g></svg>")
     return "\n".join(parts) + "\n"
@@ -745,6 +864,19 @@ def load_csv(path: Path) -> dict[str, list[Sample]]:
     return out
 
 
+def summarize_run(run: RunResult) -> RunSummary:
+    summary: RunSummary = {
+        "stats": run.stats,
+        "peak_rss_mb": max(s.rss_kb for s in run.samples) / 1024.0,
+        "tail_mean_rss_mb": run.mean_rss_kb_tail / 1024.0,
+        "report_text": run.report_text,
+    }
+    if run.baseline_rss_kb is not None and run.live_requested_bytes is not None:
+        summary["baseline_rss_kb"] = run.baseline_rss_kb
+        summary["live_requested_bytes"] = run.live_requested_bytes
+    return summary
+
+
 def write_report_json(
     path: Path, off: RunResult, on: RunResult, commit: str, cpu: str, kernel: str
 ) -> None:
@@ -752,18 +884,8 @@ def write_report_json(
         "commit": commit,
         "cpu": cpu,
         "kernel": kernel,
-        "off": {
-            "stats": off.stats,
-            "peak_rss_mb": max(s.rss_kb for s in off.samples) / 1024.0,
-            "tail_mean_rss_mb": off.mean_rss_kb_tail / 1024.0,
-            "report_text": off.report_text,
-        },
-        "on": {
-            "stats": on.stats,
-            "peak_rss_mb": max(s.rss_kb for s in on.samples) / 1024.0,
-            "tail_mean_rss_mb": on.mean_rss_kb_tail / 1024.0,
-            "report_text": on.report_text,
-        },
+        "off": summarize_run(off),
+        "on": summarize_run(on),
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -854,24 +976,15 @@ def main(argv: list[str] | None = None) -> int:
         write_report_json(json_path, off, on, commit, cpu, kernel)
         off_samples, on_samples = off.samples, on.samples
         off_stats, on_stats = off.stats, on.stats
-        off_summary: RunSummary = {
-            "stats": off.stats,
-            "peak_rss_mb": max(s.rss_kb for s in off_samples) / 1024.0,
-            "tail_mean_rss_mb": off.mean_rss_kb_tail / 1024.0,
-            "report_text": off.report_text,
-        }
-        on_summary: RunSummary = {
-            "stats": on.stats,
-            "peak_rss_mb": max(s.rss_kb for s in on_samples) / 1024.0,
-            "tail_mean_rss_mb": on.mean_rss_kb_tail / 1024.0,
-            "report_text": on.report_text,
-        }
+        off_summary = summarize_run(off)
+        on_summary = summarize_run(on)
         print(
             f"off: peak {off_summary['peak_rss_mb']:.1f} MB, "
             f"tail-mean {off_summary['tail_mean_rss_mb']:.1f} MB; "
             f"on: peak {on_summary['peak_rss_mb']:.1f} MB, "
             f"tail-mean {on_summary['tail_mean_rss_mb']:.1f} MB "
-            f"(purged {on_stats.get('purged_bytes_total', 0) / 1e6:.1f} MB)"
+            f"(purged {on_stats.get('purged_bytes_total', 0) / 1e6:.1f} MB); "
+            f"theoretical minimum {floor_mb(off_summary, on_summary) or 0.0:.1f} MB"
         )
 
     if args.table:
@@ -886,8 +999,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         light_path = out_dir / "hole-purging-rss-light.svg"
         dark_path = out_dir / "hole-purging-rss-dark.svg"
-        light_svg = render_line_chart(off_samples, on_samples, LIGHT, source_line)
-        dark_svg = render_line_chart(off_samples, on_samples, DARK, source_line)
+        floor = floor_mb(off_summary, on_summary)
+        light_svg = render_line_chart(off_samples, on_samples, LIGHT, source_line, floor)
+        dark_svg = render_line_chart(off_samples, on_samples, DARK, source_line, floor)
 
     if args.check:
         stale: list[Path] = []

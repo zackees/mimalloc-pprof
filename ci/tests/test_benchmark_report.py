@@ -34,6 +34,52 @@ THREAD_CHURN_CURVES_MIB: dict[str, tuple[int, ...]] = {
     "bun-mimalloc": (170, 170, 160, 150, 140, 140),
     "mimalloc-pprof": (150, 90, 30, 6, 5, 5),
 }
+MIB = 1024 * 1024
+
+
+def rss_floors(
+    sweep: list[dict[str, object]], churn: list[dict[str, object]] | None = None
+) -> list[dict[str, object]]:
+    """#534: the floor summaries a producer derives from its raw samples."""
+
+    best: dict[tuple[str, int], tuple[int, int]] = {}
+    for sample in sweep:
+        if sample["pattern"] not in report.DISTRIBUTION_PATTERN_IDS:
+            continue
+        response = cast(dict[str, object], sample["response"])
+        candidate = (
+            cast(int, response["baseline_rss_bytes"]),
+            cast(int, sample["diagnostic_peak_live_requested_bytes"]),
+        )
+        key = (cast(str, sample["pattern"]), cast(int, sample["thread_count"]))
+        current = best.get(key)
+        if current is None or (sum(candidate), candidate[0]) < (sum(current), current[0]):
+            best[key] = candidate
+    floors: list[dict[str, object]] = [
+        {
+            "pattern": pattern,
+            "thread_count": threads,
+            "baseline_rss_bytes": baseline,
+            "peak_live_requested_bytes": live,
+            "floor_rss_bytes": baseline + live,
+        }
+        for (pattern, threads), (baseline, live) in sorted(best.items())
+    ]
+    if churn:
+        baseline = min(
+            cast(int, cast(dict[str, object], item["response"])["baseline_rss_bytes"])
+            for item in churn
+        )
+        floors.append(
+            {
+                "pattern": report.THREAD_CHURN_PATTERN,
+                "thread_count": report.THREAD_CHURN_THREADS,
+                "baseline_rss_bytes": baseline,
+                "peak_live_requested_bytes": 0,
+                "floor_rss_bytes": baseline,
+            }
+        )
+    return floors
 
 
 class BenchmarkReportTests(unittest.TestCase):
@@ -1736,6 +1782,7 @@ class BenchmarkReportTests(unittest.TestCase):
                         }
                     )
                     source_sha, child_sha = allocator_sources[allocator]
+                    replayed = pattern in report.DISTRIBUTION_PATTERN_IDS
                     for block in range(blocks):
                         raw.append(
                             {
@@ -1749,6 +1796,10 @@ class BenchmarkReportTests(unittest.TestCase):
                                 "child_binary_sha256": child_sha,
                                 "operations_per_worker": 4096,
                                 "peak_rss_bytes": (32 + 4 * threads + index) * 1024 * 1024,
+                                # #534: the live-telemetry replay's concurrent peak.
+                                "diagnostic_peak_live_requested_bytes": (
+                                    (8 + 4 * threads) * MIB + block * 4096 if replayed else 0
+                                ),
                                 "reproduction_command": "benchmark-scaling-run --run-seed 1",
                                 "response": {
                                     "protocol_version": "throughput-scaling-sparse-child-v2",
@@ -1763,6 +1814,7 @@ class BenchmarkReportTests(unittest.TestCase):
                                     "remote_free_calls": 0,
                                     "producer_fallback_frees": 0,
                                     "setup_ns": 1,
+                                    "baseline_rss_bytes": 6 * MIB + index * 4096,
                                     "warmup_ns": 0,
                                     "elapsed_ns": 750_000_000,
                                     "teardown_ns": 1,
@@ -1841,6 +1893,7 @@ class BenchmarkReportTests(unittest.TestCase):
                     for threads in report.SCALING_THREAD_POINTS
                     for index, allocator in enumerate(report.ALLOCATOR_IDS)
                 ],
+                "floor_summaries": rss_floors(raw),
             },
         }
         pending = value["pending_metrics"]
@@ -1873,7 +1926,9 @@ class BenchmarkReportTests(unittest.TestCase):
             sample = copy.deepcopy(source)
             sample["pattern"] = report.THREAD_CHURN_PATTERN
             sample["peak_rss_bytes"] = (200 + block % 5) * mib
+            sample["diagnostic_peak_live_requested_bytes"] = 0
             response = cast(dict[str, object], sample["response"])
+            response["baseline_rss_bytes"] = 4 * mib + (block % 3) * 4096
             response["post_drain_offsets_ns"] = [
                 offset * 1_000_000 + 50_000 + block for offset in report.THREAD_CHURN_OFFSETS_MS
             ]
@@ -1926,6 +1981,8 @@ class BenchmarkReportTests(unittest.TestCase):
             "cell_summaries": summaries,
             "raw_samples": raw,
         }
+        rss = cast(dict[str, object], scaling["rss"])
+        rss["floor_summaries"] = rss_floors(sweep, raw)
         return value
 
     def test_thread_churn_chart_overlays_median_rss_after_the_drain(self) -> None:
@@ -2148,7 +2205,11 @@ class BenchmarkReportTests(unittest.TestCase):
                 with self.subTest(pattern=pattern, metric=metric):
                     svg = report.distribution_stack_svg(view, pattern, metric).decode()
                     self.assertEqual(svg.count(f'fill="{report.SCALING_INK["plot"]}"'), 1)
-                    self.assertEqual(svg.count("<path "), len(report.ALLOCATOR_IDS))
+                    # #534: the RSS panel adds one dashed floor path, never an allocator's.
+                    floors = svg.count('data-series="floor"')
+                    self.assertEqual(floors, 1 if metric == "rss" else 0)
+                    self.assertEqual(svg.count("<path "), len(report.ALLOCATOR_IDS) + floors)
+                    svg = re.sub(r'<path [^>]*data-series="floor"[^>]*/>', "", svg)
                     strokes = stroke.findall(svg)
                     self.assertEqual(len(strokes), len(report.ALLOCATOR_IDS))
                     colors = {color for color, _width in strokes}
@@ -2163,6 +2224,151 @@ class BenchmarkReportTests(unittest.TestCase):
                     self.assertEqual(last_color, report.SCALING_SERIES["mimalloc-pprof"])
                     for _color, width in strokes[:-1]:
                         self.assertGreater(float(last_width), float(width))
+
+    def floor_view(self) -> report.ScalingView:
+        latest = self.with_thread_churn(self.load_latest())
+        report.validate_latest(latest, "floor fixture")
+        scaling = report.validate_scaling_report(latest["scaling"], "floor fixture")
+        return report.scaling_view_from_validated(scaling)
+
+    @staticmethod
+    def path_ys(path: str) -> list[float]:
+        # "M x y L x y ...": every third token from the third is a y.
+        return [float(value) for value in path.split()[2::3]]
+
+    def test_distribution_rss_panels_draw_the_live_data_floor_under_every_line(self) -> None:
+        # #534: one dashed, allocator-independent floor per RSS panel (baseline +
+        # concurrent live requested bytes), on the shared domain, never above a line.
+        view = self.floor_view()
+        floor = re.compile(r'<path d="([^"]+)" [^>]*data-series="floor"')
+        allocator_paths = re.compile(r'<path d="([^"]+)" fill="none" stroke="(#[0-9a-f]+)"')
+        for pattern in report.DISTRIBUTION_PATTERN_IDS:
+            with self.subTest(pattern=pattern):
+                svg = report.distribution_stack_svg(view, pattern, "rss").decode()
+                self.assertIn(report.RSS_FLOOR_LABEL, svg)
+                self.assertIn("stroke-dasharray", svg)
+                match = floor.search(svg)
+                assert match is not None, "the RSS panel has no floor line"
+                floor_ys = self.path_ys(match.group(1))
+                self.assertEqual(len(floor_ys), len(view.thread_points))
+                floors = [
+                    item.floor_rss_bytes
+                    for item in sorted(view.rss_floors, key=lambda item: item.thread_count)
+                    if item.pattern == pattern
+                ]
+                self.assertIn(f'data-floor-bytes="{" ".join(str(value) for value in floors)}"', svg)
+                ceiling = float(
+                    cast(re.Match[str], re.search(r'data-y-domain-max="([^"]+)"', svg)).group(1)
+                )
+                self.assertLessEqual(max(floors), ceiling)
+                lines = [path for path, _color in allocator_paths.findall(svg)]
+                self.assertEqual(len(lines), len(report.ALLOCATOR_IDS))
+                for line in lines:
+                    # SVG y grows downward: on or below every allocator's median.
+                    for floor_y, line_y in zip(floor_ys, self.path_ys(line)):
+                        self.assertGreaterEqual(floor_y, line_y)
+
+    def test_throughput_panels_never_draw_the_floor(self) -> None:
+        view = self.floor_view()
+        for pattern in report.DISTRIBUTION_PATTERN_IDS:
+            svg = report.distribution_stack_svg(view, pattern, "throughput").decode()
+            self.assertNotIn(report.RSS_FLOOR_LABEL, svg)
+            self.assertNotIn('data-series="floor"', svg)
+            self.assertNotIn("data-floor-bytes", svg)
+
+    def test_thread_churn_chart_draws_the_baseline_floor(self) -> None:
+        # After the drain nothing is live: the floor is the smallest baseline, flat.
+        view = self.floor_view()
+        assert view.thread_churn is not None
+        svg = report.thread_churn_svg(view, 1300).decode()
+        self.assertIn(report.RSS_FLOOR_LABEL, svg)
+        churn = next(
+            item for item in view.rss_floors if item.pattern == report.THREAD_CHURN_PATTERN
+        )
+        self.assertEqual(churn.peak_live_requested_bytes, 0)
+        self.assertIn(f'data-floor-bytes="{churn.floor_rss_bytes}"', svg)
+        line = re.search(
+            r'<line [^>]*y1="([\d.]+)" [^>]*y2="([\d.]+)" [^>]*data-series="floor"', svg
+        )
+        assert line is not None, "the thread-churn chart has no floor line"
+        self.assertEqual(line.group(1), line.group(2))
+        for path in re.findall(r'<path d="([^"]+)" fill="none" stroke="#', svg):
+            self.assertTrue(all(float(line.group(1)) >= y for y in self.path_ys(path)))
+
+    def test_rss_floor_is_validated_against_raw_samples_and_measured_peaks(self) -> None:
+        def floors_of(value: dict[str, object]) -> list[dict[str, object]]:
+            scaling = cast(dict[str, object], value["scaling"])
+            return cast(
+                list[dict[str, object]], cast(dict[str, object], scaling["rss"])["floor_summaries"]
+            )
+
+        good = self.with_thread_churn(self.load_latest())
+        report.validate_scaling_report(good["scaling"], "floor fixture")
+
+        tampered = copy.deepcopy(good)
+        floors_of(tampered)[0]["floor_rss_bytes"] = (
+            cast(int, floors_of(tampered)[0]["floor_rss_bytes"]) + 1
+        )
+        with self.assertRaisesRegex(report.ReportError, "floor"):
+            report.validate_scaling_report(tampered["scaling"], "tampered floor")
+
+        missing = copy.deepcopy(good)
+        del cast(dict[str, object], cast(dict[str, object], missing["scaling"])["rss"])[
+            "floor_summaries"
+        ]
+        with self.assertRaisesRegex(report.ReportError, "floor_summaries"):
+            report.validate_scaling_report(missing["scaling"], "missing floors")
+
+        # A floor above what an allocator was measured at can only be a
+        # measurement bug: the run fails instead of drawing it.
+        above = copy.deepcopy(good)
+        scaling = cast(dict[str, object], above["scaling"])
+        for sample in cast(list[dict[str, object]], scaling["raw_samples"]):
+            if sample["pattern"] == "random-large" and sample["thread_count"] == 1:
+                sample["diagnostic_peak_live_requested_bytes"] = 500 * MIB
+        churn = cast(dict[str, object], scaling["thread_churn"])
+        cast(dict[str, object], scaling["rss"])["floor_summaries"] = rss_floors(
+            cast(list[dict[str, object]], scaling["raw_samples"]),
+            cast(list[dict[str, object]], churn["raw_samples"]),
+        )
+        with self.assertRaisesRegex(report.ReportError, "above"):
+            report.validate_scaling_report(above["scaling"], "floor above a peak")
+
+    def test_v1_rss_side_car_without_floors_still_validates_and_renders(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        rss = cast(dict[str, object], cast(dict[str, object], latest["scaling"])["rss"])
+        rss["metric_schema_version"] = report.LEGACY_SCALING_RSS_SCHEMA
+        del rss["floor_summaries"]
+        scaling = report.validate_scaling_report(latest["scaling"], "v1 side-car")
+        view = report.scaling_view_from_validated(scaling)
+        self.assertEqual(view.rss_floors, ())
+        svg = report.distribution_stack_svg(view, "random-large", "rss").decode()
+        self.assertNotIn(report.RSS_FLOOR_LABEL, svg)
+        self.assertIn("<td>-</td>", report.render_scaling_html(view))
+
+    def test_distribution_table_reports_the_floor_and_peak_over_floor(self) -> None:
+        view = self.floor_view()
+        page = report.render_scaling_html(view)
+        self.assertIn("<th>Floor MiB</th>", page)
+        self.assertIn("<th>Peak RSS P50 &#247; floor</th>", page)
+        floor = next(
+            item
+            for item in view.rss_floors
+            if item.pattern == "random-large" and item.thread_count == 8
+        )
+        cell = next(
+            item
+            for item in view.rss_cells
+            if item.pattern == "random-large"
+            and item.thread_count == 8
+            and item.allocator_id == "tcmalloc"
+        )
+        self.assertIn(
+            f"<td>{report.format_mib(floor.floor_rss_bytes)}</td>"
+            f"<td>{cell.median / floor.floor_rss_bytes:.2f}x</td>",
+            page,
+        )
+        self.assertIn(report.RSS_FLOOR_LABEL, page)
 
     def test_scaling_report_rejects_raw_values_that_disagree_with_summaries(self) -> None:
         latest = self.with_complete_scaling(self.load_latest())
@@ -2337,6 +2543,8 @@ class BenchmarkReportTests(unittest.TestCase):
         rss["cell_summaries"] = [
             item for item in rss_summaries if isinstance(item, dict) and item["pattern"] in legacy
         ]
+        # #534: no legacy pattern replays live telemetry, so there is no floor.
+        rss["floor_summaries"] = []
 
         report.validate_latest(latest, "legacy four-pattern lineage")
         self.assertEqual(legacy, set(report.scaling_patterns_of(scaling)))

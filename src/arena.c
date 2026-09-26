@@ -2951,8 +2951,13 @@ typedef struct mi_purge_visit_info_s {
   bool all_purged;
   bool any_purged;
   bool take_young;   // #457: forced purge -- ranges freed again since they were aged are purged too
-  mi_bitmap_t* young;   // #506: the young queue of the aged one being purged (long or short window)
 } mi_purge_visit_info_t;
+
+// #457/#506: was the slice freed again since it was aged? It is then young again, in either queue
+// (a range aged in one queue can be taken by a page of the other size class and freed again).
+static bool mi_arena_purge_is_young(mi_arena_t* arena, size_t slice_index) {
+  return (mi_bitmap_is_set(arena->slices_purge, slice_index) || mi_bitmap_is_set(arena->slices_purge_short, slice_index));
+}
 
 // #457/#506: the aged queue a young range moves into (`mi_arena_age_purge_visitor`)
 typedef struct mi_purge_age_info_s {
@@ -3000,11 +3005,12 @@ static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, m
   // waits for its own deadline. #497: only that slice -- the run handed to us is a maximal run of
   // aged bits, already cleared, so skipping all of it would lose the parts that did stay free
   // for the whole period (they are in neither queue after this).
-  if (!vinfo->take_young && !mi_bitmap_is_clearN(vinfo->young, slice_index, slice_count)) {
+  if (!vinfo->take_young && (!mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count) ||
+                             !mi_bitmap_is_clearN(arena->slices_purge_short, slice_index, slice_count))) {
     for (size_t i = 0; i < slice_count; ) {
-      if (mi_bitmap_is_set(vinfo->young, slice_index + i)) { i++; continue; }
+      if (mi_arena_purge_is_young(arena, slice_index + i)) { i++; continue; }
       size_t n = 1;
-      while (i + n < slice_count && !mi_bitmap_is_set(vinfo->young, slice_index + i + n)) { n++; }
+      while (i + n < slice_count && !mi_arena_purge_is_young(arena, slice_index + i + n)) { n++; }
       mi_arena_try_purge_run(arena, slice_index + i, n, vinfo);
       i += n;
     }
@@ -3065,7 +3071,7 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
   // `arena_purge_mult` times further apart.
   const long delay = mi_arena_purge_delay();
   const long period = mi_arena_purge_period();
-  mi_purge_visit_info_t vinfo = { now, delay, true /*all?*/, false /*any?*/, force /*young?*/, arena->slices_purge_short };
+  mi_purge_visit_info_t vinfo = { now, delay, true /*all?*/, false /*any?*/, force /*young?*/ };
   // we purge by at least `minslices` to not fragment transparent huge pages for example
   const size_t minslices = mi_slice_count_of_size(_mi_os_minimal_purge_size());
   if (force) { _mi_bitmap_forall_setc_rangesn(arena->slices_purge_short, minslices, &mi_arena_try_purge_visitor, arena, &vinfo); }
@@ -3075,7 +3081,6 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
   if (force || (long_expire != 0 && long_expire <= now)) {
     // cleared before the queue is aged, as `purge_expire` above: a free from here on re-arms it
     mi_atomic_storei64_release(&arena->purge_long_expire, (mi_msecs_t)0);
-    vinfo.young = arena->slices_purge;
     if (force) { _mi_bitmap_forall_setc_rangesn(arena->slices_purge, minslices, &mi_arena_try_purge_visitor, arena, &vinfo); }
     _mi_bitmap_forall_setc_rangesn(arena->slices_purge_aged, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
     const bool long_aged = mi_arena_age_purge(arena, arena->slices_purge, arena->slices_purge_aged);

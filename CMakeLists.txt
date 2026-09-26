@@ -90,6 +90,7 @@ set(mi_sources
     src/alloc-posix.c
     src/arena.c
     src/arena-reclaim.c
+    src/arena-layout.c
     src/bitmap.c
     src/heap.c
     src/heap-dump.c
@@ -486,7 +487,8 @@ if(MI_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND
   set(mi_strict_fork_sources "")
   foreach(f IN ITEMS src/profile.c src/profile-stack.c src/profile-maps.c src/memory-events.c
                       src/dhat.c src/dhat-stack.c src/scavenger.c src/page-holes.c
-                      src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c)
+                      src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c
+                      src/arena-layout.c)
     if(f IN_LIST mi_sources)
       list(APPEND mi_strict_fork_sources ${f})
     endif()
@@ -852,7 +854,8 @@ if(MI_USE_CXX)
   # wrapping ever change.
   # test-arena-purge-rearm.c (#491): calls `_mi_release_bound_ms` from internal.h, the same case.
   # test-resident-first-churn.c (#517): calls `_mi_arena_claim_counters` from internal.h, the same case.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c PROPERTIES LANGUAGE CXX )
+  # test-arena-layout.c (#519): calls `_mi_arena_layout_walk` from internal.h, the same case.
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -2083,6 +2086,20 @@ if (MI_BUILD_TESTS)
     endif()
     add_test(NAME test-resident-first-churn COMMAND mimalloc-test-resident-first-churn)
     set_tests_properties(test-resident-first-churn PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
+  endif()
+
+  # test-arena-layout (#519): the arena layout walk behind `mi_purge_holes_report`. Built in
+  # EVERY configuration: with MI_DIAGNOSTICS it checks the walk's exact counts on an exclusive
+  # arena; without it, that the stub zeroes the layout. (MIMALLOC_PURGE_ZEROES=0: a purge that
+  # zeroes a range clears its dirty bits, turning the purged run fresh instead of dirty.)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-layout test/test-arena-layout.c)
+    target_compile_definitions(mimalloc-test-arena-layout PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-layout PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-layout PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-layout PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-arena-layout COMMAND mimalloc-test-arena-layout)
+    set_tests_properties(test-arena-layout PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
   endif()
 
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of

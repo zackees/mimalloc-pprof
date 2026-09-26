@@ -48,6 +48,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "page-holes.c"  // #272: hole purging (Bun parity P7b)
 #include "purge-all.c"    // #366: mi_purge_all (not profiler code: unconditional)
 #include "arena-reclaim.c"// the free-arena reclaim of mi_purge_all(MI_PURGE_RECLAIM)
+#include "arena-layout.c" // #519: the arena layout walk of mi_purge_holes_report (MI_DIAGNOSTICS; stubs otherwise)
 #include "profile.c"
 #if MI_PPROF
 #include "profile-stack.c"

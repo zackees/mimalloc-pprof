@@ -894,6 +894,8 @@ def run_lint(ctx: RunCtx) -> bool:
         # cross-built bundle and the PR-diff decision that picks the lane.
         ["uv", "run", "ci/check_macos_labels.py", "--selftest"],
         ["uv", "run", "ci/macos_lane_decide.py", "--selftest"],
+        # The minimal-lane memory gate's PR-diff decision (#518).
+        ["uv", "run", "ci/memory_gate_lane_decide.py", "--selftest"],
         # No file-wide -Wunused-function suppression; the amalgamation compiles with
         # -Werror=unused-function when clang is available.
         ["uv", "run", "ci/check_no_diagnostic_suppression.py", "--selftest"],

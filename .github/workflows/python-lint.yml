@@ -96,6 +96,8 @@ jobs:
           set -euo pipefail
           python3 ci/check_macos_labels.py --selftest
           python3 ci/macos_lane_decide.py --selftest
+      - name: Minimal-lane memory gate decision (#518)
+        run: python3 ci/memory_gate_lane_decide.py --selftest
 
       # The committed chart SVGs under .github/assets must still re-render
       # byte-for-byte from the committed CSV/JSON they name. `--check` re-renders and

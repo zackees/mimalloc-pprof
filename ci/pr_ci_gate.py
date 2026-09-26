@@ -34,18 +34,29 @@ FULL_JOBS: dict[str, set[str]] = {
     "purge-teardown-regression": {"build", "reproduce"},
 }
 TEST_TIER = frozenset({"c-unit", "asan", "fuzz", "purge-teardown-regression"})
+#: Path-selected lanes: workflow -> (decide job, lane job). The decide job runs on every
+#: PR and is always required; the lane job is required when its `run` output is "true".
+#: macOS: the selective Recovery lane (#339). c-unit: the minimal-lane memory gate
+#: (#518), whose decision is already "false" when the full lane's run-linux covers it.
+SELECTIVE_JOBS: dict[str, tuple[str, str]] = {
+    "macos-bundles": ("decide", "run-macos-x64-selective"),
+    "c-unit": ("memory-gate-decide", "memory-gate"),
+}
 
 
 def required_jobs(
-    workflow: str, external: bool, ci_test: bool, ci_full: bool, selective_macos: bool
+    workflow: str, external: bool, ci_test: bool, ci_full: bool, selective: bool
 ) -> set[str]:
     expected = {"pr-ci-mode"}
     if workflow in {"c-unit", "cross", "rust-native", "windows-bundles", "macos-bundles"}:
         expected.add("resolve-candidate")
     if workflow == "macos-bundles":
-        expected.update({"decide", "build-macos"})
-        if selective_macos:
-            expected.add("run-macos-x64-selective")
+        expected.add("build-macos")
+    if workflow in SELECTIVE_JOBS:
+        decide_job, lane_job = SELECTIVE_JOBS[workflow]
+        expected.add(decide_job)
+        if selective:
+            expected.add(lane_job)
     if external or ci_full or (ci_test and workflow in TEST_TIER):
         expected.update(FULL_JOBS[workflow])
     return expected
@@ -63,7 +74,7 @@ def failures(
     external = outputs.get("external")
     if external not in {"true", "false"}:
         return ["pr-ci-mode: external decision missing or invalid"]
-    decide_value = needs.get("decide")
+    decide_value = needs.get(SELECTIVE_JOBS[workflow][0]) if workflow in SELECTIVE_JOBS else None
     decide = cast("dict[str, object]", decide_value) if isinstance(decide_value, dict) else {}
     decide_outputs_value = decide.get("outputs")
     decide_outputs = (

@@ -6,7 +6,7 @@ from typing import Any
 
 import yaml
 
-from pr_ci_gate import FULL_JOBS
+from pr_ci_gate import FULL_JOBS, SELECTIVE_JOBS
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -40,10 +40,9 @@ def test_pr_gate_covers_every_release_manifest_root() -> None:
     optional = {"pr-ci-mode", "pr-test-gate", "resolve-candidate"}
     for filename in MANIFEST["workflows"]:
         jobs = workflow(filename)["jobs"]
-        mac_optional = {"decide", "run-macos-x64-selective", "run-macos-x64-recovery"}
-        expected = set(jobs) - optional
+        expected = set(jobs) - optional - set(SELECTIVE_JOBS.get(filename.removesuffix(".yml"), ()))
         if filename == "macos-bundles.yml":
-            expected -= mac_optional
+            expected -= {"run-macos-x64-recovery"}
         assert expected == FULL_JOBS[filename.removesuffix(".yml")], filename
 
 

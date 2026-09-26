@@ -20,7 +20,9 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
 
 ## Hard rules
 
-Internal PR and `main` CI use the minimal lane. Add literal `ci-test` for the
+Internal PR and `main` CI use the minimal lane. A PR touching `src/`, `include/` or
+`CMakeLists.txt` also runs the Linux memory gate in that lane (`c-unit.yml`
+`memory-gate`, #518). Add literal `ci-test` for the
 complete C test DAG; add `ci-full` for the release platform matrix, including
 native Intel and Apple Silicon execution. External PR authors without write
 access receive the full test matrix without a label (#463). Label changes

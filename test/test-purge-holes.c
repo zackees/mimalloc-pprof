@@ -1981,9 +1981,12 @@ static void reserve_thread_a(void) {     // form a few blocks, touch them, free 
     p[i] = mi_malloc(RESERVE_SZ);
     if (p[i] != NULL) memset(p[i], 1, RESERVE_SZ);
   }
-  reserve_a_block = p[0];
-  if (p[0] != NULL) {
-    reserve_a_page = _mi_ptr_page(p[0]);
+  // #532: the page A leaves behind is the one its LAST block is in. A bin's first page is compact
+  // now (two 448 KiB blocks), so the third block opens a second, larger page; the first one empties
+  // with the frees below and goes back to the arena at once, since it is not the bin's only page.
+  reserve_a_block = p[RESERVE_N - 1];
+  if (reserve_a_block != NULL) {
+    reserve_a_page = _mi_ptr_page(reserve_a_block);
     reserve_a_bin = _mi_page_stats_bin(reserve_a_page);
     reserve_a_singleton = mi_page_is_singleton(reserve_a_page);
   }

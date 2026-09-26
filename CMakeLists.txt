@@ -104,6 +104,7 @@ set(mi_sources
     src/page.c
     src/page-map.c
     src/page-holes.c
+    src/large-span.c
     src/purge-all.c
     src/profile.c
     src/random.c
@@ -488,7 +489,7 @@ if(MI_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND
   foreach(f IN ITEMS src/profile.c src/profile-stack.c src/profile-maps.c src/memory-events.c
                       src/dhat.c src/dhat-stack.c src/scavenger.c src/page-holes.c
                       src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c
-                      src/arena-layout.c)
+                      src/arena-layout.c src/large-span.c)
     if(f IN_LIST mi_sources)
       list(APPEND mi_strict_fork_sources ${f})
     endif()
@@ -855,7 +856,8 @@ if(MI_USE_CXX)
   # test-arena-purge-rearm.c (#491): calls `_mi_release_bound_ms` from internal.h, the same case.
   # test-resident-first-churn.c (#517): calls `_mi_arena_claim_counters` from internal.h, the same case.
   # test-arena-layout.c (#519): calls `_mi_arena_layout_walk` from internal.h, the same case.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c PROPERTIES LANGUAGE CXX )
+  # test-large-span.c (#532): reads `_mi_ptr_page` / `mi_page_t` from internal.h, the same case.
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-large-span.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -2080,6 +2082,24 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-resident-first PRIVATE mimalloc-static ${mi_libraries})
     add_test(NAME test-resident-first COMMAND mimalloc-test-resident-first)
     set_tests_properties(test-resident-first PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
+  endif()
+
+  # test-large-span (#532): a large page's span comes from its bin's demand on the theap -- compact
+  # for a lightly used bin, growing to the full 4 MiB for a busy one -- and an abandoned compact page
+  # is reclaimed and validated over its own span. Structural checks only (no RSS, no timing); the
+  # scavenger and the hole sweep are off so no background pass holds an abandoned page meanwhile.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-large-span test/test-large-span.c)
+    target_compile_definitions(mimalloc-test-large-span PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-large-span PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-large-span PRIVATE include)
+    target_link_libraries(mimalloc-test-large-span PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-large-span PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-large-span COMMAND mimalloc-test-large-span)
+    set_tests_properties(test-large-span PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=0")
   endif()
 
   # test-resident-first-churn (#517): the memory gate's thread-churn scenario must not claim

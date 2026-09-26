@@ -381,6 +381,7 @@ static const mi_rs_layout_entry_t mi_rs_layout_entries[] = {
   MI_RS_OPTION(mi_option_snapshot_on_exit)
   MI_RS_OPTION(mi_option_page_reserve)
   MI_RS_OPTION(mi_option_resident_first)
+  MI_RS_OPTION(mi_option_large_span)
   MI_RS_OPTION(_mi_option_last)
   /* deprecated aliases, defined after the sentinel with explicit values */
   MI_RS_OPTION(mi_option_large_os_pages)

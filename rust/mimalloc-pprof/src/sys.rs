@@ -619,8 +619,11 @@ mi_options! {
     /// **Fork addition (#493).** Claim arena slices that are free but still resident (queued
     /// for purge) before any other free slices (=1); 0 = the plain search only.
     mi_option_resident_first = 62;
+    /// **Fork addition (#532).** Size a new large page (blocks of ~84-512 KiB) from its size
+    /// class's demand on the thread: compact first, growing to 4 MiB (=1); 0 = always 4 MiB.
+    mi_option_large_span = 63;
     /// Sentinel: one past the last real option.
-    _mi_option_last = 63;
+    _mi_option_last = 64;
 }
 
 /// `MI_SNAPSHOT_BLOCKS` (include/mimalloc.h, #338): include per-block free bitmaps for the

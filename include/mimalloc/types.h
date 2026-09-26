@@ -360,6 +360,60 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_RESIDENT_FIRST_MIN_SLICES      (16)
 #endif
 
+// #532: a large page (blocks of ~84-512 KiB) is sized from what its size class ("bin") demands on
+// the theap that creates it, not fixed at MI_LARGE_PAGE_SIZE (src/large-span.c). Every thread used
+// to hold one 4 MiB page per large bin it touched, 98-99% of it never formed (#529, E4): about
+// 44 MiB per worker whatever its live bytes. A bin's page starts at a compact span; the span grows
+// geometrically up to MI_LARGE_PAGE_SIZE while that theap keeps filling the bin's pages, and decays
+// again when it stops. The accounting is per theap and per bin, kept in slow paths only (page full,
+// page creation); no thread count and no clock go into it. Compile-time opt-out: MI_LARGE_SPAN=0;
+// run-time: `mi_option_large_span` (MIMALLOC_LARGE_SPAN=0). Both give every large page 4 MiB.
+#ifndef MI_LARGE_SPAN
+#define MI_LARGE_SPAN                     (MI_ENABLE_LARGE_PAGES)
+#endif
+// the span of a bin's page before the theap has shown any demand beyond one page: 16 slices is
+// 1 MiB with 64 KiB slices (= MI_RESIDENT_FIRST_MIN_SLICES, so resident-first still applies), which
+// two blocks of every large bin fit in (see MI_LARGE_SPAN_MIN_BLOCKS)
+#ifndef MI_LARGE_SPAN_COMPACT_SLICES
+#define MI_LARGE_SPAN_COMPACT_SLICES      (16)
+#endif
+// each demand step multiplies the span by 2^MI_LARGE_SPAN_GROW_SHIFT (1: 1 -> 2 -> 4 MiB)
+#ifndef MI_LARGE_SPAN_GROW_SHIFT
+#define MI_LARGE_SPAN_GROW_SHIFT          (1)
+#endif
+// A page request comes when a bin has no page with a free block left on the theap. It is "full"
+// when a page of the bin filled up since the previous request (demand beyond what the theap holds)
+// and "quiet" otherwise (the bin's last page emptied and went away). The bin keeps a pressure
+// count, +1 per full and -1 per quiet request: the span steps up once it reaches
+// MI_LARGE_SPAN_GROW_REQUESTS and down once it reaches -MI_LARGE_SPAN_DECAY_REQUESTS. So a bin
+// that keeps filling its pages grows (every second request), while a single overflow -- one more
+// live block than a compact page holds, once -- does not (#532: on perf-ab's large-class rows the
+// top bins, two blocks per compact page, grew to 4 MiB on every such blip). At most 7 and 8.
+#ifndef MI_LARGE_SPAN_GROW_REQUESTS
+#define MI_LARGE_SPAN_GROW_REQUESTS       (2)
+#endif
+#ifndef MI_LARGE_SPAN_DECAY_REQUESTS
+#define MI_LARGE_SPAN_DECAY_REQUESTS      (4)
+#endif
+// a span always holds at least this many blocks, even when the page meta and a guard page sit in
+// it (an OS-allocated fallback page, MI_SECURE>=5): a page with one block would be a singleton
+#ifndef MI_LARGE_SPAN_MIN_BLOCKS
+#define MI_LARGE_SPAN_MIN_BLOCKS          (2)
+#endif
+// capacity of the per-theap table (the large bins: 11 with 64 KiB slices, fewer on 32-bit); a bin
+// past it just gets MI_LARGE_PAGE_SIZE
+#define MI_LARGE_SPAN_BINS                (16)
+
+#if MI_LARGE_SPAN
+// The demand accounting of one large bin on one theap (src/large-span.c), packed in one byte:
+// bits 0-2 the level (the span is MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT),
+// capped at MI_LARGE_PAGE_SIZE), bit 3 "a page of the bin filled up since the last page request",
+// bits 4-7 the pressure count, 4-bit two's complement (see MI_LARGE_SPAN_GROW_REQUESTS; 0 = none). One byte because
+// `mi_theap_t` sits just under the 8 KiB meta-allocator size class (8144 bytes): 16 more bytes
+// keep it there, 64 would not.
+typedef uint8_t mi_large_span_bin_t;
+#endif
+
 
 // ------------------------------------------------------
 // Arena's are large reserved areas of memory allocated from
@@ -758,6 +812,9 @@ struct mi_theap_s {
   mi_page_queue_t       pages[MI_BIN_COUNT];                 // queue of pages for each size class (or "bin")
   mi_memid_t            memid;                               // provenance of the theap struct itself (meta or os)
   mi_stats_t            stats;                               // thread-local statistics
+  #if MI_LARGE_SPAN
+  mi_large_span_bin_t   large_span[MI_LARGE_SPAN_BINS];      // #532: per large bin demand accounting (src/large-span.c); last, so no fast-path offset moves
+  #endif
 };
 
 

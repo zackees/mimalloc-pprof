@@ -1295,6 +1295,9 @@ pub mod options {
         /// **Fork addition (#493).** Claim arena slices that are free but still resident (queued
         /// for purge) before any other free slices; 0 = the plain search only.
         pub const RESIDENT_FIRST: Self = Self(sys::mi_option_resident_first);
+        /// **Fork addition (#532).** Size a new large page (blocks of ~84-512 KiB) from its size
+        /// class's demand on the thread: compact first, growing to 4 MiB; 0 = always 4 MiB.
+        pub const LARGE_SPAN: Self = Self(sys::mi_option_large_span);
 
         /// Upstream: milliseconds to delay purging, which the scavenger also honours.
         pub const PURGE_DELAY: Self = Self(sys::mi_option_purge_delay);

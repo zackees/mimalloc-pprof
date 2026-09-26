@@ -897,6 +897,11 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
         mi_theap_stat_counter_increase(theap, pages_reclaim_on_alloc, 1);
 
         _mi_page_free_collect(page, false);  // update `used` count
+        // #532 (from #443's 8b569e56): the page was found by BIN, and the pages of a large bin do
+        // not all have one span (src/large-span.c). The caller's `slice_count` is only what a FRESH
+        // page of this bin would get; validating the claimed page over it would run past the end
+        // of a smaller page, into slices that belong to no page. Validate the page's own range.
+        (void)mi_page_arena_pages(page, &slice_index, &slice_count, NULL);
         mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
         mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
         mi_assert_internal(mi_bitmap_is_setN(arena->slices_dirty, slice_index, slice_count));
@@ -1237,7 +1242,17 @@ mi_page_t* _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t bl
   }
   #if MI_ENABLE_LARGE_PAGES
   else if (block_size <= MI_LARGE_MAX_OBJ_SIZE) {
+    #if MI_LARGE_SPAN
+    // #532: the span comes from the bin's demand on this theap (src/large-span.c). The overhead is
+    // the worst case (an OS fallback page carries its meta in front, MI_SECURE>=5 a guard page).
+    size_t overhead = mi_page_block_start(block_size, false);
+    #if MI_SECURE>=5
+    overhead += _mi_os_secure_guard_page_size();
+    #endif
+    page = mi_arenas_page_regular_alloc(theap, _mi_large_span_slices(theap, block_size, overhead), block_size);
+    #else
     page = mi_arenas_page_regular_alloc(theap, mi_slice_count_of_size(MI_LARGE_PAGE_SIZE), block_size);
+    #endif
   }
   #endif
   else {

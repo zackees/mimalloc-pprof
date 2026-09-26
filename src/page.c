@@ -468,6 +468,9 @@ static void mi_page_to_full(mi_page_t* page, mi_page_queue_t* pq) {
   mi_assert_internal(!mi_page_is_in_full(page));
 
   mi_theap_t* theap = mi_page_theap(page);
+  #if MI_LARGE_SPAN
+  _mi_large_span_on_full(theap, page);   // #532: demand beyond this page (src/large-span.c)
+  #endif
   if (theap->allow_page_abandon) {
     // abandon full pages (this is the usual case in order to allow for sharing of memory between theaps)
     _mi_page_abandon(page, pq);

@@ -9,10 +9,16 @@ median paired difference with a bootstrap 95% interval; a direction is only clai
 the interval excludes zero. Linux only. Meant for a CI runner, not a busy dev machine.
 
     python3 ci/perf_ab.py --base origin/main --head HEAD [--reps 7] [--workloads random] [--summary out.md]
-        [--head-env MIMALLOC_ARENA_PURGE_MULT=1]
+        [--head-env MIMALLOC_ARENA_PURGE_MULT=1] [--head-cppdefs MI_ENABLE_LARGE_PAGES=0]
 
 --head-env sets allocator options on the head arm only: base and head at the same ref then
-attribute a cost to one option (#506).
+attribute a cost to one option (#506). --head-cppdefs does the same for a compile-time define:
+the head arm's library is built with -DMI_EXTRA_CPPDEFS=<value> (#527).
+
+The #422 diagnostic rows (exact sizes, size-class edges, the sparse-large-buffers twin; names end
+in "(#422)") run only when --workloads names them, e.g. --workloads '#422' or '80 KiB|512 KiB';
+the default selection is the gating rows alone. With a diagnostic row or --head-cppdefs, the
+table also shows each probed size's bin and page kind on both arms (`perf_ab probe`).
 """
 
 from __future__ import annotations
@@ -22,10 +28,12 @@ import json
 import math
 import os
 import random
+import re
 import statistics
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 FLAGS = [
@@ -50,32 +58,93 @@ BUILDS: dict[str, tuple[list[str], dict[str, str]]] = {
     "pprof": (["-DMI_PPROF=ON"], {"MIMALLOC_PROF": "1"}),
     "chart": (["-DMI_PPROF=ON", "-DMI_MEMEVT=ON"], {}),
 }
-# name: (build, (threads, generations, min bytes, max bytes, ops per thread, pause ms, table slots)).
-# A pause makes the row bursty (#486): BURSTS bursts per thread, everything freed after each, then
-# idle. Table slots make it the Larson server workload (#506): one shared table of that many blocks
-# per thread, rotating between the threads, so later frees are remote, and a per-table log that
-# grows by doubling realloc as the chart harness's own does (see ci/perf_ab.c).
+
+
+class Params(NamedTuple):
+    """One row's ci/perf_ab.c arguments, in its argv order (the release bound follows)."""
+
+    threads: int
+    generations: int
+    min_size: int
+    max_size: int
+    ops: int  # per thread
+    pause_ms: int = 0
+    table_slots: int = 0
+    sizes: str = "uniform"  # or "log": log-uniform over [min_size, max_size] (#527)
+
+
+# name: (build, Params). A pause makes the row bursty (#486): BURSTS bursts per thread, everything
+# freed after each, then idle. Table slots make it the Larson server workload (#506): one shared
+# table of that many blocks per thread, rotating between the threads, so later frees are remote,
+# and a per-table log that grows by doubling realloc as the chart harness's own does (see
+# ci/perf_ab.c). min == max is an exact-size row.
 LARSON_SLOTS = 5000  # the benchmark suite's larson live set per thread (mimalloc-bench's `larson ... 5000 ...`)
-WORKLOADS = {
-    "large-class/8": ("plain", (8, 1, 96 << 10, 512 << 10, 400000, 0, 0)),
-    "large-class-ephemeral/8": ("plain", (8, 8, 96 << 10, 512 << 10, 400000, 0, 0)),
-    "random-large/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 0, 0)),
-    "random-large-bursty/8": ("plain", (8, 1, 64 << 10, 4 << 20, 40000, 300, 0)),
-    "random-large/1": ("plain", (1, 1, 64 << 10, 4 << 20, 200000, 0, 0)),
-    "small/8 (control)": ("plain", (8, 1, 16, 1024, 5000000, 0, 0)),
+WORKLOADS: dict[str, tuple[str, Params]] = {
+    "large-class/8": ("plain", Params(8, 1, 96 << 10, 512 << 10, 400000, 0, 0)),
+    "large-class-ephemeral/8": ("plain", Params(8, 8, 96 << 10, 512 << 10, 400000, 0, 0)),
+    "random-large/8": ("plain", Params(8, 1, 64 << 10, 4 << 20, 40000, 0, 0)),
+    "random-large-bursty/8": ("plain", Params(8, 1, 64 << 10, 4 << 20, 40000, 300, 0)),
+    "random-large/1": ("plain", Params(1, 1, 64 << 10, 4 << 20, 200000, 0, 0)),
+    "small/8 (control)": ("plain", Params(8, 1, 16, 1024, 5000000, 0, 0)),
     # #506: the README's larson chart (8-1000 B); its peak RSS regressed with no row to show it
     # (ops per thread: the chart's calibrated cells, ~9.8M at 1 worker and ~2.5M at 8)
-    "larson/1": ("plain", (1, 1, 8, 1000, 10000000, 0, LARSON_SLOTS)),
-    "larson/8": ("plain", (8, 1, 8, 1000, 2500000, 0, LARSON_SLOTS)),
-    "larson/8 (chart build)": ("chart", (8, 1, 8, 1000, 2500000, 0, LARSON_SLOTS)),
-    "large-class/8 (profiler on)": ("pprof", (8, 1, 96 << 10, 512 << 10, 400000, 0, 0)),
-    "large-class-ephemeral/8 (chart build)": ("chart", (8, 8, 96 << 10, 512 << 10, 400000, 0, 0)),
+    "larson/1": ("plain", Params(1, 1, 8, 1000, 10000000, 0, LARSON_SLOTS)),
+    "larson/8": ("plain", Params(8, 1, 8, 1000, 2500000, 0, LARSON_SLOTS)),
+    "larson/8 (chart build)": ("chart", Params(8, 1, 8, 1000, 2500000, 0, LARSON_SLOTS)),
+    "large-class/8 (profiler on)": ("pprof", Params(8, 1, 96 << 10, 512 << 10, 400000, 0, 0)),
+    "large-class-ephemeral/8 (chart build)": (
+        "chart",
+        Params(8, 8, 96 << 10, 512 << 10, 400000, 0, 0),
+    ),
     # the README chart's generation length (~12.5k ops per short-lived thread at 8 workers, #478):
     # a per-thread start/exit cost weighs 4x more than in the row above
     "large-class-ephemeral/8 short generations (chart build)": (
         "chart",
-        (8, 8, 96 << 10, 512 << 10, 100000, 0, 0),
+        Params(8, 8, 96 << 10, 512 << 10, 100000, 0, 0),
     ),
+}
+# #422 step 0 (E3, #527): diagnostic rows, not gates. They run only when --workloads selects them,
+# so a perf-ab PR run costs what it did. Every name ends in DIAGNOSTIC_TAG; selecting the tag
+# runs them all. Sizes: exact sizes across the size classes, and both sides of two edges -- the
+# last medium bin (80 KiB) against the first large one (96 KiB), a 4 MiB large page (512 KiB)
+# against a singleton page -- which `perf_ab probe` confirms per build. Screened at 1 and 4
+# workers, as the proposal asks. DIAGNOSTIC_OPS is random-large/1's count, split over the workers;
+# a size row gets as many ops as request as many bytes as the 4 MiB row (DIAGNOSTIC_BYTES), so a
+# 64 KiB row runs long enough for its cpu columns to mean something.
+DIAGNOSTIC_TAG = "(#422)"
+DIAGNOSTIC_THREADS = (1, 4)
+DIAGNOSTIC_OPS = 200000
+KIB, MIB = 1 << 10, 1 << 20
+DIAGNOSTIC_BYTES = DIAGNOSTIC_OPS * 4 * MIB
+DIAGNOSTIC_SIZES = {
+    "64 KiB": 64 * KIB,
+    "80 KiB": 80 * KIB,
+    "80 KiB+1": 80 * KIB + 1,
+    "128 KiB": 128 * KIB,
+    "512 KiB": 512 * KIB,
+    "512 KiB+1": 512 * KIB + 1,
+    "1 MiB": MIB,
+    "4 MiB": 4 * MIB,
+}
+# rust/benchmark-suite ScalingPattern::LargeBuffers: 64 KiB-4 MiB log-uniform over 8 live slots
+# (alloc 8 / free-oldest 6 / free-random 2, page-touched), which is ci/perf_ab.c's stream shape
+SPARSE_LARGE_BUFFERS = (64 * KIB, 4 * MIB)
+DIAGNOSTIC_WORKLOADS: dict[str, tuple[str, Params]] = {
+    **{
+        f"size {label}/{t} {DIAGNOSTIC_TAG}": (
+            "plain",
+            Params(t, 1, size, size, DIAGNOSTIC_BYTES // size // t),
+        )
+        for t in DIAGNOSTIC_THREADS
+        for label, size in DIAGNOSTIC_SIZES.items()
+    },
+    **{
+        f"sparse-large-buffers/{t} {DIAGNOSTIC_TAG}": (
+            "plain",
+            Params(t, 1, *SPARSE_LARGE_BUFFERS, DIAGNOSTIC_OPS // t, sizes="log"),
+        )
+        for t in DIAGNOSTIC_THREADS
+    },
 }
 # what ci/perf_ab.c prints, in order; the byte counts are shown in MiB
 METRICS = (
@@ -98,7 +167,7 @@ def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = No
     return subprocess.run(cmd, cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout
 
 
-def build(arm: str, ref: str, work: Path, kind: str) -> Path:
+def build(arm: str, ref: str, work: Path, kind: str, cppdefs: list[str]) -> Path:
     # Paths named by arm ("base"/"head") and build (BUILDS), never by ref: every
     # executable path then has the same length, and so does the process's initial stack. A
     # longer argv/environment shifts stack alignment, the likely reason identical binaries
@@ -106,7 +175,8 @@ def build(arm: str, ref: str, work: Path, kind: str) -> Path:
     tree, out = work / f"src-{arm}", work / f"bin-{arm}-{kind}"
     if not tree.exists():
         run(["git", "worktree", "add", "--detach", str(tree), ref], cwd=ROOT)
-    run(["cmake", "-S", str(tree), "-B", str(out), *FLAGS, *BUILDS[kind][0]])
+    extra = [f"-DMI_EXTRA_CPPDEFS={';'.join(cppdefs)}"] if cppdefs else []
+    run(["cmake", "-S", str(tree), "-B", str(out), *FLAGS, *BUILDS[kind][0], *extra])
     run(["cmake", "--build", str(out), "--target", "mimalloc-static", "--parallel"])
     exe = out / "perf_ab"
     lib = next(out.glob("libmimalloc*.a"))
@@ -154,6 +224,89 @@ def parse_env(text: str) -> dict[str, str]:
     return env
 
 
+# #527: a define is NAME or NAME=VALUE, kept to characters that mean the same to CMake's list
+# splitting, the shell and the compiler command line (no ';', quotes, spaces or '$')
+CPPDEF = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(=[A-Za-z0-9_.+-]+)?")
+
+
+def parse_cppdefs(text: str) -> list[str]:
+    """--head-cppdefs: defines separated by ';' (CMake's list form) or spaces."""
+    defines = [item for item in re.split(r"[;\s]+", text) if item]
+    for item in defines:
+        if not CPPDEF.fullmatch(item):
+            raise SystemExit(f"--head-cppdefs: expected NAME or NAME=VALUE, got {item!r}")
+    return defines
+
+
+def select(pattern: str) -> dict[str, tuple[str, Params]]:
+    """The rows whose name contains one of the '|'-separated alternatives; by default the gating
+    rows only (the diagnostic rows must be named)."""
+    if not pattern:
+        return dict(WORKLOADS)
+    alternatives = pattern.split("|")
+    rows = {**WORKLOADS, **DIAGNOSTIC_WORKLOADS}
+    return {name: w for name, w in rows.items() if any(a in name for a in alternatives)}
+
+
+def probe_sizes(workloads: dict[str, tuple[str, Params]], cppdefs: list[str]) -> list[int]:
+    """The sizes whose bin and page kind the table reports: the exact-size rows selected, and
+    every diagnostic size when the head arm is built with a define (it may move an edge)."""
+    sizes = {p.min_size for _, p in workloads.values() if p.min_size == p.max_size}
+    if cppdefs or any(name.endswith(DIAGNOSTIC_TAG) for name in workloads):
+        sizes.update(DIAGNOSTIC_SIZES.values())
+    return sorted(sizes)
+
+
+def probe(exe: Path, sizes: list[int]) -> dict[int, str]:
+    """`perf_ab probe`: size -> "bin N, B B block, K/page, kind" for that arm's build."""
+    found: dict[int, str] = {}
+    for line in run([str(exe), "probe", *map(str, sizes)]).splitlines():
+        size, bin_, block, blocks, kind = line.split()
+        found[int(size)] = f"bin {bin_}, {int(block):,} B block, {blocks}/page, {kind}"
+    return found
+
+
+def probe_rows(sizes: list[int], base: dict[int, str], head: dict[int, str]) -> list[str]:
+    rows = [
+        "",
+        "Bins and page kinds (`perf_ab probe`: one request of each size alone in a fresh heap; "
+        "**bold** where the arms differ).",
+        "",
+        "| size | base | head |",
+        "|---|---|---|",
+    ]
+    for size in sizes:
+        b, h = base[size], head[size]
+        if b != h:
+            b, h = f"**{b}**", f"**{h}**"
+        rows.append(f"| {size:,} | {b} | {h} |")
+    return rows
+
+
+def header(
+    base: str, head: str, head_env: str, cppdefs: list[str], cpu: str, reps: int
+) -> list[str]:
+    arms = f"`{base}` vs `{head}`"
+    if head_env.strip():
+        arms += f" with `{head_env.strip()}` on head"
+    rows: list[str] = []
+    if cppdefs:  # first, so the table cannot be mistaken for a default build's
+        rows += [
+            f"**Head arm built with `-DMI_EXTRA_CPPDEFS={';'.join(cppdefs)}`** "
+            "(base: the default build).",
+            "",
+        ]
+    rows += [
+        arms + f" on {cpu}, {reps} paired reps, alternating order. "
+        "Median base -> head, then median paired difference [bootstrap 95%]; "
+        "**bold** when the interval excludes 0.",
+        "",
+        "| workload | " + " | ".join(METRICS) + " |",
+        "|---|" + "---|" * len(METRICS),
+    ]
+    return rows
+
+
 def cpu_model() -> str:
     # an effect can depend on the CPU the runner happens to get (#478: -6.5% on some runners,
     # 0 on others), so every table says which one it came from
@@ -164,12 +317,17 @@ def cpu_model() -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--base", required=True)
     parser.add_argument("--head", required=True)
     parser.add_argument("--reps", type=int, default=7)
     parser.add_argument(
-        "--workloads", default="", help="only the workloads whose name contains this text"
+        "--workloads",
+        default="",
+        help="only the workloads whose name contains this text ('|' separates alternatives); "
+        f"the diagnostic rows ('{DIAGNOSTIC_TAG}') run only when named",
     )
     parser.add_argument("--summary", type=Path)
     parser.add_argument(
@@ -177,9 +335,16 @@ def main() -> int:
         default="",
         help="KEY=VALUE pairs (space separated) set on the head arm only, e.g. MIMALLOC_ARENA_PURGE_MULT=1",
     )
+    parser.add_argument(
+        "--head-cppdefs",
+        default="",
+        help="defines (';' or space separated) the head arm's library is built with, as "
+        "-DMI_EXTRA_CPPDEFS, e.g. MI_ENABLE_LARGE_PAGES=0",
+    )
     args = parser.parse_args()
     head_env = parse_env(args.head_env)
-    workloads = {name: w for name, w in WORKLOADS.items() if args.workloads in name}
+    cppdefs = parse_cppdefs(args.head_cppdefs)
+    workloads = select(args.workloads)
     if not workloads:
         parser.error(f"no workload matches {args.workloads!r}")
     bound_ms = int(json.loads(RATCHET.read_text())["bound_ms"])
@@ -187,9 +352,15 @@ def main() -> int:
         work = Path(tmp)
         try:
             exes = {
-                (arm, kind): build(arm, ref, work, kind)
+                (arm, kind): build(arm, ref, work, kind, cppdefs if arm == "head" else [])
                 for arm, ref in (("base", args.base), ("head", args.head))
                 for kind in sorted({k for k, _ in workloads.values()})
+            }
+            sizes = probe_sizes(workloads, cppdefs)
+            probe_kind = min(k for _, k in exes)  # a bin is the same in every BUILDS kind
+            probes = {
+                arm: probe(exes[(arm, probe_kind)], sizes) if sizes else {}
+                for arm in ("base", "head")
             }
             samples: dict[tuple[str, str], list[list[float]]] = {
                 (w, a): [] for w in workloads for a in ("base", "head")
@@ -212,16 +383,7 @@ def main() -> int:
         finally:  # unregister the trees while they still exist: a prune here would find nothing to prune
             for tree in work.glob("src-*"):
                 run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
-    rows = [
-        f"`{args.base}` vs `{args.head}`"
-        + (f" with `{args.head_env.strip()}` on head" if head_env else "")
-        + f" on {cpu_model()}, {args.reps} paired reps, alternating order. "
-        "Median base -> head, then median paired difference [bootstrap 95%]; "
-        "**bold** when the interval excludes 0.",
-        "",
-        "| workload | " + " | ".join(METRICS) + " |",
-        "|---|" + "---|" * len(METRICS),
-    ]
+    rows = header(args.base, args.head, args.head_env, cppdefs, cpu_model(), args.reps)
     for workload in workloads:
         cells: list[str] = []
         for index, _metric in enumerate(METRICS):
@@ -250,6 +412,8 @@ def main() -> int:
         f"release, worst workload: {p95[worst]:.0f} ms ({worst}) -- "
         + (", ".join(f"**{w}: {p:.0f} ms, LATE**" for w, p in late.items()) or "held")
     )
+    if sizes:
+        rows += probe_rows(sizes, probes["base"], probes["head"])
     table = "\n".join(rows) + "\n"
     print(table)
     if args.summary:

@@ -1,6 +1,12 @@
 /* Small allocator A/B workload for ci/perf_ab.py (#479). One run = one process.
 
-   usage: perf_ab <threads> <generations> <min_size> <max_size> <ops_per_thread> <pause_ms> <table_slots> <release_bound_ms>
+   usage: perf_ab <threads> <generations> <min_size> <max_size> <ops_per_thread> <pause_ms> <table_slots> <sizes> <release_bound_ms>
+          perf_ab probe <size>...
+
+   <sizes> is how a request size is drawn from [min_size, max_size]: "uniform" (every byte count
+   equally likely; min == max is an exact-size row) or "log" (#527: log-uniform, the benchmark
+   suite's sparse-large-buffers draw -- an octave uniformly, then a uniform offset inside it,
+   clamped to the range; see draw_size).
 
    Each thread replays a seeded stream over 8 live slots (allocate 8 / free-oldest 6 /
    free-random 2, one write per 4 KiB). With generations > 1 each thread runs its stream as
@@ -19,6 +25,8 @@
    was freed while the worker threads stay alive and idle (a server between requests): RSS
    DRAIN_SHORT_MS later, RSS at the release bound (ci/release_ratchet.json, #491), and the release
    time -- the first sample within RELEASE_TOLERANCE of RSS at twice the bound.
+   `perf_ab probe` (#527) allocates nothing timed: for each size it prints the bin and page kind the
+   linked allocator gives that request, so a size-class edge is confirmed, not assumed (see probe).
    Linux only (getrusage + /proc/self/statm). */
 #define _GNU_SOURCE   /* RUSAGE_THREAD */
 #include <mimalloc.h>
@@ -38,8 +46,14 @@
 #define DRAIN_SHORT_MS      500
 #define RELEASE_SAMPLE_MS   10
 #define RELEASE_TOLERANCE   (1L << 20)   /* 1 MiB: "released" = within this of RSS at twice the bound */
+/* the page sizes of include/mimalloc/types.h (MI_SMALL/MEDIUM/LARGE_PAGE_SIZE, 64-bit): a probe
+   names the smallest that holds its page's blocks. Mirrored, not included: this file uses the
+   public header only, so it links against the base arm's library too. */
+#define PROBE_SMALL_PAGE    (64L << 10)
+#define PROBE_MEDIUM_PAGE   (512L << 10)
+#define PROBE_LARGE_PAGE    (4L << 20)
 
-typedef struct { uint64_t rng; size_t lo, hi; long ops; void* slot[SLOTS]; int fifo[4096]; size_t head, tail; double cpu; int index; } stream_t;
+typedef struct { uint64_t rng; size_t lo, hi; int log_sizes; long ops; void* slot[SLOTS]; int fifo[4096]; size_t head, tail; double cpu; int index; } stream_t;
 
 /* #506: one Larson table; a round of draws on it runs on one thread at a time (the round barrier) */
 typedef struct { uint64_t rng; void** slot; size_t* log; size_t log_len, log_cap; } table_t;
@@ -51,6 +65,21 @@ static uint64_t next(uint64_t* s) {
   return z ^ (z >> 31);
 }
 
+static int bit_length(size_t x) { int n = 0; while (x != 0) { n++; x >>= 1; } return n; }
+
+/* the next request size. Log-uniform is rust/benchmark-suite ScalingStream::draw_size with
+   log_uniform (sparse-large-buffers, #527): an octave uniformly between the bit lengths of lo and
+   hi, then a uniform offset inside it, clamped to [lo, hi] -- so 64 KiB-4 MiB puts 1 in 7 draws
+   at exactly 4 MiB. The same distribution, not the suite's seeded stream. */
+static size_t draw_size(stream_t* st) {
+  if (!st->log_sizes) return st->lo + (size_t)(next(&st->rng) % (st->hi - st->lo + 1));
+  const int low = bit_length(st->lo), high = bit_length(st->hi);
+  const int octave = low + (int)(next(&st->rng) % (uint64_t)(high - low + 1));
+  const size_t base = (size_t)1 << (octave - 1);
+  const size_t size = base + (size_t)(next(&st->rng) % base);
+  return size < st->lo ? st->lo : (size > st->hi ? st->hi : size);
+}
+
 static void run_ops(stream_t* st, long n) {
   for (long i = 0; i < n; i++) {
     const uint64_t choice = next(&st->rng) % 16;
@@ -58,7 +87,7 @@ static void run_ops(stream_t* st, long n) {
     if (choice >= 8 && choice < 14 && st->head != st->tail) slot = st->fifo[st->head++ % 4096];  /* free oldest */
     if (choice >= 8) { mi_free(st->slot[slot]); st->slot[slot] = NULL; continue; }
     mi_free(st->slot[slot]);
-    const size_t size = st->lo + (size_t)(next(&st->rng) % (st->hi - st->lo + 1));
+    const size_t size = draw_size(st);
     char* p = (char*)mi_malloc(size);
     if (p == NULL) { fprintf(stderr, "allocation failed\n"); exit(1); }
     for (size_t off = 0; off < size; off += 4096) p[off] = (char)off;
@@ -154,11 +183,58 @@ static long rss_bytes(void) {
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + (double)t.tv_nsec * 1e-9; }
 
+/* #527: the bin index of a request. Not in the public header, but an ordinary function of the
+   static library (src/page-queue.c) on every revision perf-ab compares, so the probe reports the
+   linked build's own answer -- MI_EXTRA_CPPDEFS included -- instead of a copy of its formula. */
+extern size_t _mi_bin(size_t size);
+
+typedef struct { size_t block_size, blocks, used; } probe_area_t;
+
+static bool probe_visit(const mi_heap_t* heap, const mi_heap_area_t* area, void* block, size_t block_size, void* arg) {
+  (void)heap; (void)block; (void)block_size;
+  probe_area_t* found = (probe_area_t*)arg;
+  if (area->used > 0 && area->full_block_size > 0) {
+    found->block_size = area->full_block_size;
+    found->blocks = area->reserved / area->full_block_size;
+    found->used = area->used;
+  }
+  return true;
+}
+
+/* One line per size: size, bin, the page's block size, its blocks per page, and the page kind.
+   Each size is allocated alone in a fresh heap, so the only page a heap walk finds is the one that
+   request landed in. The kind is read off that page: one block is a singleton page, otherwise the
+   smallest page size (types.h) that holds all its blocks -- small 64 KiB, medium 512 KiB, large
+   4 MiB. */
+static int probe(int count, char** sizes) {
+  for (int i = 0; i < count; i++) {
+    const size_t size = (size_t)atol(sizes[i]);
+    mi_heap_t* heap = mi_heap_new();
+    void* p = (heap == NULL ? NULL : mi_heap_malloc(heap, size));
+    if (p == NULL) { fprintf(stderr, "probe: allocation of %zu failed\n", size); return 1; }
+    probe_area_t found = { 0, 0, 0 };
+    mi_heap_visit_blocks(heap, false, &probe_visit, &found);
+    if (found.used != 1) { fprintf(stderr, "probe: %zu: expected one page with one block\n", size); return 1; }
+    const size_t span = found.block_size * found.blocks;
+    const char* kind = (found.blocks == 1 ? "singleton"
+                      : span <= (size_t)PROBE_SMALL_PAGE ? "small"
+                      : span <= (size_t)PROBE_MEDIUM_PAGE ? "medium"
+                      : span <= (size_t)PROBE_LARGE_PAGE ? "large" : "unknown");
+    printf("%zu %zu %zu %zu %s\n", size, _mi_bin(size), found.block_size, found.blocks, kind);
+    mi_free(p);
+    mi_heap_delete(heap);
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
-  if (argc != 9) { fprintf(stderr, "usage: perf_ab threads generations min max ops pause_ms table_slots release_bound_ms\n"); return 2; }
+  if (argc >= 2 && strcmp(argv[1], "probe") == 0) return probe(argc - 2, argv + 2);
+  if (argc != 10) { fprintf(stderr, "usage: perf_ab threads generations min max ops pause_ms table_slots uniform|log release_bound_ms\n       perf_ab probe size...\n"); return 2; }
   pause_ms = atol(argv[6]);
   table_slots = atoi(argv[7]);
-  const long bound_ms = atol(argv[8]);
+  if (strcmp(argv[8], "uniform") != 0 && strcmp(argv[8], "log") != 0) { fprintf(stderr, "sizes: uniform or log, got %s\n", argv[8]); return 2; }
+  const int log_sizes = (strcmp(argv[8], "log") == 0);
+  const long bound_ms = atol(argv[9]);
   const long samples = 2 * bound_ms / RELEASE_SAMPLE_MS + 1;   /* RSS every RELEASE_SAMPLE_MS up to twice the bound */
   long* rss_at = (long*)calloc((size_t)samples, sizeof(long));
   threads = atoi(argv[1]);
@@ -168,6 +244,7 @@ int main(int argc, char** argv) {
   for (int i = 0; i < threads; i++) {
     st[i].rng = 0x5eed0000ull + (uint64_t)i;
     st[i].lo = (size_t)atol(argv[3]); st[i].hi = (size_t)atol(argv[4]); st[i].ops = atol(argv[5]);
+    st[i].log_sizes = log_sizes;
     st[i].index = i;
   }
   if (table_slots > 0) {   /* allocated before the clock starts, and by libc: not the allocator under test */

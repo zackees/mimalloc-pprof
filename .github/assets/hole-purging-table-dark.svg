@@ -2,7 +2,7 @@
 <rect width="1000" height="487" fill="#0d1117"/>
 <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
 <text x="24" y="26" font-size="17" font-weight="600" fill="#e6edf3">Hole purging characteristics: churn workload</text>
-<text x="24" y="44" font-size="12" fill="#8b949e">measured at be13eadf, AMD Ryzen 7 3700X 8-Core Processor, 6.18.48, taskset -c 0-3, median of 3</text>
+<text x="24" y="44" font-size="12" fill="#8b949e">measured at da59442f, AMD Ryzen 7 3700X 8-Core Processor, 6.18.48, taskset -c 0-3, median of 3</text>
 <text x="24" y="70" font-size="12" font-weight="600" fill="#8b949e">measurement</text>
 <text x="620" y="70" font-size="12" font-weight="600" text-anchor="end" fill="#8b949e">off</text>
 <text x="780" y="70" font-size="12" font-weight="600" text-anchor="end" fill="#8b949e">on</text>
@@ -14,7 +14,7 @@
 <text x="940" y="108" font-size="12" text-anchor="end" fill="#8b949e">—</text>
 <rect x="16" y="116" width="968" height="26" fill="#30363d" opacity="0.25"/>
 <text x="24" y="134" font-size="12" fill="#e6edf3">RSS after idle (median of 3)</text>
-<text x="620" y="134" font-size="12" text-anchor="end" fill="#e6edf3">230.7 MB</text>
+<text x="620" y="134" font-size="12" text-anchor="end" fill="#e6edf3">230.8 MB</text>
 <text x="780" y="134" font-size="12" text-anchor="end" fill="#e6edf3">73.2 MB</text>
 <text x="940" y="134" font-size="12" text-anchor="end" fill="#8b949e">—</text>
 <text x="24" y="160" font-size="12" fill="#e6edf3">% returned (peak to after-idle)</text>

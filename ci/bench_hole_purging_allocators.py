@@ -20,6 +20,13 @@ Series (five charted):
     jemalloc + explicit purge   the same jemalloc, with an explicit
                                 `mallctl("arena.<all>.purge")` every 100 ms
 
+A grey dashed line marks the workload's theoretical minimum (#534): the process's RSS
+before it allocates anything, plus the requested bytes it still holds while idling (the
+scattered survivors and the block table). The driver measures both operands and prints
+them on a `FLOOR,<baseline kB>,<live bytes>` line; the line is the lowest
+baseline + live over the charted series, so it is a true floor under every one of them.
+A report JSON measured before the floor existed renders without it.
+
 The two jemalloc series exist because the honest claim is narrow: jemalloc *can*
 return this memory when an embedder asks it to, it just does not do it on its own
 when the process stops allocating. jemalloc's decay is advanced by allocation
@@ -246,7 +253,13 @@ static void sleep_ms(long ms) {
 
 typedef struct { size_t size; size_t count; } size_class_t;
 
+/* One block in every BENCH_KEEP_ONE_IN survives the free pass. */
+#define BENCH_KEEP_ONE_IN 20
+
 int main(int argc, char** argv) {
+  /* The floor's baseline: this process before the workload allocates anything --
+     read first, before the block table exists. */
+  const long baseline_kb = status_kb("VmRSS:", 6);
   int seconds = 10;
   if (argc > 1) {
     seconds = 0;
@@ -273,6 +286,10 @@ int main(int argc, char** argv) {
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (blocks == MAP_FAILED) return 1;
 
+  /* The floor's live data, in requested bytes: the block table (touched below, held
+     to the end) plus every block the free pass keeps. */
+  size_t live_requested_bytes = table_bytes;
+
   /* Allocate every block, size classes interleaved so survivors land scattered
      across pages of every class rather than clustered by allocation order. */
   size_t idx = 0;
@@ -287,6 +304,7 @@ int main(int argc, char** argv) {
     }
     blocks[idx] = BENCH_MALLOC(classes[class_cursor].size);
     if (blocks[idx] != NULL) memset(blocks[idx], 0xAB, classes[class_cursor].size);
+    if (idx % BENCH_KEEP_ONE_IN == 0) live_requested_bytes += classes[class_cursor].size;
     remaining[class_cursor]--;
     class_cursor = (class_cursor + 1) % n_classes;
     idx++;
@@ -294,7 +312,7 @@ int main(int argc, char** argv) {
 
   /* Keep 1-in-20 alive (scattered survivors); free the rest. */
   for (size_t i = 0; i < total; i++) {
-    if (i % 20 != 0) {
+    if (i % BENCH_KEEP_ONE_IN != 0) {
       BENCH_FREE(blocks[i]);
       blocks[i] = NULL;
     }
@@ -313,6 +331,7 @@ int main(int argc, char** argv) {
   /* VmHWM is monotonic, so reading it last still reports the allocation-phase
      peak -- which sampling, starting only at the top of the idle window, misses. */
   emit_row("HWM", status_kb("VmHWM:", 6), 0, 0);
+  emit_row("FLOOR", baseline_kb, (long)live_requested_bytes, 1);
 
 #if !BENCH_FAMILY_MIMALLOC
   /* Report what jemalloc actually ended up configured with, not what the caller
@@ -330,7 +349,7 @@ int main(int argc, char** argv) {
 
   /* Keep survivors reachable until here so no optimizer can decide the table is
      dead and free them early; then release everything. */
-  for (size_t i = 0; i < total; i += 20) BENCH_FREE(blocks[i]);
+  for (size_t i = 0; i < total; i += BENCH_KEEP_ONE_IN) BENCH_FREE(blocks[i]);
   munmap(blocks, table_bytes);
   return 0;
 }
@@ -865,10 +884,13 @@ class RunRecord(RunRecordMeasurements, total=False):
 
     #: jemalloc children only: the live `background_thread` setting they read back.
     background_thread: bool
+    #: VmRSS at the top of the driver's main(), before the workload allocates anything
+    #: (#534). Absent from runs measured before the floor existed, and from the sizing run.
+    baseline_rss_kb: int
 
 
-class SeriesSummary(TypedDict):
-    """One series' entry in allocator-idle-report.json."""
+class SeriesSummaryMeasurements(TypedDict):
+    """The fields every series entry has carried since the report was introduced."""
 
     label: str
     allocator_id: str
@@ -883,6 +905,19 @@ class SeriesSummary(TypedDict):
     idle_start_rss_mb: float
     after_idle_rss_mb: float
     percent_returned: float
+
+
+class SeriesSummary(SeriesSummaryMeasurements, total=False):
+    """One series' entry in allocator-idle-report.json.
+
+    The two floor operands (#534) are the charted run's own; optional so a report
+    measured before them still loads and renders, without a floor line.
+    """
+
+    #: The charted run's VmRSS before the workload allocated anything.
+    baseline_rss_kb: int
+    #: Requested bytes the program still holds while idling: survivors + block table.
+    live_requested_bytes: int
 
 
 class ReportJson(TypedDict):
@@ -934,6 +969,9 @@ class RunResult:
     #: The busy driver's PURGE row: last status and max pending (see BusySeriesSummary).
     purge_status: int = -1
     purge_max_pending: int = 0
+    #: The driver's FLOOR line (#534); `None` when it printed none (the sizing run).
+    baseline_rss_kb: int | None = None
+    live_requested_bytes: int | None = None
 
     @property
     def after_idle_rss_kb(self) -> int:
@@ -1198,12 +1236,19 @@ def run_once(exe: Path, seconds: int, extra_env: Sequence[tuple[str, str]] = ())
     proc = subprocess.run(
         cmd, capture_output=True, text=True, check=True, env=child_environment(extra_env)
     )
+    return parse_driver_output(proc.stdout, str(exe))
+
+
+def parse_driver_output(stdout: str, exe: str) -> RunResult:
+    """Parse one child's stdout (either driver). `exe` names it in an error."""
     samples: list[Sample] = []
     peak_kb = 0
     background_thread: bool | None = None
     purge_status = -1
     purge_max_pending = 0
-    for line in proc.stdout.splitlines():
+    baseline_kb: int | None = None
+    live_bytes: int | None = None
+    for line in stdout.splitlines():
         if line.startswith("CSV,"):
             _, t_ms, rss_kb = line.split(",")
             samples.append(Sample(int(t_ms), int(rss_kb)))
@@ -1214,6 +1259,9 @@ def run_once(exe: Path, seconds: int, extra_env: Sequence[tuple[str, str]] = ())
         elif line.startswith("PURGE,"):
             _, status, pending = line.split(",")
             purge_status, purge_max_pending = int(status), int(pending)
+        elif line.startswith("FLOOR,"):
+            _, baseline, live = line.split(",")
+            baseline_kb, live_bytes = int(baseline), int(live)
     if not samples:
         raise SystemExit(f"{exe} produced no samples")
     if peak_kb <= 0:
@@ -1230,6 +1278,8 @@ def run_once(exe: Path, seconds: int, extra_env: Sequence[tuple[str, str]] = ())
         background_thread=background_thread,
         purge_status=purge_status,
         purge_max_pending=purge_max_pending,
+        baseline_rss_kb=baseline_kb,
+        live_requested_bytes=live_bytes,
     )
 
 
@@ -1452,6 +1502,32 @@ def caption_lines(summaries: Mapping[str, SeriesSummary]) -> list[str]:
 COINCIDENT_TOLERANCE_MB = 2.0
 
 
+def floor_mb(summaries: Mapping[str, SeriesSummary]) -> float | None:
+    """The theoretical minimum RSS in MB: baseline RSS + live requested bytes (#534).
+
+    Allocator-independent, so one line for the whole chart: the lowest baseline + live
+    over the charted series' charted runs, which keeps it a true floor under every
+    line. Uncharted diagnostics never set it. `None` when any charted series lacks the
+    operands (a report measured before #534): no floor is better than one that could
+    sit above a series it was never measured for.
+    """
+    values: list[float] = []
+    for spec in CHARTED:
+        summary = summaries.get(spec.key)
+        if summary is None:
+            continue
+        baseline_kb = summary.get("baseline_rss_kb")
+        live_bytes = summary.get("live_requested_bytes")
+        if baseline_kb is None or live_bytes is None:
+            return None
+        values.append(baseline_kb / 1024.0 + live_bytes / (1024.0 * 1024.0))
+    return min(values) if values else None
+
+
+#: The floor line's label.
+FLOOR_LABEL = "live data (theoretical minimum)"
+
+
 def final_mb_of(series: Mapping[str, list[Sample]], spec: SeriesSpec) -> float:
     return series[spec.key][-1].rss_kb / 1024.0
 
@@ -1469,6 +1545,9 @@ def render_line_chart(
     charted = [s for s in CHARTED if series.get(s.key)]
     max_t = max(series[s.key][-1].t_ms for s in charted)
     max_rss = max(max(p.rss_kb for p in series[s.key]) for s in charted) / 1024.0
+    floor = floor_mb(summaries)
+    if floor is not None:
+        max_rss = max(max_rss, floor)  # the floor is never clipped
     ticks = nice_ticks(max_rss)
     top = ticks[-1]
 
@@ -1526,6 +1605,23 @@ def render_line_chart(
         parts.append(
             f'<text x="{x_of(t_ms):.2f}" y="{HEIGHT - PAD_BOTTOM + 22:.2f}" font-size="12" '
             f'text-anchor="{anchor}" fill="{theme.muted}">{label}</text>'
+        )
+
+    # The floor goes under the series, so a series that touches it stays visible. Grey
+    # and a short dash: not an allocator color, and not the jemalloc purge's 6,4 dash.
+    if floor is not None:
+        floor_y = y_of(floor)
+        parts.append(
+            f'<line data-series="floor" x1="{PAD_LEFT}" y1="{floor_y:.2f}" '
+            f'x2="{WIDTH - PAD_RIGHT}" y2="{floor_y:.2f}" stroke="{theme.muted}" '
+            'stroke-width="1.5" stroke-dasharray="2,3"/>'
+        )
+        # Above the line unless that would climb into the caption block; below it then.
+        label_y = floor_y - 6 if floor_y - 6 > PAD_TOP + 12 else floor_y + 14
+        parts.append(
+            f'<text x="{WIDTH - PAD_RIGHT - 4}" y="{label_y:.2f}" font-size="11" '
+            f'text-anchor="end" fill="{theme.muted}">'
+            f"{escape(FLOOR_LABEL)}: {floor:.1f} MB</text>"
         )
 
     for spec in charted:
@@ -1831,6 +1927,8 @@ def record_run(run: RunResult) -> RunRecord:
     }
     if run.background_thread is not None:
         record["background_thread"] = run.background_thread
+    if run.baseline_rss_kb is not None:
+        record["baseline_rss_kb"] = run.baseline_rss_kb
     return record
 
 
@@ -1860,7 +1958,7 @@ def summarize(
 ) -> SeriesSummary:
     peak_mb = picked.peak_rss_kb / 1024.0
     after_mb = picked.after_idle_rss_kb / 1024.0
-    return {
+    summary: SeriesSummary = {
         "label": spec.label,
         "allocator_id": spec.allocator_id,
         "pin": build.pin,
@@ -1875,6 +1973,10 @@ def summarize(
         "after_idle_rss_mb": after_mb,
         "percent_returned": percent_returned(peak_mb, after_mb),
     }
+    if picked.baseline_rss_kb is not None and picked.live_requested_bytes is not None:
+        summary["baseline_rss_kb"] = picked.baseline_rss_kb
+        summary["live_requested_bytes"] = picked.live_requested_bytes
+    return summary
 
 
 PURGE_STATUS_NAMES = {0: "OK", 1: "PARTIAL", 2: "BUSY"}
@@ -1957,7 +2059,26 @@ def measure_all(
                 f"idle = {summary['idle_mechanism']})",
                 flush=True,
             )
+    assert_floor_is_below_every_series(series, summaries)
     return series, summaries
+
+
+def assert_floor_is_below_every_series(
+    series: Mapping[str, list[Sample]], summaries: Mapping[str, SeriesSummary]
+) -> None:
+    """Refuse to publish a floor that some charted RSS sample is under: nothing can
+    hold less than the program's own live data, so that can only be a measurement bug."""
+    floor = floor_mb(summaries)
+    if floor is None:
+        raise SystemExit("refusing to publish: a charted driver printed no FLOOR line")
+    for spec in CHARTED:
+        lowest = min(p.rss_kb for p in series[spec.key]) / 1024.0
+        if floor > lowest:
+            raise SystemExit(
+                f"refusing to publish: the theoretical minimum {floor:.1f} MB is above "
+                f"{spec.key}'s lowest RSS sample {lowest:.1f} MB -- a measurement bug"
+            )
+    print(f"theoretical minimum (live data + baseline): {floor:.1f} MB", flush=True)
 
 
 def measure_all_busy(

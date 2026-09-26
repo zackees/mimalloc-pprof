@@ -1,5 +1,5 @@
 {
-  "commit": "86e0c5a4",
+  "commit": "da59442f",
   "cpu": "AMD Ryzen 7 3700X 8-Core Processor",
   "idle_seconds": 10,
   "kernel": "6.18.48",
@@ -7,328 +7,378 @@
   "selection_rule": "per series, the run with the lowest after-idle VmRSS of 3 repetitions; the same rule for every allocator",
   "series": {
     "bun-mimalloc": {
-      "after_idle_rss_mb": 71.6640625,
+      "after_idle_rss_mb": 71.0078125,
       "allocator_id": "bun-mimalloc",
+      "baseline_rss_kb": 1784,
       "charted": true,
       "env": {},
       "idle_mechanism": "mi_on_thread_idle() every 100 ms",
       "idle_seconds": 10,
-      "idle_start_rss_mb": 278.7265625,
+      "idle_start_rss_mb": 278.0703125,
       "label": "Bun mimalloc",
+      "live_requested_bytes": 15200000,
       "note": "",
-      "peak_rss_mb": 278.7265625,
-      "percent_returned": 74.28875746279115,
+      "peak_rss_mb": 278.0703125,
+      "percent_returned": 74.46408001573343,
       "pin": "bun-dev3-v2@b20b60d9",
       "runs": [
         {
-          "after_idle_rss_mb": 71.6640625,
-          "idle_start_rss_mb": 278.7265625,
-          "peak_rss_mb": 278.7265625
+          "after_idle_rss_mb": 71.0078125,
+          "baseline_rss_kb": 1784,
+          "idle_start_rss_mb": 278.0703125,
+          "peak_rss_mb": 278.0703125
         },
         {
-          "after_idle_rss_mb": 71.6796875,
-          "idle_start_rss_mb": 278.7421875,
-          "peak_rss_mb": 278.7421875
+          "after_idle_rss_mb": 71.0234375,
+          "baseline_rss_kb": 1800,
+          "idle_start_rss_mb": 278.0859375,
+          "peak_rss_mb": 278.0859375
         },
         {
-          "after_idle_rss_mb": 71.69921875,
-          "idle_start_rss_mb": 278.76171875,
-          "peak_rss_mb": 278.76171875
+          "after_idle_rss_mb": 71.015625,
+          "baseline_rss_kb": 1792,
+          "idle_start_rss_mb": 278.078125,
+          "peak_rss_mb": 278.078125
         }
       ]
     },
     "jemalloc": {
-      "after_idle_rss_mb": 282.48828125,
+      "after_idle_rss_mb": 281.8515625,
       "allocator_id": "jemalloc",
+      "baseline_rss_kb": 2060,
       "charted": true,
       "env": {},
       "idle_mechanism": "nothing (a plain idle process)",
       "idle_seconds": 10,
-      "idle_start_rss_mb": 282.42578125,
+      "idle_start_rss_mb": 281.7890625,
       "label": "jemalloc",
+      "live_requested_bytes": 15200000,
       "note": "",
-      "peak_rss_mb": 282.48828125,
+      "peak_rss_mb": 281.8515625,
       "percent_returned": 0.0,
       "pin": "5.3.1@81034ce1f1373e37dc865038e1bc8eeecf559ce8",
       "runs": [
         {
-          "after_idle_rss_mb": 282.49609375,
+          "after_idle_rss_mb": 281.87109375,
           "background_thread": false,
-          "idle_start_rss_mb": 282.43359375,
-          "peak_rss_mb": 282.49609375
+          "baseline_rss_kb": 2076,
+          "idle_start_rss_mb": 281.80859375,
+          "peak_rss_mb": 281.87109375
         },
         {
-          "after_idle_rss_mb": 282.48828125,
+          "after_idle_rss_mb": 281.890625,
           "background_thread": false,
-          "idle_start_rss_mb": 282.42578125,
-          "peak_rss_mb": 282.48828125
+          "baseline_rss_kb": 2100,
+          "idle_start_rss_mb": 281.828125,
+          "peak_rss_mb": 281.890625
         },
         {
-          "after_idle_rss_mb": 282.50390625,
+          "after_idle_rss_mb": 281.8515625,
           "background_thread": false,
-          "idle_start_rss_mb": 282.44140625,
-          "peak_rss_mb": 282.50390625
+          "baseline_rss_kb": 2060,
+          "idle_start_rss_mb": 281.7890625,
+          "peak_rss_mb": 281.8515625
         }
       ]
     },
     "jemalloc-background-thread": {
-      "after_idle_rss_mb": 282.6328125,
+      "after_idle_rss_mb": 75.56640625,
       "allocator_id": "jemalloc",
+      "baseline_rss_kb": 2264,
       "charted": false,
       "env": {
         "JE_MALLOC_CONF": "background_thread:true"
       },
       "idle_mechanism": "nothing; JE_MALLOC_CONF=background_thread:true",
       "idle_seconds": 10,
-      "idle_start_rss_mb": 282.5703125,
+      "idle_start_rss_mb": 281.78125,
       "label": "jemalloc, background_thread:true",
+      "live_requested_bytes": 15200000,
       "note": "jemalloc's opt-in decay thread, at the same 10 s window as the chart; the only series whose runs do not agree with each other -- see the run-consistency footnote the table renders from the run records",
-      "peak_rss_mb": 282.6328125,
-      "percent_returned": 0.0,
+      "peak_rss_mb": 281.78125,
+      "percent_returned": 73.18259953421315,
       "pin": "5.3.1@81034ce1f1373e37dc865038e1bc8eeecf559ce8",
       "runs": [
         {
-          "after_idle_rss_mb": 282.671875,
+          "after_idle_rss_mb": 75.56640625,
           "background_thread": true,
-          "idle_start_rss_mb": 282.609375,
-          "peak_rss_mb": 282.671875
+          "baseline_rss_kb": 2264,
+          "idle_start_rss_mb": 281.78125,
+          "peak_rss_mb": 281.78125
         },
         {
-          "after_idle_rss_mb": 282.6328125,
+          "after_idle_rss_mb": 281.98828125,
           "background_thread": true,
-          "idle_start_rss_mb": 282.5703125,
-          "peak_rss_mb": 282.6328125
+          "baseline_rss_kb": 2200,
+          "idle_start_rss_mb": 281.92578125,
+          "peak_rss_mb": 281.98828125
         },
         {
-          "after_idle_rss_mb": 282.65625,
+          "after_idle_rss_mb": 282.08984375,
           "background_thread": true,
-          "idle_start_rss_mb": 282.59375,
-          "peak_rss_mb": 282.65625
+          "baseline_rss_kb": 2304,
+          "idle_start_rss_mb": 282.02734375,
+          "peak_rss_mb": 282.08984375
         }
       ]
     },
     "jemalloc-background-thread-30s": {
-      "after_idle_rss_mb": 72.69921875,
+      "after_idle_rss_mb": 72.09375,
       "allocator_id": "jemalloc",
+      "baseline_rss_kb": 2280,
       "charted": false,
       "env": {
         "JE_MALLOC_CONF": "background_thread:true"
       },
       "idle_mechanism": "nothing; JE_MALLOC_CONF=background_thread:true; 30 s window",
       "idle_seconds": 30,
-      "idle_start_rss_mb": 282.55078125,
+      "idle_start_rss_mb": 282.00390625,
       "label": "jemalloc, background_thread:true, 30 s",
+      "live_requested_bytes": 15200000,
       "note": "the same, past jemalloc's 10 s default dirty_decay_ms -- its best case",
-      "peak_rss_mb": 282.55078125,
-      "percent_returned": 74.27038834280343,
+      "peak_rss_mb": 282.00390625,
+      "percent_returned": 74.43519454794786,
       "pin": "5.3.1@81034ce1f1373e37dc865038e1bc8eeecf559ce8",
       "runs": [
         {
-          "after_idle_rss_mb": 72.73828125,
+          "after_idle_rss_mb": 72.109375,
           "background_thread": true,
-          "idle_start_rss_mb": 282.5703125,
-          "peak_rss_mb": 282.5703125
+          "baseline_rss_kb": 2264,
+          "idle_start_rss_mb": 281.98828125,
+          "peak_rss_mb": 281.98828125
         },
         {
-          "after_idle_rss_mb": 72.69921875,
+          "after_idle_rss_mb": 72.09375,
           "background_thread": true,
-          "idle_start_rss_mb": 282.55078125,
-          "peak_rss_mb": 282.55078125
+          "baseline_rss_kb": 2280,
+          "idle_start_rss_mb": 282.00390625,
+          "peak_rss_mb": 282.00390625
         },
         {
-          "after_idle_rss_mb": 72.734375,
+          "after_idle_rss_mb": 72.109375,
           "background_thread": true,
-          "idle_start_rss_mb": 282.3671875,
-          "peak_rss_mb": 282.3671875
+          "baseline_rss_kb": 2280,
+          "idle_start_rss_mb": 282.00390625,
+          "peak_rss_mb": 282.00390625
         }
       ]
     },
     "jemalloc-purge": {
-      "after_idle_rss_mb": 72.57421875,
+      "after_idle_rss_mb": 71.95703125,
       "allocator_id": "jemalloc",
+      "baseline_rss_kb": 2096,
       "charted": true,
       "env": {},
       "idle_mechanism": "mallctl(\"arena.<all>.purge\") every 100 ms",
       "idle_seconds": 10,
-      "idle_start_rss_mb": 282.44921875,
+      "idle_start_rss_mb": 281.82421875,
       "label": "jemalloc + explicit purge",
+      "live_requested_bytes": 15200000,
       "note": "",
-      "peak_rss_mb": 282.44921875,
-      "percent_returned": 74.30539228567082,
+      "peak_rss_mb": 281.82421875,
+      "percent_returned": 74.4674068221825,
       "pin": "5.3.1@81034ce1f1373e37dc865038e1bc8eeecf559ce8",
       "runs": [
         {
-          "after_idle_rss_mb": 72.60546875,
+          "after_idle_rss_mb": 71.99609375,
           "background_thread": false,
-          "idle_start_rss_mb": 282.47265625,
-          "peak_rss_mb": 282.47265625
+          "baseline_rss_kb": 2152,
+          "idle_start_rss_mb": 281.8828125,
+          "peak_rss_mb": 281.8828125
         },
         {
-          "after_idle_rss_mb": 72.625,
+          "after_idle_rss_mb": 71.9765625,
           "background_thread": false,
-          "idle_start_rss_mb": 282.4765625,
-          "peak_rss_mb": 282.4765625
+          "baseline_rss_kb": 2088,
+          "idle_start_rss_mb": 281.81640625,
+          "peak_rss_mb": 281.81640625
         },
         {
-          "after_idle_rss_mb": 72.57421875,
+          "after_idle_rss_mb": 71.95703125,
           "background_thread": false,
-          "idle_start_rss_mb": 282.44921875,
-          "peak_rss_mb": 282.44921875
+          "baseline_rss_kb": 2096,
+          "idle_start_rss_mb": 281.82421875,
+          "peak_rss_mb": 281.82421875
         }
       ]
     },
     "mimalloc-pprof": {
-      "after_idle_rss_mb": 71.6328125,
+      "after_idle_rss_mb": 71.02734375,
       "allocator_id": "mimalloc-pprof",
+      "baseline_rss_kb": 1800,
       "charted": true,
       "env": {},
       "idle_mechanism": "mi_on_thread_idle() every 100 ms",
       "idle_seconds": 10,
-      "idle_start_rss_mb": 278.6953125,
+      "idle_start_rss_mb": 278.08984375,
       "label": "mimalloc-pprof",
+      "live_requested_bytes": 15200000,
       "note": "",
-      "peak_rss_mb": 278.6953125,
-      "percent_returned": 74.29708743307263,
+      "peak_rss_mb": 278.08984375,
+      "percent_returned": 74.45885013555085,
       "pin": "workflow-source",
       "runs": [
         {
-          "after_idle_rss_mb": 71.67578125,
-          "idle_start_rss_mb": 278.73828125,
-          "peak_rss_mb": 278.73828125
+          "after_idle_rss_mb": 71.02734375,
+          "baseline_rss_kb": 1800,
+          "idle_start_rss_mb": 278.08984375,
+          "peak_rss_mb": 278.08984375
         },
         {
-          "after_idle_rss_mb": 71.6484375,
-          "idle_start_rss_mb": 278.7109375,
-          "peak_rss_mb": 278.7109375
+          "after_idle_rss_mb": 71.08203125,
+          "baseline_rss_kb": 1860,
+          "idle_start_rss_mb": 278.14453125,
+          "peak_rss_mb": 278.14453125
         },
         {
-          "after_idle_rss_mb": 71.6328125,
-          "idle_start_rss_mb": 278.6953125,
-          "peak_rss_mb": 278.6953125
+          "after_idle_rss_mb": 71.0546875,
+          "baseline_rss_kb": 1828,
+          "idle_start_rss_mb": 278.1171875,
+          "peak_rss_mb": 278.1171875
         }
       ]
     },
     "mimalloc-pprof-no-idle-hook": {
-      "after_idle_rss_mb": 278.75390625,
+      "after_idle_rss_mb": 278.078125,
       "allocator_id": "mimalloc-pprof",
+      "baseline_rss_kb": 1788,
       "charted": false,
       "env": {},
       "idle_mechanism": "nothing (a plain idle process)",
       "idle_seconds": 10,
-      "idle_start_rss_mb": 278.69140625,
+      "idle_start_rss_mb": 278.078125,
       "label": "mimalloc-pprof, no idle hook",
+      "live_requested_bytes": 15200000,
       "note": "does the background scavenger alone return memory, with no cooperation?",
-      "peak_rss_mb": 278.75390625,
+      "peak_rss_mb": 278.078125,
       "percent_returned": 0.0,
       "pin": "workflow-source",
       "runs": [
         {
-          "after_idle_rss_mb": 278.8046875,
-          "idle_start_rss_mb": 278.7421875,
-          "peak_rss_mb": 278.8046875
+          "after_idle_rss_mb": 278.15234375,
+          "baseline_rss_kb": 1804,
+          "idle_start_rss_mb": 278.08984375,
+          "peak_rss_mb": 278.15234375
         },
         {
-          "after_idle_rss_mb": 278.80078125,
-          "idle_start_rss_mb": 278.73828125,
-          "peak_rss_mb": 278.80078125
+          "after_idle_rss_mb": 278.078125,
+          "baseline_rss_kb": 1788,
+          "idle_start_rss_mb": 278.078125,
+          "peak_rss_mb": 278.078125
         },
         {
-          "after_idle_rss_mb": 278.75390625,
-          "idle_start_rss_mb": 278.69140625,
-          "peak_rss_mb": 278.75390625
+          "after_idle_rss_mb": 278.17578125,
+          "baseline_rss_kb": 1828,
+          "idle_start_rss_mb": 278.11328125,
+          "peak_rss_mb": 278.17578125
         }
       ]
     },
     "upstream-mimalloc": {
-      "after_idle_rss_mb": 276.6640625,
+      "after_idle_rss_mb": 277.9765625,
       "allocator_id": "upstream-mimalloc",
+      "baseline_rss_kb": 1624,
       "charted": true,
       "env": {},
       "idle_mechanism": "nothing (a plain idle process)",
       "idle_seconds": 10,
-      "idle_start_rss_mb": 276.6015625,
+      "idle_start_rss_mb": 277.9140625,
       "label": "Microsoft mimalloc",
+      "live_requested_bytes": 15200000,
       "note": "",
-      "peak_rss_mb": 276.6640625,
+      "peak_rss_mb": 277.9765625,
       "percent_returned": 0.0,
-      "pin": "dev3@bcee5a88",
+      "pin": "dev3@6def7be9",
       "runs": [
         {
-          "after_idle_rss_mb": 276.72265625,
-          "idle_start_rss_mb": 276.66015625,
-          "peak_rss_mb": 276.72265625
+          "after_idle_rss_mb": 278.00390625,
+          "baseline_rss_kb": 1652,
+          "idle_start_rss_mb": 277.94140625,
+          "peak_rss_mb": 278.00390625
         },
         {
-          "after_idle_rss_mb": 276.69921875,
-          "idle_start_rss_mb": 276.63671875,
-          "peak_rss_mb": 276.69921875
+          "after_idle_rss_mb": 278.01953125,
+          "baseline_rss_kb": 1668,
+          "idle_start_rss_mb": 277.95703125,
+          "peak_rss_mb": 278.01953125
         },
         {
-          "after_idle_rss_mb": 276.6640625,
-          "idle_start_rss_mb": 276.6015625,
-          "peak_rss_mb": 276.6640625
+          "after_idle_rss_mb": 277.9765625,
+          "baseline_rss_kb": 1624,
+          "idle_start_rss_mb": 277.9140625,
+          "peak_rss_mb": 277.9765625
         }
       ]
     },
     "upstream-mimalloc-collect": {
-      "after_idle_rss_mb": 227.81640625,
+      "after_idle_rss_mb": 228.234375,
       "allocator_id": "upstream-mimalloc",
+      "baseline_rss_kb": 1632,
       "charted": false,
       "env": {},
       "idle_mechanism": "mi_collect(false) every 100 ms",
       "idle_seconds": 10,
-      "idle_start_rss_mb": 276.62890625,
+      "idle_start_rss_mb": 277.921875,
       "label": "Microsoft mimalloc, mi_collect(false)",
+      "live_requested_bytes": 15200000,
       "note": "is upstream's flat line only a missing API, or a missing mechanism?",
-      "peak_rss_mb": 276.62890625,
-      "percent_returned": 17.645480604939493,
-      "pin": "dev3@bcee5a88",
+      "peak_rss_mb": 277.921875,
+      "percent_returned": 17.878225670433462,
+      "pin": "dev3@6def7be9",
       "runs": [
         {
-          "after_idle_rss_mb": 227.8359375,
-          "idle_start_rss_mb": 276.6484375,
-          "peak_rss_mb": 276.6484375
+          "after_idle_rss_mb": 228.328125,
+          "baseline_rss_kb": 1664,
+          "idle_start_rss_mb": 277.953125,
+          "peak_rss_mb": 277.953125
         },
         {
-          "after_idle_rss_mb": 227.83203125,
-          "idle_start_rss_mb": 276.64453125,
-          "peak_rss_mb": 276.64453125
+          "after_idle_rss_mb": 228.328125,
+          "baseline_rss_kb": 1652,
+          "idle_start_rss_mb": 277.953125,
+          "peak_rss_mb": 277.953125
         },
         {
-          "after_idle_rss_mb": 227.81640625,
-          "idle_start_rss_mb": 276.62890625,
-          "peak_rss_mb": 276.62890625
+          "after_idle_rss_mb": 228.234375,
+          "baseline_rss_kb": 1632,
+          "idle_start_rss_mb": 277.921875,
+          "peak_rss_mb": 277.921875
         }
       ]
     },
     "upstream-mimalloc-collect-force": {
-      "after_idle_rss_mb": 227.78125,
+      "after_idle_rss_mb": 228.2421875,
       "allocator_id": "upstream-mimalloc",
+      "baseline_rss_kb": 1576,
       "charted": false,
       "env": {},
       "idle_mechanism": "mi_collect(true) every 100 ms",
       "idle_seconds": 10,
-      "idle_start_rss_mb": 276.59375,
+      "idle_start_rss_mb": 277.8671875,
       "label": "Microsoft mimalloc, mi_collect(true)",
+      "live_requested_bytes": 15200000,
       "note": "did upstream only lose to its own 1000 ms purge_delay, rather than to page granularity?",
-      "peak_rss_mb": 276.59375,
-      "percent_returned": 17.647723421082365,
-      "pin": "dev3@bcee5a88",
+      "peak_rss_mb": 277.8671875,
+      "percent_returned": 17.859251553406246,
+      "pin": "dev3@6def7be9",
       "runs": [
         {
-          "after_idle_rss_mb": 227.8125,
-          "idle_start_rss_mb": 276.625,
-          "peak_rss_mb": 276.66796875
+          "after_idle_rss_mb": 228.25,
+          "baseline_rss_kb": 1584,
+          "idle_start_rss_mb": 277.875,
+          "peak_rss_mb": 277.875
         },
         {
-          "after_idle_rss_mb": 227.84765625,
-          "idle_start_rss_mb": 276.66015625,
-          "peak_rss_mb": 276.66015625
+          "after_idle_rss_mb": 228.24609375,
+          "baseline_rss_kb": 1580,
+          "idle_start_rss_mb": 277.87109375,
+          "peak_rss_mb": 277.87109375
         },
         {
-          "after_idle_rss_mb": 227.78125,
-          "idle_start_rss_mb": 276.59375,
-          "peak_rss_mb": 276.59375
+          "after_idle_rss_mb": 228.2421875,
+          "baseline_rss_kb": 1576,
+          "idle_start_rss_mb": 277.8671875,
+          "peak_rss_mb": 277.8671875
         }
       ]
     }

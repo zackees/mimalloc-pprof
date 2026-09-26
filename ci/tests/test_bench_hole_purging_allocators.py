@@ -384,6 +384,128 @@ class BenchHolePurgingAllocatorsTests(unittest.TestCase):
         include = Path(__file__).parent.parent.parent / "include"
         self.assertTrue(bench.header_declares([include], "mi_purge_all"))
 
+    # -- #534: the "live data (theoretical minimum)" floor line -------------------
+
+    def floor_elements(self, svg: str) -> list[ET.Element]:
+        root = ET.fromstring(svg)
+        return [node for node in root.iter() if node.attrib.get("data-series") == "floor"]
+
+    def with_floor(self, baselines: dict[str, int], live: int) -> dict[str, bench.SeriesSummary]:
+        """The fixture's summaries (measured before #534, so no floor operands), with
+        synthetic operands added to the named series."""
+        report, _ = self.load()
+        summaries: dict[str, bench.SeriesSummary] = {}
+        for key, summary in report["series"].items():
+            copy: bench.SeriesSummary = dict(summary)  # type: ignore[assignment]
+            if key in baselines:
+                copy["baseline_rss_kb"] = baselines[key]
+                copy["live_requested_bytes"] = live
+            summaries[key] = copy
+        return summaries
+
+    def test_driver_output_parser_reads_the_floor_line(self) -> None:
+        run = bench.parse_driver_output(
+            "CSV,0,280000\nCSV,100,72000\nHWM,281000\nFLOOR,1432,17425408\n", "exe"
+        )
+        self.assertEqual(run.baseline_rss_kb, 1432)
+        self.assertEqual(run.live_requested_bytes, 17425408)
+        self.assertEqual(run.peak_rss_kb, 281000)
+        self.assertEqual(len(run.samples), 2)
+        record = bench.record_run(run)
+        self.assertEqual(record.get("baseline_rss_kb"), 1432)
+
+    def test_driver_output_without_a_floor_line_has_no_floor(self) -> None:
+        run = bench.parse_driver_output("CSV,0,1024\nHWM,1024\n", "exe")
+        self.assertIsNone(run.baseline_rss_kb)
+        self.assertIsNone(run.live_requested_bytes)
+        self.assertNotIn("baseline_rss_kb", bench.record_run(run))
+
+    def test_driver_reads_the_baseline_before_it_allocates_anything(self) -> None:
+        src = bench.CHURN_C_SOURCE
+        main_body = src[src.index("int main(") :]
+        self.assertIn('emit_row("FLOOR"', src)
+        self.assertLess(main_body.index('status_kb("VmRSS:"'), main_body.index("mmap("))
+        self.assertIn("live_requested_bytes", main_body)
+        # the sizing-run driver is out of scope and stays as it was measured
+        self.assertNotIn("FLOOR", bench.BUSY_C_SOURCE)
+
+    def test_floor_is_the_minimum_over_charted_series_only(self) -> None:
+        live = 16 * 1024 * 1024
+        summaries = self.with_floor(
+            {
+                "mimalloc-pprof": 3072,
+                "jemalloc": 1024,
+                "jemalloc-purge": 2048,
+                "bun-mimalloc": 3072,
+                "upstream-mimalloc": 3072,
+                # an uncharted diagnostic never sets the floor
+                "mimalloc-pprof-no-idle-hook": 10,
+            },
+            live,
+        )
+        self.assertAlmostEqual(bench.floor_mb(summaries) or 0.0, 17.0)
+
+    def test_old_report_without_floor_fields_renders_no_floor(self) -> None:
+        report, series = self.load()
+        self.assertIsNone(bench.floor_mb(report["series"]))
+        svg = bench.render_line_chart(series, report["series"], bench.LIGHT, "src")
+        self.assertEqual(self.floor_elements(svg), [])
+        self.assertNotIn("theoretical minimum", svg)
+
+    def test_floor_line_is_one_dashed_neutral_line_inside_the_domain(self) -> None:
+        _, series = self.load()
+        summaries = self.with_floor({s.key: 1024 for s in bench.CHARTED}, 16 * 1024 * 1024)
+        floor = 17.0
+        max_rss = max(p.rss_kb for s in bench.CHARTED for p in series[s.key]) / 1024.0
+        top = bench.nice_ticks(max(max_rss, floor))[-1]
+        plot_h = bench.HEIGHT - bench.PAD_TOP - bench.PAD_BOTTOM
+        expected_y = bench.PAD_TOP + plot_h - (floor / top) * plot_h
+        for theme in (bench.LIGHT, bench.DARK):
+            with self.subTest(theme=theme.name):
+                svg = bench.render_line_chart(series, summaries, theme, "src")
+                floors = self.floor_elements(svg)
+                self.assertEqual(len(floors), 1, "exactly one floor line")
+                line = floors[0]
+                self.assertTrue(line.tag.endswith("line"))
+                self.assertIn("stroke-dasharray", line.attrib)
+                self.assertNotIn(line.attrib["stroke"], theme.slots)
+                y1, y2 = float(line.attrib["y1"]), float(line.attrib["y2"])
+                self.assertEqual(y1, y2, "the floor is a horizontal line")
+                self.assertAlmostEqual(y1, expected_y, places=1)
+                self.assertGreaterEqual(y1, bench.PAD_TOP)
+                self.assertLessEqual(y1, bench.PAD_TOP + plot_h)
+                self.assertIn("live data (theoretical minimum)", svg)
+
+    def test_a_floor_above_the_series_still_fits_the_domain(self) -> None:
+        _, series = self.load()
+        summaries = self.with_floor({s.key: 400 * 1024 for s in bench.CHARTED}, 0)
+        svg = bench.render_line_chart(series, summaries, bench.LIGHT, "src")
+        (line,) = self.floor_elements(svg)
+        self.assertGreaterEqual(float(line.attrib["y1"]), bench.PAD_TOP)
+
+    def test_the_floor_does_not_change_the_table(self) -> None:
+        """Tables are out of scope: the floor operands must not alter them."""
+        report, _ = self.load()
+        summaries = self.with_floor({s.key: 1024 for s in bench.CHARTED}, 16 * 1024 * 1024)
+        self.assertEqual(
+            bench.render_table_svg(report["series"], bench.LIGHT, "src"),
+            bench.render_table_svg(summaries, bench.LIGHT, "src"),
+        )
+
+    def test_committed_chart_carries_a_floor_below_every_sample(self) -> None:
+        json_path = ASSETS / "allocator-idle-report.json"
+        if not json_path.exists():
+            self.skipTest("no committed allocator-idle assets in this checkout")
+        report = bench.load_report_json(json_path)
+        series = bench.load_csv(ASSETS / "allocator-idle-rss.csv")
+        floor = bench.floor_mb(report["series"])
+        self.assertIsNotNone(floor, "committed report has no floor operands")
+        assert floor is not None
+        for spec in bench.CHARTED:
+            self.assertLessEqual(floor, min(p.rss_kb for p in series[spec.key]) / 1024.0)
+        svg = (ASSETS / "allocator-idle-rss-light.svg").read_text(encoding="utf-8")
+        self.assertEqual(len(self.floor_elements(svg)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

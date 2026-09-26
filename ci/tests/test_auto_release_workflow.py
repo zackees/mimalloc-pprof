@@ -108,6 +108,9 @@ class AutoReleaseStructureTests(unittest.TestCase):
         script = job_run_text(gate)
         self.assertIn("ci/verify_release_test_bundle.py", script)
         self.assertIn("ci/run_test_bundle.py", script)
+        self.assertIn("--exclude test-osx-zone-introspect-remote", script)
+        self.assertIn("--only test-osx-zone-introspect-remote", script)
+        self.assertIn('sudo -n "$(command -v python3)"', script)
         downloads = [
             step["with"]["name"]
             for step in gate["steps"]
@@ -156,7 +159,9 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 if "pattern" in with_:
                     patterns.append(str(with_["pattern"]))
         for artifact in uploaded:
-            if artifact.startswith(("release-preflight-", "release-test-bundle-")):
+            if artifact.startswith(
+                ("release-preflight-", "release-test-bundle-", "release-crate-")
+            ):
                 continue
             covered = artifact in downloaded or any(
                 artifact.startswith(pattern.rstrip("*")) for pattern in patterns
@@ -171,7 +176,13 @@ class AutoReleaseStructureTests(unittest.TestCase):
             for step in self.jobs()["release"]["steps"]
             if str(step.get("uses", "")).startswith("actions/download-artifact")
         ]
-        self.assertEqual(release_downloads, ["release-preflight-${{ inputs.candidate_sha }}"])
+        self.assertEqual(
+            release_downloads,
+            [
+                "release-preflight-${{ inputs.candidate_sha }}",
+                "release-crate-${{ inputs.candidate_sha }}",
+            ],
+        )
         self.assertIn("ci/release.py verify-artifacts", job_run_text(self.jobs()["release"]))
 
     def test_every_attempt_smokes_shipped_archives_before_publication(self) -> None:
@@ -215,14 +226,9 @@ class AutoReleaseStructureTests(unittest.TestCase):
         )
 
     def test_release_files_rename_and_matrix_agree(self) -> None:
-        release = self.jobs()["release"]
-        gh_release = next(
-            step
-            for step in release["steps"]
-            if str(step.get("uses", "")).startswith("softprops/action-gh-release")
-        )
-        files = [line.strip() for line in str(gh_release["with"]["files"]).splitlines()]
-        files = [line for line in files if line]
+        from ci import release as release_script
+
+        files = release_script.ASSET_TEMPLATES
         # The architecture-independent amalgamation ZIP plus one archive per cross lane.
         self.assertEqual(len(files), 1 + len(EXPECTED_LANES), files)
         rename_text = job_run_text(self.jobs()["preflight-assets"])
@@ -256,26 +262,17 @@ class AutoReleaseStructureTests(unittest.TestCase):
             if any(
                 token in source
                 for token in (
-                    "softprops/action-gh-release",
                     "crates-io-auth-action",
-                    "soldr cargo publish -p mimalloc-pprof --locked",
+                    "ci.release_live --real",
                 )
             ):
                 self.assertEqual(step.get("if"), "env.IS_DRY_RUN != 'true'", source)
-        tag_step = next(step for step in steps if step.get("name") == "Determine release tag")
-        tag_script = tag_step["run"]
-        self.assertIn('echo "tag=v${version}"', tag_script)
-        self.assertNotIn("git tag", tag_script)
-        gh_release = next(
-            step
-            for step in steps
-            if str(step.get("uses", "")).startswith("softprops/action-gh-release")
-        )
-        self.assertEqual(gh_release["with"]["tag_name"], "${{ steps.tag.outputs.tag }}")
         self.assertIn(
             "soldr cargo publish --dry-run -p mimalloc-pprof --locked",
             job_run_text(release),
         )
+        self.assertNotIn("softprops/action-gh-release", str(steps))
+        self.assertNotIn("soldr cargo publish -p mimalloc-pprof --locked", str(steps))
 
     def test_tag_push_cannot_publish_and_real_run_needs_full_sha_evidence(self) -> None:
         trigger_keys = cast(dict[object, Any], self.doc)
@@ -285,10 +282,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
         self.assertIn("candidate_sha", inputs)
         self.assertIn("full_run_id", inputs)
         release = self.jobs()["release"]
-        tag_step = next(
-            step for step in release["steps"] if step.get("name") == "Determine release tag"
-        )
-        self.assertNotIn("GITHUB_REF_NAME", tag_step["run"])
+        self.assertNotIn("GITHUB_REF_NAME", job_run_text(release))
         gate = next(
             step
             for step in release["steps"]
@@ -340,24 +334,21 @@ class AutoReleaseStructureTests(unittest.TestCase):
         first_write = next(
             i
             for i, step in enumerate(release["steps"])
-            if "crates-io-auth-action" in str(step.get("uses", ""))
+            if "ci.release_live --real" in str(step.get("run", ""))
         )
         self.assertLess(release["steps"].index(gate), first_write)
-        block = next(
+        full_gate = next(
             step
             for step in release["steps"]
-            if step.get("name") == "Require fleet all-platform full gate before publication"
+            if "ci/release_full_ci_gate.py" in str(step.get("run", ""))
         )
-        self.assertEqual(block["if"], "env.IS_DRY_RUN != 'true'")
-        self.assertIn("exit 1", block["run"])
-        self.assertLess(release["steps"].index(block), first_write)
-        gh_release = next(
+        self.assertLess(release["steps"].index(full_gate), first_write)
+        preflight = next(
             step
             for step in release["steps"]
-            if str(step.get("uses", "")).startswith("softprops/action-gh-release")
+            if "ci.release_destinations" in str(step.get("run", ""))
         )
-        self.assertEqual(gh_release["with"]["tag_name"], "${{ steps.tag.outputs.tag }}")
-        self.assertEqual(gh_release["if"], "env.IS_DRY_RUN != 'true'")
+        self.assertLess(release["steps"].index(preflight), first_write)
 
     def test_full_evidence_rejects_wrong_candidate_and_missing_verifier(self) -> None:
         gate = next(

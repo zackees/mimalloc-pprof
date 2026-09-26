@@ -125,7 +125,10 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
   _mi_page_free_collect_no_unpurge(page, collect >= MI_FORCE);
   if (mi_page_all_free(page)) {
     // no more used blocks, possibly free the page.
-    if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced/abandon, or not already retired
+    if (collect == MI_ABANDON) {
+      _mi_page_free_or_reserve(page, pq);   // #493: the thread is done; a large page may wait for the next one
+    }
+    else if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced, or not already retired
       // note: this will potentially free retired pages as well.
       _mi_page_free(page, pq);
     }
@@ -161,7 +164,16 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   // const bool is_main_thread = (_mi_is_main_thread() && theap->thread_id == _mi_thread_id());
 
   // collect retired pages (and full pages if theap->allow_page_abandon is false)
-  _mi_theap_collect_retired(theap, force); 
+  // #493: not when the thread is done. The visit below reaches every page anyway (the full queue
+  // included), and it is where an empty large page is reserved rather than freed -- a forced
+  // collect of the retired pages here would free exactly the pages worth reserving.
+  if (collect != MI_ABANDON) {
+    _mi_theap_collect_retired(theap, force);
+  }
+  else {
+    theap->page_retired_min = MI_BIN_FULL;   // the visit below empties every queue
+    theap->page_retired_max = 0;
+  }
 
   // collect all pages owned by this thread
   _mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
@@ -174,6 +186,10 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   // itself, as its own reclaim-gated phase (`_mi_arenas_purge_now`).
   //mi_atomic_storei64_release(&theap->tld->subproc->purge_expire, 1);
   if (theap->tld == NULL || mi_atomic_load_relaxed(&theap->tld->park_state) != MI_PARK_SWEEPING) {
+    // #493: a forced collect promises that everything free is handed back, and that includes the
+    // empty pages reserved for a next thread. First, so the purge below already sees them free.
+    mi_heap_t* const rheap = _mi_theap_heap_peek(theap);
+    if (collect == MI_FORCE && rheap != NULL) { _mi_arenas_release_reserved(rheap, true); }
     _mi_arenas_collect(collect == MI_FORCE /* force purge? */, collect >= MI_FORCE /* visit all? */, theap->tld);
   }
 
@@ -529,6 +545,7 @@ void _mi_heap_detach_theaps( mi_heap_t* heap ) {
             if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
                                 else { mi_assert_internal(tld->theaps == theap); tld->theaps = theap->tnext; }
             theap->tnext = theap->tprev = NULL;
+            _mi_theap_unpublish_retired(theap);   // #483: while its tld is certainly alive
             mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
             mi_lock_release(&tld->theaps_lock);
           }

@@ -1,0 +1,44 @@
+name: perf-ab
+
+# Small paired A/B of the allocator at this ref against a base ref (#479, #493): memory (peak
+# RSS, RSS after drain), CPU (ops/s, process and worker-thread cpu seconds) and minor page
+# faults on a few large-block workloads, a small-object control and a profiler-on row. It runs on PRs labelled `perf-ab` (against the PR base) or by
+# dispatch; the table lands in the job summary and is pasted into the PR. Runs on a hosted
+# runner so no developer machine is timed.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base ref to compare against"
+        type: string
+        default: origin/main
+      reps:
+        description: "Paired repetitions per workload"
+        type: string
+        default: "7"
+      workloads:
+        description: "Only the workloads whose name contains this text (empty = all)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'perf-ab')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: paired A/B
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || inputs.base }}
+          REPS: ${{ inputs.reps || '7' }}
+          WORKLOADS: ${{ inputs.workloads }}
+        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" --summary "$GITHUB_STEP_SUMMARY"

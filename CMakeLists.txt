@@ -850,7 +850,9 @@ if(MI_USE_CXX)
   # Ported anyway per the issue: harmless (the file's `#ifdef __cplusplus` branches already
   # target this), and keeps the CMake shape identical to Bun's should this tree's extern "C"
   # wrapping ever change.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c PROPERTIES LANGUAGE CXX )
+  # test-arena-purge-rearm.c (#491): calls `_mi_release_bound_ms` from internal.h, the same case.
+  # test-resident-first-churn.c (#517): calls `_mi_arena_claim_counters` from internal.h, the same case.
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -2009,6 +2011,80 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-thread-idle-rss PROPERTIES TIMEOUT 120)
   endif()
 
+  # test-arena-purge-rearm (#457): the DEFERRED arena purge. Workers free large blocks and
+  # then only idle, so the memory can come back only through the scavenger's `purge_delay`
+  # deadline; the 20 ms delay makes that observable in-process.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-purge-rearm test/test-arena-purge-rearm.c)
+    target_compile_definitions(mimalloc-test-arena-purge-rearm PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-purge-rearm PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-purge-rearm PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-purge-rearm PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-arena-purge-rearm PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-arena-purge-rearm COMMAND mimalloc-test-arena-purge-rearm)
+    set_tests_properties(test-arena-purge-rearm PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20")
+  endif()
+
+  # test-arena-purge-aged (#497): an aged purge run that is partly young again must still purge
+  # its other part. Single-threaded; the scavenger is off so only the test's collects purge.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-purge-aged test/test-arena-purge-aged.c)
+    target_compile_definitions(mimalloc-test-arena-purge-aged PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-purge-aged PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-purge-aged PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-purge-aged PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-arena-purge-aged COMMAND mimalloc-test-arena-purge-aged)
+    # (arena_purge_mult 1: the test steps in 60 ms periods, and the #497 case needs one arena period per step)
+    set_tests_properties(test-arena-purge-aged PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0;MIMALLOC_ARENA_PURGE_MULT=1")
+  endif()
+
+  # test-arena-retention (#486): freed arena memory stays resident for its retention window, then
+  # goes back to the OS. Single-threaded; the scavenger is off so only the test's collects purge.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-retention test/test-arena-retention.c)
+    target_compile_definitions(mimalloc-test-arena-retention PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-retention PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-retention PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-retention PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-arena-retention COMMAND mimalloc-test-arena-retention)
+    set_tests_properties(test-arena-retention PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
+  endif()
+
+  # test-resident-first (#493, strategy 9): a new page claims free arena slices that are still
+  # resident (queued for purge) before purged ones. Single-threaded; the scavenger is off so only
+  # the test's collects purge.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-resident-first test/test-resident-first.c)
+    target_compile_definitions(mimalloc-test-resident-first PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-resident-first PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-resident-first PRIVATE include)
+    target_link_libraries(mimalloc-test-resident-first PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-resident-first COMMAND mimalloc-test-resident-first)
+    set_tests_properties(test-resident-first PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
+  endif()
+
+  # test-resident-first-churn (#517): the memory gate's thread-churn scenario must not claim
+  # never-dirty (fresh) arena slices once warmed up; small/medium claims taking resident-first
+  # runs did (#514). Asserts on the MI_DIAGNOSTICS claim counters, so it needs that build.
+  # (MIMALLOC_PURGE_ZEROES=0: a purge that zeroes a range clears its dirty bits, which would
+  # make its next claim count as fresh.)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN AND MI_DIAGNOSTICS)
+    add_executable(mimalloc-test-resident-first-churn test/test-resident-first-churn.c)
+    target_compile_definitions(mimalloc-test-resident-first-churn PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-resident-first-churn PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-resident-first-churn PRIVATE include)
+    target_link_libraries(mimalloc-test-resident-first-churn PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-resident-first-churn PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-resident-first-churn COMMAND mimalloc-test-resident-first-churn)
+    set_tests_properties(test-resident-first-churn PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
+  endif()
+
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of
   # docs/purge-all-implementation.md §11 (T1-T3, G1-G8, C1-C2) in one binary that is built for
   # BOTH MI_PPROF and BOTH MI_OWNER_GATE settings and branches on `#if MI_OWNER_GATE` for its
@@ -2213,7 +2289,7 @@ endif()
 #
 #   * process-wide peak RSS / current RSS -- test-memory-gate (the committed baselines are
 #     min-of-8 peak RSS), test-degenerate (RSS must not grow per iteration),
-#     test-process-rss and test-thread-idle-rss (RSS must fall after a thread idles).
+#     test-process-rss, test-thread-idle-rss and test-arena-purge-rearm (RSS must fall after a thread idles).
 #     Under memory pressure from a parallel wave the kernel's reclaim decisions, not the
 #     allocator's, decide those numbers.
 #   * a wall-clock deadline -- test-park-handoff* wait a bounded time for a hole sweep to
@@ -2253,6 +2329,7 @@ set(mi_serial_tests
   test-degenerate
   test-process-rss
   test-thread-idle-rss
+  test-arena-purge-rearm
   test-park-handoff
   test-park-handoff-no-scavenger
   test-park-handoff-eager

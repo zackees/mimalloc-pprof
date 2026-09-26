@@ -16,11 +16,11 @@ AZURE = ROOT / "azure-pipelines.yml"
 
 
 class LintNoMacosRunnersTests(unittest.TestCase):
-    def test_production_workflows_have_only_opt_in_native_macos_runners(self) -> None:
-        """#444 permits the full lane only; all other Mac runner labels remain red."""
+    def test_production_workflows_have_only_full_lane_native_macos_runners(self) -> None:
+        """#444/#463 permit the full lane only; other Mac runner labels remain red."""
         self.assertEqual(lint.check(WORKFLOWS), 0)
 
-    def test_full_lane_has_both_arches_and_exact_opt_in_gate(self) -> None:
+    def test_full_lane_has_both_arches_and_external_author_gate(self) -> None:
         workflow = yaml.safe_load((WORKFLOWS / "macos-bundles.yml").read_text(encoding="utf-8"))
         job = workflow["jobs"]["run-macos-native-full"]
         self.assertEqual(
@@ -29,6 +29,7 @@ class LintNoMacosRunnersTests(unittest.TestCase):
         )
         gate = job["if"]
         self.assertIn("contains(github.event.pull_request.labels.*.name, 'ci-full')", gate)
+        self.assertIn("needs.pr-ci-mode.outputs.external == 'true'", gate)
         self.assertIn("inputs.ci-mode == 'full'", gate)
         self.assertIn("github.event_name == 'pull_request'", gate)
         self.assertNotIn("github.event_name == 'push'", gate)
@@ -71,10 +72,10 @@ class LintNoMacosRunnersTests(unittest.TestCase):
         self.assertIn("^[0-9a-f]{40}$", source)
         self.assertIn("git rev-parse HEAD", source)
         self.assertIn("DISPATCH_SHA", source)
-        self.assertIn("PR_SHA", source)
+        self.assertIn("EVENT_SHA", source)
         self.assertIn("candidate_sha", str(workflow))
         for name, job in jobs.items():
-            if name == "resolve-candidate":
+            if name in {"resolve-candidate", "pr-ci-mode", "pr-test-gate"}:
                 continue
             self.assertIn("resolve-candidate", job["needs"], name)
             checkouts = [s for s in job["steps"] if s.get("uses") == "actions/checkout@v4"]

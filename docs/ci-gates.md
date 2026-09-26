@@ -2,14 +2,27 @@
 
 *Part of the [mimalloc-pprof](../README.md) documentation.*
 
-Ordinary PR and default-branch CI run the minimal lane. Literal `ci-test` PRs
-add the complete `c-unit` DAG; `ci-full` PRs run the release platform matrix
-across `c-unit`, `cross`, `rust-native`, `windows-bundles`, and `macos-bundles`.
-Adding or removing either label reruns the selector on the same PR head, even
+Internal-author PRs and default-branch CI run the minimal lane. A PR whose author
+lacks effective write access to this repository runs the full test matrix,
+including documentation-only PRs. The read-only `pr-ci-mode` selector checks the
+author's current repository permission; an unknown result fails closed. Literal
+`ci-test` labels on internal PRs add the complete `c-unit` DAG and extended
+sanitizer/fuzz/purge tests; `ci-full` labels run the release platform matrix
+across `c-unit`, `cross`, `rust-native`, `windows-bundles`, and `macos-bundles`,
+plus the extended tests. Each workflow's `PR test gate` rejects selected jobs
+that are skipped, missing, cancelled, neutral, or failed, and checks the resolved
+candidate against the PR merge SHA. Require these gate checks in branch protection:
+a skipped individual job is not a passing test.
+Like the other `pull_request` workflows, these checks run workflow and script
+content from the proposed merge commit. They detect accidental skips and CI
+failures; they are not an independent security boundary against a contributor
+who deliberately edits the workflow or checker in their PR. Such edits require
+code review before merge.
+Adding or removing either label reruns the selector on the same PR merge commit, even
 for documentation-only changes. The exact-SHA release dispatch runs full mode
 independently of PR labels. The 65-job release manifest and fail-closed
 publication gate remain authoritative; a skipped job does not pass release
-validation. Required check names stay visible in minimal mode, including the
+validation. Required check names stay visible in internal minimal mode, including the
 six macOS build matrix rows, whose costly steps are skipped there. The existing
 selective Darwin PR lane still builds and runs when its path/label decision says so.
 
@@ -61,7 +74,7 @@ gh workflow run macos-bundles.yml --ref <branch>            # default 3600 s gue
 gh workflow run macos-bundles.yml --ref <branch> -f run-timeout=1800
 ```
 
-Full PR and exact-SHA release runs cross-build all six macOS bundles (both arches)
+External-author PRs, internal full PRs, and exact-SHA release runs cross-build all six macOS bundles (both arches)
 and execute them on native Macs. A selective Darwin PR also cross-builds the bundles
 for its Recovery test lane. Run the manual Recovery diagnostic before merging changes to macOS-specific paths (`src/prim/osx`,
 interpose, TLS slots) and when a Linux-green change touches the arena/heap lifecycle.
@@ -467,22 +480,25 @@ check. `ci/tests/test_verify_local.py` parses `c-unit.yml`'s matrix `include:` r
 as its `run:` blocks, so a cmake flag that moves into the matrix cannot silently escape the
 drift guard.
 
-## macOS: cross-built on Linux, native execution in opt-in full runs
+## macOS: cross-built on Linux, native execution in selected full runs
 
-Issue #277 phase B/B2 and #444. Ordinary PR/main events schedule no hosted macOS runner.
+Issue #277 phase B/B2 and #444. Internal minimal PR/main events schedule no hosted macOS runner.
 Both Apple architectures are cross-compiled on `ubuntu-latest`
 through soldr's Darwin toolchains, and the x86_64 bundle is *executed* on an
 `ubuntu-24.04` runner inside a [`dockurr/macos`](https://github.com/dockur/macos) guest
-(QEMU + KVM) for manual Recovery diagnostics. A literal `ci-full` PR label or an explicit
+(QEMU + KVM) for manual Recovery diagnostics. An external-author PR, a literal `ci-full` PR label, or an explicit
 `ci-mode=full` dispatch additionally executes the same Linux-built C and Rust test
 artifacts on hosted `macos-15` (ARM64) and `macos-15-intel` (x64). For each architecture
 and each release/debug-full C bundle, the native job runs ordinary tests without privilege
 and runs `test-osx-zone-introspect-remote` alone through `sudo` for `task_for_pid`. It
 unions the two JUnit reports against the bundle manifest, so missing or skipped tests fail. The only
-macOS runner labels permitted by `ci/lint_no_macos_runners.py` are in that opt-in job.
+macOS runner labels permitted by `ci/lint_no_macos_runners.py` are in that selected full job.
 The full dispatch requires a lowercase 40-hex `candidate_sha`; `resolve-candidate`
 checks out that commit and verifies `git rev-parse HEAD` before any build or execution.
-PR runs similarly use the PR head SHA, rather than GitHub's synthetic merge commit.
+PR runs use GitHub's synthetic merge commit, matching the other full workflows.
+This matters for fork PRs: checking out the contributor head can pair a newer
+workflow with an older `ci/run_test_bundle.py` that lacks the flags it invokes
+(PR #443 exposed exactly that mismatch with `--exclude`).
 The full run title includes the candidate SHA for release evidence.
 
 The leak bundle is a memory-gate positive control, not an ordinary C test cell. On both

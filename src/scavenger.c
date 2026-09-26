@@ -546,17 +546,24 @@ static void mi_scav_fork_child_reset(void) {
 #if !defined(MI_SCAV_HAS_FORK_RESET)
 // futex / __ulock / WaitOnAddress hold no state of ours across fork()
 // #373: correct no-ops; unused on platforms whose wait primitive needs no init/fork reset
-mi_decl_maybe_unused static void mi_scav_fork_child_reset(void) { }
+MI_DECL_MAYBE_UNUSED static void mi_scav_fork_child_reset(void) { }
 #endif
 #if !defined(MI_SCAV_HAS_INIT)
 // #373: correct no-ops; unused on platforms whose wait primitive needs no init/fork reset
-mi_decl_maybe_unused static void mi_scav_init(void) { }
+MI_DECL_MAYBE_UNUSED static void mi_scav_init(void) { }
 #endif
 
 
 // -----------------------------------------------------------------------------
 // Scavenger thread body (shared across platforms)
 // -----------------------------------------------------------------------------
+
+// The longest the scavenger sleeps with nothing scheduled, and the period of its safety-net pass
+// over every arena (#457). A build may override it (e.g. `-DMI_SCAVENGER_MAX_WAIT_MS=5000`,
+// including the Rust crate's build script).
+#ifndef MI_SCAVENGER_MAX_WAIT_MS
+#define MI_SCAVENGER_MAX_WAIT_MS  (30000)
+#endif
 
 static void mi_scavenger_run(void) {
   {   // #366: see `_mi_scavenger_tld`
@@ -566,6 +573,7 @@ static void mi_scavenger_run(void) {
   // Use the main subproc directly: this thread never allocates, so don't
   // initialise a theap/tld via _mi_subproc()'s TLS path.
   mi_subproc_t* const subproc = _mi_subproc_main();
+  mi_msecs_t full_pass = _mi_clock_now();   // last safety-net pass over every arena
   while (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) {
     // Clear with an RMW, not a plain store: it must be totally ordered against the parker's
     // coalescing `exchange(wake, 1)` in `_mi_scavenger_wake`. With a store, our clear and the later
@@ -579,30 +587,38 @@ static void mi_scavenger_run(void) {
     mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
     mi_msecs_t timeout_ms;
     if (expire == 0) {
-      // Nothing scheduled: park until woken. The 30s bound is a pure safety
-      // net so stop() is guaranteed to take effect and any per-arena expiry
-      // that did not propagate to subproc is still eventually purged.
-      timeout_ms = 30000;
+      // Nothing scheduled: park until woken. Every MI_SCAVENGER_MAX_WAIT_MS a full pass re-derives the deadline
+      // from the arenas themselves, so a per-arena expiry that never reached the subproc
+      // is still purged (#457); the bound also guarantees stop() takes effect.
+      const mi_msecs_t now = _mi_clock_now();
+      if (now - full_pass >= MI_SCAVENGER_MAX_WAIT_MS) {
+        full_pass = now;
+        _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
+        continue;
+      }
+      timeout_ms = MI_SCAVENGER_MAX_WAIT_MS - (now - full_pass);
     }
     else {
       const mi_msecs_t now = _mi_clock_now();
       if (expire > now) {
         timeout_ms = expire - now;
-        if (timeout_ms > 30000) timeout_ms = 30000;
+        if (timeout_ms > MI_SCAVENGER_MAX_WAIT_MS) timeout_ms = MI_SCAVENGER_MAX_WAIT_MS;
       }
       else {
+        // A full pass always settles subproc->purge_expire to the earliest pending arena
+        // expire (0 if none), or to a short retry when another thread holds the purge guard.
+        // Never clear it here: that orphaned arenas that were re-armed meanwhile (#457).
         _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
-        // _mi_arenas_try_purge sets subproc->purge_expire to the earliest still-pending
-        // per-arena expire once every arena is visited. If it left the stale past value
-        // (its CAS lost to a concurrent schedule), clear it so the next iteration parks on
-        // the 30s safety net instead of spinning. CAS so a concurrently scheduled future
-        // expire is never clobbered.
-        mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expire, (mi_msecs_t)0);
         continue;
       }
     }
     // a park passed over for its minimum interval is swept when its window ends, not at the safety timeout
     if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
+    // #483: retired large pages of idle threads are released once they stay retired long enough
+    if (_mi_pages_release_retired(subproc)) {
+      const long tick = mi_option_get_clamp(mi_option_purge_delay, 1, MI_SCAVENGER_MAX_WAIT_MS);
+      if (tick < timeout_ms) { timeout_ms = tick; }
+    }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
     mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
   }

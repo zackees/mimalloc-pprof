@@ -40,6 +40,7 @@ class SmokeArchiveTests(unittest.TestCase):
         with zipfile.ZipFile(self.dist / self.name, "w") as archive:
             archive.writestr("bin/mimalloc.dll", self.binary)
             archive.writestr("bin/libgcc_s_seh-1.dll", b"runtime")
+            archive.writestr("bin/mimalloc-redirect.dll", b"redirect")
         raw = (self.dist / self.name).read_bytes()
         self.info: _ArchiveInfo = {
             "candidate_sha": self.sha,
@@ -87,3 +88,43 @@ class SmokeArchiveTests(unittest.TestCase):
             self.write_info()
             with self.assertRaisesRegex(ReleaseError, "library differs"):
                 verify_and_smoke(self.dist, "windows-x64-gnu", self.sha)
+
+    def test_windows_smoke_materializes_complete_shipped_dll_closure(self) -> None:
+        seen: set[str] = set()
+        smoke_parent: Path | None = None
+
+        def load(command: list[str], *, check: bool) -> None:
+            nonlocal smoke_parent
+            self.assertTrue(check)
+            library = Path(command[-1])
+            smoke_parent = library.parent.parent
+            seen.update(item.name for item in library.parent.iterdir())
+
+        with (
+            patch("smoke_release_archive.sys.platform", "win32"),
+            patch("smoke_release_archive.platform.machine", return_value="AMD64"),
+            patch("smoke_release_archive.subprocess.run", side_effect=load),
+        ):
+            verify_and_smoke(self.dist, "windows-x64-gnu", self.sha)
+
+        self.assertEqual(
+            seen,
+            {"mimalloc.dll", "mimalloc-redirect.dll", "libgcc_s_seh-1.dll"},
+        )
+        self.assertEqual(smoke_parent, self.dist)
+
+    def test_refuses_case_colliding_windows_dll_members(self) -> None:
+        archive_path = self.dist / self.name
+        with zipfile.ZipFile(archive_path, "a") as archive:
+            archive.writestr("bin/MIMALLOC.DLL", b"different library")
+        raw = archive_path.read_bytes()
+        self.info["artifacts"][0]["bytes"] = len(raw)
+        self.info["artifacts"][0]["sha256"] = hashlib.sha256(raw).hexdigest()
+        self.write_info()
+
+        with (
+            patch("smoke_release_archive.sys.platform", "win32"),
+            patch("smoke_release_archive.platform.machine", return_value="AMD64"),
+            self.assertRaisesRegex(ReleaseError, "case-colliding Windows DLL members"),
+        ):
+            verify_and_smoke(self.dist, "windows-x64-gnu", self.sha)

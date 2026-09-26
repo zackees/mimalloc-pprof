@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import struct
 import tarfile
 import tempfile
@@ -20,6 +21,203 @@ PARENT = "c" * 40
 
 
 class ReleaseFrontdoorTests(unittest.TestCase):
+    def test_github_json_retries_empty_and_schema_invalid_success(self) -> None:
+        sleeps: list[float] = []
+        with patch.object(
+            release,
+            "command",
+            side_effect=["", "[]", '{"state":"OPEN"}'],
+        ):
+            value = release.github_json(
+                "gh",
+                "issue",
+                "view",
+                validate=lambda result: release.json_object_with_string_fields(result, ("state",)),
+                sleep=sleeps.append,
+            )
+        self.assertEqual(value, {"state": "OPEN"})
+        self.assertEqual(sleeps, [1, 2])
+
+    def test_github_json_accepts_schema_valid_document_inside_decorated_output(
+        self,
+    ) -> None:
+        raw = 'soldr telemetry {"elapsed":1}\nwarning: transient\n{"state":"OPEN"}\nfooter'
+        with patch.object(release, "command", return_value=raw):
+            value = release.github_json(
+                "gh",
+                "issue",
+                "view",
+                validate=lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        self.assertEqual(value, {"state": "OPEN"})
+
+    def test_github_json_accepts_schema_valid_object_after_same_line_decoration(
+        self,
+    ) -> None:
+        raw = 'runner diagnostic: {"state":"OPEN"}\n'
+        with patch.object(release, "command", return_value=raw):
+            value = release.github_json(
+                "gh",
+                "issue",
+                "view",
+                validate=lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        self.assertEqual(value, {"state": "OPEN"})
+
+    def test_validated_json_document_rejects_ambiguous_inline_objects(self) -> None:
+        raw = 'one {"state":"OPEN"}\ntwo {"state":"CLOSED"}\n'
+        self.assertIsNone(
+            release.validated_json_document(
+                raw,
+                lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        )
+
+    def test_validated_json_document_rejects_ambiguous_standalone_objects(self) -> None:
+        raw = '{"state":"OPEN"}\n{"state":"CLOSED"}\n'
+        self.assertIsNone(
+            release.validated_json_document(
+                raw,
+                lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        )
+
+    def test_validated_json_document_rejects_mixed_ambiguity(self) -> None:
+        raw = '{"state":"OPEN"}\ndiagnostic: {"state":"CLOSED"}\n'
+        self.assertIsNone(
+            release.validated_json_document(
+                raw,
+                lambda result: release.json_object_with_string_fields(result, ("state",)),
+            )
+        )
+
+    def test_validated_json_document_rejects_nested_or_inline_shape_matches(
+        self,
+    ) -> None:
+        validate = release.release_list_shape
+        self.assertIsNone(release.validated_json_document('{"error":{"releases":[]}}', validate))
+        self.assertIsNone(release.validated_json_document("diagnostic []", validate))
+        self.assertIsNone(release.validated_json_document("[] trailing diagnostic", validate))
+
+    def test_github_json_bounds_malformed_success_retries(self) -> None:
+        sleeps: list[float] = []
+        with (
+            patch.object(release, "command", return_value=""),
+            self.assertRaisesRegex(release.ReleaseError, "after 10 attempts"),
+        ):
+            release.github_json(
+                "gh",
+                "issue",
+                "view",
+                validate=lambda result: isinstance(result, dict),
+                sleep=sleeps.append,
+            )
+        self.assertEqual(sleeps, [1, 2, 4, 8, 16, 30, 30, 30, 30])
+
+    def test_github_json_does_not_retry_command_failure(self) -> None:
+        sleeps: list[float] = []
+        with (
+            patch.object(release, "command", side_effect=release.ReleaseError("auth failed")),
+            self.assertRaisesRegex(release.ReleaseError, "auth failed"),
+        ):
+            release.github_json(
+                "gh",
+                "issue",
+                "view",
+                validate=lambda result: isinstance(result, dict),
+                sleep=sleeps.append,
+            )
+        self.assertEqual(sleeps, [])
+
+    def test_release_list_shape_validates_fields_used_by_preflight(self) -> None:
+        self.assertTrue(
+            release.release_list_shape(
+                [
+                    {
+                        "tag_name": "v1.0.1",
+                        "assets": [{"name": "asset", "digest": "sha256:a"}],
+                    }
+                ]
+            )
+        )
+        self.assertFalse(release.release_list_shape([{"tag_name": "v1.0.1"}]))
+        self.assertFalse(release.release_list_shape([{"tag_name": "v1.0.1", "assets": [None]}]))
+
+    def test_issue_comment_read_retries_empty_success_response(self) -> None:
+        sleeps: list[float] = []
+        response = json.dumps(
+            [{"body": "trusted", "author_association": "OWNER", "login": "owner"}]
+        )
+        with patch.object(release, "command", side_effect=["", response]):
+            self.assertEqual(release.issue_comments(444, sleep=sleeps.append), ["trusted"])
+        self.assertEqual(sleeps, [1])
+
+    def test_issue_comment_read_accepts_paginated_json_lines_from_gh(self) -> None:
+        response = "\n".join(
+            json.dumps(page)
+            for page in (
+                [
+                    {
+                        "body": "owner\nbody",
+                        "author_association": "OWNER",
+                        "login": "owner",
+                    }
+                ],
+                [
+                    {
+                        "body": "automation",
+                        "author_association": "NONE",
+                        "login": "github-actions[bot]",
+                    },
+                    {
+                        "body": "untrusted",
+                        "author_association": "NONE",
+                        "login": "outsider",
+                    },
+                ],
+            )
+        )
+        with patch.object(release, "command", return_value=response) as run:
+            self.assertEqual(release.issue_comments(444), ["owner\nbody", "automation"])
+        self.assertIn("| @json", run.call_args.args[-1])
+
+    def test_issue_comment_read_accepts_valid_empty_page(self) -> None:
+        with patch.object(release, "command", return_value="[]"):
+            self.assertEqual(release.issue_comments(444), [])
+
+    def test_issue_comment_read_bounds_malformed_response_retries(self) -> None:
+        sleeps: list[float] = []
+        with (
+            patch.object(release, "command", return_value=""),
+            self.assertRaisesRegex(release.ReleaseError, "after 10 attempts"),
+        ):
+            release.issue_comments(444, sleep=sleeps.append)
+        self.assertEqual(sleeps, [1, 2, 4, 8, 16, 30, 30, 30, 30])
+        self.assertEqual(release.json_lines_shape(""), "empty")
+        self.assertEqual(release.json_lines_shape("<html>"), "ndjson/0-of-1-lines/6-bytes")
+        self.assertEqual(
+            release.json_lines_shape('{"body":"ok"}\nnot-json'),
+            "ndjson/1-of-2-lines/22-bytes",
+        )
+
+    def test_issue_comment_read_retries_malformed_rows(self) -> None:
+        sleeps: list[float] = []
+        response = json.dumps(
+            [{"body": "trusted", "author_association": "OWNER", "login": "owner"}]
+        )
+        with patch.object(release, "command", side_effect=["null", response]):
+            self.assertEqual(release.issue_comments(444, sleep=sleeps.append), ["trusted"])
+        self.assertEqual(sleeps, [1])
+
+    def test_issue_comment_read_does_not_retry_command_failure(self) -> None:
+        sleeps: list[float] = []
+        with (
+            patch.object(release, "command", side_effect=release.ReleaseError("auth failed")),
+            self.assertRaisesRegex(release.ReleaseError, "auth failed"),
+        ):
+            release.issue_comments(444, sleep=sleeps.append)
+        self.assertEqual(sleeps, [])
+
     def test_source_version_requires_matching_lockfile(self) -> None:
         self.assertEqual(release.source_version(), "1.0.1")
         with tempfile.TemporaryDirectory() as temporary:
@@ -32,7 +230,10 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             (root / "rust/Cargo.lock").write_text(
                 '[[package]]\nname = "mimalloc-pprof"\nversion = "1.0.0"\n'
             )
-            with patch.object(release, "ROOT", root), self.assertRaises(release.ReleaseError):
+            with (
+                patch.object(release, "ROOT", root),
+                self.assertRaises(release.ReleaseError),
+            ):
                 release.source_version()
 
     def test_directive_is_exact_and_full(self) -> None:
@@ -50,7 +251,9 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             release.require_same_directive(original, release.directive(444, "1.0.1", "b" * 40))
 
-    def test_artifact_preflight_rejects_missing_oversize_and_hash_mismatch(self) -> None:
+    def test_artifact_preflight_rejects_missing_oversize_and_hash_mismatch(
+        self,
+    ) -> None:
         directive = release.directive(444, "1.0.1", SHA)
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -66,7 +269,8 @@ class ReleaseFrontdoorTests(unittest.TestCase):
                             "README.md",
                         ):
                             archive.write(
-                                release.ROOT / "rust/mimalloc-pprof/vendor" / member, member
+                                release.ROOT / "rust/mimalloc-pprof/vendor" / member,
+                                member,
                             )
                     continue
                 asset = next(key for key in release.TARGETS if f"-{key}-" in name)
@@ -141,6 +345,22 @@ class ReleaseFrontdoorTests(unittest.TestCase):
     def test_archive_member_paths_and_symlink_targets_are_confined(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            rooted_tar = root / "rooted.tar.gz"
+            with tarfile.open(rooted_tar, "w:gz") as archive:
+                root_entry = tarfile.TarInfo(".")
+                root_entry.type = tarfile.DIRTYPE
+                archive.addfile(root_entry)
+                data = b"safe"
+                file_entry = tarfile.TarInfo("./safe.txt")
+                file_entry.size = len(data)
+                archive.addfile(file_entry, BytesIO(data))
+            self.assertEqual(release.archive_members(rooted_tar), {"safe.txt": b"safe"})
+            with tarfile.open(rooted_tar, "w:gz") as archive:
+                root_file = tarfile.TarInfo(".")
+                root_file.size = 1
+                archive.addfile(root_file, BytesIO(b"x"))
+            with self.assertRaisesRegex(release.ReleaseError, "unsafe archive member"):
+                release.archive_members(rooted_tar)
             zip_path = root / "bad.zip"
             for member in ("C:/escape", "dir\\escape", "../escape"):
                 with zipfile.ZipFile(zip_path, "w") as archive:
@@ -166,6 +386,59 @@ class ReleaseFrontdoorTests(unittest.TestCase):
                 link.linkname = "real.dylib"
                 archive.addfile(link)
             self.assertIn("lib/link.dylib", release.archive_members(tar_path))
+
+    def test_zip_member_types_and_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "asset.zip"
+            for label, mode in (
+                ("symlink", stat.S_IFLNK),
+                ("character device", stat.S_IFCHR),
+                ("block device", stat.S_IFBLK),
+                ("fifo", stat.S_IFIFO),
+                ("socket", stat.S_IFSOCK),
+                ("unknown", 0o150000),
+            ):
+                with self.subTest(label=label):
+                    member = zipfile.ZipInfo("bin/unsafe")
+                    member.create_system = 3
+                    member.external_attr = (mode | 0o644) << 16
+                    with zipfile.ZipFile(path, "w") as archive:
+                        archive.writestr(member, b"payload")
+                    with self.assertRaisesRegex(release.ReleaseError, "invalid archive member"):
+                        release.archive_members(path)
+            for name in ("bin/duplicate", "bin/duplicate/"):
+                with self.subTest(duplicate=name):
+                    with zipfile.ZipFile(path, "w") as archive:
+                        archive.writestr(name, b"" if name.endswith("/") else b"first")
+                        archive.writestr(name, b"" if name.endswith("/") else b"second")
+                    with self.assertRaisesRegex(release.ReleaseError, "duplicate archive member"):
+                        release.archive_members(path)
+            native = Path(temporary) / "native"
+            native.write_bytes(b"native")
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("bin/plain", b"plain")
+                archive.write(native, "bin/native")
+                unix_file = zipfile.ZipInfo("bin/unix")
+                unix_file.create_system = 3
+                unix_file.external_attr = (stat.S_IFREG | 0o644) << 16
+                archive.writestr(unix_file, b"unix")
+                unix_dir = zipfile.ZipInfo("bin/dir/")
+                unix_dir.create_system = 3
+                unix_dir.external_attr = (stat.S_IFDIR | 0o755) << 16
+                archive.writestr(unix_dir, b"")
+                dos_file = zipfile.ZipInfo("bin/dos")
+                dos_file.create_system = 0
+                dos_file.external_attr = 0x20
+                archive.writestr(dos_file, b"dos")
+            self.assertEqual(
+                release.archive_members(path),
+                {
+                    "bin/plain": b"plain",
+                    "bin/native": b"native",
+                    "bin/unix": b"unix",
+                    "bin/dos": b"dos",
+                },
+            )
 
     def test_candidate_requires_recorded_version_bump_merge(self) -> None:
         self.assertEqual(release.recorded_merge_sha(f"- Candidate merge SHA: **{SHA}**"), SHA)
@@ -202,7 +475,11 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             if args[:3] == ("gh", "pr", "view"):
                 oid = BUMP if args[3] == "999" else SHA
                 return json.dumps(
-                    {"baseRefName": "main", "mergedAt": "now", "mergeCommit": {"oid": oid}}
+                    {
+                        "baseRefName": "main",
+                        "mergedAt": "now",
+                        "mergeCommit": {"oid": oid},
+                    }
                 )
             if args[:3] == ("git", "rev-parse", "HEAD"):
                 return responses["HEAD"]
@@ -219,6 +496,14 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         ):
             run.return_value.returncode = 0
             release.validate_candidate(value, require_registry_free=False)
+            with self.assertRaisesRegex(release.ReleaseError, "ready-to-publish"):
+                release.validate_candidate(
+                    value, require_registry_free=False, require_issue_ready=True
+                )
+            issue_record = json.loads(responses["issue"])
+            issue_record["body"] = "- State: **ready-to-publish**.\n" + issue_record["body"]
+            responses["issue"] = json.dumps(issue_record)
+            release.validate_candidate(value, require_registry_free=False, require_issue_ready=True)
             responses["issue"] = responses["issue"].replace("#1000", "#999")
             with self.assertRaisesRegex(release.ReleaseError, "candidate differs"):
                 release.validate_candidate(value, require_registry_free=False)
@@ -227,7 +512,10 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         old = release.directive(444, "1.0.1", BUMP)
         new = release.directive(444, "1.0.1", SHA)
         release.require_history([old, new], new, None)
-        info = {**new, "artifacts": [{"name": name, "sha256": "d" * 64} for name in new["assets"]]}
+        info = {
+            **new,
+            "artifacts": [{"name": name, "sha256": "d" * 64} for name in new["assets"]],
+        }
         frozen = release.freeze_record(new, info, "f" * 64)
         release.require_history([old, new], new, frozen)
         release.require_frozen_info(frozen, new, info)
@@ -275,7 +563,11 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             if args[:3] == ("gh", "pr", "view"):
                 oid = BUMP if args[3] == "999" else SHA
                 return json.dumps(
-                    {"baseRefName": "main", "mergedAt": "now", "mergeCommit": {"oid": oid}}
+                    {
+                        "baseRefName": "main",
+                        "mergedAt": "now",
+                        "mergeCommit": {"oid": oid},
+                    }
                 )
             if args[:3] == ("git", "rev-parse", "HEAD"):
                 return SHA
@@ -316,7 +608,15 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         with (
             patch(
                 "sys.argv",
-                ["release.py", "start", "--issue", "444", "--candidate-sha", SHA, "--dry"],
+                [
+                    "release.py",
+                    "start",
+                    "--issue",
+                    "444",
+                    "--candidate-sha",
+                    SHA,
+                    "--dry",
+                ],
             ),
             patch.object(release, "source_version", return_value="1.0.1"),
             patch.object(release, "issue_directives", return_value=[]),
@@ -330,13 +630,13 @@ class ReleaseFrontdoorTests(unittest.TestCase):
     def test_issue_directive_ignores_untrusted_comments(self) -> None:
         value = release.directive(444, "1.0.1", SHA)
         body = release.comment_body(value, "ready")
-        comments = [
+        comments = json.dumps(
             [
-                {"body": body, "author_association": "NONE", "user": {"login": "outsider"}},
-                {"body": body, "author_association": "OWNER", "user": {"login": "zackees"}},
+                {"body": body, "author_association": "NONE", "login": "outsider"},
+                {"body": body, "author_association": "OWNER", "login": "zackees"},
             ]
-        ]
-        with patch.object(release, "command", return_value=json.dumps(comments)):
+        )
+        with patch.object(release, "command", return_value=comments):
             self.assertEqual(release.issue_directives(444), [value])
 
     def test_workflow_has_issue_gate_before_every_build(self) -> None:

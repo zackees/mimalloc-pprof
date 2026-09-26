@@ -3,11 +3,12 @@
 # requires-python = ">=3.11"
 # dependencies = ["pyyaml==6.0.2"]
 # ///
-"""Fail if a workflow schedules a native macOS runner outside #444's full lane.
+"""Fail if a workflow schedules a native macOS runner outside the full PR/release lane.
 
 Issue #277 phase B2 originally prohibited all native Mac jobs. Issue #444 narrowly
-permits hosted Intel and Apple Silicon runners for opt-in full validation; ordinary
-PR/main events remain Mac-free. Both Apple architectures are still cross-built on Linux
+permits hosted Intel and Apple Silicon runners for full validation. Issue #463 also
+selects that lane for external PR authors; internal minimal PRs and main stay Mac-free.
+Both Apple architectures are still cross-built on Linux
 (see cmake/toolchains/soldr-*-apple-darwin.cmake), and this lint permits only the reviewed
 full-lane matrix and its exact opt-in condition. Any other Mac runner is a regression.
 
@@ -116,7 +117,7 @@ def offenders(document: object) -> Iterator[tuple[str, str]]:
 
 
 def allowed_full_runner(file: Path, document: object, path: str, label: str) -> bool:
-    """The only owner-approved hosted Mac exception: both arches in one opt-in job."""
+    """The only owner-approved hosted Mac exception: both arches in one full job."""
     if file.name == "auto-release.yml" and path == "jobs.test-shipped-assets.strategy.matrix":
         jobs = cast("dict[str, object]", cast("dict[str, object]", document).get("jobs", {}))
         job = cast("dict[str, object]", jobs.get("test-shipped-assets", {}))
@@ -181,7 +182,8 @@ def allowed_full_runner(file: Path, document: object, path: str, label: str) -> 
         return False
     expected = (
         "(github.event_name == 'pull_request' && "
-        "contains(github.event.pull_request.labels.*.name, 'ci-full')) || "
+        "(contains(github.event.pull_request.labels.*.name, 'ci-full') || "
+        "needs.pr-ci-mode.outputs.external == 'true')) || "
         "(github.event_name == 'workflow_dispatch' && inputs.ci-mode == 'full')"
     )
     strategy = fields.get("strategy")
@@ -191,10 +193,17 @@ def allowed_full_runner(file: Path, document: object, path: str, label: str) -> 
     if not isinstance(matrix, dict):
         return False
     include = cast("dict[str, object]", matrix).get("include")
-    return " ".join(gate.split()) == expected and include == [
-        {"arch": "arm64", "runner": "macos-15", "triple": "aarch64-apple-darwin"},
-        {"arch": "x64", "runner": "macos-15-intel", "triple": "x86_64-apple-darwin"},
-    ]
+    needs = fields.get("needs")
+    return (
+        " ".join(gate.split()) == expected
+        and isinstance(needs, list)
+        and "pr-ci-mode" in cast("list[object]", needs)
+        and include
+        == [
+            {"arch": "arm64", "runner": "macos-15", "triple": "aarch64-apple-darwin"},
+            {"arch": "x64", "runner": "macos-15-intel", "triple": "x86_64-apple-darwin"},
+        ]
+    )
 
 
 def unverifiable(document: object) -> Iterator[tuple[str, str]]:
@@ -261,8 +270,8 @@ def check(*targets: Path) -> int:
             warnings += 1
     if failures:
         print(
-            f"\n{failures} unapproved native macOS runner label(s). Issue #444 permits only\n"
-            "the opt-in full matrix in macos-bundles.yml; all other labels are forbidden.\n"
+            f"\n{failures} unapproved native macOS runner label(s). Issues #444/#463 permit only\n"
+            "the full matrix in macos-bundles.yml; all other labels are forbidden.\n"
             "See docs/ci-gates.md, section 'macOS'.",
             file=sys.stderr,
         )

@@ -1,9 +1,10 @@
 name: macos-bundles
-run-name: macos-bundles/${{ inputs.ci-mode || 'event' }}/${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+run-name: macos-bundles/${{ inputs.ci-mode || 'event' }}/${{ inputs.candidate_sha || github.sha }}
 
 # Issue #277 phase B/B2: build the macOS test binaries on Linux, and execute them on a
 # Linux runner inside a dockurr/macos guest. Issue #444 permits hosted native execution
-# of the same Linux-built bundles only for opt-in ci-full PRs and explicit full dispatch.
+# of the same Linux-built bundles for external-author PRs, opt-in ci-full PRs,
+# and explicit full dispatch.
 #
 # The motivation is not build time. Measured over 20 runs per workflow (#277 phase 0),
 # cross.yml's Apple rows EXECUTE in 8-14 seconds and WAIT up to 5h26m (arm64) / 6h13m
@@ -15,8 +16,8 @@ run-name: macos-bundles/${{ inputs.ci-mode || 'event' }}/${{ inputs.candidate_sh
 #
 # What replaces it: both Apple architectures are cross-built here on Linux, and the
 # x86_64 bundle is EXECUTED under emulation (dockurr/macos, QEMU+KVM) on ubuntu-24.04.
-# aarch64 is compile-only on ordinary events -- there is no arm64 dockur image, and Apple
-# ships no arm64 macOS VM that runs on Linux. Opt-in full runs execute it on hosted Apple
+# aarch64 is compile-only on internal minimal events -- there is no arm64 dockur image,
+# and Apple ships no arm64 macOS VM that runs on Linux. Selected full runs execute it on hosted Apple
 # Silicon. Its test suite is still checked for parity against the executed x86_64 one
 # (`ci/bundle_coverage.py`), so an arm64-only test cannot be silently dropped.
 #
@@ -71,6 +72,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  pr-ci-mode:
+    uses: ./.github/workflows/pr-ci-mode.yml
+
   resolve-candidate:
     name: resolve-candidate (exact SHA)
     runs-on: ubuntu-latest
@@ -82,14 +86,13 @@ jobs:
           EVENT: ${{ github.event_name }}
           MODE: ${{ inputs.ci-mode }}
           DISPATCH_SHA: ${{ inputs.candidate_sha }}
-          PR_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [[ "$EVENT" == workflow_dispatch && "$MODE" == full ]]; then
             sha="$DISPATCH_SHA"
           elif [[ "$EVENT" == pull_request ]]; then
-            sha="$PR_SHA"
+            sha="$EVENT_SHA"
           else
             sha="$EVENT_SHA"
           fi
@@ -107,12 +110,23 @@ jobs:
           test "$actual" = "$CANDIDATE_SHA" || { echo "::error::checked out $actual, expected $CANDIDATE_SHA"; exit 1; }
           echo "exact candidate_sha=$actual" >> "$GITHUB_STEP_SUMMARY"
 
+  pr-test-gate:
+    name: PR test gate (macos-bundles)
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs: [pr-ci-mode, resolve-candidate, decide, build-macos, build-rust-apple, run-macos-x64-selective, run-macos-native-full]
+    uses: ./.github/workflows/pr-ci-gate.yml
+    with:
+      workflow: macos-bundles
+      needs-json: ${{ toJSON(needs) }}
+      ci-test: ${{ contains(github.event.pull_request.labels.*.name, 'ci-test') }}
+      ci-full: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
+
   build-macos:
-    needs: [resolve-candidate, decide]
+    needs: [resolve-candidate, decide, pr-ci-mode]
     # Keep this matrix job present on every PR: branch protection requires each of its
     # six named rows. Expensive steps run only for full or selective Mac validation.
     env:
-      RUN_MACOS_BUILD: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.decide.outputs.run == 'true')) }}
+      RUN_MACOS_BUILD: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true' || needs.decide.outputs.run == 'true')) }}
     # The golden-image / unattended-install question (#277, #283) that this
     # lane was parked behind is settled by not needing an installed macOS at all: the
     # x86_64 bundles execute in macOS Recovery, booted off the image on an ordinary
@@ -366,8 +380,8 @@ jobs:
           retention-days: 7
 
   build-rust-apple:
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     # The golden-image / unattended-install question (#277, #283) that this
     # lane was parked behind is settled by not needing an installed macOS at all: the
     # x86_64 bundles execute in macOS Recovery, booted off the image on an ordinary
@@ -633,11 +647,12 @@ jobs:
 
   run-macos-native-full:
     name: run-macos-native-full (${{ matrix.arch }})
-    needs: [resolve-candidate, build-macos, build-rust-apple]
-    # Hosted Apple hardware is approved only for literal ci-full PR labels and an
-    # explicit full dispatch (#444). Ordinary PR and main events allocate none.
+    needs: [resolve-candidate, build-macos, build-rust-apple, pr-ci-mode]
+    # Hosted Apple hardware is approved for external-author PRs, literal ci-full PR
+    # labels, and explicit full dispatch (#444, #463). Internal minimal PRs and main
+    # events allocate none.
     if: >-
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full')) ||
+      (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true')) ||
       (github.event_name == 'workflow_dispatch' && inputs.ci-mode == 'full')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60

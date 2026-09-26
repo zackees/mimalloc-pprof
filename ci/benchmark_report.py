@@ -189,6 +189,8 @@ SCALING_PATTERN_IDS = (
     "xmalloc-test",
     "power-of-two-large",
     "random-large",
+    "large-class-persistent",
+    "large-class-ephemeral",
 )
 # Every pattern set this validator will accept, oldest first. New production
 # runs carry SCALING_PATTERN_IDS, but the published branch still holds history
@@ -199,10 +201,12 @@ SCALING_PATTERN_IDS = (
 # patterns changed the metric comparison key, so it starts a new history
 # lineage instead of rewriting the sparse one. This mirrors
 # SCALING_THREAD_POINT_LINEAGES above.
-PRE_DISTRIBUTION_PATTERN_IDS = SCALING_PATTERN_IDS[:-2]
+PRE_DISTRIBUTION_PATTERN_IDS = SCALING_PATTERN_IDS[:6]
+PRE_LARGE_CLASS_PATTERN_IDS = SCALING_PATTERN_IDS[:8]
 SCALING_PATTERN_LINEAGES = (
     LEGACY_SCALING_PATTERN_IDS,
     PRE_DISTRIBUTION_PATTERN_IDS,
+    PRE_LARGE_CLASS_PATTERN_IDS,
     SCALING_PATTERN_IDS,
 )
 # One panel per allocation pattern. Separate files (rather than one facet grid)
@@ -211,7 +215,12 @@ SCALING_PANELS = {
     pattern: f"benchmark-scaling-{pattern.removeprefix('sparse-')}.svg"
     for pattern in PRE_DISTRIBUTION_PATTERN_IDS
 }
-DISTRIBUTION_PATTERN_IDS = ("power-of-two-large", "random-large")
+# Each family shares one Y domain per metric, so its workloads read on one scale.
+DISTRIBUTION_FAMILIES = (
+    ("power-of-two-large", "random-large"),
+    ("large-class-persistent", "large-class-ephemeral"),
+)
+DISTRIBUTION_PATTERN_IDS = tuple(pattern for family in DISTRIBUTION_FAMILIES for pattern in family)
 DISTRIBUTION_PANELS = {
     (pattern, metric): f"benchmark-scaling-{pattern}-{metric}.svg"
     for pattern in DISTRIBUTION_PATTERN_IDS
@@ -226,6 +235,8 @@ SCALING_PANEL_TITLES = {
     "xmalloc-test": "xmalloc-test producer/consumer (8-128 B, remote free)",
     "power-of-two-large": "Power-of-two requested sizes (64 KiB-4 MiB)",
     "random-large": "Uniform random requested sizes (64 KiB-4 MiB)",
+    "large-class-persistent": "Long-lived threads (96-512 KiB)",
+    "large-class-ephemeral": "Short-lived threads (96-512 KiB)",
 }
 
 
@@ -4626,11 +4637,25 @@ def scaling_svg(scaling: ScalingView, pattern: str) -> bytes:
     return ("\n".join(parts) + "\n").encode("utf-8")
 
 
-PRIMARY_DISTRIBUTION_ALLOCATORS = (
+# #507: one panel overlays every allocator's median; the P5/P95 spread lives in
+# latest.json and the dashboard table, never as a chart area.
+DISTRIBUTION_WIDTH = 1120
+DISTRIBUTION_HEIGHT = 640
+DISTRIBUTION_LEFT = 118
+DISTRIBUTION_RIGHT = 34
+DISTRIBUTION_TOP = 108
+DISTRIBUTION_PLOT_HEIGHT = 400
+DISTRIBUTION_MEDIAN_STROKE = 2.5
+DISTRIBUTION_EMPHASIS_STROKE = 4.0
+DISTRIBUTION_MARKER_RADIUS = 4.5
+DISTRIBUTION_EMPHASIS_ALLOCATOR = "mimalloc-pprof"
+# The fork is drawn last so its line sits on top of every comparison line.
+DISTRIBUTION_DRAW_ORDER = (
     "tcmalloc",
     "jemalloc",
     "upstream-mimalloc",
-    "mimalloc-pprof",
+    "bun-mimalloc",
+    DISTRIBUTION_EMPHASIS_ALLOCATOR,
 )
 
 
@@ -4645,10 +4670,17 @@ def readable_ceiling(maximum: float, intervals: int = 5) -> tuple[float, float]:
     return math.ceil(maximum / step) * step, step
 
 
-def distribution_global_domain(scaling: ScalingView, metric: str) -> tuple[float, float]:
+def distribution_family(pattern: str) -> tuple[str, ...]:
+    return next(family for family in DISTRIBUTION_FAMILIES if pattern in family)
+
+
+def distribution_global_domain(
+    scaling: ScalingView, pattern: str, metric: str
+) -> tuple[float, float]:
+    family = distribution_family(pattern)
     values: list[float] = []
     for sample in scaling.raw_observations:
-        if sample.pattern not in DISTRIBUTION_PATTERN_IDS:
+        if sample.pattern not in family:
             continue
         if metric == "throughput":
             values.append(sample.throughput)
@@ -4660,130 +4692,174 @@ def distribution_global_domain(scaling: ScalingView, metric: str) -> tuple[float
 
 
 def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str) -> bytes:
-    """Four comparable allocator rows plus a clearly supplemental Bun row.
+    """One panel overlaying every allocator's median line (#507).
 
-    The domain is calculated once from every raw observation across both new
-    workloads (including outliers and Bun), then reused verbatim by every row
-    and both workload graphics for the metric.
+    The domain is calculated once from every raw observation across both
+    workloads of the family (including outliers and Bun), then reused verbatim
+    by both workload graphics for the metric. The P5/P95 spread is not drawn;
+    it stays in latest.json and the dashboard table.
     """
-    width, height = 1120, 1120
-    left, right, top = 118, 34, 108
-    row_height, gap = 148, 38
-    plot_width = width - left - right
-    ceiling, step = distribution_global_domain(scaling, metric)
+    width, height = DISTRIBUTION_WIDTH, DISTRIBUTION_HEIGHT
+    left, top = DISTRIBUTION_LEFT, DISTRIBUTION_TOP
+    plot_width = width - left - DISTRIBUTION_RIGHT
+    plot_height = DISTRIBUTION_PLOT_HEIGHT
+    ceiling, step = distribution_global_domain(scaling, pattern, metric)
     unit = axis_unit(ceiling)
     points = scaling.thread_points
     allowed = scaling.topology.allowed_logical_cpus
     if metric == "throughput":
         metric_title = "aggregate throughput (operations/second)"
-        values_by_allocator = {
+        medians_by_allocator = {
             allocator: sorted(
-                (cell.thread_count, cell.p05, cell.median, cell.p95)
+                (cell.thread_count, cell.median)
                 for cell in scaling.throughput_cells
                 if cell.pattern == pattern and cell.allocator_id == allocator
             )
-            for allocator in (*PRIMARY_DISTRIBUTION_ALLOCATORS, "bun-mimalloc")
+            for allocator in DISTRIBUTION_DRAW_ORDER
         }
     else:
         metric_title = "peak RSS (bytes; lower is better)"
-        values_by_allocator = {
+        medians_by_allocator = {
             allocator: sorted(
-                (cell.thread_count, float(cell.p05), float(cell.median), float(cell.p95))
+                (cell.thread_count, float(cell.median))
                 for cell in scaling.rss_cells
                 if cell.pattern == pattern and cell.allocator_id == allocator
             )
-            for allocator in (*PRIMARY_DISTRIBUTION_ALLOCATORS, "bun-mimalloc")
+            for allocator in DISTRIBUTION_DRAW_ORDER
         }
-    allocators = (*PRIMARY_DISTRIBUTION_ALLOCATORS, "bun-mimalloc")
-    parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}" role="img">',
-        f"<title>{escaped(SCALING_PANEL_TITLES[pattern])}: {escaped(metric_title)}, P5-P95 empirical bands</title>",
-        f"<desc>Five vertically aligned allocator rows. The first four are the primary comparison and Bun mimalloc is supplemental. Every row starts at zero and uses domain 0 to {ceiling:g} with tick step {step:g}, shared across both requested-size workloads. Bands show empirical P5 to P95 from 40 paired repetitions; lines show medians.</desc>",
-        f'<metadata data-y-domain-min="0" data-y-domain-max="{ceiling:g}" data-y-tick-step="{step:g}" data-quantiles="linear-h=(n-1)p" data-samples="{DISTRIBUTION_BLOCKS}"/>',
-        f'<rect width="{width}" height="{height}" fill="{SCALING_INK["background"]}"/>',
-        svg_text(
-            left,
-            42,
-            SCALING_PANEL_TITLES[pattern],
-            fill=SCALING_INK["title"],
-            size=24,
-            weight="600",
-        ),
-        svg_text(left, 70, metric_title, fill=SCALING_INK["muted"], size=14),
-    ]
-    for row, allocator in enumerate(allocators):
-        y0 = top + row * (row_height + gap)
-        parts.append(
-            f'<rect x="{left}" y="{y0}" width="{plot_width}" height="{row_height}" fill="{SCALING_INK["plot"]}" rx="6"/>'
-        )
-        for tick in range(6):
-            value = step * tick
-            if value > ceiling + step / 100:
-                break
-            y = scaling_y_of(value, ceiling, y0, row_height)
-            parts.append(
-                f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_width}" y2="{y:.1f}" stroke="{SCALING_INK["grid"]}"/>'
-            )
-            parts.append(
-                svg_text(
-                    left - 10,
-                    y + 4,
-                    format_throughput(value, unit),
-                    fill=SCALING_INK["axis"],
-                    size=10,
-                    anchor="end",
-                )
-            )
-        values = values_by_allocator[allocator]
+    for allocator, values in medians_by_allocator.items():
         if len(values) != len(points):
             fail(f"distribution {pattern}/{metric}/{allocator}: incomplete worker sweep")
-        color = SCALING_SERIES[allocator]
-        upper = [(threads, high) for threads, _low, _median, high in values]
-        lower = list(reversed([(threads, low) for threads, low, _median, _high in values]))
-        polygon = " ".join(
-            f"{scaling_x_of(threads, left, plot_width, points):.1f},{scaling_y_of(value, ceiling, y0, row_height):.1f}"
-            for threads, value in (*upper, *lower)
+    title = SCALING_PANEL_TITLES[pattern]
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}" role="img">',
+        f"<title>{escaped(title)}: {escaped(metric_title)}, median of n={DISTRIBUTION_BLOCKS}</title>",
+        f"<desc>One panel with one median line per allocator, all on a shared zero-based axis from 0 to {ceiling:g} with tick step {step:g}, shared across both workloads of the family. Each line is the median of {DISTRIBUTION_BLOCKS} paired repetitions; the spread is in latest.json and the dashboard table.</desc>",
+        f'<metadata data-y-domain-min="0" data-y-domain-max="{ceiling:g}" data-y-tick-step="{step:g}" data-quantiles="linear-h=(n-1)p" data-samples="{DISTRIBUTION_BLOCKS}"/>',
+        f'<rect width="{width}" height="{height}" fill="{SCALING_INK["background"]}"/>',
+        svg_text(left, 42, title, fill=SCALING_INK["title"], size=24, weight="600"),
+        svg_text(
+            left,
+            70,
+            f"{metric_title}; median of n={DISTRIBUTION_BLOCKS}",
+            fill=SCALING_INK["muted"],
+            size=14,
+        ),
+        f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="{SCALING_INK["plot"]}" rx="6"/>',
+    ]
+    # Shade the oversubscribed region so contention is never read as core scaling.
+    oversubscribed = [threads for threads in points if threads > allowed]
+    in_budget = [threads for threads in points if threads <= allowed]
+    if oversubscribed:
+        first_over = scaling_x_of(oversubscribed[0], left, plot_width, points)
+        band_start = (
+            (scaling_x_of(in_budget[-1], left, plot_width, points) + first_over) / 2
+            if in_budget
+            else float(left)
         )
-        parts.append(f'<polygon points="{polygon}" fill="{color}" fill-opacity="0.24"/>')
-        path = " ".join(
-            f"{'M' if index == 0 else 'L'} {scaling_x_of(threads, left, plot_width, points):.1f} {scaling_y_of(median, ceiling, y0, row_height):.1f}"
-            for index, (threads, _low, median, _high) in enumerate(values)
-        )
-        parts.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.5"/>')
-        label = allocator_label(allocator) + (
-            " (supplemental)" if allocator == "bun-mimalloc" else ""
+        band_width = left + plot_width - band_start
+        parts.append(
+            f'<rect x="{band_start:.1f}" y="{top}" width="{band_width:.1f}" '
+            f'height="{plot_height}" fill="{SCALING_INK["oversubscribed"]}" rx="6"/>'
         )
         parts.append(
-            svg_text(left + 10, y0 + 22, label, fill=SCALING_INK["title"], size=13, weight="600")
+            svg_text(
+                left + plot_width - 8,
+                top + 20,
+                f"oversubscribed (> {allowed} vCPU)",
+                fill=SCALING_INK["muted"],
+                size=12,
+                anchor="end",
+            )
         )
-        for threads in points:
-            x = scaling_x_of(threads, left, plot_width, points)
+    for tick in range(round(ceiling / step) + 1):
+        value = step * tick
+        if value > ceiling + step / 100:
+            break
+        y = scaling_y_of(value, ceiling, top, plot_height)
+        parts.append(
+            f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_width}" y2="{y:.1f}" stroke="{SCALING_INK["grid"]}"/>'
+        )
+        parts.append(
+            svg_text(
+                left - 12,
+                y + 4,
+                format_throughput(value, unit),
+                fill=SCALING_INK["axis"],
+                size=12,
+                anchor="end",
+            )
+        )
+    for threads in points:
+        x = scaling_x_of(threads, left, plot_width, points)
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top + plot_height}" stroke="{SCALING_INK["grid"]}"/>'
+        )
+        parts.append(
+            svg_text(
+                x,
+                top + plot_height + 26,
+                str(threads),
+                fill=SCALING_INK["title"],
+                size=13,
+                weight="600",
+                anchor="middle",
+            )
+        )
+        if threads > allowed:
             parts.append(
                 svg_text(
                     x,
-                    y0 + row_height + 18,
-                    str(threads),
-                    fill=SCALING_INK["axis"],
-                    size=10,
+                    top + plot_height + 44,
+                    f"{threads / max(allowed, 1):g}x",
+                    fill=SCALING_INK["muted"],
+                    size=11,
                     anchor="middle",
                 )
             )
-            if threads > allowed:
-                parts.append(
-                    svg_text(
-                        x,
-                        y0 + row_height + 31,
-                        f"{threads / max(allowed, 1):g}x",
-                        fill=SCALING_INK["muted"],
-                        size=9,
-                        anchor="middle",
-                    )
-                )
+    for allocator in DISTRIBUTION_DRAW_ORDER:
+        color = SCALING_SERIES[allocator]
+        stroke_width = (
+            DISTRIBUTION_EMPHASIS_STROKE
+            if allocator == DISTRIBUTION_EMPHASIS_ALLOCATOR
+            else DISTRIBUTION_MEDIAN_STROKE
+        )
+        values = medians_by_allocator[allocator]
+        path = " ".join(
+            f"{'M' if index == 0 else 'L'} {scaling_x_of(threads, left, plot_width, points):.1f} {scaling_y_of(median, ceiling, top, plot_height):.1f}"
+            for index, (threads, median) in enumerate(values)
+        )
+        parts.append(
+            f'<path d="{path}" fill="none" stroke="{color}" stroke-width="{stroke_width:g}" '
+            'stroke-linejoin="round" stroke-linecap="round"/>'
+        )
+        for threads, median in values:
+            parts.append(
+                f'<circle cx="{scaling_x_of(threads, left, plot_width, points):.1f}" '
+                f'cy="{scaling_y_of(median, ceiling, top, plot_height):.1f}" '
+                f'r="{DISTRIBUTION_MARKER_RADIUS:g}" '
+                f'fill="{SCALING_INK["background"]}" stroke="{color}" stroke-width="{stroke_width:g}"/>'
+            )
+    legend_x = float(left)
+    legend_y = top + plot_height + 76
+    for allocator in ALLOCATOR_IDS:
+        color = SCALING_SERIES[allocator]
+        parts.append(
+            f'<rect x="{legend_x:.1f}" y="{legend_y - 7}" width="22" height="4" rx="2" fill="{color}"/>'
+        )
+        label = allocator_label(allocator)
+        weight = "600" if allocator == DISTRIBUTION_EMPHASIS_ALLOCATOR else "normal"
+        parts.append(
+            svg_text(
+                legend_x + 30, legend_y, label, fill=SCALING_INK["axis"], size=12, weight=weight
+            )
+        )
+        legend_x += 34 + 7.4 * len(label)
     parts.append(
         svg_text(
             left,
             height - 20,
-            f"shared domain 0-{ceiling:g}; tick {step:g}; P5-P95 empirical area, median line; n={DISTRIBUTION_BLOCKS}; normal allocation API",
+            f"shared domain 0-{ceiling:g}; tick {step:g}; median of n={DISTRIBUTION_BLOCKS}; spread in latest.json and the dashboard table; normal allocation API",
             fill=SCALING_INK["muted"],
             size=12,
         )
@@ -5624,22 +5700,24 @@ def escaped(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
-def has_complete_distribution(scaling: ScalingView) -> bool:
+def has_complete_distribution(
+    scaling: ScalingView, patterns: Sequence[str] = DISTRIBUTION_PATTERN_IDS
+) -> bool:
     expected = {
         (pattern, threads, allocator)
-        for pattern in DISTRIBUTION_PATTERN_IDS
+        for pattern in patterns
         for threads in scaling.thread_points
         for allocator in ALLOCATOR_IDS
     }
     throughput = {
         (cell.pattern, cell.thread_count, cell.allocator_id)
         for cell in scaling.throughput_cells
-        if cell.pattern in DISTRIBUTION_PATTERN_IDS
+        if cell.pattern in patterns
     }
     rss = {
         (cell.pattern, cell.thread_count, cell.allocator_id)
         for cell in scaling.rss_cells
-        if cell.pattern in DISTRIBUTION_PATTERN_IDS
+        if cell.pattern in patterns
     }
     return throughput == expected and rss == expected
 
@@ -5659,14 +5737,22 @@ def render_scaling_html(scaling: ScalingView) -> str:
     )
     distribution_images = ""
     distribution_tables = ""
-    if has_complete_distribution(scaling):
+    # Per family, so an older lineage keeps its charts while a new family is pending.
+    complete = [
+        pattern
+        for family in DISTRIBUTION_FAMILIES
+        if has_complete_distribution(scaling, family)
+        for pattern in family
+    ]
+    if complete:
         distribution_images = "".join(
-            f'<img src="{name}" alt="{escaped(SCALING_PANEL_TITLES[pattern])} {metric}: four primary allocator area rows with a supplemental Bun row; shared zero-based axis; P5 to P95 empirical band and median line">'
+            f'<img src="{name}" alt="{escaped(SCALING_PANEL_TITLES[pattern])} {metric}: median of every allocator overlaid on one shared zero-based axis, n={DISTRIBUTION_BLOCKS}">'
             for (pattern, metric), name in DISTRIBUTION_PANELS.items()
+            if pattern in complete
         )
         rows: list[str] = []
         for cell in scaling.throughput_cells:
-            if cell.pattern not in DISTRIBUTION_PATTERN_IDS:
+            if cell.pattern not in complete:
                 continue
             rss = next(
                 value
@@ -5687,7 +5773,7 @@ def render_scaling_html(scaling: ScalingView) -> str:
         else "https://github.com/zackees/mimalloc-pprof/actions"
     )
     workers = ", ".join(str(point) for point in scaling.thread_points)
-    return f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(scaling.rigor_label)}.</strong> Legacy panels use {SCALING_BLOCKS} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating.</p><p>Worker counts are literal {escaped(workers)}; the runner allows {scaling.topology.allowed_logical_cpus} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling.methodology.seed_chain)}. Scaling run <a href="{actions}">{escaped(scaling.run.run_id)}/{scaling.run.run_attempt}</a> measured mimalloc-pprof at source <code>{escaped(scaling.run.source_sha)}</code>, which is not necessarily the commit above; metric key <code>{escaped(scaling.metric_comparison_key)}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table><h2 id="requested-size-distributions">Deterministic requested-size distributions</h2>{distribution_images}<p>These are normal allocation requests, not pointer-alignment tests. Each area is the empirical middle 90% (P5-P95) of at least 40 paired repetitions and is not a confidence interval. Every allocator row within a metric uses the same zero-based Y domain and ticks, computed from every raw observation across both workloads and rounded upward; outliers are retained and cannot be clipped. Bun mimalloc remains collected and is shown as a supplemental fifth row.</p>{distribution_tables}</section>"""
+    return f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(scaling.rigor_label)}.</strong> Legacy panels use {SCALING_BLOCKS} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating.</p><p>Worker counts are literal {escaped(workers)}; the runner allows {scaling.topology.allowed_logical_cpus} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling.methodology.seed_chain)}. Scaling run <a href="{actions}">{escaped(scaling.run.run_id)}/{scaling.run.run_attempt}</a> measured mimalloc-pprof at source <code>{escaped(scaling.run.source_sha)}</code>, which is not necessarily the commit above; metric key <code>{escaped(scaling.metric_comparison_key)}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table><h2 id="requested-size-distributions">Deterministic requested-size distributions</h2>{distribution_images}<p>These are normal allocation requests, not pointer-alignment tests. Each line is the median of at least {DISTRIBUTION_BLOCKS} paired repetitions. Every allocator shares one zero-based Y domain and ticks per metric, computed from every raw observation across both workloads and rounded upward; outliers are retained and never clipped. The P5 / P50 / P95 spread is in the table below.</p>{distribution_tables}</section>"""
 
 
 def render_html(latest: Mapping[str, object]) -> bytes:
@@ -6102,7 +6188,7 @@ def render(
                     )
                 )
         for (pattern, metric), name in DISTRIBUTION_PANELS.items():
-            if has_complete_distribution(scaling):
+            if has_complete_distribution(scaling, distribution_family(pattern)):
                 (output / name).write_bytes(distribution_stack_svg(scaling, pattern, metric))
             else:
                 (output / name).write_bytes(

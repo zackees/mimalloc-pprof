@@ -1,0 +1,33 @@
+name: pr-ci-gate
+
+on:
+  workflow_call:
+    inputs:
+      workflow:
+        type: string
+        required: true
+      needs-json:
+        type: string
+        required: true
+      ci-test:
+        type: boolean
+        required: true
+      ci-full:
+        type: boolean
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          NEEDS_JSON: ${{ inputs.needs-json }}
+          CI_TEST: ${{ inputs.ci-test }}
+          CI_FULL: ${{ inputs.ci-full }}
+          EXPECTED_SHA: ${{ github.sha }}
+          WORKFLOW: ${{ inputs.workflow }}
+        run: python3 ci/pr_ci_gate.py --workflow "$WORKFLOW"

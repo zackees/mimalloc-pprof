@@ -185,7 +185,7 @@ static inline bool mi_bfield_atomic_try_clear_mask_optimistic(_Atomic(mi_bfield_
 // Returns `true` if the bit transitioned from 1 to 0
 // and `false` otherwise (leaving the bfield `b` as-is).
 // `all_clear` is set to true if the new bfield became zero (and false otherwise)
-mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear_optimistic(_Atomic(mi_bfield_t)* b, size_t idx, mi_bfield_t* previous) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bfield_atomic_try_clear_optimistic(_Atomic(mi_bfield_t)* b, size_t idx, mi_bfield_t* previous) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
   const mi_bfield_t mask = ((mi_bfield_t)1<<idx);
   return mi_bfield_atomic_try_clear_mask_optimistic(b, mask, previous, NULL);  // single bit never clears temporarily
@@ -194,7 +194,7 @@ mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear_optimistic(_A
 // Tries to clear a byte atomically. For performance, it assumes there is a good chance of success.  
 // Returns true if the byte atomically transitioned from 0xFF to 0
 // `all_clear` is set to true if the new bfield became zero (and false otherwise)
-mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear8_optimistic(_Atomic(mi_bfield_t)*b, size_t idx, mi_bfield_t* previous, bool* did_temp_clear_bits) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bfield_atomic_try_clear8_optimistic(_Atomic(mi_bfield_t)*b, size_t idx, mi_bfield_t* previous, bool* did_temp_clear_bits) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
   mi_assert_internal((idx%8)==0);
   const mi_bfield_t mask = ((mi_bfield_t)0xFF)<<idx;
@@ -576,16 +576,16 @@ static inline bool mi_bchunk_try_clearN(mi_bchunk_t* chunk, size_t cidx, size_t 
 // ------- mi_bchunk_try_find_and_clear ---------------------------------------
 
 #if MI_OPT_SIMD && defined(__AVX2__)
-mi_decl_maybe_unused static inline __m256i mi_mm256_zero(void) {
+MI_DECL_MAYBE_UNUSED static inline __m256i mi_mm256_zero(void) {
   return _mm256_setzero_si256();
 }
-mi_decl_maybe_unused static inline __m256i mi_mm256_ones(void) {
+MI_DECL_MAYBE_UNUSED static inline __m256i mi_mm256_ones(void) {
   return _mm256_set1_epi64x(~0);
 }
-mi_decl_maybe_unused static inline bool mi_mm256_is_ones(__m256i vec) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_mm256_is_ones(__m256i vec) {
   return _mm256_testc_si256(vec, _mm256_cmpeq_epi32(vec, vec));
 }
-mi_decl_maybe_unused static inline bool mi_mm256_is_zero( __m256i vec) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_mm256_is_zero( __m256i vec) {
   return _mm256_testz_si256(vec,vec);
 }
 #endif
@@ -710,7 +710,7 @@ static inline bool mi_bchunk_try_find_and_clear_1(mi_bchunk_t* chunk, size_t n, 
   return mi_bchunk_try_find_and_clear(chunk, pidx);
 }
 
-mi_decl_maybe_unused static inline bool mi_bchunk_try_find_and_clear8_at(mi_bchunk_t* chunk, size_t chunk_idx, size_t* pidx, bool* did_temp_clear_bits) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bchunk_try_find_and_clear8_at(mi_bchunk_t* chunk, size_t chunk_idx, size_t* pidx, bool* did_temp_clear_bits) {
   _Atomic(mi_bfield_t)* const bfield = &chunk->bfields[chunk_idx];  
   mi_bfield_t b = mi_atomic_load_relaxed(bfield);
   if (b==0) return false;
@@ -1502,6 +1502,7 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
             // break early: reset the non-visited bits
             if (b!=0) {
               mi_atomic_or_relaxed(&chunk->bfields[j], b);
+              mi_bitmap_chunkmap_set(bitmap, chunk_idx);   // #493: see the restore in `_mi_bitmap_forall_setc_rangesn`
             }
             return false;
           }
@@ -1556,6 +1557,7 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
               mi_assert_internal((notyet_visited & skipped) == 0);
               if ((notyet_visited | skipped) != 0) {
                 mi_atomic_or_relaxed(&chunk->bfields[j], notyet_visited | skipped);
+                mi_bitmap_chunkmap_set(bitmap, chunk_idx);   // #493: see below
               }
               return false;
             }
@@ -1572,8 +1574,58 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
         if (skipped != 0) {
           //  restore non-visited entries
           mi_atomic_or_relaxed(&chunk->bfields[j], skipped);
+          // #493: and the chunkmap bit, like every other setter. Between our exchange and this
+          // restore the chunk can read all clear, and a concurrent `mi_bitmap_clearN` in it (the
+          // arena clears claimed ranges out of the purge queues) then clears the chunkmap bit
+          // -- leaving the restored bits where no visitor looks: queued, never purged.
+          mi_bitmap_chunkmap_set(bitmap, chunk_idx);
         }
       }
+    }
+  }
+  return true;
+}
+
+// #493 (strategy 9): visit, in index order, each maximal run of at least `n` bits set in
+// `bitmap | bitmap2` (`bitmap2` may be NULL; both must have the same chunk count), where
+// `0 < n <= MI_BCHUNK_BITS`. Unlike the `forall_setc` visitors this leaves the bitmaps as they are:
+// the runs are only hints (the arena claims them atomically in `slices_free`), so the loads are
+// relaxed. A run never crosses a chunk, so it can be claimed with `mi_bbitmap_try_clearNC`.
+// Stops, returning false, as soon as `visit` returns false.
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
+  mi_assert_internal(n > 0 && n <= MI_BCHUNK_BITS);
+  mi_assert_internal(bitmap2 == NULL || mi_bitmap_chunk_count(bitmap2) == mi_bitmap_chunk_count(bitmap));
+  const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmap), MI_BFIELD_BITS);
+  for (size_t i = 0; i < chunkmap_max; i++) {
+    mi_bfield_t cmap_entry = mi_atomic_load_relaxed(&bitmap->chunkmap.bfields[i]);
+    if (bitmap2 != NULL) { cmap_entry |= mi_atomic_load_relaxed(&bitmap2->chunkmap.bfields[i]); }
+    size_t cmap_idx;
+    // for each chunk (corresponding to a set bit in a chunkmap entry)
+    while (mi_bfield_foreach_bit(&cmap_entry, &cmap_idx)) {
+      const size_t chunk_idx = i*MI_BFIELD_BITS + cmap_idx;
+      const size_t chunk_base = chunk_idx*MI_BCHUNK_BITS;
+      size_t run_start = 0;   // chunk-relative start of the current run
+      size_t run_len = 0;     // and its length so far (0 = none); a run can span bfields
+      for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
+        mi_bfield_t b = mi_atomic_load_relaxed(&bitmap->chunks[chunk_idx].bfields[j]);
+        if (bitmap2 != NULL) { b |= mi_atomic_load_relaxed(&bitmap2->chunks[chunk_idx].bfields[j]); }
+        size_t bidx;
+        while (mi_bfield_find_least_bit(b, &bidx)) {
+          const size_t rng = mi_ctz(~(b>>bidx));   // all the set bits from bidx
+          mi_assert_internal(rng >= 1 && bidx + rng <= MI_BFIELD_BITS);
+          const size_t start = j*MI_BFIELD_BITS + bidx;
+          if (run_len > 0 && run_start + run_len == start) {
+            run_len += rng;                          // continues the run of the previous bfield
+          }
+          else {
+            if (run_len >= n && !visit(chunk_base + run_start, run_len, arena, arg)) return false;
+            run_start = start;
+            run_len = rng;
+          }
+          b = b & ~mi_bfield_mask(rng, bidx);
+        }
+      }
+      if (run_len >= n && !visit(chunk_base + run_start, run_len, arena, arg)) return false;
     }
   }
   return true;
@@ -1757,6 +1809,32 @@ bool mi_bbitmap_try_clearNC(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   }
   // note: we don't set the size class for an explicit try_clearN (only used by purging)
   return cleared;
+}
+
+// #493 (strategy 9): claim `n` bits at a known `idx` (not crossing a chunk) for an allocation of
+// `n` slices. Unlike the purge's `mi_bbitmap_try_clearNC` this keeps to the size bins the way
+// `mi_bbitmap_try_find_and_clear_generic` does: a chunk of the bin of `n`; or an unbinned chunk
+// at its start, which the claim then bins; or an unbinned chunk whose first slice is in use
+// (already mixed, like the arena's first chunk behind its meta data, where the plain search
+// claims unbinned too). Never the middle of an unbinned chunk that starts free: the plain search
+// would claim its start and bin it, while a page left in the middle unbinned lets every size
+// class share the chunk -- the fragmentation the bins exist to stop, and the fresh memory it
+// costs (PR #501: the guarded memory gate's peak). The bin reads are hints, as in the search.
+bool mi_bbitmap_try_claimN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
+  if (n == 0 || n > MI_BCHUNK_BITS) return false;
+  const size_t chunk_idx = idx / MI_BCHUNK_BITS;
+  const size_t cidx = idx % MI_BCHUNK_BITS;
+  if (cidx + n > MI_BCHUNK_BITS || chunk_idx >= mi_bbitmap_chunk_count(bbitmap)) return false;
+  const mi_chunkbin_t bbin = mi_chunkbin_of(n);
+  const mi_chunkbin_t cbin = mi_bbitmap_debug_get_bin(bbitmap->chunkmap_bins, chunk_idx);
+  const bool bin_start = (cbin == MI_CBIN_NONE && cidx == 0);
+  if (cbin != bbin && !bin_start) {
+    if (cbin != MI_CBIN_NONE) return false;                                        // another size class
+    if (mi_bchunk_is_xsetN(MI_BIT_SET, &bbitmap->chunks[chunk_idx], 0, 1)) return false;   // starts free
+  }
+  if (!mi_bbitmap_try_clearNC(bbitmap, idx, n)) return false;
+  if (bin_start) { mi_bbitmap_set_chunk_bin(bbitmap, chunk_idx, bbin); }
+  return true;
 }
 
 

@@ -179,7 +179,7 @@ const RUN_SEED: u64 = 0x6d69_6d61_6c6c_6f63;
 
 #[test]
 fn larson_and_xmalloc_test_are_registered_scaling_patterns() {
-    assert_eq!(SCALING_PATTERNS.len(), 8);
+    assert_eq!(SCALING_PATTERNS.len(), 10);
     assert_eq!(
         ScalingPattern::parse("larson"),
         Some(ScalingPattern::Larson)
@@ -199,10 +199,16 @@ fn larson_and_xmalloc_test_are_registered_scaling_patterns() {
     let mut seed_tags: Vec<u64> = SCALING_PATTERNS.iter().map(|p| p.seed_tag()).collect();
     seed_tags.sort_unstable();
     seed_tags.dedup();
+    // One deliberate exception: large-class-ephemeral replays its control's
+    // stream, so the pair shares a tag (#478).
+    assert_eq!(
+        ScalingPattern::LargeClassPersistent.seed_tag(),
+        ScalingPattern::LargeClassEphemeral.seed_tag()
+    );
     assert_eq!(
         seed_tags.len(),
-        SCALING_PATTERNS.len(),
-        "every scaling pattern must have a pairwise distinct seed tag"
+        SCALING_PATTERNS.len() - 1,
+        "every other scaling pattern must have a pairwise distinct seed tag"
     );
 }
 
@@ -329,13 +335,13 @@ fn larson_and_xmalloc_test_streams_are_reproducible_for_identical_seeds() {
 #[test]
 fn pattern_definitions_list_all_patterns_including_the_two_named_workloads() {
     let definitions = pattern_definitions();
-    assert_eq!(definitions.len(), 8);
+    assert_eq!(definitions.len(), 10);
     let names: Vec<&str> = definitions.iter().map(|d| d.pattern.as_str()).collect();
     assert!(names.contains(&"larson"), "{names:?}");
     assert!(names.contains(&"xmalloc-test"), "{names:?}");
     // Adding patterns is part of `scaling_comparison_key`'s input by
     // construction (`pattern_definitions()` feeds it directly), so a run
     // recorded against the old four-pattern catalogue can never compare
-    // equal to one against this eight-pattern catalogue.
+    // equal to one against this ten-pattern catalogue.
     assert!(!names.contains(&"sparse-unknown"));
 }

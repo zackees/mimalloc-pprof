@@ -27,6 +27,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  pr-ci-mode:
+    uses: ./.github/workflows/pr-ci-mode.yml
+
   resolve-candidate:
     name: resolve-candidate (exact SHA ${{ inputs.candidate_sha }})
     runs-on: ubuntu-latest
@@ -59,10 +62,21 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "exact candidate_sha=$sha" >> "$GITHUB_STEP_SUMMARY"
 
+  pr-test-gate:
+    name: PR test gate (cross)
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs: [pr-ci-mode, resolve-candidate, build-linux, build-cross, build-win-gnu, test-binaries]
+    uses: ./.github/workflows/pr-ci-gate.yml
+    with:
+      workflow: cross
+      needs-json: ${{ toJSON(needs) }}
+      ci-test: ${{ contains(github.event.pull_request.labels.*.name, 'ci-test') }}
+      ci-full: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
+
   build-linux:
     name: build (${{ matrix.target }})
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: ubuntu-latest
     env:
       # The profiler walks frame pointers on non-Windows platforms.  Keep both
@@ -152,8 +166,8 @@ jobs:
 
   build-cross:
     name: build (${{ matrix.target }})
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -300,8 +314,8 @@ jobs:
 
   build-win-gnu:
     name: build (x86_64-pc-windows-gnu)
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: windows-latest
     # TODO(#277 phase C, added 2026-09-02): DELETE this job -- and the
     # x86_64-pc-windows-gnu row of test-binaries below -- after ten pushes have compared
@@ -309,7 +323,7 @@ jobs:
     # `run-windows`, which build the same test binaries on ubuntu-latest through
     # soldr's Linux-hosted mingw-w64 and run them on the shared Windows VM. Informational
     # until then. A permanently-yellow job is worse than an absent one.
-    continue-on-error: ${{ github.event_name != 'workflow_dispatch' }}
+    continue-on-error: ${{ github.event_name != 'workflow_dispatch' && needs.pr-ci-mode.outputs.external != 'true' }}
     defaults:
       run:
         working-directory: rust
@@ -350,7 +364,7 @@ jobs:
 
   test-binaries:
     name: test (${{ matrix.target }})
-    needs: [resolve-candidate, build-linux, build-cross, build-win-gnu]
+    needs: [resolve-candidate, pr-ci-mode, build-linux, build-cross, build-win-gnu]
     runs-on: ${{ matrix.runner }}
     # The two apple-darwin rows are GONE (#277 phase B2). Nothing Apple is executed on a
     # native macOS runner anywhere in this repository any more: the x86_64 test binaries
@@ -372,7 +386,7 @@ jobs:
     # `build-cross`'s x86_64-pc-windows-msvc row above must go with it, but
     # aarch64-pc-windows-msvc must NOT -- that one is build-only and has no runner.
     # A permanently-yellow job is worse than an absent one.
-    continue-on-error: ${{ github.event_name != 'workflow_dispatch' && (matrix.target == 'x86_64-pc-windows-gnu' || matrix.target == 'x86_64-pc-windows-msvc') }}
+    continue-on-error: ${{ github.event_name != 'workflow_dispatch' && needs.pr-ci-mode.outputs.external != 'true' && (matrix.target == 'x86_64-pc-windows-gnu' || matrix.target == 'x86_64-pc-windows-msvc') }}
     strategy:
       fail-fast: false
       matrix:

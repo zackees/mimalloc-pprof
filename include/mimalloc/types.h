@@ -279,12 +279,68 @@ terms of the MIT license. A copy of the license can be found in the file
 //   4 KiB  OS page: small (64 KiB) = 16 bits, medium (512 KiB) = 128, large (4 MiB) = 1024
 //   16 KiB OS page: small = 4, medium = 32, large = 256  (fits, exactly at the limit)
 //   64 KiB OS page: small = 1, medium = 8,  large = 64
-// -- i.e. every small and medium page always, and a large page on a 16 KiB or larger OS
-// page. A large page on a 4 KiB OS page needs 1024 bits and stays ineligible. The check is
-// at runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in
-// `src/page-holes.c`), never at compile time: `_mi_os_page_size()` is not a constant.
+// -- i.e. every small and medium page, and a large page from a 16 KiB OS page up. A large
+// page on a 4 KiB OS page would need 1024 bits, so there one bit covers 16 KiB instead
+// (`mi_page_purge_unit`, #477). The unit is computed at runtime, never at compile time:
+// `_mi_os_page_size()` is not a constant.
 #define MI_PAGE_PURGE_BITS                (256)
 #define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
+
+// #483: a thread publishes up to this many retired (emptied) large pages; the scavenger discards
+// the memory of one that stays retired for MI_RETIRED_RELEASE_MULT purge delays.
+#ifndef MI_RETIRED_PAGE_SLOTS
+#define MI_RETIRED_PAGE_SLOTS             (16)
+#endif
+#ifndef MI_RETIRED_RELEASE_MULT
+#define MI_RETIRED_RELEASE_MULT           (10)
+#endif
+// #493: an empty large page that a thread leaves behind at its exit is reserved (abandoned into
+// the arena, blocks formed and resident) for the next thread of the heap instead of freed; one
+// that nobody reclaims for this many purge delays goes back to the arena. The same value as
+// MI_RETIRED_RELEASE_MULT on purpose: both answer "how long may an emptied large page stay
+// resident in case its size class is wanted again", and the two must not disagree, or an idle
+// process would keep its reserved pages longer (or shorter) than its retired ones.
+#ifndef MI_PAGE_RESERVE_RELEASE_MULT
+#define MI_PAGE_RESERVE_RELEASE_MULT      (10)
+#endif
+
+// #491: the one bound on "freed memory that stays idle is back with the OS within N ms"
+// (`_mi_release_bound_ms`, src/page-holes.c): the slower of the two page releases above (a released
+// page is purged at once, #486) and the arena purge of freed memory (MI_ARENA_PURGE_PERIODS arena
+// periods, #481), plus MI_RELEASE_SLACK_MS for the scavenger to wake and run.
+// Tests poll up to it and perf-ab holds the release time to it (ci/release_ratchet.json).
+#ifndef MI_RELEASE_SLACK_MS
+#define MI_RELEASE_SLACK_MS               (300)
+#endif
+#define MI_ARENA_PURGE_PERIODS            (2)   // #481: a range is purged at the second deadline after its free
+
+// #486: freed arena memory stays resident for one to MI_ARENA_PURGE_PERIODS arena purge periods of
+// `arena_purge_mult` x `purge_delay` (400-800 ms by default) in case it is reused, then goes back
+// to the OS. Measured on perf-ab's bursty row (pauses of 300 ms): 1 (100-200 ms) refaulted every
+// burst (~120,000 minor faults), 4 about 1,300, with the same peak and release time.
+#ifndef MI_ARENA_PURGE_MULT_DEFAULT
+#define MI_ARENA_PURGE_MULT_DEFAULT       (4)
+#endif
+
+// #493 (strategy 9): a new page first tries to claim free slices that are still resident (queued
+// for purge, see above) before the plain free-slice search, which knows nothing of residency and
+// would often fault in fresh or purged memory instead. At most this many queued runs long enough
+// for the page are tried per allocation: a failed try is a run that another thread, the purge, or
+// an earlier allocation took (a stale queue bit), and after a handful of those the queue is
+// mostly stale, so the plain search is the better bet. Keeps the extra cost per page small.
+#ifndef MI_RESIDENT_FIRST_MAX_TRIES
+#define MI_RESIDENT_FIRST_MAX_TRIES       (8)
+#endif
+
+// #517: resident-first (#493) is only tried for claims of at least this many slices (default 16
+// = 1 MiB with 64 KiB slices: large and singleton pages). A small or medium page taking the first
+// queued run that fits bypasses the size-binned chunk layout of the plain search, so other size
+// classes' reusable runs are consumed and those classes spill into fresh chunks: the memory gate
+// peak rose 58.2 -> 61-63.7 MB (#514). Measured: >=16 restores 58.3 MB; #501's short-lived-thread
+// win comes from 4 MiB large pages (64 slices), which stay covered.
+#ifndef MI_RESIDENT_FIRST_MIN_SLICES
+#define MI_RESIDENT_FIRST_MIN_SLICES      (16)
+#endif
 
 
 // ------------------------------------------------------
@@ -398,6 +454,10 @@ typedef uintptr_t  mi_encoded_t;
 
 // thread id's
 typedef size_t     mi_threadid_t;
+
+// Milliseconds as in `int64_t` to avoid overflows (declared here rather than with the
+// thread-local data below because `mi_page_t::retired_at` uses it, #483)
+typedef int64_t    mi_msecs_t;
 
 // free lists contain blocks
 typedef struct mi_block_s {
@@ -516,6 +576,15 @@ typedef struct mi_page_s {
   // was allocated or freed in it since, so the sweep has nothing new to discard (see
   // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". Cold, like `purged` above.
   uint64_t                  swept_state;
+
+  // #483: a retired large page published for the scavenger (`_mi_page_retire`): the owner's tld
+  // slot holding it (NULL when not published) and when it was retired. Whoever clears the slot
+  // owns the page's memory until it puts it back.
+  // #493: `retired_at` doubles as the reserve stamp. It is cleared when a page is unpublished,
+  // so on an abandoned page (never published) a non-zero value means "reserved at that time"
+  // (`_mi_arenas_page_reserve`), and reclaiming the page clears it again.
+  _Atomic(struct mi_page_s*)* retired_slot;
+  mi_msecs_t                retired_at;
 } mi_page_t;
 
 // An impossible `(capacity,used)` (`used > capacity` never holds): "this page has no sweep state".
@@ -788,15 +857,13 @@ struct mi_subproc_s {
   mi_decl_align(8)   // a LITERAL: MSVC's __declspec(align()) rejects `MI_SIZE_SIZE` (a parenthesized
                      // expression) with C2059, and 8 over-aligns the 4-byte word harmlessly
   _Atomic(mi_scav_word_t) scavenger_wake;               // wait word signalled when a purge is scheduled (the scavenger thread waits on this)
+  _Atomic(size_t)       retired_published;              // #483: 1 when some tld may hold a retired large page for the scavenger (appended at the tail, see above); #493: or the main heap a reserved one
 };
 
 
 // ------------------------------------------------------
 // Thread Local data
 // ------------------------------------------------------
-
-// Milliseconds as in `int64_t` to avoid overflows
-typedef int64_t  mi_msecs_t;
 
 // Allocation sampling profiler per-thread state (MI_PPROF).
 typedef struct mi_profiler_tld_s {
@@ -884,7 +951,9 @@ struct mi_tld_s {
   // go through `mi_atomic_addi64_relaxed`, the 64-bit primitive, exactly as `mi_stat_counter_t`.
   size_t                holes_sweep_seq;      // idle sweeps of this thread's heaps so far (`purge_holes_full_every`)
   mi_msecs_t            holes_sweep_last;     // when the last one ran (`purge_holes_min_interval` pacing)
+  mi_msecs_t            holes_busy_last;      // when the owner last swept its large pages while busy (#477)
   bool                  holes_sweeping;       // a sweep of this thread's heaps is in progress right now
+  bool                  holes_busy;           // ... and it is the owner's busy-time sweep (#477): leave pages used this period
   bool                  holes_sweep_full;     // ... and it ignores `page->swept_state` (every N'th sweep)
   size_t                holes_sweep_skipped;  // per-pass counters, folded into the process-wide ones by
   size_t                holes_sweep_visited;  // `_mi_page_purge_holes_end` (a per-page atomic would cost real time)
@@ -898,6 +967,7 @@ struct mi_tld_s {
   _Atomic(size_t)       purge_epoch;          // `mi_purge_all` walk progress / registry cutoff
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
+  _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept
@@ -959,6 +1029,7 @@ typedef struct mi_arena_s {
   mi_bitmap_t*        slices_committed;     // is the slice committed? (i.e. accessible)
   mi_bitmap_t*        slices_dirty;         // is the slice potentially non-zero?
   mi_bitmap_t*        slices_purge;         // slices that can be purged
+  mi_bitmap_t*        slices_purge_aged;    // #457: ... and were already queued at the previous purge deadline
   mi_page_t*          pages_meta;           // pre-allocated `slice_count` page meta info -- only used if `MI_PAGE_META_IS_SEPARATED!=0`
   mi_arena_pages_t    pages_main;           // arena page bitmaps for the main heap are allocated up front as well
 

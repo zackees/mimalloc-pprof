@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from pr_ci_gate import FULL_JOBS
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 MANIFEST = json.loads((ROOT / "ci" / "release_full_ci_manifest.v1.json").read_text())
@@ -26,6 +28,23 @@ FULL_ROOTS = {
         "build-rust-windows-msvc",
     },
 }
+EXTERNAL_WORKFLOWS = set(FULL_ROOTS) | {
+    "macos-bundles.yml",
+    "asan.yml",
+    "fuzz.yml",
+    "purge-teardown-regression.yml",
+}
+
+
+def test_pr_gate_covers_every_release_manifest_root() -> None:
+    optional = {"pr-ci-mode", "pr-test-gate", "resolve-candidate"}
+    for filename in MANIFEST["workflows"]:
+        jobs = workflow(filename)["jobs"]
+        mac_optional = {"decide", "run-macos-x64-selective", "run-macos-x64-recovery"}
+        expected = set(jobs) - optional
+        if filename == "macos-bundles.yml":
+            expected -= mac_optional
+        assert expected == FULL_JOBS[filename.removesuffix(".yml")], filename
 
 
 def workflow(filename: str) -> dict[Any, Any]:
@@ -96,3 +115,40 @@ def test_ci_test_includes_nonempty_extra_sanitizer_and_fuzz_work() -> None:
         gate = document["jobs"][root]["if"]
         assert "'ci-test'" in gate and "'ci-full'" in gate, filename
         assert "github.event_name == 'push'" not in gate, filename
+
+
+def test_external_prs_select_full_roots_and_report_a_fail_closed_gate() -> None:
+    for filename in EXTERNAL_WORKFLOWS:
+        jobs = workflow(filename)["jobs"]
+        assert jobs["pr-ci-mode"]["uses"] == "./.github/workflows/pr-ci-mode.yml"
+        result = jobs["pr-test-gate"]
+        assert "always()" in result["if"]
+        assert result["uses"] == "./.github/workflows/pr-ci-gate.yml"
+        assert "pr-ci-mode" in result["needs"]
+        assert result["with"]["needs-json"] == "${{ toJSON(needs) }}"
+        roots = FULL_ROOTS.get(filename, set())
+        if filename == "macos-bundles.yml":
+            roots = {"build-macos", "build-rust-apple", "run-macos-native-full"}
+        elif filename == "asan.yml":
+            roots = {"asan"}
+        elif filename == "fuzz.yml":
+            roots = {"fuzz"}
+        elif filename == "purge-teardown-regression.yml":
+            roots = {"build"}
+        for root in roots:
+            job = jobs[root]
+            assert "pr-ci-mode" in job["needs"], (filename, root)
+            assert "needs.pr-ci-mode.outputs.external == 'true'" in (
+                job.get("if", job.get("env", {}).get("RUN_MACOS_BUILD", ""))
+            ), (filename, root)
+            assert root in result["needs"], (filename, root)
+
+
+def test_permission_selector_uses_read_only_token_and_fails_unknown_responses() -> None:
+    selector = workflow("pr-ci-mode.yml")
+    assert "workflow_call" in events(selector)
+    assert selector["permissions"] == {"contents": "read"}
+    step = selector["jobs"]["decide"]["steps"][-1]
+    assert step["env"]["AUTHOR"] == "${{ github.event.pull_request.user.login }}"
+    assert step["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
+    assert "ci/pr_ci_mode.py" in step["run"]

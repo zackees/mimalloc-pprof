@@ -366,6 +366,23 @@ void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
   }
 }
 
+// #493: a thread exits with an empty page. Freeing a large one makes the next thread of the heap
+// carve a NEW page over the same, still resident slices -- a 4 MiB page it forms only a few blocks
+// of, the rest a resident unformed tail -- so a heap run as a sequence of short-lived threads
+// peaks far above the same work on long-lived ones. Reserve it instead: abandoned with its blocks
+// formed, for the next thread to reclaim as is (`_mi_arenas_page_reserve` decides which pages).
+void _mi_page_free_or_reserve(mi_page_t* page, mi_page_queue_t* pq) {
+  mi_assert_internal(mi_page_all_free(page));
+  mi_page_set_has_interior_pointers(page, false);
+  mi_page_queue_remove(pq, page);
+  mi_theap_t* const theap = mi_page_theap(page); mi_assert_internal(theap!=NULL);
+  mi_page_set_theap(page, NULL);
+  page->retire_expire = 0;   // not retired in the theap that reclaims it
+  if (!_mi_arenas_page_reserve(page, theap)) {
+    _mi_arenas_page_free(page, theap);   // as `_mi_page_free`
+  }
+}
+
 
 // allocate a fresh page from an arena
 static mi_page_t* mi_page_fresh_alloc(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size, size_t page_alignment) {
@@ -519,6 +536,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
       mi_theap_stat_counter_increase(theap, pages_retire, 1);
       #endif
       page->retire_expire = (bsize <= MI_SMALL_MAX_OBJ_SIZE ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
+      if (bsize > MI_MEDIUM_MAX_OBJ_SIZE) { _mi_page_publish_retired(page); }   // #483: so an idle owner cannot pin it
       mi_assert_internal(pq >= theap->pages);
       const size_t index = pq - theap->pages;
       mi_assert_internal(index < MI_BIN_FULL && index < MI_BIN_HUGE);
@@ -704,6 +722,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   if (page->free != NULL) return true;
   #endif
   if (page->capacity >= page->reserved) return true;
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: before forming blocks in it
 
   size_t page_size;
   //uint8_t* page_start =
@@ -1130,6 +1149,7 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
       _mi_deferred_free(theap, false);         // call potential deferred free routines      
       _mi_theap_collect_retired(theap, false); // free retired pages      
     }
+    _mi_theap_purge_large_holes(theap);        // #477: release large-page holes while busy
   }
   return theap;
 }

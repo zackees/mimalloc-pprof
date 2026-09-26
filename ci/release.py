@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Issue-driven, SHA-pinned release entry point for mimalloc-pprof (#444).
 
-The real publisher remains disabled in auto-release.yml until the destination
-state machine is implemented. This front door only records an attempt and
-dispatches a non-publishing worker.
+Start/resume dispatch a non-publishing worker. A real workflow dispatch uses
+the same issue directive and the frozen destination worker in release_live.py.
 """
 
 from __future__ import annotations
@@ -13,14 +12,16 @@ import hashlib
 import json
 import posixpath
 import re
+import stat
 import struct
 import subprocess
 import sys
 import tarfile
+import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "zackees/mimalloc-pprof"
@@ -52,6 +53,93 @@ def command(*args: str) -> str:
     if result.returncode:
         raise ReleaseError(f"{' '.join(args[:3])} failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def github_json(
+    *args: str,
+    validate: Callable[[object], bool],
+    sleep: Callable[[float], None] = time.sleep,
+) -> object:
+    """Read schema-valid JSON from gh, retrying ambiguous successful responses."""
+    raw = ""
+    for attempt in range(10):
+        raw = command(*args)
+        value = validated_json_document(raw, validate)
+        if value is not None:
+            return value
+        if attempt == 9:
+            raise ReleaseError(
+                "GitHub returned no schema-valid JSON document after 10 attempts "
+                f"(command: {' '.join(args[:3])}; response shape: {json_lines_shape(raw)})"
+            )
+        sleep(min(2**attempt, 30))
+    raise AssertionError("unreachable")
+
+
+def validated_json_document(raw: str, validate: Callable[[object], bool]) -> object | None:
+    """Find one schema-valid JSON document inside optionally decorated CLI output."""
+    decoder = json.JSONDecoder()
+    candidates: list[object] = []
+    for offset, character in enumerate(raw):
+        if character not in "[{":
+            continue
+        line_start = raw.rfind("\n", 0, offset) + 1
+        try:
+            value, consumed = decoder.raw_decode(raw[offset:])
+        except json.JSONDecodeError:
+            continue
+        line_end = raw.find("\n", offset + consumed)
+        if line_end < 0:
+            line_end = len(raw)
+        if raw[offset + consumed : line_end].strip():
+            continue
+        if not validate(value):
+            continue
+        if not raw[line_start:offset].strip():
+            candidates.append(value)
+            continue
+        # Some runner-side gh wrappers prepend a diagnostic to the response on
+        # the same physical line. A schema-valid object that consumes the rest
+        # of that line is still unambiguous. Keep arrays strict because [] is a
+        # common diagnostic value and is also a valid empty endpoint response.
+        if isinstance(value, dict):
+            candidates.append(cast(dict[object, object], value))
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def json_object_with_string_fields(value: object, fields: tuple[str, ...]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    row = cast(dict[object, object], value)
+    return all(isinstance(row.get(field), str) for field in fields)
+
+
+def release_list_shape(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    rows = cast(list[object], value)
+    for value_row in rows:
+        if not isinstance(value_row, dict):
+            return False
+        row = cast(dict[object, object], value_row)
+        if not isinstance(row.get("tag_name"), str) or not isinstance(row.get("assets"), list):
+            return False
+        for value_asset in cast(list[object], row["assets"]):
+            if not isinstance(value_asset, dict):
+                return False
+            asset = cast(dict[object, object], value_asset)
+            if not isinstance(asset.get("name"), str) or not isinstance(asset.get("digest"), str):
+                return False
+    return True
+
+
+def merged_pr_shape(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    row = cast(dict[object, object], value)
+    return isinstance(row.get("baseRefName"), str) and isinstance(row.get("mergeCommit"), dict)
 
 
 def source_version() -> str:
@@ -125,19 +213,67 @@ def parse_directive(body: str) -> dict[str, Any] | None:
     return parsed
 
 
-def issue_comments(issue: int) -> list[str]:
-    raw = command(
-        "gh", "api", "--paginate", "--slurp", f"repos/{REPO}/issues/{issue}/comments?per_page=100"
-    )
-    pages = cast(list[list[dict[str, Any]]], json.loads(raw))
+def issue_comments(issue: int, sleep: Callable[[float], None] = time.sleep) -> list[str]:
+    rows: list[dict[str, str]] | None = None
+    for attempt in range(10):
+        raw = command(
+            "gh",
+            "api",
+            "--paginate",
+            f"repos/{REPO}/issues/{issue}/comments?per_page=100",
+            "--jq",
+            "[.[] | {body: .body, author_association: .author_association, "
+            "login: .user.login}] | @json",
+        )
+        try:
+            if not raw:
+                raise json.JSONDecodeError("empty issue comment response", raw, 0)
+            parsed_rows: list[dict[str, str]] = []
+            for line in raw.splitlines():
+                page: object = json.loads(line)
+                if not isinstance(page, list):
+                    raise json.JSONDecodeError("invalid issue comment page", line, 0)
+                for parsed in cast(list[object], page):
+                    if not isinstance(parsed, dict):
+                        raise json.JSONDecodeError("invalid issue comment row", line, 0)
+                    untyped_row = cast(dict[str, object], parsed)
+                    if not all(
+                        isinstance(untyped_row.get(field), str)
+                        for field in ("body", "author_association", "login")
+                    ):
+                        raise json.JSONDecodeError("invalid issue comment row", line, 0)
+                    parsed_rows.append(cast(dict[str, str], untyped_row))
+            rows = parsed_rows
+            break
+        except json.JSONDecodeError as error:
+            if attempt == 9:
+                raise ReleaseError(
+                    "GitHub issue comments returned malformed JSON lines after 10 attempts "
+                    f"(response shape: {json_lines_shape(raw)})"
+                ) from error
+            sleep(min(2**attempt, 30))
+    assert rows is not None
     trusted = {"OWNER", "MEMBER", "COLLABORATOR"}
     return [
-        str(row["body"])
-        for page in pages
-        for row in page
-        if row.get("author_association") in trusted
-        or row.get("user", {}).get("login") == "github-actions[bot]"
+        row["body"]
+        for row in rows
+        if row["author_association"] in trusted or row["login"] == "github-actions[bot]"
     ]
+
+
+def json_lines_shape(raw: str) -> str:
+    """Describe an API response without exposing issue-comment contents."""
+    if not raw:
+        return "empty"
+    lines = raw.splitlines()
+    valid = 0
+    for line in lines:
+        try:
+            json.loads(line)
+            valid += 1
+        except json.JSONDecodeError:
+            pass
+    return f"ndjson/{valid}-of-{len(lines)}-lines/{len(raw)}-bytes"
 
 
 def issue_directives(issue: int) -> list[dict[str, Any]]:
@@ -164,7 +300,9 @@ def frozen_identity(issue: int) -> dict[str, Any] | None:
 
 
 def require_history(
-    records: list[dict[str, Any]], desired: dict[str, Any], frozen: dict[str, Any] | None
+    records: list[dict[str, Any]],
+    desired: dict[str, Any],
+    frozen: dict[str, Any] | None,
 ) -> None:
     for record in records:
         if {key: item for key, item in record.items() if key != "candidate_sha"} != {
@@ -215,8 +353,15 @@ def require_frozen_info(
 
 def verify_existing_release_assets(value: dict[str, Any], frozen: dict[str, Any]) -> None:
     """Reject conflicting destination bytes while allowing absent outputs on resume."""
-    raw = command("gh", "api", f"repos/{REPO}/releases?per_page=100")
-    releases: list[dict[str, Any]] = json.loads(raw)
+    releases = cast(
+        list[dict[str, Any]],
+        github_json(
+            "gh",
+            "api",
+            f"repos/{REPO}/releases?per_page=100",
+            validate=release_list_shape,
+        ),
+    )
     matches = [row for row in releases if row.get("tag_name") == value["tag"]]
     if len(matches) > 1:
         raise ReleaseError("duplicate GitHub Releases for tag")
@@ -271,7 +416,8 @@ def recorded_version_bump_pr(body: str) -> int:
 
 def recorded_version_bump_sha(body: str) -> str:
     matches = re.findall(
-        r"(?im)^- Version-bump merge SHA:\s*(?:`|\*\*)?([0-9a-f]{40})(?:`|\*\*)?\s*$", body
+        r"(?im)^- Version-bump merge SHA:\s*(?:`|\*\*)?([0-9a-f]{40})(?:`|\*\*)?\s*$",
+        body,
     )
     if len(matches) != 1:
         raise ReleaseError("release issue must record one full Version-bump merge SHA")
@@ -286,8 +432,9 @@ def recorded_candidate_pr(body: str) -> int:
 
 
 def merged_pr_sha(number: int) -> str:
-    pr = json.loads(
-        command(
+    pr = cast(
+        dict[str, Any],
+        github_json(
             "gh",
             "pr",
             "view",
@@ -296,7 +443,8 @@ def merged_pr_sha(number: int) -> str:
             REPO,
             "--json",
             "baseRefName,mergedAt,mergeCommit",
-        )
+            validate=merged_pr_shape,
+        ),
     )
     sha = pr.get("mergeCommit", {}).get("oid")
     if (
@@ -326,17 +474,32 @@ def validate_candidate(
     *,
     require_registry_free: bool = True,
     frozen: dict[str, Any] | None = None,
+    allow_release_outputs: bool = False,
+    require_issue_ready: bool = False,
 ) -> None:
     expected = directive(value["issue"], value["version"], value["candidate_sha"])
     require_same_directive(expected, value)
-    issue = json.loads(
-        command(
-            "gh", "issue", "view", str(value["issue"]), "-R", REPO, "--json", "title,state,body"
-        )
+    issue = cast(
+        dict[str, Any],
+        github_json(
+            "gh",
+            "issue",
+            "view",
+            str(value["issue"]),
+            "-R",
+            REPO,
+            "--json",
+            "title,state,body",
+            validate=lambda result: json_object_with_string_fields(
+                result, ("title", "state", "body")
+            ),
+        ),
     )
     if issue.get("state") != "OPEN" or f"v{value['version']}" not in issue.get("title", ""):
         raise ReleaseError("release issue is closed or targets a different version")
     body = issue.get("body", "")
+    if require_issue_ready and not re.search(r"(?m)^- State: \*\*ready-to-publish\*\*\.", body):
+        raise ReleaseError("release issue is not in ready-to-publish state")
     bump = recorded_version_bump_sha(body)
     if merged_pr_sha(recorded_version_bump_pr(body)) != bump:
         raise ReleaseError("version bump differs from its recorded PR merge")
@@ -363,7 +526,10 @@ def validate_candidate(
     bumped_version = re.search(r'(?m)^version\s*=\s*"([^"]+)"', bumped)
     if not bumped_version or bumped_version.group(1) != value["version"]:
         raise ReleaseError("recorded bump has the wrong version")
-    if command("git", "status", "--porcelain"):
+    status_rows = command("git", "status", "--porcelain").splitlines()
+    if allow_release_outputs:
+        status_rows = [row for row in status_rows if row not in ("?? dist/", "?? release-crate/")]
+    if status_rows:
         raise ReleaseError("release candidate checkout must be clean")
     existing_tag = command("git", "ls-remote", "--tags", "origin", f"refs/tags/{value['tag']}")
     if existing_tag:
@@ -403,16 +569,29 @@ def archive_members(path: Path) -> dict[str, bytes]:
         if path.name.endswith(".zip"):
             with zipfile.ZipFile(path) as archive:
                 total = 0
+                seen_zip_names: set[str] = set()
                 for row in archive.infolist():
+                    if row.filename in seen_zip_names:
+                        raise ReleaseError(f"duplicate archive member {row.filename}")
+                    seen_zip_names.add(row.filename)
                     total += row.file_size
+                    unix_type = (
+                        stat.S_IFMT(row.external_attr >> 16) if row.create_system == 3 else 0
+                    )
                     if (
                         row.file_size > MAX_ASSET_BYTES
                         or total > MAX_ASSET_BYTES
-                        or (row.external_attr >> 16) & 0o170000 == 0o120000
+                        or unix_type not in (0, stat.S_IFREG, stat.S_IFDIR)
+                        or (unix_type == stat.S_IFREG and row.is_dir())
+                        or (unix_type == stat.S_IFDIR and not row.is_dir())
                     ):
                         raise ReleaseError(f"invalid archive member {row.filename}")
                     entries.append(
-                        (row.filename, row.is_dir(), archive.read(row) if not row.is_dir() else b"")
+                        (
+                            row.filename,
+                            row.is_dir(),
+                            archive.read(row) if not row.is_dir() else b"",
+                        )
                     )
         else:
             with tarfile.open(path, "r:gz") as archive:
@@ -440,9 +619,9 @@ def archive_members(path: Path) -> dict[str, bytes]:
     except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError) as error:
         raise ReleaseError(f"malformed archive {path.name}: {error}") from error
     for raw, is_directory, data in entries:
-        name = raw.removeprefix("./").rstrip("/")
-        if not name and raw in (".", "./") and is_directory:
+        if raw in (".", "./") and is_directory:
             continue
+        name = raw.removeprefix("./").rstrip("/")
         if (
             name.startswith("/")
             or "\\" in name
@@ -585,12 +764,16 @@ def main() -> int:
         entry.add_argument("--candidate-sha")
         if name in ("start", "resume"):
             entry.add_argument(
-                "--dry", action="store_true", help="print a plan without issue writes or dispatch"
+                "--dry",
+                action="store_true",
+                help="print a plan without issue writes or dispatch",
             )
         if name == "record-outcome":
             entry.add_argument("--run-url", required=True)
             entry.add_argument(
-                "--state", choices=("dry-passed", "blocked", "real-passed"), required=True
+                "--state",
+                choices=("dry-passed", "blocked", "real-passed"),
+                required=True,
             )
             entry.add_argument("--results", required=True)
     for operation in ("preflight-artifacts", "verify-artifacts"):
@@ -658,7 +841,8 @@ def main() -> int:
         if args.dry:
             print(
                 json.dumps(
-                    {"action": args.operation, "dispatch": False, "directive": value}, indent=2
+                    {"action": args.operation, "dispatch": False, "directive": value},
+                    indent=2,
                 )
             )
             return 0

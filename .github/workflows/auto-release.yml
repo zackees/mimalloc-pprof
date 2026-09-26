@@ -47,9 +47,9 @@ name: auto-release
 #   - A real manual run requires a successful full macOS run on this exact candidate SHA.
 #     A tag push cannot start publication.
 #
-# A real run (dry_run=false) does exactly one irreversible thing:
-# `cargo publish -p mimalloc-pprof` to crates.io. Everything else (the GitHub Release,
-# the ZIP) can be deleted/recreated by hand if needed.
+# A real run freezes the issue identity before any tag, crate, or release write.
+# One worker transfers the crate and GitHub assets concurrently, then verifies
+# every destination before it publishes the GitHub draft.
 
 on:
   workflow_dispatch:
@@ -171,6 +171,23 @@ jobs:
 
       - name: cargo publish --dry-run (mimalloc-pprof)
         run: soldr cargo publish --dry-run -p mimalloc-pprof --locked
+
+      - name: Package and size-check the exact crate for the release worker
+        run: |
+          set -euo pipefail
+          soldr cargo package -p mimalloc-pprof --locked
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("mimalloc-pprof/Cargo.toml", "rb"))["package"]["version"])')
+          crate="target/package/mimalloc-pprof-${version}.crate"
+          test -f "$crate" && test "$(stat -c %s "$crate")" -le 10000000
+          mkdir -p dist/crate
+          cp "$crate" dist/crate/
+
+      - name: Upload exact packaged crate
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-crate-${{ inputs.candidate_sha }}
+          path: rust/dist/crate/*.crate
+          if-no-files-found: error
 
       - name: Package release ZIP (vendor/ files only)
         shell: bash
@@ -513,7 +530,17 @@ jobs:
           python3 ci/verify_release_test_bundle.py --archive "$archive" --bundle "$bundle" --asset "$ASSET"
           mkdir -p release-test-bundle
           tar -C release-test-bundle -xzf "$bundle"
-          python3 ci/run_test_bundle.py release-test-bundle
+          if [[ "$ASSET" == macos-* ]]; then
+            # task_for_pid is deliberately denied to an ordinary hosted-macOS user.
+            # Run the other 54 tests with normal privileges, then exercise the one
+            # out-of-process zone-enumeration test as root instead of skipping it.
+            python3 ci/run_test_bundle.py release-test-bundle \
+              --exclude test-osx-zone-introspect-remote
+            sudo -n "$(command -v python3)" ci/run_test_bundle.py release-test-bundle \
+              --only test-osx-zone-introspect-remote
+          else
+            python3 ci/run_test_bundle.py release-test-bundle
+          fi
 
   preflight-assets:
     name: Collate and validate exact release archives
@@ -570,7 +597,7 @@ jobs:
       actions: read
       contents: write
       id-token: write
-      issues: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -641,13 +668,6 @@ jobs:
             '{"macos-bundles.yml": $macos, "c-unit.yml": $c, "windows-bundles.yml": $windows, "cross.yml": $cross, "rust-native.yml": $rust}')
           python3 ci/release_full_ci_gate.py --candidate-sha "$CANDIDATE_SHA" --run-ids-json "$run_ids"
 
-      - name: Require fleet all-platform full gate before publication
-        if: env.IS_DRY_RUN != 'true'
-        shell: bash
-        run: |
-          echo '::error::The issue-driven release worker, destination preflight, and retry/resume controls are not implemented yet; real publication is disabled.'
-          exit 1
-
       # Retried on purpose: this action has failed with a transient `write EPIPE`
       # during cache restore (issue #55), which skipped the publish job and turned a
       # tagged release into a silent no-op. A `uses:` step cannot be wrapped by a
@@ -677,6 +697,11 @@ jobs:
         with:
           name: release-preflight-${{ inputs.candidate_sha }}
           path: dist
+      - name: Download exact packaged crate
+        uses: actions/download-artifact@v4
+        with:
+          name: release-crate-${{ inputs.candidate_sha }}
+          path: release-crate
       - name: Verify the release worker received the exact tested archives
         env:
           GH_TOKEN: ${{ github.token }}
@@ -684,12 +709,31 @@ jobs:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: python3 ci/release.py verify-artifacts --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" --dist dist
 
-      - name: Determine release tag
-        id: tag
+      - name: Verify Cargo dry-run and package bytes on the publisher runner
+        working-directory: rust
         shell: bash
         run: |
+          set -euo pipefail
+          soldr cargo publish --dry-run -p mimalloc-pprof --locked
+          soldr cargo package -p mimalloc-pprof --locked
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("mimalloc-pprof/Cargo.toml", "rb"))["package"]["version"])')
+          crate="mimalloc-pprof-${version}.crate"
+          test -f "../release-crate/$crate"
+          test -f "target/package/$crate"
+          cmp "../release-crate/$crate" "target/package/$crate"
+          test "$(stat -c %s "../release-crate/$crate")" -le 10000000
+
+      - name: Read-only destination and issue-freeze preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("rust/mimalloc-pprof/Cargo.toml", "rb"))["package"]["version"])')
-          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+          python3 -m ci.release_destinations --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" \
+            --dist dist --crate "release-crate/mimalloc-pprof-${version}.crate"
 
       - name: Authenticate with crates.io
         if: env.IS_DRY_RUN != 'true'
@@ -697,59 +741,19 @@ jobs:
         # v1 pinned to its verified commit: this action handles the publish credential.
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
 
-      - name: cargo publish (mimalloc-pprof)
+      - name: Publish frozen crate and GitHub assets, then finalize the release
         if: env.IS_DRY_RUN != 'true'
-        working-directory: rust
         env:
+          GH_TOKEN: ${{ github.token }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
-        run: soldr cargo publish -p mimalloc-pprof --locked
-
-      - name: cargo publish --dry-run (mimalloc-pprof) [dry run]
-        if: env.IS_DRY_RUN == 'true'
-        working-directory: rust
-        run: soldr cargo publish --dry-run -p mimalloc-pprof --locked
-
-      # Trust the registry, not the exit code. `cargo publish` returning 0 is not the
-      # same as the version being live and installable, and after issue #55 the whole
-      # point is that a green-looking pipeline had published nothing.
-      - name: Verify the version is live on crates.io
-        if: env.IS_DRY_RUN != 'true'
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         shell: bash
         run: |
-          set -uo pipefail
-          version="$(grep -m1 '^version' rust/mimalloc-pprof/Cargo.toml | cut -d'"' -f2)"
-          url="https://crates.io/api/v1/crates/mimalloc-pprof/${version}"
-          echo "checking ${url}"
-          # The index can lag the publish by a few seconds; poll rather than fail fast.
-          for attempt in 1 2 3 4 5 6 7 8 9 10; do
-            code="$(curl -sS -o /tmp/crate.json -w '%{http_code}'                       -H 'User-Agent: mimalloc-pprof release verification' "$url" || echo 000)"
-            if [ "$code" = "200" ]; then
-              if grep -q '"yanked":true' /tmp/crate.json; then
-                echo "::error::mimalloc-pprof ${version} is on crates.io but YANKED."
-                exit 1
-              fi
-              echo "confirmed: mimalloc-pprof ${version} is live on crates.io"
-              exit 0
-            fi
-            echo "attempt ${attempt}: HTTP ${code}, retrying in 15s"
-            sleep 15
-          done
-          echo "::error::mimalloc-pprof ${version} is NOT on crates.io after publishing. The tag exists but the release did not land -- do not assume this release succeeded."
-          exit 1
-
-      - name: Create GitHub Release
-        if: env.IS_DRY_RUN != 'true'
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: mimalloc-pprof ${{ steps.tag.outputs.tag }}
-          draft: false
-          files: |
-            dist/mimalloc-pprof-c-${{ steps.tag.outputs.tag }}.zip
-            dist/mimalloc-pprof-macos-arm64-${{ steps.tag.outputs.tag }}.tar.gz
-            dist/mimalloc-pprof-macos-x86_64-${{ steps.tag.outputs.tag }}.tar.gz
-            dist/mimalloc-pprof-windows-x64-gnu-${{ steps.tag.outputs.tag }}.zip
-            dist/mimalloc-pprof-windows-x64-msvc-${{ steps.tag.outputs.tag }}.zip
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("rust/mimalloc-pprof/Cargo.toml", "rb"))["package"]["version"])')
+          python3 -m ci.release_live --real --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" \
+            --dist dist --crate "release-crate/mimalloc-pprof-${version}.crate"
 
   # Both dry and real attempts smoke the exact archived library before any release write.
   smoke-shipped-assets:

@@ -1,14 +1,12 @@
-"""Dry release destination planner and testable publication state machine.
-
-No live destination adapter is supplied here. auto-release.yml keeps its real
-publication gate closed until the exact-SHA pilot has been reviewed.
-"""
+"""Issue-frozen release destination planner and resumable publisher."""
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -25,6 +23,13 @@ class TransientGitHubError(Exception):
     """A retryable transport or GitHub server failure (not a conflict)."""
 
 
+class AmbiguousCratePublishError(release.ReleaseError):
+    """The registry may have accepted the crate before the response was lost."""
+
+
+MAX_CRATE_BYTES = 10_000_000  # crates.io's compressed .crate upload limit
+
+
 class ReadableDestination(Protocol):
     def tag_sha(self, tag: str) -> str | None: ...
     def release(self, tag: str) -> ReleaseState | None: ...
@@ -32,6 +37,7 @@ class ReadableDestination(Protocol):
 
 
 class Destination(ReadableDestination, Protocol):
+    def validate_crate(self, path: Path) -> None: ...
     def freeze(self, record: dict[str, object]) -> None: ...
     def read_freeze(self) -> dict[str, object] | None: ...
     def create_tag(self, tag: str, sha: str) -> None: ...
@@ -62,7 +68,14 @@ class ReadOnlyDestination:
     """Live destination reads for dry preflight; write methods are absent."""
 
     def tag_sha(self, tag: str) -> str | None:
-        raw = self._gh_optional(f"repos/{release.REPO}/git/ref/tags/{tag}")
+        def object_shape(value: dict[str, object]) -> bool:
+            raw_object = value.get("object")
+            if not isinstance(raw_object, dict):
+                return False
+            obj = cast(dict[str, object], raw_object)
+            return isinstance(obj.get("type"), str) and isinstance(obj.get("sha"), str)
+
+        raw = self._gh_optional(f"repos/{release.REPO}/git/ref/tags/{tag}", validate=object_shape)
         if raw is None:
             return None
         data = json.loads(raw)
@@ -72,13 +85,29 @@ class ReadOnlyDestination:
                 return str(obj["sha"])
             if obj["type"] != "tag":
                 raise release.ReleaseError("release tag does not resolve to a commit")
-            obj = json.loads(self._gh_required(f"repos/{release.REPO}/git/tags/{obj['sha']}"))[
-                "object"
-            ]
+            obj = json.loads(
+                self._gh_required(
+                    f"repos/{release.REPO}/git/tags/{obj['sha']}", validate=object_shape
+                )
+            )["object"]
         raise release.ReleaseError("release tag indirection exceeds ten levels")
 
     def release(self, tag: str) -> ReleaseState | None:
-        raw = self._gh_optional(f"repos/{release.REPO}/releases/tags/{tag}")
+        def asset_shape(value: object) -> bool:
+            if not isinstance(value, dict):
+                return False
+            asset = cast(dict[str, object], value)
+            return isinstance(asset.get("name"), str) and isinstance(asset.get("digest"), str)
+
+        def release_shape(value: dict[str, object]) -> bool:
+            return (
+                isinstance(value.get("target_commitish"), str)
+                and isinstance(value.get("draft"), bool)
+                and isinstance(value.get("assets"), list)
+                and all(asset_shape(item) for item in cast(list[object], value.get("assets")))
+            )
+
+        raw = self._gh_optional(f"repos/{release.REPO}/releases/tags/{tag}", validate=release_shape)
         if raw is None:
             return None
         data = json.loads(raw)
@@ -89,19 +118,60 @@ class ReadOnlyDestination:
         return ReleaseState(str(data["target_commitish"]), bool(data["draft"]), assets)
 
     @staticmethod
-    def _gh_optional(endpoint: str) -> str | None:
-        result = subprocess.run(
-            ["gh", "api", endpoint], capture_output=True, text=True, check=False
-        )
-        if result.returncode == 0:
-            return result.stdout
-        if "HTTP 404" in result.stderr:
-            return None
-        raise release.ReleaseError(f"GitHub read failed: {result.stderr.strip()}")
+    def _gh_optional(
+        endpoint: str,
+        *,
+        validate: Callable[[dict[str, object]], bool] = lambda _: True,
+    ) -> str | None:
+        for attempt in range(10):
+            result = subprocess.run(
+                ["gh", "api", endpoint], capture_output=True, text=True, check=False
+            )
+            if result.returncode == 0:
+                try:
+                    value = json.loads(result.stdout)
+                    if not isinstance(value, dict) or not validate(cast(dict[str, object], value)):
+                        raise json.JSONDecodeError(
+                            "GitHub object response is not an object", result.stdout, 0
+                        )
+                    return result.stdout
+                except json.JSONDecodeError as error:
+                    if attempt == 9:
+                        raise release.ReleaseError(
+                            f"GitHub read returned malformed JSON after 10 attempts: {endpoint}"
+                        ) from error
+                    time.sleep(min(2**attempt, 30))
+                    continue
+            status_match = re.search(r"\bHTTP ([0-9]{3})\b", result.stderr)
+            status = int(status_match.group(1)) if status_match else None
+            if status == 404:
+                return None
+            retryable = status == 429 or (status is not None and status >= 500)
+            if status is None:
+                retryable = bool(
+                    re.search(
+                        r"(?:connection|timeout|EOF|broken pipe|EPIPE)",
+                        result.stderr,
+                        re.I,
+                    )
+                )
+            if not retryable:
+                raise release.ReleaseError(f"GitHub read failed: {result.stderr.strip()}")
+            if attempt == 9:
+                raise release.ReleaseError(
+                    f"GitHub read failed after 10 attempts: {result.stderr.strip()}"
+                )
+            time.sleep(min(2**attempt, 30))
+        raise AssertionError("unreachable GitHub retry loop")
 
     @classmethod
-    def _gh_required(cls, endpoint: str) -> str:
-        raw = cls._gh_optional(endpoint)
+    def _gh_required(
+        cls,
+        endpoint: str,
+        *,
+        validate: Callable[[dict[str, object]], bool] = lambda _: True,
+    ) -> str:
+        raw = cls._gh_optional(endpoint, validate=validate)
         if raw is None:
             raise release.ReleaseError("release tag object disappeared during verification")
         return raw
@@ -118,6 +188,10 @@ class ReadOnlyDestination:
             if error.code == 404:
                 return None
             raise release.ReleaseError(f"crates.io returned HTTP {error.code}") from error
+        except urllib.error.URLError as error:
+            raise release.ReleaseError(f"crates.io read failed: {error}") from error
+        if data.get("version", {}).get("yanked"):
+            raise release.ReleaseError("crates.io version is yanked")
         return str(data["version"]["checksum"])
 
 
@@ -170,11 +244,17 @@ def preflight(
 ) -> Plan:
     """Inspect every destination and byte before any write, including a freeze."""
     release.verify_info(dist, directive, info)
+    version = str(directive["version"])
+    if crate.name != f"mimalloc-pprof-{version}.crate" or crate.is_symlink():
+        raise release.ReleaseError("packaged crate name or file type differs from directive")
+    crate_size = crate.stat().st_size
+    if crate_size <= 0 or crate_size > MAX_CRATE_BYTES:
+        raise release.ReleaseError("packaged crate exceeds crates.io 10 MB limit or is empty")
     crate_hash = file_sha256(crate)
     record = release.freeze_record(directive, info, crate_hash)
     if frozen is not None and frozen != record:
         raise release.ReleaseError("issue freeze differs from exact packaged bytes")
-    tag, sha, version = (str(directive[key]) for key in ("tag", "candidate_sha", "version"))
+    tag, sha = (str(directive[key]) for key in ("tag", "candidate_sha"))
     existing_tag = destination.tag_sha(tag)
     if existing_tag is not None and existing_tag != sha:
         raise release.ReleaseError("immutable tag points to another candidate")
@@ -223,6 +303,13 @@ def github_retry(
         try:
             operation()
             return
+        except release.ReleaseError:
+            # A second attempt may report 422 because the first request committed
+            # while its response was lost. Reconcile exact state before failing.
+            if completed is not None and completed():
+                log("github: verified write after conflict response")
+                return
+            raise
         except TransientGitHubError as error:
             log(f"github transient attempt={attempt}/10: {error}")
             # The server may have committed the write before the response failed.
@@ -245,8 +332,9 @@ def execute(
     log: Callable[[str], None],
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    """Run a frozen plan with an injected destination; no live adapter exists."""
+    """Freeze, transfer from one runner, verify all bytes, then publish the draft."""
     plan = preflight(destination, directive, info, dist, crate, frozen)
+    destination.validate_crate(crate)
     tag, sha = str(directive["tag"]), str(directive["candidate_sha"])
     expected_assets = cast(dict[str, str], plan.freeze["asset_sha256"])
 
@@ -282,7 +370,12 @@ def execute(
         return digest == expected_assets[name]
 
     if frozen is None:
-        destination.freeze(plan.freeze)
+        github_retry(
+            lambda: destination.freeze(plan.freeze),
+            log=log,
+            completed=lambda: destination.read_freeze() == plan.freeze,
+            sleep=sleep,
+        )
     authoritative_freeze = destination.read_freeze()
     if authoritative_freeze != plan.freeze:
         raise release.ReleaseError("issue freeze readback differs from packaged release identity")
@@ -303,19 +396,65 @@ def execute(
             sleep=sleep,
         )
         log("github: draft created")
-    for name in plan.missing_assets:
-        github_retry(
-            lambda name=name: destination.upload_asset(tag, name, dist / name),
-            log=log,
-            completed=lambda name=name: asset_done(name),
-            sleep=sleep,
-        )
-        log(f"github: asset verified {name}")
-    if plan.missing_crate:
-        destination.publish_crate(crate)
-        log("crates.io: publish attempted")
+    # The two network destinations transfer concurrently. Workers buffer their logs;
+    # the job prints each destination's complete transcript in a fixed order.
+    github_lines: list[str] = []
+    crate_lines: list[str] = []
+
+    def transfer_assets() -> None:
+        for name in plan.missing_assets:
+            github_retry(
+                lambda name=name: destination.upload_asset(tag, name, dist / name),
+                log=github_lines.append,
+                completed=lambda name=name: asset_done(name),
+                sleep=sleep,
+            )
+            github_lines.append(f"github: asset verified {name}")
+
+    def transfer_crate() -> None:
+        if plan.missing_crate:
+            try:
+                destination.publish_crate(crate)
+            except AmbiguousCratePublishError:
+                # Cargo may lose its response after crates.io accepted the upload.
+                # A matching registry checksum is the only safe success signal.
+                for attempt in range(10):
+                    if (
+                        destination.crate_checksum(str(directive["version"]))
+                        == plan.freeze["crate_sha256"]
+                    ):
+                        crate_lines.append("crates.io: accepted despite ambiguous response")
+                        break
+                    if attempt == 9:
+                        raise
+                    sleep(min(2**attempt, 30))
+            crate_lines.append("crates.io: publish attempted")
+
+    log("release: GitHub assets and crates.io transfers started on one worker")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        github_transfer = pool.submit(transfer_assets)
+        crate_transfer = pool.submit(transfer_crate)
+        failures: list[Exception] = []
+        for label, future, lines in (
+            ("github", github_transfer, github_lines),
+            ("crates.io", crate_transfer, crate_lines),
+        ):
+            try:
+                future.result()
+            except Exception as error:
+                log(f"{label}: transfer failed: {error}")
+                failures.append(error)
+            for line in lines:
+                log(line)
+        if failures:
+            raise failures[0]
     # Re-read authoritative destinations after potentially ambiguous writes.
     complete = preflight(destination, directive, info, dist, crate, plan.freeze)
+    for attempt in range(9):
+        if not complete.missing_crate:
+            break
+        sleep(min(2**attempt, 30))
+        complete = preflight(destination, directive, info, dist, crate, plan.freeze)
     if (
         complete.missing_tag
         or complete.missing_release

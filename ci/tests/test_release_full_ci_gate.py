@@ -22,7 +22,7 @@ WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
 def expanded_job_names(filename: str) -> list[str]:
     """Expand required jobs so changing a workflow matrix cannot outrun the manifest."""
     jobs = yaml.safe_load((WORKFLOWS / filename).read_text())["jobs"]
-    optional = {
+    optional = {"pr-ci-mode", "pr-test-gate"} | {
         "macos-bundles.yml": {
             "decide",
             "run-macos-x64-selective",

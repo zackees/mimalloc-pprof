@@ -187,19 +187,36 @@ These four scaling graphics use deterministic per-worker playback at 1, 2, 3, 4,
 and 8 workers. They request either exact powers of two from 64 KiB through 4 MiB or an
 unbiased uniformly random byte size over the same inclusive range. Both use the normal
 allocation API; “power-of-two” describes the requested size, not extra pointer alignment.
-The allocator rows show the empirical P5–P95 area and median from 40 paired runs.
-Within each metric every row—and both workloads—uses the same zero-based Y-axis domain and
-ticks, rounded upward from the maximum of all raw observations so outliers are not clipped.
-The four primary rows are TCMalloc, jemalloc, Microsoft mimalloc, and mimalloc-pprof; Bun
-mimalloc remains collected in a separately labelled supplemental row.
+Each chart overlays, on one panel, the median of 40 paired runs for all five allocators:
+TCMalloc, jemalloc, Microsoft mimalloc, Bun mimalloc, and mimalloc-pprof (drawn last and
+thicker). Within each metric both workloads share one zero-based Y axis, rounded upward
+from the largest raw observation so outliers are not clipped. The per-cell spread across
+runs is on the dashboard table and in `latest.json`, not on the chart.
 
-[![Power-of-two requested sizes: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Power-of-two requested sizes: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Power-of-two requested sizes: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Power-of-two requested sizes: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Uniformly random requested sizes: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Uniformly random requested sizes: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Uniformly random requested sizes: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Uniformly random requested sizes: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+### Short-lived threads
+
+Every chart above keeps its worker threads alive for the whole run. These two workloads
+replay one identical 96–512 KiB request stream (the size classes a mimalloc large page
+serves); only thread lifetime differs. In the short-lived variant each worker runs its
+stream as 8 successive threads, and each thread exits while still owning live blocks
+that the next one frees. Both share one Y axis per metric, so the gap between them is
+the cost of short-lived threads.
+
+[![Long-lived threads, 96-512 KiB: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Long-lived threads, 96-512 KiB: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Short-lived threads, 96-512 KiB: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+[![Short-lived threads, 96-512 KiB: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
 Full methodology, per-cell tables and the other benchmark families are in
 [Performance](#performance) below and on the
@@ -775,7 +792,7 @@ and the `mi_purge_holes_stats_t` gauges.
 | `mi_option_is_enabled` / `_enable` / `_disable` / `_set_enabled` / `_set_enabled_default` | ✅ | `options::is_enabled` / `enable` / `disable` / `set_enabled` / `set_enabled_default` |
 | `mi_options_print_out` | ✅ | `options::print` |
 
-The fourteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the environment:
+The fifteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the environment:
 
 | Option | Default | What it does |
 |---|---|---|
@@ -793,6 +810,8 @@ The fourteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the envi
 | `purge_holes_min_interval` | `100` | ms floor between sweeps of one thread's heaps |
 | `purge_holes_full_every` | `64` | every N-th sweep walks every page; 0 disables |
 | `snapshot_on_exit` | `0` | write a heap snapshot at process exit; `1` = on, `2` = with per-block freemaps (needs `MI_DIAGNOSTICS`) |
+| `page_reserve` | `1` | at thread exit, keep an empty large page for the next thread instead of freeing it; released after `MI_PAGE_RESERVE_RELEASE_MULT` (10) purge delays; 0 frees it (#493) |
+| `resident_first` | `1` | claim arena slices that are free but still resident (queued for purge) before any other free slices, so a new page reuses memory the retention window kept instead of faulting in fresh pages; 0 = the plain search only (#493) |
 
 Because they are positional, a stale Rust mirror of this enum would silently set the
 *wrong* option — which is why `tests/t19_layout.rs` checks every value against the C

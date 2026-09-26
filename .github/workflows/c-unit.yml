@@ -61,6 +61,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  pr-ci-mode:
+    uses: ./.github/workflows/pr-ci-mode.yml
+
   resolve-candidate:
     name: resolve-candidate (exact SHA ${{ inputs.candidate_sha }})
     runs-on: ubuntu-latest
@@ -93,6 +96,17 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "exact candidate_sha=$sha" >> "$GITHUB_STEP_SUMMARY"
 
+  pr-test-gate:
+    name: PR test gate (c-unit)
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs: [pr-ci-mode, resolve-candidate, build, build-bun-objects, build-windows-native, run-linux, run-linux-serial, coverage, run-windows-native, fastpath-identity, isa-baseline-arm64]
+    uses: ./.github/workflows/pr-ci-gate.yml
+    with:
+      workflow: c-unit
+      needs-json: ${{ toJSON(needs) }}
+      ci-test: ${{ contains(github.event.pull_request.labels.*.name, 'ci-test') }}
+      ci-full: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
+
   # ------------------------------------------------------------------------------------
   # STAGE 1 -- every configuration, built exactly once, in parallel.
   # ------------------------------------------------------------------------------------
@@ -109,8 +123,8 @@ jobs:
   #           BUILD, so it cannot be an extra entry in another bundle's manifest.
   build:
     name: build (${{ matrix.config }})
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
     timeout-minutes: 30
@@ -388,8 +402,8 @@ jobs:
   # `src/static.c` -- the one thing #307 exists to stop doing.
   build-bun-objects:
     name: build-bun-objects (${{ matrix.name }})
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
     timeout-minutes: 20
@@ -437,8 +451,8 @@ jobs:
   # #307 split it into build + run for the same reason as Linux -- the configuration is
   # compiled once and the result is what gets executed -- not to weaken it.
   build-windows-native:
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: windows-latest
     timeout-minutes: 40
     defaults:
@@ -907,8 +921,8 @@ jobs:
   # build is the positive control -- the gate MUST change those bytes -- so a normaliser
   # that had gone blind fails here rather than reporting "identical" forever.
   fastpath-identity:
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -934,8 +948,8 @@ jobs:
   # result would mean nothing.
   isa-baseline-arm64:
     name: isa-baseline (ubuntu-24.04-arm)
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:

@@ -19,6 +19,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  pr-ci-mode:
+    uses: ./.github/workflows/pr-ci-mode.yml
+
   resolve-candidate:
     name: resolve-candidate (exact SHA ${{ inputs.candidate_sha }})
     runs-on: ubuntu-latest
@@ -51,9 +54,20 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "exact candidate_sha=$sha" >> "$GITHUB_STEP_SUMMARY"
 
+  pr-test-gate:
+    name: PR test gate (rust-native)
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs: [pr-ci-mode, resolve-candidate, test, test-win-gnu, test-no-pprof]
+    uses: ./.github/workflows/pr-ci-gate.yml
+    with:
+      workflow: rust-native
+      needs-json: ${{ toJSON(needs) }}
+      ci-test: ${{ contains(github.event.pull_request.labels.*.name, 'ci-test') }}
+      ci-full: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
+
   test:
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -64,7 +78,7 @@ jobs:
     # workspace's test binaries -- cross-built on Linux for x86_64-pc-windows-msvc -- on
     # the shared Windows VM. Informational until then. A permanently-yellow job is worse
     # than an absent one. The ubuntu-latest row is NOT affected and stays a hard gate.
-    continue-on-error: ${{ github.event_name != 'workflow_dispatch' && matrix.os == 'windows-latest' }}
+    continue-on-error: ${{ github.event_name != 'workflow_dispatch' && needs.pr-ci-mode.outputs.external != 'true' && matrix.os == 'windows-latest' }}
     defaults:
       run:
         working-directory: rust
@@ -140,8 +154,8 @@ jobs:
         run: python ../ci/check_crate_package.py target/package
 
   test-win-gnu:
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: windows-latest
     # TODO(#277 phase C, added 2026-09-02): DELETE this job after ten pushes have compared
     # it against `run-windows` in windows-bundles.yml, which runs the same Rust test
@@ -149,7 +163,7 @@ jobs:
     # the control arm for a deliberate CRT change (MSYS2 MINGW64 is msvcrt, soldr's
     # mingw-w64 is UCRT), so do not delete it before that comparison has actually
     # happened. A permanently-yellow job is worse than an absent one.
-    continue-on-error: ${{ github.event_name != 'workflow_dispatch' }}
+    continue-on-error: ${{ github.event_name != 'workflow_dispatch' && needs.pr-ci-mode.outputs.external != 'true' }}
     defaults:
       run:
         working-directory: rust
@@ -178,8 +192,8 @@ jobs:
           soldr --no-cache cargo test --locked --target x86_64-pc-windows-gnu
 
   test-no-pprof:
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: ubuntu-latest
     defaults:
       run:

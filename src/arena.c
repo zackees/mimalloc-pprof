@@ -224,13 +224,145 @@ static size_t mi_page_full_size(mi_page_t* page) {
   Arena Allocation
 ----------------------------------------------------------- */
 
+// #493 (strategy 9): resident-first claiming. A freed range sits in `slices_purge` (young) or
+// `slices_purge_aged` for the #486 retention window: free, and still resident. The plain search
+// (`mi_bbitmap_try_find_and_clearN`) knows nothing of that and, measured on short-lived threads,
+// mostly handed out fresh or already purged slices while such ranges were waiting -- growing RSS
+// and zero-fill faulting the new range. So first try the queued runs, in index order.
+// Limited to claims of at least MI_RESIDENT_FIRST_MIN_SLICES slices (#517).
+typedef struct mi_resident_claim_s {
+  size_t slice_count;   // wanted
+  size_t tries;         // queued runs tried so far (at most MI_RESIDENT_FIRST_MAX_TRIES)
+  size_t slice_index;   // out: the claimed range, when `claimed`
+  bool   claimed;
+} mi_resident_claim_t;
+
+static bool mi_arena_resident_claim_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  mi_resident_claim_t* const rc = (mi_resident_claim_t*)arg;
+  mi_assert_internal(slice_count >= rc->slice_count); MI_UNUSED(slice_count);
+  rc->tries++;
+  // The same atomic claim of `slices_free` the purge makes before it purges
+  // (`mi_arena_try_purge_range`): if we win, the purge cannot touch the range; if the purge or
+  // another thread holds any of it -- or it was allocated since it was queued -- this fails.
+  if (mi_bbitmap_try_claimN(arena->slices_free, slice_index, rc->slice_count)) {
+    rc->slice_index = slice_index;
+    rc->claimed = true;
+    return false;   // done
+  }
+  return (rc->tries < MI_RESIDENT_FIRST_MAX_TRIES);
+}
+
+static bool mi_arena_try_claim_resident(mi_arena_t* arena, size_t slice_count, size_t* slice_index) {
+  // Small and medium pages keep the size-binned plain search (MI_RESIDENT_FIRST_MIN_SLICES, #517).
+  if (slice_count < MI_RESIDENT_FIRST_MIN_SLICES) return false;
+  // A pinned arena is never purged (all of it is resident); a range of more than a chunk is
+  // beyond `mi_bbitmap_try_claimN`.
+  if (arena->memid.is_pinned || slice_count > MI_BCHUNK_BITS) return false;
+  // Nothing queued: `purge_expire` is armed after every queueing (`mi_arena_schedule_purge`) and
+  // only disarmed by a purge that leaves both queues empty, so 0 means empty but for a moment
+  // around a concurrent free or purge -- and then we merely take the plain search.
+  if (mi_atomic_loadi64_relaxed(&arena->purge_expire) == 0) return false;
+  if (!mi_option_is_enabled(mi_option_resident_first)) return false;
+  #if MI_GUARDED
+  // A page of guarded blocks writes about half of its range (each block is followed by a guard
+  // OS page that is never written): carved over retained memory, the other half keeps the old
+  // tenant resident until the page goes. Measured with every allocation guarded
+  // (test-memory-gate, sample rate 1): +28 MiB while the retention window lasted. Guarded
+  // sampling is a debugging mode; it takes the plain search.
+  if (mi_option_get(mi_option_guarded_sample_rate) != 0) return false;
+  #endif
+  // young | aged: a range freed in two steps is one run even when half of it has aged
+  mi_resident_claim_t rc = { slice_count, 0, 0, false };
+  _mi_bitmap_forall_set_runsN(arena->slices_purge, arena->slices_purge_aged, slice_count, &mi_arena_resident_claim_visitor, arena, &rc);
+  if (rc.claimed) { *slice_index = rc.slice_index; }
+  return rc.claimed;
+}
+
+// #493: a claimed range is no longer waiting for a purge, so drop it from both queues. The purge
+// itself would only skip it (its claim of `slices_free` fails), but the stale bits would stay on
+// the queues to be retried by every purge -- and every resident-first scan above, where each one
+// costs a try. Only a read when nothing of the range is queued. Safe against the purge: we own the
+// range, so no free can queue it again, and a purge that already took the bits fails its claim.
+static void mi_arena_unqueue_purge(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
+  if (!mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);
+  }
+  if (!mi_bitmap_is_clearN(arena->slices_purge_aged, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge_aged, slice_index, slice_count);
+  }
+}
+
+// #517: slice claims by kind (see `mi_arena_claim_counters_t`). Diagnostics builds only.
+#if MI_DIAGNOSTICS
+static _Atomic(size_t) mi_arena_claims_resident_first;
+static _Atomic(size_t) mi_arena_claims_resident_first_slices;
+static _Atomic(size_t) mi_arena_claims_plain_reused;
+static _Atomic(size_t) mi_arena_claims_plain_reused_slices;
+static _Atomic(size_t) mi_arena_claims_plain_fresh;
+static _Atomic(size_t) mi_arena_claims_plain_fresh_slices;
+
+// Must run before the claim sets the range's dirty bits: a never-dirty slice is a fresh one.
+static void mi_arena_count_claim(mi_arena_t* arena, size_t slice_index, size_t slice_count, bool resident) {
+  if (resident) {
+    mi_atomic_add_relaxed(&mi_arena_claims_resident_first, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_resident_first_slices, slice_count);
+    return;
+  }
+  const size_t dirty = mi_bitmap_popcountN(arena->slices_dirty, slice_index, slice_count);
+  mi_assert_internal(dirty <= slice_count);
+  const size_t fresh = slice_count - dirty;
+  if (fresh > 0) {
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_fresh, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_fresh_slices, fresh);
+  }
+  else {
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_reused, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_reused_slices, slice_count);
+  }
+}
+#endif
+
+bool _mi_arena_claim_counters(mi_arena_claim_counters_t* out) {
+  if (out == NULL) return false;
+  #if MI_DIAGNOSTICS
+  out->resident_first_claims = mi_atomic_load_relaxed(&mi_arena_claims_resident_first);
+  out->resident_first_slices = mi_atomic_load_relaxed(&mi_arena_claims_resident_first_slices);
+  out->plain_reused_claims   = mi_atomic_load_relaxed(&mi_arena_claims_plain_reused);
+  out->plain_reused_slices   = mi_atomic_load_relaxed(&mi_arena_claims_plain_reused_slices);
+  out->plain_fresh_claims    = mi_atomic_load_relaxed(&mi_arena_claims_plain_fresh);
+  out->plain_fresh_slices    = mi_atomic_load_relaxed(&mi_arena_claims_plain_fresh_slices);
+  return true;
+  #else
+  _mi_memzero(out, sizeof(*out));
+  return false;
+  #endif
+}
+
+void _mi_arena_claim_counters_reset(void) {
+  #if MI_DIAGNOSTICS
+  mi_atomic_store_relaxed(&mi_arena_claims_resident_first, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_resident_first_slices, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_reused, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_reused_slices, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_fresh, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_fresh_slices, (size_t)0);
+  #endif
+}
+
 static mi_decl_noinline void* mi_arena_try_alloc_at(
   mi_arena_t* arena, size_t slice_count, bool commit, size_t tseq, mi_memid_t* memid)
 {
   mi_assert_internal(arena!=NULL);
   mi_assert_internal(slice_count>0);
   size_t slice_index;
-  if (!mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  const bool resident = mi_arena_try_claim_resident(arena, slice_count, &slice_index);
+  if (!resident && !mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  if (!arena->memid.is_pinned) { mi_arena_unqueue_purge(arena, slice_index, slice_count); }
+  #if MI_DIAGNOSTICS
+  mi_arena_count_claim(arena, slice_index, slice_count, resident);   // before the dirty bits are set below
+  #else
+  MI_UNUSED(resident);
+  #endif
 
   // claimed it!
   void* p = mi_arena_slice_start(arena, slice_index);
@@ -751,6 +883,7 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
         mi_assert_internal(mi_page_is_owned(page));
         mi_assert_internal(mi_page_is_abandoned(page));
         mi_assert_internal(mi_heap_has_page(heap, arena, page));
+        page->retired_at = 0;   // #493: if it was a reserved page, it is in use again
         mi_atomic_decrement_relaxed(&heap->abandoned_count[bin]);
         mi_theap_stat_decrease(theap, pages_abandoned, 1);
         mi_theap_stat_counter_increase(theap, pages_reclaim_on_alloc, 1);
@@ -978,6 +1111,7 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
   // initialize the page start
   uint8_t* const start = slice_start + block_start;
   mi_assert_internal(start > (uint8_t*)page);
+
   const size_t offset = start - (uint8_t*)page;
   mi_assert_internal((offset % MI_MAX_ALIGN_SIZE) == 0 && (offset / MI_MAX_ALIGN_SIZE) <= UINT32_MAX);
   page->page_ma_offset = (uint32_t)(offset / MI_MAX_ALIGN_SIZE);
@@ -1228,6 +1362,7 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
   // until it is MADV_FREE_REUSE'd. This function is the single choke point for a page going
   // back to the arena (`_mi_page_free` and the abandoned-page free in `free.c` both land here).
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: first, so the scavenger cannot discard it meanwhile
   _mi_page_unpurge_all(page);
 
   // all we need from the heap, before the page is unpublished from it (see
@@ -1335,6 +1470,60 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
   mi_abandoned_page_unown(page, current_theap);
 }
 
+// #493: reserve an EMPTY large page for the next thread of its heap (`_mi_page_free_or_reserve`,
+// at thread exit). It goes into the same per-bin abandoned map as the pages `_mi_arenas_page_abandon`
+// maps, so the ordinary reclaim-on-alloc (`mi_arenas_page_try_find_abandoned`) hands it to the next
+// thread that needs a page of its size class -- with its blocks formed and resident: no new page,
+// no new unformed tail. Separate from `_mi_arenas_page_abandon` because that one only ever sees a
+// page with live blocks. Stamped in `retired_at`, so a page nobody reclaims is freed after
+// MI_PAGE_RESERVE_RELEASE_MULT purge delays (`mi_arena_page_reserve_kept`). Returns false (and
+// leaves the page to the caller to free) when it should not or cannot be reserved.
+bool _mi_arenas_page_reserve(mi_page_t* page, mi_theap_t* current_theap) {
+  mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
+  mi_assert_internal(mi_page_is_owned(page));
+  mi_assert_internal(mi_page_is_abandoned(page));
+  mi_assert_internal(mi_page_all_free(page));
+  mi_assert_internal(page->next==NULL && page->prev == NULL);
+  mi_assert_internal(_mi_theap_can_touch(current_theap));
+
+  if (!mi_option_is_enabled(mi_option_page_reserve)) return false;
+  // no purge delay to derive a retention window from: purging is off, keep upstream's free
+  if (mi_option_get(mi_option_purge_delay) < 0) return false;
+  // large pages only: small and medium pages are cheap to carve, and it is the 4 MiB page with a
+  // few formed blocks that leaves the resident tail behind
+  const size_t bsize = mi_page_block_size(page);
+  if (bsize <= MI_MEDIUM_MAX_OBJ_SIZE || bsize > MI_LARGE_MAX_OBJ_SIZE) return false;
+  if (page->memid.memkind != MI_MEM_ARENA || mi_page_is_singleton(page)) return false;
+  // a heap being released claims every page through `pages` (see `_mi_arenas_page_abandon`)
+  mi_heap_t* const heap = mi_page_heap(page);
+  if (mi_atomic_load_relaxed(&heap->releasing) != 0) return false;
+  const size_t bin = _mi_bin(bsize);
+  if (bin >= MI_ARENA_BIN_COUNT) return false;
+
+  size_t slice_index;
+  size_t slice_count;
+  mi_arena_pages_t* arena_pages = NULL;
+  mi_arena_t* const arena = mi_page_arena_pages(page, &slice_index, &slice_count, &arena_pages);
+  mi_bitmap_t* const bitmap = mi_arena_pages_abandoned_ensure(arena, arena_pages, bin);
+  if (bitmap == NULL) return false;
+
+  // #483: a retired page published in its (exiting) thread's tld slots must be taken back before
+  // the tld goes -- this also clears `retired_at`, which we then set to the reserve stamp
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }
+  const mi_msecs_t now = _mi_clock_now();
+  page->retired_at = (now != 0 ? now : 1);   // non-zero: this marks the page as reserved
+
+  mi_page_set_abandoned_mapped(page);
+  const bool was_clear = mi_bitmap_set(bitmap, slice_index);
+  MI_UNUSED(was_clear); mi_assert_internal(was_clear);
+  mi_atomic_increment_relaxed(&heap->abandoned_count[bin]);
+  mi_theap_stat_increase(current_theap, pages_abandoned, 1);
+  _mi_pages_release_schedule(heap->subproc);   // an idle process relies on the scavenger to release it
+  mi_abandoned_page_unown(page, current_theap);   // (cannot free it: no block can be freed into an empty page)
+  return true;
+}
+
 
 // this is called from `free.c:mi_free_try_collect_mt` only.
 bool _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page) {
@@ -1432,10 +1621,32 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   needs the arena bitmaps and the claim protocol.)
 ----------------------------------------------------------- */
 
+// #493: is this abandoned page a reserved one (`_mi_arenas_page_reserve`) still inside its
+// retention window of MI_PAGE_RESERVE_RELEASE_MULT purge delays? (The caller owns the page.)
+static bool mi_arena_page_reserve_kept(const mi_page_t* page, mi_msecs_t now) {
+  if (page->retired_at == 0) return false;   // not reserved
+  const long delay = mi_option_get(mi_option_purge_delay);
+  if (delay < 0) return false;               // purging was switched off since: no window, release
+  return (now - page->retired_at < (mi_msecs_t)delay * MI_PAGE_RESERVE_RELEASE_MULT);
+}
+
 typedef struct mi_purge_holes_arg_s {
   mi_bitmap_t* bitmap;
   mi_tld_t*    tld;      // the thread whose sweep this is (its own, or the parked one the scavenger is sweeping for)
 } mi_purge_holes_arg_t;
+
+static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size_t slice_count);
+static long mi_arena_purge_delay(void);
+
+// #486: a reserved page released after its window has been idle for the whole retention already;
+// purge its slices now instead of aging them again in the arena queue, which would hold them
+// for another two arena periods (and past the release bound, #491). Only if they are still free.
+static void mi_arena_purge_released(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
+  if (arena->memid.is_pinned || mi_arena_purge_delay() < 0) return;
+  if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);   // queued by the free: done already
+  }
+}
 
 static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   MI_UNUSED(slice_count);
@@ -1460,9 +1671,19 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
   // We own the page: no other thread can reclaim, unabandon, or free it now, and only the
   // atomic `xthread_free` can still change under us. (No un-purging: we are about to purge.)
   _mi_page_free_collect_no_unpurge(page, true);
+  if (mi_page_all_free(page) && mi_arena_page_reserve_kept(page, _mi_clock_now())) {
+    // #493: reserved for the next thread and still inside its window. Leave it whole: discarding
+    // its free blocks now would only make that thread fault them back in.
+    mi_bitmap_set(bitmap, slice_index);
+    mi_abandoned_page_unown(page, NULL);
+    return true;
+  }
   if (mi_page_all_free(page)) {
+    const bool reserved = (page->retired_at != 0);   // (an expired reserved page, see above)
+    const size_t page_slices = mi_page_full_size(page) / MI_ARENA_SLICE_SIZE;
     mi_bitmap_set(bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
     _mi_arenas_abandoned_page_free(page, NULL);
+    if (reserved) { mi_arena_purge_released(arena, slice_index, page_slices); }
     _mi_page_holes_count_page_freed();
     return true;
   }
@@ -1475,7 +1696,7 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
 // note: this only reaches the *mapped* abandoned pages (the ones in `pages_abandoned`).
 // A page abandoned while full is not mapped; it has no free blocks at that point, and once
 // enough blocks are freed in it, `_mi_arenas_page_try_reabandon_to_mapped` puts it in the map.
-void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
+void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld, size_t bin_lo, size_t bin_hi) {
   if (heap == NULL || tld == NULL) return;
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   _mi_page_purge_holes_begin(tld);
@@ -1484,7 +1705,7 @@ void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
     if (arena_pages != NULL) {
       // pages_abandoned[] is MI_ARENA_BIN_COUNT wide, not MI_BIN_COUNT: bins above the
       // singleton bins have no abandoned bitmap (upstream ad1bcdbf, to shrink arena meta).
-      for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
+      for (size_t bin = bin_lo; bin < bin_hi && bin < MI_ARENA_BIN_COUNT; bin++) {
         if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
         mi_bitmap_t* const bitmap = mi_arena_pages_abandoned(arena_pages, bin);
         if (bitmap == NULL) continue;
@@ -1495,6 +1716,63 @@ void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
   }
   mi_forall_arenas_end();
   _mi_page_purge_holes_end(tld);
+}
+
+// #493: release the reserved pages of a heap. The hole sweep above already frees the ones past
+// their window that it meets, but it only runs on a thread that allocates (or idles through
+// `mi_on_thread_idle`) with `purge_holes` on; this is the pass for the scavenger (`force == false`,
+// see `_mi_pages_release_retired`) and for a forced collect (`force == true`: every one of them).
+// Same claim protocol as `mi_arena_page_purge_holes_at`. Only the large bins can hold one.
+typedef struct mi_reserve_release_arg_s {
+  mi_bitmap_t* bitmap;
+  mi_msecs_t   now;
+  bool         force;
+  bool         pending;   // out: a reserved page is kept for now
+} mi_reserve_release_arg_t;
+
+static bool mi_arena_page_release_reserved_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  MI_UNUSED(slice_count);
+  mi_reserve_release_arg_t* const rarg = (mi_reserve_release_arg_t*)arg;
+  if (!mi_bitmap_clear(rarg->bitmap, slice_index)) return true;   // someone else has the page
+  mi_page_t* const page = mi_arena_page_at_slice(arena, slice_index);
+  if (!mi_page_claim_ownership(page)) {
+    mi_bitmap_set(rarg->bitmap, slice_index);   // a concurrent free owns it: keep it abandoned
+    return true;
+  }
+  // a reserved page has no live block, so no free can have arrived in it: `used` is exact
+  if (page->retired_at != 0 && mi_page_all_free(page)) {
+    if (rarg->force || !mi_arena_page_reserve_kept(page, rarg->now)) {
+      const size_t page_slices = mi_page_full_size(page) / MI_ARENA_SLICE_SIZE;
+      mi_bitmap_set(rarg->bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
+      _mi_arenas_abandoned_page_free(page, NULL);
+      mi_arena_purge_released(arena, slice_index, page_slices);
+      return true;
+    }
+    rarg->pending = true;
+  }
+  mi_bitmap_set(rarg->bitmap, slice_index);       // back in the map *before* unowning: unown may free the page
+  mi_abandoned_page_unown(page, NULL);
+  return true;
+}
+
+bool _mi_arenas_release_reserved(mi_heap_t* heap, bool force) {
+  if (heap == NULL) return false;
+  const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
+  const size_t bin_hi = _mi_bin(MI_LARGE_MAX_OBJ_SIZE) + 1;
+  mi_reserve_release_arg_t rarg = { NULL, _mi_clock_now(), force, false };
+  mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
+    mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
+    if (arena_pages != NULL) {
+      for (size_t bin = bin_lo; bin < bin_hi && bin < MI_ARENA_BIN_COUNT; bin++) {   // see above: not MI_BIN_COUNT
+        if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
+        rarg.bitmap = mi_arena_pages_abandoned(arena_pages, bin);
+        if (rarg.bitmap == NULL) continue;
+        (void)_mi_bitmap_forall_set(rarg.bitmap, &mi_arena_page_release_reserved_at, arena, &rarg);
+      }
+    }
+  }
+  mi_forall_arenas_end();
+  return rarg.pending;
 }
 
 // The read-only counterpart of the sweep above: account for the holes in the abandoned pages
@@ -1559,7 +1837,7 @@ void _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep) {
       if (mi_bitmap_is_set(arena->slices_committed, i)) { rep->arena_committed_bytes += MI_ARENA_SLICE_SIZE; }
       if (!mi_bbitmap_is_setN(arena->slices_free, i, 1)) continue;   // in a page (or reserved meta): not slack
       if (mi_bitmap_is_set(arena->slices_dirty, i)) { rep->arena_free_dirty_bytes += MI_ARENA_SLICE_SIZE; }
-      if (mi_bitmap_is_set(arena->slices_purge, i)) { rep->arena_purge_pending_bytes += MI_ARENA_SLICE_SIZE; }
+      if (mi_bitmap_is_set(arena->slices_purge, i) || mi_bitmap_is_set(arena->slices_purge_aged, i)) { rep->arena_purge_pending_bytes += MI_ARENA_SLICE_SIZE; }
     }
   }
   mi_forall_arenas_end();
@@ -1775,7 +2053,7 @@ static size_t mi_arena_info_slices_needed(size_t slice_count, size_t* bitmap_bas
   if (slice_count == 0) slice_count = MI_BCHUNK_BITS;
   mi_assert_internal((slice_count % MI_BCHUNK_BITS) == 0);
   const size_t base_size = _mi_align_up(sizeof(mi_arena_t), MI_BCHUNK_SIZE);
-  const size_t bitmaps_count = 4; // commit, dirty, purge, and pages (the abandoned bitmaps are allocated on demand, Bun parity P10b #317)
+  const size_t bitmaps_count = 5; // commit, dirty, purge, purge_aged (#457), and pages (the abandoned bitmaps are allocated on demand, Bun parity P10b #317)
   const size_t bitmaps_size = bitmaps_count * mi_bitmap_size(slice_count, NULL) + mi_bbitmap_size(slice_count, NULL); // + free
   #if MI_PAGE_META_IS_SEPARATED
   const size_t pages_size = slice_count * sizeof(mi_page_t);
@@ -2002,6 +2280,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   arena->slices_committed = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_dirty = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_purge = mi_arena_bitmap_init(slice_count, &base);
+  arena->slices_purge_aged = mi_arena_bitmap_init(slice_count, &base);
   arena->pages_main.pages = mi_arena_bitmap_init(slice_count, &base);
   // Allocated on first abandon (Bun parity P10b, #317, ported from oven-sh/mimalloc @
   // 787be2a8, MIT); the arena's own memory is not yet fully zeroed at this point in every
@@ -2571,7 +2850,10 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
     mi_arena_purge(arena, slice_index, slice_count);
   }
   else {
-    // schedule purge
+    // schedule purge. #457: queue the range BEFORE arming, so a purge that runs concurrently
+    // either sees the range (ages it, and re-arms) or has already cleared the deadline (so the
+    // CAS below arms it); in the other order the range could land in a queue with no deadline.
+    mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
     const mi_msecs_t expire = _mi_clock_now() + delay;
     mi_msecs_t expire0 = 0;
     if (mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire)) {
@@ -2585,10 +2867,14 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
         _mi_scavenger_wake(arena->subproc);
       }
     }
-    else {
-      // already an expiration was set
+    else if (mi_atomic_loadi64_relaxed(&arena->subproc->purge_expire) == 0) {
+      // #457: this arena is already armed but the subproc deadline is not (a settle raced
+      // this arena's 0 -> set). Re-arm it so the scavenger wakes for it.
+      mi_msecs_t sexpire0 = 0;
+      if (mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &sexpire0, expire0)) {
+        _mi_scavenger_wake(arena->subproc);
+      }
     }
-    mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
   }
 }
 
@@ -2597,6 +2883,7 @@ typedef struct mi_purge_visit_info_s {
   mi_msecs_t delay;
   bool all_purged;
   bool any_purged;
+  bool take_young;   // #457: forced purge -- ranges freed again since they were aged are purged too
 } mi_purge_visit_info_t;
 
 static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
@@ -2615,8 +2902,37 @@ static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size
   }
 }
 
+// #457: move a range queued in this period into the aged queue (see `mi_arena_try_purge`)
+static bool mi_arena_age_purge_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  *(bool*)arg = true;
+  mi_bitmap_setN(arena->slices_purge_aged, slice_index, slice_count, NULL);
+  return true;
+}
+
+static void mi_arena_try_purge_run(mi_arena_t* arena, size_t slice_index, size_t slice_count, mi_purge_visit_info_t* vinfo);
+
 static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   mi_purge_visit_info_t* vinfo = (mi_purge_visit_info_t*)arg;
+  // #457: a slice freed again since it was aged is young again (`slices_purge` still has it) and
+  // waits for its own deadline. #497: only that slice -- the run handed to us is a maximal run of
+  // aged bits, already cleared, so skipping all of it would lose the parts that did stay free
+  // for the whole period (they are in neither queue after this).
+  if (!vinfo->take_young && !mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count)) {
+    for (size_t i = 0; i < slice_count; ) {
+      if (mi_bitmap_is_set(arena->slices_purge, slice_index + i)) { i++; continue; }
+      size_t n = 1;
+      while (i + n < slice_count && !mi_bitmap_is_set(arena->slices_purge, slice_index + i + n)) { n++; }
+      mi_arena_try_purge_run(arena, slice_index + i, n, vinfo);
+      i += n;
+    }
+    return true;
+  }
+  mi_arena_try_purge_run(arena, slice_index, slice_count, vinfo);
+  return true; // continue
+}
+
+// Purge `[slice_index, slice_index + slice_count)` where its slices are free.
+static void mi_arena_try_purge_run(mi_arena_t* arena, size_t slice_index, size_t slice_count, mi_purge_visit_info_t* vinfo) {
   // try to purge: first claim the free blocks
   if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
     vinfo->any_purged = true;
@@ -2633,7 +2949,6 @@ static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, m
   }
   // don't clear the purge bits as that is done atomically be the _bitmap_forall_set_ranges
   // mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);
-  return true; // continue
 }
 
 // returns
@@ -2656,15 +2971,22 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
   mi_atomic_storei64_release(&arena->purge_expire, (mi_msecs_t)0);
   mi_subproc_stat_counter_increase(arena->subproc, arena_purges, 1);
 
-  // go through all purge info's  (with max MI_BFIELD_BITS ranges at a time)
-  // this also clears those ranges atomically (so any newly freed blocks will get purged next
-  // time around)
-  mi_purge_visit_info_t vinfo = { now, mi_arena_purge_delay(), true /*all?*/, false /*any?*/};
-
+  // #457: two generations. Purge only what was already queued at the previous deadline, is
+  // still free, and was not freed again since: memory freed moments ago is about to be reused,
+  // and purging it would only make the next allocation re-fault it. Then age this period's
+  // queue and re-arm, so idle memory goes back between one and two `delay`s after its free.
+  // A forced purge (`mi_collect(true)`, `mi_purge_all`) takes both queues right away.
+  // The visitors clear each range atomically as they go (so a concurrent free is kept for next time).
+  const long delay = mi_arena_purge_delay();
+  mi_purge_visit_info_t vinfo = { now, delay, true /*all?*/, false /*any?*/, force /*young?*/ };
   // we purge by at least `minslices` to not fragment transparent huge pages for example
   const size_t minslices = mi_slice_count_of_size(_mi_os_minimal_purge_size());
-  _mi_bitmap_forall_setc_rangesn(arena->slices_purge, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
-
+  if (force) { _mi_bitmap_forall_setc_rangesn(arena->slices_purge, minslices, &mi_arena_try_purge_visitor, arena, &vinfo); }
+  _mi_bitmap_forall_setc_rangesn(arena->slices_purge_aged, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
+  bool aged = false;
+  _mi_bitmap_forall_setc_ranges(arena->slices_purge, &mi_arena_age_purge_visitor, arena, &aged);
+  mi_msecs_t expire0 = 0;
+  if (aged && delay > 0) { mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, now + delay); }
   return (vinfo.any_purged ? 1 : -1);
 }
 
@@ -2719,6 +3041,8 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
     const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
     if (expire == 0) continue;                 // nothing queued for this arena
     any_scheduled = true;
+    bool aged = false;                         // #457: the caller is idle, so everything queued counts as aged
+    _mi_bitmap_forall_setc_ranges(arena->slices_purge, &mi_arena_age_purge_visitor, arena, &aged);
     if (expire > now) { mi_atomic_storei64_release(&arena->purge_expire, now); }
   }
   if (!any_scheduled) return;
@@ -2808,7 +3132,7 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
         if (purged >= 0) {      // purged, or arena expire is not yet reached
           any_purged = true;
           if (purged >= 1) {    // purged
-            if (max_purge_count <= 1) {
+            if (max_purge_count <= 1 && !visit_all) {   // #457: a full pass must reach the settle below
               all_visited = false;
               break;
             }
@@ -2827,7 +3151,16 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       // per-arena expire (0 if none) and the scavenger's next wait is exact. A CAS, so a purge
       // scheduled concurrently with this walk is never clobbered.
       mi_msecs_t expected = arenas_expire;
-      mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
+      if (mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire) && next_expire == 0) {
+        // #457: a free may have armed an arena after we read it, and its own attempt to arm the
+        // subproc failed against the value we just replaced. Re-read so it is not orphaned.
+        for (size_t i = 0; i < max_arena; i++) {
+          mi_arena_t* const arena = mi_arena_from_index(subproc, i);
+          const mi_msecs_t aexpire = (arena == NULL ? 0 : mi_atomic_loadi64_relaxed(&arena->purge_expire));
+          mi_msecs_t zero = 0;
+          if (aexpire != 0) { mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &zero, aexpire); break; }
+        }
+      }
     }
   }
     if (!ran && force) {   // #272, see above
@@ -2840,6 +3173,12 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       _mi_prim_thread_yield();
     }
   } while (!ran && force);
+  if (!ran && visit_all) {
+    // #457: another thread holds the guard. Retry shortly instead of leaving a past deadline
+    // (which the scavenger would spin on) or clearing it (which would orphan pending arenas).
+    mi_msecs_t expected = arenas_expire;
+    mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, now + (delay/10) + 1);
+  }
 }
 
 

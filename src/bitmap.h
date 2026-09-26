@@ -182,7 +182,9 @@ static inline bool mi_bitmap_is_set(mi_bitmap_t* bitmap, size_t idx) {
   return mi_bitmap_is_setN(bitmap, idx, 1);
 }
 
-static inline bool mi_bitmap_is_clear(mi_bitmap_t* bitmap, size_t idx) {
+// Maybe unused: called only from `mi_assert_internal` (src/arena.c) and the flat page map
+// (MI_PAGE_MAP_FLAT, src/page-map.c), so a release build with the 2-level page map has none.
+MI_DECL_MAYBE_UNUSED static inline bool mi_bitmap_is_clear(mi_bitmap_t* bitmap, size_t idx) {
   return mi_bitmap_is_clearN(bitmap, idx, 1);
 }
 
@@ -225,6 +227,10 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
 // Ranges will never cross chunk boundaries (and `slice_count <= MI_BCHUNK_BITS`).
 bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
 
+// #493: visit each maximal run of at least `n <= MI_BCHUNK_BITS` bits set in `bitmap | bitmap2`
+// (`bitmap2` may be NULL), in index order, WITHOUT clearing them. Runs never cross a chunk.
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
+
 // Count all set bits in given range in the bitmap.
 size_t mi_bitmap_popcountN( mi_bitmap_t* bitmap, size_t idx, size_t n);
 
@@ -241,7 +247,8 @@ static inline mi_chunkbin_t mi_chunkbin_inc(mi_chunkbin_t bbin) {
   return (mi_chunkbin_t)((int)bbin + 1);
 }
 
-static inline mi_chunkbin_t mi_chunkbin_dec(mi_chunkbin_t bbin) {
+// Maybe unused: kept from upstream to pair with `mi_chunkbin_inc`; nothing in this tree (or upstream) calls it.
+MI_DECL_MAYBE_UNUSED static inline mi_chunkbin_t mi_chunkbin_dec(mi_chunkbin_t bbin) {
   mi_assert_internal(bbin > MI_CBIN_NONE);
   return (mi_chunkbin_t)((int)bbin - 1);
 }
@@ -310,7 +317,8 @@ static inline bool mi_bbitmap_is_setN(mi_bbitmap_t* bbitmap, size_t idx, size_t 
 }
 
 // Is a sequence of n bits already clear?
-static inline bool mi_bbitmap_is_clearN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
+// Maybe unused: called only from `mi_assert_internal` (src/arena.c), which a release build compiles out.
+MI_DECL_MAYBE_UNUSED static inline bool mi_bbitmap_is_clearN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   return mi_bbitmap_is_xsetN(MI_BIT_CLEAR, bbitmap, idx, n);
 }
 
@@ -318,6 +326,10 @@ static inline bool mi_bbitmap_is_clearN(mi_bbitmap_t* bbitmap, size_t idx, size_
 // Try to atomically transition `n` bits from all set to all clear. Returns `true` on succes.
 // `n` cannot cross chunk boundaries, where `n <= MI_CHUNK_BITS`.
 bool mi_bbitmap_try_clearNC(mi_bbitmap_t* bbitmap, size_t idx, size_t n);
+
+// #493: like `mi_bbitmap_try_clearNC`, but as an allocation of `n` slices: respects (and assigns)
+// the chunk size bins the way the find-and-clear searches do. `n <= MI_BCHUNK_BITS`.
+bool mi_bbitmap_try_claimN(mi_bbitmap_t* bbitmap, size_t idx, size_t n);
 
 
 // Specialized versions for common bit sequence sizes

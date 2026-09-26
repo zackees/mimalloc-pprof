@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import platform
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -48,17 +49,38 @@ def verify_and_smoke(dist: Path, asset: str, candidate_sha: str) -> None:
     digest = hashlib.sha256(binary).hexdigest()
     if digest != validated["binary_sha256"]:
         raise ReleaseError(f"{asset} library differs from info.json")
-    with tempfile.TemporaryDirectory(prefix="mimalloc-release-smoke-") as temp:
+    # Keep executable extraction under the Actions workspace. Windows hosted
+    # runners can deny newly written DLLs under the user-global %TEMP%, while
+    # the downloaded artifact workspace is the same boundary used by the
+    # already-passing packaged test extraction.
+    with tempfile.TemporaryDirectory(prefix="mimalloc-release-smoke-", dir=dist) as temp:
         directory = Path(temp)
         library_path = directory / Path(binary_name).name
         library_path.write_bytes(binary)
-        if asset == "windows-x64-gnu":
-            runtime = "bin/libgcc_s_seh-1.dll"
-            (directory / Path(runtime).name).write_bytes(members[runtime])
         if sys.platform == "win32":
-            with os.add_dll_directory(str(directory)):
-                library = ctypes.CDLL(str(library_path))
-                allocation_smoke(library)
+            # LoadLibrary must see the complete shipped DLL closure beside mimalloc.dll.
+            # This includes mimalloc-redirect.dll on both ABIs and libgcc on GNU.
+            dlls: dict[str, tuple[str, bytes]] = {}
+            for name, data in members.items():
+                path = Path(name)
+                if path.parent.as_posix() != "bin" or path.suffix.lower() != ".dll":
+                    continue
+                key = path.name.casefold()
+                if key in dlls:
+                    raise ReleaseError(
+                        f"case-colliding Windows DLL members: {dlls[key][0]}, {name}"
+                    )
+                dlls[key] = (name, data)
+            for key, (name, data) in dlls.items():
+                if key != library_path.name.casefold():
+                    (directory / Path(name).name).write_bytes(data)
+            # A loaded DLL cannot be deleted on Windows. Keep the load and allocation
+            # in a child process so it exits (and unloads the closure) before the
+            # TemporaryDirectory cleanup proves the extracted files are removable.
+            subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--load-only", str(library_path)],
+                check=True,
+            )
         else:
             library = ctypes.CDLL(str(library_path))
             allocation_smoke(library)
@@ -79,11 +101,20 @@ def allocation_smoke(library: ctypes.CDLL) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dist", type=Path, required=True)
-    parser.add_argument("--asset", required=True)
-    parser.add_argument("--candidate-sha", required=True)
+    parser.add_argument("--dist", type=Path)
+    parser.add_argument("--asset")
+    parser.add_argument("--candidate-sha")
+    parser.add_argument("--load-only", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
-        verify_and_smoke(args.dist, args.asset, args.candidate_sha)
-    except (ReleaseError, KeyError, OSError, ValueError) as error:
+        if args.load_only is not None:
+            if sys.platform != "win32":
+                raise ReleaseError("--load-only is only valid on Windows")
+            with os.add_dll_directory(str(args.load_only.parent)):
+                allocation_smoke(ctypes.CDLL(str(args.load_only)))
+        elif args.dist is None or args.asset is None or args.candidate_sha is None:
+            parser.error("--dist, --asset, and --candidate-sha are required")
+        else:
+            verify_and_smoke(args.dist, args.asset, args.candidate_sha)
+    except (ReleaseError, KeyError, OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"release archive smoke refused: {error}\n")

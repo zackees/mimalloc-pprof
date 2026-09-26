@@ -417,7 +417,7 @@ static bool mi_page_holes_discard(mi_page_t* page, uintptr_t dstart, size_t dsiz
 // the range can still overlap a hole we are not touching: those stay purged.
 static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool discarded) {
   mi_assert_internal(k0 <= k1 && k1 < MI_PAGE_PURGE_BITS);
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t dstart = mi_page_purge_base(page) + (k0 * os_size);
   const size_t dsize = ((k1 - k0) + 1) * os_size;
   if (discarded) { _mi_os_reuse(mi_page_subproc(page), (void*)dstart, dsize); }
@@ -540,6 +540,24 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
 }
 
+// #493: the slack past a page's last block, `[start + reserved*block_size, end of its slices)`, is
+// never formed, so no tail or hole discard reaches it. On a page carved from reused memory (the
+// resident-first claim, #501) it still holds the previous tenant's blocks, and an idle thread's
+// retired page kept that resident for good. It is given back with the rest of such a page when
+// the page is released for idling, not when the page is created: under churn the arena hands
+// those slices to the next page right away, and discarding them then only makes it refault them.
+static void mi_page_discard_slack(mi_page_t* page) {
+  if (page->memid.memkind != MI_MEM_ARENA || !mi_page_holes_madvisable(page)) return;
+  const size_t os_size = _mi_os_page_size();
+  uint8_t* const pstart = mi_page_start(page);
+  uint8_t* hi = mi_page_slice_start(page) + page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE;
+  const size_t committed = mi_page_slice_committed(page);   // 0: the whole page is committed
+  if (committed > 0 && hi > mi_page_slice_start(page) + committed) { hi = mi_page_slice_start(page) + committed; }   // never beyond what is committed
+  const uintptr_t lo = _mi_align_up((uintptr_t)pstart + (size_t)page->reserved * mi_page_block_size(page), os_size);
+  const uintptr_t ahi = _mi_align_down((uintptr_t)hi, os_size);
+  if (ahi > lo) { _mi_os_discard(mi_page_subproc(page), (void*)lo, (size_t)(ahi - lo)); }
+}
+
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
 // in it is written to. `end` is an absolute address (`UINTPTR_MAX` for the whole tail); it is
 // rounded up to an OS page, as the discard covers whole OS pages.
@@ -575,7 +593,7 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
 static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   if (page->free == NULL) return true;                    // nothing to take off the free list
 
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const size_t nbits = mi_page_purge_bits(page);
   mi_assert_internal(nbits <= MI_PAGE_PURGE_BITS);
   if (nbits > MI_PAGE_PURGE_BITS) return true;
@@ -689,6 +707,12 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   if (mi_page_all_free(page)) return;                     // the page itself is about to be freed
   if (mi_option_get(mi_option_purge_delay) < 0) return;   // purging disabled
+  if (tld->holes_busy) {
+    // #477: a page allocated from or freed to since the last busy tick (its free-list head or
+    // `used` moved) is left alone; it is swept once it stays unchanged for a whole tick.
+    const uint64_t sig = (uint64_t)(uintptr_t)page->free ^ mi_page_sweep_state(page);
+    if (page->swept_state != sig) { page->swept_state = sig; return; }
+  }
   mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
   if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }
 
@@ -731,7 +755,7 @@ bool _mi_page_unpurge_run(mi_page_t* page) {
 void _mi_page_unpurge_all(mi_page_t* page) {
   _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);   // the unformed tail goes back as well
   if (!mi_page_has_purged(page)) return;
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t base = mi_page_purge_base(page);
   size_t k = 0;
   while (k < MI_PAGE_PURGE_BITS) {
@@ -750,6 +774,143 @@ void _mi_page_unpurge_all(mi_page_t* page) {
     }
   }
   _mi_page_purged_reset(page);
+}
+
+
+/* -----------------------------------------------------------
+  Retired large pages of idle threads  (#483)
+
+  `_mi_page_retire` keeps the only page of a size class on its theap when it empties, and only
+  the owner's own later allocations free it (`_mi_theap_collect_retired`). A thread that stays
+  alive but stops allocating would pin its emptied 4 MiB large pages forever. So when a large
+  page retires, the owner resets it to "nothing formed" (`capacity == 0`, `free == NULL`: the
+  memory stays resident, so a reuse re-forms blocks without faulting, and the alloc fast path
+  can never reach a block of it) and publishes it in a slot of its tld. The scavenger discards
+  the whole block area of a page that stays published for MI_RETIRED_RELEASE_MULT purge delays,
+  as an unformed tail -- which `mi_page_extend_free` already hands back before forming a block.
+
+  The slot is the lock: whoever takes the page out of the slot owns the page's memory until it
+  puts it back. The scavenger takes it by swapping in MI_RETIRED_SLOT_BUSY (not NULL, or the
+  owner could publish another page into that slot meanwhile) for exactly one discard. The owner
+  takes it back for good (`_mi_page_unpublish_retired`) before it forms a block in the page or
+  returns the page to the arena, waiting out the scavenger's one discard if it has to.
+----------------------------------------------------------- */
+
+#define MI_RETIRED_SLOT_BUSY  ((mi_page_t*)1)   // the scavenger holds this slot's page for one discard
+
+// Owner only (from `_mi_page_retire`): reset an emptied large page and publish it for the
+// scavenger. When every slot is taken the page simply stays retired as upstream keeps it.
+void _mi_page_publish_retired(mi_page_t* page) {
+  mi_assert_internal(mi_page_all_free(page));
+  mi_assert_internal(page->retired_slot == NULL);
+  if (page->retired_slot != NULL) return;
+  mi_tld_t* const tld = mi_page_theap(page)->tld;
+  // only the owner ever fills an empty slot, so one it sees empty stays empty until it fills it
+  _Atomic(mi_page_t*)* slot = NULL;
+  for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {
+    if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[i]) == NULL) { slot = &tld->retired_pages[i]; break; }
+  }
+  if (slot == NULL) return;   // all slots full: leave it unpublished
+
+  _mi_page_unpurge_all(page);   // holes describe formed blocks, and there will be none
+  page->free = NULL;            // nothing formed: every block of the page is unformed tail now
+  page->local_free = NULL;
+  page->capacity = 0;
+  page->free_is_zero = false;
+  page->retired_at = _mi_clock_now();
+  page->retired_slot = slot;
+  mi_atomic_store_ptr_release(mi_page_t, slot, page);   // publishes the reset above to the scavenger
+  _mi_pages_release_schedule(mi_page_subproc(page));
+}
+
+// A retired (#483) or reserved (#493) page now waits for `_mi_pages_release_retired`.
+void _mi_pages_release_schedule(mi_subproc_t* subproc) {
+  if (mi_atomic_load_relaxed(&subproc->retired_published) == 0 &&
+      mi_atomic_exchange_acq_rel(&subproc->retired_published, (size_t)1) == 0) {
+    _mi_scavenger_wake(subproc);   // a sleeping scavenger has nothing scheduled to notice this by
+  }
+}
+
+// Take a published page back from the scavenger for good: before a block is formed in it or it
+// is returned to the arena. If the scavenger holds the slot, that is for one discard only.
+void _mi_page_unpublish_retired(mi_page_t* page) {
+  _Atomic(mi_page_t*)* const slot = page->retired_slot;
+  if (slot == NULL) return;
+  mi_page_t* expected = page;
+  while (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &expected, NULL)) {
+    mi_assert_internal(expected == MI_RETIRED_SLOT_BUSY);
+    expected = page;
+    _mi_prim_thread_yield();
+  }
+  page->retired_slot = NULL;
+  page->retired_at = 0;   // #493: a non-zero stamp on an unpublished page marks a reserved one
+}
+
+// A theap detached from its tld by a heap delete/destroy (`_mi_heap_detach_theaps`) has its pages
+// freed only later -- possibly after its thread exited and freed the tld, slots and all. So it takes
+// its published pages back now, while the tld is certainly alive.
+void _mi_theap_unpublish_retired(mi_theap_t* theap) {
+  for (size_t bin = 0; bin <= MI_BIN_FULL; bin++) {
+    for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {
+      if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }
+    }
+  }
+}
+
+// Scavenger: discard the memory of every published page retired for long enough. Returns true
+// when some published page is not old enough yet, i.e. the scavenger should come back.
+// #491: see MI_RELEASE_SLACK_MS. Follows the `purge_delay` option, as the releases themselves do.
+long _mi_release_bound_ms(void) {
+  const long delay = mi_option_get(mi_option_purge_delay);
+  const long arena_mult = mi_option_get(mi_option_arena_purge_mult);
+  if (delay < 0 || arena_mult < 0) return -1;   // purging is off
+  long mult = (MI_RETIRED_RELEASE_MULT > MI_PAGE_RESERVE_RELEASE_MULT ? MI_RETIRED_RELEASE_MULT : MI_PAGE_RESERVE_RELEASE_MULT);
+  if (MI_ARENA_PURGE_PERIODS * arena_mult > mult) { mult = MI_ARENA_PURGE_PERIODS * arena_mult; }
+  return mult * delay + MI_RELEASE_SLACK_MS;
+}
+
+bool _mi_pages_release_retired(mi_subproc_t* subproc) {
+  if (mi_atomic_exchange_acq_rel(&subproc->retired_published, (size_t)0) == 0) return false;
+  const long delay = mi_option_get(mi_option_purge_delay);
+  if (delay < 0) return false;   // purging disabled
+  const mi_msecs_t min_age = (mi_msecs_t)delay * MI_RETIRED_RELEASE_MULT;
+  const mi_msecs_t now = _mi_clock_now();
+  bool pending = false;
+  mi_lock(&subproc->tlds_lock) {   // keeps every registered tld (and so its slots) alive
+    for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
+      for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {
+        _Atomic(mi_page_t*)* const slot = &tld->retired_pages[i];
+        mi_page_t* page = mi_atomic_load_ptr_relaxed(mi_page_t, slot);
+        if (page == NULL || page == MI_RETIRED_SLOT_BUSY) continue;
+        if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &page, MI_RETIRED_SLOT_BUSY)) continue;   // the owner took it back
+        // the page's memory is ours until we put it back
+        if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not discarded already)
+          if (now - page->retired_at < min_age) { pending = true; }
+          else { mi_page_purge_unformed_tail(page); mi_page_discard_slack(page); }   // `capacity == 0`: the whole block area, and past it
+        }
+        mi_atomic_store_ptr_release(mi_page_t, slot, page);
+      }
+    }
+  }
+  // #493: and the empty large pages reserved at thread exit (`_mi_arenas_page_reserve`) that no
+  // thread reclaimed within their window -- an idle process has no busy sweep to release them.
+  // Only the main heap: it is never freed while the scavenger runs, and its per-arena tracking
+  // lives in the arena itself, whereas another heap's can be freed by a concurrent
+  // `mi_heap_delete` (its own threads' sweeps and the delete itself release those). The purge
+  // guard keeps the empty-arena reclaim (src/arena-reclaim.c) from freeing an arena under the walk;
+  // when a user thread holds it for a forced purge, come back at the next tick.
+  mi_heap_t* const heap_main = mi_atomic_load_ptr_acquire(mi_heap_t, &subproc->heap_main);
+  if (heap_main != NULL) {
+    if (_mi_arenas_purge_guard_acquire()) {
+      if (_mi_arenas_release_reserved(heap_main, false)) { pending = true; }
+      _mi_arenas_purge_guard_release();
+    }
+    else {
+      pending = true;
+    }
+  }
+  if (pending) { mi_atomic_store_release(&subproc->retired_published, (size_t)1); }
+  return pending;
 }
 
 
@@ -808,6 +969,39 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
   _mi_page_purge_holes_begin(tld);
   _mi_theap_visit_pages(theap, &mi_theap_page_purge_holes, true /* include full pages */, tld, NULL);
   _mi_page_purge_holes_end(tld);
+}
+
+// #477: the idle sweep never runs on a thread that never goes idle, so the OWNER also sweeps
+// the large-class pages -- the ones whose free blocks are big enough to be worth a discard --
+// of its theap and of the heap's abandoned pages (every large page is abandoned the moment it
+// is full, and a thread's pages at its exit) from its generic-malloc housekeeping, at most
+// once per `purge_holes_min_interval`. `holes_busy` makes it leave any page that was used since
+// the previous tick: its free blocks are about to be reused, and discarding them now would only
+// make the next allocation re-fault them.
+void _mi_theap_purge_large_holes(mi_theap_t* theap) {
+  mi_tld_t* const tld = theap->tld;
+  if (tld == NULL || tld->holes_sweeping || !mi_option_is_enabled(mi_option_purge_holes)) return;
+  const mi_msecs_t now = _mi_clock_now();
+  // #478: a thread's first call starts its clock instead of sweeping at once. Otherwise every new
+  // thread swept the abandoned pages it will reclaim in a moment -- a dead thread's pages look
+  // "unchanged since the last tick" -- and then refaulted them: with short-lived threads (the
+  // README's ephemeral chart) that was ~28x the minor faults and ~10% of the throughput.
+  if (tld->holes_busy_last == 0) { tld->holes_busy_last = now; return; }
+  if (now - tld->holes_busy_last < (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000)) return;
+  tld->holes_busy_last = now;
+  const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
+  const size_t bin_hi = _mi_bin(MI_LARGE_MAX_OBJ_SIZE) + 1;
+  tld->holes_busy = true;
+  _mi_arenas_purge_abandoned_holes(_mi_theap_heap(theap), tld, bin_lo, bin_hi);
+  _mi_page_purge_holes_begin(tld);
+  for (size_t bin = bin_lo; bin < bin_hi; bin++) {
+    for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {
+      _mi_page_free_collect_no_unpurge(page, true);
+      if (!mi_page_all_free(page)) { _mi_page_purge_holes(page, tld); }   // an empty page is left to page retirement
+    }
+  }
+  _mi_page_purge_holes_end(tld);
+  tld->holes_busy = false;
 }
 
 // Purge the holes in every page this thread may safely touch:
@@ -893,7 +1087,7 @@ void _mi_purge_holes_of(mi_tld_t* tld, bool force) {
     }
     for (size_t i = 0; i < heap_count; i++) {
       if (mi_tld_reclaim_requested(tld)) break;   // #366: unless the claimant asked for completion
-      _mi_arenas_purge_abandoned_holes(heaps[i], tld);
+      _mi_arenas_purge_abandoned_holes(heaps[i], tld, 0, MI_ARENA_BIN_COUNT);
     }
   }
 }
@@ -1018,7 +1212,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
     return;
   }
 
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   const uintptr_t pend = pstart + (cap * bs);
   const uintptr_t base = mi_page_purge_base(page);

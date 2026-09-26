@@ -467,10 +467,9 @@ static bool test_abandoned(void) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. large pages (4MB, for blocks over ~84KB). Whether they fit the OS-page bitmap depends
-//    on the OS page size: 4MB/4KB = 1024 bits does not fit, 4MB/16KB = 256 bits does. So we
-//    assert what the page itself reports: either it is eligible and its holes are discarded,
-//    or it is ineligible and the sweep counts it (and discards nothing). Either way its data
+// 6. large pages (4MB, for blocks over ~84KB). Since #477 one purge bit covers as many OS
+//    pages as the page needs to fit the bitmap, so every large page is eligible on every OS
+//    page size and its holes are discarded; only a singleton page (32-bit) has none. Its data
 //    must survive.
 // ---------------------------------------------------------------------------
 
@@ -493,6 +492,10 @@ static bool test_large_pages(void) {
   }
   eligible = mi_page_can_purge_holes(_mi_ptr_page(ptrs[0]));
   singleton = (_mi_ptr_page(ptrs[0])->reserved <= 1);
+  if (!singleton && !eligible) {
+    fprintf(stderr, "\n  a large page is not eligible for hole purging (#477)\n");
+    ok_all = false;
+  }
   for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
 
   before = hole_stats();
@@ -1630,6 +1633,116 @@ static void run_one_thread(void (*fun)(void)) {
 #endif
 
 // ---------------------------------------------------------------------------
+// #477: large pages give their holes back without any idle call -- while the owner stays
+//       busy (its generic-malloc housekeeping, paced by `purge_holes_min_interval`), and after
+//       a thread exits still owning them (another busy thread sweeps the abandoned page).
+// ---------------------------------------------------------------------------
+
+static void* large_keep[LARGE_N];
+
+// One block short of a full page: a full large page is abandoned at once, out of its owner's reach.
+static void large_page_with_holes(void) {   // keep the even blocks, free the odd ones
+  for (size_t i = 0; i < LARGE_N - 1; i++) {
+    large_keep[i] = mi_malloc(LARGE_SZ);
+    if (large_keep[i] != NULL) pattern_fill(large_keep[i], LARGE_SZ, i);
+  }
+  for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(large_keep[i]); large_keep[i] = NULL; }
+}
+
+static bool large_survivors_ok_and_free(void) {
+  bool ok = true;
+  for (size_t i = 0; i < LARGE_N; i += 2) {
+    if (large_keep[i] == NULL || pattern_check(large_keep[i], LARGE_SZ, i) != LARGE_SZ) ok = false;
+    mi_free(large_keep[i]);
+    large_keep[i] = NULL;
+  }
+  return ok;
+}
+
+static void stay_busy(void) {   // allocate through the generic path, never idle
+  const mi_msecs_t start = _mi_clock_now();
+  while (_mi_clock_now() - start < 300) { mi_free(mi_malloc(2 * LARGE_SZ)); }
+}
+
+static bool test_large_holes_without_idle(void) {
+  hole_stats_t before = hole_stats();
+  large_page_with_holes();
+  stay_busy();
+  bool ok = expect_purged(before, "large-busy");
+  if (!large_survivors_ok_and_free()) { fprintf(stderr, "\n  large-busy: CORRUPT survivor\n"); ok = false; }
+
+  before = hole_stats();
+  run_one_thread(&large_page_with_holes);   // exits still owning the even blocks
+  stay_busy();
+  if (!expect_purged(before, "large-exit")) ok = false;
+  if (!large_survivors_ok_and_free()) { fprintf(stderr, "\n  large-exit: CORRUPT survivor\n"); ok = false; }
+  return ok;
+}
+
+// #483: a thread that stays alive but stops allocating must not keep an emptied large page
+//       resident: nothing can sweep its pages, so the page must go back to the arena, whose
+//       deferred purge returns it.
+// ---------------------------------------------------------------------------
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+
+// #491: a release test polls up to the release bound instead of sleeping a fixed time, so it
+// fails only when the memory really is late. The bound is the allocator's promise; the margin
+// is for a loaded runner that delays the scavenger, and the time it took is reported either way.
+#define RELEASE_POLL_MS      (5)
+#define RELEASE_TEST_MARGIN  (4)
+
+// Poll until fewer than a quarter of the `os_pages` OS pages at `p` are resident, or the bound
+// (times the margin) passes. Returns the milliseconds it took; `*resident` is the last count.
+static long poll_until_released(const void* p, size_t os_pages, size_t* resident) {
+  const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
+  const mi_msecs_t limit = (mi_msecs_t)_mi_release_bound_ms() * RELEASE_TEST_MARGIN;
+  const mi_msecs_t start = _mi_clock_now();
+  unsigned char vec[64];
+  if (os_pages > sizeof(vec)) { os_pages = sizeof(vec); }
+  for (;;) {
+    *resident = 0;
+    if (mincore((void*)_mi_align_down((uintptr_t)p, psize), os_pages * psize, vec) == 0) {
+      for (size_t i = 0; i < os_pages; i++) { *resident += (vec[i] & 1); }
+    }
+    const mi_msecs_t elapsed = _mi_clock_now() - start;
+    if (*resident * 4 < os_pages || elapsed > limit) return (long)elapsed;
+    usleep(RELEASE_POLL_MS * 1000);
+  }
+}
+
+static volatile int idle_ready, idle_release;
+static uint8_t* idle_block;
+
+static void* idle_thread(void* arg) {
+  (void)arg;
+  idle_block = (uint8_t*)mi_malloc(256 * 1024);   // a large page, the only one of its class
+  if (idle_block != NULL) { memset(idle_block, 1, 256 * 1024); mi_free(idle_block); }
+  idle_ready = 1;
+  while (!idle_release) { usleep(1000); }          // alive, but never allocates again
+  return NULL;
+}
+
+static bool test_idle_thread_releases_large_page(void) {
+  const long delay = mi_option_get(mi_option_purge_delay);
+  mi_option_set(mi_option_purge_delay, 20);
+  pthread_t t;
+  if (pthread_create(&t, NULL, &idle_thread, NULL) != 0) return false;
+  while (!idle_ready) { usleep(1000); }
+  size_t resident = 64;
+  const long took = (idle_block != NULL ? poll_until_released(idle_block, 64, &resident) : -1);
+  const long bound = _mi_release_bound_ms();
+  idle_release = 1;
+  pthread_join(t, NULL);
+  mi_option_set(mi_option_purge_delay, delay);
+  fprintf(stderr, "(freed block: %zu of 64 OS pages resident after %ld ms; bound %ld ms) ", resident, took, bound);
+  return resident * 4 < 64;
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // 12. `purge_holes_min_interval` paces the OWNER's own sweeps, not only the
 //     scavenger's claim of a parked thread's tld.
 //
@@ -1672,6 +1785,45 @@ static bool pace_churn(void** ptrs, size_t n, size_t sz) {
     if ((i % 4) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; }
   }
   return true;
+}
+
+// #478: a new thread's first busy tick only starts its clock. Before, every new thread swept the
+// abandoned large pages at its first slow-path malloc, and a page a dead thread left behind looks
+// "unchanged since the last tick" to it (the signature an earlier thread recorded) -- so it was
+// discarded and then refaulted when reclaimed. Thread A leaves such a page (live blocks with
+// freed holes); B and C each live one tick, far shorter than the interval, on another size class
+// (so neither reclaims A's page): B's tick would record the signature, C's would discard.
+#define FIRST_SWEEP_ALLOCS  (3000)            // several generic-malloc admin ticks (every 1000th)
+#define FIRST_SWEEP_A_SIZE  (200 * 1024)      // A's page
+#define FIRST_SWEEP_BC_SIZE (320 * 1024)      // another large size class
+#define FIRST_SWEEP_A_COUNT (16)
+
+static void* first_sweep_a_blocks[FIRST_SWEEP_A_COUNT];
+
+static void first_sweep_thread_a(void) {   // leaves an abandoned page with holes
+  for (int i = 0; i < FIRST_SWEEP_A_COUNT; i++) {
+    first_sweep_a_blocks[i] = mi_malloc(FIRST_SWEEP_A_SIZE);
+    if (first_sweep_a_blocks[i] != NULL) { memset(first_sweep_a_blocks[i], 1, FIRST_SWEEP_A_SIZE); }
+  }
+  for (int i = 0; i < FIRST_SWEEP_A_COUNT; i += 2) { mi_free(first_sweep_a_blocks[i]); first_sweep_a_blocks[i] = NULL; }
+}
+
+static void first_sweep_thread(void) {     // one short life with a few admin ticks
+  for (int i = 0; i < FIRST_SWEEP_ALLOCS; i++) { void* p = mi_malloc(FIRST_SWEEP_BC_SIZE); mi_free(p); }
+}
+
+static bool test_new_thread_does_not_sweep_at_once(void) {
+  const long interval = mi_option_get(mi_option_purge_holes_min_interval);
+  mi_option_set(mi_option_purge_holes_min_interval, PACE_INTERVAL_MS);   // far longer than B and C live
+  run_one_thread(&first_sweep_thread_a);
+  run_one_thread(&first_sweep_thread);                                    // B
+  const int64_t before = hole_stats().discards;
+  run_one_thread(&first_sweep_thread);                                    // C
+  const int64_t discarded = hole_stats().discards - before;
+  mi_option_set(mi_option_purge_holes_min_interval, interval);
+  for (int i = 1; i < FIRST_SWEEP_A_COUNT; i += 2) { mi_free(first_sweep_a_blocks[i]); first_sweep_a_blocks[i] = NULL; }
+  fprintf(stderr, "(discards by a short-lived thread: %lld) ", (long long)discarded);
+  return (!purging_enabled || discarded == 0);
 }
 
 static bool test_owner_sweep_pacing(void) {
@@ -1756,6 +1908,237 @@ static bool layout_is_predictable(void) {
   #endif
 }
 
+// ---------------------------------------------------------------------------
+// #493: a thread that exits with an empty large page reserves it for the next thread of the
+//       heap, which reclaims it as is -- instead of carving a NEW page over the same, still
+//       resident slices, whose unformed tail then stays resident too. And a reserved page that
+//       nobody reclaims goes back after MI_PAGE_RESERVE_RELEASE_MULT purge delays.
+// ---------------------------------------------------------------------------
+#define RESERVE_SZ        (400 * 1024)   // the 448 KiB large bin: no other case in this file uses it
+#define RESERVE_N         (3)            // blocks thread A forms (well short of a full page)
+#define RESERVE_WINDOW_MS (1000)         // purge delay for the reuse case: nothing may release the page meanwhile
+
+static void*      reserve_a_block;       // thread A's first block
+static mi_page_t* reserve_a_page;
+static size_t     reserve_a_bin;         // the stats bin of A's page
+static bool       reserve_a_singleton;
+static mi_page_t* reserve_b_page;
+
+static void reserve_thread_a(void) {     // form a few blocks, touch them, free them all, exit
+  void* p[RESERVE_N];
+  for (size_t i = 0; i < RESERVE_N; i++) {
+    p[i] = mi_malloc(RESERVE_SZ);
+    if (p[i] != NULL) memset(p[i], 1, RESERVE_SZ);
+  }
+  reserve_a_block = p[0];
+  if (p[0] != NULL) {
+    reserve_a_page = _mi_ptr_page(p[0]);
+    reserve_a_bin = _mi_page_stats_bin(reserve_a_page);
+    reserve_a_singleton = mi_page_is_singleton(reserve_a_page);
+  }
+  for (size_t i = 0; i < RESERVE_N; i++) { mi_free(p[i]); }
+}
+
+static void reserve_thread_b(void) {     // one block of the same size class, then exit
+  void* p = mi_malloc(RESERVE_SZ);
+  reserve_b_page = (p != NULL ? _mi_ptr_page(p) : NULL);
+  if (p != NULL) memset(p, 2, RESERVE_SZ);
+  mi_free(p);
+}
+
+static void reserve_reset(void) {
+  reserve_a_block = NULL; reserve_a_page = NULL; reserve_a_bin = 0;
+  reserve_a_singleton = false; reserve_b_page = NULL;
+}
+
+// Pages ever created in A's size class. Page equality alone could pass by accident: a page freed
+// at A's exit and carved anew by B over the same slices sits at the same address. A reused page
+// is never CREATED, so the bin's `total` (which only grows, and which B merges into its heap's
+// stats when it exits) is the signal that cannot.
+static int64_t reserve_pages_created(void) {
+  mi_stats_t_decl(st);
+  if (!mi_stats_get(&st)) return -1;
+  return st.page_bins[reserve_a_bin].total;
+}
+
+static bool test_dead_thread_page_is_reused(void) {
+  if (!layout_is_predictable()) {
+    fprintf(stderr, "(skipped: every allocation is guarded) ");
+    return true;
+  }
+  const long delay = mi_option_get(mi_option_purge_delay);
+  const long reserve = mi_option_get(mi_option_page_reserve);
+  bool ok = true;
+  mi_collect(true);   // start with nothing reserved
+  mi_option_set(mi_option_purge_delay, RESERVE_WINDOW_MS);
+
+  // (a) on: B's block lies in A's page, and B created no page of that size class
+  mi_option_set(mi_option_page_reserve, 1);
+  reserve_reset();
+  run_one_thread(&reserve_thread_a);
+  if (reserve_a_block == NULL) { fprintf(stderr, "\n  thread A could not allocate\n"); ok = false; goto done; }
+  if (reserve_a_singleton) { fprintf(stderr, "(skipped: %d KiB blocks get a singleton page in this build) ", RESERVE_SZ / 1024); goto done; }
+  {
+    const int64_t before = reserve_pages_created();
+    run_one_thread(&reserve_thread_b);
+    const int64_t after = reserve_pages_created();
+    if (reserve_b_page != reserve_a_page) {
+      fprintf(stderr, "\n  thread B's block is not in the page thread A left behind (%p vs %p)\n",
+              (void*)reserve_b_page, (void*)reserve_a_page);
+      ok = false;
+    }
+    if (before < 0 || after != before) {
+      fprintf(stderr, "\n  thread B created %lld page(s) in the %d KiB class instead of reusing A's\n",
+              (long long)(after - before), RESERVE_SZ / 1024);
+      ok = false;
+    }
+  }
+
+  // (b) off: the page is freed at A's exit, as upstream does; where B lands is not our business
+  mi_collect(true);   // hand back the page (a) left reserved (B's exit reserved it again)
+  mi_option_set(mi_option_page_reserve, 0);
+  reserve_reset();
+  run_one_thread(&reserve_thread_a);
+  run_one_thread(&reserve_thread_b);
+
+done:
+  mi_option_set(mi_option_page_reserve, reserve);
+  mi_option_set(mi_option_purge_delay, delay);
+  mi_collect(true);
+  return ok;
+}
+
+#if !defined(_WIN32)
+#define RESERVE_DELAY_MS  (20)   // purge delay for the release case: the window is MI_PAGE_RESERVE_RELEASE_MULT of these
+
+// Nobody reclaims the reserved page: after its window the scavenger (this process allocates
+// nothing meanwhile, so there is no busy sweep) hands it back to the arena, whose deferred purge
+// then returns its memory. Polled up to the release bound (#491), not a fixed sleep.
+static bool test_reserved_page_is_released(void) {
+  if (!layout_is_predictable()) {
+    fprintf(stderr, "(skipped: every allocation is guarded) ");
+    return true;
+  }
+  const long delay = mi_option_get(mi_option_purge_delay);
+  const long reserve = mi_option_get(mi_option_page_reserve);
+  bool ok = true;
+  mi_collect(true);
+  mi_option_set(mi_option_purge_delay, RESERVE_DELAY_MS);
+  mi_option_set(mi_option_page_reserve, 1);
+  reserve_reset();
+  run_one_thread(&reserve_thread_a);   // exits: its page, blocks touched, is now reserved
+  if (reserve_a_block == NULL) { fprintf(stderr, "\n  thread A could not allocate\n"); ok = false; goto done; }
+  if (reserve_a_singleton) { fprintf(stderr, "(skipped: singleton page) "); goto done; }
+  {
+    size_t resident = 64;
+    const long took = poll_until_released(reserve_a_block, 64, &resident);
+    fprintf(stderr, "(reserved page: %zu of 64 OS pages resident after %ld ms; bound %ld ms) ",
+            resident, took, _mi_release_bound_ms());
+    if (resident * 4 >= 64) {
+      fprintf(stderr, "\n  the reserved page was not released within %ld ms\n", took);
+      ok = false;
+    }
+  }
+done:
+  mi_option_set(mi_option_page_reserve, reserve);
+  mi_option_set(mi_option_purge_delay, delay);
+  return ok;
+}
+
+// #493 strategy 9: a page carved from reused memory keeps the previous tenant's blocks resident
+// in the slack past its own last block. Thread A fills a large page with SLACK_OLD_SIZE blocks
+// and exits (page reserve off, so its slices go back to the arena, still resident); an idle
+// thread then takes one SLACK_NEW_SIZE block -- resident-first carves its page over A's range,
+// 10 blocks where A had 31, so ~250 KiB of A's written blocks lie past its last block -- frees
+// it and idles. When the retired page is released for idling, its slack must go too.
+#define SLACK_OLD_SIZE   (128 * 1024 - 256)   // 31 blocks fill a large page
+#define SLACK_NEW_SIZE   (384 * 1024 - 256)   // 10 blocks: the rest of the page is slack
+#define SLACK_OLD_COUNT  (31)
+
+static uint8_t* slack_old_lo;
+static uint8_t* slack_old_hi;
+static volatile int slack_ready, slack_release;
+static uint8_t* slack_new;
+static uintptr_t slack_lo, slack_hi;   // the new page's slack over A's written blocks (set while the block is live)
+
+static void slack_fill_page(void) {
+  void* p[SLACK_OLD_COUNT];
+  slack_old_lo = NULL; slack_old_hi = NULL;
+  for (int i = 0; i < SLACK_OLD_COUNT; i++) {
+    p[i] = mi_malloc(SLACK_OLD_SIZE);
+    if (p[i] == NULL) continue;
+    memset(p[i], 1, SLACK_OLD_SIZE);
+    if (slack_old_lo == NULL || (uint8_t*)p[i] < slack_old_lo) { slack_old_lo = (uint8_t*)p[i]; }
+    if ((uint8_t*)p[i] + SLACK_OLD_SIZE > slack_old_hi) { slack_old_hi = (uint8_t*)p[i] + SLACK_OLD_SIZE; }
+  }
+  for (int i = 0; i < SLACK_OLD_COUNT; i++) { mi_free(p[i]); }
+}
+
+static void* slack_idle_thread(void* arg) {
+  (void)arg;
+  slack_new = (uint8_t*)mi_malloc(SLACK_NEW_SIZE);
+  slack_lo = slack_hi = 0;
+  if (slack_new != NULL) {
+    const mi_page_t* const page = _mi_ptr_page(slack_new);
+    const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
+    const uintptr_t page_end = (uintptr_t)mi_page_slice_start(page) + page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE;
+    slack_lo = _mi_align_up((uintptr_t)mi_page_start(page) + (size_t)page->reserved * mi_page_block_size(page), psize);
+    slack_hi = _mi_align_down(((uintptr_t)slack_old_hi < page_end ? (uintptr_t)slack_old_hi : page_end), psize);   // A's written blocks in it
+    memset(slack_new, 2, SLACK_NEW_SIZE);
+    mi_free(slack_new);   // the page retires
+  }
+  slack_ready = 1;
+  while (!slack_release) { usleep(1000); }   // alive, but never allocates again
+  return NULL;
+}
+
+static bool test_retired_page_slack_released(void) {
+  if (!layout_is_predictable()) { fprintf(stderr, "(skipped: every allocation is guarded) "); return true; }
+  const long delay = mi_option_get(mi_option_purge_delay);
+  const long reserve = mi_option_get(mi_option_page_reserve);
+  mi_collect(true);                                    // nothing queued but what this case frees
+  mi_option_set(mi_option_purge_delay, RESERVE_DELAY_MS);
+  mi_option_set(mi_option_page_reserve, 0);
+  run_one_thread(&slack_fill_page);
+  pthread_t t;
+  bool ok = true;
+  slack_ready = 0; slack_release = 0;
+  if (pthread_create(&t, NULL, &slack_idle_thread, NULL) != 0) { ok = false; goto done; }
+  while (!slack_ready) { usleep(1000); }
+  {
+    const size_t psize = (size_t)sysconf(_SC_PAGESIZE);
+    const uintptr_t lo = slack_lo, hi = slack_hi;
+    if (slack_new == NULL || (uint8_t*)slack_new < slack_old_lo || (uint8_t*)slack_new >= slack_old_hi || hi <= lo) {
+      fprintf(stderr, "(skipped: the new page did not land on the old one's written blocks) ");
+    }
+    else {
+      const mi_msecs_t limit = (mi_msecs_t)_mi_release_bound_ms() * RELEASE_TEST_MARGIN;
+      const mi_msecs_t start = _mi_clock_now();
+      size_t resident = 0, total = 0;
+      for (;;) {
+        unsigned char vec[128];
+        resident = 0; total = 0;
+        for (uintptr_t a = lo; a < hi; a += sizeof(vec) * psize) {
+          const size_t n = ((hi - a) / psize < sizeof(vec) ? (hi - a) / psize : sizeof(vec));
+          if (mincore((void*)a, n * psize, vec) != 0) break;
+          for (size_t i = 0; i < n; i++) { resident += (vec[i] & 1); total++; }
+        }
+        if (resident == 0 || _mi_clock_now() - start > limit) break;
+        usleep(RELEASE_POLL_MS * 1000);
+      }
+      fprintf(stderr, "(slack: %zu of %zu OS pages resident after %lld ms) ", resident, total, (long long)(_mi_clock_now() - start));
+      ok = (resident == 0);
+    }
+  }
+  slack_release = 1;
+  pthread_join(t, NULL);
+done:
+  mi_option_set(mi_option_page_reserve, reserve);
+  mi_option_set(mi_option_purge_delay, delay);
+  return ok;
+}
+#endif
+
 int main(void) {
   mi_version();
   purging_enabled = mi_option_is_enabled(mi_option_purge_holes);
@@ -1825,6 +2208,14 @@ int main(void) {
   CHECK("sweep-does-not-unpurge-on-collect", test_sweep_no_unpurge_on_collect());
   CHECK("sweep-full-every-bounds-a-missed-hole", test_sweep_full_every());
   CHECK("owner-sweeps-are-paced", test_owner_sweep_pacing());
+  CHECK("new-thread-does-not-sweep-at-once", test_new_thread_does_not_sweep_at_once());
+  #if !defined(_WIN32)
+  CHECK("idle-thread-releases-large-page", test_idle_thread_releases_large_page());
+  CHECK("reserved-page-is-released", test_reserved_page_is_released());
+  CHECK("retired-page-slack-released", test_retired_page_slack_released());
+  #endif
+  CHECK("dead-thread-page-is-reused", test_dead_thread_page_is_reused());
+  CHECK("large-holes-without-idle", test_large_holes_without_idle());
 
   // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);

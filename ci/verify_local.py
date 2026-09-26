@@ -894,6 +894,14 @@ def run_lint(ctx: RunCtx) -> bool:
         # cross-built bundle and the PR-diff decision that picks the lane.
         ["uv", "run", "ci/check_macos_labels.py", "--selftest"],
         ["uv", "run", "ci/macos_lane_decide.py", "--selftest"],
+        # No file-wide -Wunused-function suppression; the amalgamation compiles with
+        # -Werror=unused-function when clang is available.
+        ["uv", "run", "ci/check_no_diagnostic_suppression.py", "--selftest"],
+        ["uv", "run", "ci/check_no_diagnostic_suppression.py"],
+        ["uv", "run", "ci/check_macro_case.py", "--selftest"],
+        ["uv", "run", "ci/check_macro_case.py"],
+        ["uv", "run", "ci/check_release_ratchet.py", "--selftest"],
+        ["uv", "run", "ci/check_release_ratchet.py", "--base", "origin/main"],
     ):
         rc, _ = run_logged(cmd, cwd=ROOT, log=ctx.log)
         ok = ok and rc == 0

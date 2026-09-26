@@ -36,6 +36,17 @@ terms of the MIT license. A copy of the license can be found in the file
   #define mi_decl_nodiscard
 #endif
 
+// Marks a `static` function that a translation unit may legitimately not call (for
+// example, one used only on some platforms or configurations); every use carries a
+// comment saying why. Defined here, not in internal.h, so every header can use it.
+#if (defined(__GNUC__) && (__GNUC__ >= 7)) || defined(__clang__)  // includes clang and icc
+  #define MI_DECL_MAYBE_UNUSED    __attribute__((unused))
+#elif defined(__cplusplus) && (__cplusplus >= 201703L)            // c++17
+  #define MI_DECL_MAYBE_UNUSED    [[maybe_unused]]
+#else
+  #define MI_DECL_MAYBE_UNUSED
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
   #if !defined(MI_SHARED_LIB)
     #define mi_decl_export
@@ -544,19 +555,20 @@ mi_decl_nodiscard mi_decl_export                  void* mi_theap_rezalloc(mi_the
 // Fast constant size allocations.
 // ------------------------------------------------------
 
-static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexcept {
+// Maybe unused: public inline API for applications; the library itself never calls these.
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_malloc_small(size); } else { return mi_malloc(size); }
 }
-static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_zalloc_small(size); } else { return mi_zalloc(size); }
 }
-static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_malloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
 }
-static inline mi_decl_restrict void* mi_theap_zalloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_theap_zalloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_zalloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
 }
-static inline void mi_free_csize(void* p, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline void mi_free_csize(void* p, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { mi_free_small(p); } else { mi_free(p); }
 }
 
@@ -636,7 +648,7 @@ typedef enum mi_option_e {
   mi_option_deprecated_max_segment_reclaim,  // max. percentage of the abandoned segments can be reclaimed per try (=10%)
   mi_option_destroy_on_exit,            // if set, release all memory on exit; sometimes used for dynamic unloading but can be unsafe
   mi_option_arena_reserve,              // initial memory size for arena reservation (= 1 GiB on 64-bit) (internally, this value is in KiB; use `mi_option_get_size`)
-  mi_option_arena_purge_mult,           // multiplier for `purge_delay` for the purging delay for arenas (=10)
+  mi_option_arena_purge_mult,           // multiplier for `purge_delay` for the purging delay for arenas (=4, #486)
   mi_option_deprecated_purge_extend_delay,
   mi_option_disallow_arena_alloc,       // 1 = do not use arena's for allocation (except if using specific arena id's)
   mi_option_retry_on_oom,               // retry on out-of-memory for N milli seconds (=400), set to 0 to disable retries. (only on windows)
@@ -677,6 +689,8 @@ typedef enum mi_option_e {
   mi_option_purge_holes_min_interval,   // do not sweep one thread's heaps more often than every N milli-seconds (=100)
   mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=64); 0 disables
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin". Bun parity (#338)
+  mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
+  mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

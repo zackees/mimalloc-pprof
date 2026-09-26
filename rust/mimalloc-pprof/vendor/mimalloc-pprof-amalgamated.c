@@ -1,8 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ff7b5e5b of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
-
-#if defined(__clang__) || defined(__GNUC__)
-#pragma GCC diagnostic ignored "-Wunused-function"
-#endif
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 97209db8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -56,6 +52,17 @@ terms of the MIT license. A copy of the license can be found in the file
   #define mi_decl_nodiscard    _Check_return_
 #else
   #define mi_decl_nodiscard
+#endif
+
+// Marks a `static` function that a translation unit may legitimately not call (for
+// example, one used only on some platforms or configurations); every use carries a
+// comment saying why. Defined here, not in internal.h, so every header can use it.
+#if (defined(__GNUC__) && (__GNUC__ >= 7)) || defined(__clang__)  // includes clang and icc
+  #define MI_DECL_MAYBE_UNUSED    __attribute__((unused))
+#elif defined(__cplusplus) && (__cplusplus >= 201703L)            // c++17
+  #define MI_DECL_MAYBE_UNUSED    [[maybe_unused]]
+#else
+  #define MI_DECL_MAYBE_UNUSED
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -566,19 +573,20 @@ mi_decl_nodiscard mi_decl_export                  void* mi_theap_rezalloc(mi_the
 // Fast constant size allocations.
 // ------------------------------------------------------
 
-static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexcept {
+// Maybe unused: public inline API for applications; the library itself never calls these.
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_malloc_small(size); } else { return mi_malloc(size); }
 }
-static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_zalloc_small(size); } else { return mi_zalloc(size); }
 }
-static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_malloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
 }
-static inline mi_decl_restrict void* mi_theap_zalloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline mi_decl_restrict void* mi_theap_zalloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_zalloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
 }
-static inline void mi_free_csize(void* p, size_t size) mi_attr_noexcept {
+MI_DECL_MAYBE_UNUSED static inline void mi_free_csize(void* p, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { mi_free_small(p); } else { mi_free(p); }
 }
 
@@ -658,7 +666,7 @@ typedef enum mi_option_e {
   mi_option_deprecated_max_segment_reclaim,  // max. percentage of the abandoned segments can be reclaimed per try (=10%)
   mi_option_destroy_on_exit,            // if set, release all memory on exit; sometimes used for dynamic unloading but can be unsafe
   mi_option_arena_reserve,              // initial memory size for arena reservation (= 1 GiB on 64-bit) (internally, this value is in KiB; use `mi_option_get_size`)
-  mi_option_arena_purge_mult,           // multiplier for `purge_delay` for the purging delay for arenas (=10)
+  mi_option_arena_purge_mult,           // multiplier for `purge_delay` for the purging delay for arenas (=4, #486)
   mi_option_deprecated_purge_extend_delay,
   mi_option_disallow_arena_alloc,       // 1 = do not use arena's for allocation (except if using specific arena id's)
   mi_option_retry_on_oom,               // retry on out-of-memory for N milli seconds (=400), set to 0 to disable retries. (only on windows)
@@ -699,6 +707,8 @@ typedef enum mi_option_e {
   mi_option_purge_holes_min_interval,   // do not sweep one thread's heaps more often than every N milli-seconds (=100)
   mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=64); 0 disables
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin". Bun parity (#338)
+  mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
+  mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -1848,7 +1858,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #define mi_atomic_decrement_acq_rel(p)           mi_atomic_sub_acq_rel(p,(uintptr_t)1)
 
 static inline intptr_t mi_atomic_addi(_Atomic(intptr_t)*p, intptr_t add);
-static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub);
+MI_DECL_MAYBE_UNUSED static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub);  // see its definition
 
 
 #if defined(MI_USE_C11_ATOMICS) || defined(__cplusplus) || !defined(_MSC_VER) || MI_HAS_C11_ATOMICS
@@ -2131,7 +2141,8 @@ static inline intptr_t mi_atomic_addi(_Atomic(intptr_t)*p, intptr_t add) {
 }
 
 // Atomically subtract a signed value; returns the previous value.
-static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub) {
+// Maybe unused: kept from upstream to complete the addi/subi pair; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline intptr_t mi_atomic_subi(_Atomic(intptr_t)*p, intptr_t sub) {
   return (intptr_t)mi_atomic_addi(p, -sub);
 }
 
@@ -2670,12 +2681,68 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 //   4 KiB  OS page: small (64 KiB) = 16 bits, medium (512 KiB) = 128, large (4 MiB) = 1024
 //   16 KiB OS page: small = 4, medium = 32, large = 256  (fits, exactly at the limit)
 //   64 KiB OS page: small = 1, medium = 8,  large = 64
-// -- i.e. every small and medium page always, and a large page on a 16 KiB or larger OS
-// page. A large page on a 4 KiB OS page needs 1024 bits and stays ineligible. The check is
-// at runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in
-// `src/page-holes.c`), never at compile time: `_mi_os_page_size()` is not a constant.
+// -- i.e. every small and medium page, and a large page from a 16 KiB OS page up. A large
+// page on a 4 KiB OS page would need 1024 bits, so there one bit covers 16 KiB instead
+// (`mi_page_purge_unit`, #477). The unit is computed at runtime, never at compile time:
+// `_mi_os_page_size()` is not a constant.
 #define MI_PAGE_PURGE_BITS                (256)
 #define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
+
+// #483: a thread publishes up to this many retired (emptied) large pages; the scavenger discards
+// the memory of one that stays retired for MI_RETIRED_RELEASE_MULT purge delays.
+#ifndef MI_RETIRED_PAGE_SLOTS
+#define MI_RETIRED_PAGE_SLOTS             (16)
+#endif
+#ifndef MI_RETIRED_RELEASE_MULT
+#define MI_RETIRED_RELEASE_MULT           (10)
+#endif
+// #493: an empty large page that a thread leaves behind at its exit is reserved (abandoned into
+// the arena, blocks formed and resident) for the next thread of the heap instead of freed; one
+// that nobody reclaims for this many purge delays goes back to the arena. The same value as
+// MI_RETIRED_RELEASE_MULT on purpose: both answer "how long may an emptied large page stay
+// resident in case its size class is wanted again", and the two must not disagree, or an idle
+// process would keep its reserved pages longer (or shorter) than its retired ones.
+#ifndef MI_PAGE_RESERVE_RELEASE_MULT
+#define MI_PAGE_RESERVE_RELEASE_MULT      (10)
+#endif
+
+// #491: the one bound on "freed memory that stays idle is back with the OS within N ms"
+// (`_mi_release_bound_ms`, src/page-holes.c): the slower of the two page releases above (a released
+// page is purged at once, #486) and the arena purge of freed memory (MI_ARENA_PURGE_PERIODS arena
+// periods, #481), plus MI_RELEASE_SLACK_MS for the scavenger to wake and run.
+// Tests poll up to it and perf-ab holds the release time to it (ci/release_ratchet.json).
+#ifndef MI_RELEASE_SLACK_MS
+#define MI_RELEASE_SLACK_MS               (300)
+#endif
+#define MI_ARENA_PURGE_PERIODS            (2)   // #481: a range is purged at the second deadline after its free
+
+// #486: freed arena memory stays resident for one to MI_ARENA_PURGE_PERIODS arena purge periods of
+// `arena_purge_mult` x `purge_delay` (400-800 ms by default) in case it is reused, then goes back
+// to the OS. Measured on perf-ab's bursty row (pauses of 300 ms): 1 (100-200 ms) refaulted every
+// burst (~120,000 minor faults), 4 about 1,300, with the same peak and release time.
+#ifndef MI_ARENA_PURGE_MULT_DEFAULT
+#define MI_ARENA_PURGE_MULT_DEFAULT       (4)
+#endif
+
+// #493 (strategy 9): a new page first tries to claim free slices that are still resident (queued
+// for purge, see above) before the plain free-slice search, which knows nothing of residency and
+// would often fault in fresh or purged memory instead. At most this many queued runs long enough
+// for the page are tried per allocation: a failed try is a run that another thread, the purge, or
+// an earlier allocation took (a stale queue bit), and after a handful of those the queue is
+// mostly stale, so the plain search is the better bet. Keeps the extra cost per page small.
+#ifndef MI_RESIDENT_FIRST_MAX_TRIES
+#define MI_RESIDENT_FIRST_MAX_TRIES       (8)
+#endif
+
+// #517: resident-first (#493) is only tried for claims of at least this many slices (default 16
+// = 1 MiB with 64 KiB slices: large and singleton pages). A small or medium page taking the first
+// queued run that fits bypasses the size-binned chunk layout of the plain search, so other size
+// classes' reusable runs are consumed and those classes spill into fresh chunks: the memory gate
+// peak rose 58.2 -> 61-63.7 MB (#514). Measured: >=16 restores 58.3 MB; #501's short-lived-thread
+// win comes from 4 MiB large pages (64 slices), which stay covered.
+#ifndef MI_RESIDENT_FIRST_MIN_SLICES
+#define MI_RESIDENT_FIRST_MIN_SLICES      (16)
+#endif
 
 
 // ------------------------------------------------------
@@ -2789,6 +2856,10 @@ typedef uintptr_t  mi_encoded_t;
 
 // thread id's
 typedef size_t     mi_threadid_t;
+
+// Milliseconds as in `int64_t` to avoid overflows (declared here rather than with the
+// thread-local data below because `mi_page_t::retired_at` uses it, #483)
+typedef int64_t    mi_msecs_t;
 
 // free lists contain blocks
 typedef struct mi_block_s {
@@ -2907,6 +2978,15 @@ typedef struct mi_page_s {
   // was allocated or freed in it since, so the sweep has nothing new to discard (see
   // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". Cold, like `purged` above.
   uint64_t                  swept_state;
+
+  // #483: a retired large page published for the scavenger (`_mi_page_retire`): the owner's tld
+  // slot holding it (NULL when not published) and when it was retired. Whoever clears the slot
+  // owns the page's memory until it puts it back.
+  // #493: `retired_at` doubles as the reserve stamp. It is cleared when a page is unpublished,
+  // so on an abandoned page (never published) a non-zero value means "reserved at that time"
+  // (`_mi_arenas_page_reserve`), and reclaiming the page clears it again.
+  _Atomic(struct mi_page_s*)* retired_slot;
+  mi_msecs_t                retired_at;
 } mi_page_t;
 
 // An impossible `(capacity,used)` (`used > capacity` never holds): "this page has no sweep state".
@@ -3179,15 +3259,13 @@ struct mi_subproc_s {
   mi_decl_align(8)   // a LITERAL: MSVC's __declspec(align()) rejects `MI_SIZE_SIZE` (a parenthesized
                      // expression) with C2059, and 8 over-aligns the 4-byte word harmlessly
   _Atomic(mi_scav_word_t) scavenger_wake;               // wait word signalled when a purge is scheduled (the scavenger thread waits on this)
+  _Atomic(size_t)       retired_published;              // #483: 1 when some tld may hold a retired large page for the scavenger (appended at the tail, see above); #493: or the main heap a reserved one
 };
 
 
 // ------------------------------------------------------
 // Thread Local data
 // ------------------------------------------------------
-
-// Milliseconds as in `int64_t` to avoid overflows
-typedef int64_t  mi_msecs_t;
 
 // Allocation sampling profiler per-thread state (MI_PPROF).
 typedef struct mi_profiler_tld_s {
@@ -3275,7 +3353,9 @@ struct mi_tld_s {
   // go through `mi_atomic_addi64_relaxed`, the 64-bit primitive, exactly as `mi_stat_counter_t`.
   size_t                holes_sweep_seq;      // idle sweeps of this thread's heaps so far (`purge_holes_full_every`)
   mi_msecs_t            holes_sweep_last;     // when the last one ran (`purge_holes_min_interval` pacing)
+  mi_msecs_t            holes_busy_last;      // when the owner last swept its large pages while busy (#477)
   bool                  holes_sweeping;       // a sweep of this thread's heaps is in progress right now
+  bool                  holes_busy;           // ... and it is the owner's busy-time sweep (#477): leave pages used this period
   bool                  holes_sweep_full;     // ... and it ignores `page->swept_state` (every N'th sweep)
   size_t                holes_sweep_skipped;  // per-pass counters, folded into the process-wide ones by
   size_t                holes_sweep_visited;  // `_mi_page_purge_holes_end` (a per-page atomic would cost real time)
@@ -3289,6 +3369,7 @@ struct mi_tld_s {
   _Atomic(size_t)       purge_epoch;          // `mi_purge_all` walk progress / registry cutoff
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
+  _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept
@@ -3350,6 +3431,7 @@ typedef struct mi_arena_s {
   mi_bitmap_t*        slices_committed;     // is the slice committed? (i.e. accessible)
   mi_bitmap_t*        slices_dirty;         // is the slice potentially non-zero?
   mi_bitmap_t*        slices_purge;         // slices that can be purged
+  mi_bitmap_t*        slices_purge_aged;    // #457: ... and were already queued at the previous purge deadline
   mi_page_t*          pages_meta;           // pre-allocated `slice_count` page meta info -- only used if `MI_PAGE_META_IS_SEPARATED!=0`
   mi_arena_pages_t    pages_main;           // arena page bitmaps for the main heap are allocated up front as well
 
@@ -4551,13 +4633,8 @@ _mcgen_PASTE2(McTemplateU0xx_, MCGEN_EVENTWRITETRANSFER)(
 #define mi_likely(x)       (x)
 #endif
 
-#if (defined(__GNUC__) && (__GNUC__ >= 7)) || defined(__clang__) // includes clang and icc
-#define mi_decl_maybe_unused    __attribute__((unused))
-#elif __cplusplus >= 201703L    // c++17
-#define mi_decl_maybe_unused    [[maybe_unused]]
-#else
-#define mi_decl_maybe_unused
-#endif
+// `MI_DECL_MAYBE_UNUSED` is defined in mimalloc.h (reached through types.h -> mimalloc-stats.h)
+// so that headers included before this one can use it too.
 
 #ifndef __has_builtin
 #define __has_builtin(x)    0
@@ -4720,7 +4797,9 @@ bool          _mi_meta_is_meta_page(const mi_subproc_t* subproc, const mi_page_t
 // (the only kind a meta-allocator page ever is -- mi_heap_t/mi_theap_t are always small,
 // arena-sized allocations, never OS/oversized) its arena's `subproc` field is set once at
 // arena creation and outlives every heap in it, so this never touches page->heap/page->theap.
-static inline bool _mi_meta_is_meta_page_safe(const mi_page_t* page) {
+// Maybe unused: only the profiler (MI_PPROF) and memory-events/DHAT (MI_MEMEVT || MI_DHAT)
+// hooks call it, so the minimal build has no caller.
+MI_DECL_MAYBE_UNUSED static inline bool _mi_meta_is_meta_page_safe(const mi_page_t* page) {
   mi_arena_t* const arena = mi_memid_arena(page->memid);
   return (arena != NULL && _mi_meta_is_meta_page(arena->subproc, page));
 }
@@ -4888,6 +4967,8 @@ mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t
 void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271)
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
+bool          _mi_arenas_page_reserve(mi_page_t* page, mi_theap_t* current_theap);   // #493: keep an empty large page for the next thread; false: the caller frees it
+bool          _mi_arenas_release_reserved(mi_heap_t* heap, bool force);             // #493: free the reserved pages past their window (all if `force`); true while one is not
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
 void          _mi_arena_pages_free(mi_arena_pages_t* arena_pages);  // Bun parity P10b, #317: frees the on-demand abandoned bitmaps then `arena_pages` itself
@@ -4907,6 +4988,7 @@ void          _mi_page_retire(mi_page_t* page) mi_attr_noexcept;       // free t
 void          _mi_page_unfull(mi_page_t* page);
 void          _mi_page_free(mi_page_t* page, mi_page_queue_t* pq);     // free the page
 void          _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq);  // abandon the page, to be picked up by another thread...
+void          _mi_page_free_or_reserve(mi_page_t* page, mi_page_queue_t* pq);  // #493: at thread exit, reserve an empty large page instead of freeing it
 void          _mi_deferred_free(mi_theap_t* theap, bool force);
 void          _mi_page_free_collect(mi_page_t* page, bool force);
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b): the same, but
@@ -5281,20 +5363,22 @@ void __mi_stat_counter_increase_mt(mi_stat_counter_t* stat, size_t amount);
 
 mi_decl_noinline bool _mi_pthread_key_create(pthread_key_t* pkey, void (*destruct)(void*), void* init);
 
-static inline void* mi_pthread_key_get(pthread_key_t key) {
+// Maybe unused: these are called only when thread locals are pthread keys -- MI_TLS_MODEL_PTHREADS
+// (prim-tls.h) or macOS (src/threadlocal.c) -- not with the default Linux `__thread` model.
+MI_DECL_MAYBE_UNUSED static inline void* mi_pthread_key_get(pthread_key_t key) {
   #if !MI_PTHREADS_GET_INVALID_KEY_IS_NULL
   if mi_unlikely(key==MI_PTHREAD_KEY_INVALID) return NULL;
   #endif
   return pthread_getspecific(key);
 }
 
-static inline bool mi_pthread_key_set(pthread_key_t* pkey, void* val) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_pthread_key_set(pthread_key_t* pkey, void* val) {
   if mi_likely(*pkey!=MI_PTHREAD_KEY_INVALID) { pthread_setspecific(*pkey,val); return true; }
   else if (val!=NULL) { return _mi_pthread_key_create(pkey,NULL,val); }
   else return true;
 }
 
-static inline void mi_pthread_key_delete(pthread_key_t* pkey) {
+MI_DECL_MAYBE_UNUSED static inline void mi_pthread_key_delete(pthread_key_t* pkey) {
   const pthread_key_t key = *pkey;
   if (key!=MI_PTHREAD_KEY_INVALID) {
     *pkey = MI_PTHREAD_KEY_INVALID;
@@ -5412,7 +5496,9 @@ static inline size_t _mi_clamp(size_t sz, size_t min, size_t max) {
 }
 
 // Is memory zero initialized?
-static inline bool mi_mem_is_zero(const void* p, size_t size) {
+// Maybe unused: every caller is an expensive assertion or an `MI_DEBUG > 1` check, so a
+// release build has none.
+MI_DECL_MAYBE_UNUSED static inline bool mi_mem_is_zero(const void* p, size_t size) {
   for (size_t i = 0; i < size; i++) {
     if (((uint8_t*)p)[i] != 0) return false;
   }
@@ -5623,7 +5709,8 @@ static inline bool mi_theap_is_detached(mi_theap_t* theap) {
   return (theap!=NULL && theap->tld->thread_id == MI_THREADID_DETACHED);
 }
 
-static inline bool mi_theap_matches_thread(mi_theap_t* theap) {
+// Maybe unused: called only from `mi_assert`/`mi_assert_internal`, which a release build compiles out.
+MI_DECL_MAYBE_UNUSED static inline bool mi_theap_matches_thread(mi_theap_t* theap) {
   const mi_threadid_t tid = _mi_thread_id();
   return (theap==NULL || theap->tld->thread_id == tid || mi_theap_is_detached(theap));
 }
@@ -5636,7 +5723,8 @@ static inline bool mi_theap_matches_thread(mi_theap_t* theap) {
 // is not the theap's own owning thread. Bun's version also allows the park state the
 // background scavenger sets while sweeping a parked thread's theaps; that state does not
 // exist in this tree (#272), so that clause is omitted here.
-static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
+// Maybe unused: called only from `mi_assert_internal` (src/arena.c), which a release build compiles out.
+MI_DECL_MAYBE_UNUSED static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
   if (theap == NULL || theap->tld == NULL) return true;
   if (mi_atomic_load_ptr_relaxed(mi_heap_t, &theap->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`
   if (theap->tld->thread_id == _mi_thread_id()) return true;
@@ -5668,7 +5756,10 @@ static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
 // this function -- a parked thread's fast-path free that ends up retiring a page (via
 // `_mi_page_retire`) still races the scavenger's walk on that path. `mi_free_block_local` carries
 // a permanent debug-only assert as a detector for that residual instead (see its definition).
-static inline void _mi_park_leave_if_parked(mi_theap_t* theap) {
+//
+// Maybe unused: both callers (src/page.c, src/free.c) are compiled only when `!MI_OWNER_GATE`;
+// a gated build has none.
+MI_DECL_MAYBE_UNUSED static inline void _mi_park_leave_if_parked(mi_theap_t* theap) {
   if (theap == NULL) return;
   mi_tld_t* const tld = theap->tld;
   if mi_likely(tld == NULL || mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_RUNNING) return;
@@ -5714,7 +5805,9 @@ static inline mi_page_t* _mi_checked_ptr_page(const void* p) {
   return (valid ? page : NULL);
 }
 
-static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
+// Maybe unused: `_mi_ptr_page` calls it only when `!(MI_DEBUG || MI_SECURE || MI_FREE_IS_CHECKED)`;
+// debug, secure and checked-free builds use `_mi_checked_ptr_page` instead.
+MI_DECL_MAYBE_UNUSED static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
   return _mi_ptr_page_ex(p, NULL);
 }
 
@@ -5756,7 +5849,8 @@ static inline mi_submap_t _mi_page_map_at(const mi_page_map_t* pmap, size_t idx)
   return mi_atomic_load_ptr_relaxed(mi_page_t*, &pmap->submaps[idx]);
 }
 
-static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
+// Maybe unused: see the flat page-map variant above.
+MI_DECL_MAYBE_UNUSED static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
   const mi_page_map_t* pmap = _mi_page_map();
   size_t sub_idx;
   const size_t idx = _mi_page_map_index(p, &sub_idx);
@@ -5817,7 +5911,8 @@ static inline bool mi_page_contains_address(const mi_page_t* page, const void* p
   return (start <= (uint8_t*)p && (uint8_t*)p < start + psize);
 }
 
-static inline bool mi_page_is_in_arena(const mi_page_t* page) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline bool mi_page_is_in_arena(const mi_page_t* page) {
   return (page->memid.memkind == MI_MEM_ARENA);
 }
 
@@ -5890,6 +5985,27 @@ void          _mi_page_unpurge_all(mi_page_t* page);
 size_t        _mi_page_purged_count(const mi_page_t* page);
 void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   // hand the discarded unformed tail back below `end` (an absolute address)
 size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            // the bytes of this page's unformed tail that are discarded right now
+void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner resets a retired large page and publishes it for the scavenger
+void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
+bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
+long          _mi_release_bound_ms(void);                                       // #491: idle memory is back with the OS within this many ms
+
+// #517: arena slice claims by kind, counted process-wide in `mi_arena_try_alloc_at` when
+// MI_DIAGNOSTICS=1. `plain_fresh` is a plain-search claim that includes at least one slice that
+// was never dirty (never handed out before); its `_slices` counts only those never-dirty slices.
+typedef struct mi_arena_claim_counters_s {
+  size_t resident_first_claims;
+  size_t resident_first_slices;
+  size_t plain_reused_claims;
+  size_t plain_reused_slices;
+  size_t plain_fresh_claims;
+  size_t plain_fresh_slices;
+} mi_arena_claim_counters_t;
+bool          _mi_arena_claim_counters(mi_arena_claim_counters_t* out);   // false (and *out zeroed) when not compiled in (MI_DIAGNOSTICS=0)
+void          _mi_arena_claim_counters_reset(void);
+
+void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
+void          _mi_pages_release_schedule(mi_subproc_t* subproc);  // #483/#493: a retired or reserved page waits for the scavenger's release
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
                                             size_t capacity, size_t k, size_t* first, size_t* last);
 bool          _mi_page_purge_holes_in_progress(void);            // is the calling thread inside a sweep of its own heaps?
@@ -5899,6 +6015,7 @@ void          _mi_page_holes_reset_ineligible(void);
 void          _mi_page_purge_holes_begin(mi_tld_t* tld);         // around each pass of a sweep; `tld` is the thread being swept
 void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
+void          _mi_theap_purge_large_holes(mi_theap_t* theap);   // #477: the owner's paced busy-time sweep (src/page-holes.c)
 void          _mi_purge_holes_of(mi_tld_t* tld, bool force);     // the sweep itself (src/page-holes.c); #366: `force` skips the interval pacing and reads MI_GATE_FLAG_RECLAIM_IGNORED
 void          _mi_page_holes_assert_valid(const mi_page_t* page);   // MI_DEBUG hole invariants, called from `_mi_page_is_valid`
 
@@ -5967,7 +6084,7 @@ void          _mi_page_holes_report_print(const mi_holes_report_t* rep);
 void          _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep);
 void          _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep);
 void          _mi_purge_holes_report_collect(mi_holes_report_t* rep);
-void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld);   // src/arena.c
+void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld, size_t bin_lo, size_t bin_hi);   // src/arena.c: bins [lo,hi)
 
 // The free-arena reclaim (src/arena-reclaim.c, phase F of `mi_purge_all_ex`): give back the
 // arenas that are completely free. The report is filled in even when it is a no-op.
@@ -5984,28 +6101,36 @@ void          _mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages);    
 bool          _mi_arenas_purge_guard_acquire(void);   // src/arena.c: the guard held across a reclaim
 void          _mi_arenas_purge_guard_release(void);   // src/arena.c
 
-// The base of the OS-page bitmap: the start of the first OS page that the block area of
-// this page overlaps. It is OS-page aligned by construction, so bit `k` always names the
-// OS-page-aligned range `[base + k*os_page_size, base + (k+1)*os_page_size)`.
-static inline uintptr_t mi_page_purge_base(const mi_page_t* page) {
-  return _mi_align_down((uintptr_t)mi_page_start(page), _mi_os_page_size());
+// The unit one purge bit covers: the OS page, doubled until the block area fits
+// MI_PAGE_PURGE_BITS (#477). Only a large page on a 4 KiB OS page needs more than one OS
+// page (16 KiB); its blocks are over 84 KiB, so a free block still covers whole units.
+static inline size_t mi_page_purge_unit(const mi_page_t* page) {
+  const uintptr_t start = (uintptr_t)mi_page_start(page);
+  const uintptr_t end = start + mi_page_size(page);
+  size_t unit = _mi_os_page_size();
+  while (_mi_divide_up((size_t)(end - _mi_align_down(start, unit)), unit) > MI_PAGE_PURGE_BITS) { unit *= 2; }
+  return unit;
 }
 
-// the number of OS pages the block area spans = the number of bits this page needs
+// The base of the purge bitmap: the start of the first purge unit that the block area of
+// this page overlaps. It is unit (hence OS-page) aligned by construction, so bit `k` always
+// names the range `[base + k*unit, base + (k+1)*unit)`.
+static inline uintptr_t mi_page_purge_base(const mi_page_t* page) {
+  return _mi_align_down((uintptr_t)mi_page_start(page), mi_page_purge_unit(page));
+}
+
+// the number of purge units the block area spans = the number of bits this page needs
 static inline size_t mi_page_purge_bits(const mi_page_t* page) {
   const uintptr_t base = mi_page_purge_base(page);
   const uintptr_t end = (uintptr_t)mi_page_start(page) + mi_page_size(page);
-  return _mi_divide_up((size_t)(end - base), _mi_os_page_size());
+  return _mi_divide_up((size_t)(end - base), mi_page_purge_unit(page));
 }
 
-// Eligible when the page's OS pages fit the bitmap. This does not depend on the block size
-// at all: a discard covers a whole OS page, so any number of small free blocks can together
-// cover one (and a page whose free runs never cover a whole OS page simply discards nothing).
-// Small and medium pages always fit; a large (4 MiB) page fits from a 16 KiB OS page up
-// (exactly 256 bits at 16 KiB, 64 at 64 KiB) and needs 1024 bits -- so stays ineligible --
-// on a 4 KiB OS page; a huge page is a singleton (one block) so there is nothing to purge
-// in it. The bit count is `ceil(block_area / os_page_size)` with no header page; see
-// `MI_PAGE_PURGE_BITS` in `types.h` for why there is no `+1`.
+// Eligible when the page's purge units fit the bitmap, which `mi_page_purge_unit` makes true
+// for every small, medium and large page (#477). This does not depend on the block size: a
+// discard covers a whole unit, so any number of small free blocks can together cover one (and
+// a page whose free runs never cover a whole unit simply discards nothing). A huge page is a
+// singleton (one block) so there is nothing to purge in it.
 // Pinned memory (large/huge OS pages) cannot be madvise'd away, and an arena with a custom
 // commit function owns its own commit/decommit -- like every other purge site
 // (`mi_arena_schedule_purge`, `_mi_os_purge_ex`), we stay away from both.
@@ -6035,7 +6160,7 @@ static inline bool mi_page_os_page_purged(const mi_page_t* page, size_t k) {
 // overlapping it is free, so a block lost memory exactly when it overlaps a discarded OS page.
 static inline bool mi_page_block_index_is_purged(const mi_page_t* page, size_t idx) {
   if (!mi_page_has_purged(page)) return false;
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t base = mi_page_purge_base(page);
   const uintptr_t lo = (uintptr_t)mi_page_start(page) + (idx * page->block_size);
   const size_t kfirst = (size_t)(lo - base) / os_size;
@@ -6048,7 +6173,9 @@ static inline bool mi_page_block_index_is_purged(const mi_page_t* page, size_t i
 
 // is `block` free-but-discarded? A purged block is on no free list, so a free-list walk
 // (as `free.c`'s double-free check does) cannot see that it is already free.
-static inline bool mi_page_block_is_purged(const mi_page_t* page, const void* block) {
+// Maybe unused: its callers are that check (MI_CHECK_DOUBLE_FREE) and `MI_DEBUG > 1` asserts in
+// src/page-holes.c, so a plain release build has none.
+MI_DECL_MAYBE_UNUSED static inline bool mi_page_block_is_purged(const mi_page_t* page, const void* block) {
   if (!mi_page_has_purged(page)) return false;
   mi_assert_internal((const uint8_t*)block >= mi_page_start(page));
   const size_t idx = ((size_t)((const uint8_t*)block - mi_page_start(page))) / page->block_size;
@@ -6086,7 +6213,7 @@ static inline void mi_page_purged_clear(mi_page_t* page, size_t k) {
 
 // the OS pages that the block at index `idx` overlaps (relative to `mi_page_purge_base`)
 static inline void mi_page_block_os_pages(const mi_page_t* page, size_t idx, size_t* kfirst, size_t* klast) {
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t base = mi_page_purge_base(page);
   const uintptr_t lo = (uintptr_t)mi_page_start(page) + (idx * page->block_size);
   *kfirst = (size_t)(lo - base) / os_size;
@@ -6096,7 +6223,7 @@ static inline void mi_page_block_os_pages(const mi_page_t* page, size_t idx, siz
 // the blocks that overlap OS page `k`, or `false` if that OS page is not entirely inside
 // the block area (see `_mi_page_purge_os_page_blocks`)
 static inline bool mi_page_os_page_blocks(const mi_page_t* page, size_t k, size_t* first, size_t* last) {
-  return _mi_page_purge_os_page_blocks(_mi_os_page_size(), page->block_size, (uintptr_t)mi_page_start(page),
+  return _mi_page_purge_os_page_blocks(mi_page_purge_unit(page), page->block_size, (uintptr_t)mi_page_start(page),
                                        page->capacity, k, first, last);
 }
 
@@ -6155,7 +6282,8 @@ static inline bool mi_page_is_mostly_used(const mi_page_t* page) {
 }
 
 // is more than (n-1)/n'th of a page in use?
-static inline bool mi_page_is_used_at_frac(const mi_page_t* page, uint16_t n) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline bool mi_page_is_used_at_frac(const mi_page_t* page, uint16_t n) {
   if (page==NULL) return true;
   uint16_t frac = page->reserved / n;
   return (page->reserved - page->used <= frac);
@@ -6271,7 +6399,8 @@ static inline mi_theap_t* mi_page_theap(const mi_page_t* page) {
   return page->theap;
 }
 
-static inline mi_tld_t* mi_page_tld(const mi_page_t* page) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline mi_tld_t* mi_page_tld(const mi_page_t* page) {
   mi_assert_internal(!mi_page_is_abandoned(page));
   mi_assert_internal(page->theap != NULL);
   return page->theap->tld;
@@ -6328,13 +6457,15 @@ static inline mi_block_t* mi_page_thread_free(const mi_page_t* page) {
 }
 
 // are there any available blocks?
-static inline bool mi_page_has_any_available(const mi_page_t* page) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline bool mi_page_has_any_available(const mi_page_t* page) {
   mi_assert_internal(page != NULL && page->reserved > 0);
   return (page->used < page->reserved || (mi_page_thread_free(page) != NULL));
 }
 
 // Owned?
-static inline bool mi_page_is_owned(const mi_page_t* page) {
+// Maybe unused: called only from `mi_assert_internal`, which a release build compiles out.
+MI_DECL_MAYBE_UNUSED static inline bool mi_page_is_owned(const mi_page_t* page) {
   return mi_tf_is_owned(mi_atomic_load_relaxed(&((mi_page_t*)page)->xthread_free));
 }
 
@@ -6421,13 +6552,17 @@ We also pass a separate `null` value to be used as `NULL` or otherwise
 `(k2<<<k1)+k1` would appear (too) often as a sentinel value.
 ------------------------------------------------------------------- */
 
-static inline bool mi_is_in_same_page(const void* p, const void* q) {
+// Maybe unused (this and the two below): the encoded free list (MI_ENCODE_FREELIST), the
+// double-free check (MI_CHECK_DOUBLE_FREE) and the padding canary (MI_PADDING) are their
+// only callers (plus, for `mi_ptr_decode`, the macOS zone enumerator), and a plain release
+// build enables none of them.
+MI_DECL_MAYBE_UNUSED static inline bool mi_is_in_same_page(const void* p, const void* q) {
   mi_page_t* page = _mi_ptr_page(p);
   return mi_page_contains_address(page,q);
   // return (_mi_ptr_page(p) == _mi_ptr_page(q));
 }
 
-static inline void* mi_ptr_decode(const void* null, const mi_encoded_t x, const uintptr_t* keys) {
+MI_DECL_MAYBE_UNUSED static inline void* mi_ptr_decode(const void* null, const mi_encoded_t x, const uintptr_t* keys) {
   void* p = (void*)(mi_rotr(x - keys[0], keys[0]) ^ keys[1]);
   return (p==null ? NULL : p);
 }
@@ -6437,7 +6572,7 @@ static inline mi_encoded_t mi_ptr_encode(const void* null, const void* p, const 
   return mi_rotl(x ^ keys[1], keys[0]) + keys[0];
 }
 
-static inline uint32_t mi_ptr_encode_canary(const void* null, const void* p, const uintptr_t* keys) {
+MI_DECL_MAYBE_UNUSED static inline uint32_t mi_ptr_encode_canary(const void* null, const void* p, const uintptr_t* keys) {
   const uint32_t x = (uint32_t)(mi_ptr_encode(null,p,keys));
   // make the lowest byte 0 to prevent spurious read overflows which could be a security issue (issue #951)
   #if MI_BIG_ENDIAN
@@ -6861,7 +6996,10 @@ static inline void** mi_prim_thread_pointer(void) {
 
 #if !MI_NO_THREAD_POINTER
 #define MI_HAS_TLS_SLOT  (1)
-static inline void* mi_prim_tls_slot(size_t slot) {
+// Maybe unused: the slot accessors are called only by the TLS models that use a fixed OS slot
+// (MI_TLS_MODEL_WIN32/FIXED, pthreads on Apple arm64, Bionic's thread id), not by the default
+// MI_TLS_MODEL_LOCAL on Linux.
+MI_DECL_MAYBE_UNUSED static inline void* mi_prim_tls_slot(size_t slot) {
   #if defined(_WIN32)
     #if (_M_X64 || _M_AMD64) && !defined(_M_ARM64EC)
       return (void*)__readgsqword((unsigned long)(slot*sizeof(void*)));   // direct load at offset from gs
@@ -6882,7 +7020,7 @@ static inline void* mi_prim_tls_slot(size_t slot) {
   #endif
 }
 
-static inline void mi_prim_tls_slot_set(size_t slot, void* value) {
+MI_DECL_MAYBE_UNUSED static inline void mi_prim_tls_slot_set(size_t slot, void* value) {
   #if defined(__GNUC__) || defined(__clang__)
   __atomic_store_n(&mi_prim_thread_pointer()[slot], value, __ATOMIC_RELAXED);
   #else
@@ -6969,7 +7107,8 @@ This incurs an extra check in the fast path (but can often be combined in an exi
 // Declared this way to optimize register spills and branches
 mi_decl_cold mi_decl_noinline mi_theap_t* _mi_theap_empty_get(void);
 
-static inline mi_theap_t* __mi_theap_empty(void) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline mi_theap_t* __mi_theap_empty(void) {
   #if __GNUC__
   __asm("");  // prevent conditional load
   return (mi_theap_t*)&_mi_theap_empty;
@@ -9459,6 +9598,10 @@ static void* mi_block_ptr_set_guarded(mi_block_t* block, size_t obj_size, size_t
   mi_assert_internal(_mi_is_aligned(block, os_page_size));
   mi_assert_internal(_mi_is_aligned(guard_page, os_page_size));
   if (!page->memid.is_pinned && _mi_is_aligned(guard_page, os_page_size)) {
+    // #493: a guard page never holds data. On memory reused from an earlier page (resident-first
+    // claims, reclaimed pages) it can still be resident with that tenant's contents: discard it,
+    // so a guarded block costs one resident OS page, not two.
+    _mi_os_discard(mi_page_subproc(page), guard_page, os_page_size);
     const bool ok = _mi_os_protect(guard_page, os_page_size);
     if mi_unlikely(!ok) {
       _mi_warning_message("failed to set a guard page behind an object (object %p of size %zu)\n", block, block_size);
@@ -10645,7 +10788,9 @@ static inline bool mi_bitmap_is_set(mi_bitmap_t* bitmap, size_t idx) {
   return mi_bitmap_is_setN(bitmap, idx, 1);
 }
 
-static inline bool mi_bitmap_is_clear(mi_bitmap_t* bitmap, size_t idx) {
+// Maybe unused: called only from `mi_assert_internal` (src/arena.c) and the flat page map
+// (MI_PAGE_MAP_FLAT, src/page-map.c), so a release build with the 2-level page map has none.
+MI_DECL_MAYBE_UNUSED static inline bool mi_bitmap_is_clear(mi_bitmap_t* bitmap, size_t idx) {
   return mi_bitmap_is_clearN(bitmap, idx, 1);
 }
 
@@ -10688,6 +10833,10 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
 // Ranges will never cross chunk boundaries (and `slice_count <= MI_BCHUNK_BITS`).
 bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
 
+// #493: visit each maximal run of at least `n <= MI_BCHUNK_BITS` bits set in `bitmap | bitmap2`
+// (`bitmap2` may be NULL), in index order, WITHOUT clearing them. Runs never cross a chunk.
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
+
 // Count all set bits in given range in the bitmap.
 size_t mi_bitmap_popcountN( mi_bitmap_t* bitmap, size_t idx, size_t n);
 
@@ -10704,7 +10853,8 @@ static inline mi_chunkbin_t mi_chunkbin_inc(mi_chunkbin_t bbin) {
   return (mi_chunkbin_t)((int)bbin + 1);
 }
 
-static inline mi_chunkbin_t mi_chunkbin_dec(mi_chunkbin_t bbin) {
+// Maybe unused: kept from upstream to pair with `mi_chunkbin_inc`; nothing in this tree (or upstream) calls it.
+MI_DECL_MAYBE_UNUSED static inline mi_chunkbin_t mi_chunkbin_dec(mi_chunkbin_t bbin) {
   mi_assert_internal(bbin > MI_CBIN_NONE);
   return (mi_chunkbin_t)((int)bbin - 1);
 }
@@ -10773,7 +10923,8 @@ static inline bool mi_bbitmap_is_setN(mi_bbitmap_t* bbitmap, size_t idx, size_t 
 }
 
 // Is a sequence of n bits already clear?
-static inline bool mi_bbitmap_is_clearN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
+// Maybe unused: called only from `mi_assert_internal` (src/arena.c), which a release build compiles out.
+MI_DECL_MAYBE_UNUSED static inline bool mi_bbitmap_is_clearN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   return mi_bbitmap_is_xsetN(MI_BIT_CLEAR, bbitmap, idx, n);
 }
 
@@ -10781,6 +10932,10 @@ static inline bool mi_bbitmap_is_clearN(mi_bbitmap_t* bbitmap, size_t idx, size_
 // Try to atomically transition `n` bits from all set to all clear. Returns `true` on succes.
 // `n` cannot cross chunk boundaries, where `n <= MI_CHUNK_BITS`.
 bool mi_bbitmap_try_clearNC(mi_bbitmap_t* bbitmap, size_t idx, size_t n);
+
+// #493: like `mi_bbitmap_try_clearNC`, but as an allocation of `n` slices: respects (and assigns)
+// the chunk size bins the way the find-and-clear searches do. `n <= MI_BCHUNK_BITS`.
+bool mi_bbitmap_try_claimN(mi_bbitmap_t* bbitmap, size_t idx, size_t n);
 
 
 // Specialized versions for common bit sequence sizes
@@ -11006,13 +11161,145 @@ static size_t mi_page_full_size(mi_page_t* page) {
   Arena Allocation
 ----------------------------------------------------------- */
 
+// #493 (strategy 9): resident-first claiming. A freed range sits in `slices_purge` (young) or
+// `slices_purge_aged` for the #486 retention window: free, and still resident. The plain search
+// (`mi_bbitmap_try_find_and_clearN`) knows nothing of that and, measured on short-lived threads,
+// mostly handed out fresh or already purged slices while such ranges were waiting -- growing RSS
+// and zero-fill faulting the new range. So first try the queued runs, in index order.
+// Limited to claims of at least MI_RESIDENT_FIRST_MIN_SLICES slices (#517).
+typedef struct mi_resident_claim_s {
+  size_t slice_count;   // wanted
+  size_t tries;         // queued runs tried so far (at most MI_RESIDENT_FIRST_MAX_TRIES)
+  size_t slice_index;   // out: the claimed range, when `claimed`
+  bool   claimed;
+} mi_resident_claim_t;
+
+static bool mi_arena_resident_claim_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  mi_resident_claim_t* const rc = (mi_resident_claim_t*)arg;
+  mi_assert_internal(slice_count >= rc->slice_count); MI_UNUSED(slice_count);
+  rc->tries++;
+  // The same atomic claim of `slices_free` the purge makes before it purges
+  // (`mi_arena_try_purge_range`): if we win, the purge cannot touch the range; if the purge or
+  // another thread holds any of it -- or it was allocated since it was queued -- this fails.
+  if (mi_bbitmap_try_claimN(arena->slices_free, slice_index, rc->slice_count)) {
+    rc->slice_index = slice_index;
+    rc->claimed = true;
+    return false;   // done
+  }
+  return (rc->tries < MI_RESIDENT_FIRST_MAX_TRIES);
+}
+
+static bool mi_arena_try_claim_resident(mi_arena_t* arena, size_t slice_count, size_t* slice_index) {
+  // Small and medium pages keep the size-binned plain search (MI_RESIDENT_FIRST_MIN_SLICES, #517).
+  if (slice_count < MI_RESIDENT_FIRST_MIN_SLICES) return false;
+  // A pinned arena is never purged (all of it is resident); a range of more than a chunk is
+  // beyond `mi_bbitmap_try_claimN`.
+  if (arena->memid.is_pinned || slice_count > MI_BCHUNK_BITS) return false;
+  // Nothing queued: `purge_expire` is armed after every queueing (`mi_arena_schedule_purge`) and
+  // only disarmed by a purge that leaves both queues empty, so 0 means empty but for a moment
+  // around a concurrent free or purge -- and then we merely take the plain search.
+  if (mi_atomic_loadi64_relaxed(&arena->purge_expire) == 0) return false;
+  if (!mi_option_is_enabled(mi_option_resident_first)) return false;
+  #if MI_GUARDED
+  // A page of guarded blocks writes about half of its range (each block is followed by a guard
+  // OS page that is never written): carved over retained memory, the other half keeps the old
+  // tenant resident until the page goes. Measured with every allocation guarded
+  // (test-memory-gate, sample rate 1): +28 MiB while the retention window lasted. Guarded
+  // sampling is a debugging mode; it takes the plain search.
+  if (mi_option_get(mi_option_guarded_sample_rate) != 0) return false;
+  #endif
+  // young | aged: a range freed in two steps is one run even when half of it has aged
+  mi_resident_claim_t rc = { slice_count, 0, 0, false };
+  _mi_bitmap_forall_set_runsN(arena->slices_purge, arena->slices_purge_aged, slice_count, &mi_arena_resident_claim_visitor, arena, &rc);
+  if (rc.claimed) { *slice_index = rc.slice_index; }
+  return rc.claimed;
+}
+
+// #493: a claimed range is no longer waiting for a purge, so drop it from both queues. The purge
+// itself would only skip it (its claim of `slices_free` fails), but the stale bits would stay on
+// the queues to be retried by every purge -- and every resident-first scan above, where each one
+// costs a try. Only a read when nothing of the range is queued. Safe against the purge: we own the
+// range, so no free can queue it again, and a purge that already took the bits fails its claim.
+static void mi_arena_unqueue_purge(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
+  if (!mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);
+  }
+  if (!mi_bitmap_is_clearN(arena->slices_purge_aged, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge_aged, slice_index, slice_count);
+  }
+}
+
+// #517: slice claims by kind (see `mi_arena_claim_counters_t`). Diagnostics builds only.
+#if MI_DIAGNOSTICS
+static _Atomic(size_t) mi_arena_claims_resident_first;
+static _Atomic(size_t) mi_arena_claims_resident_first_slices;
+static _Atomic(size_t) mi_arena_claims_plain_reused;
+static _Atomic(size_t) mi_arena_claims_plain_reused_slices;
+static _Atomic(size_t) mi_arena_claims_plain_fresh;
+static _Atomic(size_t) mi_arena_claims_plain_fresh_slices;
+
+// Must run before the claim sets the range's dirty bits: a never-dirty slice is a fresh one.
+static void mi_arena_count_claim(mi_arena_t* arena, size_t slice_index, size_t slice_count, bool resident) {
+  if (resident) {
+    mi_atomic_add_relaxed(&mi_arena_claims_resident_first, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_resident_first_slices, slice_count);
+    return;
+  }
+  const size_t dirty = mi_bitmap_popcountN(arena->slices_dirty, slice_index, slice_count);
+  mi_assert_internal(dirty <= slice_count);
+  const size_t fresh = slice_count - dirty;
+  if (fresh > 0) {
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_fresh, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_fresh_slices, fresh);
+  }
+  else {
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_reused, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_reused_slices, slice_count);
+  }
+}
+#endif
+
+bool _mi_arena_claim_counters(mi_arena_claim_counters_t* out) {
+  if (out == NULL) return false;
+  #if MI_DIAGNOSTICS
+  out->resident_first_claims = mi_atomic_load_relaxed(&mi_arena_claims_resident_first);
+  out->resident_first_slices = mi_atomic_load_relaxed(&mi_arena_claims_resident_first_slices);
+  out->plain_reused_claims   = mi_atomic_load_relaxed(&mi_arena_claims_plain_reused);
+  out->plain_reused_slices   = mi_atomic_load_relaxed(&mi_arena_claims_plain_reused_slices);
+  out->plain_fresh_claims    = mi_atomic_load_relaxed(&mi_arena_claims_plain_fresh);
+  out->plain_fresh_slices    = mi_atomic_load_relaxed(&mi_arena_claims_plain_fresh_slices);
+  return true;
+  #else
+  _mi_memzero(out, sizeof(*out));
+  return false;
+  #endif
+}
+
+void _mi_arena_claim_counters_reset(void) {
+  #if MI_DIAGNOSTICS
+  mi_atomic_store_relaxed(&mi_arena_claims_resident_first, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_resident_first_slices, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_reused, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_reused_slices, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_fresh, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_fresh_slices, (size_t)0);
+  #endif
+}
+
 static mi_decl_noinline void* mi_arena_try_alloc_at(
   mi_arena_t* arena, size_t slice_count, bool commit, size_t tseq, mi_memid_t* memid)
 {
   mi_assert_internal(arena!=NULL);
   mi_assert_internal(slice_count>0);
   size_t slice_index;
-  if (!mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  const bool resident = mi_arena_try_claim_resident(arena, slice_count, &slice_index);
+  if (!resident && !mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  if (!arena->memid.is_pinned) { mi_arena_unqueue_purge(arena, slice_index, slice_count); }
+  #if MI_DIAGNOSTICS
+  mi_arena_count_claim(arena, slice_index, slice_count, resident);   // before the dirty bits are set below
+  #else
+  MI_UNUSED(resident);
+  #endif
 
   // claimed it!
   void* p = mi_arena_slice_start(arena, slice_index);
@@ -11533,6 +11820,7 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
         mi_assert_internal(mi_page_is_owned(page));
         mi_assert_internal(mi_page_is_abandoned(page));
         mi_assert_internal(mi_heap_has_page(heap, arena, page));
+        page->retired_at = 0;   // #493: if it was a reserved page, it is in use again
         mi_atomic_decrement_relaxed(&heap->abandoned_count[bin]);
         mi_theap_stat_decrease(theap, pages_abandoned, 1);
         mi_theap_stat_counter_increase(theap, pages_reclaim_on_alloc, 1);
@@ -11760,6 +12048,7 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
   // initialize the page start
   uint8_t* const start = slice_start + block_start;
   mi_assert_internal(start > (uint8_t*)page);
+
   const size_t offset = start - (uint8_t*)page;
   mi_assert_internal((offset % MI_MAX_ALIGN_SIZE) == 0 && (offset / MI_MAX_ALIGN_SIZE) <= UINT32_MAX);
   page->page_ma_offset = (uint32_t)(offset / MI_MAX_ALIGN_SIZE);
@@ -12010,6 +12299,7 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
   // until it is MADV_FREE_REUSE'd. This function is the single choke point for a page going
   // back to the arena (`_mi_page_free` and the abandoned-page free in `free.c` both land here).
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: first, so the scavenger cannot discard it meanwhile
   _mi_page_unpurge_all(page);
 
   // all we need from the heap, before the page is unpublished from it (see
@@ -12117,6 +12407,60 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap) {
   mi_abandoned_page_unown(page, current_theap);
 }
 
+// #493: reserve an EMPTY large page for the next thread of its heap (`_mi_page_free_or_reserve`,
+// at thread exit). It goes into the same per-bin abandoned map as the pages `_mi_arenas_page_abandon`
+// maps, so the ordinary reclaim-on-alloc (`mi_arenas_page_try_find_abandoned`) hands it to the next
+// thread that needs a page of its size class -- with its blocks formed and resident: no new page,
+// no new unformed tail. Separate from `_mi_arenas_page_abandon` because that one only ever sees a
+// page with live blocks. Stamped in `retired_at`, so a page nobody reclaims is freed after
+// MI_PAGE_RESERVE_RELEASE_MULT purge delays (`mi_arena_page_reserve_kept`). Returns false (and
+// leaves the page to the caller to free) when it should not or cannot be reserved.
+bool _mi_arenas_page_reserve(mi_page_t* page, mi_theap_t* current_theap) {
+  mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
+  mi_assert_internal(mi_page_is_owned(page));
+  mi_assert_internal(mi_page_is_abandoned(page));
+  mi_assert_internal(mi_page_all_free(page));
+  mi_assert_internal(page->next==NULL && page->prev == NULL);
+  mi_assert_internal(_mi_theap_can_touch(current_theap));
+
+  if (!mi_option_is_enabled(mi_option_page_reserve)) return false;
+  // no purge delay to derive a retention window from: purging is off, keep upstream's free
+  if (mi_option_get(mi_option_purge_delay) < 0) return false;
+  // large pages only: small and medium pages are cheap to carve, and it is the 4 MiB page with a
+  // few formed blocks that leaves the resident tail behind
+  const size_t bsize = mi_page_block_size(page);
+  if (bsize <= MI_MEDIUM_MAX_OBJ_SIZE || bsize > MI_LARGE_MAX_OBJ_SIZE) return false;
+  if (page->memid.memkind != MI_MEM_ARENA || mi_page_is_singleton(page)) return false;
+  // a heap being released claims every page through `pages` (see `_mi_arenas_page_abandon`)
+  mi_heap_t* const heap = mi_page_heap(page);
+  if (mi_atomic_load_relaxed(&heap->releasing) != 0) return false;
+  const size_t bin = _mi_bin(bsize);
+  if (bin >= MI_ARENA_BIN_COUNT) return false;
+
+  size_t slice_index;
+  size_t slice_count;
+  mi_arena_pages_t* arena_pages = NULL;
+  mi_arena_t* const arena = mi_page_arena_pages(page, &slice_index, &slice_count, &arena_pages);
+  mi_bitmap_t* const bitmap = mi_arena_pages_abandoned_ensure(arena, arena_pages, bin);
+  if (bitmap == NULL) return false;
+
+  // #483: a retired page published in its (exiting) thread's tld slots must be taken back before
+  // the tld goes -- this also clears `retired_at`, which we then set to the reserve stamp
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }
+  const mi_msecs_t now = _mi_clock_now();
+  page->retired_at = (now != 0 ? now : 1);   // non-zero: this marks the page as reserved
+
+  mi_page_set_abandoned_mapped(page);
+  const bool was_clear = mi_bitmap_set(bitmap, slice_index);
+  MI_UNUSED(was_clear); mi_assert_internal(was_clear);
+  mi_atomic_increment_relaxed(&heap->abandoned_count[bin]);
+  mi_theap_stat_increase(current_theap, pages_abandoned, 1);
+  _mi_pages_release_schedule(heap->subproc);   // an idle process relies on the scavenger to release it
+  mi_abandoned_page_unown(page, current_theap);   // (cannot free it: no block can be freed into an empty page)
+  return true;
+}
+
 
 // this is called from `free.c:mi_free_try_collect_mt` only.
 bool _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page) {
@@ -12214,10 +12558,32 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   needs the arena bitmaps and the claim protocol.)
 ----------------------------------------------------------- */
 
+// #493: is this abandoned page a reserved one (`_mi_arenas_page_reserve`) still inside its
+// retention window of MI_PAGE_RESERVE_RELEASE_MULT purge delays? (The caller owns the page.)
+static bool mi_arena_page_reserve_kept(const mi_page_t* page, mi_msecs_t now) {
+  if (page->retired_at == 0) return false;   // not reserved
+  const long delay = mi_option_get(mi_option_purge_delay);
+  if (delay < 0) return false;               // purging was switched off since: no window, release
+  return (now - page->retired_at < (mi_msecs_t)delay * MI_PAGE_RESERVE_RELEASE_MULT);
+}
+
 typedef struct mi_purge_holes_arg_s {
   mi_bitmap_t* bitmap;
   mi_tld_t*    tld;      // the thread whose sweep this is (its own, or the parked one the scavenger is sweeping for)
 } mi_purge_holes_arg_t;
+
+static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size_t slice_count);
+static long mi_arena_purge_delay(void);
+
+// #486: a reserved page released after its window has been idle for the whole retention already;
+// purge its slices now instead of aging them again in the arena queue, which would hold them
+// for another two arena periods (and past the release bound, #491). Only if they are still free.
+static void mi_arena_purge_released(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
+  if (arena->memid.is_pinned || mi_arena_purge_delay() < 0) return;
+  if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);   // queued by the free: done already
+  }
+}
 
 static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   MI_UNUSED(slice_count);
@@ -12242,9 +12608,19 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
   // We own the page: no other thread can reclaim, unabandon, or free it now, and only the
   // atomic `xthread_free` can still change under us. (No un-purging: we are about to purge.)
   _mi_page_free_collect_no_unpurge(page, true);
+  if (mi_page_all_free(page) && mi_arena_page_reserve_kept(page, _mi_clock_now())) {
+    // #493: reserved for the next thread and still inside its window. Leave it whole: discarding
+    // its free blocks now would only make that thread fault them back in.
+    mi_bitmap_set(bitmap, slice_index);
+    mi_abandoned_page_unown(page, NULL);
+    return true;
+  }
   if (mi_page_all_free(page)) {
+    const bool reserved = (page->retired_at != 0);   // (an expired reserved page, see above)
+    const size_t page_slices = mi_page_full_size(page) / MI_ARENA_SLICE_SIZE;
     mi_bitmap_set(bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
     _mi_arenas_abandoned_page_free(page, NULL);
+    if (reserved) { mi_arena_purge_released(arena, slice_index, page_slices); }
     _mi_page_holes_count_page_freed();
     return true;
   }
@@ -12257,7 +12633,7 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
 // note: this only reaches the *mapped* abandoned pages (the ones in `pages_abandoned`).
 // A page abandoned while full is not mapped; it has no free blocks at that point, and once
 // enough blocks are freed in it, `_mi_arenas_page_try_reabandon_to_mapped` puts it in the map.
-void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
+void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld, size_t bin_lo, size_t bin_hi) {
   if (heap == NULL || tld == NULL) return;
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   _mi_page_purge_holes_begin(tld);
@@ -12266,7 +12642,7 @@ void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
     if (arena_pages != NULL) {
       // pages_abandoned[] is MI_ARENA_BIN_COUNT wide, not MI_BIN_COUNT: bins above the
       // singleton bins have no abandoned bitmap (upstream ad1bcdbf, to shrink arena meta).
-      for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
+      for (size_t bin = bin_lo; bin < bin_hi && bin < MI_ARENA_BIN_COUNT; bin++) {
         if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
         mi_bitmap_t* const bitmap = mi_arena_pages_abandoned(arena_pages, bin);
         if (bitmap == NULL) continue;
@@ -12277,6 +12653,63 @@ void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
   }
   mi_forall_arenas_end();
   _mi_page_purge_holes_end(tld);
+}
+
+// #493: release the reserved pages of a heap. The hole sweep above already frees the ones past
+// their window that it meets, but it only runs on a thread that allocates (or idles through
+// `mi_on_thread_idle`) with `purge_holes` on; this is the pass for the scavenger (`force == false`,
+// see `_mi_pages_release_retired`) and for a forced collect (`force == true`: every one of them).
+// Same claim protocol as `mi_arena_page_purge_holes_at`. Only the large bins can hold one.
+typedef struct mi_reserve_release_arg_s {
+  mi_bitmap_t* bitmap;
+  mi_msecs_t   now;
+  bool         force;
+  bool         pending;   // out: a reserved page is kept for now
+} mi_reserve_release_arg_t;
+
+static bool mi_arena_page_release_reserved_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  MI_UNUSED(slice_count);
+  mi_reserve_release_arg_t* const rarg = (mi_reserve_release_arg_t*)arg;
+  if (!mi_bitmap_clear(rarg->bitmap, slice_index)) return true;   // someone else has the page
+  mi_page_t* const page = mi_arena_page_at_slice(arena, slice_index);
+  if (!mi_page_claim_ownership(page)) {
+    mi_bitmap_set(rarg->bitmap, slice_index);   // a concurrent free owns it: keep it abandoned
+    return true;
+  }
+  // a reserved page has no live block, so no free can have arrived in it: `used` is exact
+  if (page->retired_at != 0 && mi_page_all_free(page)) {
+    if (rarg->force || !mi_arena_page_reserve_kept(page, rarg->now)) {
+      const size_t page_slices = mi_page_full_size(page) / MI_ARENA_SLICE_SIZE;
+      mi_bitmap_set(rarg->bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
+      _mi_arenas_abandoned_page_free(page, NULL);
+      mi_arena_purge_released(arena, slice_index, page_slices);
+      return true;
+    }
+    rarg->pending = true;
+  }
+  mi_bitmap_set(rarg->bitmap, slice_index);       // back in the map *before* unowning: unown may free the page
+  mi_abandoned_page_unown(page, NULL);
+  return true;
+}
+
+bool _mi_arenas_release_reserved(mi_heap_t* heap, bool force) {
+  if (heap == NULL) return false;
+  const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
+  const size_t bin_hi = _mi_bin(MI_LARGE_MAX_OBJ_SIZE) + 1;
+  mi_reserve_release_arg_t rarg = { NULL, _mi_clock_now(), force, false };
+  mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
+    mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
+    if (arena_pages != NULL) {
+      for (size_t bin = bin_lo; bin < bin_hi && bin < MI_ARENA_BIN_COUNT; bin++) {   // see above: not MI_BIN_COUNT
+        if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
+        rarg.bitmap = mi_arena_pages_abandoned(arena_pages, bin);
+        if (rarg.bitmap == NULL) continue;
+        (void)_mi_bitmap_forall_set(rarg.bitmap, &mi_arena_page_release_reserved_at, arena, &rarg);
+      }
+    }
+  }
+  mi_forall_arenas_end();
+  return rarg.pending;
 }
 
 // The read-only counterpart of the sweep above: account for the holes in the abandoned pages
@@ -12341,7 +12774,7 @@ void _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep) {
       if (mi_bitmap_is_set(arena->slices_committed, i)) { rep->arena_committed_bytes += MI_ARENA_SLICE_SIZE; }
       if (!mi_bbitmap_is_setN(arena->slices_free, i, 1)) continue;   // in a page (or reserved meta): not slack
       if (mi_bitmap_is_set(arena->slices_dirty, i)) { rep->arena_free_dirty_bytes += MI_ARENA_SLICE_SIZE; }
-      if (mi_bitmap_is_set(arena->slices_purge, i)) { rep->arena_purge_pending_bytes += MI_ARENA_SLICE_SIZE; }
+      if (mi_bitmap_is_set(arena->slices_purge, i) || mi_bitmap_is_set(arena->slices_purge_aged, i)) { rep->arena_purge_pending_bytes += MI_ARENA_SLICE_SIZE; }
     }
   }
   mi_forall_arenas_end();
@@ -12557,7 +12990,7 @@ static size_t mi_arena_info_slices_needed(size_t slice_count, size_t* bitmap_bas
   if (slice_count == 0) slice_count = MI_BCHUNK_BITS;
   mi_assert_internal((slice_count % MI_BCHUNK_BITS) == 0);
   const size_t base_size = _mi_align_up(sizeof(mi_arena_t), MI_BCHUNK_SIZE);
-  const size_t bitmaps_count = 4; // commit, dirty, purge, and pages (the abandoned bitmaps are allocated on demand, Bun parity P10b #317)
+  const size_t bitmaps_count = 5; // commit, dirty, purge, purge_aged (#457), and pages (the abandoned bitmaps are allocated on demand, Bun parity P10b #317)
   const size_t bitmaps_size = bitmaps_count * mi_bitmap_size(slice_count, NULL) + mi_bbitmap_size(slice_count, NULL); // + free
   #if MI_PAGE_META_IS_SEPARATED
   const size_t pages_size = slice_count * sizeof(mi_page_t);
@@ -12784,6 +13217,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   arena->slices_committed = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_dirty = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_purge = mi_arena_bitmap_init(slice_count, &base);
+  arena->slices_purge_aged = mi_arena_bitmap_init(slice_count, &base);
   arena->pages_main.pages = mi_arena_bitmap_init(slice_count, &base);
   // Allocated on first abandon (Bun parity P10b, #317, ported from oven-sh/mimalloc @
   // 787be2a8, MIT); the arena's own memory is not yet fully zeroed at this point in every
@@ -13353,7 +13787,10 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
     mi_arena_purge(arena, slice_index, slice_count);
   }
   else {
-    // schedule purge
+    // schedule purge. #457: queue the range BEFORE arming, so a purge that runs concurrently
+    // either sees the range (ages it, and re-arms) or has already cleared the deadline (so the
+    // CAS below arms it); in the other order the range could land in a queue with no deadline.
+    mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
     const mi_msecs_t expire = _mi_clock_now() + delay;
     mi_msecs_t expire0 = 0;
     if (mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire)) {
@@ -13367,10 +13804,14 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
         _mi_scavenger_wake(arena->subproc);
       }
     }
-    else {
-      // already an expiration was set
+    else if (mi_atomic_loadi64_relaxed(&arena->subproc->purge_expire) == 0) {
+      // #457: this arena is already armed but the subproc deadline is not (a settle raced
+      // this arena's 0 -> set). Re-arm it so the scavenger wakes for it.
+      mi_msecs_t sexpire0 = 0;
+      if (mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &sexpire0, expire0)) {
+        _mi_scavenger_wake(arena->subproc);
+      }
     }
-    mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
   }
 }
 
@@ -13379,6 +13820,7 @@ typedef struct mi_purge_visit_info_s {
   mi_msecs_t delay;
   bool all_purged;
   bool any_purged;
+  bool take_young;   // #457: forced purge -- ranges freed again since they were aged are purged too
 } mi_purge_visit_info_t;
 
 static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
@@ -13397,8 +13839,37 @@ static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size
   }
 }
 
+// #457: move a range queued in this period into the aged queue (see `mi_arena_try_purge`)
+static bool mi_arena_age_purge_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  *(bool*)arg = true;
+  mi_bitmap_setN(arena->slices_purge_aged, slice_index, slice_count, NULL);
+  return true;
+}
+
+static void mi_arena_try_purge_run(mi_arena_t* arena, size_t slice_index, size_t slice_count, mi_purge_visit_info_t* vinfo);
+
 static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   mi_purge_visit_info_t* vinfo = (mi_purge_visit_info_t*)arg;
+  // #457: a slice freed again since it was aged is young again (`slices_purge` still has it) and
+  // waits for its own deadline. #497: only that slice -- the run handed to us is a maximal run of
+  // aged bits, already cleared, so skipping all of it would lose the parts that did stay free
+  // for the whole period (they are in neither queue after this).
+  if (!vinfo->take_young && !mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count)) {
+    for (size_t i = 0; i < slice_count; ) {
+      if (mi_bitmap_is_set(arena->slices_purge, slice_index + i)) { i++; continue; }
+      size_t n = 1;
+      while (i + n < slice_count && !mi_bitmap_is_set(arena->slices_purge, slice_index + i + n)) { n++; }
+      mi_arena_try_purge_run(arena, slice_index + i, n, vinfo);
+      i += n;
+    }
+    return true;
+  }
+  mi_arena_try_purge_run(arena, slice_index, slice_count, vinfo);
+  return true; // continue
+}
+
+// Purge `[slice_index, slice_index + slice_count)` where its slices are free.
+static void mi_arena_try_purge_run(mi_arena_t* arena, size_t slice_index, size_t slice_count, mi_purge_visit_info_t* vinfo) {
   // try to purge: first claim the free blocks
   if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
     vinfo->any_purged = true;
@@ -13415,7 +13886,6 @@ static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, m
   }
   // don't clear the purge bits as that is done atomically be the _bitmap_forall_set_ranges
   // mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);
-  return true; // continue
 }
 
 // returns
@@ -13438,15 +13908,22 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
   mi_atomic_storei64_release(&arena->purge_expire, (mi_msecs_t)0);
   mi_subproc_stat_counter_increase(arena->subproc, arena_purges, 1);
 
-  // go through all purge info's  (with max MI_BFIELD_BITS ranges at a time)
-  // this also clears those ranges atomically (so any newly freed blocks will get purged next
-  // time around)
-  mi_purge_visit_info_t vinfo = { now, mi_arena_purge_delay(), true /*all?*/, false /*any?*/};
-
+  // #457: two generations. Purge only what was already queued at the previous deadline, is
+  // still free, and was not freed again since: memory freed moments ago is about to be reused,
+  // and purging it would only make the next allocation re-fault it. Then age this period's
+  // queue and re-arm, so idle memory goes back between one and two `delay`s after its free.
+  // A forced purge (`mi_collect(true)`, `mi_purge_all`) takes both queues right away.
+  // The visitors clear each range atomically as they go (so a concurrent free is kept for next time).
+  const long delay = mi_arena_purge_delay();
+  mi_purge_visit_info_t vinfo = { now, delay, true /*all?*/, false /*any?*/, force /*young?*/ };
   // we purge by at least `minslices` to not fragment transparent huge pages for example
   const size_t minslices = mi_slice_count_of_size(_mi_os_minimal_purge_size());
-  _mi_bitmap_forall_setc_rangesn(arena->slices_purge, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
-
+  if (force) { _mi_bitmap_forall_setc_rangesn(arena->slices_purge, minslices, &mi_arena_try_purge_visitor, arena, &vinfo); }
+  _mi_bitmap_forall_setc_rangesn(arena->slices_purge_aged, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
+  bool aged = false;
+  _mi_bitmap_forall_setc_ranges(arena->slices_purge, &mi_arena_age_purge_visitor, arena, &aged);
+  mi_msecs_t expire0 = 0;
+  if (aged && delay > 0) { mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, now + delay); }
   return (vinfo.any_purged ? 1 : -1);
 }
 
@@ -13501,6 +13978,8 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
     const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
     if (expire == 0) continue;                 // nothing queued for this arena
     any_scheduled = true;
+    bool aged = false;                         // #457: the caller is idle, so everything queued counts as aged
+    _mi_bitmap_forall_setc_ranges(arena->slices_purge, &mi_arena_age_purge_visitor, arena, &aged);
     if (expire > now) { mi_atomic_storei64_release(&arena->purge_expire, now); }
   }
   if (!any_scheduled) return;
@@ -13590,7 +14069,7 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
         if (purged >= 0) {      // purged, or arena expire is not yet reached
           any_purged = true;
           if (purged >= 1) {    // purged
-            if (max_purge_count <= 1) {
+            if (max_purge_count <= 1 && !visit_all) {   // #457: a full pass must reach the settle below
               all_visited = false;
               break;
             }
@@ -13609,7 +14088,16 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       // per-arena expire (0 if none) and the scavenger's next wait is exact. A CAS, so a purge
       // scheduled concurrently with this walk is never clobbered.
       mi_msecs_t expected = arenas_expire;
-      mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
+      if (mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire) && next_expire == 0) {
+        // #457: a free may have armed an arena after we read it, and its own attempt to arm the
+        // subproc failed against the value we just replaced. Re-read so it is not orphaned.
+        for (size_t i = 0; i < max_arena; i++) {
+          mi_arena_t* const arena = mi_arena_from_index(subproc, i);
+          const mi_msecs_t aexpire = (arena == NULL ? 0 : mi_atomic_loadi64_relaxed(&arena->purge_expire));
+          mi_msecs_t zero = 0;
+          if (aexpire != 0) { mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &zero, aexpire); break; }
+        }
+      }
     }
   }
     if (!ran && force) {   // #272, see above
@@ -13622,6 +14110,12 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       _mi_prim_thread_yield();
     }
   } while (!ran && force);
+  if (!ran && visit_all) {
+    // #457: another thread holds the guard. Retry shortly instead of leaving a past deadline
+    // (which the scavenger would spin on) or clearing it (which would orphan pending arenas).
+    mi_msecs_t expected = arenas_expire;
+    mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, now + (delay/10) + 1);
+  }
 }
 
 
@@ -14467,7 +14961,7 @@ static inline bool mi_bfield_atomic_try_clear_mask_optimistic(_Atomic(mi_bfield_
 // Returns `true` if the bit transitioned from 1 to 0
 // and `false` otherwise (leaving the bfield `b` as-is).
 // `all_clear` is set to true if the new bfield became zero (and false otherwise)
-mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear_optimistic(_Atomic(mi_bfield_t)* b, size_t idx, mi_bfield_t* previous) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bfield_atomic_try_clear_optimistic(_Atomic(mi_bfield_t)* b, size_t idx, mi_bfield_t* previous) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
   const mi_bfield_t mask = ((mi_bfield_t)1<<idx);
   return mi_bfield_atomic_try_clear_mask_optimistic(b, mask, previous, NULL);  // single bit never clears temporarily
@@ -14476,7 +14970,7 @@ mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear_optimistic(_A
 // Tries to clear a byte atomically. For performance, it assumes there is a good chance of success.  
 // Returns true if the byte atomically transitioned from 0xFF to 0
 // `all_clear` is set to true if the new bfield became zero (and false otherwise)
-mi_decl_maybe_unused static inline bool mi_bfield_atomic_try_clear8_optimistic(_Atomic(mi_bfield_t)*b, size_t idx, mi_bfield_t* previous, bool* did_temp_clear_bits) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bfield_atomic_try_clear8_optimistic(_Atomic(mi_bfield_t)*b, size_t idx, mi_bfield_t* previous, bool* did_temp_clear_bits) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
   mi_assert_internal((idx%8)==0);
   const mi_bfield_t mask = ((mi_bfield_t)0xFF)<<idx;
@@ -14858,16 +15352,16 @@ static inline bool mi_bchunk_try_clearN(mi_bchunk_t* chunk, size_t cidx, size_t 
 // ------- mi_bchunk_try_find_and_clear ---------------------------------------
 
 #if MI_OPT_SIMD && defined(__AVX2__)
-mi_decl_maybe_unused static inline __m256i mi_mm256_zero(void) {
+MI_DECL_MAYBE_UNUSED static inline __m256i mi_mm256_zero(void) {
   return _mm256_setzero_si256();
 }
-mi_decl_maybe_unused static inline __m256i mi_mm256_ones(void) {
+MI_DECL_MAYBE_UNUSED static inline __m256i mi_mm256_ones(void) {
   return _mm256_set1_epi64x(~0);
 }
-mi_decl_maybe_unused static inline bool mi_mm256_is_ones(__m256i vec) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_mm256_is_ones(__m256i vec) {
   return _mm256_testc_si256(vec, _mm256_cmpeq_epi32(vec, vec));
 }
-mi_decl_maybe_unused static inline bool mi_mm256_is_zero( __m256i vec) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_mm256_is_zero( __m256i vec) {
   return _mm256_testz_si256(vec,vec);
 }
 #endif
@@ -14992,7 +15486,7 @@ static inline bool mi_bchunk_try_find_and_clear_1(mi_bchunk_t* chunk, size_t n, 
   return mi_bchunk_try_find_and_clear(chunk, pidx);
 }
 
-mi_decl_maybe_unused static inline bool mi_bchunk_try_find_and_clear8_at(mi_bchunk_t* chunk, size_t chunk_idx, size_t* pidx, bool* did_temp_clear_bits) {
+MI_DECL_MAYBE_UNUSED static inline bool mi_bchunk_try_find_and_clear8_at(mi_bchunk_t* chunk, size_t chunk_idx, size_t* pidx, bool* did_temp_clear_bits) {
   _Atomic(mi_bfield_t)* const bfield = &chunk->bfields[chunk_idx];  
   mi_bfield_t b = mi_atomic_load_relaxed(bfield);
   if (b==0) return false;
@@ -15784,6 +16278,7 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
             // break early: reset the non-visited bits
             if (b!=0) {
               mi_atomic_or_relaxed(&chunk->bfields[j], b);
+              mi_bitmap_chunkmap_set(bitmap, chunk_idx);   // #493: see the restore in `_mi_bitmap_forall_setc_rangesn`
             }
             return false;
           }
@@ -15838,6 +16333,7 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
               mi_assert_internal((notyet_visited & skipped) == 0);
               if ((notyet_visited | skipped) != 0) {
                 mi_atomic_or_relaxed(&chunk->bfields[j], notyet_visited | skipped);
+                mi_bitmap_chunkmap_set(bitmap, chunk_idx);   // #493: see below
               }
               return false;
             }
@@ -15854,8 +16350,58 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
         if (skipped != 0) {
           //  restore non-visited entries
           mi_atomic_or_relaxed(&chunk->bfields[j], skipped);
+          // #493: and the chunkmap bit, like every other setter. Between our exchange and this
+          // restore the chunk can read all clear, and a concurrent `mi_bitmap_clearN` in it (the
+          // arena clears claimed ranges out of the purge queues) then clears the chunkmap bit
+          // -- leaving the restored bits where no visitor looks: queued, never purged.
+          mi_bitmap_chunkmap_set(bitmap, chunk_idx);
         }
       }
+    }
+  }
+  return true;
+}
+
+// #493 (strategy 9): visit, in index order, each maximal run of at least `n` bits set in
+// `bitmap | bitmap2` (`bitmap2` may be NULL; both must have the same chunk count), where
+// `0 < n <= MI_BCHUNK_BITS`. Unlike the `forall_setc` visitors this leaves the bitmaps as they are:
+// the runs are only hints (the arena claims them atomically in `slices_free`), so the loads are
+// relaxed. A run never crosses a chunk, so it can be claimed with `mi_bbitmap_try_clearNC`.
+// Stops, returning false, as soon as `visit` returns false.
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
+  mi_assert_internal(n > 0 && n <= MI_BCHUNK_BITS);
+  mi_assert_internal(bitmap2 == NULL || mi_bitmap_chunk_count(bitmap2) == mi_bitmap_chunk_count(bitmap));
+  const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmap), MI_BFIELD_BITS);
+  for (size_t i = 0; i < chunkmap_max; i++) {
+    mi_bfield_t cmap_entry = mi_atomic_load_relaxed(&bitmap->chunkmap.bfields[i]);
+    if (bitmap2 != NULL) { cmap_entry |= mi_atomic_load_relaxed(&bitmap2->chunkmap.bfields[i]); }
+    size_t cmap_idx;
+    // for each chunk (corresponding to a set bit in a chunkmap entry)
+    while (mi_bfield_foreach_bit(&cmap_entry, &cmap_idx)) {
+      const size_t chunk_idx = i*MI_BFIELD_BITS + cmap_idx;
+      const size_t chunk_base = chunk_idx*MI_BCHUNK_BITS;
+      size_t run_start = 0;   // chunk-relative start of the current run
+      size_t run_len = 0;     // and its length so far (0 = none); a run can span bfields
+      for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
+        mi_bfield_t b = mi_atomic_load_relaxed(&bitmap->chunks[chunk_idx].bfields[j]);
+        if (bitmap2 != NULL) { b |= mi_atomic_load_relaxed(&bitmap2->chunks[chunk_idx].bfields[j]); }
+        size_t bidx;
+        while (mi_bfield_find_least_bit(b, &bidx)) {
+          const size_t rng = mi_ctz(~(b>>bidx));   // all the set bits from bidx
+          mi_assert_internal(rng >= 1 && bidx + rng <= MI_BFIELD_BITS);
+          const size_t start = j*MI_BFIELD_BITS + bidx;
+          if (run_len > 0 && run_start + run_len == start) {
+            run_len += rng;                          // continues the run of the previous bfield
+          }
+          else {
+            if (run_len >= n && !visit(chunk_base + run_start, run_len, arena, arg)) return false;
+            run_start = start;
+            run_len = rng;
+          }
+          b = b & ~mi_bfield_mask(rng, bidx);
+        }
+      }
+      if (run_len >= n && !visit(chunk_base + run_start, run_len, arena, arg)) return false;
     }
   }
   return true;
@@ -16039,6 +16585,32 @@ bool mi_bbitmap_try_clearNC(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   }
   // note: we don't set the size class for an explicit try_clearN (only used by purging)
   return cleared;
+}
+
+// #493 (strategy 9): claim `n` bits at a known `idx` (not crossing a chunk) for an allocation of
+// `n` slices. Unlike the purge's `mi_bbitmap_try_clearNC` this keeps to the size bins the way
+// `mi_bbitmap_try_find_and_clear_generic` does: a chunk of the bin of `n`; or an unbinned chunk
+// at its start, which the claim then bins; or an unbinned chunk whose first slice is in use
+// (already mixed, like the arena's first chunk behind its meta data, where the plain search
+// claims unbinned too). Never the middle of an unbinned chunk that starts free: the plain search
+// would claim its start and bin it, while a page left in the middle unbinned lets every size
+// class share the chunk -- the fragmentation the bins exist to stop, and the fresh memory it
+// costs (PR #501: the guarded memory gate's peak). The bin reads are hints, as in the search.
+bool mi_bbitmap_try_claimN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
+  if (n == 0 || n > MI_BCHUNK_BITS) return false;
+  const size_t chunk_idx = idx / MI_BCHUNK_BITS;
+  const size_t cidx = idx % MI_BCHUNK_BITS;
+  if (cidx + n > MI_BCHUNK_BITS || chunk_idx >= mi_bbitmap_chunk_count(bbitmap)) return false;
+  const mi_chunkbin_t bbin = mi_chunkbin_of(n);
+  const mi_chunkbin_t cbin = mi_bbitmap_debug_get_bin(bbitmap->chunkmap_bins, chunk_idx);
+  const bool bin_start = (cbin == MI_CBIN_NONE && cidx == 0);
+  if (cbin != bbin && !bin_start) {
+    if (cbin != MI_CBIN_NONE) return false;                                        // another size class
+    if (mi_bchunk_is_xsetN(MI_BIT_SET, &bbitmap->chunks[chunk_idx], 0, 1)) return false;   // starts free
+  }
+  if (!mi_bbitmap_try_clearNC(bbitmap, idx, n)) return false;
+  if (bin_start) { mi_bbitmap_set_chunk_bin(bbitmap, chunk_idx, bbin); }
+  return true;
 }
 
 
@@ -18718,7 +19290,9 @@ static const mi_page_t mi_page_empty = {
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b)
   { 0 },                  // purged: no discarded OS pages
   0, 0,                   // unformed_purged_lo / _hi: nothing of the unformed tail is discarded
-  MI_PAGE_SWEPT_NONE      // swept_state: never swept
+  MI_PAGE_SWEPT_NONE,     // swept_state: never swept
+  NULL,                   // retired_slot: not published (#483)
+  0                       // retired_at
 };
 
 #define MI_PAGE_EMPTY() ((mi_page_t*)&mi_page_empty)
@@ -18791,14 +19365,15 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   NULL,                   // park_theap0
   MI_ATOMIC_VAR_INIT(0),  // park_swept
   NULL,                   // subproc_next (unregistered)
-  0, 0,                   // holes_sweep_seq / holes_sweep_last (#272 P7b)
-  false, false,           // holes_sweeping / holes_sweep_full
+  0, 0, 0,                // holes_sweep_seq / holes_sweep_last (#272 P7b) / holes_busy_last (#477)
+  false, false, false,    // holes_sweeping / holes_busy (#477) / holes_sweep_full
   0, 0,                   // holes_sweep_skipped / holes_sweep_visited
   0,                      // gate_depth (#366)
   MI_ATOMIC_VAR_INIT(0),  // sweeper
   MI_ATOMIC_VAR_INIT(0),  // purge_epoch
   MI_ATOMIC_VAR_INIT(0),  // gate_flags
-  0                       // fork_gen (#293)
+  0,                      // fork_gen (#293)
+  { 0 }                   // retired_pages (#483)
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -19025,6 +19600,11 @@ static void mi_tld_unregister(mi_tld_t* tld) {
 mi_decl_noinline static void mi_tld_free(mi_tld_t* tld) {
   if (tld==NULL) return;
   mi_tld_unregister(tld);   // #272
+  #if MI_DEBUG>1
+  for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {   // #483: every published page was taken back (freed or detached) first
+    mi_assert_internal(mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[i]) == NULL);
+  }
+  #endif
   mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
   tld->thread_id = (mi_threadid_t)(~0);          // it is best to set an invalid tid for tld_main as sometimes the same thread-id
                                                  // is reused by the OS after a thread has terminated. (see issue #1287)
@@ -20189,7 +20769,9 @@ static inline mi_hooks_tld_t* _mi_hooks_tld_peek(void) {
 // zeroed here) instead of NULL. `local` must live at least as long as every use of the
 // returned pointer. See the file comment above for when this is (and is not) the right
 // choice over a plain peek.
-static inline mi_hooks_tld_t* _mi_hooks_tld_peek_or_local(mi_hooks_tld_t* local) {
+// Maybe unused: its only callers are the memory-events/DHAT slow paths (src/memory-events.c,
+// src/dhat.c), compiled only with MI_MEMEVT or MI_DHAT; the profiler uses the plain peek.
+MI_DECL_MAYBE_UNUSED static inline mi_hooks_tld_t* _mi_hooks_tld_peek_or_local(mi_hooks_tld_t* local) {
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
   if (hooks != NULL) return hooks;
   _mi_memzero(local, sizeof(*local));
@@ -21680,7 +22262,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { 10,  MI_OPTION_UNINIT, MI_OPTION(deprecated_max_segment_reclaim)},       // max. percentage of the abandoned segments to be reclaimed per try.
   { 0,   MI_OPTION_UNINIT, MI_OPTION(destroy_on_exit)},           // release all OS memory on process exit; careful with dangling pointer or after-exit frees!
   { MI_DEFAULT_ARENA_RESERVE, MI_OPTION_UNINIT, MI_OPTION(arena_reserve) }, // reserve memory N KiB at a time (=1GiB) (use `option_get_size`)
-  { 1,   MI_OPTION_UNINIT, MI_OPTION(arena_purge_mult) },         // purge delay multiplier for arena's
+  { MI_ARENA_PURGE_MULT_DEFAULT, MI_OPTION_UNINIT, MI_OPTION(arena_purge_mult) },   // purge delay multiplier for arena's (#486: the retention of freed arena memory)
   { 1,   MI_OPTION_UNINIT, MI_OPTION_LEGACY(deprecated_purge_extend_delay, decommit_extend_delay) },
   { MI_DEFAULT_DISALLOW_ARENA_ALLOC,   MI_OPTION_UNINIT, MI_OPTION(disallow_arena_alloc) }, // 1 = do not use arena's for allocation (except if using specific arena id's)
   { 400, MI_OPTION_UNINIT, MI_OPTION(retry_on_oom) },             // windows only: retry on out-of-memory for N milli seconds (=400), set to 0 to disable retries.
@@ -21725,6 +22307,8 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 100,    MI_OPTION_UNINIT, MI_OPTION(purge_holes_min_interval) } // min milli-seconds between two sweeps of the same thread's heaps
   ,{ 64,     MI_OPTION_UNINIT, MI_OPTION(purge_holes_full_every) }   // every N'th sweep walks every page regardless of the skip check; 0 disables (Bun's default)
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(snapshot_on_exit) }       // write a heap snapshot on process exit (=0). 1=on, 2=on+blocks. Bun parity (#338)
+  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(page_reserve) }           // #493: reserve an exiting thread's empty large pages for the next thread (MIMALLOC_PAGE_RESERVE); 0 frees them as upstream
+  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(resident_first) }         // #493: claim free-but-resident (queued for purge) arena slices first (MIMALLOC_RESIDENT_FIRST); 0 = the plain search only
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
@@ -23408,7 +23992,8 @@ static inline bool mi_page_queue_is_special(const mi_page_queue_t* pq) {
   return (pq->block_size > MI_LARGE_MAX_OBJ_SIZE);
 }
 
-static inline size_t mi_page_queue_count(const mi_page_queue_t* pq) {
+// Maybe unused: kept from upstream, which has no caller for it either; nothing in this tree calls it.
+MI_DECL_MAYBE_UNUSED static inline size_t mi_page_queue_count(const mi_page_queue_t* pq) {
   return pq->count;
 }
 
@@ -24183,6 +24768,23 @@ void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
   }
 }
 
+// #493: a thread exits with an empty page. Freeing a large one makes the next thread of the heap
+// carve a NEW page over the same, still resident slices -- a 4 MiB page it forms only a few blocks
+// of, the rest a resident unformed tail -- so a heap run as a sequence of short-lived threads
+// peaks far above the same work on long-lived ones. Reserve it instead: abandoned with its blocks
+// formed, for the next thread to reclaim as is (`_mi_arenas_page_reserve` decides which pages).
+void _mi_page_free_or_reserve(mi_page_t* page, mi_page_queue_t* pq) {
+  mi_assert_internal(mi_page_all_free(page));
+  mi_page_set_has_interior_pointers(page, false);
+  mi_page_queue_remove(pq, page);
+  mi_theap_t* const theap = mi_page_theap(page); mi_assert_internal(theap!=NULL);
+  mi_page_set_theap(page, NULL);
+  page->retire_expire = 0;   // not retired in the theap that reclaims it
+  if (!_mi_arenas_page_reserve(page, theap)) {
+    _mi_arenas_page_free(page, theap);   // as `_mi_page_free`
+  }
+}
+
 
 // allocate a fresh page from an arena
 static mi_page_t* mi_page_fresh_alloc(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size, size_t page_alignment) {
@@ -24336,6 +24938,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
       mi_theap_stat_counter_increase(theap, pages_retire, 1);
       #endif
       page->retire_expire = (bsize <= MI_SMALL_MAX_OBJ_SIZE ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
+      if (bsize > MI_MEDIUM_MAX_OBJ_SIZE) { _mi_page_publish_retired(page); }   // #483: so an idle owner cannot pin it
       mi_assert_internal(pq >= theap->pages);
       const size_t index = pq - theap->pages;
       mi_assert_internal(index < MI_BIN_FULL && index < MI_BIN_HUGE);
@@ -24521,6 +25124,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   if (page->free != NULL) return true;
   #endif
   if (page->capacity >= page->reserved) return true;
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: before forming blocks in it
 
   size_t page_size;
   //uint8_t* page_start =
@@ -24947,6 +25551,7 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
       _mi_deferred_free(theap, false);         // call potential deferred free routines      
       _mi_theap_collect_retired(theap, false); // free retired pages      
     }
+    _mi_theap_purge_large_holes(theap);        // #477: release large-page holes while busy
   }
   return theap;
 }
@@ -26013,7 +26618,7 @@ static bool mi_page_holes_discard(mi_page_t* page, uintptr_t dstart, size_t dsiz
 // the range can still overlap a hole we are not touching: those stay purged.
 static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool discarded) {
   mi_assert_internal(k0 <= k1 && k1 < MI_PAGE_PURGE_BITS);
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t dstart = mi_page_purge_base(page) + (k0 * os_size);
   const size_t dsize = ((k1 - k0) + 1) * os_size;
   if (discarded) { _mi_os_reuse(mi_page_subproc(page), (void*)dstart, dsize); }
@@ -26136,6 +26741,24 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
 }
 
+// #493: the slack past a page's last block, `[start + reserved*block_size, end of its slices)`, is
+// never formed, so no tail or hole discard reaches it. On a page carved from reused memory (the
+// resident-first claim, #501) it still holds the previous tenant's blocks, and an idle thread's
+// retired page kept that resident for good. It is given back with the rest of such a page when
+// the page is released for idling, not when the page is created: under churn the arena hands
+// those slices to the next page right away, and discarding them then only makes it refault them.
+static void mi_page_discard_slack(mi_page_t* page) {
+  if (page->memid.memkind != MI_MEM_ARENA || !mi_page_holes_madvisable(page)) return;
+  const size_t os_size = _mi_os_page_size();
+  uint8_t* const pstart = mi_page_start(page);
+  uint8_t* hi = mi_page_slice_start(page) + page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE;
+  const size_t committed = mi_page_slice_committed(page);   // 0: the whole page is committed
+  if (committed > 0 && hi > mi_page_slice_start(page) + committed) { hi = mi_page_slice_start(page) + committed; }   // never beyond what is committed
+  const uintptr_t lo = _mi_align_up((uintptr_t)pstart + (size_t)page->reserved * mi_page_block_size(page), os_size);
+  const uintptr_t ahi = _mi_align_down((uintptr_t)hi, os_size);
+  if (ahi > lo) { _mi_os_discard(mi_page_subproc(page), (void*)lo, (size_t)(ahi - lo)); }
+}
+
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
 // in it is written to. `end` is an absolute address (`UINTPTR_MAX` for the whole tail); it is
 // rounded up to an OS page, as the discard covers whole OS pages.
@@ -26171,7 +26794,7 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
 static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   if (page->free == NULL) return true;                    // nothing to take off the free list
 
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const size_t nbits = mi_page_purge_bits(page);
   mi_assert_internal(nbits <= MI_PAGE_PURGE_BITS);
   if (nbits > MI_PAGE_PURGE_BITS) return true;
@@ -26285,6 +26908,12 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   if (mi_page_all_free(page)) return;                     // the page itself is about to be freed
   if (mi_option_get(mi_option_purge_delay) < 0) return;   // purging disabled
+  if (tld->holes_busy) {
+    // #477: a page allocated from or freed to since the last busy tick (its free-list head or
+    // `used` moved) is left alone; it is swept once it stays unchanged for a whole tick.
+    const uint64_t sig = (uint64_t)(uintptr_t)page->free ^ mi_page_sweep_state(page);
+    if (page->swept_state != sig) { page->swept_state = sig; return; }
+  }
   mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
   if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }
 
@@ -26327,7 +26956,7 @@ bool _mi_page_unpurge_run(mi_page_t* page) {
 void _mi_page_unpurge_all(mi_page_t* page) {
   _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);   // the unformed tail goes back as well
   if (!mi_page_has_purged(page)) return;
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t base = mi_page_purge_base(page);
   size_t k = 0;
   while (k < MI_PAGE_PURGE_BITS) {
@@ -26346,6 +26975,143 @@ void _mi_page_unpurge_all(mi_page_t* page) {
     }
   }
   _mi_page_purged_reset(page);
+}
+
+
+/* -----------------------------------------------------------
+  Retired large pages of idle threads  (#483)
+
+  `_mi_page_retire` keeps the only page of a size class on its theap when it empties, and only
+  the owner's own later allocations free it (`_mi_theap_collect_retired`). A thread that stays
+  alive but stops allocating would pin its emptied 4 MiB large pages forever. So when a large
+  page retires, the owner resets it to "nothing formed" (`capacity == 0`, `free == NULL`: the
+  memory stays resident, so a reuse re-forms blocks without faulting, and the alloc fast path
+  can never reach a block of it) and publishes it in a slot of its tld. The scavenger discards
+  the whole block area of a page that stays published for MI_RETIRED_RELEASE_MULT purge delays,
+  as an unformed tail -- which `mi_page_extend_free` already hands back before forming a block.
+
+  The slot is the lock: whoever takes the page out of the slot owns the page's memory until it
+  puts it back. The scavenger takes it by swapping in MI_RETIRED_SLOT_BUSY (not NULL, or the
+  owner could publish another page into that slot meanwhile) for exactly one discard. The owner
+  takes it back for good (`_mi_page_unpublish_retired`) before it forms a block in the page or
+  returns the page to the arena, waiting out the scavenger's one discard if it has to.
+----------------------------------------------------------- */
+
+#define MI_RETIRED_SLOT_BUSY  ((mi_page_t*)1)   // the scavenger holds this slot's page for one discard
+
+// Owner only (from `_mi_page_retire`): reset an emptied large page and publish it for the
+// scavenger. When every slot is taken the page simply stays retired as upstream keeps it.
+void _mi_page_publish_retired(mi_page_t* page) {
+  mi_assert_internal(mi_page_all_free(page));
+  mi_assert_internal(page->retired_slot == NULL);
+  if (page->retired_slot != NULL) return;
+  mi_tld_t* const tld = mi_page_theap(page)->tld;
+  // only the owner ever fills an empty slot, so one it sees empty stays empty until it fills it
+  _Atomic(mi_page_t*)* slot = NULL;
+  for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {
+    if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[i]) == NULL) { slot = &tld->retired_pages[i]; break; }
+  }
+  if (slot == NULL) return;   // all slots full: leave it unpublished
+
+  _mi_page_unpurge_all(page);   // holes describe formed blocks, and there will be none
+  page->free = NULL;            // nothing formed: every block of the page is unformed tail now
+  page->local_free = NULL;
+  page->capacity = 0;
+  page->free_is_zero = false;
+  page->retired_at = _mi_clock_now();
+  page->retired_slot = slot;
+  mi_atomic_store_ptr_release(mi_page_t, slot, page);   // publishes the reset above to the scavenger
+  _mi_pages_release_schedule(mi_page_subproc(page));
+}
+
+// A retired (#483) or reserved (#493) page now waits for `_mi_pages_release_retired`.
+void _mi_pages_release_schedule(mi_subproc_t* subproc) {
+  if (mi_atomic_load_relaxed(&subproc->retired_published) == 0 &&
+      mi_atomic_exchange_acq_rel(&subproc->retired_published, (size_t)1) == 0) {
+    _mi_scavenger_wake(subproc);   // a sleeping scavenger has nothing scheduled to notice this by
+  }
+}
+
+// Take a published page back from the scavenger for good: before a block is formed in it or it
+// is returned to the arena. If the scavenger holds the slot, that is for one discard only.
+void _mi_page_unpublish_retired(mi_page_t* page) {
+  _Atomic(mi_page_t*)* const slot = page->retired_slot;
+  if (slot == NULL) return;
+  mi_page_t* expected = page;
+  while (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &expected, NULL)) {
+    mi_assert_internal(expected == MI_RETIRED_SLOT_BUSY);
+    expected = page;
+    _mi_prim_thread_yield();
+  }
+  page->retired_slot = NULL;
+  page->retired_at = 0;   // #493: a non-zero stamp on an unpublished page marks a reserved one
+}
+
+// A theap detached from its tld by a heap delete/destroy (`_mi_heap_detach_theaps`) has its pages
+// freed only later -- possibly after its thread exited and freed the tld, slots and all. So it takes
+// its published pages back now, while the tld is certainly alive.
+void _mi_theap_unpublish_retired(mi_theap_t* theap) {
+  for (size_t bin = 0; bin <= MI_BIN_FULL; bin++) {
+    for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {
+      if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }
+    }
+  }
+}
+
+// Scavenger: discard the memory of every published page retired for long enough. Returns true
+// when some published page is not old enough yet, i.e. the scavenger should come back.
+// #491: see MI_RELEASE_SLACK_MS. Follows the `purge_delay` option, as the releases themselves do.
+long _mi_release_bound_ms(void) {
+  const long delay = mi_option_get(mi_option_purge_delay);
+  const long arena_mult = mi_option_get(mi_option_arena_purge_mult);
+  if (delay < 0 || arena_mult < 0) return -1;   // purging is off
+  long mult = (MI_RETIRED_RELEASE_MULT > MI_PAGE_RESERVE_RELEASE_MULT ? MI_RETIRED_RELEASE_MULT : MI_PAGE_RESERVE_RELEASE_MULT);
+  if (MI_ARENA_PURGE_PERIODS * arena_mult > mult) { mult = MI_ARENA_PURGE_PERIODS * arena_mult; }
+  return mult * delay + MI_RELEASE_SLACK_MS;
+}
+
+bool _mi_pages_release_retired(mi_subproc_t* subproc) {
+  if (mi_atomic_exchange_acq_rel(&subproc->retired_published, (size_t)0) == 0) return false;
+  const long delay = mi_option_get(mi_option_purge_delay);
+  if (delay < 0) return false;   // purging disabled
+  const mi_msecs_t min_age = (mi_msecs_t)delay * MI_RETIRED_RELEASE_MULT;
+  const mi_msecs_t now = _mi_clock_now();
+  bool pending = false;
+  mi_lock(&subproc->tlds_lock) {   // keeps every registered tld (and so its slots) alive
+    for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
+      for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {
+        _Atomic(mi_page_t*)* const slot = &tld->retired_pages[i];
+        mi_page_t* page = mi_atomic_load_ptr_relaxed(mi_page_t, slot);
+        if (page == NULL || page == MI_RETIRED_SLOT_BUSY) continue;
+        if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &page, MI_RETIRED_SLOT_BUSY)) continue;   // the owner took it back
+        // the page's memory is ours until we put it back
+        if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not discarded already)
+          if (now - page->retired_at < min_age) { pending = true; }
+          else { mi_page_purge_unformed_tail(page); mi_page_discard_slack(page); }   // `capacity == 0`: the whole block area, and past it
+        }
+        mi_atomic_store_ptr_release(mi_page_t, slot, page);
+      }
+    }
+  }
+  // #493: and the empty large pages reserved at thread exit (`_mi_arenas_page_reserve`) that no
+  // thread reclaimed within their window -- an idle process has no busy sweep to release them.
+  // Only the main heap: it is never freed while the scavenger runs, and its per-arena tracking
+  // lives in the arena itself, whereas another heap's can be freed by a concurrent
+  // `mi_heap_delete` (its own threads' sweeps and the delete itself release those). The purge
+  // guard keeps the empty-arena reclaim (src/arena-reclaim.c) from freeing an arena under the walk;
+  // when a user thread holds it for a forced purge, come back at the next tick.
+  mi_heap_t* const heap_main = mi_atomic_load_ptr_acquire(mi_heap_t, &subproc->heap_main);
+  if (heap_main != NULL) {
+    if (_mi_arenas_purge_guard_acquire()) {
+      if (_mi_arenas_release_reserved(heap_main, false)) { pending = true; }
+      _mi_arenas_purge_guard_release();
+    }
+    else {
+      pending = true;
+    }
+  }
+  if (pending) { mi_atomic_store_release(&subproc->retired_published, (size_t)1); }
+  return pending;
 }
 
 
@@ -26404,6 +27170,39 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
   _mi_page_purge_holes_begin(tld);
   _mi_theap_visit_pages(theap, &mi_theap_page_purge_holes, true /* include full pages */, tld, NULL);
   _mi_page_purge_holes_end(tld);
+}
+
+// #477: the idle sweep never runs on a thread that never goes idle, so the OWNER also sweeps
+// the large-class pages -- the ones whose free blocks are big enough to be worth a discard --
+// of its theap and of the heap's abandoned pages (every large page is abandoned the moment it
+// is full, and a thread's pages at its exit) from its generic-malloc housekeeping, at most
+// once per `purge_holes_min_interval`. `holes_busy` makes it leave any page that was used since
+// the previous tick: its free blocks are about to be reused, and discarding them now would only
+// make the next allocation re-fault them.
+void _mi_theap_purge_large_holes(mi_theap_t* theap) {
+  mi_tld_t* const tld = theap->tld;
+  if (tld == NULL || tld->holes_sweeping || !mi_option_is_enabled(mi_option_purge_holes)) return;
+  const mi_msecs_t now = _mi_clock_now();
+  // #478: a thread's first call starts its clock instead of sweeping at once. Otherwise every new
+  // thread swept the abandoned pages it will reclaim in a moment -- a dead thread's pages look
+  // "unchanged since the last tick" -- and then refaulted them: with short-lived threads (the
+  // README's ephemeral chart) that was ~28x the minor faults and ~10% of the throughput.
+  if (tld->holes_busy_last == 0) { tld->holes_busy_last = now; return; }
+  if (now - tld->holes_busy_last < (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000)) return;
+  tld->holes_busy_last = now;
+  const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
+  const size_t bin_hi = _mi_bin(MI_LARGE_MAX_OBJ_SIZE) + 1;
+  tld->holes_busy = true;
+  _mi_arenas_purge_abandoned_holes(_mi_theap_heap(theap), tld, bin_lo, bin_hi);
+  _mi_page_purge_holes_begin(tld);
+  for (size_t bin = bin_lo; bin < bin_hi; bin++) {
+    for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {
+      _mi_page_free_collect_no_unpurge(page, true);
+      if (!mi_page_all_free(page)) { _mi_page_purge_holes(page, tld); }   // an empty page is left to page retirement
+    }
+  }
+  _mi_page_purge_holes_end(tld);
+  tld->holes_busy = false;
 }
 
 // Purge the holes in every page this thread may safely touch:
@@ -26489,7 +27288,7 @@ void _mi_purge_holes_of(mi_tld_t* tld, bool force) {
     }
     for (size_t i = 0; i < heap_count; i++) {
       if (mi_tld_reclaim_requested(tld)) break;   // #366: unless the claimant asked for completion
-      _mi_arenas_purge_abandoned_holes(heaps[i], tld);
+      _mi_arenas_purge_abandoned_holes(heaps[i], tld, 0, MI_ARENA_BIN_COUNT);
     }
   }
 }
@@ -26614,7 +27413,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
     return;
   }
 
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);
   const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   const uintptr_t pend = pstart + (cap * bs);
   const uintptr_t base = mi_page_purge_base(page);
@@ -26979,7 +27778,7 @@ static void mi_purge_all_abandoned_subproc(mi_subproc_t* sp, mi_tld_t* my_tld) {
   mi_lock(&sp->heaps_lock) {
     for (mi_heap_t* heap = sp->heaps; heap != NULL; heap = heap->next) {
       if (mi_atomic_load_acquire(&heap->releasing) != 0) continue;
-      _mi_arenas_purge_abandoned_holes(heap, my_tld);
+      _mi_arenas_purge_abandoned_holes(heap, my_tld, 0, MI_ARENA_BIN_COUNT);
     }
   }
 }
@@ -27178,18 +27977,14 @@ int mi_purge_all_ex(mi_purge_flags_t flags, size_t wait_ms, mi_purge_all_report_
   // A. arenas: everything due (or, forced, everything purgeable) goes back to the OS first
   mi_purge_all_arenas(force);
 
-  // The caller's tld is used for hole-sweep bookkeeping in B as well as for its own
-  // sweep in C. In a gated build it may be PARKED between allocator calls, allowing
-  // the scavenger to claim it unless we enter the owner gate for both phases.
-  MI_GATE_ENTER(my_theap);
-
   // B. abandoned pages of every heap of every subproc
-  MI_GATE_ASSERT_HELD(my_theap);
   mi_purge_all_abandoned(my_tld);
 
-  // C. our own tld, through the OWNER door: `mi_theap_collect` is a public (gated) entry,
-  //    and the hole sweep is not. Both remain under the gate entered before B.
-  //    (Ungated: the macros expand to nothing; we are RUNNING.)
+  // C. our own tld, through the OWNER door: `mi_theap_collect` is a public (gated) entry, and
+  //    the hole sweep is not, so both run under one enter / one leave of our own gate -- in a
+  //    gated build we are PARKED between allocator calls and the scavenger could otherwise be
+  //    sweeping these very free lists. (Ungated: the macros expand to nothing; we are RUNNING.)
+  MI_GATE_ENTER(my_theap);
   mi_theap_collect(my_theap, force);
   _mi_purge_holes_of(my_tld, force);
   MI_GATE_LEAVE(my_tld);
@@ -30221,17 +31016,24 @@ static void mi_scav_fork_child_reset(void) {
 #if !defined(MI_SCAV_HAS_FORK_RESET)
 // futex / __ulock / WaitOnAddress hold no state of ours across fork()
 // #373: correct no-ops; unused on platforms whose wait primitive needs no init/fork reset
-mi_decl_maybe_unused static void mi_scav_fork_child_reset(void) { }
+MI_DECL_MAYBE_UNUSED static void mi_scav_fork_child_reset(void) { }
 #endif
 #if !defined(MI_SCAV_HAS_INIT)
 // #373: correct no-ops; unused on platforms whose wait primitive needs no init/fork reset
-mi_decl_maybe_unused static void mi_scav_init(void) { }
+MI_DECL_MAYBE_UNUSED static void mi_scav_init(void) { }
 #endif
 
 
 // -----------------------------------------------------------------------------
 // Scavenger thread body (shared across platforms)
 // -----------------------------------------------------------------------------
+
+// The longest the scavenger sleeps with nothing scheduled, and the period of its safety-net pass
+// over every arena (#457). A build may override it (e.g. `-DMI_SCAVENGER_MAX_WAIT_MS=5000`,
+// including the Rust crate's build script).
+#ifndef MI_SCAVENGER_MAX_WAIT_MS
+#define MI_SCAVENGER_MAX_WAIT_MS  (30000)
+#endif
 
 static void mi_scavenger_run(void) {
   {   // #366: see `_mi_scavenger_tld`
@@ -30241,6 +31043,7 @@ static void mi_scavenger_run(void) {
   // Use the main subproc directly: this thread never allocates, so don't
   // initialise a theap/tld via _mi_subproc()'s TLS path.
   mi_subproc_t* const subproc = _mi_subproc_main();
+  mi_msecs_t full_pass = _mi_clock_now();   // last safety-net pass over every arena
   while (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) {
     // Clear with an RMW, not a plain store: it must be totally ordered against the parker's
     // coalescing `exchange(wake, 1)` in `_mi_scavenger_wake`. With a store, our clear and the later
@@ -30254,30 +31057,38 @@ static void mi_scavenger_run(void) {
     mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
     mi_msecs_t timeout_ms;
     if (expire == 0) {
-      // Nothing scheduled: park until woken. The 30s bound is a pure safety
-      // net so stop() is guaranteed to take effect and any per-arena expiry
-      // that did not propagate to subproc is still eventually purged.
-      timeout_ms = 30000;
+      // Nothing scheduled: park until woken. Every MI_SCAVENGER_MAX_WAIT_MS a full pass re-derives the deadline
+      // from the arenas themselves, so a per-arena expiry that never reached the subproc
+      // is still purged (#457); the bound also guarantees stop() takes effect.
+      const mi_msecs_t now = _mi_clock_now();
+      if (now - full_pass >= MI_SCAVENGER_MAX_WAIT_MS) {
+        full_pass = now;
+        _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
+        continue;
+      }
+      timeout_ms = MI_SCAVENGER_MAX_WAIT_MS - (now - full_pass);
     }
     else {
       const mi_msecs_t now = _mi_clock_now();
       if (expire > now) {
         timeout_ms = expire - now;
-        if (timeout_ms > 30000) timeout_ms = 30000;
+        if (timeout_ms > MI_SCAVENGER_MAX_WAIT_MS) timeout_ms = MI_SCAVENGER_MAX_WAIT_MS;
       }
       else {
+        // A full pass always settles subproc->purge_expire to the earliest pending arena
+        // expire (0 if none), or to a short retry when another thread holds the purge guard.
+        // Never clear it here: that orphaned arenas that were re-armed meanwhile (#457).
         _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
-        // _mi_arenas_try_purge sets subproc->purge_expire to the earliest still-pending
-        // per-arena expire once every arena is visited. If it left the stale past value
-        // (its CAS lost to a concurrent schedule), clear it so the next iteration parks on
-        // the 30s safety net instead of spinning. CAS so a concurrently scheduled future
-        // expire is never clobbered.
-        mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expire, (mi_msecs_t)0);
         continue;
       }
     }
     // a park passed over for its minimum interval is swept when its window ends, not at the safety timeout
     if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
+    // #483: retired large pages of idle threads are released once they stay retired long enough
+    if (_mi_pages_release_retired(subproc)) {
+      const long tick = mi_option_get_clamp(mi_option_purge_delay, 1, MI_SCAVENGER_MAX_WAIT_MS);
+      if (tick < timeout_ms) { timeout_ms = tick; }
+    }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
     mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
   }
@@ -32004,7 +32815,10 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
   _mi_page_free_collect_no_unpurge(page, collect >= MI_FORCE);
   if (mi_page_all_free(page)) {
     // no more used blocks, possibly free the page.
-    if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced/abandon, or not already retired
+    if (collect == MI_ABANDON) {
+      _mi_page_free_or_reserve(page, pq);   // #493: the thread is done; a large page may wait for the next one
+    }
+    else if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced, or not already retired
       // note: this will potentially free retired pages as well.
       _mi_page_free(page, pq);
     }
@@ -32040,7 +32854,16 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   // const bool is_main_thread = (_mi_is_main_thread() && theap->thread_id == _mi_thread_id());
 
   // collect retired pages (and full pages if theap->allow_page_abandon is false)
-  _mi_theap_collect_retired(theap, force); 
+  // #493: not when the thread is done. The visit below reaches every page anyway (the full queue
+  // included), and it is where an empty large page is reserved rather than freed -- a forced
+  // collect of the retired pages here would free exactly the pages worth reserving.
+  if (collect != MI_ABANDON) {
+    _mi_theap_collect_retired(theap, force);
+  }
+  else {
+    theap->page_retired_min = MI_BIN_FULL;   // the visit below empties every queue
+    theap->page_retired_max = 0;
+  }
 
   // collect all pages owned by this thread
   _mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
@@ -32053,6 +32876,10 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   // itself, as its own reclaim-gated phase (`_mi_arenas_purge_now`).
   //mi_atomic_storei64_release(&theap->tld->subproc->purge_expire, 1);
   if (theap->tld == NULL || mi_atomic_load_relaxed(&theap->tld->park_state) != MI_PARK_SWEEPING) {
+    // #493: a forced collect promises that everything free is handed back, and that includes the
+    // empty pages reserved for a next thread. First, so the purge below already sees them free.
+    mi_heap_t* const rheap = _mi_theap_heap_peek(theap);
+    if (collect == MI_FORCE && rheap != NULL) { _mi_arenas_release_reserved(rheap, true); }
     _mi_arenas_collect(collect == MI_FORCE /* force purge? */, collect >= MI_FORCE /* visit all? */, theap->tld);
   }
 
@@ -32408,6 +33235,7 @@ void _mi_heap_detach_theaps( mi_heap_t* heap ) {
             if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
                                 else { mi_assert_internal(tld->theaps == theap); tld->theaps = theap->tnext; }
             theap->tnext = theap->tprev = NULL;
+            _mi_theap_unpublish_retired(theap);   // #483: while its tld is certainly alive
             mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
             mi_lock_release(&tld->theaps_lock);
           }

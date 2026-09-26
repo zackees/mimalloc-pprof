@@ -84,6 +84,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  pr-ci-mode:
+    uses: ./.github/workflows/pr-ci-mode.yml
+
   resolve-candidate:
     name: resolve-candidate (exact SHA ${{ inputs.candidate_sha }})
     runs-on: ubuntu-latest
@@ -116,10 +119,21 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "exact candidate_sha=$sha" >> "$GITHUB_STEP_SUMMARY"
 
+  pr-test-gate:
+    name: PR test gate (windows-bundles)
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs: [pr-ci-mode, resolve-candidate, build-windows-gnu, build-rust-windows-gnu, build-windows-msvc, build-rust-windows-msvc, run-windows]
+    uses: ./.github/workflows/pr-ci-gate.yml
+    with:
+      workflow: windows-bundles
+      needs-json: ${{ toJSON(needs) }}
+      ci-test: ${{ contains(github.event.pull_request.labels.*.name, 'ci-test') }}
+      ci-full: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
+
   build-windows-gnu:
     name: build-windows-gnu (${{ matrix.bundle }})
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -319,8 +333,8 @@ jobs:
 
   build-rust-windows-gnu:
     name: build-rust (x86_64-pc-windows-gnu)
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     # cross.yml's `build-win-gnu` runs this on `windows-latest` (it predates soldr having
     # a Linux-hosted mingw lane). Nothing about it needs Windows: soldr's mingw-w64 is a
     # Linux-hosted cross compiler and cc-rs picks it up from CC_x86_64_pc_windows_gnu.
@@ -390,8 +404,8 @@ jobs:
 
   build-windows-msvc:
     name: build-windows-msvc (${{ matrix.bundle }})
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     # Issue #277 phase D. soldr's `blessed-msvc` lane is clang-cl + lld-link + llvm-lib
     # against an xwin-materialised MS CRT and Windows SDK, all Linux-hosted. See
     # cmake/toolchains/soldr-x86_64-pc-windows-msvc.cmake for what it consumes and why
@@ -664,8 +678,8 @@ jobs:
 
   build-rust-windows-msvc:
     name: build-rust (x86_64-pc-windows-msvc)
-    needs: resolve-candidate
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    needs: [resolve-candidate, pr-ci-mode]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     # Duplicated from cross.yml's `build-cross` rather than reused: artifacts do not cross
     # workflows without run-id plumbing (#277 phase B correction 1). That row stays where
     # it is, feeding its now-informational `test (x86_64-pc-windows-msvc)`, until the

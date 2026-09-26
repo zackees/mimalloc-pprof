@@ -1,0 +1,26 @@
+name: pr-ci-mode
+
+on:
+  workflow_call:
+    outputs:
+      external:
+        description: Whether the PR author lacks write access to the base repository
+        value: ${{ jobs.decide.outputs.external }}
+
+permissions:
+  contents: read
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      external: ${{ steps.mode.outputs.external }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: mode
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: python3 ci/pr_ci_mode.py --event "$EVENT" --repository "$REPOSITORY" --author "$AUTHOR"

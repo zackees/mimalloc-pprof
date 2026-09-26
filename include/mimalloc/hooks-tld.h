@@ -69,7 +69,9 @@ static inline mi_hooks_tld_t* _mi_hooks_tld_peek(void) {
 // zeroed here) instead of NULL. `local` must live at least as long as every use of the
 // returned pointer. See the file comment above for when this is (and is not) the right
 // choice over a plain peek.
-static inline mi_hooks_tld_t* _mi_hooks_tld_peek_or_local(mi_hooks_tld_t* local) {
+// Maybe unused: its only callers are the memory-events/DHAT slow paths (src/memory-events.c,
+// src/dhat.c), compiled only with MI_MEMEVT or MI_DHAT; the profiler uses the plain peek.
+MI_DECL_MAYBE_UNUSED static inline mi_hooks_tld_t* _mi_hooks_tld_peek_or_local(mi_hooks_tld_t* local) {
   mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
   if (hooks != NULL) return hooks;
   _mi_memzero(local, sizeof(*local));

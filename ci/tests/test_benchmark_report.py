@@ -1912,8 +1912,36 @@ class BenchmarkReportTests(unittest.TestCase):
         self.assertGreaterEqual(float(throughput_domains[0].group(1)), 99_000_000.0)  # type: ignore[union-attr]
         self.assertGreaterEqual(float(rss_domains[0].group(1)), 9_900_000_000.0)  # type: ignore[union-attr]
         for svg in (*throughput, *rss):
-            self.assertEqual(svg.count("(supplemental)"), 1)
-            self.assertIn("P5-P95 empirical area", svg)
+            self.assertNotIn("P5", svg)
+            self.assertIn(f"median of n={report.DISTRIBUTION_BLOCKS}", svg)
+
+    def test_distribution_chart_overlays_every_allocator_median_on_one_panel(self) -> None:
+        # #507: one plot panel, one median line per allocator, a legend, and no
+        # P5-P95 area; the spread stays in latest.json and the dashboard table.
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = report.validate_scaling_report(latest["scaling"], "distribution fixture")
+        view = report.scaling_view_from_validated(scaling)
+        stroke = re.compile(r'<path [^>]*stroke="(#[0-9a-f]+)" stroke-width="([\d.]+)"')
+        for pattern in report.DISTRIBUTION_PATTERN_IDS:
+            for metric in ("throughput", "rss"):
+                with self.subTest(pattern=pattern, metric=metric):
+                    svg = report.distribution_stack_svg(view, pattern, metric).decode()
+                    self.assertEqual(svg.count(f'fill="{report.SCALING_INK["plot"]}"'), 1)
+                    self.assertEqual(svg.count("<path "), len(report.ALLOCATOR_IDS))
+                    strokes = stroke.findall(svg)
+                    self.assertEqual(len(strokes), len(report.ALLOCATOR_IDS))
+                    colors = {color for color, _width in strokes}
+                    for allocator in report.ALLOCATOR_IDS:
+                        self.assertIn(report.SCALING_SERIES[allocator], colors)
+                        self.assertIn(report.allocator_label(allocator), svg)
+                    self.assertNotIn("<polygon", svg)
+                    self.assertNotIn("fill-opacity", svg)
+                    self.assertNotIn("P5", svg)
+                    self.assertIn(f"median of n={report.DISTRIBUTION_BLOCKS}", svg)
+                    last_color, last_width = strokes[-1]
+                    self.assertEqual(last_color, report.SCALING_SERIES["mimalloc-pprof"])
+                    for _color, width in strokes[:-1]:
+                        self.assertGreater(float(last_width), float(width))
 
     def test_scaling_report_rejects_raw_values_that_disagree_with_summaries(self) -> None:
         latest = self.with_complete_scaling(self.load_latest())

@@ -19,8 +19,23 @@ concurrency:
 permissions:
   contents: read
 jobs:
+  pr-ci-mode:
+    uses: ./.github/workflows/pr-ci-mode.yml
+
+  pr-test-gate:
+    name: PR test gate (purge-teardown-regression)
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs: [pr-ci-mode, build, reproduce]
+    uses: ./.github/workflows/pr-ci-gate.yml
+    with:
+      workflow: purge-teardown-regression
+      needs-json: ${{ toJSON(needs) }}
+      ci-test: ${{ contains(github.event.pull_request.labels.*.name, 'ci-test') }}
+      ci-full: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
+
   build:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
+    needs: pr-ci-mode
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:

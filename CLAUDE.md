@@ -1,8 +1,9 @@
 # mimalloc-pprof — agent guidance
 
 > [!IMPORTANT]
-> Ordinary PR/main CI is fractional. Add `ci-full` to a PR for every supported
-> platform; a release needs the full matrix on the exact merged commit SHA.
+> Internal PR/main CI is fractional. External-contributor PRs run the full test
+> matrix automatically (#463). A release needs the full matrix on the exact
+> merged commit SHA.
 > Start or resume the issue-driven release attempt through `ci/release.py`.
 > Read [docs/release-process.md](docs/release-process.md) before changing release
 > workflows or trying to tag, publish, or dispatch a release.
@@ -19,11 +20,15 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
 
 ## Hard rules
 
-Ordinary PR and `main` CI use the minimal lane. Add literal `ci-test` for the
+Internal PR and `main` CI use the minimal lane. Add literal `ci-test` for the
 complete C test DAG; add `ci-full` for the release platform matrix, including
-native Intel and Apple Silicon execution. Label changes recompute the mode on
-the same PR head. A release requires full validation from exact-SHA dispatches
-before tagging; the publication workflow remains fail-closed. See
+native Intel and Apple Silicon execution. External PR authors without write
+access receive the full test matrix without a label (#463). Label changes
+recompute the mode on the same PR revision. A release requires full validation from exact-SHA dispatches
+before tagging. Real publication requires the issue freeze, matching packaged
+crate, exact-SHA full CI, and shipped-asset smoke gates. The issue body must
+explicitly say `- State: **ready-to-publish**.`; a dry run never sets that state.
+See
 `docs/ci-gates.md` and `ci/release_full_ci_manifest.v1.json`.
 
 1. **Never commit directly to `main`.** Feature branch → PR → merge. Branch names come from
@@ -55,9 +60,10 @@ before tagging; the publication workflow remains fail-closed. See
    to require; every `test-osx-*` must carry `LABELS macos` (`ci/check_macos_labels.py`).
    Issue #444 makes one narrow owner-approved exception: `run-macos-native-full` executes
    the same Linux-built ARM64 and x64 bundles on hosted `macos-15` and `macos-15-intel`
-   only for a literal `ci-full` PR label or an explicit `ci-mode=full` dispatch. Ordinary
-   PR/main events allocate no hosted Mac runner. The full dispatch requires an exact
-   `candidate_sha`, verified by `resolve-candidate`; PR runs build the PR head SHA.
+   for a literal `ci-full` PR label, an external-contributor PR, or an explicit
+   `ci-mode=full` dispatch. Internal minimal PR/main events allocate no hosted Mac
+   runner. The full dispatch requires an exact `candidate_sha`, verified by
+   `resolve-candidate`; PR runs build the test-merge SHA.
    `ci/lint_no_macos_runners.py` rejects any
    other macOS runner label, including an exception whose opt-in gate is removed.
    The guest boots macOS **Recovery** straight off the image every run via the
@@ -125,6 +131,19 @@ before tagging; the publication workflow remains fail-closed. See
    Appending fields to `mi_purge_all_report_t` is therefore not, by itself, a blocker for
    #438. This does **not** waive same-build C/Rust layout checks, ordinary memory safety,
    or the separate retained `mi_arena_id_t` use-after-free risk in arena reclamation.
+9. **Never suppress `-Wunused-function` file-wide** (no `#pragma GCC/clang diagnostic
+   ignored`, including in the xtask amalgamation). Mark the individual `static` function
+   `MI_DECL_MAYBE_UNUSED` (defined in `include/mimalloc.h`) with a comment saying why a
+   translation unit may not call it. `ci/check_no_diagnostic_suppression.py` enforces this.
+
+10. **Macros are UPPER_CASE** (owner rule, 2026-09-25). `ci/check_macro_case.py` fails on any new
+    lower-case `#define`; `ci/macro_case_baseline.txt` grandfathers the ones inherited from upstream
+    and may only shrink.
+
+11. **No magic numbers (owner rule, 2026-09-25).** A tuning constant (a time, size, count or
+   threshold) is a named `#define` guarded by `#ifndef`, so a build can override it
+   (`-DMI_SCAVENGER_MAX_WAIT_MS=5000`, including from the Rust crate's build script). Make it an
+   `mi_option` when it should be settable at run time, from C or Rust. Never write the value inline.
 
 ## Repo facts
 

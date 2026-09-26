@@ -105,7 +105,7 @@ static void mi_purge_all_abandoned_subproc(mi_subproc_t* sp, mi_tld_t* my_tld) {
   mi_lock(&sp->heaps_lock) {
     for (mi_heap_t* heap = sp->heaps; heap != NULL; heap = heap->next) {
       if (mi_atomic_load_acquire(&heap->releasing) != 0) continue;
-      _mi_arenas_purge_abandoned_holes(heap, my_tld);
+      _mi_arenas_purge_abandoned_holes(heap, my_tld, 0, MI_ARENA_BIN_COUNT);
     }
   }
 }

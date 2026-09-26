@@ -1044,6 +1044,83 @@ class BenchmarkReportTests(unittest.TestCase):
                 "provenance must sit inside the memory section",
             )
 
+    @staticmethod
+    def floor_timeline_samples(
+        baseline_mib: int, live_mib: int, peak_mib: int
+    ) -> list[dict[str, object]]:
+        """#534: one timeline cell whose samples carry the floor's operands."""
+
+        samples: list[dict[str, object]] = []
+        for index, allocator in enumerate(report.ALLOCATOR_IDS):
+            peak = (peak_mib + 20 * index) * MIB
+            samples.append(
+                {
+                    "scenario_id": "large-objects",
+                    "thread_point": "1",
+                    "allocator_id": allocator,
+                    "baseline_rss_bytes": (baseline_mib + index) * MIB,
+                    "peak_live_requested_bytes": live_mib * MIB + index * 4096,
+                    "sampled_peak_rss_bytes": peak,
+                    "workload_active_ns": 10_000_000,
+                    "workload_drained_ns": 50_000_000,
+                    "post_drain_sample_100ms_ns": 150_000_000,
+                    "post_drain_sample_1s_ns": 1_050_000_000,
+                    "post_drain_sample_5s_ns": 5_050_000_000,
+                    "post_drain_rss_100ms_bytes": 160 * MIB,
+                    "post_drain_rss_1s_bytes": 140 * MIB,
+                    "post_drain_rss_5s_bytes": (130 + 5 * index) * MIB,
+                    "timeline": [
+                        {"elapsed_ns": 15_000_000, "rss_bytes": 150 * MIB},
+                        {"elapsed_ns": 35_000_000, "rss_bytes": peak},
+                        {"elapsed_ns": 45_000_000, "rss_bytes": 200 * MIB},
+                    ],
+                }
+            )
+        return samples
+
+    def test_rss_timeline_draws_the_live_data_floor_inside_its_domain(self) -> None:
+        # #534: baseline + concurrent live bytes, the smallest in the cell, drawn as a
+        # dashed horizontal line and never clipped by the RSS domain.
+        cells = report.timeline_cells(
+            {"raw_samples": self.floor_timeline_samples(baseline_mib=20, live_mib=64, peak_mib=300)}
+        )
+        self.assertEqual(cells[0]["floor"], 84 * MIB)
+        _t_min, _t_max, rss_min, rss_max = report.timeline_domain(cells)
+        self.assertLess(rss_min, 84 * MIB)
+        canvas = report.Canvas(report.TIMELINE_WIDTH, report.TIMELINE_HEIGHT, (248, 250, 252))
+        report.draw_rss_timeline(canvas, cells)
+        left, top, right, bottom = report.TIMELINE_SLOT_MARGINS
+        plot_height = report.TIMELINE_HEIGHT // report.TIMELINE_ROWS - top - bottom
+        y = round(report.timeline_y(84 * MIB, rss_min, rss_max, top, plot_height))
+        row = [
+            tuple(
+                canvas.pixels[
+                    (y * report.TIMELINE_WIDTH + x) * 3 : (y * report.TIMELINE_WIDTH + x) * 3 + 3
+                ]
+            )
+            for x in range(left, report.TIMELINE_WIDTH // report.TIMELINE_COLS - right)
+        ]
+        floor_pixels = row.count(report.TIMELINE_FLOOR_COLOR)
+        # Dashed: a good share of the row, not all of it.
+        self.assertGreater(floor_pixels, len(row) // 3)
+        self.assertLess(floor_pixels, len(row))
+
+    def test_rss_timeline_omits_a_floor_the_baseline_already_absorbed(self) -> None:
+        # A live set that fit in memory already resident before the workload leaves
+        # peak RSS under baseline + live: then that sum is not a floor, so none is drawn.
+        cells = report.timeline_cells(
+            {
+                "raw_samples": self.floor_timeline_samples(
+                    baseline_mib=200, live_mib=150, peak_mib=300
+                )
+            }
+        )
+        self.assertIsNone(cells[0]["floor"])
+        legacy = self.floor_timeline_samples(baseline_mib=20, live_mib=64, peak_mib=300)
+        for sample in legacy:
+            del sample["baseline_rss_bytes"]
+        self.assertIsNone(report.timeline_cells({"raw_samples": legacy})[0]["floor"])
+
     def test_rss_timeline_sawtooth_rises_falls_and_decay_markers_at_offsets(self) -> None:
         # One synthetic cell: every allocator gets a sawtooth timeline that
         # rises to a distinct peak, falls back, and then decays through the

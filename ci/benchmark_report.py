@@ -3513,6 +3513,9 @@ TIMELINE_ROWS = 2
 TIMELINE_SLOT_MARGINS = (54, 26, 6, 34)
 TIMELINE_DRAIN_COLOR = (90, 102, 115)
 TIMELINE_GRID_COLOR = (223, 229, 236)
+# #534: the live-data floor, a dashed horizontal line in a neutral slate.
+TIMELINE_FLOOR_COLOR = (148, 163, 184)
+TIMELINE_FLOOR_DASH = (8, 5)
 
 
 def _median_int(values: Sequence[int]) -> int:
@@ -3632,9 +3635,35 @@ def timeline_cells(memory: Mapping[str, object]) -> list[dict[str, object]]:
                 "series": series["series"],
                 "active_ns": series["active_ns"],
                 "drained_ns": series["drained_ns"],
+                "floor": timeline_floor(group, f"memory cell {key[0]}/{key[1]}"),
             }
         )
     return cells
+
+
+def timeline_floor(group: Sequence[Mapping[str, object]], label: str) -> int | None:
+    """#534: the cell's live-data floor -- the smallest baseline RSS + concurrent
+    peak live requested bytes of any sample -- or None when the samples do not
+    carry both, or when it is not a floor at all: a live set that fit in memory
+    already resident at the baseline leaves the sampled peak under the sum (the
+    fragmentation proxy's `non_positive_rss_delta`), and a line drawn there
+    would claim a minimum some allocator beat."""
+
+    if not group or any(
+        "baseline_rss_bytes" not in sample or "peak_live_requested_bytes" not in sample
+        for sample in group
+    ):
+        return None
+    floor = min(
+        int_value(sample.get("baseline_rss_bytes"), f"{label}.baseline_rss_bytes", 1)
+        + int_value(sample.get("peak_live_requested_bytes"), f"{label}.peak_live_requested_bytes")
+        for sample in group
+    )
+    lowest_peak = min(
+        int_value(sample.get("sampled_peak_rss_bytes"), f"{label}.sampled_peak_rss_bytes", 1)
+        for sample in group
+    )
+    return floor if floor <= lowest_peak else None
 
 
 def timeline_domain(cells: Sequence[Mapping[str, object]]) -> tuple[int, int, int, int]:
@@ -3656,6 +3685,9 @@ def timeline_domain(cells: Sequence[Mapping[str, object]]) -> tuple[int, int, in
             for elapsed, rss in cast(list[tuple[int, int]], series["decay"]):
                 rss_values.append(rss)
                 t_max_values.append(elapsed)
+        # #534: the floor is part of the domain, so it is never clipped.
+        if cell.get("floor") is not None:
+            rss_values.append(cast(int, cell["floor"]))
     if not active_values or not t_max_values or not rss_values:
         fail("timeline cells contain no series data")
     # The x domain runs to the latest 5 s post-drain sample so return-to-OS is
@@ -3752,6 +3784,17 @@ def draw_rss_timeline(canvas: Canvas, cells: Sequence[Mapping[str, object]]) -> 
             dash_y += 5 if on else 4
             on = not on
         canvas.text(drained_x + 4, top + 2, "D", TIMELINE_DRAIN_COLOR, 1)
+        if cell.get("floor") is not None:
+            # #534: dashed live-data floor across the plot, under every allocator line.
+            floor_y = round(
+                timeline_y(cast(int, cell["floor"]), rss_min, rss_max, top, plot_height)
+            )
+            dash_on, dash_off = TIMELINE_FLOOR_DASH
+            dash_x = left
+            while dash_x < left + plot_width:
+                end = min(dash_x + dash_on, left + plot_width)
+                canvas.line(dash_x, floor_y, end, floor_y, TIMELINE_FLOOR_COLOR, 2)
+                dash_x += dash_on + dash_off
         # Lines first, markers second: a steep line from another allocator may
         # pass through this allocator's peak, and its marker must stay visible.
         strokes: list[
@@ -3805,6 +3848,9 @@ def draw_rss_timeline(canvas: Canvas, cells: Sequence[Mapping[str, object]]) -> 
         "",
         "D dashed: workload drained",
         "",
+        "slate dashed: theoretical minimum",
+        "= baseline + peak live bytes",
+        "",
         "axis diamonds: post-drain",
         "sample offsets 100ms/1s/5s",
         "",
@@ -3812,8 +3858,7 @@ def draw_rss_timeline(canvas: Canvas, cells: Sequence[Mapping[str, object]]) -> 
         "post-drain RSS per allocator",
         "(return-to-OS)",
         "",
-        "natural purge only;",
-        "lower is better",
+        "natural purge only; lower is better",
     ]
     note_y = legend_y + 22 + len(ALLOCATOR_IDS) * 20 + 10
     for note in notes:
@@ -6682,7 +6727,7 @@ def render_html(latest: Mapping[str, object]) -> bytes:
             if memory_run["run_origin"] == "github-actions"
             else "https://github.com/zackees/mimalloc-pprof/actions"
         )
-        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Sampled peak RSS normalized to Microsoft mimalloc; 1.0 equals Microsoft mimalloc; lower is better"><img src="benchmark-pareto.png" alt="Speed-memory Pareto scatter: fragmentation proxy versus median throughput; upper-left is better"><img src="benchmark-rss-timeline.png" alt="Linux process RSS over time with workload-drained marker and post-drain return-to-OS points; lower is better"><img src="benchmark-fragmentation.png" alt="Fragmentation proxy ratio bars with a 1.0 reference line; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. The bar chart normalizes sampled peak RSS to Microsoft mimalloc (<code>upstream-mimalloc</code>) = 1.0 (matching the throughput panel), with absolute MiB in the table below. The Pareto scatter pairs each allocator's fragmentation proxy with its median throughput on the matching scenario/thread cell; upper-left is better. The timeline shows RSS growth, the workload-drained marker, and the 100 ms / 1 s / 5 s post-drain points so return-to-OS behavior is visible. The fragmentation proxy is reported only where the live set is the measured quantity; <code>thread-churn</code> reads n/a by design, and any cell whose peak RSS never rose above its baseline records no ratio rather than a fabricated one. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a> measured mimalloc-pprof at source <code>{escaped(memory_run["source_sha"])}</code>, which is not necessarily the commit above; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th><th>vs Microsoft mimalloc</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
+        memory_html = f"""<section><h2 id="memory">Linux process memory</h2><img src="benchmark-memory.png" alt="Sampled peak RSS normalized to Microsoft mimalloc; 1.0 equals Microsoft mimalloc; lower is better"><img src="benchmark-pareto.png" alt="Speed-memory Pareto scatter: fragmentation proxy versus median throughput; upper-left is better"><img src="benchmark-rss-timeline.png" alt="Linux process RSS over time with workload-drained marker and post-drain return-to-OS points; lower is better"><img src="benchmark-fragmentation.png" alt="Fragmentation proxy ratio bars with a 1.0 reference line; lower is better"><p>Externally sampled from <code>/proc/&lt;pid&gt;/smaps_rollup</code> every {escaped(memory["sampling_target_interval_ns"])} ns with VmHWM cross-checks and natural purge only. The bar chart normalizes sampled peak RSS to Microsoft mimalloc (<code>upstream-mimalloc</code>) = 1.0 (matching the throughput panel), with absolute MiB in the table below. The Pareto scatter pairs each allocator's fragmentation proxy with its median throughput on the matching scenario/thread cell; upper-left is better. The timeline shows RSS growth, the workload-drained marker, and the 100 ms / 1 s / 5 s post-drain points so return-to-OS behavior is visible; its slate dashed line is the {RSS_FLOOR_LABEL} (the smallest baseline RSS + peak live requested bytes in the cell), omitted where a live set fit in memory already resident at the baseline, since it would not be a minimum there. The fragmentation proxy is reported only where the live set is the measured quantity; <code>thread-churn</code> reads n/a by design, and any cell whose peak RSS never rose above its baseline records no ratio rather than a fabricated one. Runner: {escaped(memory_runner["runner_class"])}; results are informational. Memory run <a href="{memory_actions}">{escaped(memory_run["run_id"])}/{escaped(memory_run["run_attempt"])}</a> measured mimalloc-pprof at source <code>{escaped(memory_run["source_sha"])}</code>, which is not necessarily the commit above; metric key <code>{escaped(memory["metric_comparison_key"])}</code>.</p><table><thead><tr><th>Scenario</th><th>Threads</th><th>Metric</th><th>Allocator</th><th>Median (MiB or ratio)</th><th>vs Microsoft mimalloc</th></tr></thead><tbody>{memory_rows}</tbody></table></section>"""
     latency_html = ""
     if "latency" in latest:
         latency = validate_latency_report(latest["latency"], "latest.latency")

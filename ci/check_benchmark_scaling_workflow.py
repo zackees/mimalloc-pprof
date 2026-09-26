@@ -665,7 +665,7 @@ SOURCE_MUTATIONS: dict[str, Callable[[str], str]] = {
     ),
     "rss schema renamed on one side": lambda text: text.replace(
         f'SCALING_RSS_SCHEMA_VERSION: &str = "{SCALING_RSS_SCHEMA}"',
-        'SCALING_RSS_SCHEMA_VERSION: &str = "throughput-scaling-rss-v2"',
+        'SCALING_RSS_SCHEMA_VERSION: &str = "throughput-scaling-rss-v3"',
     ),
     "thread points declared out of order": lambda text: text.replace(
         f"[{', '.join(str(p) for p in SCALING_THREAD_POINTS)}]",

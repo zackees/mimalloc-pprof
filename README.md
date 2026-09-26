@@ -191,7 +191,11 @@ Each chart overlays, on one panel, the median of 40 paired runs for all five all
 TCMalloc, jemalloc, Microsoft mimalloc, Bun mimalloc, and mimalloc-pprof (drawn last and
 thicker). Within each metric both workloads share one zero-based Y axis, rounded upward
 from the largest raw observation so outliers are not clipped. The per-cell spread across
-runs is on the dashboard table and in `latest.json`, not on the chart.
+runs is on the dashboard table and in `latest.json`, not on the chart. Every peak-RSS chart
+also draws a grey dashed **live data (theoretical minimum)** line: the process's own RSS
+before any worker starts, plus the requested bytes the workload holds at once. No allocator
+can go below it, so the gap between a line and the floor is that allocator's overhead.
+Throughput charts have no floor.
 
 [![Power-of-two requested sizes: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
@@ -223,8 +227,10 @@ the cost of short-lived threads.
 Peak RSS is only half of it. This chart runs the short-lived-thread stream again at 8
 workers, then joins every worker thread and keeps the process alive and idle, like a
 server between requests. Each process reads its own RSS 0.1, 0.5, 1, 1.5, 2 and 3 s
-after the last thread was joined. Each line is one allocator's median of 40 paired runs,
-and the dashed line is the release bound perf-ab enforces. The table under the chart gives
+after the last thread was joined. Each line is one allocator's median of 40 paired runs.
+The vertical dashed line is the release bound perf-ab enforces, and the grey horizontal
+one is the floor: nothing is live after the drain, so an allocator that returned
+everything would sit at the process's pre-worker RSS. The table under the chart gives
 each allocator's peak and its time to release: the first sample within 1 MiB of the 3 s
 one, the same definition perf-ab uses.
 

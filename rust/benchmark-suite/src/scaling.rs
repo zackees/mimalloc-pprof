@@ -46,8 +46,12 @@ pub const SCALING_CHILD_PROTOCOL_VERSION: &str = "throughput-scaling-sparse-chil
 /// The RSS side-car overlaid on the same sweep. It is deliberately an optional
 /// object inside the scaling report (not a mutation of the cell summaries) so
 /// every already-published sparse row stays valid history: rows recorded
-/// before the side-car existed simply carry no `rss` object.
-pub const SCALING_RSS_SCHEMA_VERSION: &str = "throughput-scaling-rss-v1";
+/// before the side-car existed simply carry no `rss` object. v2 (#534) adds
+/// `floor_summaries`: the theoretical-minimum RSS the memory charts draw.
+pub const SCALING_RSS_SCHEMA_VERSION: &str = "throughput-scaling-rss-v2";
+/// #534: the `floor_summaries` entry of the thread-churn chart. After the
+/// drain nothing is live, so its floor is the baseline alone.
+pub const SCALING_RSS_FLOOR_THREAD_CHURN: &str = "thread-churn";
 /// Coverage mode: three blocks is the minimum that still permits a paired
 /// comparison and still exposes a single wild outlier through min/max.
 pub const SCALING_BLOCKS: u32 = 3;
@@ -1037,6 +1041,12 @@ pub struct ScalingChildResponse {
     pub size_histogram: Vec<ScalingSizeHistogramBucket>,
     #[serde(default)]
     pub peak_live_requested_bytes: u64,
+    /// #534: the child's own resident set after setup, before any worker
+    /// thread exists (`/proc/self/statm`; 0 off Linux). The memory charts'
+    /// floor is this plus the live requested bytes. Defaulted: rows
+    /// published before it carry none.
+    #[serde(default)]
+    pub baseline_rss_bytes: u64,
     pub remote_free_calls: u64,
     pub producer_fallback_frees: u64,
     pub setup_ns: u64,
@@ -1392,6 +1402,7 @@ pub fn execute_scaling_child_request_with_rss_probe<A: AllocatorAdapter>(
     let produced = Arc::new(Barrier::new(threads));
     let finished = Arc::new(Barrier::new(threads + 1));
     let setup_ns = nonzero_ns(setup_started);
+    let baseline_rss_bytes = read_baseline_rss_bytes()?;
     let mut warmup_ns = 0u64;
     let mut elapsed_ns = 0u64;
     let tallies = std::thread::scope(|scope| -> Result<Vec<WorkerTally>, String> {
@@ -1532,6 +1543,7 @@ pub fn execute_scaling_child_request_with_rss_probe<A: AllocatorAdapter>(
             .as_ref()
             .map(|value| value.peak.load(Ordering::Relaxed))
             .unwrap_or(metadata.peak_live_requested_bytes),
+        baseline_rss_bytes,
         remote_free_calls,
         producer_fallback_frees,
         setup_ns,
@@ -1596,6 +1608,17 @@ pub fn read_self_rss_bytes() -> Result<u64, String> {
         return Err("sysconf(_SC_PAGESIZE) failed".into());
     }
     Ok(resident_pages * page_bytes as u64)
+}
+
+/// #534: the child's resident set after setup, before any worker thread
+/// exists -- the part of every allocator's RSS the workload itself does not
+/// ask for. Linux-only like every RSS reading here; 0 elsewhere.
+fn read_baseline_rss_bytes() -> Result<u64, String> {
+    if cfg!(target_os = "linux") {
+        read_self_rss_bytes()
+    } else {
+        Ok(0)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1672,6 +1695,7 @@ fn execute_larson_rotation<A: AllocatorAdapter>(
     // still reaching every barrier) once it is set.
     let aborted = Arc::new(AtomicBool::new(false));
     let setup_ns = nonzero_ns(setup_started);
+    let baseline_rss_bytes = read_baseline_rss_bytes()?;
     let mut warmup_ns = 0u64;
     let mut elapsed_ns = 0u64;
     let base_quota = request.operations_per_worker / u64::from(rounds);
@@ -1785,6 +1809,7 @@ fn execute_larson_rotation<A: AllocatorAdapter>(
         worker_seeds: metadata.worker_seeds,
         size_histogram: metadata.size_histogram,
         peak_live_requested_bytes: metadata.peak_live_requested_bytes,
+        baseline_rss_bytes,
         remote_free_calls,
         producer_fallback_frees: 0,
         setup_ns,
@@ -2646,6 +2671,139 @@ pub struct ScalingRssReport {
     pub metric_schema_version: String,
     pub sampling: ScalingRssSampling,
     pub cell_summaries: Vec<ScalingRssCellSummary>,
+    /// #534: one theoretical-minimum RSS per memory-chart cell. Empty (and
+    /// then not serialized) on rows published before v2.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub floor_summaries: Vec<ScalingRssFloorSummary>,
+}
+
+/// #534: the least RSS any allocator could have shown in one memory-chart
+/// cell: the child's baseline plus the requested bytes it held at once. It is
+/// allocator-independent, so it is the smallest such sum across every sample
+/// in the cell (ties to the smaller baseline): a true floor for every line.
+/// `pattern` is a replayed sweep pattern, or `SCALING_RSS_FLOOR_THREAD_CHURN`
+/// with no live bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScalingRssFloorSummary {
+    pub pattern: String,
+    pub thread_count: u32,
+    pub baseline_rss_bytes: u64,
+    /// The concurrent peak measured by the live-telemetry replay, never the
+    /// plan's sum of per-worker peaks (an upper bound on it).
+    pub peak_live_requested_bytes: u64,
+    pub floor_rss_bytes: u64,
+}
+
+/// #534: the floors of every replayed sweep cell, in (pattern, workers)
+/// order, then the thread-churn floor when there are churn samples.
+pub fn build_rss_floors(
+    samples: &[ScalingRawSample],
+    thread_churn_samples: &[ScalingRawSample],
+) -> Vec<ScalingRssFloorSummary> {
+    let mut best: BTreeMap<(String, u32), (u64, u64)> = BTreeMap::new();
+    for sample in samples {
+        if !ScalingPattern::parse(&sample.pattern)
+            .is_some_and(|pattern| pattern.replays_live_telemetry(false))
+        {
+            continue;
+        }
+        let candidate = (
+            sample.response.baseline_rss_bytes,
+            sample.diagnostic_peak_live_requested_bytes,
+        );
+        let rank = |(baseline, live): (u64, u64)| (baseline.saturating_add(live), baseline);
+        best.entry((sample.pattern.clone(), sample.thread_count))
+            .and_modify(|current| {
+                if rank(candidate) < rank(*current) {
+                    *current = candidate;
+                }
+            })
+            .or_insert(candidate);
+    }
+    let mut floors = best
+        .into_iter()
+        .map(
+            |((pattern, thread_count), (baseline, live))| ScalingRssFloorSummary {
+                pattern,
+                thread_count,
+                baseline_rss_bytes: baseline,
+                peak_live_requested_bytes: live,
+                floor_rss_bytes: baseline.saturating_add(live),
+            },
+        )
+        .collect::<Vec<_>>();
+    if let Some(baseline) = thread_churn_samples
+        .iter()
+        .map(|sample| sample.response.baseline_rss_bytes)
+        .min()
+    {
+        floors.push(ScalingRssFloorSummary {
+            pattern: SCALING_RSS_FLOOR_THREAD_CHURN.into(),
+            thread_count: THREAD_CHURN_THREADS,
+            baseline_rss_bytes: baseline,
+            peak_live_requested_bytes: 0,
+            floor_rss_bytes: baseline,
+        });
+    }
+    floors
+}
+
+/// #534: the floors must be exactly what the raw samples give, non-zero, and
+/// never above an RSS any allocator was measured at -- that could only be a
+/// measurement bug, so it fails the run rather than drawing a wrong floor.
+fn validate_rss_floors(
+    rss: &ScalingRssReport,
+    samples: &[ScalingRawSample],
+    thread_churn: Option<&ThreadChurnReport>,
+) -> Result<(), String> {
+    let churn_samples = thread_churn.map_or(&[][..], |churn| churn.raw_samples.as_slice());
+    if rss.floor_summaries != build_rss_floors(samples, churn_samples) {
+        return Err("scaling RSS floors differ from their raw samples".into());
+    }
+    let replayed = SCALING_PATTERNS
+        .into_iter()
+        .filter(|pattern| pattern.replays_live_telemetry(false))
+        .count();
+    let expected = replayed * SCALING_THREAD_POINTS.len() + usize::from(thread_churn.is_some());
+    if rss.floor_summaries.len() != expected {
+        return Err(format!(
+            "scaling RSS side-car has {} floors, expected {expected}",
+            rss.floor_summaries.len()
+        ));
+    }
+    for floor in &rss.floor_summaries {
+        let lowest_measured = if floor.pattern == SCALING_RSS_FLOOR_THREAD_CHURN {
+            thread_churn
+                .into_iter()
+                .flat_map(|churn| &churn.cell_summaries)
+                .flat_map(|cell| {
+                    std::iter::once(cell.p05_peak_rss_bytes)
+                        .chain(cell.p05_post_drain_rss_bytes.iter().copied())
+                })
+                .min()
+        } else {
+            rss.cell_summaries
+                .iter()
+                .filter(|cell| {
+                    cell.pattern == floor.pattern && cell.thread_count == floor.thread_count
+                })
+                .map(|cell| cell.min_peak_rss_bytes)
+                .min()
+        };
+        let live_expected = floor.pattern != SCALING_RSS_FLOOR_THREAD_CHURN;
+        if floor.baseline_rss_bytes == 0
+            || (floor.peak_live_requested_bytes == 0) == live_expected
+            || floor.floor_rss_bytes != floor.baseline_rss_bytes + floor.peak_live_requested_bytes
+            || lowest_measured.is_none_or(|lowest| floor.floor_rss_bytes > lowest)
+        {
+            return Err(format!(
+                "scaling RSS floor for {}/{} is missing, inconsistent, or above a measured RSS",
+                floor.pattern, floor.thread_count
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3066,6 +3224,12 @@ pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
                 sample.pattern, sample.thread_count, sample.allocator_id
             ));
         }
+        if pattern.replays_live_telemetry(false) && sample.response.baseline_rss_bytes == 0 {
+            return Err(format!(
+                "scaling sample for {}/{} on {} has no baseline RSS for the chart floor",
+                sample.pattern, sample.thread_count, sample.allocator_id
+            ));
+        }
         if pattern.is_distribution() && sample.diagnostic_peak_rss_bytes == 0 {
             return Err(format!(
                 "scaling distribution sample for {}/{} on {} has no diagnostic RSS observation",
@@ -3254,12 +3418,13 @@ pub fn validate_thread_churn_samples(
             );
         }
         if sample.peak_rss_bytes == 0
+            || sample.response.baseline_rss_bytes == 0
             || sample.diagnostic_peak_rss_bytes != 0
             || sample.live_requested_bytes_at_diagnostic_peak_rss != 0
             || sample.diagnostic_peak_live_requested_bytes != 0
         {
             return Err(format!(
-                "thread-churn sample on {} has no peak RSS or carries a diagnostic replay",
+                "thread-churn sample on {} has no peak or baseline RSS, or carries a diagnostic replay",
                 sample.allocator_id
             ));
         }
@@ -3414,6 +3579,7 @@ pub fn build_scaling_report(raw: &ScalingRawRun) -> Result<ScalingMetricReport, 
             metric_schema_version: SCALING_RSS_SCHEMA_VERSION.into(),
             sampling: rss_sampling(),
             cell_summaries: rss_cell_summaries,
+            floor_summaries: build_rss_floors(&raw.samples, &raw.thread_churn_samples),
         }),
         raw_samples: raw.samples.clone(),
         thread_churn: Some(build_thread_churn_report(&raw.thread_churn_samples)),
@@ -3548,6 +3714,7 @@ pub fn validate_scaling_report(report: &ScalingMetricReport) -> Result<(), Strin
                 ));
             }
         }
+        validate_rss_floors(rss, &report.raw_samples, report.thread_churn.as_ref())?;
     }
     // A fresh report always carries the thread-churn side-car; only rows
     // published before #508 lack it, and those are never re-validated here.
@@ -3721,6 +3888,13 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                         + u64::from(block_id))
                         * 1024
                         * 1024;
+                    // #534: the replay's concurrent live peak sits below the
+                    // plan's per-worker sum, and with the baseline under
+                    // every synthetic peak, so the floor is a true floor.
+                    let concurrent_live = metadata.peak_live_requested_bytes.min(
+                        (1 + u64::from(thread_count)) * 1024 * 1024 + u64::from(block_id) * 4096,
+                    );
+                    let baseline_rss_bytes = (4 * 1024 + ordinal as u64 * 4) * 1024;
                     samples.push(ScalingRawSample {
                         metric_schema_version: SCALING_SCHEMA_VERSION.into(),
                         block_id,
@@ -3738,12 +3912,12 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                             0
                         },
                         live_requested_bytes_at_diagnostic_peak_rss: if pattern.is_distribution() {
-                            metadata.peak_live_requested_bytes
+                            concurrent_live
                         } else {
                             0
                         },
                         diagnostic_peak_live_requested_bytes: if pattern.is_distribution() {
-                            metadata.peak_live_requested_bytes
+                            concurrent_live
                         } else {
                             0
                         },
@@ -3765,6 +3939,7 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                             worker_seeds: metadata.worker_seeds.clone(),
                             size_histogram: metadata.size_histogram.clone(),
                             peak_live_requested_bytes: metadata.peak_live_requested_bytes,
+                            baseline_rss_bytes,
                             remote_free_calls: 0,
                             producer_fallback_frees: 0,
                             setup_ns: 1,
@@ -3847,6 +4022,8 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                     worker_seeds: metadata.worker_seeds.clone(),
                     size_histogram: metadata.size_histogram.clone(),
                     peak_live_requested_bytes: metadata.peak_live_requested_bytes,
+                    baseline_rss_bytes: (4 * 1024 + ordinal as u64 * 4 + u64::from(block_id % 3))
+                        * 1024,
                     remote_free_calls: 0,
                     producer_fallback_frees: 0,
                     setup_ns: 1,

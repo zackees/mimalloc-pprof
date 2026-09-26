@@ -28,6 +28,10 @@ use crate::model::{
 };
 use crate::orchestration::ChildProgram;
 use crate::provenance::sha256_bytes;
+use crate::scaling_diagnostic::{
+    decode_live_telemetry, encode_live_telemetry, RssPhaseAccumulator, ScalingDiagnostic,
+    ScalingPhase, ScalingRssPhase, DIAGNOSTIC_STATUS,
+};
 use crate::stats::MetricDirection;
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
@@ -429,6 +433,16 @@ impl ScalingPattern {
                 | Self::LargeClassEphemeral
                 | Self::ThreadChurn
         )
+    }
+
+    /// Whether the controller runs the separate live-telemetry replay for this
+    /// pattern (live requested bytes and, since #528, phase-marked RSS). The
+    /// published sweep replays the distribution workloads; a diagnostic run
+    /// (#528, #422 P5) also replays `sparse-large-buffers`, so what the
+    /// published mode measures is unchanged.
+    pub const fn replays_live_telemetry(self, diagnostic: bool) -> bool {
+        (self.is_distribution() && !self.samples_after_drain())
+            || (diagnostic && matches!(self, Self::LargeBuffers))
     }
 
     /// Whether the child stays alive after the drain and samples its own RSS
@@ -1256,9 +1270,12 @@ struct WorkerTally {
     fallback_frees: u64,
 }
 
+/// The diagnostic replay's shared file: live requested bytes and, since #528,
+/// the child's current phase (`scaling_diagnostic::encode_live_telemetry`).
 struct LiveTelemetry {
     current: std::sync::atomic::AtomicU64,
     peak: std::sync::atomic::AtomicU64,
+    phase: std::sync::atomic::AtomicU64,
     file: Mutex<std::fs::File>,
 }
 
@@ -1271,6 +1288,7 @@ impl LiveTelemetry {
         Ok(Arc::new(Self {
             current: std::sync::atomic::AtomicU64::new(0),
             peak: std::sync::atomic::AtomicU64::new(0),
+            phase: std::sync::atomic::AtomicU64::new(ScalingPhase::Setup.code()),
             file: Mutex::new(file),
         }))
     }
@@ -1294,15 +1312,29 @@ impl LiveTelemetry {
         }
     }
 
+    /// Raise the phase (never lower it: with several workers a phase begins
+    /// when the first worker reaches it) and publish it.
+    fn mark(&self, phase: ScalingPhase) -> Result<(), String> {
+        self.phase.fetch_max(phase.code(), Ordering::Relaxed);
+        self.publish(self.current.load(Ordering::Relaxed))
+    }
+
     fn publish(&self, value: u64) -> Result<(), String> {
         let mut file = self
             .file
             .lock()
             .map_err(|_| "live telemetry lock poisoned".to_string())?;
+        // Read under the lock, so a later write never carries an older phase.
+        let phase = ScalingPhase::from_code(self.phase.load(Ordering::Relaxed))
+            .ok_or("live telemetry phase is out of range")?;
         file.seek(SeekFrom::Start(0))
-            .and_then(|_| file.write_all(&value.to_le_bytes()))
+            .and_then(|_| file.write_all(&encode_live_telemetry(value, phase)))
             .map_err(|error| format!("write live telemetry: {error}"))
     }
+}
+
+fn mark_phase(telemetry: Option<&Arc<LiveTelemetry>>, phase: ScalingPhase) -> Result<(), String> {
+    telemetry.map_or(Ok(()), |telemetry| telemetry.mark(phase))
 }
 
 /// Execute one scaling child request against the linked allocator.
@@ -1387,7 +1419,9 @@ pub fn execute_scaling_child_request_with_rss_probe<A: AllocatorAdapter>(
                 // thread forever; the child would then die on the parent's
                 // watchdog with an empty stderr instead of reporting the real
                 // error. The outcome is therefore carried, not propagated.
-                let warmup = warm_up_worker(adapter, request, pattern, seed, worker_index, threads);
+                let warmup = mark_phase(telemetry.as_ref(), ScalingPhase::Warmup).and_then(|()| {
+                    warm_up_worker(adapter, request, pattern, seed, worker_index, threads)
+                });
                 ready.wait();
                 start.wait();
                 let mut outcome = warmup.and_then(|()| {
@@ -1433,10 +1467,15 @@ pub fn execute_scaling_child_request_with_rss_probe<A: AllocatorAdapter>(
         } else {
             0
         };
+        // #528: the phase marks from this thread are carried past the
+        // barriers, never returned early: an early return would strand the
+        // workers on `start`/`finished`.
+        let measured_mark = mark_phase(telemetry.as_ref(), ScalingPhase::Measured);
         let measured = Instant::now();
         start.wait();
         finished.wait();
         elapsed_ns = nonzero_ns(measured);
+        let teardown_mark = mark_phase(telemetry.as_ref(), ScalingPhase::Teardown);
         let mut tallies = Vec::with_capacity(threads);
         for handle in handles {
             tallies.push(
@@ -1445,6 +1484,7 @@ pub fn execute_scaling_child_request_with_rss_probe<A: AllocatorAdapter>(
                     .map_err(|_| "scaling worker panicked".to_string())??,
             );
         }
+        measured_mark.and(teardown_mark)?;
         Ok(tallies)
     })?;
     // Every worker -- and every generation thread inside it -- has been
@@ -1924,6 +1964,7 @@ fn run_worker_stream<A: AllocatorAdapter>(
     }
     // Slots still live at the end of the stream are freed here; the oracle
     // counts exactly the same set through `WorkerPlanner::drain_actions`.
+    mark_phase(telemetry, ScalingPhase::Drain)?;
     for action in planner.drain_actions() {
         if let PlannedAction::FreeSlot { slot } = action {
             let parcel = table.slots[slot]
@@ -2107,31 +2148,42 @@ fn nonzero_ns(started: Instant) -> u64 {
 /// peak. Linux-only: production collection refuses to run anywhere else, and
 /// other targets record zero so the code still compiles for the full matrix.
 pub fn sample_peak_rss(pid: u32, stop: &AtomicBool) -> u64 {
-    sample_peak_rss_with_live(pid, stop, None).0
+    sample_rss_trace(pid, stop, None).peak_rss_bytes
 }
 
-fn sample_peak_rss_with_live(
-    pid: u32,
-    stop: &AtomicBool,
-    live_telemetry_path: Option<&str>,
-) -> (u64, u64) {
-    let mut peak = 0u64;
-    let mut live_at_peak = 0u64;
+/// What the controller's external RSS sampler saw of one child.
+#[derive(Debug, Default)]
+struct RssTrace {
+    peak_rss_bytes: u64,
+    live_requested_bytes_at_peak_rss: u64,
+    /// #528: per-phase summaries, only for a replay with live telemetry.
+    phases: Vec<ScalingRssPhase>,
+}
+
+fn sample_rss_trace(pid: u32, stop: &AtomicBool, live_telemetry_path: Option<&str>) -> RssTrace {
+    let mut trace = RssTrace::default();
     if !cfg!(target_os = "linux") {
-        return (0, 0);
+        return trace;
     }
+    let mut phases = RssPhaseAccumulator::default();
+    let started = Instant::now();
     let path = format!("/proc/{pid}/smaps_rollup");
     while !stop.load(Ordering::Relaxed) {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 if let Ok(rss) = crate::memory::parse_smaps_rollup(&text) {
-                    if rss > peak {
-                        peak = rss;
-                        live_at_peak = live_telemetry_path
-                            .and_then(|telemetry| std::fs::read(telemetry).ok())
-                            .and_then(|bytes| bytes.get(..8)?.try_into().ok())
-                            .map(u64::from_le_bytes)
-                            .unwrap_or(0);
+                    // Only a diagnostic replay names a telemetry file; the timed
+                    // run reads nothing but its own RSS.
+                    let telemetry = live_telemetry_path
+                        .and_then(|telemetry| std::fs::read(telemetry).ok())
+                        .and_then(|bytes| decode_live_telemetry(&bytes));
+                    let live = telemetry.map_or(0, |(live, _)| live);
+                    if rss > trace.peak_rss_bytes {
+                        trace.peak_rss_bytes = rss;
+                        trace.live_requested_bytes_at_peak_rss = live;
+                    }
+                    if let Some((live, phase)) = telemetry {
+                        phases.observe(nonzero_ns(started), rss, live, phase);
                     }
                 }
             }
@@ -2139,7 +2191,18 @@ fn sample_peak_rss_with_live(
         }
         std::thread::sleep(Duration::from_nanos(SCALING_RSS_POLL_INTERVAL_NS));
     }
-    (peak, live_at_peak)
+    trace.phases = phases.finish();
+    trace
+}
+
+/// One validated scaling child run as the controller observed it.
+#[derive(Debug)]
+pub struct ScalingChildRun {
+    pub response: ScalingChildResponse,
+    pub peak_rss_bytes: u64,
+    pub live_requested_bytes_at_peak_rss: u64,
+    /// #528: the replay's RSS samples per phase; empty without live telemetry.
+    pub rss_phases: Vec<ScalingRssPhase>,
 }
 
 /// Spawn one isolated scaling child and validate its response against the
@@ -2169,23 +2232,46 @@ pub fn run_scaling_child_with_plan(
     timeout: Duration,
     expected: &ScalingCounts,
 ) -> Result<(ScalingChildResponse, u64, u64), String> {
-    request.validate()?;
-    if child.allocator != request.allocator || timeout.is_zero() {
-        return Err("scaling child identity mismatch or zero timeout".into());
-    }
-    let encoded = serde_json::to_vec(request)
-        .map_err(|error| format!("serialize scaling request: {error}"))?;
+    let run = run_scaling_child_traced(child, request, timeout, expected)?;
+    Ok((
+        run.response,
+        run.peak_rss_bytes,
+        run.live_requested_bytes_at_peak_rss,
+    ))
+}
+
+/// The command a scaling child is spawned with: an empty environment plus the
+/// child's own (the diagnostic env, #528, on the mimalloc-pprof child only),
+/// then the profiler switches forced off.
+fn scaling_child_command(child: &ChildProgram) -> Command {
     let mut process = Command::new(&child.program);
     process
         .args(&child.arguments)
         .arg("--scaling")
         .env_clear()
         .envs(child.environment.iter().map(|(key, value)| (key, value)))
-        .env("MIMALLOC_PROF", "0")
-        .env("MIMALLOC_MEMORY_EVENTS", "0")
+        .envs(crate::scaling_diagnostic::FORCED_CHILD_ENVIRONMENT)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    process
+}
+
+/// `run_scaling_child_with_plan`, also returning the phase-marked RSS
+/// summaries of a live-telemetry replay (#528).
+pub fn run_scaling_child_traced(
+    child: &ChildProgram,
+    request: &ScalingChildRequest,
+    timeout: Duration,
+    expected: &ScalingCounts,
+) -> Result<ScalingChildRun, String> {
+    request.validate()?;
+    if child.allocator != request.allocator || timeout.is_zero() {
+        return Err("scaling child identity mismatch or zero timeout".into());
+    }
+    let encoded = serde_json::to_vec(request)
+        .map_err(|error| format!("serialize scaling request: {error}"))?;
+    let mut process = scaling_child_command(child);
     let mut child_process = process
         .spawn()
         .map_err(|error| format!("spawn scaling child: {error}"))?;
@@ -2194,7 +2280,7 @@ pub fn run_scaling_child_with_plan(
     let stop_for_sampler = Arc::clone(&stop);
     let telemetry_path = request.live_telemetry_path.clone();
     let sampler = std::thread::spawn(move || {
-        sample_peak_rss_with_live(pid, &stop_for_sampler, telemetry_path.as_deref())
+        sample_rss_trace(pid, &stop_for_sampler, telemetry_path.as_deref())
     });
     child_process
         .stdin
@@ -2249,7 +2335,7 @@ pub fn run_scaling_child_with_plan(
         std::thread::sleep(Duration::from_millis(2));
     };
     stop.store(true, Ordering::Relaxed);
-    let (peak_rss_bytes, live_requested_bytes_at_peak_rss) = sampler
+    let trace = sampler
         .join()
         .map_err(|_| "scaling RSS sampler panicked".to_string())?;
     let output = stdout_reader
@@ -2267,7 +2353,12 @@ pub fn run_scaling_child_with_plan(
     let response: ScalingChildResponse = serde_json::from_slice(&output)
         .map_err(|error| format!("decode scaling child response: {error}"))?;
     response.validate_against_expected(request, expected)?;
-    Ok((response, peak_rss_bytes, live_requested_bytes_at_peak_rss))
+    Ok(ScalingChildRun {
+        response,
+        peak_rss_bytes: trace.peak_rss_bytes,
+        live_requested_bytes_at_peak_rss: trace.live_requested_bytes_at_peak_rss,
+        rss_phases: trace.phases,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2327,6 +2418,11 @@ pub struct ScalingRawSample {
     pub live_requested_bytes_at_diagnostic_peak_rss: u64,
     #[serde(default)]
     pub diagnostic_peak_live_requested_bytes: u64,
+    /// #528: the diagnostic replay's external RSS samples, summarised per
+    /// child phase. Only a diagnostic run records them, so published rows keep
+    /// their exact shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_rss_phases: Vec<ScalingRssPhase>,
     pub response: ScalingChildResponse,
 }
 
@@ -2348,11 +2444,21 @@ pub struct ScalingRawRun {
     /// worker count. Kept out of `samples` because it is not a sweep cell.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub thread_churn_samples: Vec<ScalingRawSample>,
+    /// #528: present only on a diagnostic run (status `diagnostic`), which
+    /// `validate_scaling_raw_run` refuses, so it can never be published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<ScalingDiagnostic>,
 }
 
 pub fn merge_scaling_runs(mut shards: Vec<ScalingRawRun>) -> Result<ScalingRawRun, String> {
     if shards.is_empty() {
         return Err("at least one scaling shard is required".into());
+    }
+    if shards
+        .iter()
+        .any(|shard| (shard.status == DIAGNOSTIC_STATUS) != shard.diagnostic.is_some())
+    {
+        return Err("a scaling shard's diagnostic status and metadata disagree".into());
     }
     let mut merged = shards.remove(0);
     merged.status = "incomplete".into();
@@ -2396,6 +2502,9 @@ pub fn merge_scaling_runs(mut shards: Vec<ScalingRawRun>) -> Result<ScalingRawRu
         if !merged.thread_churn_samples.is_empty() && !shard.thread_churn_samples.is_empty() {
             return Err("scaling shards overlap on the thread-churn workload".into());
         }
+        if shard.diagnostic != merged.diagnostic {
+            return Err("scaling shards disagree on their diagnostic metadata".into());
+        }
         merged.calibrations.extend(shard.calibrations);
         merged.samples.extend(shard.samples);
         merged
@@ -2418,6 +2527,12 @@ pub fn merge_scaling_runs(mut shards: Vec<ScalingRawRun>) -> Result<ScalingRawRu
         )
     });
 
+    // #528: a diagnostic run measures a selection; it is never complete.
+    if let Some(diagnostic) = &merged.diagnostic {
+        diagnostic.validate()?;
+        merged.status = DIAGNOSTIC_STATUS.into();
+        return Ok(merged);
+    }
     let expected_cells = SCALING_PATTERNS.len() * SCALING_THREAD_POINTS.len();
     if merged.calibrations.len() != expected_cells {
         return Err(format!(
@@ -2851,6 +2966,18 @@ fn quantile_u64_sorted(values: &[u64], probability: f64) -> u64 {
 }
 
 pub fn validate_scaling_raw_run(raw: &ScalingRawRun) -> Result<(), String> {
+    // #528: a diagnostic run changed the fork's build or environment; nothing
+    // may build a report from it.
+    if raw.diagnostic.is_some()
+        || raw.status == DIAGNOSTIC_STATUS
+        || raw
+            .samples
+            .iter()
+            .chain(&raw.thread_churn_samples)
+            .any(|sample| !sample.diagnostic_rss_phases.is_empty())
+    {
+        return Err("a diagnostic scaling run can never be validated for publication".into());
+    }
     if raw.metric_schema_version != SCALING_SCHEMA_VERSION || raw.status != "complete" {
         return Err("scaling raw run is not a complete run of this metric version".into());
     }
@@ -3620,6 +3747,7 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                         } else {
                             0
                         },
+                        diagnostic_rss_phases: Vec::new(),
                         reproduction_command: format!(
                             "benchmark-scaling-run --run-seed {run_seed} # {}/{thread_count}",
                             pattern.as_str()
@@ -3702,6 +3830,7 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
                 diagnostic_peak_rss_bytes: 0,
                 live_requested_bytes_at_diagnostic_peak_rss: 0,
                 diagnostic_peak_live_requested_bytes: 0,
+                diagnostic_rss_phases: Vec::new(),
                 reproduction_command: format!(
                     "benchmark-scaling-run --run-seed {run_seed} # thread-churn/{THREAD_CHURN_THREADS}"
                 ),
@@ -3758,6 +3887,7 @@ pub fn synthetic_scaling_fixture(run_seed: u64) -> Result<ScalingRawRun, String>
         calibrations,
         samples,
         thread_churn_samples,
+        diagnostic: None,
     })
 }
 

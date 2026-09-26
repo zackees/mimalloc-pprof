@@ -322,6 +322,24 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_ARENA_PURGE_MULT_DEFAULT       (4)
 #endif
 
+// #506: ... but only a freed range of MORE than this many slices (a large or singleton page) gets
+// that long window. A range of at most this many (default: a small or medium page, 1 or 8 slices)
+// keeps the short one of one to two `purge_delay`s, as before #486: a server workload (larson:
+// 8-1000 B blocks freed by other threads) churns small pages through the arena, and holding each
+// one four times longer raised its peak RSS 10-30% over Bun's mimalloc, while #486's refaults were
+// all large ones (the bursty row). 0 gives every range the long window (the #486 behaviour).
+#ifndef MI_ARENA_RETAIN_SHORT_MAX_SLICES
+#define MI_ARENA_RETAIN_SHORT_MAX_SLICES  (MI_MEDIUM_PAGE_SIZE / MI_ARENA_SLICE_SIZE)
+#endif
+// #506: ... and so does the singleton page a growing realloc moved its block out of
+// (`_mi_realloc_free_old`): a Vec that doubles never asks for the size it outgrew, and holding
+// each outgrown buffer for the long window kept a growing buffer's peak at three times its size
+// instead of two (+10-18% peak RSS on perf-ab's larson rows, whose per-table log grows so). 0 gives
+// the outgrown buffer the long window (the #486 behaviour).
+#ifndef MI_REALLOC_RETAIN_SHORT
+#define MI_REALLOC_RETAIN_SHORT           (1)
+#endif
+
 // #493 (strategy 9): a new page first tries to claim free slices that are still resident (queued
 // for purge, see above) before the plain free-slice search, which knows nothing of residency and
 // would often fault in fresh or purged memory instead. At most this many queued runs long enough
@@ -1018,7 +1036,8 @@ typedef struct mi_arena_s {
   bool                is_exclusive;         // only allow allocations if specifically for this arena
   bool                is_auto_reserved;     // created by mi_arena_reserve, not a public reserve/manage API
   mi_decl_align(8)                          // needed on some 32-bit platforms
-  _Atomic(mi_msecs_t) purge_expire;         // expiration time when slices can be purged from `slices_purge`.
+  _Atomic(mi_msecs_t) purge_expire;         // the next purge pass: every `purge_delay` while anything is queued for purge
+  _Atomic(mi_msecs_t) purge_long_expire;    // #506: the deadline of the long-window queue (`slices_purge` / `_aged`), `arena_purge_mult` x `purge_delay` apart
   mi_commit_fun_t*    commit_fun;           // custom commit/decommit memory
   void*               commit_fun_arg;       // user argument for a custom commit function
 
@@ -1028,8 +1047,10 @@ typedef struct mi_arena_s {
   mi_bbitmap_t*       slices_free;          // is the slice free? (a binned bitmap with size classes)
   mi_bitmap_t*        slices_committed;     // is the slice committed? (i.e. accessible)
   mi_bitmap_t*        slices_dirty;         // is the slice potentially non-zero?
-  mi_bitmap_t*        slices_purge;         // slices that can be purged
+  mi_bitmap_t*        slices_purge;         // slices that can be purged (long window: large and singleton pages, #486)
   mi_bitmap_t*        slices_purge_aged;    // #457: ... and were already queued at the previous purge deadline
+  mi_bitmap_t*        slices_purge_short;   // #506: slices that can be purged (short window: small and medium pages, outgrown realloc buffers)
+  mi_bitmap_t*        slices_purge_short_aged; // #506: ... and were already queued at the previous purge pass
   mi_page_t*          pages_meta;           // pre-allocated `slice_count` page meta info -- only used if `MI_PAGE_META_IS_SEPARATED!=0`
   mi_arena_pages_t    pages_main;           // arena page bitmaps for the main heap are allocated up front as well
 

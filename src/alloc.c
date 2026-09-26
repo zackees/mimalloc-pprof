@@ -539,7 +539,7 @@ static mi_decl_forceinline void* mi_theap_realloc_zero_ex(mi_theap_t* theap, voi
     if mi_likely(p != NULL) {
       mi_track_mem_defined(p,copy_size);  // _mi_useable_size may be too large for byte precise memory tracking..
       _mi_memcpy_aligned(newp, p, copy_size);
-      mi_free(p); // only free the original pointer if successful
+      _mi_realloc_free_old(page, p, newsize > size); // only free the original pointer if successful (#506: an outgrown buffer, see there)
     }
   }
   if (memevt_is_resize) {

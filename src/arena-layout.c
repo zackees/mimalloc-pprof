@@ -18,8 +18,10 @@
      FRESH        free and not dirty: never handed out (or purged to zero), costs nothing
      FREE_DIRTY   free, dirty and not queued: purged earlier by a reset (the dirty bit survives
                   it, so this is an UPPER bound on residency) or in an arena that never purges
-     QUEUED       free and in `slices_purge`: waiting for the purge delay, certainly resident
-     QUEUED_AGED  free and in `slices_purge_aged`: queued since the previous purge deadline
+     QUEUED       free and in `slices_purge` (or `slices_purge_short`, #506): waiting for the purge
+                  delay, certainly resident
+     QUEUED_AGED  free and in `slices_purge_aged` (or `slices_purge_short_aged`): queued since the
+                  previous purge deadline of its queue
 
    and, orthogonally, counted as committed when its `slices_committed` bit is set (address
    space, not residency, on POSIX: see `mi_holes_report_t`). Then, walking each chunk
@@ -62,8 +64,8 @@ size_t _mi_arena_layout_bucket(size_t run_slices) {
 
 static mi_arena_layout_kind_t mi_arena_layout_kind_at(mi_arena_t* arena, size_t slice_index) {
   if (!mi_bbitmap_is_setN(arena->slices_free, slice_index, 1)) return MI_ARENA_LAYOUT_IN_USE;
-  if (mi_bitmap_is_set(arena->slices_purge_aged, slice_index)) return MI_ARENA_LAYOUT_QUEUED_AGED;
-  if (mi_bitmap_is_set(arena->slices_purge, slice_index))      return MI_ARENA_LAYOUT_QUEUED;
+  if (mi_bitmap_is_set(arena->slices_purge_aged, slice_index) || mi_bitmap_is_set(arena->slices_purge_short_aged, slice_index)) return MI_ARENA_LAYOUT_QUEUED_AGED;
+  if (mi_bitmap_is_set(arena->slices_purge, slice_index) || mi_bitmap_is_set(arena->slices_purge_short, slice_index))      return MI_ARENA_LAYOUT_QUEUED;
   if (mi_bitmap_is_set(arena->slices_dirty, slice_index))      return MI_ARENA_LAYOUT_FREE_DIRTY;
   return MI_ARENA_LAYOUT_FRESH;
 }

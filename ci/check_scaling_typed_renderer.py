@@ -14,6 +14,8 @@ TYPED_FUNCTIONS = frozenset(
         "distribution_global_domain",
         "distribution_stack_svg",
         "render_scaling_html",
+        # #508: the thread-churn "RSS after the work stops" chart.
+        "thread_churn_svg",
     }
 )
 
@@ -128,8 +130,26 @@ def selftest() -> None:
 def distribution_global_domain(scaling: ScalingView, metric: str): pass
 def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str): pass
 def render_scaling_html(scaling: ScalingView): pass
+def thread_churn_svg(scaling: ScalingView, bound_ms: int): pass
 """
     assert not check_source(good + support)
+    # The thread-churn chart is held to the same boundary: dropping it, or reading
+    # the report dictionary instead of ScalingView, is a violation.
+    missing = support.replace(
+        "def thread_churn_svg(scaling: ScalingView, bound_ms: int): pass\n", ""
+    )
+    assert any(
+        "missing typed renderer function thread_churn_svg" in violation.message
+        for violation in check_source(good + missing)
+    )
+    untyped = support.replace(
+        "def thread_churn_svg(scaling: ScalingView, bound_ms: int): pass",
+        "def thread_churn_svg(scaling: Mapping[str, object], bound_ms: int):\n"
+        "    return scaling['thread_churn']",
+    )
+    churn_messages = [violation.message for violation in check_source(good + untyped)]
+    assert any("thread_churn_svg must accept ScalingView" in message for message in churn_messages)
+    assert any("thread_churn_svg uses dynamic string-key" in message for message in churn_messages)
     messages = [violation.message for violation in check_source(bad + support)]
     assert any("must accept ScalingView" in message for message in messages)
     assert any("dynamic string-key" in message for message in messages)

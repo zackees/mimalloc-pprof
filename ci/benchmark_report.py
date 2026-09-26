@@ -237,7 +237,26 @@ SCALING_PANEL_TITLES = {
     "random-large": "Uniform random requested sizes (64 KiB-4 MiB)",
     "large-class-persistent": "Long-lived threads (96-512 KiB)",
     "large-class-ephemeral": "Short-lived threads (96-512 KiB)",
+    "thread-churn": "RSS after the work stops",
 }
+# #508: thread-churn is large-class-ephemeral's stream at one worker count; then every
+# worker thread is joined and the child stays alive and idle, sampling its own RSS at
+# fixed offsets after the drain. It is a side-car of the scaling report, not a sweep
+# cell, so it has its own schema and panel. Mirrored from rust/benchmark-suite/src/
+# scaling.rs; ci/check_benchmark_scaling_workflow.py keeps the two declarations equal.
+THREAD_CHURN_SCHEMA = "thread-churn-rss-v1"
+THREAD_CHURN_PATTERN = "thread-churn"
+THREAD_CHURN_SOURCE_PATTERN = "large-class-ephemeral"
+THREAD_CHURN_THREADS = 8
+THREAD_CHURN_GENERATIONS = 8
+THREAD_CHURN_BLOCKS = DISTRIBUTION_BLOCKS
+THREAD_CHURN_OFFSETS_MS = (100, 500, 1000, 1500, 2000, 3000)
+# perf-ab's definition (ci/perf_ab.c RELEASE_TOLERANCE): released at the first sample
+# within this many bytes of the final one.
+THREAD_CHURN_RELEASE_TOLERANCE_BYTES = 1 << 20
+THREAD_CHURN_PANEL = "benchmark-scaling-thread-churn-rss.svg"
+# The allocator's current release promise, drawn on the chart for reference (#491, #509).
+RELEASE_RATCHET = Path(__file__).resolve().parent / "release_ratchet.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +316,24 @@ class ScalingRawObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class ThreadChurnCell:
+    allocator_id: str
+    median_peak: int
+    median_post_drain: tuple[int, ...]
+    median_release_ms: int
+    p95_release_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadChurnView:
+    thread_count: int
+    block_count: int
+    offsets_ms: tuple[int, ...]
+    release_tolerance_bytes: int
+    cells: tuple[ThreadChurnCell, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ScalingView:
     schema: str
     rigor_label: str
@@ -309,6 +346,7 @@ class ScalingView:
     throughput_cells: tuple[ScalingThroughputCell, ...]
     rss_cells: tuple[ScalingRssCell, ...]
     raw_observations: tuple[ScalingRawObservation, ...]
+    thread_churn: ThreadChurnView | None = None
 
 
 SITE_FILES = {
@@ -328,6 +366,7 @@ SITE_FILES = {
     "benchmark-pprof-tax.png",
     *SCALING_PANELS.values(),
     *DISTRIBUTION_PANELS.values(),
+    THREAD_CHURN_PANEL,
 }
 PNG_DIMENSIONS = {
     "benchmark-throughput.png": (1280, 720),
@@ -340,7 +379,7 @@ PNG_DIMENSIONS = {
     "benchmark-latency-tail.png": (960, 540),
     "benchmark-pprof-tax.png": (960, 540),
 }
-SVG_FILES = frozenset((*SCALING_PANELS.values(), *DISTRIBUTION_PANELS.values()))
+SVG_FILES = frozenset((*SCALING_PANELS.values(), *DISTRIBUTION_PANELS.values(), THREAD_CHURN_PANEL))
 FILE_CAPS = {
     ".nojekyll": 0,
     "index.html": 2 * 1024 * 1024,
@@ -374,6 +413,7 @@ ROLES = {
     "benchmark-pprof-tax.png": "pprof-tax-panel",
     **dict.fromkeys(SCALING_PANELS.values(), "scaling-panel"),
     **dict.fromkeys(DISTRIBUTION_PANELS.values(), "distribution-scaling-panel"),
+    THREAD_CHURN_PANEL: "thread-churn-panel",
 }
 
 MEMORY_SCHEMA = "linux-process-memory-v1"
@@ -2474,7 +2514,16 @@ def history_row(
         row["scaling"] = {
             key: value
             for key, value in scaling.items()
-            if key not in {"invalid_reason", "runner", "topology", "patterns", "raw_samples"}
+            # thread_churn carries raw samples; history rows stay compact (#508).
+            if key
+            not in {
+                "invalid_reason",
+                "runner",
+                "topology",
+                "patterns",
+                "raw_samples",
+                "thread_churn",
+            }
         } | {"runner_fingerprint_sha256": runner["fingerprint_sha256"]}
     if include_optional_metrics and "pprof_tax" in latest:
         pprof_tax = validate_pprof_tax_report(latest["pprof_tax"], "latest.pprof_tax")
@@ -3932,6 +3981,204 @@ def validate_scaling_rss(
     return rss
 
 
+THREAD_CHURN_FIELDS = {
+    "metric_schema_version",
+    "source_pattern",
+    "thread_count",
+    "generations",
+    "block_count",
+    "post_drain_offsets_ms",
+    "release_tolerance_bytes",
+    "sampling",
+    "cell_summaries",
+    "raw_samples",
+}
+THREAD_CHURN_SAMPLING_FIELDS = {"peak_source", "post_drain_source", "release_definition"}
+THREAD_CHURN_SUMMARY_FIELDS = {
+    "allocator_id",
+    "block_count",
+    "median_peak_rss_bytes",
+    "p05_peak_rss_bytes",
+    "p95_peak_rss_bytes",
+    "median_post_drain_rss_bytes",
+    "p05_post_drain_rss_bytes",
+    "p95_post_drain_rss_bytes",
+    "median_release_ms",
+    "p95_release_ms",
+}
+# The response fields that pin a run's plan: equal between a thread-churn block and the
+# large-class-ephemeral block it replays.
+THREAD_CHURN_PLAN_FIELDS = (
+    "alloc_calls",
+    "realloc_calls",
+    "free_calls",
+    "operation_count",
+    "checksum",
+)
+
+
+def thread_churn_release_ms(post_drain_rss: Sequence[int]) -> int:
+    """perf-ab's release time: the first offset within the tolerance of the final
+    sample. The final sample always qualifies."""
+
+    final = post_drain_rss[-1]
+    return next(
+        offset
+        for offset, rss in zip(THREAD_CHURN_OFFSETS_MS, post_drain_rss)
+        if rss <= final + THREAD_CHURN_RELEASE_TOLERANCE_BYTES
+    )
+
+
+def rounded_type7(values: Sequence[int], probability: float) -> int:
+    return math.floor(latency_type7(values, probability) + 0.5)
+
+
+def validate_thread_churn(
+    value: object,
+    label: str,
+    declared: tuple[str, ...],
+    sweep_raw: Mapping[tuple[str, int, str, int], Mapping[str, object]],
+) -> dict[str, object]:
+    """The thread-churn side-car (#508): RSS after the work stops.
+
+    Every summary is recomputed from the raw post-drain samples, and every raw block
+    must replay the large-class-ephemeral block of the same run it names (`sweep_raw`,
+    keyed by pattern, workers, allocator, block): same operation count, same counts and
+    checksum. That is the same-run comparison the chart relies on.
+    """
+
+    churn = object_value(value, label)
+    exact_fields(churn, THREAD_CHURN_FIELDS, label)
+    offsets = [
+        int_value(item, f"{label}.post_drain_offsets_ms[{index}]", 1)
+        for index, item in enumerate(
+            list_value(churn.get("post_drain_offsets_ms"), f"{label}.post_drain_offsets_ms")
+        )
+    ]
+    if (
+        churn.get("metric_schema_version") != THREAD_CHURN_SCHEMA
+        or churn.get("source_pattern") != THREAD_CHURN_SOURCE_PATTERN
+        or churn.get("thread_count") != THREAD_CHURN_THREADS
+        or churn.get("generations") != THREAD_CHURN_GENERATIONS
+        or churn.get("block_count") != THREAD_CHURN_BLOCKS
+        or tuple(offsets) != THREAD_CHURN_OFFSETS_MS
+        or churn.get("release_tolerance_bytes") != THREAD_CHURN_RELEASE_TOLERANCE_BYTES
+    ):
+        fail(f"{label}: unsupported thread-churn schema or protocol")
+    sampling = object_value(churn.get("sampling"), f"{label}.sampling")
+    exact_fields(sampling, THREAD_CHURN_SAMPLING_FIELDS, f"{label}.sampling")
+    for field in sorted(THREAD_CHURN_SAMPLING_FIELDS):
+        string_value(sampling.get(field), f"{label}.sampling.{field}")
+
+    raw = list_value(churn.get("raw_samples"), f"{label}.raw_samples")
+    if len(raw) != THREAD_CHURN_BLOCKS * len(declared):
+        fail(f"{label}.raw_samples: expected {THREAD_CHURN_BLOCKS * len(declared)} samples")
+    peaks: dict[str, list[int]] = {}
+    post_drain: dict[str, list[list[int]]] = {}
+    seen: set[tuple[int, str]] = set()
+    paired: dict[int, set[int]] = {}
+    for index, item_value in enumerate(raw):
+        item_label = f"{label}.raw_samples[{index}]"
+        item = object_value(item_value, item_label)
+        allocator = string_value(item.get("allocator_id"), f"{item_label}.allocator_id")
+        block = int_value(item.get("block_id"), f"{item_label}.block_id")
+        ordinal = int_value(item.get("ordinal"), f"{item_label}.ordinal")
+        if (
+            item.get("pattern") != THREAD_CHURN_PATTERN
+            or item.get("thread_count") != THREAD_CHURN_THREADS
+            or allocator not in declared
+            or block >= THREAD_CHURN_BLOCKS
+            or ordinal >= len(declared)
+            or (block, allocator) in seen
+        ):
+            fail(f"{item_label}: undeclared, misplaced, or duplicate thread-churn sample")
+        seen.add((block, allocator))
+        paired.setdefault(block, set()).add(ordinal)
+        response = object_value(item.get("response"), f"{item_label}.response")
+        if (
+            response.get("allocator_id") != allocator
+            or response.get("thread_count") != THREAD_CHURN_THREADS
+        ):
+            fail(f"{item_label}.response: identity disagrees with sample")
+        observed = [
+            int_value(offset, f"{item_label}.response.post_drain_offsets_ns[{position}]", 1)
+            for position, offset in enumerate(
+                list_value(
+                    response.get("post_drain_offsets_ns"),
+                    f"{item_label}.response.post_drain_offsets_ns",
+                )
+            )
+        ]
+        rss = [
+            int_value(bytes_value, f"{item_label}.response.post_drain_rss_bytes[{position}]", 1)
+            for position, bytes_value in enumerate(
+                list_value(
+                    response.get("post_drain_rss_bytes"),
+                    f"{item_label}.response.post_drain_rss_bytes",
+                )
+            )
+        ]
+        if (
+            len(observed) != len(THREAD_CHURN_OFFSETS_MS)
+            or len(rss) != len(THREAD_CHURN_OFFSETS_MS)
+            or any(
+                sample_ns < target_ms * 1_000_000
+                for sample_ns, target_ms in zip(observed, THREAD_CHURN_OFFSETS_MS)
+            )
+            or any(later <= earlier for earlier, later in zip(observed, observed[1:]))
+        ):
+            fail(f"{item_label}: post-drain samples are missing, early, or out of order")
+        source = sweep_raw.get(
+            (THREAD_CHURN_SOURCE_PATTERN, THREAD_CHURN_THREADS, allocator, block)
+        )
+        if source is None:
+            fail(f"{item_label}: no large-class-ephemeral block {block} to replay in this run")
+        source_response = object_value(source.get("response"), f"{item_label} source response")
+        if source.get("operations_per_worker") != item.get("operations_per_worker") or any(
+            source_response.get(field) != response.get(field) for field in THREAD_CHURN_PLAN_FIELDS
+        ):
+            fail(f"{item_label}: does not replay large-class-ephemeral's stream in this run")
+        peaks.setdefault(allocator, []).append(
+            int_value(item.get("peak_rss_bytes"), f"{item_label}.peak_rss_bytes", 1)
+        )
+        post_drain.setdefault(allocator, []).append(rss)
+    if len(paired) != THREAD_CHURN_BLOCKS or any(
+        ordinals != set(range(len(declared))) for ordinals in paired.values()
+    ):
+        fail(f"{label}.raw_samples: paired blocks do not carry every allocator ordinal")
+
+    summaries = list_value(churn.get("cell_summaries"), f"{label}.cell_summaries")
+    if len(summaries) != len(declared):
+        fail(f"{label}.cell_summaries: expected one summary per allocator")
+    summarized: set[str] = set()
+    for index, summary_value in enumerate(summaries):
+        summary_label = f"{label}.cell_summaries[{index}]"
+        summary = object_value(summary_value, summary_label)
+        exact_fields(summary, THREAD_CHURN_SUMMARY_FIELDS, summary_label)
+        allocator = string_value(summary.get("allocator_id"), f"{summary_label}.allocator_id")
+        if allocator not in declared or allocator in summarized:
+            fail(f"{summary_label}: undeclared or duplicate allocator")
+        summarized.add(allocator)
+        runs = post_drain[allocator]
+        releases = [thread_churn_release_ms(values) for values in runs]
+        expected: dict[str, object] = {
+            "block_count": THREAD_CHURN_BLOCKS,
+            "median_peak_rss_bytes": rounded_type7(peaks[allocator], 0.50),
+            "p05_peak_rss_bytes": rounded_type7(peaks[allocator], 0.05),
+            "p95_peak_rss_bytes": rounded_type7(peaks[allocator], 0.95),
+            "median_release_ms": rounded_type7(releases, 0.50),
+            "p95_release_ms": rounded_type7(releases, 0.95),
+        }
+        for prefix, probability in (("median", 0.50), ("p05", 0.05), ("p95", 0.95)):
+            expected[f"{prefix}_post_drain_rss_bytes"] = [
+                rounded_type7([values[position] for values in runs], probability)
+                for position in range(len(THREAD_CHURN_OFFSETS_MS))
+            ]
+        if any(summary.get(field) != wanted for field, wanted in expected.items()):
+            fail(f"{summary_label}: thread-churn summary differs from its raw samples")
+    return churn
+
+
 def validate_scaling_report(
     value: object, label: str, *, compact: bool = False
 ) -> dict[str, object]:
@@ -3941,7 +4188,10 @@ def validate_scaling_report(
     )
     if compact:
         required.add("runner_fingerprint_sha256")
-    exact_fields_with_optional(report, required, {"rss"}, label)
+    # The thread-churn side-car (#508) carries raw samples, so history rows never do.
+    exact_fields_with_optional(
+        report, required, {"rss"} if compact else {"rss", "thread_churn"}, label
+    )
     if (
         report.get("metric_schema_version") not in SCALING_SCHEMAS
         or report.get("status") != "complete"
@@ -4112,6 +4362,7 @@ def validate_scaling_report(
             fail(f"{label}.raw_samples: expected {expected_samples} samples")
         raw_groups: dict[tuple[str, int, str], list[tuple[int, int, float]]] = {}
         raw_keys: set[tuple[str, int, str, int]] = set()
+        raw_by_key: dict[tuple[str, int, str, int], dict[str, object]] = {}
         paired_ordinals: dict[tuple[str, int, int], set[int]] = {}
         for index, value in enumerate(raw):
             item = object_value(value, f"{label}.raw_samples[{index}]")
@@ -4132,6 +4383,7 @@ def validate_scaling_report(
             if allocator not in declared or ordinal >= len(declared) or sample_key in raw_keys:
                 fail(f"{label}.raw_samples[{index}]: invalid ordinal or duplicate sample")
             raw_keys.add(sample_key)
+            raw_by_key[sample_key] = item
             paired_ordinals.setdefault((pattern, threads, block), set()).add(ordinal)
             response = object_value(item.get("response"), f"{label}.raw_samples[{index}].response")
             if response.get("allocator_id") != allocator or response.get("thread_count") != threads:
@@ -4218,6 +4470,10 @@ def validate_scaling_report(
                     )
                 if any(rss_summary[name] != expected for name, expected in expected_rss.items()):
                     fail(f"{label}: RSS summary differs from raw observations for {key}")
+        if "thread_churn" in report:
+            validate_thread_churn(
+                report.get("thread_churn"), f"{label}.thread_churn", declared, raw_by_key
+            )
     return report
 
 
@@ -4277,6 +4533,29 @@ def scaling_view_from_validated(report: Mapping[str, object]) -> ScalingView:
                 peak_rss_bytes=cast(int, item.get("peak_rss_bytes", 0)),
             )
         )
+    thread_churn: ThreadChurnView | None = None
+    churn_value = report.get("thread_churn")
+    if churn_value is not None:
+        churn = object_value(churn_value, "scaling thread churn")
+        churn_cells: list[ThreadChurnCell] = []
+        for value in list_value(churn["cell_summaries"], "thread churn summaries"):
+            item = object_value(value, "thread churn summary")
+            churn_cells.append(
+                ThreadChurnCell(
+                    allocator_id=cast(str, item["allocator_id"]),
+                    median_peak=cast(int, item["median_peak_rss_bytes"]),
+                    median_post_drain=tuple(cast(list[int], item["median_post_drain_rss_bytes"])),
+                    median_release_ms=cast(int, item["median_release_ms"]),
+                    p95_release_ms=cast(int, item["p95_release_ms"]),
+                )
+            )
+        thread_churn = ThreadChurnView(
+            thread_count=cast(int, churn["thread_count"]),
+            block_count=cast(int, churn["block_count"]),
+            offsets_ms=tuple(cast(list[int], churn["post_drain_offsets_ms"])),
+            release_tolerance_bytes=cast(int, churn["release_tolerance_bytes"]),
+            cells=tuple(churn_cells),
+        )
     return ScalingView(
         schema=cast(str, report["metric_schema_version"]),
         rigor_label=cast(str, report["rigor_label"]),
@@ -4298,6 +4577,7 @@ def scaling_view_from_validated(report: Mapping[str, object]) -> ScalingView:
         throughput_cells=tuple(throughput_cells),
         rss_cells=tuple(rss_cells),
         raw_observations=tuple(raw_observations),
+        thread_churn=thread_churn,
     )
 
 
@@ -4860,6 +5140,244 @@ def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str) -> b
             left,
             height - 20,
             f"shared domain 0-{ceiling:g}; tick {step:g}; median of n={DISTRIBUTION_BLOCKS}; spread in latest.json and the dashboard table; normal allocation API",
+            fill=SCALING_INK["muted"],
+            size=12,
+        )
+    )
+    parts.append("</svg>")
+    return ("\n".join(parts) + "\n").encode()
+
+
+# #508 "RSS after the work stops": the overlay layout of #507 on a time axis, plus a
+# time-to-release table under the plot.
+THREAD_CHURN_HEIGHT = 780
+THREAD_CHURN_PLOT_HEIGHT = 330
+THREAD_CHURN_TABLE_TOP = 590
+THREAD_CHURN_ROW_HEIGHT = 26
+THREAD_CHURN_TABLE_COLUMN_WIDTH = 96
+THREAD_CHURN_TABLE_FIRST_COLUMN = 190
+MIB = 1024 * 1024
+
+
+def release_bound_ms() -> int:
+    """The release bound perf-ab enforces today (ci/release_ratchet.json, #491/#509)."""
+    return int_value(
+        object_value(read_json(RELEASE_RATCHET), str(RELEASE_RATCHET)).get("bound_ms"),
+        f"{RELEASE_RATCHET}.bound_ms",
+        1,
+    )
+
+
+def format_mib(value: float) -> str:
+    return f"{value / MIB:.0f}" if value >= 10 * MIB else f"{value / MIB:.1f}"
+
+
+def format_seconds(milliseconds: int) -> str:
+    return f"{milliseconds / 1000:g} s"
+
+
+def thread_churn_svg(scaling: ScalingView, bound_ms: int) -> bytes:
+    """RSS after the work stops: time since the drain on x, MiB on y, one median line
+    per allocator (mimalloc-pprof last and thicker), then a time-to-release table."""
+
+    churn = scaling.thread_churn
+    if churn is None:
+        fail("thread-churn chart: the scaling report has no thread-churn side-car")
+    width, height = DISTRIBUTION_WIDTH, THREAD_CHURN_HEIGHT
+    left, top = DISTRIBUTION_LEFT, DISTRIBUTION_TOP
+    plot_width = width - left - DISTRIBUTION_RIGHT
+    plot_height = THREAD_CHURN_PLOT_HEIGHT
+    cells = {cell.allocator_id: cell for cell in churn.cells}
+    if set(cells) != set(DISTRIBUTION_DRAW_ORDER):
+        fail("thread-churn chart: expected one summary per allocator")
+    offsets = churn.offsets_ms
+    span_ms = max(offsets)
+    ceiling, step = readable_ceiling(
+        max(value for cell in churn.cells for value in cell.median_post_drain) / MIB
+    )
+
+    def x_of(milliseconds: float) -> float:
+        return left + plot_width * milliseconds / span_ms
+
+    def y_of(bytes_value: float) -> float:
+        return scaling_y_of(bytes_value / MIB, ceiling, top, plot_height)
+
+    title = SCALING_PANEL_TITLES[THREAD_CHURN_PATTERN]
+    subtitle = (
+        f"short-lived threads, 96-512 KiB, {churn.thread_count} workers; every thread "
+        f"joined at 0 s, then idle; RSS in MiB, median of n={churn.block_count}"
+    )
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}" role="img">',
+        f"<title>{escaped(title)}: {escaped(subtitle)}</title>",
+        f"<desc>Resident memory of each allocator's process at fixed times after its worker threads were joined, one median line per allocator on a shared zero-based axis from 0 to {ceiling:g} MiB, and a table of when each one's memory settled.</desc>",
+        f'<metadata data-y-domain-min="0" data-y-domain-max="{ceiling:g}" data-y-unit="MiB" data-x-offsets-ms="{" ".join(str(offset) for offset in offsets)}" data-samples="{churn.block_count}"/>',
+        f'<rect width="{width}" height="{height}" fill="{SCALING_INK["background"]}"/>',
+        svg_text(left, 42, title, fill=SCALING_INK["title"], size=24, weight="600"),
+        svg_text(left, 70, subtitle, fill=SCALING_INK["muted"], size=14),
+        f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="{SCALING_INK["plot"]}" rx="6"/>',
+    ]
+    for tick in range(round(ceiling / step) + 1):
+        value = step * tick
+        if value > ceiling + step / 100:
+            break
+        y = scaling_y_of(value, ceiling, top, plot_height)
+        parts.append(
+            f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_width}" y2="{y:.1f}" stroke="{SCALING_INK["grid"]}"/>'
+        )
+        parts.append(
+            svg_text(
+                left - 12, y + 4, f"{value:g}", fill=SCALING_INK["axis"], size=12, anchor="end"
+            )
+        )
+    parts.append(
+        svg_text(
+            left - 64,
+            top + plot_height / 2,
+            "MiB",
+            fill=SCALING_INK["axis"],
+            size=13,
+            weight="600",
+        )
+    )
+    # Every sample offset gets a grid line; 0 s is the plot's left edge.
+    for milliseconds in offsets:
+        x = x_of(milliseconds)
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top + plot_height}" stroke="{SCALING_INK["grid"]}"/>'
+        )
+        parts.append(
+            svg_text(
+                x,
+                top + plot_height + 26,
+                format_seconds(milliseconds),
+                fill=SCALING_INK["title"],
+                size=13,
+                weight="600",
+                anchor="middle",
+            )
+        )
+    parts.append(
+        svg_text(
+            left + plot_width / 2,
+            top + plot_height + 50,
+            "time since every worker thread was joined",
+            fill=SCALING_INK["muted"],
+            size=12,
+            anchor="middle",
+        )
+    )
+    if 0 < bound_ms <= span_ms:
+        bound_x = x_of(bound_ms)
+        parts.append(
+            f'<line x1="{bound_x:.1f}" y1="{top}" x2="{bound_x:.1f}" y2="{top + plot_height}" '
+            f'stroke="{SCALING_INK["badge"]}" stroke-width="1.5" stroke-dasharray="6 5"/>'
+        )
+        parts.append(
+            svg_text(
+                bound_x,
+                top - 8,
+                f"release bound {format_seconds(bound_ms)}",
+                fill=SCALING_INK["badge"],
+                size=12,
+                anchor="middle",
+            )
+        )
+    for allocator in DISTRIBUTION_DRAW_ORDER:
+        color = SCALING_SERIES[allocator]
+        stroke_width = (
+            DISTRIBUTION_EMPHASIS_STROKE
+            if allocator == DISTRIBUTION_EMPHASIS_ALLOCATOR
+            else DISTRIBUTION_MEDIAN_STROKE
+        )
+        points = list(zip(offsets, cells[allocator].median_post_drain))
+        path = " ".join(
+            f"{'M' if index == 0 else 'L'} {x_of(milliseconds):.1f} {y_of(rss):.1f}"
+            for index, (milliseconds, rss) in enumerate(points)
+        )
+        parts.append(
+            f'<path d="{path}" fill="none" stroke="{color}" stroke-width="{stroke_width:g}" '
+            'stroke-linejoin="round" stroke-linecap="round"/>'
+        )
+        for milliseconds, rss in points:
+            parts.append(
+                f'<circle cx="{x_of(milliseconds):.1f}" cy="{y_of(rss):.1f}" '
+                f'r="{DISTRIBUTION_MARKER_RADIUS:g}" '
+                f'fill="{SCALING_INK["background"]}" stroke="{color}" stroke-width="{stroke_width:g}"/>'
+            )
+    legend_x = float(left)
+    legend_y = top + plot_height + 84
+    for allocator in ALLOCATOR_IDS:
+        color = SCALING_SERIES[allocator]
+        parts.append(
+            f'<rect x="{legend_x:.1f}" y="{legend_y - 7}" width="22" height="4" rx="2" fill="{color}"/>'
+        )
+        label = allocator_label(allocator)
+        weight = "600" if allocator == DISTRIBUTION_EMPHASIS_ALLOCATOR else "normal"
+        parts.append(
+            svg_text(
+                legend_x + 30, legend_y, label, fill=SCALING_INK["axis"], size=12, weight=weight
+            )
+        )
+        legend_x += 34 + 7.4 * len(label)
+    # Time-to-release table: peak, the median at each offset, and when it settled.
+    headers = ("peak", *(format_seconds(offset) for offset in offsets), "released by")
+    row_y = THREAD_CHURN_TABLE_TOP
+    parts.append(
+        svg_text(left, row_y, "MiB, median", fill=SCALING_INK["muted"], size=12, weight="600")
+    )
+    for column, header in enumerate(headers):
+        parts.append(
+            svg_text(
+                left + THREAD_CHURN_TABLE_FIRST_COLUMN + column * THREAD_CHURN_TABLE_COLUMN_WIDTH,
+                row_y,
+                header,
+                fill=SCALING_INK["muted"],
+                size=12,
+                weight="600",
+                anchor="end",
+            )
+        )
+    for allocator in ALLOCATOR_IDS:
+        row_y += THREAD_CHURN_ROW_HEIGHT
+        cell = cells[allocator]
+        weight = "600" if allocator == DISTRIBUTION_EMPHASIS_ALLOCATOR else "normal"
+        parts.append(
+            svg_text(
+                left,
+                row_y,
+                allocator_label(allocator),
+                fill=SCALING_SERIES[allocator],
+                size=13,
+                weight=weight,
+            )
+        )
+        values = (
+            format_mib(cell.median_peak),
+            *(format_mib(value) for value in cell.median_post_drain),
+            format_seconds(cell.median_release_ms),
+        )
+        for column, text in enumerate(values):
+            parts.append(
+                svg_text(
+                    left
+                    + THREAD_CHURN_TABLE_FIRST_COLUMN
+                    + column * THREAD_CHURN_TABLE_COLUMN_WIDTH,
+                    row_y,
+                    text,
+                    fill=SCALING_INK["title"],
+                    size=13,
+                    weight=weight,
+                    anchor="end",
+                )
+            )
+    parts.append(
+        svg_text(
+            left,
+            height - 20,
+            f"released by = first sample within {format_mib(churn.release_tolerance_bytes)} MiB "
+            f"of the {format_seconds(span_ms)} sample (perf-ab's definition), median of "
+            f"n={churn.block_count}; peak is the external smaps_rollup peak; spread in latest.json",
             fill=SCALING_INK["muted"],
             size=12,
         )
@@ -5773,7 +6291,19 @@ def render_scaling_html(scaling: ScalingView) -> str:
         else "https://github.com/zackees/mimalloc-pprof/actions"
     )
     workers = ", ".join(str(point) for point in scaling.thread_points)
-    return f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(scaling.rigor_label)}.</strong> Legacy panels use {SCALING_BLOCKS} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating.</p><p>Worker counts are literal {escaped(workers)}; the runner allows {scaling.topology.allowed_logical_cpus} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling.methodology.seed_chain)}. Scaling run <a href="{actions}">{escaped(scaling.run.run_id)}/{scaling.run.run_attempt}</a> measured mimalloc-pprof at source <code>{escaped(scaling.run.source_sha)}</code>, which is not necessarily the commit above; metric key <code>{escaped(scaling.metric_comparison_key)}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table><h2 id="requested-size-distributions">Deterministic requested-size distributions</h2>{distribution_images}<p>These are normal allocation requests, not pointer-alignment tests. Each line is the median of at least {DISTRIBUTION_BLOCKS} paired repetitions. Every allocator shares one zero-based Y domain and ticks per metric, computed from every raw observation across both workloads and rounded upward; outliers are retained and never clipped. The P5 / P50 / P95 spread is in the table below.</p>{distribution_tables}</section>"""
+    churn = scaling.thread_churn
+    if churn is None:
+        thread_churn_html = f'<h2 id="thread-churn">RSS after the work stops</h2><img src="{THREAD_CHURN_PANEL}" alt="RSS after the work stops: pending until a scaling run records the thread-churn workload"><p>Pending: this scaling run predates the thread-churn workload (#508).</p>'
+    else:
+        churn_header = "".join(f"<th>{format_seconds(offset)}</th>" for offset in churn.offsets_ms)
+        churn_rows = "".join(
+            f"<tr><td>{escaped(cell.allocator_id)}</td><td>{format_mib(cell.median_peak)}</td>"
+            + "".join(f"<td>{format_mib(value)}</td>" for value in cell.median_post_drain)
+            + f"<td>{format_seconds(cell.median_release_ms)} / {format_seconds(cell.p95_release_ms)}</td></tr>"
+            for cell in churn.cells
+        )
+        thread_churn_html = f"""<h2 id="thread-churn">RSS after the work stops</h2><img src="{THREAD_CHURN_PANEL}" alt="RSS after the work stops: median resident memory of all five allocators at fixed times after every worker thread was joined, with a time-to-release table"><p>The short-lived-thread stream (the large-class-ephemeral workload at {churn.thread_count} workers, replayed block for block from the same run), after which every worker thread is joined and the process stays alive and idle, like a server between requests. Each child reads its own <code>/proc/self/statm</code> at fixed times after the drain; peak RSS is the external peak. Released by is the first sample within {format_mib(churn.release_tolerance_bytes)} MiB of the {format_seconds(max(churn.offsets_ms))} sample, perf-ab's definition. Median of {churn.block_count} paired runs; the P5/P95 spread is in <code>latest.json</code>.</p><table><thead><tr><th>Allocator</th><th>Peak MiB</th>{churn_header}<th>Released by P50 / P95</th></tr></thead><tbody>{churn_rows}</tbody></table>"""
+    return f"""<section><h2 id="scaling">Thread scaling (sparse sweep)</h2>{scaling_images}<p><strong>{escaped(scaling.rigor_label)}.</strong> Legacy panels use {SCALING_BLOCKS} blocks per cell, median with min/max, and deliberately no confidence intervals or noise gating.</p><p>Worker counts are literal {escaped(workers)}; the runner allows {scaling.topology.allowed_logical_cpus} logical CPUs, so higher points are oversubscribed and describe contention rather than core scaling. {escaped(scaling.methodology.seed_chain)}. Scaling run <a href="{actions}">{escaped(scaling.run.run_id)}/{scaling.run.run_attempt}</a> measured mimalloc-pprof at source <code>{escaped(scaling.run.source_sha)}</code>, which is not necessarily the commit above; metric key <code>{escaped(scaling.metric_comparison_key)}</code>.</p><table><thead><tr><th>Pattern</th><th>Workers</th><th>Allocator</th><th>Median ops/s</th><th>Min - max</th><th>Speedup vs 1</th><th>Oversubscribed</th></tr></thead><tbody>{scaling_rows}</tbody></table><h2 id="requested-size-distributions">Deterministic requested-size distributions</h2>{distribution_images}<p>These are normal allocation requests, not pointer-alignment tests. Each line is the median of at least {DISTRIBUTION_BLOCKS} paired repetitions. Every allocator shares one zero-based Y domain and ticks per metric, computed from every raw observation across both workloads and rounded upward; outliers are retained and never clipped. The P5 / P50 / P95 spread is in the table below.</p>{distribution_tables}{thread_churn_html}</section>"""
 
 
 def render_html(latest: Mapping[str, object]) -> bytes:
@@ -6194,12 +6724,21 @@ def render(
                 (output / name).write_bytes(
                     pending_scaling_svg(pattern, "deterministic distribution baseline pending")
                 )
+        (output / THREAD_CHURN_PANEL).write_bytes(
+            thread_churn_svg(scaling, release_bound_ms())
+            if scaling.thread_churn is not None
+            else pending_scaling_svg(
+                THREAD_CHURN_PATTERN,
+                "this scaling run predates the thread-churn workload (#508)",
+            )
+        )
     else:
         reason = cast(str, pending["scaling"]["reason"])
         for pattern, name in SCALING_PANELS.items():
             (output / name).write_bytes(pending_scaling_svg(pattern, reason))
         for (pattern, _metric), name in DISTRIBUTION_PANELS.items():
             (output / name).write_bytes(pending_scaling_svg(pattern, reason))
+        (output / THREAD_CHURN_PANEL).write_bytes(pending_scaling_svg(THREAD_CHURN_PATTERN, reason))
     if "pprof_tax" in latest:
         pprof_tax = validate_pprof_tax_report(latest["pprof_tax"], "latest.pprof_tax")
         (output / image_names["pprof-tax"]).write_bytes(pprof_tax_png(pprof_tax))

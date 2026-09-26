@@ -25,6 +25,10 @@ from benchmark_report import (
     SCALING_RSS_SCHEMA,
     SCALING_SCHEMA,
     SCALING_THREAD_POINTS,
+    THREAD_CHURN_OFFSETS_MS,
+    THREAD_CHURN_RELEASE_TOLERANCE_BYTES,
+    THREAD_CHURN_SCHEMA,
+    THREAD_CHURN_THREADS,
 )
 from check_benchmark_workflow import check_action_ref
 
@@ -261,6 +265,59 @@ RUST_PATTERN_NAMES = re.compile(
     re.DOTALL,
 )
 RUST_PATTERN_ARM = re.compile(r'Self::(\w+)\s*=>\s*"([^"]+)"')
+# #508: the thread-churn side-car's protocol, declared on both sides as well.
+RUST_THREAD_CHURN_SCHEMA = re.compile(
+    r'pub const THREAD_CHURN_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<schema>[^"]*)";'
+)
+RUST_THREAD_CHURN_THREADS = re.compile(
+    r"pub const THREAD_CHURN_THREADS:\s*u32\s*=\s*(?P<threads>\d+);"
+)
+RUST_THREAD_CHURN_OFFSETS = re.compile(
+    r"pub const THREAD_CHURN_POST_DRAIN_OFFSETS_MS:\s*\[u64;\s*(?P<length>\d+)\]\s*=\s*"
+    r"\[(?P<offsets>[^\]]*)\];"
+)
+RUST_THREAD_CHURN_TOLERANCE = re.compile(
+    r"pub const THREAD_CHURN_RELEASE_TOLERANCE_BYTES:\s*u64\s*=\s*"
+    r"(?:(?P<base>\d+)\s*<<\s*(?P<shift>\d+)|(?P<literal>[\d_]+));"
+)
+
+
+def validate_thread_churn_contract(source: str) -> None:
+    """The thread-churn constants the Rust producer emits and Python validates."""
+
+    schema = RUST_THREAD_CHURN_SCHEMA.search(source)
+    if schema is None or schema.group("schema") != THREAD_CHURN_SCHEMA:
+        fail(f"scaling.rs: THREAD_CHURN_SCHEMA_VERSION must be {THREAD_CHURN_SCHEMA!r}")
+    threads = RUST_THREAD_CHURN_THREADS.search(source)
+    if threads is None or int(threads.group("threads")) != THREAD_CHURN_THREADS:
+        fail(f"scaling.rs: THREAD_CHURN_THREADS must be {THREAD_CHURN_THREADS}")
+    if THREAD_CHURN_THREADS not in SCALING_THREAD_POINTS:
+        fail("benchmark_report.py: THREAD_CHURN_THREADS must be a declared thread point")
+    offsets = RUST_THREAD_CHURN_OFFSETS.search(source)
+    if offsets is None:
+        fail("scaling.rs: THREAD_CHURN_POST_DRAIN_OFFSETS_MS is missing or not a [u64; N] literal")
+    raw_offsets = [item.strip() for item in offsets.group("offsets").split(",") if item.strip()]
+    if not all(item.isdigit() for item in raw_offsets):
+        fail("scaling.rs: THREAD_CHURN_POST_DRAIN_OFFSETS_MS must be literal milliseconds")
+    values = tuple(int(item) for item in raw_offsets)
+    if int(offsets.group("length")) != len(values) or values != THREAD_CHURN_OFFSETS_MS:
+        fail(
+            f"scaling.rs: THREAD_CHURN_POST_DRAIN_OFFSETS_MS is {list(values)} but "
+            f"benchmark_report.py declares {list(THREAD_CHURN_OFFSETS_MS)}"
+        )
+    tolerance = RUST_THREAD_CHURN_TOLERANCE.search(source)
+    if tolerance is None:
+        fail("scaling.rs: THREAD_CHURN_RELEASE_TOLERANCE_BYTES is missing")
+    declared = (
+        int(tolerance.group("base")) << int(tolerance.group("shift"))
+        if tolerance.group("base") is not None
+        else int(tolerance.group("literal").replace("_", ""))
+    )
+    if declared != THREAD_CHURN_RELEASE_TOLERANCE_BYTES:
+        fail(
+            f"scaling.rs: THREAD_CHURN_RELEASE_TOLERANCE_BYTES must be "
+            f"{THREAD_CHURN_RELEASE_TOLERANCE_BYTES}"
+        )
 
 
 def validate_source_contract(source: str) -> None:
@@ -332,6 +389,7 @@ def validate_source_contract(source: str) -> None:
             "scaling.rs: SCALING_PATTERNS is "
             f"{ordered_names} but benchmark_report.py declares {list(SCALING_PATTERN_IDS)}"
         )
+    validate_thread_churn_contract(source)
 
 
 def load(path: Path) -> dict[str, object]:
@@ -467,6 +525,21 @@ SOURCE_MUTATIONS: dict[str, Callable[[str], str]] = {
     "pattern renamed": lambda text: text.replace('"larson"', '"larson-v2"'),
     "pattern array length lies": lambda text: text.replace(
         f"[ScalingPattern; {len(SCALING_PATTERN_IDS)}]", "[ScalingPattern; 99]"
+    ),
+    "thread-churn schema renamed on one side": lambda text: text.replace(
+        f'THREAD_CHURN_SCHEMA_VERSION: &str = "{THREAD_CHURN_SCHEMA}"',
+        'THREAD_CHURN_SCHEMA_VERSION: &str = "thread-churn-rss-v2"',
+    ),
+    "thread-churn worker count diverges": lambda text: text.replace(
+        f"THREAD_CHURN_THREADS: u32 = {THREAD_CHURN_THREADS};", "THREAD_CHURN_THREADS: u32 = 4;"
+    ),
+    "thread-churn offsets diverge": lambda text: text.replace(
+        f"[{', '.join(str(offset) for offset in THREAD_CHURN_OFFSETS_MS)}]",
+        f"[{', '.join(str(offset) for offset in THREAD_CHURN_OFFSETS_MS[:-1])}, 5000]",
+    ),
+    "thread-churn tolerance diverges": lambda text: text.replace(
+        "THREAD_CHURN_RELEASE_TOLERANCE_BYTES: u64 = 1 << 20;",
+        "THREAD_CHURN_RELEASE_TOLERANCE_BYTES: u64 = 1 << 22;",
     ),
 }
 

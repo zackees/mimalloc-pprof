@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import unittest
 import urllib.request
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -22,6 +23,17 @@ from unittest import mock
 import benchmark_report as report
 
 FIXTURE = Path(__file__).parent / "fixtures" / "benchmark"
+
+
+# #508: synthetic post-drain curves (MiB at each offset). The fork returns its memory by
+# the 1.5 s sample, Bun's mimalloc part of it, the others hold it.
+THREAD_CHURN_CURVES_MIB: dict[str, tuple[int, ...]] = {
+    "tcmalloc": (190, 190, 190, 190, 190, 190),
+    "jemalloc": (120, 100, 90, 90, 90, 90),
+    "upstream-mimalloc": (175, 175, 175, 170, 170, 170),
+    "bun-mimalloc": (170, 170, 160, 150, 140, 140),
+    "mimalloc-pprof": (150, 90, 30, 6, 5, 5),
+}
 
 
 class BenchmarkReportTests(unittest.TestCase):
@@ -1839,6 +1851,215 @@ class BenchmarkReportTests(unittest.TestCase):
             if not isinstance(item, dict) or item.get("metric_id") != "scaling"
         ]
         return value
+
+    def with_thread_churn(self, latest: dict[str, object]) -> dict[str, object]:
+        """A complete scaling section plus its #508 thread-churn side-car, whose raw
+        blocks replay the section's own large-class-ephemeral/8 blocks."""
+
+        value = self.with_complete_scaling(latest)
+        scaling = value["scaling"]
+        assert isinstance(scaling, dict)
+        sweep = cast(list[dict[str, object]], scaling["raw_samples"])
+        mib = 1024 * 1024
+        raw: list[dict[str, object]] = []
+        for source in sweep:
+            if (
+                source["pattern"] != report.THREAD_CHURN_SOURCE_PATTERN
+                or source["thread_count"] != report.THREAD_CHURN_THREADS
+            ):
+                continue
+            allocator = cast(str, source["allocator_id"])
+            block = cast(int, source["block_id"])
+            sample = copy.deepcopy(source)
+            sample["pattern"] = report.THREAD_CHURN_PATTERN
+            sample["peak_rss_bytes"] = (200 + block % 5) * mib
+            response = cast(dict[str, object], sample["response"])
+            response["post_drain_offsets_ns"] = [
+                offset * 1_000_000 + 50_000 + block for offset in report.THREAD_CHURN_OFFSETS_MS
+            ]
+            response["post_drain_rss_bytes"] = [
+                value_mib * mib + (block % 3) * 4096
+                for value_mib in THREAD_CHURN_CURVES_MIB[allocator]
+            ]
+            raw.append(sample)
+
+        def rounded(values: list[int], probability: float) -> int:
+            return math.floor(report.latency_type7(values, probability) + 0.5)
+
+        summaries: list[dict[str, object]] = []
+        for allocator in report.ALLOCATOR_IDS:
+            runs = [item for item in raw if item["allocator_id"] == allocator]
+            peaks = [cast(int, item["peak_rss_bytes"]) for item in runs]
+            curves = [
+                cast(list[int], cast(dict[str, object], item["response"])["post_drain_rss_bytes"])
+                for item in runs
+            ]
+            releases = [report.thread_churn_release_ms(curve) for curve in curves]
+            summary: dict[str, object] = {
+                "allocator_id": allocator,
+                "block_count": report.THREAD_CHURN_BLOCKS,
+                "median_peak_rss_bytes": rounded(peaks, 0.5),
+                "p05_peak_rss_bytes": rounded(peaks, 0.05),
+                "p95_peak_rss_bytes": rounded(peaks, 0.95),
+                "median_release_ms": rounded(releases, 0.5),
+                "p95_release_ms": rounded(releases, 0.95),
+            }
+            for prefix, probability in (("median", 0.5), ("p05", 0.05), ("p95", 0.95)):
+                summary[f"{prefix}_post_drain_rss_bytes"] = [
+                    rounded([curve[index] for curve in curves], probability)
+                    for index in range(len(report.THREAD_CHURN_OFFSETS_MS))
+                ]
+            summaries.append(summary)
+        scaling["thread_churn"] = {
+            "metric_schema_version": report.THREAD_CHURN_SCHEMA,
+            "source_pattern": report.THREAD_CHURN_SOURCE_PATTERN,
+            "thread_count": report.THREAD_CHURN_THREADS,
+            "generations": report.THREAD_CHURN_GENERATIONS,
+            "block_count": report.THREAD_CHURN_BLOCKS,
+            "post_drain_offsets_ms": list(report.THREAD_CHURN_OFFSETS_MS),
+            "release_tolerance_bytes": report.THREAD_CHURN_RELEASE_TOLERANCE_BYTES,
+            "sampling": {
+                "peak_source": "external smaps_rollup peak",
+                "post_drain_source": "/proc/self/statm after every worker was joined",
+                "release_definition": "first sample within 1 MiB of the last",
+            },
+            "cell_summaries": summaries,
+            "raw_samples": raw,
+        }
+        return value
+
+    def test_thread_churn_chart_overlays_median_rss_after_the_drain(self) -> None:
+        # #508: one panel, time since the drain on x, one median line per allocator
+        # (the fork last and thicker), the release bound, and a time-to-release table.
+        latest = self.with_thread_churn(self.load_latest())
+        report.validate_latest(latest, "thread-churn fixture")
+        scaling = report.validate_scaling_report(latest["scaling"], "thread-churn fixture")
+        view = report.scaling_view_from_validated(scaling)
+        assert view.thread_churn is not None
+        svg = report.thread_churn_svg(view, 1300).decode()
+        self.assertIn("RSS after the work stops", svg)
+        self.assertEqual(svg.count(f'fill="{report.SCALING_INK["plot"]}"'), 1)
+        stroke = re.compile(r'<path [^>]*stroke="(#[0-9a-f]+)" stroke-width="([\d.]+)"')
+        strokes = stroke.findall(svg)
+        self.assertEqual(len(strokes), len(report.ALLOCATOR_IDS))
+        self.assertEqual(strokes[-1][0], report.SCALING_SERIES["mimalloc-pprof"])
+        for _color, width in strokes[:-1]:
+            self.assertGreater(float(strokes[-1][1]), float(width))
+        for offset in report.THREAD_CHURN_OFFSETS_MS:
+            self.assertIn(f">{offset / 1000:g} s<", svg)
+        self.assertIn("release bound 1.3 s", svg)
+        self.assertIn("released by", svg)
+        self.assertNotIn("<polygon", svg)
+        fork = next(
+            cell for cell in view.thread_churn.cells if cell.allocator_id == "mimalloc-pprof"
+        )
+        tcmalloc = next(cell for cell in view.thread_churn.cells if cell.allocator_id == "tcmalloc")
+        # The fork settles at the 1.5 s sample; tcmalloc never falls, so it "settles"
+        # at once -- perf-ab's definition measures when RSS stops moving.
+        self.assertEqual(fork.median_release_ms, 1500)
+        self.assertEqual(tcmalloc.median_release_ms, 100)
+        # The fork's path ends lower on the canvas (larger y) than tcmalloc's.
+        paths = dict(re.findall(r'<path d="([^"]+)" fill="none" stroke="(#[0-9a-f]+)"', svg))
+        by_color = {color: path for path, color in paths.items()}
+        fork_end = float(by_color[report.SCALING_SERIES["mimalloc-pprof"]].split()[-1])
+        tcmalloc_end = float(by_color[report.SCALING_SERIES["tcmalloc"]].split()[-1])
+        self.assertGreater(fork_end, tcmalloc_end)
+
+    def test_thread_churn_publishes_on_the_dashboard_and_site(self) -> None:
+        latest = self.with_thread_churn(self.load_latest())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            self.assertIn('<h2 id="thread-churn">RSS after the work stops</h2>', page)
+            self.assertIn(f'src="{report.THREAD_CHURN_PANEL}"', page)
+            self.assertIn("Released by P50 / P95", page)
+            panel = (site / report.THREAD_CHURN_PANEL).read_text(encoding="utf-8")
+            self.assertIn("released by", panel)
+            self.assertNotIn("pending", panel)
+            history = report.history_row(latest)
+            self.assertNotIn("thread_churn", cast(dict[str, object], history["scaling"]))
+
+    def test_scaling_without_thread_churn_renders_a_pending_panel(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            panel = (site / report.THREAD_CHURN_PANEL).read_text(encoding="utf-8")
+            self.assertIn("pending", panel)
+            self.assertIn('id="thread-churn"', (site / "index.html").read_text(encoding="utf-8"))
+
+    def test_thread_churn_side_car_is_validated_against_its_raw_samples(self) -> None:
+        def churn_of(value: dict[str, object]) -> dict[str, object]:
+            return cast(
+                dict[str, object], cast(dict[str, object], value["scaling"])["thread_churn"]
+            )
+
+        def first_raw(value: dict[str, object]) -> dict[str, object]:
+            return cast(list[dict[str, object]], churn_of(value)["raw_samples"])[0]
+
+        def rejects(mutate: Callable[[dict[str, object]], object], pattern: str) -> None:
+            latest = self.with_thread_churn(self.load_latest())
+            mutate(latest)
+            with self.assertRaisesRegex(report.ReportError, pattern):
+                report.validate_scaling_report(latest["scaling"], "tampered thread churn")
+
+        rejects(
+            lambda value: cast(list[dict[str, object]], churn_of(value)["cell_summaries"])[
+                0
+            ].__setitem__("median_release_ms", 3000),
+            "differs from its raw samples",
+        )
+        rejects(
+            lambda value: cast(
+                list[int],
+                cast(dict[str, object], first_raw(value)["response"])["post_drain_rss_bytes"],
+            ).pop(),
+            "missing, early, or out of order",
+        )
+        rejects(
+            lambda value: cast(
+                list[int],
+                cast(dict[str, object], first_raw(value)["response"])["post_drain_offsets_ns"],
+            ).__setitem__(0, 1),
+            "missing, early, or out of order",
+        )
+        # The block must replay large-class-ephemeral's stream in the same run.
+        rejects(
+            lambda value: cast(dict[str, object], first_raw(value)["response"]).__setitem__(
+                "checksum", 1
+            ),
+            "does not replay large-class-ephemeral",
+        )
+        rejects(
+            lambda value: first_raw(value).__setitem__("operations_per_worker", 1),
+            "does not replay large-class-ephemeral",
+        )
+        rejects(
+            lambda value: churn_of(value).__setitem__("post_drain_offsets_ms", [100, 500]),
+            "unsupported thread-churn schema",
+        )
+        rejects(
+            lambda value: cast(list[object], churn_of(value)["raw_samples"]).pop(),
+            "expected 200 samples",
+        )
+        rejects(
+            lambda value: first_raw(value).__setitem__("thread_count", 4),
+            "misplaced",
+        )
+        # History rows are compact and never carry the side-car.
+        latest = self.with_thread_churn(self.load_latest())
+        history = report.history_row(latest)
+        compact = cast(dict[str, object], history["scaling"])
+        compact["thread_churn"] = churn_of(latest)
+        with self.assertRaisesRegex(report.ReportError, "unexpected=\\['thread_churn'\\]"):
+            report.validate_scaling_report(compact, "history", compact=True)
 
     def test_complete_scaling_publishes_one_dark_panel_per_pattern(self) -> None:
         latest = self.with_complete_scaling(self.load_latest())

@@ -30,6 +30,8 @@ def test_readme_accepts_complete_image_inventory(tmp_path: Path) -> None:
         + (
             "(https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)"
             if name in report.DISTRIBUTION_PANELS.values()
+            else "(https://zackees.github.io/mimalloc-pprof/#thread-churn)"
+            if name == report.THREAD_CHURN_PANEL
             else ""
         )
         for name in sorted(evaluate.EXPECTED_SVGS)
@@ -61,6 +63,26 @@ def test_publication_rejects_old_lineage_and_missing_dashboard(tmp_path: Path) -
     assert any("current distribution schema" in error for error in errors)
     assert any("power-of-two-large" in error for error in errors)
     assert any("requested-size-distributions anchor" in error for error in errors)
+    assert any("thread-churn side-car" in error for error in errors)
+    assert any("thread-churn anchor" in error for error in errors)
+
+
+def test_readme_requires_the_thread_churn_chart(tmp_path: Path) -> None:
+    readme = tmp_path / "README.md"
+    lines = [
+        f"![{name}](https://raw.githubusercontent.com/zackees/mimalloc-pprof/"
+        f"benchmark-stats/{name})"
+        + (
+            "(https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)"
+            if name in report.DISTRIBUTION_PANELS.values()
+            else ""
+        )
+        for name in sorted(evaluate.EXPECTED_SVGS - {report.THREAD_CHURN_PANEL})
+    ]
+    readme.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    errors = evaluate.readme_errors(readme)
+    assert any(report.THREAD_CHURN_PANEL in error for error in errors)
+    assert any("#thread-churn" in error for error in errors)
 
 
 def test_publication_calls_strict_validator_for_full_lineage(tmp_path: Path) -> None:
@@ -69,10 +91,11 @@ def test_publication_calls_strict_validator_for_full_lineage(tmp_path: Path) -> 
         "patterns": [{"pattern": pattern} for pattern in report.SCALING_PATTERN_IDS],
         "thread_points": list(report.SCALING_THREAD_POINTS),
         "run": {"source_ref": "refs/heads/main"},
+        "thread_churn": {},
     }
     (tmp_path / "latest.json").write_text(json.dumps({"scaling": scaling}), encoding="utf-8")
     (tmp_path / "index.html").write_text(
-        '<h2 id="requested-size-distributions"></h2>'
+        '<h2 id="requested-size-distributions"></h2><h2 id="thread-churn"></h2>'
         + "".join(f'<img src="{name}">' for name in sorted(evaluate.EXPECTED_SVGS)),
         encoding="utf-8",
     )

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit e10a2d57 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 331e4547 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -10906,9 +10906,10 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
 // Ranges will never cross chunk boundaries (and `slice_count <= MI_BCHUNK_BITS`).
 bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
 
-// #493: visit each maximal run of at least `n <= MI_BCHUNK_BITS` bits set in `bitmap | bitmap2`
-// (`bitmap2` may be NULL), in index order, WITHOUT clearing them. Runs never cross a chunk.
-bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
+// #493: visit each maximal run of at least `n <= MI_BCHUNK_BITS` bits set in the union of the
+// `count` bitmaps (all of one size; #506: the arena's four purge queues), in index order,
+// WITHOUT clearing them. Runs never cross a chunk.
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* const* bitmaps, size_t count, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
 
 // Count all set bits in given range in the bitmap.
 size_t mi_bitmap_popcountN( mi_bitmap_t* bitmap, size_t idx, size_t n);
@@ -11281,9 +11282,11 @@ static bool mi_arena_try_claim_resident(mi_arena_t* arena, size_t slice_count, s
   // sampling is a debugging mode; it takes the plain search.
   if (mi_option_get(mi_option_guarded_sample_rate) != 0) return false;
   #endif
-  // young | aged: a range freed in two steps is one run even when half of it has aged
+  // young | aged: a range freed in two steps is one run even when half of it has aged; and both
+  // queues (#506): a freed medium page next to a freed large one is one resident run too
+  mi_bitmap_t* const queues[4] = { arena->slices_purge, arena->slices_purge_aged, arena->slices_purge_short, arena->slices_purge_short_aged };
   mi_resident_claim_t rc = { slice_count, 0, 0, false };
-  _mi_bitmap_forall_set_runsN(arena->slices_purge, arena->slices_purge_aged, slice_count, &mi_arena_resident_claim_visitor, arena, &rc);
+  _mi_bitmap_forall_set_runsN(queues, 4, slice_count, &mi_arena_resident_claim_visitor, arena, &rc);
   if (rc.claimed) { *slice_index = rc.slice_index; }
   return rc.claimed;
 }
@@ -16554,13 +16557,16 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
 // the runs are only hints (the arena claims them atomically in `slices_free`), so the loads are
 // relaxed. A run never crosses a chunk, so it can be claimed with `mi_bbitmap_try_clearNC`.
 // Stops, returning false, as soon as `visit` returns false.
-bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* const* bitmaps, size_t count, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
   mi_assert_internal(n > 0 && n <= MI_BCHUNK_BITS);
-  mi_assert_internal(bitmap2 == NULL || mi_bitmap_chunk_count(bitmap2) == mi_bitmap_chunk_count(bitmap));
-  const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmap), MI_BFIELD_BITS);
+  mi_assert_internal(count > 0);
+  const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmaps[0]), MI_BFIELD_BITS);
   for (size_t i = 0; i < chunkmap_max; i++) {
-    mi_bfield_t cmap_entry = mi_atomic_load_relaxed(&bitmap->chunkmap.bfields[i]);
-    if (bitmap2 != NULL) { cmap_entry |= mi_atomic_load_relaxed(&bitmap2->chunkmap.bfields[i]); }
+    mi_bfield_t cmap_entry = 0;
+    for (size_t k = 0; k < count; k++) {
+      mi_assert_internal(mi_bitmap_chunk_count(bitmaps[k]) == mi_bitmap_chunk_count(bitmaps[0]));
+      cmap_entry |= mi_atomic_load_relaxed(&bitmaps[k]->chunkmap.bfields[i]);
+    }
     size_t cmap_idx;
     // for each chunk (corresponding to a set bit in a chunkmap entry)
     while (mi_bfield_foreach_bit(&cmap_entry, &cmap_idx)) {
@@ -16569,8 +16575,8 @@ bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size
       size_t run_start = 0;   // chunk-relative start of the current run
       size_t run_len = 0;     // and its length so far (0 = none); a run can span bfields
       for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
-        mi_bfield_t b = mi_atomic_load_relaxed(&bitmap->chunks[chunk_idx].bfields[j]);
-        if (bitmap2 != NULL) { b |= mi_atomic_load_relaxed(&bitmap2->chunks[chunk_idx].bfields[j]); }
+        mi_bfield_t b = 0;
+        for (size_t k = 0; k < count; k++) { b |= mi_atomic_load_relaxed(&bitmaps[k]->chunks[chunk_idx].bfields[j]); }
         size_t bidx;
         while (mi_bfield_find_least_bit(b, &bidx)) {
           const size_t rng = mi_ctz(~(b>>bidx));   // all the set bits from bidx

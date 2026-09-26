@@ -7,6 +7,10 @@ name: perf-ab
 # dispatch; the table lands in the job summary and is pasted into the PR. Runs on a hosted
 # runner so no developer machine is timed. A dispatch can set allocator options on the head arm
 # only (`head_env`): with base = the same commit, that attributes a cost to one option (#506).
+# `head_cppdefs` does the same for compile-time defines: the head arm's library is built with
+# -DMI_EXTRA_CPPDEFS=<value>, and the table's first line says so (#527). The #422 diagnostic rows
+# (exact sizes, size-class edges, the sparse-large-buffers twin; names end in "(#422)") never run
+# on a PR: a dispatch selects them through `workloads`, e.g. "#422" or "80 KiB|512 KiB".
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -21,11 +25,15 @@ on:
         type: string
         default: "7"
       workloads:
-        description: "Only the workloads whose name contains this text (empty = all)"
+        description: "Only the workloads whose name contains this text, '|' between alternatives (empty = the gating rows; the (#422) diagnostic rows run only when named)"
         type: string
         default: ""
       head_env:
         description: "KEY=VALUE pairs (space separated) set on the head arm only, e.g. MIMALLOC_ARENA_PURGE_MULT=1"
+        type: string
+        default: ""
+      head_cppdefs:
+        description: "Defines (NAME or NAME=VALUE, ';' or space separated) the head arm's library is built with, as -DMI_EXTRA_CPPDEFS, e.g. MI_ENABLE_LARGE_PAGES=0"
         type: string
         default: ""
 
@@ -48,4 +56,5 @@ jobs:
           REPS: ${{ inputs.reps || '7' }}
           WORKLOADS: ${{ inputs.workloads }}
           HEAD_ENV: ${{ inputs.head_env }}
-        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --summary "$GITHUB_STEP_SUMMARY"
+          HEAD_CPPDEFS: ${{ inputs.head_cppdefs }}
+        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" --summary "$GITHUB_STEP_SUMMARY"

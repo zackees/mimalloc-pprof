@@ -53,7 +53,8 @@ BUILDS: dict[str, tuple[list[str], dict[str, str]]] = {
 # name: (build, (threads, generations, min bytes, max bytes, ops per thread, pause ms, table slots)).
 # A pause makes the row bursty (#486): BURSTS bursts per thread, everything freed after each, then
 # idle. Table slots make it the Larson server workload (#506): one shared table of that many blocks
-# per thread, rotating between the threads, so later frees are remote (see ci/perf_ab.c).
+# per thread, rotating between the threads, so later frees are remote, and a per-table log that
+# grows by doubling realloc as the chart harness's own does (see ci/perf_ab.c).
 LARSON_SLOTS = 5000  # the benchmark suite's larson live set per thread (mimalloc-bench's `larson ... 5000 ...`)
 WORKLOADS = {
     "large-class/8": ("plain", (8, 1, 96 << 10, 512 << 10, 400000, 0, 0)),
@@ -63,9 +64,10 @@ WORKLOADS = {
     "random-large/1": ("plain", (1, 1, 64 << 10, 4 << 20, 200000, 0, 0)),
     "small/8 (control)": ("plain", (8, 1, 16, 1024, 5000000, 0, 0)),
     # #506: the README's larson chart (8-1000 B); its peak RSS regressed with no row to show it
-    "larson/1": ("plain", (1, 1, 8, 1000, 8000000, 0, LARSON_SLOTS)),
-    "larson/8": ("plain", (8, 1, 8, 1000, 4000000, 0, LARSON_SLOTS)),
-    "larson/8 (chart build)": ("chart", (8, 1, 8, 1000, 4000000, 0, LARSON_SLOTS)),
+    # (ops per thread: the chart's calibrated cells, ~9.8M at 1 worker and ~2.5M at 8)
+    "larson/1": ("plain", (1, 1, 8, 1000, 10000000, 0, LARSON_SLOTS)),
+    "larson/8": ("plain", (8, 1, 8, 1000, 2500000, 0, LARSON_SLOTS)),
+    "larson/8 (chart build)": ("chart", (8, 1, 8, 1000, 2500000, 0, LARSON_SLOTS)),
     "large-class/8 (profiler on)": ("pprof", (8, 1, 96 << 10, 512 << 10, 400000, 0, 0)),
     "large-class-ephemeral/8 (chart build)": ("chart", (8, 8, 96 << 10, 512 << 10, 400000, 0, 0)),
     # the README chart's generation length (~12.5k ops per short-lived thread at 8 workers, #478):

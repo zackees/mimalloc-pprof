@@ -11,7 +11,10 @@
    the README's larson chart, rust/benchmark-suite ScalingPattern::Larson): one shared table of
    table_slots blocks per thread, each draw frees a random slot's block and allocates a new one into
    it, and every LARSON_ROUNDS-th of the draws the tables rotate to the next thread, so later frees
-   are of another thread's blocks; at the end each thread frees the table it started with. Prints one line: ops/s, process cpu seconds, the workers' own cpu seconds (the
+   are of another thread's blocks; at the end each thread frees the table it started with. Like the
+   chart's harness (its planner's VecDeque, which the override routes through the allocator under
+   test), each table also appends every draw's slot to a log that grows by doubling mi_realloc from
+   table_slots entries: the growing-buffer pattern of any Rust Vec. Prints one line: ops/s, process cpu seconds, the workers' own cpu seconds (the
    allocating threads, without the scavenger), minor page faults, peak RSS, and, after everything
    was freed while the worker threads stay alive and idle (a server between requests): RSS
    DRAIN_SHORT_MS later, RSS at the release bound (ci/release_ratchet.json, #491), and the release
@@ -39,7 +42,7 @@
 typedef struct { uint64_t rng; size_t lo, hi; long ops; void* slot[SLOTS]; int fifo[4096]; size_t head, tail; double cpu; int index; } stream_t;
 
 /* #506: one Larson table; a round of draws on it runs on one thread at a time (the round barrier) */
-typedef struct { uint64_t rng; void** slot; } table_t;
+typedef struct { uint64_t rng; void** slot; size_t* log; size_t log_len, log_cap; } table_t;
 
 static uint64_t next(uint64_t* s) {
   uint64_t z = (*s += 0x9e3779b97f4a7c15ull);
@@ -99,6 +102,12 @@ static void larson_round(table_t* tb, size_t lo, size_t hi, long n) {
     if (p == NULL) { fprintf(stderr, "allocation failed\n"); exit(1); }
     p[0] = (char)size;
     tb->slot[k] = p;
+    if (tb->log_len == tb->log_cap) {   /* as the harness's VecDeque::push_back: double */
+      tb->log_cap *= 2;
+      tb->log = (size_t*)mi_realloc(tb->log, tb->log_cap * sizeof(size_t));
+      if (tb->log == NULL) { fprintf(stderr, "allocation failed\n"); exit(1); }
+    }
+    tb->log[tb->log_len++] = k;
   }
 }
 
@@ -111,6 +120,7 @@ static void* worker_main(void* arg) {
     }
     table_t* own = &tables[st->index];
     for (int k = 0; k < table_slots; k++) { mi_free(own->slot[k]); own->slot[k] = NULL; }
+    mi_free(own->log); own->log = NULL;
   }
   else if (pause_ms > 0) {
     for (int b = 0; b < BURSTS; b++) {
@@ -165,6 +175,8 @@ int main(int argc, char** argv) {
     for (int i = 0; i < threads; i++) {
       tables[i].rng = 0x1a750000ull + (uint64_t)i;
       tables[i].slot = (void**)calloc((size_t)table_slots, sizeof(void*));
+      tables[i].log_cap = (size_t)table_slots;
+      tables[i].log = (size_t*)mi_malloc(tables[i].log_cap * sizeof(size_t));
     }
     pthread_barrier_init(&round_barrier, NULL, (unsigned)threads);
   }

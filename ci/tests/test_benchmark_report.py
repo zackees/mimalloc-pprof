@@ -2345,6 +2345,31 @@ class BenchmarkReportTests(unittest.TestCase):
                     for floor_y, line_y in zip(floor_ys, self.path_ys(line)):
                         self.assertGreaterEqual(floor_y, line_y)
 
+    def test_floor_sits_in_the_allocator_legend_row_as_theoretical_minimum(self) -> None:
+        # Owner request: the floor is a legend entry beside the allocators, labelled
+        # "theoretical minimum", on every chart that draws it.
+        view = self.floor_view()
+        assert view.thread_churn is not None
+        svgs = [
+            report.distribution_stack_svg(view, pattern, "rss").decode()
+            for pattern in report.DISTRIBUTION_PATTERN_IDS
+        ] + [report.thread_churn_svg(view, 1300).decode()]
+        text_y = re.compile(r'<text x="([\d.]+)" y="([\d.]+)"[^>]*>([^<]+)</text>')
+        for svg in svgs:
+            labels: dict[str, tuple[float, str]] = {}
+            for x, y, label in text_y.findall(svg):
+                # First occurrence: the legend row precedes the churn chart's table.
+                labels.setdefault(label, (float(x), y))
+            self.assertEqual(report.RSS_FLOOR_LEGEND_LABEL, "theoretical minimum")
+            self.assertIn(report.RSS_FLOOR_LEGEND_LABEL, labels)
+            fork = labels[report.allocator_label("mimalloc-pprof")]
+            floor = labels[report.RSS_FLOOR_LEGEND_LABEL]
+            self.assertEqual(floor[1], fork[1], "same legend row as the allocators")
+            self.assertGreater(floor[0], fork[0], "after the last allocator")
+            self.assertLess(
+                floor[0] + 7.4 * len(report.RSS_FLOOR_LEGEND_LABEL), report.DISTRIBUTION_WIDTH
+            )
+
     def test_throughput_panels_never_draw_the_floor(self) -> None:
         view = self.floor_view()
         for pattern in report.DISTRIBUTION_PATTERN_IDS:

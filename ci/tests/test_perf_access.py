@@ -69,6 +69,20 @@ def test_target_pid_does_not_override_permission_denial() -> None:
     assert targeted.reason == "permission denied"
 
 
+def test_ubuntu_perf_launcher_resolves_only_kernel_matched_elf(tmp_path: Path) -> None:
+    launcher = tmp_path / "perf-wrapper"
+    launcher.write_text('#!/bin/sh\nexec /usr/lib/linux-tools/6.17-azure/perf "$@"\n')
+    tools_root = tmp_path / "linux-tools"
+    matched = tools_root / "6.17-azure/perf"
+    matched.parent.mkdir(parents=True)
+    matched.write_bytes(b"\x7fELFbinary")
+    stale = tools_root / "6.15-azure/perf"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"\x7fELFstale")
+    assert access.resolve_perf_elf(str(launcher), "6.17-azure", tools_root) == matched
+    assert access.resolve_perf_elf(str(launcher), "6.19-azure", tools_root) is None
+
+
 def test_missing_bounding_capability_never_changes_host_policy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -84,10 +98,11 @@ def test_missing_bounding_capability_never_changes_host_policy(
     monkeypatch.setattr(access.shutil, "which", which)
     monkeypatch.setattr(access, "snapshot_permissions", snapshot)
 
-    def forbidden(_command: object) -> None:
-        pytest.fail("no command may run when CAP_PERFMON is absent from the bounding set")
+    def read_only(command: list[str]) -> subprocess.CompletedProcess[str]:
+        assert command[0] == "getcap"
+        return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(access, "run", forbidden)
+    monkeypatch.setattr(access, "run", read_only)
     report = access.prepare(tmp_path / "private")
     assert report.collector_mode == "unavailable"
     assert report.reason == "CAP_PERFMON absent from runner capability bounding set"
@@ -123,5 +138,5 @@ def test_private_file_capability_never_touches_installed_perf_or_sysctl(
     assert report.collector_path == str(tmp_path / "private/perf-private")
     assert source.read_bytes() == b"\x7fELFdummy"
     assert any(command[0:4] == ("sudo", "-n", "setcap", "cap_perfmon=ep") for command in commands)
-    assert all(str(source) not in command for command in commands)
+    assert all(str(source) not in command for command in commands if command[0] == "sudo")
     assert all("sysctl" not in command for command in commands)

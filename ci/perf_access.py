@@ -71,6 +71,9 @@ class AccessReport:
     reason: str | None
     permissions_before: RunnerPermissions
     permissions_after: RunnerPermissions
+    source_elf: str | None
+    source_capabilities_before: str
+    source_capabilities_after: str
     private_capabilities: str
     event_probes: tuple[EventProbe, ...]
 
@@ -187,9 +190,36 @@ def probe_events(perf: str) -> tuple[EventProbe, ...]:
     )
 
 
+def is_elf(path: Path) -> bool:
+    try:
+        with path.open("rb") as source:
+            return source.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def resolve_perf_elf(
+    installed_perf: str, kernel: str, tools_root: Path = Path("/usr/lib/linux-tools")
+) -> Path | None:
+    """Ubuntu's /usr/bin/perf is a script; copy its kernel-matched ELF instead."""
+    installed = Path(installed_perf)
+    if is_elf(installed):
+        return installed.resolve()
+    candidate = tools_root / kernel / "perf"
+    return candidate.resolve() if is_elf(candidate) else None
+
+
+def file_capabilities(path: Path | None) -> str:
+    if path is None or not shutil.which("getcap"):
+        return "unavailable"
+    return run(["getcap", "-n", str(path)]).stdout.strip()
+
+
 def prepare(directory: Path) -> AccessReport:
     installed_perf = shutil.which("perf")
     before = snapshot_permissions(directory, installed_perf)
+    source = resolve_perf_elf(installed_perf, before.kernel) if installed_perf else None
+    source_caps_before = file_capabilities(source)
     reason: str | None = None
     private: Path | None = None
     private_caps = "unavailable"
@@ -199,6 +229,8 @@ def prepare(directory: Path) -> AccessReport:
         bounding_capabilities = 0
     if installed_perf is None:
         reason = "perf executable not installed"
+    elif source is None:
+        reason = "no kernel-matched perf ELF found behind installed launcher"
     elif not shutil.which("setcap") or not shutil.which("getcap") or not shutil.which("sudo"):
         reason = "setcap, getcap or sudo unavailable"
     elif not bounding_capabilities & CAP_PERFMON_BIT:
@@ -211,15 +243,8 @@ def prepare(directory: Path) -> AccessReport:
         private = directory / "perf-private"
         if private.exists():
             reason = "job-private perf path already exists"
-        else:
-            try:
-                with Path(installed_perf).open("rb") as source:
-                    if source.read(4) != b"\x7fELF":
-                        reason = "installed perf is not an ELF executable"
-            except OSError as error:
-                reason = f"could not inspect installed perf: {error}"
         if reason is None:
-            shutil.copyfile(installed_perf, private)
+            shutil.copyfile(source, private)
             for command in (
                 ["sudo", "-n", "chown", f"root:{os.getgid()}", str(private)],
                 ["sudo", "-n", "chmod", "0550", str(private)],
@@ -235,10 +260,13 @@ def prepare(directory: Path) -> AccessReport:
     selected = str(private) if private is not None and reason is None else None
     probes = probe_events(selected) if selected else ()
     after = snapshot_permissions(directory, installed_perf)
+    source_caps_after = file_capabilities(source)
     if before.perf_event_paranoid != after.perf_event_paranoid:
         raise RuntimeError("host-wide perf_event_paranoid changed during perf setup")
     if before.installed_perf_capabilities != after.installed_perf_capabilities:
         raise RuntimeError("installed perf capabilities changed during perf setup")
+    if source_caps_before != source_caps_after:
+        raise RuntimeError("source perf ELF capabilities changed during perf setup")
     return AccessReport(
         "perf-access-v1",
         "private-cap-perfmon" if selected else "unavailable",
@@ -246,6 +274,9 @@ def prepare(directory: Path) -> AccessReport:
         reason,
         before,
         after,
+        str(source) if source else None,
+        source_caps_before,
+        source_caps_after,
         private_caps,
         probes,
     )

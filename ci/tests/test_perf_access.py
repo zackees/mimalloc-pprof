@@ -46,12 +46,13 @@ def test_permission_denial_is_not_an_unsupported_pmu() -> None:
     )
     counted = access.classify_probe(
         "task-clock:u",
-        subprocess.CompletedProcess(["perf"], 0, "", "123.45;;task-clock:u;"),
+        subprocess.CompletedProcess(["perf"], 0, "", "123.45;;task-clock:u;12345;75.00;"),
     )
     assert denied.reason == "permission denied"
     assert unsupported.reason == "event unsupported by runner PMU"
     assert not_counted.reason == "event was not counted"
     assert counted.availability == "available" and counted.value == 123.45
+    assert counted.running_percent == 75
 
 
 def test_missing_bounding_capability_never_changes_host_policy(

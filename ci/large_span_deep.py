@@ -617,6 +617,12 @@ def parse_perf_stat(text: str, returncode: int | None) -> tuple[NamedCounter, ..
         if event not in expected_events:
             continue
         raw = raw.strip()
+        running_percent: float | None = None
+        if len(fields) > 4:
+            try:
+                running_percent = float(fields[4].strip().rstrip("%"))
+            except ValueError:
+                running_percent = None
         try:
             value = float(raw.replace(",", ""))
         except ValueError:
@@ -634,7 +640,24 @@ def parse_perf_stat(text: str, returncode: int | None) -> tuple[NamedCounter, ..
             upsert_counter(
                 parsed,
                 event,
-                available("perf stat", "command process tree", "event units per perf", value),
+                unavailable(
+                    "perf stat",
+                    "command process tree",
+                    "event units per perf",
+                    "event was not scheduled",
+                )
+                if running_percent == 0
+                else CounterRecord(
+                    "perf stat",
+                    "command process tree, user space",
+                    "event units per perf",
+                    "perf stat diagnostic replay",
+                    "available",
+                    value,
+                    f"multiplexed: ran {running_percent:.1f}% of enabled time; perf scaled count"
+                    if running_percent is not None and running_percent < 100
+                    else None,
+                ),
             )
     if returncode != 0:
         for event in expected_events:
@@ -756,6 +779,22 @@ def parse_replay_evidence(
         expected_uid,
         expected_workers,
     )
+
+
+def profile_sample_count(report: str) -> int | None:
+    match = re.search(r"# Samples:\s*([0-9][0-9,.]*)([KMG]?)\b", report)
+    if match is None:
+        return None
+    amount = float(match.group(1).replace(",", ""))
+    suffix = match.group(2)
+    scale = 1
+    if suffix == "K":
+        scale = 1_000
+    elif suffix == "M":
+        scale = 1_000_000
+    elif suffix == "G":
+        scale = 1_000_000_000
+    return round(amount * scale)
 
 
 def run_tool(
@@ -1053,8 +1092,7 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
                     if rc == 0
                     else (None, "", "profile recording unavailable")
                 )
-                sample_match = re.search(r"# Samples:\s*([0-9,]+)", report_out)
-                sample_count = int(sample_match.group(1).replace(",", "")) if sample_match else None
+                sample_count = profile_sample_count(report_out)
                 replay = parse_replay_evidence(
                     record_stdout, expected_uid, expected_workers, control.stdout
                 )

@@ -60,6 +60,7 @@ class EventProbe:
     reason: str | None
     returncode: int | None
     raw_stderr: str
+    running_percent: float | None = None
 
 
 @dataclass(frozen=True)
@@ -149,12 +150,22 @@ def classify_probe(event: str, result: subprocess.CompletedProcess[str]) -> Even
         fields = line.split(";")
         if len(fields) < 3 or fields[2].strip() != event:
             continue
+        running_percent: float | None = None
+        if len(fields) > 4:
+            try:
+                running_percent = float(fields[4].strip().rstrip("%"))
+            except ValueError:
+                running_percent = None
         try:
             value = float(fields[0].strip().replace(",", ""))
         except ValueError:
             break
+        if running_percent == 0:
+            return EventProbe(
+                event, "unavailable", None, "event was not scheduled", result.returncode, raw, 0
+            )
         if result.returncode == 0 and value > 0:
-            return EventProbe(event, "available", value, None, 0, raw)
+            return EventProbe(event, "available", value, None, 0, raw, running_percent)
         break
     return EventProbe(
         event,

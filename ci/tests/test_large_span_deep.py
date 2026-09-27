@@ -132,6 +132,22 @@ def test_perf_stat_parser_preserves_unavailable_not_zero() -> None:
     assert cycles.reason == "<not supported>"
 
 
+def test_perf_stat_marks_multiplexing_and_unscheduled_events() -> None:
+    values = deep.parse_perf_stat("1000;;cycles:u;50;40.00;\n0;;instructions:u;0;0.00;\n", 0)
+    cycles = deep.named_counter(values, "cycles")
+    instructions = deep.named_counter(values, "instructions")
+    assert cycles.value == 1000
+    assert cycles.reason is not None and "multiplexed" in cycles.reason
+    assert instructions.value is None
+    assert instructions.reason == "event was not scheduled"
+
+
+def test_profile_sample_count_handles_perf_human_abbreviations() -> None:
+    assert deep.profile_sample_count("# Samples: 1.2K of event cycles\n") == 1200
+    assert deep.profile_sample_count("# Samples: 12,345 of event cycles\n") == 12345
+    assert deep.profile_sample_count("no sample header") is None
+
+
 def credential_stdout(uid: int, worker_uid: int, cap_eff: str = "0") -> str:
     template = (
         '{"completed_operations":800,"trace_checksum":"deadbeef","perf_credentials":{'

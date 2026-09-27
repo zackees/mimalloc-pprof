@@ -603,6 +603,18 @@ def host_memory_metadata(
     )
 
 
+def perf_event_unit(event: str) -> str:
+    if event == "task-clock":
+        return "nanoseconds"
+    if event == "cycles":
+        return "cycles"
+    if event == "instructions":
+        return "instructions"
+    if event == "page-faults":
+        return "faults"
+    return "events"
+
+
 def parse_perf_stat(text: str, returncode: int | None) -> tuple[NamedCounter, ...]:
     parsed: list[NamedCounter] = []
     expected_events = [event.partition(":")[0] for event in PERF_EVENTS.split(",")]
@@ -619,6 +631,7 @@ def parse_perf_stat(text: str, returncode: int | None) -> tuple[NamedCounter, ..
         event = event.strip().split(":", 1)[0]
         if event not in expected_events:
             continue
+        unit = perf_event_unit(event)
         raw = raw.strip()
         running_percent: float | None = None
         if len(fields) > 4:
@@ -635,7 +648,7 @@ def parse_perf_stat(text: str, returncode: int | None) -> tuple[NamedCounter, ..
                 unavailable(
                     "perf stat",
                     "command process tree",
-                    "event units per perf",
+                    unit,
                     raw or "counter unavailable",
                 ),
             )
@@ -646,14 +659,14 @@ def parse_perf_stat(text: str, returncode: int | None) -> tuple[NamedCounter, ..
                 unavailable(
                     "perf stat",
                     "command process tree",
-                    "event units per perf",
+                    unit,
                     "event was not scheduled",
                 )
                 if running_percent == 0
                 else CounterRecord(
                     "perf stat",
                     "command process tree, user space",
-                    "event units per perf",
+                    unit,
                     "perf stat diagnostic replay",
                     "available",
                     value,
@@ -671,7 +684,7 @@ def parse_perf_stat(text: str, returncode: int | None) -> tuple[NamedCounter, ..
                         unavailable(
                             "perf stat",
                             "command process tree",
-                            "event units per perf",
+                            perf_event_unit(event),
                             missing_reason,
                             "perf stat diagnostic replay",
                         ),
@@ -685,7 +698,7 @@ def parse_perf_stat(text: str, returncode: int | None) -> tuple[NamedCounter, ..
                     unavailable(
                         "perf stat",
                         "command process tree",
-                        "event units per perf",
+                        perf_event_unit(event),
                         "event missing from perf output",
                         "perf stat diagnostic replay",
                     ),
@@ -995,7 +1008,7 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
                 unavailable(
                     "perf",
                     "command process tree",
-                    "event units per perf",
+                    perf_event_unit(event),
                     "private collector unavailable; see perf-access.json"
                     if setup_status == "unavailable"
                     else "perf executable not installed",

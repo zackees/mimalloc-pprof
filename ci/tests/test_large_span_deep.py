@@ -126,10 +126,12 @@ def test_perf_stat_parser_preserves_unavailable_not_zero() -> None:
     text = "1000.00; ;task-clock;100.00;%;\n<not supported>; ;cycles; ; ;\n"
     values = deep.parse_perf_stat(text, 0)
     assert deep.named_counter(values, "task-clock").value == 1000.0
+    assert deep.named_counter(values, "task-clock").unit == "nanoseconds"
     cycles = deep.named_counter(values, "cycles")
     assert cycles.value is None
     assert cycles.availability == "unavailable"
     assert cycles.reason == "<not supported>"
+    assert cycles.unit == "cycles"
 
 
 def test_perf_stat_marks_multiplexing_and_unscheduled_events() -> None:

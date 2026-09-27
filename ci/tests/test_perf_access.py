@@ -53,6 +53,13 @@ def test_permission_denial_is_not_an_unsupported_pmu() -> None:
     assert not_counted.reason == "event was not counted"
     assert counted.availability == "available" and counted.value == 123.45
     assert counted.running_percent == 75
+    assert counted.unit == "nanoseconds"
+    zero_cache = access.classify_probe(
+        "cache-misses:u",
+        subprocess.CompletedProcess(["perf"], 0, "", "0;;cache-misses:u;12345;100.00;"),
+    )
+    assert zero_cache.availability == "available" and zero_cache.value == 0
+    assert zero_cache.unit == "events"
 
 
 def test_target_pid_does_not_override_permission_denial() -> None:

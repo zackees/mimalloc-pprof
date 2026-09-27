@@ -61,6 +61,7 @@ class EventProbe:
     returncode: int | None
     raw_stderr: str
     running_percent: float | None = None
+    unit: str = "events"
 
 
 @dataclass(frozen=True)
@@ -138,17 +139,33 @@ def snapshot_permissions(directory: Path, installed_perf: str | None) -> RunnerP
     )
 
 
+def perf_event_unit(event: str) -> str:
+    name = event.partition(":")[0]
+    if name in ("task-clock", "cpu-clock"):
+        return "nanoseconds"
+    if name == "cycles":
+        return "cycles"
+    if name == "instructions":
+        return "instructions"
+    if name == "page-faults":
+        return "faults"
+    return "events"
+
+
 def classify_probe(event: str, result: subprocess.CompletedProcess[str]) -> EventProbe:
     raw = result.stderr
     lowered = raw.lower()
+    unit = perf_event_unit(event)
     if "permission" in lowered or "access to performance monitoring" in lowered:
-        return EventProbe(event, "unavailable", None, "permission denied", result.returncode, raw)
+        return EventProbe(
+            event, "unavailable", None, "permission denied", result.returncode, raw, unit=unit
+        )
     for marker, reason in (
         ("<not supported>", "event unsupported by runner PMU"),
         ("<not counted>", "event was not counted"),
     ):
         if marker in lowered:
-            return EventProbe(event, "unavailable", None, reason, result.returncode, raw)
+            return EventProbe(event, "unavailable", None, reason, result.returncode, raw, unit=unit)
     for line in raw.splitlines():
         fields = line.split(";")
         if len(fields) < 3 or fields[2].strip() != event:
@@ -165,18 +182,37 @@ def classify_probe(event: str, result: subprocess.CompletedProcess[str]) -> Even
             break
         if running_percent == 0:
             return EventProbe(
-                event, "unavailable", None, "event was not scheduled", result.returncode, raw, 0
+                event,
+                "unavailable",
+                None,
+                "event was not scheduled",
+                result.returncode,
+                raw,
+                0,
+                unit,
             )
-        if result.returncode == 0 and value > 0:
-            return EventProbe(event, "available", value, None, 0, raw, running_percent)
+        if result.returncode == 0 and value >= 0:
+            if event in ("task-clock:u", "cpu-clock:u", "cpu-clock") and value == 0:
+                return EventProbe(
+                    event,
+                    "unavailable",
+                    None,
+                    "CPU clock probe had zero count",
+                    0,
+                    raw,
+                    running_percent,
+                    unit,
+                )
+            return EventProbe(event, "available", value, None, 0, raw, running_percent, unit)
         break
     return EventProbe(
         event,
         "unavailable",
         None,
-        f"tool failure or zero count (exit {result.returncode})",
+        f"tool failure or invalid count (exit {result.returncode})",
         result.returncode,
         raw,
+        unit=unit,
     )
 
 

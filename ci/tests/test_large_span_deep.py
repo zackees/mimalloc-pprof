@@ -214,6 +214,27 @@ def test_collect_marks_missing_tools_and_keeps_profile_optional(
     assert asdict(artifact)["schema_version"] == "large-span-deep-v1"
 
 
+def test_hosted_setup_failure_does_not_silently_retry_unprivileged_perf(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MIMALLOC_PERF_SETUP_STATUS", "unavailable")
+    monkeypatch.setattr(deep, "cgroup_v2_path", no_cgroup)
+    monkeypatch.setattr(deep, "snapshot_cgroup", missing_cgroup_snapshot)
+    monkeypatch.setattr(deep, "host_memory_metadata", no_host_memory_metadata)
+    monkeypatch.setattr(deep.shutil, "which", perf_only_tool)
+
+    def forbidden(
+        _command: list[str], _timeout: int = 3600, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        pytest.fail("unprivileged perf must not run after scoped setup failed")
+
+    monkeypatch.setattr(deep, "run_tool", forbidden)
+    artifact = deep.collect(["./replay", "1"], tmp_path / "out")
+    assert artifact.collector is not None and artifact.collector.mode == "unavailable"
+    assert deep.named_counter(artifact.perf_stat.events, "cycles").value is None
+    assert "private collector unavailable" in artifact.perf_stat.raw_stderr
+
+
 def test_collect_runs_tools_separately_and_records_raw_scope(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -302,7 +323,7 @@ def test_collect_runs_tools_separately_and_records_raw_scope(
     assert deep.named_counter(stat_delta.value, "pgfault").value == 6
     cpu = deep.named_profile(result.profiles.runs, "cpu")
     assert cpu.availability == "available"
-    assert cpu.event == "cpu-clock:u"  # cycles unsupported: use a software CPU sampler
+    assert cpu.event == "cpu-clock"  # cycles unsupported: use a software CPU sampler
     assert cpu.sample_count == 10
     assert cpu.replay is not None and cpu.replay.availability == "available"
     assert cpu.overhead_vs_control_percent.value is not None

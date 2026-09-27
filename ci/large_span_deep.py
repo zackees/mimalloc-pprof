@@ -883,9 +883,20 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
     cgpath = cgroup_v2_path()
     before_cgroup = snapshot_cgroup(cgpath, "before diagnostic replays")
     configured_perf = os.environ.get("MIMALLOC_PERF_EXECUTABLE")
-    perf_available = configured_perf if configured_perf else shutil.which("perf")
+    setup_status = os.environ.get("MIMALLOC_PERF_SETUP_STATUS")
+    perf_available = (
+        None
+        if setup_status == "unavailable"
+        else configured_perf
+        if configured_perf
+        else shutil.which("perf")
+    )
     collector = PerfCollector(
-        "private-cap-perfmon" if configured_perf else "unprivileged",
+        "unavailable"
+        if setup_status == "unavailable"
+        else "private-cap-perfmon"
+        if configured_perf
+        else "unprivileged",
         perf_available,
         os.environ.get("MIMALLOC_PERF_ACCESS_REPORT"),
         "launched benchmark command and its inherited worker threads only",
@@ -900,6 +911,8 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
         expected_workers = 0
     strace_available = shutil.which("strace")
     perf_tool = ToolAvailability(perf_available)
+    if setup_status == "unavailable":
+        perf_tool.permission_probe = "private collector unavailable; see perf-access.json"
     strace_tool = ToolAvailability(strace_available)
     perf_stat: tuple[NamedCounter, ...] = ()
     perf_raw = ""
@@ -938,13 +951,19 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
                     "perf",
                     "command process tree",
                     "event units per perf",
-                    "perf executable not installed",
+                    "private collector unavailable; see perf-access.json"
+                    if setup_status == "unavailable"
+                    else "perf executable not installed",
                     "perf stat diagnostic replay",
                 ),
             )
             for event in (name.partition(":")[0] for name in PERF_EVENTS.split(","))
         )
-        perf_raw = "perf executable not installed"
+        perf_raw = (
+            "private collector unavailable; see perf-access.json"
+            if setup_status == "unavailable"
+            else "perf executable not installed"
+        )
 
     mapping: CounterRecord
     strace_returncode: int | None = None
@@ -984,14 +1003,18 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
                 "perf record",
                 "replayed process tree",
                 "samples",
-                "perf executable not installed",
+                "private collector unavailable; see perf-access.json"
+                if setup_status == "unavailable"
+                else "perf executable not installed",
                 "separate profile diagnostic",
             )
         else:
             runs: list[NamedProfile] = []
             cycles = named_counter(perf_stat, "cycles")
-            cpu_event = "cycles:u" if cycles.availability == "available" else "cpu-clock:u"
-            for kind, event in (("cpu", cpu_event), ("page_faults", "page-faults:u")):
+            # Sampling includes both user and kernel stacks when supported. Stat's :u
+            # counters above deliberately isolate allocator user-space cost.
+            cpu_event = "cycles" if cycles.availability == "available" else "cpu-clock"
+            for kind, event in (("cpu", cpu_event), ("page_faults", "page-faults")):
                 profile_path = f"{profile}.cpu.data" if kind == "cpu" else f"{profile}.faults.data"
                 record_started = time.monotonic_ns()
                 rc, record_stdout, stderr = run_tool(
@@ -1137,7 +1160,9 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
             "perf stat",
             "replayed process tree",
             "exit status",
-            "perf executable not installed or could not run",
+            "private collector unavailable; see perf-access.json"
+            if setup_status == "unavailable"
+            else "perf executable not installed or could not run",
             "perf stat diagnostic replay",
         )
     )

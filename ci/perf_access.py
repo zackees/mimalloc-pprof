@@ -21,7 +21,9 @@ from pathlib import Path
 PROBE_EVENTS = (
     "task-clock:u",
     "cpu-clock:u",
+    "cpu-clock",
     "cycles:u",
+    "cycles",
     "instructions:u",
     "cache-references:u",
     "cache-misses:u",
@@ -30,6 +32,7 @@ PROBE_EVENTS = (
     "iTLB-loads:u",
     "iTLB-load-misses:u",
     "page-faults:u",
+    "page-faults",
 )
 BUSY_PROBE = "sum(i * i for i in range(1_000_000))"
 CAP_PERFMON_BIT = 1 << 38
@@ -246,9 +249,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = prepare(args.directory)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(asdict(report), indent=2) + "\n")
-    if args.github_env and report.collector_path:
+    if args.github_env:
         with args.github_env.open("a") as environment:
-            environment.write(f"MIMALLOC_PERF_EXECUTABLE={report.collector_path}\n")
+            environment.write(f"MIMALLOC_PERF_SETUP_STATUS={report.collector_mode}\n")
+            if report.collector_path:
+                environment.write(f"MIMALLOC_PERF_EXECUTABLE={report.collector_path}\n")
     print(args.output)
     return 0
 

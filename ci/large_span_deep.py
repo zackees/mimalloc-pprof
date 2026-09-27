@@ -227,6 +227,9 @@ class PerfCollector:
     mode: str
     executable: str | None
     access_report: str | None
+    launch_uid: int
+    launch_gid: int
+    private_file_capabilities: str | None
     target_scope: str
     startup_coverage: str
 
@@ -938,6 +941,9 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
         else "unprivileged",
         perf_available,
         os.environ.get("MIMALLOC_PERF_ACCESS_REPORT"),
+        os.getuid(),
+        os.getgid(),
+        os.environ.get("MIMALLOC_PERF_FILE_CAPABILITIES"),
         "launched benchmark command and its inherited worker threads only",
         "perf launches the child before event counting; no PID-attach startup gap",
     )

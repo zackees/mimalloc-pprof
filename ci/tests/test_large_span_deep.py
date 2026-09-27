@@ -319,6 +319,8 @@ def test_collect_runs_tools_separately_and_records_raw_scope(
     monkeypatch.setattr(deep, "cgroup_v2_path", cgroup_path)
     monkeypatch.setattr(deep, "run_control", replay_control)
     monkeypatch.setattr(deep, "host_memory_metadata", no_host_memory_metadata)
+    monkeypatch.setenv("MIMALLOC_PERF_EXECUTABLE", "/private/perf")
+    monkeypatch.setenv("MIMALLOC_PERF_FILE_CAPABILITIES", "/private/perf cap_perfmon=ep")
 
     def runner_uid() -> int:
         return 1000
@@ -345,6 +347,10 @@ def test_collect_runs_tools_separately_and_records_raw_scope(
     assert cpu.overhead_vs_control_percent.value is not None
     assert "graph,0.5,caller" in cpu.report.source
     assert result.replay_return_codes.perf_stat.value == 0
+    assert result.collector is not None
+    assert result.collector.mode == "private-cap-perfmon"
+    assert result.collector.private_file_capabilities == "/private/perf cap_perfmon=ep"
+    assert calls[0][0] == "/private/perf"
     assert "outside acceptance timing" in result.execution_note
 
 

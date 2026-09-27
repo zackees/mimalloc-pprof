@@ -265,6 +265,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             environment.write(f"MIMALLOC_PERF_SETUP_STATUS={report.collector_mode}\n")
             if report.collector_path:
                 environment.write(f"MIMALLOC_PERF_EXECUTABLE={report.collector_path}\n")
+                environment.write(
+                    f"MIMALLOC_PERF_FILE_CAPABILITIES={report.private_capabilities}\n"
+                )
     print(args.output)
     return 0
 

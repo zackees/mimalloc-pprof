@@ -55,6 +55,20 @@ def test_permission_denial_is_not_an_unsupported_pmu() -> None:
     assert counted.running_percent == 75
 
 
+def test_target_pid_does_not_override_permission_denial() -> None:
+    targeted = access.classify_probe(
+        "task-clock:u",
+        subprocess.CompletedProcess(
+            ["perf", "stat", "-p", "123", "-e", "task-clock:u"],
+            255,
+            "",
+            "Access to performance monitoring and observability operations is limited",
+        ),
+    )
+    assert targeted.availability == "unavailable"
+    assert targeted.reason == "permission denied"
+
+
 def test_missing_bounding_capability_never_changes_host_policy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

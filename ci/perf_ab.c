@@ -70,10 +70,46 @@
 #endif
 #define PERF_AB_PHASE_DEFINITION "work=pre-worker-start..all-workers-drained; drain=then..end-of-2x-bound-RSS-window"
 
+#if defined(PERF_AB_DIAGNOSTIC)
+typedef struct {
+  unsigned uid, euid, gid, egid;
+  unsigned long long cap_eff, cap_amb;
+  int valid;
+} perf_credential_t;
+
+/* Read each Linux thread's own credentials, not the process leader's copy. This is enabled
+   only for untimed perf replays and happens after the worker has finished measured work. */
+static perf_credential_t perf_credentials(void) {
+  perf_credential_t result = {0};
+  FILE* f = fopen("/proc/thread-self/status", "r");
+  if (f == NULL) return result;
+  char line[256];
+  int got_uid = 0, got_gid = 0, got_eff = 0, got_amb = 0;
+  while (fgets(line, sizeof(line), f) != NULL) {
+    unsigned ignored1, ignored2;
+    if (sscanf(line, "Uid:\t%u\t%u\t%u\t%u", &result.uid, &result.euid, &ignored1, &ignored2) == 4) got_uid = 1;
+    if (sscanf(line, "Gid:\t%u\t%u\t%u\t%u", &result.gid, &result.egid, &ignored1, &ignored2) == 4) got_gid = 1;
+    if (sscanf(line, "CapEff:\t%llx", &result.cap_eff) == 1) got_eff = 1;
+    if (sscanf(line, "CapAmb:\t%llx", &result.cap_amb) == 1) got_amb = 1;
+  }
+  fclose(f);
+  result.valid = got_uid && got_gid && got_eff && got_amb;
+  return result;
+}
+
+static void print_perf_credentials(const perf_credential_t* credential) {
+  printf("{\"uid\":%u,\"euid\":%u,\"gid\":%u,\"egid\":%u,"
+         "\"cap_eff\":\"%016llx\",\"cap_amb\":\"%016llx\",\"valid\":%s}",
+         credential->uid, credential->euid, credential->gid, credential->egid,
+         credential->cap_eff, credential->cap_amb, credential->valid ? "true" : "false");
+}
+#endif
+
 typedef struct {
   uint64_t rng;
 #if defined(PERF_AB_DIAGNOSTIC)
   long completed;
+  perf_credential_t credential;
 #endif
   size_t lo, hi; int log_sizes; long ops; int slots; void* slot[MAX_SLOTS]; size_t size[MAX_SLOTS];
   int fifo[4096]; size_t head, tail; double cpu; int index;
@@ -180,6 +216,11 @@ static int threads, table_slots;
 static table_t* tables;
 static pthread_barrier_t round_barrier;
 static atomic_int drained, release_workers;
+#if defined(PERF_AB_DIAGNOSTIC)
+static atomic_int credentials_ready;
+static int credentials_enabled;
+static perf_credential_t process_credentials;
+#endif
 static int holes_report;   /* PERF_AB_HOLES_REPORT (#529) */
 static pthread_barrier_t report_barrier;
 static pthread_mutex_t report_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -276,6 +317,12 @@ static void* worker_main(void* arg) {
   free_slots(st);
   st->cpu += thread_cpu();
   atomic_fetch_add(&drained, 1);
+#if defined(PERF_AB_DIAGNOSTIC)
+  if (credentials_enabled) {
+    st->credential = perf_credentials();
+    atomic_fetch_add(&credentials_ready, 1);
+  }
+#endif
   while (!atomic_load(&release_workers)) usleep(1000);   /* idle, but alive */
   return NULL;
 }
@@ -365,6 +412,10 @@ int main(int argc, char** argv) {
   long* rss_at = (long*)calloc((size_t)samples, sizeof(long));
   threads = atoi(argv[1]);
   generations = atoi(argv[2]);
+#if defined(PERF_AB_DIAGNOSTIC)
+  credentials_enabled = getenv("PERF_AB_PERF_CREDENTIALS") != NULL;
+  if (credentials_enabled) process_credentials = perf_credentials();
+#endif
   holes_report = (getenv("PERF_AB_HOLES_REPORT") != NULL);
   if (holes_report) pthread_barrier_init(&report_barrier, NULL, (unsigned)threads);
   stream_t* st = (stream_t*)calloc((size_t)threads, sizeof(stream_t));
@@ -449,11 +500,23 @@ int main(int argc, char** argv) {
     printf(",\"worker_cpu_s\":%.6f,\"completed_operations\":%ld,\"trace_checksum\":\"%016llx\","
            "\"stream_seed_base\":\"%016llx\",\"larson_table_seed_base\":\"%016llx\","
            "\"peak_work_rss_bytes\":%ld,\"rss_after_drain_bytes\":%ld,\"rss_at_release_bound_bytes\":%ld,"
-           "\"release_ms\":%ld}\n", owner_cpu, completed, (unsigned long long)checksum,
+           "\"release_ms\":%ld", owner_cpu, completed, (unsigned long long)checksum,
            (unsigned long long)PERF_AB_STREAM_SEED_BASE, (unsigned long long)PERF_AB_LARSON_TABLE_SEED_BASE,
            work_end.peak_rss_bytes,
            rss_final, /* full drain-window end; the default publication still uses rss_short */
            rss_at[bound_ms / RELEASE_SAMPLE_MS], release_ms);
+    if (credentials_enabled) {
+      while (atomic_load(&credentials_ready) < threads) usleep(100);
+      printf(",\"perf_credentials\":{\"process\":");
+      print_perf_credentials(&process_credentials);
+      printf(",\"workers\":[");
+      for (int i = 0; i < threads; i++) {
+        if (i != 0) printf(",");
+        print_perf_credentials(&st[i].credential);
+      }
+      printf("]}");
+    }
+    printf("}\n");
   }
 #else
   {

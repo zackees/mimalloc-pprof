@@ -15,19 +15,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TypeAlias, Union
+from typing import TypeAlias, Union, cast
 
 SCHEMA = "large-span-deep-v1"
 PERF_EVENTS = (
-    "task-clock,cycles,instructions,cache-references,cache-misses,"
-    "dTLB-loads,dTLB-load-misses,iTLB-loads,iTLB-load-misses"
+    "task-clock:u,cycles:u,instructions:u,cache-references:u,cache-misses:u,"
+    "dTLB-loads:u,dTLB-load-misses:u,iTLB-loads:u,iTLB-load-misses:u,page-faults:u"
 )
 CGROUP_FILES = ("memory.current", "memory.peak", "memory.events", "memory.stat", "memory.pressure")
 
@@ -194,6 +196,39 @@ class ToolInventory:
 class PerfStatistics:
     events: tuple[NamedCounter, ...]
     raw_stderr: str
+    replay: ReplayEvidence | None = None
+
+
+@dataclass(frozen=True)
+class ThreadCredentials:
+    uid: int
+    euid: int
+    gid: int
+    egid: int
+    cap_eff: str
+    cap_amb: str
+    valid: bool
+
+
+@dataclass(frozen=True)
+class ReplayEvidence:
+    availability: str
+    reason: str | None
+    completed_operations: int | None
+    trace_checksum: str | None
+    process: ThreadCredentials | None
+    workers: tuple[ThreadCredentials, ...]
+    expected_uid: int
+    expected_workers: int
+
+
+@dataclass(frozen=True)
+class PerfCollector:
+    mode: str
+    executable: str | None
+    access_report: str | None
+    target_scope: str
+    startup_coverage: str
 
 
 @dataclass
@@ -225,6 +260,9 @@ class ProfileRun:
     report_scope: str
     report_stderr: str
     reason: str | None = None
+    event: str | None = None
+    sample_count: int | None = None
+    replay: ReplayEvidence | None = None
 
 
 @dataclass
@@ -256,6 +294,7 @@ class DeepDiagnosticArtifact:
     profiles: ProfileDiagnostic
     replay_return_codes: ReturnCodes
     paired_run: PairedRunLink | None = None
+    collector: PerfCollector | None = None
 
 
 @dataclass
@@ -273,6 +312,15 @@ class PairedEventEstimate:
     paired_change_percent: CounterRecord
 
 
+@dataclass(frozen=True)
+class PairReplayIdentity:
+    availability: str
+    reason: str | None
+    baseline_checksum: str | None
+    candidate_checksum: str | None
+    operations_per_arm: int
+
+
 @dataclass
 class PairedDeepDiagnosticArtifact:
     schema_version: str
@@ -284,6 +332,7 @@ class PairedDeepDiagnosticArtifact:
     candidate: DeepDiagnosticArtifact
     event_estimates: tuple[PairedEventEstimate, ...]
     inference_note: str
+    replay_identity: PairReplayIdentity | None = None
 
 
 def unavailable(
@@ -553,7 +602,12 @@ def host_memory_metadata(
 
 def parse_perf_stat(text: str, returncode: int | None) -> tuple[NamedCounter, ...]:
     parsed: list[NamedCounter] = []
-    expected_events = PERF_EVENTS.split(",")
+    expected_events = [event.partition(":")[0] for event in PERF_EVENTS.split(",")]
+    missing_reason = (
+        "permission denied by perf_event_open; see raw output"
+        if "access to performance monitoring" in text.lower() or "permission denied" in text.lower()
+        else f"perf exited {returncode}; see raw output"
+    )
     for line in text.splitlines():
         fields = line.split(";")
         if len(fields) < 3:
@@ -592,7 +646,7 @@ def parse_perf_stat(text: str, returncode: int | None) -> tuple[NamedCounter, ..
                             "perf stat",
                             "command process tree",
                             "event units per perf",
-                            f"perf exited {returncode}; see raw output",
+                            missing_reason,
                             "perf stat diagnostic replay",
                         ),
                     )
@@ -616,10 +670,100 @@ def parse_perf_stat(text: str, returncode: int | None) -> tuple[NamedCounter, ..
     return tuple(parsed)
 
 
-def run_tool(command: list[str], timeout: int = 3600) -> tuple[int | None, str, str]:
+def _credential(value: object) -> ThreadCredentials:
+    if not isinstance(value, Mapping):
+        raise ValueError("credential record is not an object")
+    row = cast(Mapping[str, object], value)
+    numbers = (row.get("uid"), row.get("euid"), row.get("gid"), row.get("egid"))
+    if any(type(item) is not int for item in numbers):
+        raise ValueError("credential UID/GID is missing or invalid")
+    cap_eff, cap_amb, valid = row.get("cap_eff"), row.get("cap_amb"), row.get("valid")
+    if not isinstance(cap_eff, str) or not isinstance(cap_amb, str) or type(valid) is not bool:
+        raise ValueError("credential capability fields are missing or invalid")
+    try:
+        int(cap_eff, 16)
+        int(cap_amb, 16)
+    except ValueError as error:
+        raise ValueError("credential capability mask is not hexadecimal") from error
+    return ThreadCredentials(
+        cast(int, numbers[0]),
+        cast(int, numbers[1]),
+        cast(int, numbers[2]),
+        cast(int, numbers[3]),
+        cap_eff,
+        cap_amb,
+        valid,
+    )
+
+
+def parse_replay_evidence(
+    stdout: str, expected_uid: int, expected_workers: int, control_stdout: str = ""
+) -> ReplayEvidence:
+    def missing(reason: str) -> ReplayEvidence:
+        return ReplayEvidence(
+            "unavailable", reason, None, None, None, (), expected_uid, expected_workers
+        )
+
+    if expected_uid == 0:
+        return missing("benchmark runner UID is root")
+    if expected_workers <= 0:
+        return missing("benchmark worker count is missing or invalid")
+    try:
+        value = json.loads(stdout)
+        if not isinstance(value, Mapping):
+            return missing("benchmark child output is not a JSON object")
+        data = cast(Mapping[str, object], value)
+        count, checksum = data.get("completed_operations"), data.get("trace_checksum")
+        if type(count) is not int or not isinstance(checksum, str):
+            return missing("benchmark child lacks operation count or trace checksum")
+        credentials = data.get("perf_credentials")
+        if not isinstance(credentials, Mapping):
+            return missing("benchmark child omitted perf credentials")
+        credential_data = cast(Mapping[str, object], credentials)
+        process = _credential(credential_data.get("process"))
+        raw_workers = credential_data.get("workers")
+        if not isinstance(raw_workers, list):
+            return missing("worker credential list is missing")
+        workers = tuple(_credential(item) for item in cast(list[object], raw_workers))
+        if len(workers) != expected_workers:
+            return missing("worker credential count does not match workload")
+        for credential in (process, *workers):
+            if not credential.valid:
+                return missing("a child or worker credential snapshot failed")
+            if credential.uid != expected_uid or credential.euid != expected_uid:
+                return missing("a benchmark child or worker ran under a different UID")
+            if int(credential.cap_eff, 16) & (1 << 38) or int(credential.cap_amb, 16) & (1 << 38):
+                return missing("a benchmark child or worker retained CAP_PERFMON")
+        if control_stdout:
+            control_value = json.loads(control_stdout)
+            if not isinstance(control_value, Mapping):
+                return missing("direct replay control is not a JSON object")
+            control = cast(Mapping[str, object], control_value)
+            if (
+                control.get("completed_operations") != count
+                or control.get("trace_checksum") != checksum
+            ):
+                return missing("profiled replay work differs from direct control")
+    except (ValueError, TypeError) as error:
+        return missing(f"invalid benchmark child evidence: {error}")
+    return ReplayEvidence(
+        "available",
+        None,
+        count,
+        checksum,
+        process,
+        workers,
+        expected_uid,
+        expected_workers,
+    )
+
+
+def run_tool(
+    command: list[str], timeout: int = 3600, env: dict[str, str] | None = None
+) -> tuple[int | None, str, str]:
     try:
         result = subprocess.run(
-            command, text=True, capture_output=True, timeout=timeout, check=False
+            command, text=True, capture_output=True, timeout=timeout, check=False, env=env
         )
         return result.returncode, result.stdout, result.stderr
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -738,22 +882,54 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
     start_wall = time.time()
     cgpath = cgroup_v2_path()
     before_cgroup = snapshot_cgroup(cgpath, "before diagnostic replays")
-    perf_available = shutil.which("perf")
+    configured_perf = os.environ.get("MIMALLOC_PERF_EXECUTABLE")
+    perf_available = configured_perf if configured_perf else shutil.which("perf")
+    collector = PerfCollector(
+        "private-cap-perfmon" if configured_perf else "unprivileged",
+        perf_available,
+        os.environ.get("MIMALLOC_PERF_ACCESS_REPORT"),
+        "launched benchmark command and its inherited worker threads only",
+        "perf launches the child before event counting; no PID-attach startup gap",
+    )
+    perf_environment = os.environ.copy()
+    perf_environment["PERF_AB_PERF_CREDENTIALS"] = "1"
+    expected_uid = os.getuid()
+    try:
+        expected_workers = int(command[1])
+    except (IndexError, ValueError):
+        expected_workers = 0
     strace_available = shutil.which("strace")
     perf_tool = ToolAvailability(perf_available)
     strace_tool = ToolAvailability(strace_available)
     perf_stat: tuple[NamedCounter, ...] = ()
     perf_raw = ""
     perf_stat_returncode: int | None = None
+    perf_replay: ReplayEvidence | None = None
     if perf_available:
-        rc, _, perf_raw = run_tool(
-            [perf_available, "stat", "-x;", "-e", PERF_EVENTS, "--", *command]
+        rc, stat_stdout, perf_raw = run_tool(
+            [perf_available, "stat", "-x;", "-e", PERF_EVENTS, "--", *command],
+            env=perf_environment,
         )
         perf_stat_returncode = rc
+        perf_replay = parse_replay_evidence(stat_stdout, expected_uid, expected_workers)
         perf_tool.permission_probe = (
             "command replayed under perf stat; inspect availability per event"
         )
         perf_stat = parse_perf_stat(perf_raw, rc if rc is not None else 1)
+        if rc == 0 and perf_replay.availability != "available":
+            perf_stat = tuple(
+                NamedCounter(
+                    entry.name,
+                    unavailable(
+                        "perf stat",
+                        "benchmark process tree",
+                        entry.counter.unit,
+                        f"target credentials or trace unverified: {perf_replay.reason}",
+                        "perf stat diagnostic replay",
+                    ),
+                )
+                for entry in perf_stat
+            )
     else:
         perf_stat = tuple(
             NamedCounter(
@@ -766,7 +942,7 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
                     "perf stat diagnostic replay",
                 ),
             )
-            for event in PERF_EVENTS.split(",")
+            for event in (name.partition(":")[0] for name in PERF_EVENTS.split(","))
         )
         perf_raw = "perf executable not installed"
 
@@ -813,10 +989,12 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
             )
         else:
             runs: list[NamedProfile] = []
-            for kind, event in (("cpu", "cycles"), ("page_faults", "page-faults")):
+            cycles = named_counter(perf_stat, "cycles")
+            cpu_event = "cycles:u" if cycles.availability == "available" else "cpu-clock:u"
+            for kind, event in (("cpu", cpu_event), ("page_faults", "page-faults:u")):
                 profile_path = f"{profile}.cpu.data" if kind == "cpu" else f"{profile}.faults.data"
                 record_started = time.monotonic_ns()
-                rc, _, stderr = run_tool(
+                rc, record_stdout, stderr = run_tool(
                     [
                         perf_available,
                         "record",
@@ -830,7 +1008,8 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
                         profile_path,
                         "--",
                         *command,
-                    ]
+                    ],
+                    env=perf_environment,
                 )
                 elapsed_ms = (time.monotonic_ns() - record_started) / 1_000_000
                 report_rc, report_out, report_err = (
@@ -850,6 +1029,20 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
                     )
                     if rc == 0
                     else (None, "", "profile recording unavailable")
+                )
+                sample_match = re.search(r"# Samples:\s*([0-9,]+)", report_out)
+                sample_count = int(sample_match.group(1).replace(",", "")) if sample_match else None
+                replay = parse_replay_evidence(
+                    record_stdout, expected_uid, expected_workers, control.stdout
+                )
+                profile_reason = (
+                    "perf record failed or permission denied"
+                    if rc != 0
+                    else "perf report failed"
+                    if report_rc != 0
+                    else "perf report has no counted samples"
+                    if sample_count is None or sample_count == 0
+                    else replay.reason
                 )
                 overhead = None
                 overhead_reason = None
@@ -886,17 +1079,17 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
                         report_out,
                         f"report for separate {kind} profile replay",
                     )
-                    if report_rc == 0
+                    if report_rc == 0 and sample_count is not None and sample_count > 0
                     else unavailable(
                         "perf report",
                         "replayed process tree",
                         "overhead percent and sample count",
-                        "perf report failed or permission denied",
+                        profile_reason or "perf report failed",
                         f"report for separate {kind} profile replay",
                     )
                 )
                 profile_run = ProfileRun(
-                    "available" if rc == 0 else "unavailable",
+                    "available" if profile_reason is None else "unavailable",
                     profile_path if rc == 0 else None,
                     "perf record",
                     "replayed process tree",
@@ -909,7 +1102,10 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
                     report_record,
                     "DSO/symbol call chains distinguish user and kernel samples",
                     report_err,
-                    None if rc == 0 else "perf record failed or permission denied",
+                    profile_reason,
+                    event,
+                    sample_count,
+                    replay,
                 )
                 runs.append(NamedProfile(kind, profile_run))
             profiles.runs = tuple(runs)
@@ -973,11 +1169,12 @@ def collect(command: list[str], output: Path, profile: str | None = None) -> Dee
         ),
         host_memory_metadata(),
         ToolInventory(perf_tool, strace_tool),
-        PerfStatistics(perf_stat, perf_raw),
+        PerfStatistics(perf_stat, perf_raw, perf_replay),
         mapping,
         strace_raw,
         profiles,
         ReturnCodes(perf_stat_record, strace_record),
+        collector=collector,
     )
 
 
@@ -987,6 +1184,23 @@ def _per_operation_estimate(
     counter = named_counter(artifact.perf_stat.events, event)
     phase = f"{arm} diagnostic perf-stat estimate"
     unit = f"{event} per operation"
+    replay = artifact.perf_stat.replay
+    if replay is None or replay.availability != "available":
+        return unavailable(
+            counter.source,
+            counter.scope,
+            unit,
+            "profiled replay target credentials and trace are not verified",
+            phase,
+        )
+    if replay.completed_operations != operations:
+        return unavailable(
+            counter.source,
+            counter.scope,
+            unit,
+            "profiled replay operation count differs from paired timed workload",
+            phase,
+        )
     if counter.availability != "available" or not isinstance(counter.value, (int, float)):
         return unavailable(
             counter.source,
@@ -1032,6 +1246,29 @@ def collect_paired_deep_diagnostic(
     candidate = collect(
         candidate_command, output.with_name(output.stem + ".candidate"), candidate_profile
     )
+    baseline_replay = baseline.perf_stat.replay
+    candidate_replay = candidate.perf_stat.replay
+    identity_reason: str | None = None
+    if baseline_replay is None or candidate_replay is None:
+        identity_reason = "a perf-stat replay has no target evidence"
+    elif (
+        baseline_replay.availability != "available" or candidate_replay.availability != "available"
+    ):
+        identity_reason = "a perf-stat replay target credential or trace is unverified"
+    elif (
+        baseline_replay.completed_operations != operations_per_arm
+        or candidate_replay.completed_operations != operations_per_arm
+    ):
+        identity_reason = "a perf-stat replay operation count differs from the timed pair"
+    elif baseline_replay.trace_checksum != candidate_replay.trace_checksum:
+        identity_reason = "baseline and candidate perf-stat trace checksums differ"
+    identity = PairReplayIdentity(
+        "available" if identity_reason is None else "unavailable",
+        identity_reason,
+        baseline_replay.trace_checksum if baseline_replay else None,
+        candidate_replay.trace_checksum if candidate_replay else None,
+        operations_per_arm,
+    )
     estimates: list[PairedEventEstimate] = []
     for event in ("cycles", "instructions"):
         baseline_estimate = _per_operation_estimate(baseline, event, operations_per_arm, "baseline")
@@ -1040,7 +1277,8 @@ def collect_paired_deep_diagnostic(
         )
         phase = "paired baseline-to-candidate diagnostic estimate"
         if (
-            baseline_estimate.availability == "available"
+            identity.availability == "available"
+            and baseline_estimate.availability == "available"
             and candidate_estimate.availability == "available"
             and isinstance(baseline_estimate.value, (int, float))
             and isinstance(candidate_estimate.value, (int, float))
@@ -1057,7 +1295,9 @@ def collect_paired_deep_diagnostic(
             )
         else:
             reason = (
-                "baseline counter unavailable or zero"
+                identity_reason
+                if identity_reason is not None
+                else "baseline counter unavailable or zero"
                 if baseline_estimate.value in (None, 0)
                 else "candidate counter unavailable"
             )
@@ -1075,6 +1315,7 @@ def collect_paired_deep_diagnostic(
         candidate,
         tuple(estimates),
         "Separate diagnostic replays only; per-operation event estimates are descriptive and have no timed-run confidence interval.",
+        identity,
     )
 
 

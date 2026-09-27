@@ -209,6 +209,9 @@ def validate(policy: WorkflowPolicy) -> None:
         "current-allocator-provenance.json",
         "allocator-lock.json",
         "ci/build_old_fork_latency_provenance.py",
+        "ci/perf_access.py",
+        '--output "$OUTPUT_DIR/perf-access.json"',
+        '--github-env "$GITHUB_ENV"',
         "ci/large_span_diagnostic.py",
         "--reps 7",
         "--deep-output",
@@ -234,6 +237,8 @@ def validate(policy: WorkflowPolicy) -> None:
         fail("workflow is missing a required measurement/link step")
     if "git push" in run_scripts or "gh workflow run" in run_scripts:
         fail("workflow must not publish or dispatch another workflow")
+    if "sysctl -w" in run_scripts or "perf_event_paranoid" in run_scripts:
+        fail("workflow must not modify the host-wide perf permission setting")
     checkout_steps = [step for step in job.steps if step.action.startswith("actions/checkout@")]
     if (
         len(checkout_steps) != 1
@@ -248,6 +253,7 @@ def validate(policy: WorkflowPolicy) -> None:
         "run-context.json",
         "current-allocator-provenance.json",
         "allocator-lock.json",
+        "perf-access.json",
         "old-fork-build/allocator-provenance.json",
         "old-fork-build/old-libmimalloc.a",
         "old-fork-build/benchmark-child-old-fork",

@@ -76,6 +76,14 @@ jobs:
             --provenance rust/target/release/allocator-provenance.json \
             --build-root rust/target/release \
             --output-dir "$OUTPUT_DIR/old-fork-build"
+      - name: prepare process-scoped perf collector and probe runner events
+        run: |
+          set -euo pipefail
+          python3 ci/perf_access.py \
+            --directory "$RUNNER_TEMP/large-span-perf-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --output "$OUTPUT_DIR/perf-access.json" \
+            --github-env "$GITHUB_ENV"
+          printf 'MIMALLOC_PERF_ACCESS_REPORT=%s\n' "$OUTPUT_DIR/perf-access.json" >> "$GITHUB_ENV"
       - name: run seven paired large-span repetitions and untimed deep diagnostics
         run: |
           set -euxo pipefail
@@ -138,6 +146,7 @@ jobs:
             ${{ github.workspace }}/.large-span-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/run-context.json
             ${{ github.workspace }}/.large-span-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/current-allocator-provenance.json
             ${{ github.workspace }}/.large-span-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/allocator-lock.json
+            ${{ github.workspace }}/.large-span-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/perf-access.json
             ${{ github.workspace }}/.large-span-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/old-fork-build/allocator-provenance.json
             ${{ github.workspace }}/.large-span-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/old-fork-build/old-libmimalloc.a
             ${{ github.workspace }}/.large-span-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/old-fork-build/benchmark-child-old-fork

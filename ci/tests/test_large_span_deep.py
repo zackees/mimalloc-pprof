@@ -40,7 +40,10 @@ def perf_only_tool(name: str) -> str | None:
     return "/usr/bin/perf" if name == "perf" else None
 
 
-def permission_denied_tool(_command: list[str], _timeout: int = 3600) -> tuple[int, str, str]:
+def permission_denied_tool(
+    _command: list[str], _timeout: int = 3600, env: dict[str, str] | None = None
+) -> tuple[int, str, str]:
+    assert env is not None and env["PERF_AB_PERF_CREDENTIALS"] == "1"
     return (17, "", "permission denied")
 
 
@@ -58,6 +61,7 @@ def empty_deep_artifact(
         deep.PerfStatistics(
             (deep.NamedCounter("cycles", cycles), deep.NamedCounter("instructions", instructions)),
             "",
+            deep.ReplayEvidence("available", None, 10, "same-trace", None, (), 1000, 1),
         ),
         deep.unavailable("strace", "process", "calls", "absent"),
         "",
@@ -126,6 +130,50 @@ def test_perf_stat_parser_preserves_unavailable_not_zero() -> None:
     assert cycles.value is None
     assert cycles.availability == "unavailable"
     assert cycles.reason == "<not supported>"
+
+
+def credential_stdout(uid: int, worker_uid: int, cap_eff: str = "0") -> str:
+    template = (
+        '{"completed_operations":800,"trace_checksum":"deadbeef","perf_credentials":{'
+        '"process":{"uid":<UID>,"euid":<UID>,"gid":100,"egid":100,'
+        '"cap_eff":"<CAP>","cap_amb":"0","valid":true},'
+        '"workers":[{"uid":<WORKER>,"euid":<WORKER>,"gid":100,"egid":100,'
+        '"cap_eff":"0","cap_amb":"0","valid":true}]}}'
+    )
+    return (
+        template.replace("<UID>", str(uid))
+        .replace("<WORKER>", str(worker_uid))
+        .replace("<CAP>", cap_eff)
+    )
+
+
+def test_profiled_child_and_workers_remain_unprivileged_and_match_control() -> None:
+    control = '{"completed_operations":800,"trace_checksum":"deadbeef"}'
+    good = deep.parse_replay_evidence(credential_stdout(1000, 1000), 1000, 1, control)
+    root_worker = deep.parse_replay_evidence(credential_stdout(1000, 0), 1000, 1, control)
+    privileged_child = deep.parse_replay_evidence(
+        credential_stdout(1000, 1000, "0000004000000000"), 1000, 1, control
+    )
+    changed_work = deep.parse_replay_evidence(
+        credential_stdout(1000, 1000),
+        1000,
+        1,
+        '{"completed_operations":800,"trace_checksum":"other"}',
+    )
+    assert good.availability == "available"
+    assert good.completed_operations == 800
+    assert len(good.workers) == 1
+    assert root_worker.availability == "unavailable" and "different UID" in str(root_worker.reason)
+    assert privileged_child.availability == "unavailable"
+    assert "retained CAP_PERFMON" in str(privileged_child.reason)
+    assert changed_work.availability == "unavailable"
+
+
+def test_target_pid_does_not_grant_perf_permission() -> None:
+    denied = deep.parse_perf_stat(
+        "Access to performance monitoring and observability operations is limited", 255
+    )
+    assert deep.named_counter(denied, "task-clock").availability == "unavailable"
 
 
 def test_host_thp_counters_are_explicitly_unattributable(tmp_path: Path) -> None:
@@ -200,20 +248,30 @@ def test_collect_runs_tools_separately_and_records_raw_scope(
             ),
         )
 
-    def run_tool(command: list[str], timeout: int = 3600) -> tuple[int, str, str]:
+    def run_tool(
+        command: list[str], timeout: int = 3600, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
         calls.append(command)
+        if command[1] in ("stat", "record"):
+            assert env is not None and env["PERF_AB_PERF_CREDENTIALS"] == "1"
         if "stat" in command:
-            return 0, "", "100; ;task-clock;100%;\n<not supported>; ;cycles; ; ;\n"
+            return (
+                0,
+                credential_stdout(1000, 1000),
+                "100; ;task-clock;100%;\n<not supported>; ;cycles; ; ;\n",
+            )
         if "strace" in command[0]:
             return 0, "", "% time seconds usecs/call calls errors syscall\n"
-        return 0, "", "profiled\n"
+        if command[1] == "record":
+            return 0, credential_stdout(1000, 1000), "profiled\n"
+        return 0, "# Samples: 10 of event cpu-clock:u\n", ""
 
     def replay_control(_command: list[str]) -> deep.ReplayControl:
         return deep.ReplayControl(
             "available",
             0,
             100.0,
-            "",
+            '{"completed_operations":800,"trace_checksum":"deadbeef"}',
             "",
             "untimed diagnostic replay control",
             "command process tree",
@@ -225,12 +283,17 @@ def test_collect_runs_tools_separately_and_records_raw_scope(
     monkeypatch.setattr(deep, "run_control", replay_control)
     monkeypatch.setattr(deep, "host_memory_metadata", no_host_memory_metadata)
 
+    def runner_uid() -> int:
+        return 1000
+
+    monkeypatch.setattr(deep.os, "getuid", runner_uid)
+
     def installed_tool(name: str) -> str:
         return f"/usr/bin/{name}"
 
     monkeypatch.setattr(deep.shutil, "which", installed_tool)
     monkeypatch.setattr(deep, "run_tool", run_tool)
-    result = deep.collect(["./replay"], tmp_path / "out", str(tmp_path / "profile"))
+    result = deep.collect(["./replay", "1"], tmp_path / "out", str(tmp_path / "profile"))
     assert len(calls) == 6  # perf/strace, two profile replays, and their two reports
     assert deep.named_counter(result.perf_stat.events, "cycles").value is None
     assert result.mapping_syscalls.scope == "replayed process tree"
@@ -239,6 +302,9 @@ def test_collect_runs_tools_separately_and_records_raw_scope(
     assert deep.named_counter(stat_delta.value, "pgfault").value == 6
     cpu = deep.named_profile(result.profiles.runs, "cpu")
     assert cpu.availability == "available"
+    assert cpu.event == "cpu-clock:u"  # cycles unsupported: use a software CPU sampler
+    assert cpu.sample_count == 10
+    assert cpu.replay is not None and cpu.replay.availability == "available"
     assert cpu.overhead_vs_control_percent.value is not None
     assert "graph,0.5,caller" in cpu.report.source
     assert result.replay_return_codes.perf_stat.value == 0
@@ -295,6 +361,8 @@ def test_paired_collector_derives_per_operation_events_and_keeps_profiles_separa
     assert cycles.paired_change_percent.value == 20
     instructions = result.event_estimates[1]
     assert instructions.paired_change_percent.value == 20
+    assert result.replay_identity is not None
+    assert result.replay_identity.availability == "available"
     assert "no timed-run confidence interval" in result.inference_note
 
 
@@ -325,6 +393,38 @@ def test_paired_collector_keeps_unavailable_event_null_with_reason(
     assert cycles.candidate_per_operation.value is None
     assert cycles.paired_change_percent.value is None
     assert cycles.paired_change_percent.reason == "baseline counter unavailable or zero"
+
+
+def test_paired_collector_rejects_changed_profiled_trace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_collect(
+        command: list[str], output: Path, profile: str | None = None
+    ) -> deep.DeepDiagnosticArtifact:
+        artifact = empty_deep_artifact(
+            command,
+            deep.available("perf stat", "command tree", "cycles", 1000),
+            deep.available("perf stat", "command tree", "instructions", 500),
+        )
+        artifact.perf_stat.replay = deep.ReplayEvidence(
+            "available", None, 10, command[0], None, (), 1000, 1
+        )
+        return artifact
+
+    monkeypatch.setattr(deep, "collect", fake_collect)
+    result = deep.collect_paired_deep_diagnostic(
+        ["base", "same-args"],
+        ["candidate", "same-args"],
+        10,
+        "a" * 40,
+        "b" * 40,
+        "cell",
+        tmp_path / "paired.json",
+    )
+    assert result.replay_identity is not None
+    assert result.replay_identity.availability == "unavailable"
+    assert "checksums differ" in str(result.replay_identity.reason)
+    assert result.event_estimates[0].paired_change_percent.value is None
 
 
 def test_paired_collector_rejects_mismatched_args_and_short_sha(tmp_path: Path) -> None:

@@ -206,6 +206,8 @@ jobs:
       - uses: zackees/setup-soldr@v0
         if: env.RUN_MACOS_BUILD == 'true'
         with:
+          # Save caches fully under act (local bosn runs are pull_request events); setup-soldr#537 makes this the default. Remove then.
+          save-cache: ${{ env.ACT && 'true' || 'auto' }}
           # zccache wraps `soldr cargo`; this job drives CMake directly, so there is
           # nothing for it to wrap. Only the toolchain provisioning is wanted here.
           cache: false
@@ -402,6 +404,7 @@ jobs:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
+          save-cache: ${{ env.ACT && 'true' || 'auto' }}
           cache: true
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock

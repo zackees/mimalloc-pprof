@@ -182,6 +182,8 @@ jobs:
       - uses: astral-sh/setup-uv@v3
       - uses: zackees/setup-soldr@v0
         with:
+          # Save caches fully under act (local bosn runs are pull_request events); setup-soldr#537 makes this the default. Remove then.
+          save-cache: ${{ env.ACT && 'true' || 'auto' }}
           # zccache wraps `soldr cargo`; this job drives CMake directly, so there is
           # nothing for it to wrap. Only the toolchain provisioning is wanted here.
           cache: false
@@ -349,6 +351,7 @@ jobs:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
+          save-cache: ${{ env.ACT && 'true' || 'auto' }}
           # Same reason cross.yml's build-win-gnu gives: the embedded cache expects
           # MSVC-style .pdb outputs even though this target is GNU, then fails while
           # materialising files that do not exist.
@@ -477,6 +480,7 @@ jobs:
       - uses: astral-sh/setup-uv@v3
       - uses: zackees/setup-soldr@v0
         with:
+          save-cache: ${{ env.ACT && 'true' || 'auto' }}
           # This job drives CMake directly; there is no `soldr cargo` for zccache to wrap.
           cache: false
           toolchain-file: rust/rust-toolchain.toml
@@ -720,6 +724,7 @@ jobs:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
+          save-cache: ${{ env.ACT && 'true' || 'auto' }}
           cache: false
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock

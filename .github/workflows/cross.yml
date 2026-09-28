@@ -109,6 +109,8 @@ jobs:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
+          # Save caches fully under act (local bosn runs are pull_request events); setup-soldr#537 makes this the default. Remove then.
+          save-cache: ${{ env.ACT && 'true' || 'auto' }}
           cache: true
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
@@ -187,6 +189,7 @@ jobs:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
+          save-cache: ${{ env.ACT && 'true' || 'auto' }}
           cache: true
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
@@ -333,6 +336,7 @@ jobs:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
+          save-cache: ${{ env.ACT && 'true' || 'auto' }}
           # The embedded cache expects MSVC-style .pdb outputs even though this
           # target is GNU, then fails while materializing files that do not exist.
           # Keep Soldr's managed MinGW toolchain but bypass zccache for this job.

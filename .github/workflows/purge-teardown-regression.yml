@@ -52,6 +52,8 @@ jobs:
       - uses: astral-sh/setup-uv@v3
       - uses: zackees/setup-soldr@v0
         with:
+          # Save caches fully under act (local bosn runs are pull_request events); setup-soldr#537 makes this the default. Remove then.
+          save-cache: ${{ env.ACT && 'true' || 'auto' }}
           cache: false
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock

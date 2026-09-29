@@ -147,6 +147,24 @@ See
    (`-DMI_SCAVENGER_MAX_WAIT_MS=5000`, including from the Rust crate's build script). Make it an
    `mi_option` when it should be settable at run time, from C or Rust. Never write the value inline.
 
+12. **Performance accounting: memory buys CPU at 3:1, nothing else is free (owner rule,
+   2026-09-28).** Every allocator perf change reports a per-cell ledger against its fixed
+   baseline (the previous merged policy, exact SHA, same run/host): throughput, CPU per
+   operation, minor faults, peak and after-drain RSS, p99 latency.
+   - **Memory credit.** `saved%` = the cell's peak-RSS reduction as a share of the reducible
+     gap, `(baseline - candidate) / (baseline - ideal)`, where `ideal` is the theoretical floor
+     (live bytes requested, or the same-run TCMalloc reference where live bytes are unknown).
+   - **Allowed CPU regression** on that cell = `saved% / 3`. Saving 75% of the gap allows at
+     most +25% CPU/op (and at most -25% throughput); saving 30% allows 10%.
+   - **Cells with no memory credit** (controls such as `small/8`, `larson/8`, and any cell whose
+     RSS did not fall) allow **no** regression: a CPU/op or throughput change whose 95% CI lies
+     beyond perf-ab noise is a regression. INCONCLUSIVE is not a pass; rerun or narrow it.
+   - **Regressions in the baseline are debts, not allowances.** The previous PR's measured costs
+     (for example #538's exact-128-KiB +4.6% CPU, `random-large-bursty/8` +55% minor faults,
+     `larson/8` +3.7% CPU) are the floor to improve, not a budget to spend.
+   - After the memory win lands, spend dedicated rounds cutting its CPU cost; reaching the 1/3
+     ceiling is a limit, not a target. Put the ledger table in the PR and on the parent issue.
+
 ## Repo facts
 
 - Branch layout: `main` is the **v3** line (crate 1.0.x, overlay pinned to `upstream/dev3`

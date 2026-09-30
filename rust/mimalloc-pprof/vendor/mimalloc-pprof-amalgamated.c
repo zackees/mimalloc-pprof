@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 1cbd5a74 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 42b15137 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -3524,8 +3524,8 @@ struct mi_tld_s {
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
-  size_t                retired_used;         // #530: owner-private bitmask of the occupied `retired_pages` slots (only the owner fills or empties one)
-  size_t                retired_resident;     // #575: owner-private bitmask of the `retired_pages` slots whose block area may still be resident (a subset of `retired_used`)
+  uint32_t              retired_used;         // #530: owner-private bitmask of the occupied `retired_pages` slots (only the owner fills or empties one)
+  uint32_t              retired_resident;     // #575: owner-private bitmask of the `retired_pages` slots whose block area may still be resident (a subset of `retired_used`; a second word-pair member so the struct does not grow)
   size_t                large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
 };
 
@@ -27924,8 +27924,8 @@ void _mi_page_unpurge_all(mi_page_t* page) {
 ----------------------------------------------------------- */
 
 #define MI_RETIRED_SLOT_BUSY  ((mi_page_t*)1)   // the scavenger holds this slot's page for one discard
-#define MI_RETIRED_SLOTS_MASK ((MI_RETIRED_PAGE_SLOTS >= MI_SIZE_BITS) ? ~(size_t)0 : (((size_t)1 << MI_RETIRED_PAGE_SLOTS) - 1))
-#if MI_RETIRED_PAGE_SLOTS > MI_SIZE_BITS
+#define MI_RETIRED_SLOTS_MASK ((MI_RETIRED_PAGE_SLOTS >= 32) ? (uint32_t)0xFFFFFFFFu : (uint32_t)(((uint32_t)1 << MI_RETIRED_PAGE_SLOTS) - 1))
+#if MI_RETIRED_PAGE_SLOTS > 32
 #error "MI_RETIRED_PAGE_SLOTS must fit in the owner's slot mask (mi_tld_t.retired_used)"
 #endif
 
@@ -27959,7 +27959,7 @@ static void mi_retired_trim_over_cap(mi_tld_t* tld, size_t keep) {
     const size_t others = tld->retired_resident & ~((size_t)1 << keep);
     if (others == 0) return;
     const size_t k = mi_ctz(others);
-    tld->retired_resident &= ~((size_t)1 << k);
+    tld->retired_resident &= (uint32_t)~((size_t)1 << k);
     _Atomic(mi_page_t*)* const slot = &tld->retired_pages[k];
     mi_page_t* victim = mi_atomic_load_ptr_relaxed(mi_page_t, slot);
     if (victim == NULL || victim == MI_RETIRED_SLOT_BUSY) continue;
@@ -27986,22 +27986,22 @@ void _mi_page_publish_retired(mi_page_t* page) {
   // the same page back), so an owner-private mask knows which are free without reading the slots
   // -- cache lines the scavenger also touches: scanning them was ~60% of this function's samples
   // (#530, large-class-ephemeral/8 short generations).
-  size_t free_mask = ~tld->retired_used & MI_RETIRED_SLOTS_MASK;
+  size_t free_mask = (size_t)(~tld->retired_used & MI_RETIRED_SLOTS_MASK);
   if mi_unlikely(free_mask == 0) {
     // the mask says full: rebuild it from the slots once (a bit a foreign unpublish could not clear)
     size_t used = 0;
     for (size_t k = 0; k < MI_RETIRED_PAGE_SLOTS; k++) {
       if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[k]) != NULL) { used |= ((size_t)1 << k); }
     }
-    tld->retired_used = used;
-    tld->retired_resident &= used;   // (#575)
-    free_mask = ~used & MI_RETIRED_SLOTS_MASK;
+    tld->retired_used = (uint32_t)used;
+    tld->retired_resident &= (uint32_t)used;   // (#575)
+    free_mask = (size_t)(~(uint32_t)used & MI_RETIRED_SLOTS_MASK);
     if (free_mask == 0) return;   // all slots full: leave it unpublished
   }
   const size_t i = mi_ctz(free_mask);
   _Atomic(mi_page_t*)* const slot = &tld->retired_pages[i];
   mi_assert_internal(mi_atomic_load_ptr_relaxed(mi_page_t, slot) == NULL);
-  tld->retired_used |= ((size_t)1 << i);
+  tld->retired_used |= (uint32_t)((size_t)1 << i);
 
   _mi_page_unpurge_all(page);   // holes describe formed blocks, and there will be none
   page->free = NULL;            // nothing formed: every block of the page is unformed tail now
@@ -28014,7 +28014,7 @@ void _mi_page_publish_retired(mi_page_t* page) {
   MI_EVENT(MI_EVENT_RETIRED_PUBLISH);   // (#573)
   MI_PROBE1(retired_publish, page->block_size);
   #if MI_RETIRED_TRIM
-  tld->retired_resident |= ((size_t)1 << i);
+  tld->retired_resident |= (uint32_t)((size_t)1 << i);
   mi_retired_trim_over_cap(tld, i);
   #endif
   _mi_pages_release_schedule(mi_page_subproc(page));
@@ -28055,8 +28055,8 @@ void _mi_page_unpublish_retired(mi_page_t* page, mi_tld_t* owner_tld) {
     tld = (theap != NULL ? theap->tld : NULL);
   }
   if (tld != NULL && slot >= &tld->retired_pages[0] && slot < &tld->retired_pages[MI_RETIRED_PAGE_SLOTS]) {
-    tld->retired_used &= ~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));
-    tld->retired_resident &= ~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));   // (#575)
+    tld->retired_used &= (uint32_t)~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));
+    tld->retired_resident &= (uint32_t)~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));   // (#575)
   }
   // (else -- a heap delete from another thread -- the bit stays set until the owner's next publish
   // finds no free bit and rebuilds the mask from the slots)

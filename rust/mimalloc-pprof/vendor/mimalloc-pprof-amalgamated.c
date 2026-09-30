@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3ce55423 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 119c4f9b of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -713,7 +713,7 @@ typedef enum mi_option_e {
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
   mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
   mi_option_large_span,                 // size a new large page (blocks of ~84-512 KiB) from its size class's demand on the thread: compact first, growing to 4 MiB (=1). 0 = always 4 MiB (upstream) (#532)
-  mi_option_retired_keep,           // a retired (emptied) large page seen by its owner's heartbeat keeps only its first N blocks resident, the rest of its block area is discarded (=1). 0 = keep all, the scavenger releases the page after MI_RETIRED_RELEASE_MULT purge delays (#575)
+  mi_option_retired_keep,           // a retired (emptied) large page seen by its owner's heartbeat keeps only its first N blocks resident, the rest of its block area is discarded. 0 = keep all (=0, opt-in: it refaults on the bin's next request, #575), the scavenger releases the page after MI_RETIRED_RELEASE_MULT purge delays (#575)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -2707,10 +2707,11 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 // delays. A page reset to "nothing formed" re-forms its blocks from the start, so the first block(s)
 // are the ones the bin's next request touches; the cold tail was 43% of large-class-persistent/8's
 // peak RSS. Default of `mi_option_retired_keep`; 0 = keep everything (#483). MI_RETIRED_TRIM=0
-// compiles it out. (Discarding the whole block area, or a page at publish, refaulted it at once:
-// +70% CPU on random-large-bursty/8, 5x on large-class/8.)
+// compiles it out. DEFAULT 0: the perf-ab ledger of #583 measured MI_RETIRED_KEEP_BLOCKS=1 at -90%
+// throughput on large-class/8 for -50% peak RSS (every bin's next request refaults what was
+// discarded), so it stays an opt-in knob until a policy passes rule 12.
 #ifndef MI_RETIRED_KEEP_BLOCKS
-#define MI_RETIRED_KEEP_BLOCKS            (1)
+#define MI_RETIRED_KEEP_BLOCKS            (0)
 #endif
 #ifndef MI_RETIRED_TRIM_AGE
 #define MI_RETIRED_TRIM_AGE               (0)
@@ -27966,13 +27967,15 @@ static bool mi_retired_mask_covers_slots(const mi_tld_t* tld) {
 // protocol as the scavenger: swap the slot to BUSY for one discard.
 void _mi_page_retired_trim(mi_page_t* page) {
   _Atomic(mi_page_t*)* const slot = page->retired_slot;
-  if (slot == NULL || _mi_page_unformed_purged_bytes(page) != 0) return;   // not published, or trimmed since it was
   const long keep = mi_option_get(mi_option_retired_keep);
-  if (keep <= 0) return;
+  if (slot == NULL || keep <= 0) return;
   mi_page_t* expected = page;
   if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &expected, MI_RETIRED_SLOT_BUSY)) return;   // the scavenger holds it
-  mi_page_purge_unformed_tail(page, (size_t)keep);   // `capacity == 0`: the block area past `keep` blocks
-  MI_EVENT(MI_EVENT_RETIRED_TRIM);
+  // (the purge range is the slot holder's to read: the scavenger writes it too)
+  if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not trimmed since it was published)
+    mi_page_purge_unformed_tail(page, (size_t)keep);   // `capacity == 0`: the block area past `keep` blocks
+    MI_EVENT(MI_EVENT_RETIRED_TRIM);
+  }
   mi_atomic_store_ptr_release(mi_page_t, slot, page);
 }
 #endif

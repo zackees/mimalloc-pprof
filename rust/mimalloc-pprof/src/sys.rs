@@ -623,7 +623,7 @@ mi_options! {
     /// class's demand on the thread: compact first, growing to 4 MiB (=1); 0 = always 4 MiB.
     mi_option_large_span = 63;
     /// **Fork addition (#575).** A retired (emptied) large page seen by its owner's heartbeat
-    /// keeps only its first N blocks resident, the rest is discarded (=1). 0 = keep all.
+    /// keeps only its first N blocks resident, the rest is discarded. 0 = keep all (=0: opt-in).
     mi_option_retired_keep = 64;
     /// Sentinel: one past the last real option.
     _mi_option_last = 65;

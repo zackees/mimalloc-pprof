@@ -404,6 +404,9 @@ jobs:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
         with:
+          # #590: soldr 0.9.27 embeds zccache 1.15.0, which leaves cook-restored host
+          # build-dep .rmeta writable (zccache#1791). Drop once setup-soldr v0 defaults to it.
+          version: "0.9.27"
           save-cache: ${{ env.ACT && 'true' || 'auto' }}
           cache: true
           toolchain-file: rust/rust-toolchain.toml

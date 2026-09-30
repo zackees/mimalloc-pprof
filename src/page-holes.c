@@ -829,13 +829,15 @@ static bool mi_retired_mask_covers_slots(const mi_tld_t* tld) {
 // protocol as the scavenger: swap the slot to BUSY for one discard.
 void _mi_page_retired_trim(mi_page_t* page) {
   _Atomic(mi_page_t*)* const slot = page->retired_slot;
-  if (slot == NULL || _mi_page_unformed_purged_bytes(page) != 0) return;   // not published, or trimmed since it was
   const long keep = mi_option_get(mi_option_retired_keep);
-  if (keep <= 0) return;
+  if (slot == NULL || keep <= 0) return;
   mi_page_t* expected = page;
   if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &expected, MI_RETIRED_SLOT_BUSY)) return;   // the scavenger holds it
-  mi_page_purge_unformed_tail(page, (size_t)keep);   // `capacity == 0`: the block area past `keep` blocks
-  MI_EVENT(MI_EVENT_RETIRED_TRIM);
+  // (the purge range is the slot holder's to read: the scavenger writes it too)
+  if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not trimmed since it was published)
+    mi_page_purge_unformed_tail(page, (size_t)keep);   // `capacity == 0`: the block area past `keep` blocks
+    MI_EVENT(MI_EVENT_RETIRED_TRIM);
+  }
   mi_atomic_store_ptr_release(mi_page_t, slot, page);
 }
 #endif

@@ -76,8 +76,8 @@ def parse(stdout: str, stderr: str) -> dict:
         head = re.match(r"\s*=== worker (\d+) of \d+: (\d+) live slots, (\d+) live requested bytes", b)
         if not head:
             continue
-        tot = kv(next(l for l in b.splitlines() if l.startswith("ATTR total")))
-        bins = [kv(l) for l in b.splitlines() if l.startswith("ATTR bin")]
+        tot = kv(next(ln for ln in b.splitlines() if ln.startswith("ATTR total")))
+        bins = [kv(ln) for ln in b.splitlines() if ln.startswith("ATTR bin")]
         smaps = re.search(r"Rss (\d+) kB, Anonymous (\d+) kB, AnonHugePages (\d+) kB", b)
         workers.append({
             "index": int(head.group(1)), "slots": int(head.group(2)), "requested": int(head.group(3)),

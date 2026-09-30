@@ -24,7 +24,7 @@
 #include <string.h>
 #include <mimalloc.h>
 #include "mimalloc/internal.h"
-#include "mimalloc/prim-tls.h"   // _mi_theap_default; MI_RETIRED_TRIM (undefined on a tree without #575: RED)
+   // MI_RETIRED_TRIM (undefined on a tree without #575: RED)
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -74,7 +74,7 @@ static void* worker(void* arg) {
     assert(is_resident(first[i], sizes[i] * 1024) && is_resident(second[i], sizes[i] * 1024));   // the probe sees resident memory
     mi_free(first[i]); mi_free(second[i]);   // the bin's only page retires
   }
-  _mi_theap_collect_retired(_mi_theap_default(), false);   // one heartbeat
+  mi_collect(false);   // a collect ages the retired pages (`_mi_theap_collect_retired`) as a heartbeat does
   int n1 = 0, n2 = 0;
   for (int i = 0; i < NBINS; i++) {
     n1 += is_resident(first[i], sizes[i] * 1024);

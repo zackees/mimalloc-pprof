@@ -300,10 +300,11 @@ terms of the MIT license. A copy of the license can be found in the file
 // delays. A page reset to "nothing formed" re-forms its blocks from the start, so the first block(s)
 // are the ones the bin's next request touches; the cold tail was 43% of large-class-persistent/8's
 // peak RSS. Default of `mi_option_retired_keep`; 0 = keep everything (#483). MI_RETIRED_TRIM=0
-// compiles it out. (Discarding the whole block area, or a page at publish, refaulted it at once:
-// +70% CPU on random-large-bursty/8, 5x on large-class/8.)
+// compiles it out. DEFAULT 0: the perf-ab ledger of #583 measured MI_RETIRED_KEEP_BLOCKS=1 at -90%
+// throughput on large-class/8 for -50% peak RSS (every bin's next request refaults what was
+// discarded), so it stays an opt-in knob until a policy passes rule 12.
 #ifndef MI_RETIRED_KEEP_BLOCKS
-#define MI_RETIRED_KEEP_BLOCKS            (1)
+#define MI_RETIRED_KEEP_BLOCKS            (0)
 #endif
 #ifndef MI_RETIRED_TRIM_AGE
 #define MI_RETIRED_TRIM_AGE               (0)

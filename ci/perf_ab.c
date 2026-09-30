@@ -266,6 +266,21 @@ static void larson_round(table_t* tb, stream_t* st, size_t lo, size_t hi, long n
    holds and mi_purge_holes_report() -- which reads only the calling thread's own pages (plus the
    arenas, the same for every worker), hence one report per worker. Untimed: perf_ab.py runs it
    in a separate replay. */
+/* #575: the kernel's own residency numbers for the whole process, next to the allocator's split */
+static void smaps_rollup_line(void) {
+  FILE* f = fopen("/proc/self/smaps_rollup", "r");
+  if (f == NULL) return;
+  char line[256];
+  long rss = -1, anon_huge = -1, anon = -1;
+  while (fgets(line, sizeof(line), f) != NULL) {
+    sscanf(line, "Rss: %ld kB", &rss);
+    sscanf(line, "Anonymous: %ld kB", &anon);
+    sscanf(line, "AnonHugePages: %ld kB", &anon_huge);
+  }
+  fclose(f);
+  fprintf(stderr, "smaps_rollup: Rss %ld kB, Anonymous %ld kB, AnonHugePages %ld kB\n", rss, anon, anon_huge);
+}
+
 static void report_holes(stream_t* st) {
   size_t live = 0;
   int held = 0;
@@ -280,6 +295,7 @@ static void report_holes(stream_t* st) {
           st->index, threads, held, live, rss_bytes(),
           hs.purged_bytes, hs.purged_blocks, hs.purged_bytes_total, hs.discard_calls, hs.pages_freed,
           hs.unformed_bytes, hs.unformed_bytes_total, hs.pages_skipped, hs.full_sweeps);
+  smaps_rollup_line();   /* #575 */
   fflush(stderr);
   mi_purge_holes_report();
   fflush(stderr);

@@ -1300,9 +1300,9 @@ pub mod options {
         /// **Fork addition (#532).** Size a new large page (blocks of ~84-512 KiB) from its size
         /// class's demand on the thread: compact first, growing to 4 MiB; 0 = always 4 MiB.
         pub const LARGE_SPAN: Self = Self(sys::mi_option_large_span);
-        /// **Fork addition (#575).** Keep at most N of a thread's retired (emptied) large pages
-        /// resident; publishing one more discards the lowest slot's block area at once. 0 = no cap.
-        pub const RETIRED_RESIDENT: Self = Self(sys::mi_option_retired_resident);
+        /// **Fork addition (#575).** A retired (emptied) large page seen by its owner's heartbeat
+        /// keeps only its first N blocks resident, the rest is discarded. 0 = keep all.
+        pub const RETIRED_KEEP: Self = Self(sys::mi_option_retired_keep);
 
         /// Upstream: milliseconds to delay purging, which the scavenger also honours.
         pub const PURGE_DELAY: Self = Self(sys::mi_option_purge_delay);

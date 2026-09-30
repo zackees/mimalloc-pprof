@@ -50,7 +50,7 @@ class CheckRustSurfaceTests(unittest.TestCase):
             "mi_option_page_reserve",
             "mi_option_resident_first",
             "mi_option_large_span",
-            "mi_option_retired_resident",
+            "mi_option_retired_keep",
         ]
         self.assertEqual(options[-len(fork_block) - 1 : -1], fork_block)
 

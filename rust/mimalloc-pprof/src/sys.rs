@@ -622,9 +622,9 @@ mi_options! {
     /// **Fork addition (#532).** Size a new large page (blocks of ~84-512 KiB) from its size
     /// class's demand on the thread: compact first, growing to 4 MiB (=1); 0 = always 4 MiB.
     mi_option_large_span = 63;
-    /// **Fork addition (#575).** Keep at most N of a thread's retired (emptied) large pages
-    /// resident; publishing one more discards the lowest slot's block area at once (=2). 0 = no cap.
-    mi_option_retired_resident = 64;
+    /// **Fork addition (#575).** A retired (emptied) large page seen by its owner's heartbeat
+    /// keeps only its first N blocks resident, the rest is discarded (=1). 0 = keep all.
+    mi_option_retired_keep = 64;
     /// Sentinel: one past the last real option.
     _mi_option_last = 65;
 }

@@ -88,6 +88,20 @@ size_t _mi_diag_resident_bytes(const void* start, size_t size) {
   #endif
 }
 
+// #575: which OS pages of [start, start + npages * page size) are resident (`mincore`): vec[i] is
+// 1 or 0 per OS page. False when this platform or build cannot say (or the range is unmapped).
+bool _mi_diag_resident_map(const void* start, size_t npages, unsigned char* vec) {
+  #if MI_DIAG_RESIDENT
+  const size_t psize = _mi_os_page_size();
+  if (mincore((void*)start, npages * psize, vec) != 0) return false;
+  for (size_t i = 0; i < npages; i++) { vec[i] &= 1; }
+  return true;
+  #else
+  MI_UNUSED(start); MI_UNUSED(npages); MI_UNUSED(vec);
+  return false;
+  #endif
+}
+
 // The `run_hist` bucket of a run of `run_slices` slices: floor(log2(run_slices)), so bucket b
 // holds the lengths [2^b, 2^(b+1)). Needs no build flag: it is pure arithmetic.
 size_t _mi_arena_layout_bucket(size_t run_slices) {

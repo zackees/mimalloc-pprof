@@ -30,7 +30,7 @@ static _Atomic(size_t) mi_event_counts[MI_EVENT_COUNT];
 
 static const char* const mi_event_names[MI_EVENT_COUNT] = {
   "large_page_request", "large_repurpose", "large_repurpose_denied",
-  "retired_publish", "retired_unpublish",
+  "retired_publish", "retired_unpublish", "retired_trim",
   "page_map_register", "page_map_reextend",
   "large_span_grow", "large_span_shrink",
   "arena_page_alloc", "arena_page_free"

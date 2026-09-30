@@ -1391,6 +1391,7 @@ typedef enum mi_event_e {
   MI_EVENT_LARGE_REPURPOSE_DENIED,  // ... could not, for lack of this heartbeat's budget
   MI_EVENT_RETIRED_PUBLISH,         // a retired large page was published for the scavenger
   MI_EVENT_RETIRED_UNPUBLISH,       // ... and taken back
+  MI_EVENT_RETIRED_TRIM,            // a retired large page's block area was discarded at once, over the resident cap (#575)
   MI_EVENT_PAGE_MAP_REGISTER,       // a page was registered in the page map
   MI_EVENT_PAGE_MAP_REEXTEND,       // a re-carve changed a page's mapped extent
   MI_EVENT_LARGE_SPAN_GROW,         // a large bin's demand-sized span stepped up (#532)

@@ -820,6 +820,34 @@ static bool mi_retired_mask_covers_slots(const mi_tld_t* tld) {
 }
 #endif
 
+#if MI_RETIRED_TRIM
+// #575: over `mi_option_retired_resident` resident retired pages, discard the block area of the
+// lowest-slot ones (never slot `keep`, the page just published) now, with the scavenger's own
+// protocol: swap the slot to BUSY for one discard. The owner-private `retired_resident` mask
+// over-approximates (the scavenger's release does not clear a bit): a page found already
+// discarded, or gone, just drops its bit. Only called on publish, a slow path.
+static void mi_retired_trim_over_cap(mi_tld_t* tld, size_t keep) {
+  const long cap = mi_option_get(mi_option_retired_resident);
+  if (cap <= 0) return;
+  while ((long)mi_popcount(tld->retired_resident) > cap) {
+    const size_t others = tld->retired_resident & ~((size_t)1 << keep);
+    if (others == 0) return;
+    const size_t k = mi_ctz(others);
+    tld->retired_resident &= ~((size_t)1 << k);
+    _Atomic(mi_page_t*)* const slot = &tld->retired_pages[k];
+    mi_page_t* victim = mi_atomic_load_ptr_relaxed(mi_page_t, slot);
+    if (victim == NULL || victim == MI_RETIRED_SLOT_BUSY) continue;
+    if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &victim, MI_RETIRED_SLOT_BUSY)) continue;
+    if (_mi_page_unformed_purged_bytes(victim) == 0) {   // (not discarded already)
+      mi_page_purge_unformed_tail(victim);   // `capacity == 0`: the whole block area
+      mi_page_discard_slack(victim);
+      MI_EVENT(MI_EVENT_RETIRED_TRIM);
+    }
+    mi_atomic_store_ptr_release(mi_page_t, slot, victim);
+  }
+}
+#endif
+
 // Owner only (from `_mi_page_retire`): reset an emptied large page and publish it for the
 // scavenger. When every slot is taken the page simply stays retired as upstream keeps it.
 void _mi_page_publish_retired(mi_page_t* page) {
@@ -840,6 +868,7 @@ void _mi_page_publish_retired(mi_page_t* page) {
       if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[k]) != NULL) { used |= ((size_t)1 << k); }
     }
     tld->retired_used = used;
+    tld->retired_resident &= used;   // (#575)
     free_mask = ~used & MI_RETIRED_SLOTS_MASK;
     if (free_mask == 0) return;   // all slots full: leave it unpublished
   }
@@ -858,6 +887,10 @@ void _mi_page_publish_retired(mi_page_t* page) {
   mi_atomic_store_ptr_release(mi_page_t, slot, page);   // publishes the reset above to the scavenger
   MI_EVENT(MI_EVENT_RETIRED_PUBLISH);   // (#573)
   MI_PROBE1(retired_publish, page->block_size);
+  #if MI_RETIRED_TRIM
+  tld->retired_resident |= ((size_t)1 << i);
+  mi_retired_trim_over_cap(tld, i);
+  #endif
   _mi_pages_release_schedule(mi_page_subproc(page));
 }
 
@@ -897,6 +930,7 @@ void _mi_page_unpublish_retired(mi_page_t* page, mi_tld_t* owner_tld) {
   }
   if (tld != NULL && slot >= &tld->retired_pages[0] && slot < &tld->retired_pages[MI_RETIRED_PAGE_SLOTS]) {
     tld->retired_used &= ~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));
+    tld->retired_resident &= ~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));   // (#575)
   }
   // (else -- a heap delete from another thread -- the bit stays set until the owner's next publish
   // finds no free bit and rebuilds the mask from the slots)

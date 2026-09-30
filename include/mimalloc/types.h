@@ -294,6 +294,17 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MI_RETIRED_RELEASE_MULT
 #define MI_RETIRED_RELEASE_MULT           (10)
 #endif
+// #575: a thread keeps at most this many of its retired large pages resident (default of
+// `mi_option_retired_resident`). Publishing one more discards the block area of the lowest-slot
+// resident page at once, not after MI_RETIRED_RELEASE_MULT purge delays: large-class-persistent/8
+// held one empty page per large bin per worker, 66 MiB = 43% of its peak RSS. 0 = no cap (#483).
+// MI_RETIRED_TRIM=0 compiles the cap out.
+#ifndef MI_RETIRED_RESIDENT_MAX
+#define MI_RETIRED_RESIDENT_MAX           (2)
+#endif
+#ifndef MI_RETIRED_TRIM
+#define MI_RETIRED_TRIM                   (1)
+#endif
 // #493: an empty large page that a thread leaves behind at its exit is reserved (abandoned into
 // the arena, blocks formed and resident) for the next thread of the heap instead of freed; one
 // that nobody reclaims for this many purge delays goes back to the arena. The same value as
@@ -1107,6 +1118,7 @@ struct mi_tld_s {
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
   size_t                retired_used;         // #530: owner-private bitmask of the occupied `retired_pages` slots (only the owner fills or empties one)
+  size_t                retired_resident;     // #575: owner-private bitmask of the `retired_pages` slots whose block area may still be resident (a subset of `retired_used`)
   size_t                large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
 };
 

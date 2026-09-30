@@ -695,7 +695,7 @@ typedef enum mi_option_e {
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
   mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
   mi_option_large_span,                 // size a new large page (blocks of ~84-512 KiB) from its size class's demand on the thread: compact first, growing to 4 MiB (=1). 0 = always 4 MiB (upstream) (#532)
-  mi_option_retired_resident,           // keep at most N of a thread's retired (emptied) large pages resident; publishing one more discards the lowest slot's block area at once (=2). 0 = no cap, the scavenger releases them after MI_RETIRED_RELEASE_MULT purge delays (#575)
+  mi_option_retired_keep,           // a retired (emptied) large page seen by its owner's heartbeat keeps only its first N blocks resident, the rest of its block area is discarded (=1). 0 = keep all, the scavenger releases the page after MI_RETIRED_RELEASE_MULT purge delays (#575)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

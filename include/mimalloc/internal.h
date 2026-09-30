@@ -1391,7 +1391,7 @@ typedef enum mi_event_e {
   MI_EVENT_LARGE_REPURPOSE_DENIED,  // ... could not, for lack of this heartbeat's budget
   MI_EVENT_RETIRED_PUBLISH,         // a retired large page was published for the scavenger
   MI_EVENT_RETIRED_UNPUBLISH,       // ... and taken back
-  MI_EVENT_RETIRED_TRIM,            // a retired large page's block area was discarded at once, over the resident cap (#575)
+  MI_EVENT_RETIRED_TRIM,            // a retired large page's block area past its first blocks was discarded at a heartbeat (#575)
   MI_EVENT_PAGE_MAP_REGISTER,       // a page was registered in the page map
   MI_EVENT_PAGE_MAP_REEXTEND,       // a re-carve changed a page's mapped extent
   MI_EVENT_LARGE_SPAN_GROW,         // a large bin's demand-sized span stepped up (#532)
@@ -1417,6 +1417,7 @@ void          _mi_event_count(mi_event_t event);
 void          _mi_page_debug_print(const mi_page_t* page);   // #573 A4: one line of a page's state, malloc-free
 #endif
 
+void          _mi_page_retired_trim(mi_page_t* page);   // #575: heartbeat: discard a published retired page's block area past its first blocks
 void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
 void          _mi_pages_release_schedule(mi_subproc_t* subproc);  // #483/#493: a retired or reserved page waits for the scavenger's release
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,

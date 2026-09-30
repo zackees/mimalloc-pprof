@@ -489,12 +489,13 @@ static bool mi_page_holes_madvisable(const mi_page_t* page) {
 // the page: `[align_up(page_start + capacity*bs), align_down(min(page_start + reserved*bs, committed_end)))`.
 // Empty (lo == hi) when there is no tail, when it is smaller than an OS page, or when the
 // page has no committed memory there (`slice_committed`).
-static void mi_page_unformed_tail_range(const mi_page_t* page, uintptr_t* lo, uintptr_t* hi) {
+static void mi_page_unformed_tail_range(const mi_page_t* page, size_t keep, uintptr_t* lo, uintptr_t* hi) {
   *lo = 0; *hi = 0;
   if (page->capacity >= page->reserved) return;    // no tail
   const size_t os_size = _mi_os_page_size();
   const uintptr_t pstart = (uintptr_t)mi_page_start(page);
-  const uintptr_t tlo = pstart + ((size_t)page->capacity * page->block_size);
+  const size_t formed = (page->capacity > keep ? (size_t)page->capacity : keep);   // (#575: the first `keep` blocks stay out of the range)
+  const uintptr_t tlo = pstart + (formed * page->block_size);
   uintptr_t thi = pstart + ((size_t)page->reserved * page->block_size);
   const uintptr_t climit = pstart + mi_page_committed(page);   // never discard memory that is not committed
   if (thi > climit) { thi = climit; }
@@ -511,10 +512,10 @@ size_t _mi_page_unformed_purged_bytes(const mi_page_t* page) {
 }
 
 // Discard the OS pages of the unformed tail that are not discarded already.
-static void mi_page_purge_unformed_tail(mi_page_t* page) {
+static void mi_page_purge_unformed_tail(mi_page_t* page, size_t keep) {
   if (!mi_page_holes_madvisable(page)) return;
   uintptr_t lo, hi;
-  mi_page_unformed_tail_range(page, &lo, &hi);
+  mi_page_unformed_tail_range(page, keep, &lo, &hi);
   if (lo >= hi) return;
   const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   mi_assert_internal(hi - pstart <= UINT32_MAX);   // only a huge page can be that big, and it has no tail
@@ -713,7 +714,7 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
     const uint64_t sig = (uint64_t)(uintptr_t)page->free ^ mi_page_sweep_state(page);
     if (page->swept_state != sig) { page->swept_state = sig; return; }
   }
-  mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
+  mi_page_purge_unformed_tail(page, 0);                   // the blocks that are not formed yet: resident, but never handed out
   if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }
 
   if (!tld->holes_sweep_full && page->swept_state == mi_page_sweep_state(page)) {
@@ -798,8 +799,8 @@ void _mi_page_unpurge_all(mi_page_t* page) {
 ----------------------------------------------------------- */
 
 #define MI_RETIRED_SLOT_BUSY  ((mi_page_t*)1)   // the scavenger holds this slot's page for one discard
-#define MI_RETIRED_SLOTS_MASK ((MI_RETIRED_PAGE_SLOTS >= 32) ? (uint32_t)0xFFFFFFFFu : (uint32_t)(((uint32_t)1 << MI_RETIRED_PAGE_SLOTS) - 1))
-#if MI_RETIRED_PAGE_SLOTS > 32
+#define MI_RETIRED_SLOTS_MASK ((MI_RETIRED_PAGE_SLOTS >= MI_SIZE_BITS) ? ~(size_t)0 : (((size_t)1 << MI_RETIRED_PAGE_SLOTS) - 1))
+#if MI_RETIRED_PAGE_SLOTS > MI_SIZE_BITS
 #error "MI_RETIRED_PAGE_SLOTS must fit in the owner's slot mask (mi_tld_t.retired_used)"
 #endif
 
@@ -821,30 +822,21 @@ static bool mi_retired_mask_covers_slots(const mi_tld_t* tld) {
 #endif
 
 #if MI_RETIRED_TRIM
-// #575: over `mi_option_retired_resident` resident retired pages, discard the block area of the
-// lowest-slot ones (never slot `keep`, the page just published) now, with the scavenger's own
-// protocol: swap the slot to BUSY for one discard. The owner-private `retired_resident` mask
-// over-approximates (the scavenger's release does not clear a bit): a page found already
-// discarded, or gone, just drops its bit. Only called on publish, a slow path.
-static void mi_retired_trim_over_cap(mi_tld_t* tld, size_t keep) {
-  const long cap = mi_option_get(mi_option_retired_resident);
-  if (cap <= 0) return;
-  while ((long)mi_popcount(tld->retired_resident) > cap) {
-    const size_t others = tld->retired_resident & ~((size_t)1 << keep);
-    if (others == 0) return;
-    const size_t k = mi_ctz(others);
-    tld->retired_resident &= (uint32_t)~((size_t)1 << k);
-    _Atomic(mi_page_t*)* const slot = &tld->retired_pages[k];
-    mi_page_t* victim = mi_atomic_load_ptr_relaxed(mi_page_t, slot);
-    if (victim == NULL || victim == MI_RETIRED_SLOT_BUSY) continue;
-    if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &victim, MI_RETIRED_SLOT_BUSY)) continue;
-    if (_mi_page_unformed_purged_bytes(victim) == 0) {   // (not discarded already)
-      mi_page_purge_unformed_tail(victim);   // `capacity == 0`: the whole block area
-      mi_page_discard_slack(victim);
-      MI_EVENT(MI_EVENT_RETIRED_TRIM);
-    }
-    mi_atomic_store_ptr_release(mi_page_t, slot, victim);
-  }
+// #575: the owner's heartbeat (`_mi_theap_collect_retired`) saw this published retired page, still
+// empty: discard its block area past the first `mi_option_retired_keep` blocks now, not when the
+// scavenger releases it. The bin's next request re-forms blocks from the start of the page, so the
+// prefix is what it touches; the cold tail was 43% of large-class-persistent/8's peak. Same slot
+// protocol as the scavenger: swap the slot to BUSY for one discard.
+void _mi_page_retired_trim(mi_page_t* page) {
+  _Atomic(mi_page_t*)* const slot = page->retired_slot;
+  if (slot == NULL || _mi_page_unformed_purged_bytes(page) != 0) return;   // not published, or trimmed since it was
+  const long keep = mi_option_get(mi_option_retired_keep);
+  if (keep <= 0) return;
+  mi_page_t* expected = page;
+  if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &expected, MI_RETIRED_SLOT_BUSY)) return;   // the scavenger holds it
+  mi_page_purge_unformed_tail(page, (size_t)keep);   // `capacity == 0`: the block area past `keep` blocks
+  MI_EVENT(MI_EVENT_RETIRED_TRIM);
+  mi_atomic_store_ptr_release(mi_page_t, slot, page);
 }
 #endif
 
@@ -860,22 +852,21 @@ void _mi_page_publish_retired(mi_page_t* page) {
   // the same page back), so an owner-private mask knows which are free without reading the slots
   // -- cache lines the scavenger also touches: scanning them was ~60% of this function's samples
   // (#530, large-class-ephemeral/8 short generations).
-  size_t free_mask = (size_t)(~tld->retired_used & MI_RETIRED_SLOTS_MASK);
+  size_t free_mask = ~tld->retired_used & MI_RETIRED_SLOTS_MASK;
   if mi_unlikely(free_mask == 0) {
     // the mask says full: rebuild it from the slots once (a bit a foreign unpublish could not clear)
     size_t used = 0;
     for (size_t k = 0; k < MI_RETIRED_PAGE_SLOTS; k++) {
       if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[k]) != NULL) { used |= ((size_t)1 << k); }
     }
-    tld->retired_used = (uint32_t)used;
-    tld->retired_resident &= (uint32_t)used;   // (#575)
-    free_mask = (size_t)(~(uint32_t)used & MI_RETIRED_SLOTS_MASK);
+    tld->retired_used = used;
+    free_mask = ~used & MI_RETIRED_SLOTS_MASK;
     if (free_mask == 0) return;   // all slots full: leave it unpublished
   }
   const size_t i = mi_ctz(free_mask);
   _Atomic(mi_page_t*)* const slot = &tld->retired_pages[i];
   mi_assert_internal(mi_atomic_load_ptr_relaxed(mi_page_t, slot) == NULL);
-  tld->retired_used |= (uint32_t)((size_t)1 << i);
+  tld->retired_used |= ((size_t)1 << i);
 
   _mi_page_unpurge_all(page);   // holes describe formed blocks, and there will be none
   page->free = NULL;            // nothing formed: every block of the page is unformed tail now
@@ -887,10 +878,6 @@ void _mi_page_publish_retired(mi_page_t* page) {
   mi_atomic_store_ptr_release(mi_page_t, slot, page);   // publishes the reset above to the scavenger
   MI_EVENT(MI_EVENT_RETIRED_PUBLISH);   // (#573)
   MI_PROBE1(retired_publish, page->block_size);
-  #if MI_RETIRED_TRIM
-  tld->retired_resident |= (uint32_t)((size_t)1 << i);
-  mi_retired_trim_over_cap(tld, i);
-  #endif
   _mi_pages_release_schedule(mi_page_subproc(page));
 }
 
@@ -929,8 +916,7 @@ void _mi_page_unpublish_retired(mi_page_t* page, mi_tld_t* owner_tld) {
     tld = (theap != NULL ? theap->tld : NULL);
   }
   if (tld != NULL && slot >= &tld->retired_pages[0] && slot < &tld->retired_pages[MI_RETIRED_PAGE_SLOTS]) {
-    tld->retired_used &= (uint32_t)~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));
-    tld->retired_resident &= (uint32_t)~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));   // (#575)
+    tld->retired_used &= ~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));
   }
   // (else -- a heap delete from another thread -- the bit stays set until the owner's next publish
   // finds no free bit and rebuilds the mask from the slots)
@@ -974,6 +960,13 @@ bool _mi_pages_release_retired(mi_subproc_t* subproc) {
         if (page == NULL || page == MI_RETIRED_SLOT_BUSY) continue;
         if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &page, MI_RETIRED_SLOT_BUSY)) continue;   // the owner took it back
         // the page's memory is ours until we put it back
+        #if MI_RETIRED_TRIM
+        // (#575: a page the owner's heartbeat trimmed keeps its first blocks: give those back as well)
+        if (page->unformed_purged_lo != 0 && _mi_page_unformed_purged_bytes(page) != 0
+            && page->unformed_purged_lo > (uint32_t)(_mi_align_up((uintptr_t)mi_page_start(page), _mi_os_page_size()) - (uintptr_t)mi_page_start(page))) {
+          _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);
+        }
+        #endif
         if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not discarded already)
           // #544: the owner publishes a page without reading the clock. A bin's only page empties
           // and is taken back again on nearly every allocation cycle of a sparse large bin (1.04M
@@ -982,7 +975,7 @@ bool _mi_pages_release_retired(mi_subproc_t* subproc) {
           // release can come at most one scavenger wake-up later, never earlier.
           if (page->retired_at == 0) { page->retired_at = (now != 0 ? now : 1); pending = true; }
           else if (now - page->retired_at < min_age) { pending = true; }
-          else { MI_PROBE1(retired_release, page->block_size); mi_page_purge_unformed_tail(page); mi_page_discard_slack(page); }   // `capacity == 0`: the whole block area, and past it
+          else { MI_PROBE1(retired_release, page->block_size); mi_page_purge_unformed_tail(page, 0); mi_page_discard_slack(page); }   // `capacity == 0`: the whole block area, and past it
         }
         mi_atomic_store_ptr_release(mi_page_t, slot, page);
       }

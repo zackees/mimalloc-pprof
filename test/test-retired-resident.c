@@ -1,17 +1,19 @@
-/* #575: a thread's retired large pages do not all stay resident.
+/* #575: a retired large page does not keep its whole block area resident.
 
    `_mi_page_retire` keeps the only page of a large size class when it empties, and #483 resets it
    to "nothing formed" but leaves its bytes resident until the scavenger releases them, MI_RETIRED_
    RELEASE_MULT purge delays later. A thread that once used ~10 large size classes therefore held
    ~10 empty resident pages: large-class-persistent/8 had 66 MiB of them, 43% of its peak RSS.
-   With `mi_option_retired_resident` = N the block area of the lowest-slot resident retired page is
-   discarded as soon as more than N are resident (src/page-holes.c, `mi_retired_trim_over_cap`).
+   A page reset to "nothing formed" re-forms its blocks from the start, so with
+   `mi_option_retired_keep` = N the owner's heartbeat (`_mi_theap_collect_retired`) discards the
+   block area past the first N blocks of a retired page (src/page-holes.c, `_mi_page_retired_trim`).
 
-   Deterministic: one block in each of NBINS distinct large size classes, touched (resident), then
-   all freed so every bin's only page retires; `mincore` counts the blocks that still have resident
-   memory. ctest turns the scavenger off (it would release them later regardless of the cap) and
-   page reserve off. Phase 2: the option at 0 keeps them all resident (the run-time opt-out).
-   Linux only (mincore); elsewhere the test only checks that the option exists. */
+   Deterministic: two blocks in each of NBINS distinct large size classes (the two land in one
+   page), touched (resident), then both freed so each bin's only page retires; one heartbeat; then
+   `mincore` says whether the first and the second block still have resident memory. ctest turns the
+   scavenger off (it would release everything later regardless) and page reserve off. Phase 2: the
+   option at 0 keeps both blocks of every page resident (the run-time opt-out).
+   Linux only (mincore); elsewhere the test does nothing. */
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -21,7 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mimalloc.h>
-#include "mimalloc/internal.h"   // MI_RETIRED_TRIM (undefined on a tree without #575: RED)
+#include "mimalloc/internal.h"
+#include "mimalloc/prim-tls.h"   // _mi_theap_default; MI_RETIRED_TRIM (undefined on a tree without #575: RED)
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -31,7 +34,8 @@
 #define NBINS (9)
 static const size_t sizes[NBINS] = { 100, 120, 140, 170, 200, 240, 290, 350, 420 };   // KiB: distinct 12.5% classes
 static long cap_for_thread;
-static int resident_blocks;
+static int is_resident(const void* p, size_t size);
+static int first_resident, second_resident;
 
 static size_t resident_bytes(const void* p, size_t size) {
   const size_t psz = (size_t)sysconf(_SC_PAGESIZE);
@@ -48,45 +52,55 @@ static size_t resident_bytes(const void* p, size_t size) {
   return r;
 }
 
+static int is_resident(const void* p, size_t size) { return resident_bytes(p, size) >= size / 2; }
+
 static void* worker(void* arg) {
   (void)arg;
-  void* blocks[NBINS];
+  void* first[NBINS]; void* second[NBINS];
 #ifdef MI_RETIRED_TRIM
-  mi_option_set(mi_option_retired_resident, cap_for_thread);
+  mi_option_set(mi_option_retired_keep, cap_for_thread);
 #endif
   for (int i = 0; i < NBINS; i++) {
     const size_t sz = sizes[i] * 1024;
-    blocks[i] = mi_malloc(sz);
-    assert(blocks[i] != NULL);
-    memset(blocks[i], 0xab, sz);   // resident
+    void* a = mi_malloc(sz);
+    void* b = mi_malloc(sz);
+    assert(a != NULL && b != NULL && _mi_ptr_page(a) == _mi_ptr_page(b));
+    memset(a, 0xab, sz);
+    memset(b, 0xab, sz);   // both resident
+    first[i] = (a < b ? a : b);
+    second[i] = (a < b ? b : a);
   }
-  size_t before = 0;
-  for (int i = 0; i < NBINS; i++) { before += (resident_bytes(blocks[i], sizes[i] * 1024) >= sizes[i] * 1024 / 2) ? 1 : 0; }
-  assert(before == NBINS);   // the probe sees resident memory
-  for (int i = 0; i < NBINS; i++) { mi_free(blocks[i]); }   // each bin's only page retires
-  int n = 0;
-  for (int i = 0; i < NBINS; i++) { n += (resident_bytes(blocks[i], sizes[i] * 1024) >= sizes[i] * 1024 / 2) ? 1 : 0; }
-  resident_blocks = n;
+  for (int i = 0; i < NBINS; i++) {
+    assert(is_resident(first[i], sizes[i] * 1024) && is_resident(second[i], sizes[i] * 1024));   // the probe sees resident memory
+    mi_free(first[i]); mi_free(second[i]);   // the bin's only page retires
+  }
+  _mi_theap_collect_retired(_mi_theap_default(), false);   // one heartbeat
+  int n1 = 0, n2 = 0;
+  for (int i = 0; i < NBINS; i++) {
+    n1 += is_resident(first[i], sizes[i] * 1024);
+    n2 += is_resident(second[i], sizes[i] * 1024);
+  }
+  first_resident = n1; second_resident = n2;
   return NULL;
 }
 
-static int run(long cap) {
+static void run(long keep) {
   pthread_t t;
-  cap_for_thread = cap;
-  resident_blocks = -1;
+  cap_for_thread = keep;
+  first_resident = second_resident = -1;
   assert(pthread_create(&t, NULL, worker, NULL) == 0);
   assert(pthread_join(t, NULL) == 0);
-  return resident_blocks;
 }
 
 int main(void) {
   int failures = 0;
-  const int capped = run(2);
-  fprintf(stderr, "retired-resident: cap 2 -> %d of %d retired pages resident\n", capped, NBINS);
-  if (capped > 2) { fprintf(stderr, "FAILED: %d retired pages resident with the cap at 2\n", capped); failures++; }
-  const int uncapped = run(0);
-  fprintf(stderr, "retired-resident: cap 0 -> %d of %d retired pages resident\n", uncapped, NBINS);
-  if (uncapped != NBINS) { fprintf(stderr, "FAILED: the opt-out discarded (%d of %d resident)\n", uncapped, NBINS); failures++; }
+  run(1);
+  fprintf(stderr, "retired-keep: keep 1 -> first blocks resident %d/%d, second blocks resident %d/%d\n", first_resident, NBINS, second_resident, NBINS);
+  if (second_resident != 0) { fprintf(stderr, "FAILED: %d retired pages kept their second block resident with keep=1\n", second_resident); failures++; }
+  if (first_resident != NBINS) { fprintf(stderr, "FAILED: the kept prefix was discarded (%d of %d resident)\n", first_resident, NBINS); failures++; }
+  run(0);
+  fprintf(stderr, "retired-keep: keep 0 -> first blocks resident %d/%d, second blocks resident %d/%d\n", first_resident, NBINS, second_resident, NBINS);
+  if (first_resident != NBINS || second_resident != NBINS) { fprintf(stderr, "FAILED: the opt-out discarded memory\n"); failures++; }
   return failures == 0 ? 0 : 1;
 }
 #else

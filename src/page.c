@@ -702,6 +702,12 @@ void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
         }
         else {
           // keep retired, update min/max
+          #if MI_RETIRED_TRIM
+          // #575: a large page still empty at the heartbeat gives back its cold tail
+          if (page->retire_expire + 1 + MI_RETIRED_TRIM_AGE <= MI_RETIRE_CYCLES/4 && mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE) {
+            _mi_page_retired_trim(page);
+          }
+          #endif
           if (bin < min) min = bin;
           if (bin > max) max = bin;
         }

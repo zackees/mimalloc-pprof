@@ -410,6 +410,10 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
+          # #590: the soldr cook layer restores host build-dependency rmeta files
+          # read-only, and the cross build then fails "rmeta is not writeable" on every
+          # non-host target after a Cargo.lock change. Skip the cook; cross builds stay cross.
+          prebuild-deps: none
       - name: Prepare blessed cross toolchain
         env:
           TARGET: ${{ matrix.target }}

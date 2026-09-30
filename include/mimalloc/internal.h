@@ -1485,6 +1485,7 @@ typedef struct mi_arena_layout_s {
 // #573 A3: the bytes of [start, start+size) resident in RAM now, or SIZE_MAX when the platform
 // cannot say. Diagnostics only (a syscall per call): the layout walk and the holes report.
 size_t        _mi_diag_resident_bytes(const void* start, size_t size);
+bool          _mi_diag_resident_map(const void* start, size_t npages, unsigned char* vec);   // #575
 uint8_t*      mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);   // src/arena.c: the slice must exist
 uint8_t*      mi_arena_slice_end(mi_arena_t* arena, size_t slice_end);       // src/arena.c: one past a range; may be the arena's end (#573)
 
@@ -1497,6 +1498,13 @@ void          _mi_arena_layout_print(const mi_arena_layout_t* layout);
 
 #define MI_HOLES_HIST_BUCKETS  (5)    // live blocks per pinned OS page: 1, 2, 3-4, 5-8, 9+
 #define MI_HOLES_GRAN_COUNT    (5)    // the hypothetical OS page sizes of the granularity curve
+
+// #575: what a resident byte of a page is
+#define MI_HOLES_RES_LIVE      (0)   // inside an allocated block
+#define MI_HOLES_RES_FREE      (1)   // inside a formed free block (free-listed)
+#define MI_HOLES_RES_UNFORMED  (2)   // inside a block not formed yet (`capacity <= idx < reserved`)
+#define MI_HOLES_RES_SLACK     (3)   // in the page's slices but outside `reserved * block_size` (header, geometry slack)
+#define MI_HOLES_RES_COUNT     (4)
 
 typedef struct mi_holes_bin_s {
   size_t block_size;           // the largest block size seen in this bin
@@ -1516,6 +1524,12 @@ typedef struct mi_holes_bin_s {
   size_t pinned_free_bytes;    // free bytes trapped inside those pinned OS pages
   size_t pinned_live_bytes;    // live bytes inside those pinned OS pages
   size_t hist[MI_HOLES_HIST_BUCKETS];
+  // #575: RESIDENT bytes of this bin's pages (`mincore`, whole page extent), split by what the bytes
+  // are. Index 0: pages with a live block; 1: empty pages (retired or not).
+  size_t res[2][MI_HOLES_RES_COUNT];
+  size_t res_extent;           // #575: the bytes of address space the bin's pages span
+  size_t res_formed[2];        // #575: bytes of formed blocks (`capacity * block_size`), [0] used pages, [1] empty ones
+  size_t res_reserved[2];      // #575: bytes of the block area (`reserved * block_size`), same split
 } mi_holes_bin_t;
 
 typedef struct mi_holes_report_s {

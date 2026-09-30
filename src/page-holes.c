@@ -1235,6 +1235,65 @@ static void mi_page_holes_granularity_curve(const mi_page_t* page, const uint64_
   }
 }
 
+
+// #575 (#422 Step 0): split the RESIDENT bytes of this page's whole slice extent (`mincore`, so a
+// THP fault-around neighbour counts like any other resident byte) by what each byte is: inside a
+// live block, a formed free block, a block not formed yet, or outside `reserved * block_size`
+// (header and geometry slack). Read-only, untimed, diagnostics only. `freelisted` is NULL for a
+// page with no formed block.
+#ifndef MI_HOLES_RES_CHUNK_PAGES
+#define MI_HOLES_RES_CHUNK_PAGES  (1024)
+#endif
+static void mi_page_residency_split(const mi_page_t* page, const uint64_t* freelisted, mi_holes_report_t* rep) {
+  if (page->memid.memkind != MI_MEM_ARENA) return;
+  const size_t bs = page->block_size;
+  const size_t cap = page->capacity;
+  const size_t psize = _mi_os_page_size();
+  const uintptr_t lo = (uintptr_t)mi_page_slice_start(page);
+  const uintptr_t hi = lo + ((size_t)page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE);
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
+  const uintptr_t cend = pstart + (cap * bs);                        // end of the formed blocks
+  const uintptr_t rend = pstart + ((size_t)page->reserved * bs);     // end of the block area
+  mi_holes_bin_t* const r = &rep->bin[_mi_bin(bs)];
+  const size_t u = (page->used == 0 ? 1 : 0);
+  r->res_extent += (size_t)(hi - lo);
+  r->res_formed[u] += cap * bs;
+  r->res_reserved[u] += (size_t)page->reserved * bs;
+  unsigned char vec[MI_HOLES_RES_CHUNK_PAGES];
+  for (uintptr_t at = lo; at < hi; ) {
+    size_t n = (size_t)(hi - at) / psize;
+    if (n > MI_HOLES_RES_CHUNK_PAGES) n = MI_HOLES_RES_CHUNK_PAGES;
+    if (n == 0) break;
+    if (!_mi_diag_resident_map((const void*)at, n, vec)) return;
+    for (size_t k = 0; k < n; k++) {
+      if (vec[k] == 0) continue;
+      const uintptr_t olo = at + (k * psize);
+      const uintptr_t ohi = olo + psize;
+      // (1) bytes before the block area or past `reserved`: slack
+      uintptr_t a = olo;
+      if (a < pstart) { const uintptr_t e = (ohi < pstart ? ohi : pstart); r->res[u][MI_HOLES_RES_SLACK] += (size_t)(e - a); a = e; }
+      if (a < ohi && a < cend) {   // (2) formed blocks: live or free, block by block
+        const uintptr_t e = (ohi < cend ? ohi : cend);
+        size_t idx = (size_t)(a - pstart) / bs;
+        while (a < e) {
+          const uintptr_t bend = pstart + ((idx + 1) * bs);
+          const uintptr_t x = (bend < e ? bend : e);
+          const bool is_free = (freelisted != NULL && mi_holes_block_is_free(page, freelisted, idx));
+          r->res[u][is_free ? MI_HOLES_RES_FREE : MI_HOLES_RES_LIVE] += (size_t)(x - a);
+          a = x; idx++;
+        }
+      }
+      if (a < ohi && a < rend) {   // (3) unformed blocks
+        const uintptr_t x = (ohi < rend ? ohi : rend);
+        r->res[u][MI_HOLES_RES_UNFORMED] += (size_t)(x - a);
+        a = x;
+      }
+      if (a < ohi) { r->res[u][MI_HOLES_RES_SLACK] += (size_t)(ohi - a); }   // (4) past the block area
+    }
+    at += n * psize;
+  }
+}
+
 void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   if (page == NULL || rep == NULL) return;
   const size_t bs = page->block_size;
@@ -1255,7 +1314,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   rep->page_committed_bytes += mi_page_committed(page);
   if (page->reserved > cap) { rep->unformed_bytes += ((size_t)page->reserved - cap) * bs; }
   rep->unformed_discarded_bytes += _mi_page_unformed_purged_bytes(page);
-  if (cap == 0) return;
+  if (cap == 0) { mi_page_residency_split(page, NULL, rep); return; }
 
   uint64_t freelisted[MI_HOLES_MAX_CAP / 64];
   const size_t nwords = _mi_divide_up(cap, 64);
@@ -1264,6 +1323,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   mi_holes_mark_free_list(page, page->local_free, freelisted);
   mi_holes_mark_free_list(page, mi_page_thread_free((mi_page_t*)page), freelisted);   // a concurrent free can push after this read: that block reads as live (a diagnostic, so this is fine)
 
+  mi_page_residency_split(page, freelisted, rep);   // #575
   if (mi_page_holes_madvisable(page)) { mi_page_holes_granularity_curve(page, freelisted, rep); }
   else { rep->unmadvisable_pages++; }
 
@@ -1355,6 +1415,35 @@ static void mi_holes_print_row(const char* name, const mi_holes_bin_t* r) {
               name, r->pages, slive, sfree, sundisc, sdisc, avg100 / 100, avg100 % 100);
 }
 
+// #575: the resident-byte attribution, per bin and in total (this thread's own pages only)
+static void mi_holes_print_residency(const mi_holes_report_t* rep) {
+  static const char* const names[MI_HOLES_RES_COUNT] = { "live", "free_formed", "unformed", "slack" };
+  size_t tot[2][MI_HOLES_RES_COUNT] = {{0}};
+  size_t extent = 0, pages = 0, pages_used = 0, pages_empty = 0;
+  for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+    const mi_holes_bin_t* const r = &rep->bin[bin];
+    if (r->pages == 0) continue;
+    extent += r->res_extent;
+    pages += r->pages;
+    pages_empty += r->empty_pages;
+    for (size_t u = 0; u < 2; u++) { for (size_t c = 0; c < MI_HOLES_RES_COUNT; c++) { tot[u][c] += r->res[u][c]; } }
+    _mi_fprintf(NULL, NULL, "ATTR bin block_size=%zu pages=%zu empty=%zu extent=%zu"
+                " used_live=%zu used_free=%zu used_unformed=%zu used_slack=%zu"
+                " empty_live=%zu empty_free=%zu empty_unformed=%zu empty_slack=%zu"
+                " formed_used=%zu formed_empty=%zu reserved_used=%zu reserved_empty=%zu\n",
+                r->block_size, r->pages, r->empty_pages, r->res_extent,
+                r->res[0][0], r->res[0][1], r->res[0][2], r->res[0][3],
+                r->res[1][0], r->res[1][1], r->res[1][2], r->res[1][3],
+                r->res_formed[0], r->res_formed[1], r->res_reserved[0], r->res_reserved[1]);
+  }
+  pages_used = pages - pages_empty;
+  _mi_fprintf(NULL, NULL, "ATTR total pages=%zu used_pages=%zu empty_pages=%zu extent=%zu", pages, pages_used, pages_empty, extent);
+  for (size_t u = 0; u < 2; u++) {
+    for (size_t c = 0; c < MI_HOLES_RES_COUNT; c++) { _mi_fprintf(NULL, NULL, " %s_%s=%zu", (u == 0 ? "used" : "empty"), names[c], tot[u][c]); }
+  }
+  _mi_fprintf(NULL, NULL, "\n");
+}
+
 void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
   if (rep == NULL) return;
   static const char* hist_name[MI_HOLES_HIST_BUCKETS] = { "1", "2", "3-4", "5-8", "9+" };
@@ -1433,6 +1522,7 @@ void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
     _mi_fprintf(NULL, NULL, "      'in pages' misses pages owned by OTHER threads' theaps -- this walk cannot read them.\n");
   }
 
+  mi_holes_print_residency(rep);   // #575
   _mi_arena_layout_print(&rep->arena_layout);   // #519: prints nothing unless MI_DIAGNOSTICS
 
   _mi_fprintf(NULL, NULL, "%10s %8s %10s %10s %18s %13s %13s\n",

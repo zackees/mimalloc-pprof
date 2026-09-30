@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 063120df of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 1cbd5a74 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -713,6 +713,7 @@ typedef enum mi_option_e {
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
   mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
   mi_option_large_span,                 // size a new large page (blocks of ~84-512 KiB) from its size class's demand on the thread: compact first, growing to 4 MiB (=1). 0 = always 4 MiB (upstream) (#532)
+  mi_option_retired_resident,           // keep at most N of a thread's retired (emptied) large pages resident; publishing one more discards the lowest slot's block area at once (=2). 0 = no cap, the scavenger releases them after MI_RETIRED_RELEASE_MULT purge delays (#575)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -2700,6 +2701,17 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 #ifndef MI_RETIRED_RELEASE_MULT
 #define MI_RETIRED_RELEASE_MULT           (10)
 #endif
+// #575: a thread keeps at most this many of its retired large pages resident (default of
+// `mi_option_retired_resident`). Publishing one more discards the block area of the lowest-slot
+// resident page at once, not after MI_RETIRED_RELEASE_MULT purge delays: large-class-persistent/8
+// held one empty page per large bin per worker, 66 MiB = 43% of its peak RSS. 0 = no cap (#483).
+// MI_RETIRED_TRIM=0 compiles the cap out.
+#ifndef MI_RETIRED_RESIDENT_MAX
+#define MI_RETIRED_RESIDENT_MAX           (2)
+#endif
+#ifndef MI_RETIRED_TRIM
+#define MI_RETIRED_TRIM                   (1)
+#endif
 // #493: an empty large page that a thread leaves behind at its exit is reserved (abandoned into
 // the arena, blocks formed and resident) for the next thread of the heap instead of freed; one
 // that nobody reclaims for this many purge delays goes back to the arena. The same value as
@@ -3513,6 +3525,7 @@ struct mi_tld_s {
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
   size_t                retired_used;         // #530: owner-private bitmask of the occupied `retired_pages` slots (only the owner fills or empties one)
+  size_t                retired_resident;     // #575: owner-private bitmask of the `retired_pages` slots whose block area may still be resident (a subset of `retired_used`)
   size_t                large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
 };
 
@@ -6225,6 +6238,7 @@ typedef enum mi_event_e {
   MI_EVENT_LARGE_REPURPOSE_DENIED,  // ... could not, for lack of this heartbeat's budget
   MI_EVENT_RETIRED_PUBLISH,         // a retired large page was published for the scavenger
   MI_EVENT_RETIRED_UNPUBLISH,       // ... and taken back
+  MI_EVENT_RETIRED_TRIM,            // a retired large page's block area was discarded at once, over the resident cap (#575)
   MI_EVENT_PAGE_MAP_REGISTER,       // a page was registered in the page map
   MI_EVENT_PAGE_MAP_REEXTEND,       // a re-carve changed a page's mapped extent
   MI_EVENT_LARGE_SPAN_GROW,         // a large bin's demand-sized span stepped up (#532)
@@ -6319,6 +6333,7 @@ typedef struct mi_arena_layout_s {
 // #573 A3: the bytes of [start, start+size) resident in RAM now, or SIZE_MAX when the platform
 // cannot say. Diagnostics only (a syscall per call): the layout walk and the holes report.
 size_t        _mi_diag_resident_bytes(const void* start, size_t size);
+bool          _mi_diag_resident_map(const void* start, size_t npages, unsigned char* vec);   // #575
 uint8_t*      mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);   // src/arena.c: the slice must exist
 uint8_t*      mi_arena_slice_end(mi_arena_t* arena, size_t slice_end);       // src/arena.c: one past a range; may be the arena's end (#573)
 
@@ -6331,6 +6346,13 @@ void          _mi_arena_layout_print(const mi_arena_layout_t* layout);
 
 #define MI_HOLES_HIST_BUCKETS  (5)    // live blocks per pinned OS page: 1, 2, 3-4, 5-8, 9+
 #define MI_HOLES_GRAN_COUNT    (5)    // the hypothetical OS page sizes of the granularity curve
+
+// #575: what a resident byte of a page is
+#define MI_HOLES_RES_LIVE      (0)   // inside an allocated block
+#define MI_HOLES_RES_FREE      (1)   // inside a formed free block (free-listed)
+#define MI_HOLES_RES_UNFORMED  (2)   // inside a block not formed yet (`capacity <= idx < reserved`)
+#define MI_HOLES_RES_SLACK     (3)   // in the page's slices but outside `reserved * block_size` (header, geometry slack)
+#define MI_HOLES_RES_COUNT     (4)
 
 typedef struct mi_holes_bin_s {
   size_t block_size;           // the largest block size seen in this bin
@@ -6350,6 +6372,12 @@ typedef struct mi_holes_bin_s {
   size_t pinned_free_bytes;    // free bytes trapped inside those pinned OS pages
   size_t pinned_live_bytes;    // live bytes inside those pinned OS pages
   size_t hist[MI_HOLES_HIST_BUCKETS];
+  // #575: RESIDENT bytes of this bin's pages (`mincore`, whole page extent), split by what the bytes
+  // are. Index 0: pages with a live block; 1: empty pages (retired or not).
+  size_t res[2][MI_HOLES_RES_COUNT];
+  size_t res_extent;           // #575: the bytes of address space the bin's pages span
+  size_t res_formed[2];        // #575: bytes of formed blocks (`capacity * block_size`), [0] used pages, [1] empty ones
+  size_t res_reserved[2];      // #575: bytes of the block area (`reserved * block_size`), same split
 } mi_holes_bin_t;
 
 typedef struct mi_holes_report_s {
@@ -19974,6 +20002,7 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   0,                      // fork_gen (#293)
   { 0 },                  // retired_pages (#483)
   0,                      // retired_used (#530)
+  0,                      // retired_resident (#575)
   0                       // large_repurpose_left (#530)
 };
 
@@ -23015,6 +23044,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(page_reserve) }           // #493: reserve an exiting thread's empty large pages for the next thread (MIMALLOC_PAGE_RESERVE); 0 frees them as upstream
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(resident_first) }         // #493: claim free-but-resident (queued for purge) arena slices first (MIMALLOC_RESIDENT_FIRST); 0 = the plain search only
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(large_span) }             // #532: demand-sized large-page spans (MIMALLOC_LARGE_SPAN); 0 = every large page is MI_LARGE_PAGE_SIZE
+  ,{ MI_RETIRED_RESIDENT_MAX, MI_OPTION_UNINIT, MI_OPTION(retired_resident) }   // #575: resident retired large pages per thread (MIMALLOC_RETIRED_RESIDENT); 0 = no cap
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
@@ -27916,6 +27946,34 @@ static bool mi_retired_mask_covers_slots(const mi_tld_t* tld) {
 }
 #endif
 
+#if MI_RETIRED_TRIM
+// #575: over `mi_option_retired_resident` resident retired pages, discard the block area of the
+// lowest-slot ones (never slot `keep`, the page just published) now, with the scavenger's own
+// protocol: swap the slot to BUSY for one discard. The owner-private `retired_resident` mask
+// over-approximates (the scavenger's release does not clear a bit): a page found already
+// discarded, or gone, just drops its bit. Only called on publish, a slow path.
+static void mi_retired_trim_over_cap(mi_tld_t* tld, size_t keep) {
+  const long cap = mi_option_get(mi_option_retired_resident);
+  if (cap <= 0) return;
+  while ((long)mi_popcount(tld->retired_resident) > cap) {
+    const size_t others = tld->retired_resident & ~((size_t)1 << keep);
+    if (others == 0) return;
+    const size_t k = mi_ctz(others);
+    tld->retired_resident &= ~((size_t)1 << k);
+    _Atomic(mi_page_t*)* const slot = &tld->retired_pages[k];
+    mi_page_t* victim = mi_atomic_load_ptr_relaxed(mi_page_t, slot);
+    if (victim == NULL || victim == MI_RETIRED_SLOT_BUSY) continue;
+    if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &victim, MI_RETIRED_SLOT_BUSY)) continue;
+    if (_mi_page_unformed_purged_bytes(victim) == 0) {   // (not discarded already)
+      mi_page_purge_unformed_tail(victim);   // `capacity == 0`: the whole block area
+      mi_page_discard_slack(victim);
+      MI_EVENT(MI_EVENT_RETIRED_TRIM);
+    }
+    mi_atomic_store_ptr_release(mi_page_t, slot, victim);
+  }
+}
+#endif
+
 // Owner only (from `_mi_page_retire`): reset an emptied large page and publish it for the
 // scavenger. When every slot is taken the page simply stays retired as upstream keeps it.
 void _mi_page_publish_retired(mi_page_t* page) {
@@ -27936,6 +27994,7 @@ void _mi_page_publish_retired(mi_page_t* page) {
       if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[k]) != NULL) { used |= ((size_t)1 << k); }
     }
     tld->retired_used = used;
+    tld->retired_resident &= used;   // (#575)
     free_mask = ~used & MI_RETIRED_SLOTS_MASK;
     if (free_mask == 0) return;   // all slots full: leave it unpublished
   }
@@ -27954,6 +28013,10 @@ void _mi_page_publish_retired(mi_page_t* page) {
   mi_atomic_store_ptr_release(mi_page_t, slot, page);   // publishes the reset above to the scavenger
   MI_EVENT(MI_EVENT_RETIRED_PUBLISH);   // (#573)
   MI_PROBE1(retired_publish, page->block_size);
+  #if MI_RETIRED_TRIM
+  tld->retired_resident |= ((size_t)1 << i);
+  mi_retired_trim_over_cap(tld, i);
+  #endif
   _mi_pages_release_schedule(mi_page_subproc(page));
 }
 
@@ -27993,6 +28056,7 @@ void _mi_page_unpublish_retired(mi_page_t* page, mi_tld_t* owner_tld) {
   }
   if (tld != NULL && slot >= &tld->retired_pages[0] && slot < &tld->retired_pages[MI_RETIRED_PAGE_SLOTS]) {
     tld->retired_used &= ~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));
+    tld->retired_resident &= ~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));   // (#575)
   }
   // (else -- a heap delete from another thread -- the bit stays set until the owner's next publish
   // finds no free bit and rebuilds the mask from the slots)
@@ -28331,6 +28395,65 @@ static void mi_page_holes_granularity_curve(const mi_page_t* page, const uint64_
   }
 }
 
+
+// #575 (#422 Step 0): split the RESIDENT bytes of this page's whole slice extent (`mincore`, so a
+// THP fault-around neighbour counts like any other resident byte) by what each byte is: inside a
+// live block, a formed free block, a block not formed yet, or outside `reserved * block_size`
+// (header and geometry slack). Read-only, untimed, diagnostics only. `freelisted` is NULL for a
+// page with no formed block.
+#ifndef MI_HOLES_RES_CHUNK_PAGES
+#define MI_HOLES_RES_CHUNK_PAGES  (1024)
+#endif
+static void mi_page_residency_split(const mi_page_t* page, const uint64_t* freelisted, mi_holes_report_t* rep) {
+  if (page->memid.memkind != MI_MEM_ARENA) return;
+  const size_t bs = page->block_size;
+  const size_t cap = page->capacity;
+  const size_t psize = _mi_os_page_size();
+  const uintptr_t lo = (uintptr_t)mi_page_slice_start(page);
+  const uintptr_t hi = lo + ((size_t)page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE);
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
+  const uintptr_t cend = pstart + (cap * bs);                        // end of the formed blocks
+  const uintptr_t rend = pstart + ((size_t)page->reserved * bs);     // end of the block area
+  mi_holes_bin_t* const r = &rep->bin[_mi_bin(bs)];
+  const size_t u = (page->used == 0 ? 1 : 0);
+  r->res_extent += (size_t)(hi - lo);
+  r->res_formed[u] += cap * bs;
+  r->res_reserved[u] += (size_t)page->reserved * bs;
+  unsigned char vec[MI_HOLES_RES_CHUNK_PAGES];
+  for (uintptr_t at = lo; at < hi; ) {
+    size_t n = (size_t)(hi - at) / psize;
+    if (n > MI_HOLES_RES_CHUNK_PAGES) n = MI_HOLES_RES_CHUNK_PAGES;
+    if (n == 0) break;
+    if (!_mi_diag_resident_map((const void*)at, n, vec)) return;
+    for (size_t k = 0; k < n; k++) {
+      if (vec[k] == 0) continue;
+      const uintptr_t olo = at + (k * psize);
+      const uintptr_t ohi = olo + psize;
+      // (1) bytes before the block area or past `reserved`: slack
+      uintptr_t a = olo;
+      if (a < pstart) { const uintptr_t e = (ohi < pstart ? ohi : pstart); r->res[u][MI_HOLES_RES_SLACK] += (size_t)(e - a); a = e; }
+      if (a < ohi && a < cend) {   // (2) formed blocks: live or free, block by block
+        const uintptr_t e = (ohi < cend ? ohi : cend);
+        size_t idx = (size_t)(a - pstart) / bs;
+        while (a < e) {
+          const uintptr_t bend = pstart + ((idx + 1) * bs);
+          const uintptr_t x = (bend < e ? bend : e);
+          const bool is_free = (freelisted != NULL && mi_holes_block_is_free(page, freelisted, idx));
+          r->res[u][is_free ? MI_HOLES_RES_FREE : MI_HOLES_RES_LIVE] += (size_t)(x - a);
+          a = x; idx++;
+        }
+      }
+      if (a < ohi && a < rend) {   // (3) unformed blocks
+        const uintptr_t x = (ohi < rend ? ohi : rend);
+        r->res[u][MI_HOLES_RES_UNFORMED] += (size_t)(x - a);
+        a = x;
+      }
+      if (a < ohi) { r->res[u][MI_HOLES_RES_SLACK] += (size_t)(ohi - a); }   // (4) past the block area
+    }
+    at += n * psize;
+  }
+}
+
 void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   if (page == NULL || rep == NULL) return;
   const size_t bs = page->block_size;
@@ -28351,7 +28474,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   rep->page_committed_bytes += mi_page_committed(page);
   if (page->reserved > cap) { rep->unformed_bytes += ((size_t)page->reserved - cap) * bs; }
   rep->unformed_discarded_bytes += _mi_page_unformed_purged_bytes(page);
-  if (cap == 0) return;
+  if (cap == 0) { mi_page_residency_split(page, NULL, rep); return; }
 
   uint64_t freelisted[MI_HOLES_MAX_CAP / 64];
   const size_t nwords = _mi_divide_up(cap, 64);
@@ -28360,6 +28483,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   mi_holes_mark_free_list(page, page->local_free, freelisted);
   mi_holes_mark_free_list(page, mi_page_thread_free((mi_page_t*)page), freelisted);   // a concurrent free can push after this read: that block reads as live (a diagnostic, so this is fine)
 
+  mi_page_residency_split(page, freelisted, rep);   // #575
   if (mi_page_holes_madvisable(page)) { mi_page_holes_granularity_curve(page, freelisted, rep); }
   else { rep->unmadvisable_pages++; }
 
@@ -28451,6 +28575,35 @@ static void mi_holes_print_row(const char* name, const mi_holes_bin_t* r) {
               name, r->pages, slive, sfree, sundisc, sdisc, avg100 / 100, avg100 % 100);
 }
 
+// #575: the resident-byte attribution, per bin and in total (this thread's own pages only)
+static void mi_holes_print_residency(const mi_holes_report_t* rep) {
+  static const char* const names[MI_HOLES_RES_COUNT] = { "live", "free_formed", "unformed", "slack" };
+  size_t tot[2][MI_HOLES_RES_COUNT] = {{0}};
+  size_t extent = 0, pages = 0, pages_used = 0, pages_empty = 0;
+  for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+    const mi_holes_bin_t* const r = &rep->bin[bin];
+    if (r->pages == 0) continue;
+    extent += r->res_extent;
+    pages += r->pages;
+    pages_empty += r->empty_pages;
+    for (size_t u = 0; u < 2; u++) { for (size_t c = 0; c < MI_HOLES_RES_COUNT; c++) { tot[u][c] += r->res[u][c]; } }
+    _mi_fprintf(NULL, NULL, "ATTR bin block_size=%zu pages=%zu empty=%zu extent=%zu"
+                " used_live=%zu used_free=%zu used_unformed=%zu used_slack=%zu"
+                " empty_live=%zu empty_free=%zu empty_unformed=%zu empty_slack=%zu"
+                " formed_used=%zu formed_empty=%zu reserved_used=%zu reserved_empty=%zu\n",
+                r->block_size, r->pages, r->empty_pages, r->res_extent,
+                r->res[0][0], r->res[0][1], r->res[0][2], r->res[0][3],
+                r->res[1][0], r->res[1][1], r->res[1][2], r->res[1][3],
+                r->res_formed[0], r->res_formed[1], r->res_reserved[0], r->res_reserved[1]);
+  }
+  pages_used = pages - pages_empty;
+  _mi_fprintf(NULL, NULL, "ATTR total pages=%zu used_pages=%zu empty_pages=%zu extent=%zu", pages, pages_used, pages_empty, extent);
+  for (size_t u = 0; u < 2; u++) {
+    for (size_t c = 0; c < MI_HOLES_RES_COUNT; c++) { _mi_fprintf(NULL, NULL, " %s_%s=%zu", (u == 0 ? "used" : "empty"), names[c], tot[u][c]); }
+  }
+  _mi_fprintf(NULL, NULL, "\n");
+}
+
 void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
   if (rep == NULL) return;
   static const char* hist_name[MI_HOLES_HIST_BUCKETS] = { "1", "2", "3-4", "5-8", "9+" };
@@ -28529,6 +28682,7 @@ void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
     _mi_fprintf(NULL, NULL, "      'in pages' misses pages owned by OTHER threads' theaps -- this walk cannot read them.\n");
   }
 
+  mi_holes_print_residency(rep);   // #575
   _mi_arena_layout_print(&rep->arena_layout);   // #519: prints nothing unless MI_DIAGNOSTICS
 
   _mi_fprintf(NULL, NULL, "%10s %8s %10s %10s %18s %13s %13s\n",
@@ -29737,6 +29891,20 @@ size_t _mi_diag_resident_bytes(const void* start, size_t size) {
   #endif
 }
 
+// #575: which OS pages of [start, start + npages * page size) are resident (`mincore`): vec[i] is
+// 1 or 0 per OS page. False when this platform or build cannot say (or the range is unmapped).
+bool _mi_diag_resident_map(const void* start, size_t npages, unsigned char* vec) {
+  #if MI_DIAG_RESIDENT
+  const size_t psize = _mi_os_page_size();
+  if (mincore((void*)start, npages * psize, vec) != 0) return false;
+  for (size_t i = 0; i < npages; i++) { vec[i] &= 1; }
+  return true;
+  #else
+  MI_UNUSED(start); MI_UNUSED(npages); MI_UNUSED(vec);
+  return false;
+  #endif
+}
+
 // The `run_hist` bucket of a run of `run_slices` slices: floor(log2(run_slices)), so bucket b
 // holds the lengths [2^b, 2^(b+1)). Needs no build flag: it is pure arithmetic.
 size_t _mi_arena_layout_bucket(size_t run_slices) {
@@ -29940,7 +30108,7 @@ static _Atomic(size_t) mi_event_counts[MI_EVENT_COUNT];
 
 static const char* const mi_event_names[MI_EVENT_COUNT] = {
   "large_page_request", "large_repurpose", "large_repurpose_denied",
-  "retired_publish", "retired_unpublish",
+  "retired_publish", "retired_unpublish", "retired_trim",
   "page_map_register", "page_map_reextend",
   "large_span_grow", "large_span_shrink",
   "arena_page_alloc", "arena_page_free"

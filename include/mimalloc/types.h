@@ -1117,8 +1117,8 @@ struct mi_tld_s {
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
-  size_t                retired_used;         // #530: owner-private bitmask of the occupied `retired_pages` slots (only the owner fills or empties one)
-  size_t                retired_resident;     // #575: owner-private bitmask of the `retired_pages` slots whose block area may still be resident (a subset of `retired_used`)
+  uint32_t              retired_used;         // #530: owner-private bitmask of the occupied `retired_pages` slots (only the owner fills or empties one)
+  uint32_t              retired_resident;     // #575: owner-private bitmask of the `retired_pages` slots whose block area may still be resident (a subset of `retired_used`; a second word-pair member so the struct does not grow)
   size_t                large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
 };
 

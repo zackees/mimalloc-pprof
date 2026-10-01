@@ -63,7 +63,13 @@ jobs:
       - uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
+      # Fail before any build if the lockfile setup-soldr's yank audit reads is
+      # missing; otherwise the audit fails in the post step, ~45 min later.
+      - name: preflight lockfile
+        run: test -f rust/Cargo.lock
       - uses: zackees/setup-soldr@v0
+        with:
+          lockfile: rust/Cargo.lock
       - name: build pprof-tax configurations
         run: |
           set -euxo pipefail

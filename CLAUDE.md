@@ -33,6 +33,12 @@ explicitly say `- State: **ready-to-publish**.`; a dry run never sets that state
 See
 `docs/ci-gates.md` and `ci/release_full_ci_manifest.v1.json`.
 
+0. **Stamp every PR head with the local gate** (zackees/ci.yml#166/#190/#198). Before each push run
+   `uvx --from git+https://github.com/zackees/ci.yml@0d0c5545b0f574f31c70fae2f961863984a13eae ci-lint local-gate run`
+   on a clean, committed tree (it runs `ci/local_gate.py`, the python-lint job's checks, and adds
+   `Local-Gate:`/`Ci-Attestation:` trailers). `python-lint.yml`'s `ci-mode` fails an unstamped PR
+   head, and skips the remote `lint` job for a stamped in-policy one; main pushes always run it.
+   See `local-gate.toml` and `ci-attestations.yml`.
 1. **Never commit directly to `main`.** Feature branch → PR → merge. Branch names come from
    the sub-issue. One PR per phase. Conventional commits (`feat:`, `fix:`, `ci:`, `docs:`, `test:`).
 2. **Never mix C-core paths (`src/`, `include/`, `test/`, `CMakeLists.txt`) and `rust/` paths

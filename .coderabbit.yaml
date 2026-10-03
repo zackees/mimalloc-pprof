@@ -1,0 +1,8 @@
+# zackees/ci.yml GATE-012: checks act cannot run never gate a PR. CodeRabbit (a GitHub App) does
+# not review automatically or post a commit status; request a review explicitly when wanted.
+reviews:
+  auto_review:
+    enabled: false
+  commit_status: false
+  fail_commit_status: false
+  request_changes_workflow: false

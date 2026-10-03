@@ -840,149 +840,30 @@ def run_rust(ctx: RunCtx) -> bool:
 
 
 def run_lint(ctx: RunCtx) -> bool:
-    """python-lint.yml job `lint` (its only job, already ubuntu-latest).
+    """python-lint.yml job `lint`: exactly the local gate's `lint` lane.
 
-    Every tool/script below runs through `uv run --with <pkg>==<version> ...` --
-    pinned to the same versions `.github/workflows/python-lint.yml`'s `pip install`
-    line uses -- rather than a bare `ruff`/`pyright`/`python3`, so this config never
-    depends on (or silently drifts from) whatever happens to be on the ambient PATH.
+    Since zackees/ci.yml#166 (GATE-001) the remote job runs `ci/local_gate.py --lane lint` and
+    nothing else, and ci/local_gate.py holds the check list and the pinned tool versions, so this
+    config runs the same command instead of keeping a third copy of the list. That lane also
+    runs `ci/memory_gate_lane_decide.py --selftest`, the decision c-unit.yml's
+    `memory-gate-decide` job makes from the PR diff (no local config of its own: it needs one).
     """
-    ok = True
-    rc, _ = run_logged(
-        ["uv", "run", "--with", "ruff==0.12.10", "ruff", "check", "ci/"], cwd=ROOT, log=ctx.log
-    )
-    ok = ok and rc == 0
-    rc, _ = run_logged(
-        ["uv", "run", "--with", "ruff==0.12.10", "ruff", "format", "--check", "ci/"],
-        cwd=ROOT,
-        log=ctx.log,
-    )
-    ok = ok and rc == 0
-    # (pytest and pyyaml in the same environment, as python-lint.yml's single `pip install`:
-    # without them pyright cannot resolve the test modules' imports and reports hundreds of
-    # errors that CI does not see)
     rc, _ = run_logged(
         [
             "uv",
             "run",
-            "--with",
-            "pyright[nodejs]==1.1.411",
-            "--with",
-            "pyyaml==6.0.2",
-            "--with",
-            "pytest==8.3.4",
-            "pyright",
-        ],
-        cwd=ROOT,
-        log=ctx.log,
-    )
-    ok = ok and rc == 0
-
-    for cmd in (
-        ["uv", "run", "ci/check_isa_baseline.py", "--selftest"],
-        ["uv", "run", "ci/check_internal_state.py", "--selftest"],
-        ["uv", "run", "ci/check_rust_surface.py", "--selftest"],
-        ["uv", "run", "ci/check_rust_surface.py"],
-        ["uv", "run", "ci/check_scaling_typed_renderer.py", "--selftest"],
-        ["uv", "run", "ci/check_scaling_typed_renderer.py"],
-        ["uv", "run", "ci/check_isa_baseline.py", "--help"],
-        ["uv", "run", "ci/check_release_equivalence.py", "--help"],
-        # The committed chart SVGs must still re-render byte-for-byte from the
-        # committed CSV/JSON. Nothing ran these before, so a renderer edit could ship
-        # SVGs whose captions no longer matched the data they claim to come from.
-        # `--check` re-renders and compares; it never re-measures.
-        ["uv", "run", "ci/bench_hole_purging.py", "--check"],
-        ["uv", "run", "ci/bench_hole_purging.py", "--check", "--table"],
-        ["uv", "run", "ci/bench_hole_purging_allocators.py", "--check"],
-        ["uv", "run", "ci/bench_hole_purging_allocators.py", "--check", "--table"],
-        [
-            "uv",
-            "run",
-            "ci/bench_arena_reclaim.py",
-            "--check",
-            "--data",
-            ".github/assets/arena-reclaim-linux-pr.json",
-        ],
-        # Same idea for the README's allocator feature table and its two SVGs: they
-        # render from docs/allocator-features.json, and `--check` fails if any of the
-        # three has drifted from it.
-        ["uv", "run", "ci/render_feature_table.py", "--check"],
-        # Selective macOS lane helpers (#339): the label check that runs on every
-        # cross-built bundle and the PR-diff decision that picks the lane.
-        ["uv", "run", "ci/check_macos_labels.py", "--selftest"],
-        ["uv", "run", "ci/macos_lane_decide.py", "--selftest"],
-        # The minimal-lane memory gate's PR-diff decision (#518).
-        ["uv", "run", "ci/memory_gate_lane_decide.py", "--selftest"],
-        # No file-wide -Wunused-function suppression; the amalgamation compiles with
-        # -Werror=unused-function when clang is available.
-        ["uv", "run", "ci/check_no_diagnostic_suppression.py", "--selftest"],
-        ["uv", "run", "ci/check_no_diagnostic_suppression.py"],
-        # #573: page geometry has one writer; the size-class-edge structs stay in budget.
-        ["uv", "run", "ci/check_page_geometry_writes.py", "--selftest"],
-        ["uv", "run", "ci/check_page_geometry_writes.py"],
-        ["uv", "run", "ci/check_struct_sizes.py", "--selftest"],
-        ["uv", "run", "ci/check_struct_sizes.py"],
-        # #573 A5: needs <sys/sdt.h>; without it the check says so and passes (CI requires it).
-        ["uv", "run", "ci/check_usdt_probes.py", "--selftest"],
-        ["uv", "run", "ci/check_usdt_probes.py"],
-        ["uv", "run", "ci/scaling_failure_alert.py", "--selftest"],
-        ["uv", "run", "ci/check_macro_case.py", "--selftest"],
-        ["uv", "run", "ci/check_macro_case.py"],
-        ["uv", "run", "ci/check_release_ratchet.py", "--selftest"],
-        ["uv", "run", "ci/check_release_ratchet.py", "--base", "origin/main"],
-    ):
-        rc, _ = run_logged(cmd, cwd=ROOT, log=ctx.log)
-        ok = ok and rc == 0
-    rc, out = run_logged(["uv", "run", "ci/memory_gate.py"], cwd=ROOT, log=ctx.log)
-    ok = ok and "Exit codes" in out
-
-    # These workflow checkers import `yaml`, which python-lint.yml's job-level `pip install`
-    # provides for every subsequent bare `python3` call in that job. Nothing here
-    # guarantees the ambient interpreter has PyYAML, so run them the same way
-    # ci/tests gets it below: an ephemeral `uv run --with pyyaml==...` environment.
-    for script in (
-        "ci/check_benchmark_workflow.py",
-        "ci/check_benchmark_memory_workflow.py",
-        "ci/check_benchmark_latency_workflow.py",
-        "ci/check_benchmark_scaling_workflow.py",
-        "ci/check_large_span_diagnostic_workflow.py",
-        "ci/check_benchmark_pprof_tax_workflow.py",
-        "ci/build_pprof_tax_configurations.py",
-        # #371 layer 3: the published-parity assertion's own parsers.
-        "ci/check_scaling_parity.py",
-    ):
-        rc, _ = run_logged(
-            ["uv", "run", "--with", "pyyaml==6.0.2", script, "--selftest"],
-            cwd=ROOT,
-            log=ctx.log,
-        )
-        ok = ok and rc == 0
-
-    # Issue #277 phase B2: no workflow -- nor azure-pipelines.yml -- may schedule onto a
-    # native macOS runner. Run bare, unlike the four above: this script carries a PEP-723
-    # header declaring its own PyYAML, so the command in its docstring works on a fresh
-    # checkout. Injecting --with here would hide a regression in that header.
-    rc, _ = run_logged(["uv", "run", "ci/lint_no_macos_runners.py"], cwd=ROOT, log=ctx.log)
-    ok = ok and rc == 0
-
-    rc, _ = run_logged(
-        [
-            "uv",
-            "run",
-            "--with",
-            "pyyaml==6.0.2",
-            "--with",
-            "pytest==8.3.4",
+            "--no-project",
+            "--python",
+            "3.13",
             "python",
-            "-m",  # (python -m pytest puts the repository root on sys.path: `from ci import release`)
-            "pytest",
-            "ci/tests",
-            "-q",
+            "ci/local_gate.py",
+            "--lane",
+            "lint",
         ],
         cwd=ROOT,
         log=ctx.log,
     )
-    return ok and rc == 0
+    return rc == 0
 
 
 # Issue #301. `MI_TRACK_ASAN` is not a compiler flag we control -- CMakeLists probes for

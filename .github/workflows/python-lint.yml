@@ -19,133 +19,49 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # zackees/ci.yml#166 (GATE-002/003): the lint job needs this one, so a PR head that never passed
+  # the local gate (`ci-lint local-gate run`, which stamps a tree-bound `Local-Gate:` trailer)
+  # fails here in seconds. #190/#198 (GATE-008/010): on an attested, in-policy PR head it outputs
+  # skip_lint=true and the lint job is skipped (the required `lint` check then reports skipped,
+  # which GitHub accepts, like the minimal lane's skipped run-linux); pushes to main never skip. The ci_lint ref is ci/local_gate.py's CI_LINT_REF
+  # (ci/tests/test_local_gate.py keeps the two in step).
+  ci-mode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      trusted: ${{ steps.gate.outputs.trusted }}
+      skip_lint: ${{ steps.gate.outputs.skip_lint }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          # Full history: GATE-008 reads the base commit's local-gate.toml and diffs the PR
+          # from its merge base; GATE-003 accepts an "Update branch" merge head through its
+          # attested first parent.
+          fetch-depth: 0
+      - name: Fetch ci_lint
+        run: |
+          set -euo pipefail
+          git init -q "$RUNNER_TEMP/ci-lint"
+          git -C "$RUNNER_TEMP/ci-lint" fetch -q --depth=1 https://github.com/zackees/ci.yml 0d0c5545b0f574f31c70fae2f961863984a13eae
+          git -C "$RUNNER_TEMP/ci-lint" checkout -q FETCH_HEAD
+      - name: Local gate attestation
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: PYTHONPATH="$RUNNER_TEMP/ci-lint" python3 -m ci_lint local-gate verify --repo . --trust --github-output
+
   lint:
+    needs: ci-mode
+    if: needs.ci-mode.outputs.skip_lint != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-      # Pinned so a tool release cannot turn a green PR red (or a red one green)
-      # without a commit that says so.
-      - run: pip install ruff==0.12.10 pyright==1.1.411 pyyaml==6.0.2 pytest==8.3.4 pytest-xdist==3.6.1
-      - run: ruff check ci/
-      - run: ruff format --check ci/
-      - run: pyright
-      - run: python3 ci/check_scaling_typed_renderer.py --selftest
-      - run: python3 ci/check_scaling_typed_renderer.py
-      # The linters must not have changed behavior. These are the same checks the
-      # isa-baseline job runs, minus the compile: parser fixtures for both
-      # architectures, which is what caught the arm64 breakage in the first place.
-      - name: Gate scripts still work
-        run: |
-          python3 ci/check_isa_baseline.py --selftest
-          python3 ci/check_internal_state.py --selftest
-          # Parses C headers and Rust source with regexes; a regex that matches nothing
-          # reports "clean" exactly as loudly as one that works.
-          python3 ci/check_rust_surface.py --selftest
-          python3 ci/check_rust_surface.py
-          # A gate script that imports cleanly but crashes on argv is still broken.
-          python3 ci/memory_gate.py 2>&1 | grep -q "Exit codes"
-          python3 ci/check_isa_baseline.py --help > /dev/null
-          python3 ci/check_release_equivalence.py --help > /dev/null
-      # The benchmark publication policy checkers gate a workflow that can push
-      # to a public branch and to Pages. They were previously unreachable from
-      # any workflow, so a policy regression could not fail anything.
-      - name: Benchmark workflow policy checkers
-        run: |
-          set -euo pipefail
-          python3 ci/check_benchmark_workflow.py --selftest
-          python3 ci/check_benchmark_memory_workflow.py --selftest
-          python3 ci/check_benchmark_latency_workflow.py --selftest
-          python3 ci/check_benchmark_scaling_workflow.py --selftest
-          python3 ci/check_large_span_diagnostic_workflow.py --selftest
-          python3 ci/check_benchmark_pprof_tax_workflow.py --selftest
-          python3 ci/build_pprof_tax_configurations.py --selftest
-          python3 ci/check_scaling_parity.py --selftest
-      # Issue #277 phase B2. Both Apple architectures are cross-built on Linux and the
-      # x86_64 bundle runs under dockurr/macos, so a macOS runner label anywhere in
-      # .github/workflows is a regression. This is the check that says so out loud --
-      # see the module docstring for why it parses the YAML instead of grepping it.
-      - name: No workflow may schedule onto a native macOS runner
-        run: python3 ci/lint_no_macos_runners.py
-      # No file-wide `-Wunused-function` suppression anywhere, and the vendored
-      # amalgamation compiles with `-Werror=unused-function` across the Rust feature
-      # combinations (ubuntu-latest ships clang; the script skips the compile without it).
-      - name: No -Wunused-function suppression
-        run: |
-          set -euo pipefail
-          python3 ci/check_no_diagnostic_suppression.py --selftest
-          python3 ci/check_no_diagnostic_suppression.py
-      # #573: a page's geometry changes in one place only (it owns the page-map re-registration),
-      # and the structs at a size-class edge stay within ci/struct_size_budget.json.
-      - name: Page geometry writes and struct size budget
-        run: |
-          set -euo pipefail
-          python3 ci/check_page_geometry_writes.py --selftest
-          python3 ci/check_page_geometry_writes.py
-          python3 ci/check_struct_sizes.py --selftest
-          python3 ci/check_struct_sizes.py
-      # #573 A5: the USDT probes are emitted when asked for (MI_USDT=1) and never otherwise.
-      - name: USDT probes are emitted, and only when asked for
-        run: |
-          set -euo pipefail
-          sudo apt-get install -y --no-install-recommends systemtap-sdt-dev binutils
-          python3 ci/check_usdt_probes.py --selftest
-          python3 ci/check_usdt_probes.py --require
-      # #573 B9: the scheduled-failure alert opens or updates one issue.
-      - name: Scaling failure alert
-        run: python3 ci/scaling_failure_alert.py --selftest
-      # Macros are UPPER_CASE; ci/macro_case_baseline.txt grandfathers the inherited ones.
-      - name: Macro names are upper case
-        run: |
-          set -euo pipefail
-          python3 ci/check_macro_case.py --selftest
-          python3 ci/check_macro_case.py
-      # #491: the release-time bound may only go down, with perf-ab evidence (ci/release_ratchet.json).
-      - name: Release-time ratchet
-        env:
-          BASE: ${{ github.base_ref || 'main' }}
-        run: |
-          set -euo pipefail
-          python3 ci/check_release_ratchet.py --selftest
-          git fetch --depth=1 origin "$BASE"
-          python3 ci/check_release_ratchet.py --base FETCH_HEAD
-      - name: Selective macOS lane helpers (#339)
-        run: |
-          set -euo pipefail
-          python3 ci/check_macos_labels.py --selftest
-          python3 ci/macos_lane_decide.py --selftest
-      - name: Minimal-lane memory gate decision (#518)
-        run: python3 ci/memory_gate_lane_decide.py --selftest
-
-      # The committed chart SVGs under .github/assets must still re-render
-      # byte-for-byte from the committed CSV/JSON they name. `--check` re-renders and
-      # compares; it never re-measures, so this needs no allocator build and no
-      # benchmark machine. Without it, a renderer edit can ship an SVG whose caption
-      # no longer matches the data it claims to come from -- which is exactly the kind
-      # of drift the charts exist to rule out.
-      - name: Committed benchmark charts still re-render from their committed data
-        run: |
-          set -euo pipefail
-          python3 ci/bench_hole_purging.py --check
-          python3 ci/bench_hole_purging.py --check --table
-          python3 ci/bench_hole_purging_allocators.py --check
-          python3 ci/bench_hole_purging_allocators.py --check --table
-          python3 ci/bench_hole_purging_allocators.py --check --busy-threads
-          python3 ci/bench_arena_reclaim.py --check --data .github/assets/arena-reclaim-linux-pr.json
-
-      # Same argument, different data: the README's allocator feature table and the two
-      # allocator-features SVGs are rendered from docs/allocator-features.json. Editing
-      # the JSON without re-rendering, or hand-editing the README region, would ship a
-      # table that disagrees with its own sourced data -- which is worse than no table,
-      # because the sources are the whole reason to believe it.
-      - name: The feature table still re-renders from docs/allocator-features.json
-        run: python3 ci/render_feature_table.py --check
-
-      # pytest-xdist: serial, this step was ~2m50s of the job's ~3m30s -- the critical path
-      # of every minimal-lane PR. ten test_benchmark_report.py cases deep-copy large fixtures
-      # thousands of times (~100 s of the serial total); spreading them over the runner's
-      # cores cut the suite to ~45 s locally (858 passed, -n 4) with no test changes.
-      - name: Benchmark report and policy unit tests
-        run: python3 -m pytest ci/tests -q -n auto --dist worksteal
+      - uses: astral-sh/setup-uv@v3
+      # check_usdt_probes.py --require compiles src/static.c against <sys/sdt.h>.
+      - name: Install USDT probe headers
+        run: sudo apt-get install -y --no-install-recommends systemtap-sdt-dev binutils
+      # GATE-001: exactly the local gate's lint lane; ci/local_gate.py lists every check
+      # (ruff, pyright, the gate-script selftests, the chart/table re-renders, pytest ci/tests).
+      - run: uv run --no-project --python 3.13 python ci/local_gate.py --lane lint

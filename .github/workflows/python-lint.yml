@@ -28,7 +28,7 @@ jobs:
           python-version: '3.13'
       # Pinned so a tool release cannot turn a green PR red (or a red one green)
       # without a commit that says so.
-      - run: pip install ruff==0.12.10 pyright==1.1.411 pyyaml==6.0.2 pytest==8.3.4
+      - run: pip install ruff==0.12.10 pyright==1.1.411 pyyaml==6.0.2 pytest==8.3.4 pytest-xdist==3.6.1
       - run: ruff check ci/
       - run: ruff format --check ci/
       - run: pyright
@@ -143,5 +143,9 @@ jobs:
       - name: The feature table still re-renders from docs/allocator-features.json
         run: python3 ci/render_feature_table.py --check
 
+      # pytest-xdist: serial, this step was ~2m50s of the job's ~3m30s -- the critical path
+      # of every minimal-lane PR. ten test_benchmark_report.py cases deep-copy large fixtures
+      # thousands of times (~100 s of the serial total); spreading them over the runner's
+      # cores cut the suite to ~45 s locally (858 passed, -n 4) with no test changes.
       - name: Benchmark report and policy unit tests
-        run: python3 -m pytest ci/tests -q
+        run: python3 -m pytest ci/tests -q -n auto --dist worksteal

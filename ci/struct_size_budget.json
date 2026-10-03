@@ -1,5 +1,0 @@
-{
-  "comment": "#573: sizes of the structs that sit at the edge of an allocator size class. mi_theap_t is allocated from the meta-allocator; at 8168 + 8 bytes of padding it sits just under the 8 KiB class, and 8 more bytes made CI ASan test-resident-first-churn flaky. mi_tld_t is at the 512-byte class. Put new per-thread state in mi_tld_t only while it fits; raise a budget deliberately, after checking the size class, and keep MI_THEAP_META_MAX_SIZE in include/mimalloc/types.h equal to the first number.",
-  "mi_theap_t_plus_padding": 8176,
-  "mi_tld_t": 512
-}

@@ -35,14 +35,26 @@ platforms = ["linux-x64"]
 suites    = ["lint", "c-unit"]
 budget    = { critical-path = "12m" }
 
+# NO `pre-prune = true` here, deliberately (zackees/ci.yml#352, CACHE-034). The waiver dropped
+# CACHE-004's lockfile-change-peak term, and no workflow in this repository runs
+# `ci-lint cache preprune` -- so the declaration was not true and the modelled footprint was
+# understated by 8,294,236,160 B for free.
+#
+# Removing it makes CACHE-004 FAIL, honestly: steady 8,619,294,720 B + lockfile peak
+# 8,294,236,160 B = 16,913,530,880 B against a 9.5GB (10,200,547,328 B) budget. That number is
+# left visible rather than papered over. `ci-lint cache preprune --lockfile-changed --dry-run`
+# confirms the peak is not hypothetical: run live against the 82 real entries it forecasts
+# 16,913,530,880 B and finds 12 superseded lockfile-keyed entries it would delete.
+#
+# The real problem this exposes is upstream of the waiver: the steady total alone (8.02 GiB) is
+# already 85% of the budget, because `per = "platform"` (7) over-counts families that key on the
+# runner OS, not the target triple -- the very thing the `shapes` note below declines to use.
+# Fixing the cardinality, not the waiver, is what buys the peak term back. See the PR body.
 [flow.main]
 extends   = "pr"
 platforms = ["linux-x64", "linux-arm64", "win-msvc"]
 suites    = ["lint", "c-unit", "rust"]
 cache     = "write"
-# CACHE-004: with pre-prune on the only writer flow, the lockfile-change peak term is waived and
-# the budget proof reduces to the steady total below.
-pre-prune = true
 
 [flow.full]
 extends = "main"
@@ -54,9 +66,13 @@ ci-full = { add = { platforms = "all", suites = "all" } }
 release = { flow = "full", publish = "none" }
 
 # ── Caches ───────────────────────────────────────────────────────────────────
-# Measured 2026-10-05 on main: 85 entries, 8061 MB = 79% of GitHub's 10 GiB cap. This document
-# bounds the DECLARABLE families at ~5.0 GiB steady, leaving headroom for the lockfile generations
-# a toolchain bump produces before the janitor reclaims them.
+# Measured 2026-10-05 on main: 82 entries, 7763 MB = 76% of GitHub's 10 GiB cap.
+#
+# CACHE-004 currently FAILS on this document: steady 8,619,294,720 B + lockfile peak
+# 8,294,236,160 B = 16,913,530,880 B > the 9.5GB budget. That is deliberate and visible -- see
+# the [flow.main] comment above. An earlier "~5.0 GiB steady, leaving headroom" claim here was
+# wrong: the arithmetic was computed with the `pre-prune` waiver applied, and the steady total
+# with no waiver at all is 8.02 GiB, already 85% of the budget before the peak term.
 #
 # The live repository holds ~3.3 GiB more that NO `via` value can classify -- see the PR body.
 [cache]

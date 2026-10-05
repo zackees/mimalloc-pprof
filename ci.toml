@@ -40,9 +40,15 @@ extends   = "pr"
 platforms = ["linux-x64", "linux-arm64", "win-msvc"]
 suites    = ["lint", "c-unit", "rust"]
 cache     = "write"
-# CACHE-004: with pre-prune on the only writer flow, the lockfile-change peak term is waived and
-# the budget proof reduces to the steady total below.
-pre-prune = true
+# `pre-prune = true` is deliberately ABSENT from this, the repository's ONLY cache writer
+# (zackees/ci.yml#352, rule CACHE-034). It was declared but never honoured: no workflow or ci/
+# script here runs `ci-lint cache preprune` (`grep -rn preprune .github/ ci/` finds nothing), yet
+# CACHE-004's arithmetic waives the lockfile-change-peak term purely on the declaration, so the
+# modelled footprint was understated by that peak for free. Dropped rather than wired, per
+# zackees/ci.yml#354 (checklist item: zackees/ci.yml#360) -- because this is the only writer
+# flow, removing it brings the full lockfile-change peak back into CACHE-004's model. Restoring
+# `pre-prune = true` requires a real `ci-lint cache preprune` step ordered ahead of the cache
+# saves in the same run, on a job holding `actions: write`.
 
 [flow.full]
 extends = "main"

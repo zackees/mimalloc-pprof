@@ -195,7 +195,9 @@ def main() -> int:
     parser.add_argument("--head-sha", default="")
     parser.add_argument("--reps", type=int, default=15)
     parser.add_argument("--max-reps", type=int, default=0)
-    parser.add_argument("--workloads", default="")
+    parser.add_argument(
+        "--workloads", default="", help="name substrings separated by '|'; '=name' matches exactly"
+    )
     parser.add_argument("--head-env", default="")
     parser.add_argument("--head-cppdefs", default="")
     parser.add_argument("--holes-report", action="store_true")

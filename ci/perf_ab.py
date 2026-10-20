@@ -366,13 +366,19 @@ def parse_cppdefs(text: str) -> list[str]:
 
 
 def select(pattern: str) -> dict[str, tuple[str, Params]]:
-    """The rows whose name contains one of the '|'-separated alternatives; by default the gating
-    rows only (the diagnostic rows must be named)."""
+    """Match '|'-separated substrings, or an exact name when a term starts with '='.
+
+    By default select gating rows only; diagnostic rows must be named.
+    """
     if not pattern:
         return dict(WORKLOADS)
     alternatives = pattern.split("|")
     rows = {**WORKLOADS, **DIAGNOSTIC_WORKLOADS}
-    return {name: w for name, w in rows.items() if any(a in name for a in alternatives)}
+    return {
+        name: w
+        for name, w in rows.items()
+        if any(name == a[1:] if a.startswith("=") else a in name for a in alternatives)
+    }
 
 
 def probe_sizes(workloads: dict[str, tuple[str, Params]], cppdefs: list[str]) -> list[int]:
@@ -712,7 +718,7 @@ def main() -> int:
     parser.add_argument(
         "--workloads",
         default="",
-        help="only the workloads whose name contains this text ('|' separates alternatives); "
+        help="workload name substrings ('|' separates alternatives; '=name' matches exactly); "
         f"the diagnostic rows ('{DIAGNOSTIC_TAG}') run only when named",
     )
     parser.add_argument("--summary", type=Path)

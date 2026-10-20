@@ -177,6 +177,20 @@ def test_probe_table_marks_the_arms_that_differ(
         assert f"| {size:,} |" in table
 
 
+def test_exact_workload_selector_runs_only_the_named_plain_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = "large-class-ephemeral/8"
+    table, builds, children = run_main(tmp_path, monkeypatch, "--workloads", f"={name}")
+    assert f"| {name} |" in table
+    assert "(chart build)" not in table
+    assert len(builds) == len(children) == 2
+    for child in children:
+        assert child[1:-1] == list(map(str, perf_ab.WORKLOADS[name][1]))
+        assert "-plain/" in child[0]
+    assert set(perf_ab.select(f"={name}|=larson/1")) == {name, "larson/1"}
+
+
 def test_diagnostic_rows_are_opt_in() -> None:
     assert perf_ab.select("") == perf_ab.WORKLOADS
     assert not any(perf_ab.DIAGNOSTIC_TAG in name for name in perf_ab.WORKLOADS)

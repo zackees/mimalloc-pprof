@@ -213,6 +213,13 @@ uv run ci/perf_ab_dispatch.py --ref perf/my-branch --head-env 'MIMALLOC_X=4 || M
 uv run ci/perf_ab_dispatch.py --from-json a.json b.json
 ```
 
+For one exact workload, prefix its full name with `=`:
+`--workloads '=large-class-ephemeral/8'`. Unprefixed terms still match substrings;
+`|` combines either form. This permits attribution of the plain row without also
+selecting its chart variants. Long adaptive groups can approach the 90-minute job
+limit with separate latency replays; select individual rows while preserving their
+original parameters, seeds and touch policy.
+
 - **Raw samples.** Every run uploads `perf-ab-samples` (`perf-ab-samples.json`): per-repetition
   values for every row and arm, the base and head SHAs, defines, environment, CPU model and the
   RSS floor. `ci/perf_ab_ledger.py` judges them; nothing is scraped from a log.

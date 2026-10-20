@@ -38,7 +38,7 @@ on:
         type: string
         default: "7"
       workloads:
-        description: "Only the workloads whose name contains this text, '|' between alternatives (empty = the gating rows; the (#422) diagnostic rows run only when named)"
+        description: "Workload name substrings, '|' between alternatives; '=name' matches exactly (empty = gating rows; diagnostics run only when named)"
         type: string
         default: ""
       head_env:

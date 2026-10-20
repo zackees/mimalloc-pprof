@@ -94,8 +94,7 @@ jobs:
           # diagnostics were unconditional C), so cross coverage is unchanged. `owner-gate`
           # is deliberately not here -- it changes allocator behaviour and has its own rows.
           - target: x86_64-unknown-linux-gnu
-            # Plain cargo, not `soldr cargo`: see the comment on cmd= in build-cross.
-            command: cargo test -p mimalloc-pprof --features pprof,memory-events,diagnostics --no-run
+            command: soldr cargo test -p mimalloc-pprof --features pprof,memory-events,diagnostics --no-run
             cflags: ""
           - target: aarch64-unknown-linux-gnu
             command: soldr cargo zigbuild -p mimalloc-pprof --features pprof,memory-events,diagnostics --tests
@@ -285,20 +284,11 @@ jobs:
             fi
             return "$rc"
           }
-          # Plain `cargo`, NOT `soldr cargo`. setup-soldr still provisions the
-          # toolchain above; only the build wrapper is dropped.
-          #
-          # Every `soldr cargo test --no-run` target has been failing to link since
-          # ~23:10 with `undefined reference to mi_prof_is_enabled` and friends, while
-          # the two targets that do NOT use it (aarch64-linux via zigbuild, and the
-          # MinGW job) keep passing. build.rs defines MI_PPROF=1 unconditionally and the
-          # vendored amalgamation contains every missing symbol, so the C is right and
-          # something in the wrapper is dropping it.
-          #
-          # Already tested and disproved: build-cache:false, linker:platform-default,
-          # and cache:false (the action's own "skip zccache wrapping entirely" switch).
+          # #585 owner direction: install and build through soldr so both commands
+          # use the same toolchain binding. Plain cargo could not see the Windows
+          # ARM64 std that soldr rustup reported installed (run 39495221785).
           # #414: name the features explicitly -- `default = []` since 0.12.0.
-          cmd="cargo test -p mimalloc-pprof --features pprof,memory-events,diagnostics --no-run"
+          cmd="soldr cargo test -p mimalloc-pprof --features pprof,memory-events,diagnostics --no-run"
           if ! run_build "$cmd"; then
             echo "::warning::build failed; retrying with the soldr compile cache bypassed (soldr#1969)"
             run_build "${cmd/soldr/soldr --no-cache}"

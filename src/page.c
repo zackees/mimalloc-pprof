@@ -587,6 +587,9 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
     const size_t size = mi_size_of_slices(page->memid.mem.arena.slice_count);
     if (size < want || size / block_size < MI_LARGE_SPAN_MIN_BLOCKS || size >= best_size) continue;
     best_pq = q; best_size = size;   // best fit: the smallest that is large enough
+    // #585: no later page can improve an exact fit. Keep the same first-best
+    // selection while avoiding the remaining bins on every such re-carve.
+    if (size == want) break;
   }
   if (best_pq == NULL) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_NONE); return NULL; }
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it

@@ -411,14 +411,19 @@ def apply_source_patches(
             log.write("$ " + " ".join(command) + "\n")
             log.flush()
             try:
-                subprocess.run(
-                    command,
-                    cwd=source_dir,
-                    env=command_environment(),
-                    check=True,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                )
+                try:
+                    subprocess.run(
+                        command,
+                        cwd=source_dir,
+                        env=command_environment(),
+                        check=True,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                    )
+                except subprocess.CalledProcessError:
+                    log.flush()
+                    print((logs / f"{allocator_id}.log").read_text(encoding="utf-8"))
+                    raise
             except FileNotFoundError as error:
                 raise ArchiveError(
                     "source patches require the standard `patch` executable"

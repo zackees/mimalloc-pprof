@@ -579,7 +579,15 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   const size_t bin_hi = mi_bin(MI_LARGE_MAX_OBJ_SIZE);
   // at least the span the bin's own demand accounting (#532) would give a new page: a smaller one
   // fills and is abandoned at once, and a busy bin then churns through pages
-  const size_t want = mi_size_of_slices(_mi_large_span_peek_slices(theap, block_size, 0));
+  size_t want = mi_size_of_slices(_mi_large_span_peek_slices(theap, block_size, 0));
+  // Compare byte bounds once instead of dividing every eligible candidate. An
+  // overflowing minimum cannot fit in any representable page; preserve the miss.
+  size_t min_bytes;
+  if (mi_unlikely(mi_mul_overflow(MI_LARGE_SPAN_MIN_BLOCKS, block_size, &min_bytes))) {
+    MI_EVENT(MI_EVENT_LARGE_REPURPOSE_NONE);
+    return NULL;
+  }
+  if (want < min_bytes) { want = min_bytes; }
   mi_page_queue_t* best_pq = NULL;
   size_t best_size = SIZE_MAX;
   for (size_t bin = bin_lo; bin <= bin_hi; bin++) {
@@ -593,7 +601,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
     if (page->has_metadata) continue;   // (an empty page holds no sample record, but be sure)
     #endif
     const size_t size = mi_size_of_slices(page->memid.mem.arena.slice_count);
-    if (size < want || size / block_size < MI_LARGE_SPAN_MIN_BLOCKS || size >= best_size) continue;
+    if (size < want || size >= best_size) continue;
     best_pq = q; best_size = size;   // best fit: the smallest that is large enough
     // #585: no later page can improve an exact fit. Keep the same first-best
     // selection while avoiding the remaining bins on every such re-carve.

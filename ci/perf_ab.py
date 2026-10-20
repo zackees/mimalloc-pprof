@@ -29,11 +29,13 @@ ci/perf_ab.c); the text is appended to the table, one collapsed block per row an
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
 import re
+import shutil
 import statistics
 import subprocess
 import tempfile
@@ -623,6 +625,24 @@ def render_variant(
     return rows, not late
 
 
+def preserve_builds(exes: dict[tuple[str, str], Path], output: Path) -> None:
+    """Keep the exact measured children before temporary build trees disappear."""
+    output.mkdir(parents=True, exist_ok=False)
+    digests: dict[str, str] = {}
+    for (arm, kind), exe in sorted(exes.items()):
+        if arm == NULL_ARM:  # aliases base's executable
+            continue
+        destination = output / arm / kind
+        destination.mkdir(parents=True)
+        for source in (exe, exe.with_name("perf_ab_latency")):
+            target = destination / source.name
+            shutil.copy2(source, target)
+            digests[str(target.relative_to(output))] = hashlib.sha256(
+                target.read_bytes()
+            ).hexdigest()
+    (output / "sha256.json").write_text(json.dumps(digests, indent=2) + "\n")
+
+
 def artifact(
     args: argparse.Namespace,
     variants: list[Variant],
@@ -697,6 +717,11 @@ def main() -> int:
     )
     parser.add_argument("--summary", type=Path)
     parser.add_argument(
+        "--preserve-builds",
+        type=Path,
+        help="copy the exact timing/latency executables and SHA-256 digests here after measurements",
+    )
+    parser.add_argument(
         "--json",
         type=Path,
         help="write the raw per-repetition samples, SHAs, defines, environment and CPU here (#573 B4)",
@@ -746,12 +771,14 @@ def main() -> int:
     cpu = cpu_model()
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
+        exes: dict[tuple[str, str], Path] = {}
         try:
             wanted: set[str] = {k for k, _ in workloads.values()}
             if args.holes_report:
                 wanted.add(HOLES_KIND)
             kinds = sorted(wanted)
-            exes = {("base", kind): build("base", args.base, work, kind, []) for kind in kinds}
+            for kind in kinds:
+                exes[("base", kind)] = build("base", args.base, work, kind, [])
             for v in variants:
                 for kind in kinds:
                     exes[(v.arm, kind)] = build(
@@ -833,11 +860,15 @@ def main() -> int:
             data = (
                 artifact(args, variants, workloads, samples, bound_ms, cpu) if args.json else None
             )
+            if args.json and data is not None:
+                args.json.write_text(json.dumps(data, indent=1) + "\n")
         finally:  # unregister the trees while they still exist: a prune here would find nothing to prune
-            for tree in work.glob("src-*"):
-                run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
-    if args.json and data is not None:
-        args.json.write_text(json.dumps(data, indent=1) + "\n")
+            try:
+                if args.preserve_builds:
+                    preserve_builds(exes, args.preserve_builds)
+            finally:
+                for tree in work.glob("src-*"):
+                    run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
     rows: list[str] = []
     held = True
     for variant in variants:

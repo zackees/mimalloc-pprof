@@ -18,6 +18,24 @@ import perf_ab_dispatch
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_preserved_children_match_actual_linked_executables(
+    latency_children: Path, tmp_path: Path
+) -> None:
+    output = tmp_path / "preserved"
+    exe = latency_children / "perf_ab"
+    perf_ab.preserve_builds({("base", "plain"): exe, ("null", "plain"): exe}, output)
+    digests = json.loads((output / "sha256.json").read_text())
+    assert set(digests) == {"base/plain/perf_ab", "base/plain/perf_ab_latency"}
+    for relative, digest in digests.items():
+        original = latency_children / Path(relative).name
+        copied = output / relative
+        assert copied.read_bytes() == original.read_bytes()
+        assert digest == hashlib.sha256(original.read_bytes()).hexdigest()
+        assert copied.stat().st_mode == original.stat().st_mode
+    with pytest.raises(FileExistsError):
+        perf_ab.preserve_builds({}, output)
+
+
 @pytest.fixture(scope="module")
 def latency_children(tmp_path_factory: pytest.TempPathFactory) -> Path:
     if shutil.which("cc") is None or shutil.which("cmake") is None:

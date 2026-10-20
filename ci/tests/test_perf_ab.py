@@ -519,6 +519,56 @@ def test_null_arm_reuses_the_base_binary(tmp_path: Path, monkeypatch: pytest.Mon
     assert len(exes) == 3 and len(set(exes)) == 2  # base twice, head once
 
 
+@pytest.mark.parametrize("failed_sanity", [False, True])
+def test_preserves_measured_children_on_success_and_sanity_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_sanity: bool
+) -> None:
+    captured: list[tuple[set[tuple[str, str]], Path]] = []
+
+    def capture(exes: dict[tuple[str, str], Path], output: Path) -> None:
+        captured.append((set(exes), output))
+
+    def sanity(*_: object) -> list[str]:
+        return ["test failure"] if failed_sanity else []
+
+    monkeypatch.setattr(perf_ab, "preserve_builds", capture)
+    monkeypatch.setattr(perf_ab, "sanity_failures", sanity)
+    output = tmp_path / "builds"
+    run_main(
+        tmp_path,
+        monkeypatch,
+        "--workloads",
+        "small",
+        "--null-arm",
+        "--preserve-builds",
+        str(output),
+        expected_status=int(failed_sanity),
+    )
+    assert captured == [({("base", "plain"), ("head", "plain"), ("null", "plain")}, output)]
+
+
+def test_samples_survive_a_build_preservation_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_copy(*_: object) -> None:
+        raise OSError("test copy failure")
+
+    monkeypatch.setattr(perf_ab, "preserve_builds", fail_copy)
+    output = tmp_path / "samples.json"
+    with pytest.raises(OSError, match="test copy failure"):
+        run_main(
+            tmp_path,
+            monkeypatch,
+            "--workloads",
+            "small",
+            "--json",
+            str(output),
+            "--preserve-builds",
+            str(tmp_path / "builds"),
+        )
+    assert len(json.loads(output.read_text())["samples"]["small/8 (control)"]["head"]) == 1
+
+
 def test_candidate_occupies_every_execution_position(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -650,6 +700,7 @@ def test_workflow_uploads_the_samples_and_takes_the_new_inputs() -> None:
     step = ab_step(workflow)
     assert " $NULL_ARM " in step["run"] and '--max-reps "$MAX_REPS"' in step["run"]
     assert "--json perf-ab-samples.json" in step["run"]
+    assert "--preserve-builds perf-ab-builds" in step["run"]
     assert "${{" not in step["run"]
     (upload,) = [
         s
@@ -658,6 +709,12 @@ def test_workflow_uploads_the_samples_and_takes_the_new_inputs() -> None:
     ]
     assert upload["if"] == "always()"  # a failed sanity gate still leaves its samples
     assert upload["with"]["name"] == "perf-ab-samples"
+    (executables,) = [
+        s
+        for s in workflow["jobs"]["ab"]["steps"]
+        if s.get("with", {}).get("name") == "perf-ab-builds"
+    ]
+    assert executables["if"] == "always()"
 
 
 def test_p99_cannot_spend_memory_credit() -> None:

@@ -118,7 +118,7 @@ jobs:
             fi
             python3 ci/perf_ab_build_report.py --base "$BASE_REF" --head "$HEAD_REF" --output perf-ab-build-report --summary "$GITHUB_STEP_SUMMARY"
           else
-            python3 ci/perf_ab.py --base "$BASE_REF" --head "$HEAD_REF" --reps "$REPS" --max-reps "$MAX_REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" $HOLES_REPORT $NO_SANITY_GATE $NULL_ARM --json perf-ab-samples.json --summary "$GITHUB_STEP_SUMMARY"
+            python3 ci/perf_ab.py --base "$BASE_REF" --head "$HEAD_REF" --reps "$REPS" --max-reps "$MAX_REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" $HOLES_REPORT $NO_SANITY_GATE $NULL_ARM --json perf-ab-samples.json --preserve-builds perf-ab-builds --summary "$GITHUB_STEP_SUMMARY"
           fi
       - name: upload the build-only diagnostic
         if: always() && inputs.build_report_only
@@ -126,6 +126,14 @@ jobs:
         with:
           name: perf-ab-build-report
           path: perf-ab-build-report
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: upload the measured executables
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: perf-ab-builds
+          path: perf-ab-builds
           if-no-files-found: ignore
           retention-days: 30
       # the raw per-repetition samples (#573 B4): ci/perf_ab_dispatch.py and ci/perf_ab_ledger.py

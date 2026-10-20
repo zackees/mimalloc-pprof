@@ -769,6 +769,15 @@ def main() -> int:
                     if broken:  # fail in minutes, not after the whole run (#573)
                         message = "sanity gate (first repetition, #573):\n  " + "\n  ".join(broken)
                         print(message)
+                        if args.json:
+                            partial = artifact(args, variants, workloads, samples, bound_ms, cpu)
+                            partial.update(
+                                complete=False,
+                                failure=message,
+                                requested_reps=args.reps,
+                                reps=rep + 1,
+                            )
+                            args.json.write_text(json.dumps(partial, indent=1) + "\n")
                         if args.summary:
                             args.summary.write_text(message + "\n")
                         return 1

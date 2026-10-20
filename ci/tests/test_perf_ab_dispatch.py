@@ -147,3 +147,12 @@ def test_pool_refuses_different_contention_or_sampling(key: str) -> None:
         first[key], second[key] = {"version": "one"}, {"version": "two"}
     with pytest.raises(SystemExit, match=key):
         perf_ab_dispatch.pool([first, second])
+
+
+def test_partial_sanity_samples_cannot_be_pooled_or_judged() -> None:
+    data = artifact()
+    data["complete"] = False
+    with pytest.raises(SystemExit, match="diagnostic only"):
+        perf_ab_dispatch.pool([data])
+    with pytest.raises(SystemExit, match="no regression verdict"):
+        perf_ab_dispatch.ledger_lines(data)

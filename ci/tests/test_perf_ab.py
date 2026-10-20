@@ -97,7 +97,7 @@ def test_diagnostic_child_compile_flag_does_not_change_default_child(
 
 
 def run_main(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *argv: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *argv: str, expected_status: int = 0
 ) -> tuple[str, list[tuple[str, list[str]]], list[list[str]]]:
     """main() with the builds and children faked: which arm got which defines, the child
     command lines, and the summary."""
@@ -132,7 +132,7 @@ def run_main(
     summary = tmp_path / "summary.md"
     argv_full = ["perf_ab.py", "--base", "B", "--head", "H", "--reps", "1", "--summary"]
     monkeypatch.setattr("sys.argv", [*argv_full, str(summary), *argv])
-    assert perf_ab.main() == 0
+    assert perf_ab.main() == expected_status
     return summary.read_text(), builds, children
 
 
@@ -622,3 +622,32 @@ def test_p99_cannot_spend_memory_credit() -> None:
     )
     assert latency.allowance == 0
     assert latency.verdict == "FAIL"
+
+
+def test_sanity_failure_saves_all_partial_arms_without_claiming_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def injected_failure(*_: object) -> list[str]:
+        return ["injected memory failure"]
+
+    monkeypatch.setattr(perf_ab, "sanity_failures", injected_failure)
+    out = tmp_path / "partial.json"
+    run_main(
+        tmp_path,
+        monkeypatch,
+        "--workloads",
+        "small/8",
+        "--reps",
+        "15",
+        "--null-arm",
+        "--json",
+        str(out),
+        expected_status=1,
+    )
+    data = json.loads(out.read_text())
+    assert data["complete"] is False
+    assert data["requested_reps"] == 15 and data["reps"] == 1
+    assert "injected memory failure" in data["failure"]
+    arms = data["samples"]["small/8 (control)"]
+    assert set(arms) == {"base", "head", "null"}
+    assert all(len(values) == 1 for values in arms.values())

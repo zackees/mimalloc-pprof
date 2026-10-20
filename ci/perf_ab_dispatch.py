@@ -44,6 +44,8 @@ def pool(datas: Sequence[dict[str, Any]]) -> dict[str, Any]:
     repetitions are concatenated. Anything else is refused."""
     if not datas:
         raise SystemExit("nothing to pool")
+    if any(data.get("complete") is False for data in datas):
+        raise SystemExit("incomplete perf-ab samples are diagnostic only; refusing to pool")
     first = datas[0]
     for other in datas[1:]:
         for key in ("cpu", "base", "head", "logical_cpus", "latency_protocol"):
@@ -68,6 +70,8 @@ def pool(datas: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 def ledger_lines(data: dict[str, Any]) -> list[str]:
     """The ledger table of every head arm in an artifact, computed from its raw samples."""
+    if data.get("complete") is False:
+        raise SystemExit("incomplete perf-ab samples are diagnostic only; no regression verdict")
     if data["fields"] != [*perf_ab.METRICS, "ideal RSS MiB"]:
         raise SystemExit("artifact fields do not match this harness; p99 must not be invented")
     lines: list[str] = []

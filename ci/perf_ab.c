@@ -43,6 +43,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +70,19 @@
 #define PERF_AB_LARSON_TABLE_SEED_BASE 0x1a750000ull
 #endif
 #define PERF_AB_PHASE_DEFINITION "work=pre-worker-start..all-workers-drained; drain=then..end-of-2x-bound-RSS-window"
+
+/* #585: latency is measured in a separate replay binary. The throughput/RSS
+   binary has no sampling branches, clocks, or sample buffers. A sample covers
+   a stream operation (free or replace, including page touches), not just malloc. */
+#ifndef PERF_AB_LATENCY_SAMPLES_PER_WORKER
+#define PERF_AB_LATENCY_SAMPLES_PER_WORKER 4096
+#endif
+#ifndef PERF_AB_LATENCY_PERCENTILE
+#define PERF_AB_LATENCY_PERCENTILE 99
+#endif
+#if PERF_AB_LATENCY_SAMPLES_PER_WORKER < 1 || PERF_AB_LATENCY_PERCENTILE < 1 || PERF_AB_LATENCY_PERCENTILE > 100
+#error "latency sampling needs a positive sample budget and a percentile in 1..100"
+#endif
 
 #if defined(PERF_AB_DIAGNOSTIC)
 typedef struct {
@@ -113,7 +127,53 @@ typedef struct {
 #endif
   size_t lo, hi; int log_sizes; long ops; int slots; void* slot[MAX_SLOTS]; size_t size[MAX_SLOTS];
   int fifo[4096]; size_t head, tail; double cpu; int index;
+#if defined(PERF_AB_LATENCY)
+  uint64_t* latency_ns;
+  size_t latency_count, latency_capacity, latency_mask, latency_seen;
+#endif
 } stream_t;
+
+#if defined(PERF_AB_LATENCY)
+static uint64_t latency_now_ns(void) {
+  struct timespec t;
+  if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) { perror("clock_gettime"); exit(1); }
+  return (uint64_t)t.tv_sec * 1000000000ULL + (uint64_t)t.tv_nsec;
+}
+
+static uint64_t latency_start(stream_t* st) {
+  return ((st->latency_seen++ & st->latency_mask) == 0 ? latency_now_ns() : 0);
+}
+
+static void latency_end(stream_t* st, uint64_t start) {
+  if (start == 0) return;
+  const uint64_t elapsed = latency_now_ns() - start;
+  if (st->latency_count == st->latency_capacity) { fprintf(stderr, "latency sample overflow\n"); exit(1); }
+  st->latency_ns[st->latency_count++] = elapsed;
+}
+
+static int latency_compare(const void* a, const void* b) {
+  const uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+  return (x > y) - (x < y);
+}
+
+static uint64_t latency_percentile(stream_t* streams, int count) {
+  size_t n = 0;
+  for (int i = 0; i < count; i++) n += streams[i].latency_count;
+  if (n == 0) { fprintf(stderr, "no latency samples\n"); exit(1); }
+  uint64_t* samples = (uint64_t*)malloc(n * sizeof(uint64_t));
+  if (samples == NULL) { perror("latency samples"); exit(1); }
+  size_t offset = 0;
+  for (int i = 0; i < count; i++) {
+    memcpy(samples + offset, streams[i].latency_ns, streams[i].latency_count * sizeof(uint64_t));
+    offset += streams[i].latency_count;
+  }
+  qsort(samples, n, sizeof(uint64_t), latency_compare);
+  const size_t percentile_scale = 100;
+  const uint64_t result = samples[(n * PERF_AB_LATENCY_PERCENTILE + percentile_scale - 1) / percentile_scale - 1];
+  free(samples);
+  return result;
+}
+#endif
 
 /* #506: one Larson table; a round of draws on it runs on one thread at a time (the round barrier) */
 typedef struct { uint64_t rng; void** slot; size_t* log; size_t log_len, log_cap; } table_t;
@@ -145,8 +205,14 @@ static void run_ops(stream_t* st, long n) {
     const uint64_t choice = next(&st->rng) % 16;
     int slot = (int)(next(&st->rng) % (uint64_t)st->slots);
     if (choice >= 8 && choice < 14 && st->head != st->tail) slot = st->fifo[st->head++ % 4096];  /* free oldest */
+#if defined(PERF_AB_LATENCY)
+    const uint64_t latency = latency_start(st);
+#endif
     if (choice >= 8) {
       mi_free(st->slot[slot]); st->slot[slot] = NULL; st->size[slot] = 0;
+#if defined(PERF_AB_LATENCY)
+      latency_end(st, latency);
+#endif
       continue;
     }
     mi_free(st->slot[slot]);
@@ -157,6 +223,9 @@ static void run_ops(stream_t* st, long n) {
     st->slot[slot] = p;
     st->size[slot] = size;
     st->fifo[st->tail++ % 4096] = slot;
+#if defined(PERF_AB_LATENCY)
+    latency_end(st, latency);
+#endif
   }
 #if defined(PERF_AB_DIAGNOSTIC)
   st->completed += n;  /* one batch update, no per-operation instrumentation */
@@ -244,6 +313,9 @@ static void larson_round(table_t* tb, stream_t* st, size_t lo, size_t hi, long n
   for (long i = 0; i < n; i++) {
     const size_t k = (size_t)(next(&tb->rng) % (uint64_t)table_slots);
     const size_t size = lo + (size_t)(next(&tb->rng) % (hi - lo + 1));
+#if defined(PERF_AB_LATENCY)
+    const uint64_t latency = latency_start(st);
+#endif
     mi_free(tb->slot[k]);
     char* p = (char*)mi_malloc(size);
     if (p == NULL) { fprintf(stderr, "allocation failed\n"); exit(1); }
@@ -255,6 +327,9 @@ static void larson_round(table_t* tb, stream_t* st, size_t lo, size_t hi, long n
       if (tb->log == NULL) { fprintf(stderr, "allocation failed\n"); exit(1); }
     }
     tb->log[tb->log_len++] = k;
+#if defined(PERF_AB_LATENCY)
+    latency_end(st, latency);
+#endif
   }
 #if defined(PERF_AB_DIAGNOSTIC)
   st->completed += n;
@@ -415,6 +490,25 @@ static int probe(int count, char** sizes) {
 }
 
 int main(int argc, char** argv) {
+#if defined(PERF_AB_LATENCY)
+  if (argc == 2 && strcmp(argv[1], "latency-selftest") == 0) {
+    /* Known nearest-rank answer across two workers: 99, not the maximum 100.
+       Also check that splitting work into batches does not restart sampling. */
+    uint64_t odd[50], even[50];
+    for (size_t i = 0; i < 50; i++) { odd[i] = 2 * i + 1; even[i] = 2 * i + 2; }
+    stream_t streams[2] = {0};
+    streams[0].latency_ns = odd; streams[0].latency_count = 50;
+    streams[1].latency_ns = even; streams[1].latency_count = 50;
+    if (latency_percentile(streams, 2) != 99) return 1;
+    stream_t stream = {0};
+    stream.latency_mask = 3;
+    size_t samples = 0;
+    for (size_t batch = 0; batch < 2; batch++) {
+      for (size_t i = 0; i < 5; i++) { if (latency_start(&stream) != 0) samples++; }
+    }
+    return (samples == 3 ? 0 : 1);
+  }
+#endif
   if (argc >= 2 && strcmp(argv[1], "probe") == 0) return probe(argc - 2, argv + 2);
   if (argc != 11) { fprintf(stderr, "usage: perf_ab threads generations min max ops pause_ms table_slots uniform|log slots release_bound_ms\n       perf_ab probe size...\n"); return 2; }
   pause_ms = atol(argv[6]);
@@ -442,6 +536,16 @@ int main(int argc, char** argv) {
     st[i].log_sizes = log_sizes;
     st[i].slots = slots;
     st[i].index = i;
+#if defined(PERF_AB_LATENCY)
+    /* Uniform sampling continues across generations/rounds, with a power-of-two
+       stride and bounded buffers allocated through libc before work. */
+    size_t stride = 1;
+    while (((size_t)st[i].ops + stride - 1) / stride > PERF_AB_LATENCY_SAMPLES_PER_WORKER) stride *= 2;
+    st[i].latency_mask = stride - 1;
+    st[i].latency_capacity = ((size_t)st[i].ops + stride - 1) / stride;
+    st[i].latency_ns = (uint64_t*)calloc(st[i].latency_capacity, sizeof(uint64_t));
+    if (st[i].latency_ns == NULL) { perror("latency samples"); exit(1); }
+#endif
   }
   if (table_slots > 0) {   /* allocated before the clock starts, and by libc: not the allocator under test */
     tables = (table_t*)calloc((size_t)threads, sizeof(table_t));
@@ -497,7 +601,11 @@ int main(int argc, char** argv) {
   }
   double owner_cpu = 0;
   for (int i = 0; i < threads; i++) owner_cpu += st[i].cpu;
-#if defined(PERF_AB_DIAGNOSTIC)
+#if defined(PERF_AB_LATENCY)
+  /* The replay follows the same drain lifecycle, but emits only its latency. */
+  (void)elapsed; (void)rss_peak; (void)rss_short;
+  printf("%llu\n", (unsigned long long)latency_percentile(st, threads));
+#elif defined(PERF_AB_DIAGNOSTIC)
   {
     const phase_snapshot_t drain_end = phase_snapshot();
     uint64_t checksum = 0;
@@ -549,6 +657,9 @@ int main(int argc, char** argv) {
 #endif
   atomic_store(&release_workers, 1);
   for (int i = 0; i < threads; i++) pthread_join(t[i], NULL);
+#if defined(PERF_AB_LATENCY)
+  for (int i = 0; i < threads; i++) free(st[i].latency_ns);
+#endif
   if (table_slots > 0) {
     for (int i = 0; i < threads; i++) free(tables[i].slot);
     free(tables);

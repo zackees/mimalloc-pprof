@@ -127,11 +127,15 @@ confirm it, not to explore. The safety nets that make that cheap:
   A head arm whose peak RSS, RSS after drain or RSS at the release bound exceeds
   `1.5 x base + 8 MiB` fails the job at once (`SANITY_FACTOR`, `SANITY_SLACK_MIB` in
   `ci/perf_ab.py`). A dispatch that is meant to trade memory away sets `sanity_gate: false`.
-- **One live run per PR.** `perf-ab` cancels its older run on a new push, and only the
-  `perf-ab` label itself starts a run. Trap (#575): pushing to a PR branch (even a docs or
-  regenerated-amalgamation commit) cancels an in-flight 15-rep run, so do not push until the
-  ledger is in; dispatch against a `head_sha` instead. A guard is on #585. `head_sha` dispatches a commit other than the ref the
-  workflow runs from.
+- **One live run per PR.** `perf-ab` queues new pushes behind the running measurement
+  instead of cancelling it (#585). Only the `perf-ab` label starts a labelled run;
+  dispatches have independent concurrency groups. A `head_sha` dispatch always uses
+  the dispatch ref's measurement harness, even when the measured allocator is older.
+- **p99 latency.** A separate replay executable samples stream-operation latency
+  (free or replacement, including page touches), using a deterministic power-of-two
+  stride and at most 4096 samples per worker. The throughput/RSS executable has no
+  latency clocks or sample buffers. Each paired repetition includes a latency replay;
+  its p99 is reported and judged against the null-arm noise, with no memory credit.
 - **Page-map check.** At `MI_DEBUG>=2`, `_mi_page_init` asserts that the page map resolves the
   first byte and the last byte of a page's blocks to that page. A re-carve that changes a page's
   geometry without re-registering it fails on the first local debug ctest, not in a
@@ -189,9 +193,10 @@ copy it here.
    in the large/retire/purge paths. Follow-up on #585.
 5. **Tooling traps.**
    - `benchmark-scaling` above 15 blocks blows the 1500 s shard budget on the 8-worker shard.
-   - Pushing to a PR branch cancels an in-flight `perf-ab` run (see above).
-   - `perf-ab` has no p99 column, although rule 12 demands p99. Until #585 adds one, the PR
-     ledger must say "p99: not measured" instead of omitting it.
+   - Pushes now queue behind in-flight `perf-ab` measurements; label and dispatch runs
+     keep their isolated groups.
+   - Artifacts from before #585 have no p99 measurement. Do not supply a synthetic
+     latency value to re-judge them with the new harness.
    - The 8-worker cells run on a 4-vCPU EPYC 7763 VM (2 physical cores), 2:1 oversubscribed:
      they measure contention under oversubscription, not core scaling.
    - A local untimed residency probe is allowed; timing is CI-only (see the memory gate loop
@@ -268,7 +273,7 @@ first; use perf-ab to confirm, not to explore.
   sweep left a 30-45 MiB spread per cell and produced a false +6-12% RSS regression; 15 resolved
   single cells. More than 15 blocks over the 8-worker shard exceeds the runner's 1500 s projected
   budget (#575: 30 blocks projected 2150 s, 40 blocks 1503 s, both failed before measuring); the
-  workflow's "15-40" input text is wrong until #585 fixes the cap. Use 15, or narrow
+  dispatch input is capped at 15 (#585). Use 15, or narrow
   `diagnostic_patterns` / `diagnostic_threads` and pool runs.
 - **Two allocator caches.** `benchmark-scaling.yml` restores the four reference allocators (TCMalloc,
   jemalloc, upstream and Bun mimalloc) keyed on their pins, patches and the builder only, and the

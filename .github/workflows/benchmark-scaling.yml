@@ -45,7 +45,7 @@ on:
         required: false
         type: string
       blocks:
-        description: "Legacy blocks per cell (full 3; smoke 1; distribution full is fixed at 40); diagnostic: every selected cell's blocks, 15-40 (#573: 5 blocks gave a false +6-12% RSS regression)"
+        description: "Legacy blocks per cell (full 3; smoke 1; distribution full is fixed at 40); diagnostic: every selected cell's blocks, exactly 15 (#573: 5 blocks gave a false +6-12% RSS regression)"
         type: number
         default: 3
         required: false

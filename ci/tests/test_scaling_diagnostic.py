@@ -140,13 +140,12 @@ def test_summary_refuses_a_default_run() -> None:
         diagnostic.summarize(raw)
 
 
-@pytest.mark.parametrize("blocks", [1, 5, 14, 41])
-def test_a_diagnostic_dispatch_needs_at_least_fifteen_blocks(blocks: int) -> None:
+@pytest.mark.parametrize("blocks", [1, 5, 14, 16, 40, 41])
+def test_a_diagnostic_dispatch_requires_fifteen_blocks(blocks: int) -> None:
     # #573 B7: 5 blocks gave a false +6-12% RSS regression; 15 resolved single cells
-    with pytest.raises(diagnostic.DiagnosticInputError, match=r"15\.\.40"):
+    with pytest.raises(diagnostic.DiagnosticInputError, match=r"15\.\.15"):
         diagnostic.validate_inputs("diagnostic", "", "", "", "", blocks)
 
 
-@pytest.mark.parametrize("blocks", [15, 16, 40])
-def test_fifteen_to_forty_blocks_are_accepted(blocks: int) -> None:
-    diagnostic.validate_inputs("diagnostic", "", "", "", "", blocks)
+def test_fifteen_blocks_are_accepted() -> None:
+    diagnostic.validate_inputs("diagnostic", "", "", "", "", 15)

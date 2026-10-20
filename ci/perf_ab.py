@@ -196,6 +196,7 @@ METRICS = (
     "RSS 0.5 s after drain MiB",
     "RSS at release bound MiB",
     "release ms",
+    "p99 operation ns",
 )
 IN_MIB = {"peak RSS MiB", "RSS 0.5 s after drain MiB", "RSS at release bound MiB"}
 # ci/perf_ab.c prints one more number (#573): the RSS floor -- the RSS before the work plus the
@@ -273,6 +274,23 @@ def build(
             str(exe),
         ]
     )
+    if not diagnostic:
+        # #585: a separate replay samples operation latency, leaving every timed
+        # throughput/RSS executable free of latency clocks and buffers.
+        run(
+            [
+                "cc",
+                "-O2",
+                "-DPERF_AB_LATENCY=1",
+                "-I",
+                str(tree / "include"),
+                str(ROOT / "ci/perf_ab.c"),
+                str(lib),
+                "-lpthread",
+                "-o",
+                str(exe.with_name("perf_ab_latency")),
+            ]
+        )
     return exe
 
 
@@ -408,6 +426,12 @@ def header(
         "Median base -> head, then median paired difference [95% sign-test interval]; "
         "**bold** when the interval excludes 0 (and, with a null arm, exceeds its noise floor) "
         "on a rule-12 metric.",
+        f"Host exposes {logical_cpus()} logical CPUs; an 8-worker row has "
+        f"{8 / logical_cpus():.2f} workers per logical CPU. Ratios above 1 are "
+        "oversubscription, not scaling on dedicated cores.",
+        "p99 is the nearest-rank percentile of sampled stream operations in a separate "
+        "replay (free or replace, including page touches); sampling buffers and clocks "
+        "are absent from the throughput/RSS runs.",
         "",
         "| workload | " + " | ".join(METRICS) + " |",
         "|---|" + "---|" * len(METRICS),
@@ -422,6 +446,10 @@ def cpu_model() -> str:
         if line.startswith("model name"):
             return line.split(":", 1)[1].strip()
     return "unknown CPU"
+
+
+def logical_cpus() -> int:
+    return len(os.sched_getaffinity(0))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -469,6 +497,14 @@ def parse_variants(head_env: str, head_cppdefs: str) -> list[Variant]:
 def measure(exe: Path, params: Params, env: dict[str, str], bound_ms: int) -> list[float]:
     """One child run: the METRICS, then the RSS floor; byte counts in MiB."""
     values = list(map(float, run([str(exe), *map(str, params), str(bound_ms)], env=env).split()))
+    latency = float(
+        run(
+            [str(exe.with_name("perf_ab_latency")), *map(str, params), str(bound_ms)], env=env
+        ).strip()
+    )
+    if not math.isfinite(latency) or latency <= 0:
+        raise ValueError(f"invalid p99 latency: {latency}")
+    values.insert(METRICS.index("p99 operation ns"), latency)
     for index, metric in enumerate(METRICS):
         if metric in IN_MIB:
             values[index] /= 2**20
@@ -589,6 +625,14 @@ def artifact(
         "base": {"ref": args.base, "sha": rev(args.base)},
         "head": {"ref": args.head, "sha": rev(args.head)},
         "cpu": cpu,
+        "logical_cpus": logical_cpus(),
+        "latency_protocol": {
+            "version": "sampled-stream-operation-v1",
+            "percentile": 99,
+            "replay": "separate executable; timing/RSS executable has no sampling",
+            "operation": "free or replace, including page touches",
+            "sampling": "power-of-two stride targeting at most 4096 samples per worker",
+        },
         "reps": args.reps,
         "max_reps": args.max_reps,
         "release_bound_ms": bound_ms,

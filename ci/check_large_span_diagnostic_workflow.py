@@ -190,7 +190,7 @@ def validate(policy: WorkflowPolicy) -> None:
         fail("workflow must take only the baseline and candidate SHAs and the repetition count")
     for item in policy.inputs:
         if item.name == "reps":
-            # #573 B7: optional, a string with a default, validated 15..40 before any build
+            # #573 B7: optional, a string with a default, validated 15-block before any build
             if item.input_type != "string" or item.required or not item.has_default:
                 fail("the reps input must be an optional string with a default")
         elif item.input_type != "string" or not item.required or item.has_default:

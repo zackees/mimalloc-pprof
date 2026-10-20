@@ -68,6 +68,8 @@ def pool(datas: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 def ledger_lines(data: dict[str, Any]) -> list[str]:
     """The ledger table of every head arm in an artifact, computed from its raw samples."""
+    if data["fields"] != [*perf_ab.METRICS, "ideal RSS MiB"]:
+        raise SystemExit("artifact fields do not match this harness; p99 must not be invented")
     lines: list[str] = []
     for variant in data["variants"]:
         rows: dict[str, tuple[float, list[perf_ab_ledger.Cell]]] = {}
@@ -85,6 +87,12 @@ def ledger_lines(data: dict[str, Any]) -> list[str]:
         f"{data['reps']} reps"
         + (f" (up to {data['max_reps']})" if data.get("max_reps", 0) > data["reps"] else "")
     )
+    if data.get("logical_cpus"):
+        header += (
+            f"; {data['logical_cpus']} logical CPUs, "
+            f"8-worker cells have {8 / data['logical_cpus']:.2f} workers per logical CPU "
+            "(above 1 means oversubscription)"
+        )
     return [header, *lines]
 
 

@@ -15,7 +15,7 @@ on:
         required: true
         type: string
       reps:
-        description: "Paired repetitions of the large-span rows, latency blocks and scaling blocks (15-40; #573: 5 blocks gave a false +6-12% RSS regression, 7 left single cells unresolved)"
+        description: "Paired repetitions of the large-span rows, latency blocks and scaling blocks (exactly 15; #573: 5 blocks gave a false +6-12% RSS regression, 7 left single cells unresolved)"
         required: false
         type: string
         default: "15"
@@ -42,7 +42,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: validate the repetition count
-        # #573 B7: the same 15..40 bound as a benchmark-scaling diagnostic dispatch, before anything
+        # #573 B7: the same 15-block bound as a benchmark-scaling diagnostic dispatch, before anything
         # is built (the patterns are fixed: ci/large_span_refs.py links exactly random-large,
         # large-class-persistent and larson).
         run: python3 ci/scaling_diagnostic.py validate --mode diagnostic --blocks "$REPS"

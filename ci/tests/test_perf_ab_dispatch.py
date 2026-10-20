@@ -26,7 +26,9 @@ def reps(cpu: float, peak: float, n: int = 7) -> list[list[float]]:
     out: list[list[float]] = []
     for i in range(n):
         scale = 1 + 0.001 * i
-        out.append([1000.0, cpu * scale, cpu * scale, 1000.0, peak * scale, 50.0, 50.0, 0.0, 40.0])
+        out.append(
+            [1000.0, cpu * scale, cpu * scale, 1000.0, peak * scale, 50.0, 50.0, 0.0, 1000.0, 40.0]
+        )
     return out
 
 
@@ -127,3 +129,10 @@ def test_a_failed_run_is_reported_not_swallowed() -> None:
     with pytest.raises(SystemExit) as exit_info:
         perf_ab_dispatch.run_and_fetch(namespace(), runner, lambda _s: None)
     assert exit_info.value.code == 1
+
+
+def test_old_artifact_cannot_get_a_synthetic_p99() -> None:
+    data = artifact()
+    data["fields"] = [f for f in data["fields"] if f != "p99 operation ns"]
+    with pytest.raises(SystemExit, match="p99 must not be invented"):
+        perf_ab_dispatch.ledger_lines(data)

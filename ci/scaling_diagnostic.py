@@ -41,11 +41,11 @@ FORCED_ENV = ("MIMALLOC_PROF", "MIMALLOC_MEMORY_EVENTS")
 ENV_PAIR = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>[A-Za-z0-9_.+-]+)")
 MIB = 1 << 20
 DIAGNOSTIC_STATUS = "diagnostic"
-MAX_BLOCKS = 40  # rust/benchmark-suite MAX_DIAGNOSTIC_BLOCKS (= DISTRIBUTION_BLOCKS)
+MAX_BLOCKS = 15  # #585: the 8-worker shard exceeds its 1500 s budget above this.
 # #573 B7: a diagnostic DISPATCH takes at least this many paired blocks per cell. A 5-block sweep
 # produced a false +6-12% RSS "regression" in #572 (the spread of a cell is 30-45 MiB at 5 blocks);
-# 15 is what resolved single cells. (The runner itself still accepts 1..MAX_BLOCKS: the large-span
-# diagnostic workflow and the tests call it directly.)
+# 15 is what resolved single cells. The Rust runner's broader internal bound also
+# serves distribution runs; dispatches must fit the slowest diagnostic shard.
 MIN_DISPATCH_BLOCKS = 15
 
 

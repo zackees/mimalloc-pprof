@@ -31,10 +31,12 @@ RULE12: dict[str, int] = {
     "ops/s": -1,
     "cpu s": +1,
     "minor faults": +1,
+    "p99 operation ns": +1,
     PEAK: +1,
     DRAIN: +1,
 }
 MEMORY_METRICS = (PEAK, DRAIN)
+NO_CREDIT_METRICS = (*MEMORY_METRICS, "p99 operation ns")
 
 
 @dataclass(frozen=True)
@@ -95,7 +97,7 @@ def cells(
         change = perf_ab_stats.paired_percent(base[metric], head[metric])
         floor = (noise or {}).get(metric, 0.0)
         # the memory metrics may not regress at all beyond noise; CPU-like ones may cost saved%/3
-        allowance = floor if metric in MEMORY_METRICS else max(saved / MEMORY_TO_CPU, floor)
+        allowance = floor if metric in NO_CREDIT_METRICS else max(saved / MEMORY_TO_CPU, floor)
         mid, low, high = change
         regression = (low, high) if worse > 0 else (-high, -low)
         result.append(

@@ -89,9 +89,11 @@ def test_diagnostic_child_compile_flag_does_not_change_default_child(
     perf_ab.build("base", "OLD", tmp_path, "plain", [])
     perf_ab.build("head", "NEW", tmp_path, "plain", [], diagnostic=True)
     compiles = [call for call in calls if call and call[0] == "cc"]
-    assert len(compiles) == 2
+    assert len(compiles) == 3
     assert "-DPERF_AB_DIAGNOSTIC=1" not in compiles[0]
-    assert "-DPERF_AB_DIAGNOSTIC=1" in compiles[1]
+    assert "-DPERF_AB_LATENCY=1" not in compiles[0]
+    assert "-DPERF_AB_LATENCY=1" in compiles[1]
+    assert "-DPERF_AB_DIAGNOSTIC=1" in compiles[2]
 
 
 def run_main(
@@ -107,6 +109,8 @@ def run_main(
         return work / f"bin-{arm}-{kind}" / "perf_ab"
 
     def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
+        if Path(cmd[0]).name == "perf_ab_latency":
+            return "1000\n"
         if cmd[1:2] == ["probe"]:
             arm = "head" if "bin-head" in cmd[0] else "base"
             kind = "singleton" if arm == "head" else "large"
@@ -247,6 +251,10 @@ def test_workflow_passes_head_cppdefs_through_the_environment() -> None:
     inputs = workflow[True]["workflow_dispatch"]["inputs"]
     assert inputs["head_cppdefs"]["default"] == ""
     step = ab_step(workflow)
+    assert step["env"]["HEAD_REF"] == "${{ inputs.head_sha || 'HEAD' }}"
+    assert '--head "$HEAD_REF"' in step["run"]
+    checkout = workflow["jobs"]["ab"]["steps"][0]
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
     assert step["env"]["HEAD_CPPDEFS"] == "${{ inputs.head_cppdefs }}"
     assert '--head-cppdefs "$HEAD_CPPDEFS"' in step["run"]
     assert "${{" not in step["run"]  # inputs reach the shell as data, never as script
@@ -348,12 +356,12 @@ def test_replay_build_counts_events_and_prints_them() -> None:
     assert set(perf_ab.KIND_CPPDEFS) == {perf_ab.HOLES_KIND}
 
 
-def test_workflow_gates_and_cancels_per_pr() -> None:
+def test_workflow_gates_and_preserves_running_measurements() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     inputs = workflow[True]["workflow_dispatch"]["inputs"]
     assert inputs["sanity_gate"]["default"] is True
     assert inputs["head_sha"]["default"] == ""
-    assert workflow["concurrency"]["cancel-in-progress"] is True
+    assert workflow["concurrency"]["cancel-in-progress"] is False
     # another label's (skipped) run must not share the group of a live perf-ab run
     assert "github.event.label.name != 'perf-ab'" in workflow["concurrency"]["group"]
     condition = workflow["jobs"]["ab"]["if"]
@@ -409,6 +417,7 @@ def metric_columns(
         return {
             "ops/s": [ops[index] * (1 + 0.001 * i) for i in range(7)],
             "cpu s": [cpu[index] * (1 + 0.001 * i) for i in range(7)],
+            "p99 operation ns": [1000.0] * 7,
             "minor faults": [1000.0 * (1 + 0.001 * i) for i in range(7)],
             perf_ab_ledger.PEAK: [peak[index] * (1 + 0.001 * i) for i in range(7)],
             perf_ab_ledger.DRAIN: [50.0 * (1 + 0.001 * i) for i in range(7)],
@@ -520,6 +529,8 @@ def test_adaptive_reps_extend_only_the_inconclusive_rows(
     ) -> str:
         if cmd[0] == "git":
             return ""
+        if Path(cmd[0]).name == "perf_ab_latency":
+            return "1000\n"
         if cmd[1:2] == ["probe"]:
             return ""
         arm = "head" if "bin-head" in cmd[0] else "base"
@@ -601,3 +612,13 @@ def test_workflow_uploads_the_samples_and_takes_the_new_inputs() -> None:
     (upload,) = [s for s in workflow["jobs"]["ab"]["steps"] if "upload" in s.get("name", "")]
     assert upload["if"] == "always()"  # a failed sanity gate still leaves its samples
     assert upload["with"]["name"] == "perf-ab-samples"
+
+
+def test_p99_cannot_spend_memory_credit() -> None:
+    base, head = metric_columns((200.0, 100.0), (10.0, 10.0), (1000.0, 1000.0))
+    head["p99 operation ns"] = [1100.0] * 7
+    latency = next(
+        c for c in perf_ab_ledger.cells(base, head, 50.0) if c.metric == "p99 operation ns"
+    )
+    assert latency.allowance == 0
+    assert latency.verdict == "FAIL"

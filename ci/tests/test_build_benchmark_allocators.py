@@ -109,6 +109,23 @@ class BunAllocatorRowTests(unittest.TestCase):
 
 
 class TcmallocLockTests(unittest.TestCase):
+    def test_newer_bazel_is_rejected_even_with_a_valid_lock(self) -> None:
+        record = next(record for record in locked_records() if record["id"] == "tcmalloc")
+        with tempfile.TemporaryDirectory(prefix="tcmalloc-version-") as temporary:
+            root = Path(temporary)
+            lock = root / "MODULE.bazel.lock"
+            lock.write_text("{}\n", encoding="utf-8")
+            record["build"]["generated_lock_sha256"] = builder.sha256_file(lock)
+            with (
+                patch.object(builder, "prepare_sources", return_value=({"tcmalloc": root}, {}, {})),
+                patch.object(builder, "checkout_commit", return_value="a" * 40),
+                patch.object(builder, "checked_tool_version", return_value="bazel 9.3.0"),
+                patch.object(builder.subprocess, "run") as run,
+                self.assertRaisesRegex(builder.ArchiveError, "requires bazel 9.1.0"),
+            ):
+                builder.build_records([record], root, 1)
+            run.assert_not_called()
+
     def test_corrupt_module_lock_fails_before_running_a_build_tool(self) -> None:
         record = next(record for record in locked_records() if record["id"] == "tcmalloc")
         with tempfile.TemporaryDirectory(prefix="tcmalloc-lock-") as temporary:

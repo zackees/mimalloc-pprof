@@ -517,10 +517,11 @@ def expand_command(
         raise LockfileError(f"unsupported build-command placeholder: {error}") from error
 
 
-def tool_version(command: Sequence[str]) -> str:
+def tool_version(command: Sequence[str], cwd: Path | None = None) -> str:
     try:
         result = subprocess.run(
             [*command, "--version"],
+            cwd=cwd,
             env=command_environment(),
             check=False,
             capture_output=True,
@@ -545,33 +546,11 @@ def split_tool_command(value: str) -> list[str]:
     return command
 
 
-def checked_tool_version(command: Sequence[str]) -> str:
-    version = tool_version(command)
+def checked_tool_version(command: Sequence[str], cwd: Path | None = None) -> str:
+    version = tool_version(command, cwd=cwd)
     if version == "unavailable" or version.startswith("exit "):
         raise ArchiveError(f"cannot identify build tool {list(command)!r}: {version}")
     return version
-
-
-def _tool_version_satisfies(actual: str, required: str) -> bool:
-    """Check that actual tool version meets or exceeds the required version.
-
-    Both strings are expected in the form 'toolname major.minor.patch'.
-    Only major and minor are compared; patch is advisory.
-    """
-    if actual == required:
-        return True
-    try:
-        actual_parts = actual.rsplit(" ", 1)
-        required_parts = required.rsplit(" ", 1)
-        if len(actual_parts) != 2 or len(required_parts) != 2:
-            return actual == required
-        if actual_parts[0] != required_parts[0]:
-            return False
-        actual_ver = tuple(int(p) for p in actual_parts[1].split("."))
-        required_ver = tuple(int(p) for p in required_parts[1].split("."))
-        return actual_ver[:2] >= required_ver[:2]
-    except (ValueError, IndexError):
-        return actual == required
 
 
 def compiler_identity(value: str) -> str:
@@ -1146,11 +1125,11 @@ def build_records(
             generated_lock_verified = True
         required_tool = build.get("required_tool_version")
         if required_tool is not None:
-            actual_tool = checked_tool_version([resolved[0][0]])
+            actual_tool = checked_tool_version([resolved[0][0]], cwd=source_dir)
             required_tool_str = require_string(
                 required_tool, f"{allocator_id}.build.required_tool_version"
             )
-            if not _tool_version_satisfies(actual_tool, required_tool_str):
+            if actual_tool != required_tool_str:
                 raise ArchiveError(f"{allocator_id} requires {required_tool}, got {actual_tool}")
         with (logs / f"{allocator_id}.log").open("w", encoding="utf-8") as log:
             for command in resolved:
@@ -1254,7 +1233,7 @@ def build_records(
             "cxx": compiler_identity(command_environment().get("CXX", "c++")),
             "cmake": checked_tool_version(["cmake"]),
             "ninja": checked_tool_version(["ninja"]),
-            "bazel": checked_tool_version(["bazel"]),
+            "bazel": checked_tool_version(["bazel"], cwd=sources["tcmalloc"]),
             "make": checked_tool_version(["make"]),
         },
         "mimalloc_option_comparison": mimalloc_option_comparison(records),

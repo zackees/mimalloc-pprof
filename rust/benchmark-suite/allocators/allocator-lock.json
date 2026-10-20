@@ -54,7 +54,7 @@
           },
           {
             "file": "tcmalloc-module-lock.patch",
-            "sha256": "e0007e0bff74141516e4d0e9b76f5b867cde381110a3ddf83264fb50773f5e3e"
+            "sha256": "8d619a166611a1a7c83e98d5737f635685f95fab98f5852d23dc305bebb3d55a"
           }
         ],
         "build": []

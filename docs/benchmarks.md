@@ -55,7 +55,7 @@ Every competitor is an immutable archive verified by SHA-256 before extraction;
 the fork itself is the workflow checkout.  The lockfile is
 [`rust/benchmark-suite/allocators/allocator-lock.json`](../rust/benchmark-suite/allocators/allocator-lock.json).
 
-TCMalloc's Bazel dependency lock is supplied by the checksummed
+TCMalloc's Bazel 9.1.0 selection and dependency lock are supplied by the checksummed
 `tcmalloc-module-lock.patch` source patch. Both query and build use
 `--lockfile_mode=error`, after the builder verifies the lock's SHA-256.
 Regenerating it during every build would incorporate mutable registry metadata.

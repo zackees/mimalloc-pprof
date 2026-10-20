@@ -46,11 +46,11 @@ def pool(datas: Sequence[dict[str, Any]]) -> dict[str, Any]:
         raise SystemExit("nothing to pool")
     first = datas[0]
     for other in datas[1:]:
-        for key in ("cpu", "base", "head"):
-            if other[key] != first[key]:
+        for key in ("cpu", "base", "head", "logical_cpus", "latency_protocol"):
+            if other.get(key) != first.get(key):
                 raise SystemExit(
                     f"refusing to pool runs with a different {key}: "
-                    f"{first[key]!r} vs {other[key]!r} (numbers from different hosts or commits "
+                    f"{first.get(key)!r} vs {other.get(key)!r} (numbers from different hosts or commits "
                     "are not comparable)"
                 )
         if other["fields"] != first["fields"] or other["variants"] != first["variants"]:

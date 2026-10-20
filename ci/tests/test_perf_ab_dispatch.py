@@ -136,3 +136,14 @@ def test_old_artifact_cannot_get_a_synthetic_p99() -> None:
     data["fields"] = [f for f in data["fields"] if f != "p99 operation ns"]
     with pytest.raises(SystemExit, match="p99 must not be invented"):
         perf_ab_dispatch.ledger_lines(data)
+
+
+@pytest.mark.parametrize("key", ["logical_cpus", "latency_protocol"])
+def test_pool_refuses_different_contention_or_sampling(key: str) -> None:
+    first, second = artifact(), artifact()
+    if key == "logical_cpus":
+        first[key], second[key] = 4, 8
+    else:
+        first[key], second[key] = {"version": "one"}, {"version": "two"}
+    with pytest.raises(SystemExit, match=key):
+        perf_ab_dispatch.pool([first, second])

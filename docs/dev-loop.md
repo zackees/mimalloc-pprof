@@ -269,7 +269,7 @@ first; use perf-ab to confirm, not to explore.
 ### Benchmark scaling: diagnostics, caches and alerts (#573 B7, B9)
 
 - **Diagnostic sweeps take 15 blocks per cell in practice** (`MIN_DISPATCH_BLOCKS` in
-  `ci/scaling_diagnostic.py` enforces only the floor of 15, before anything is built). A 5-block
+  `ci/scaling_diagnostic.py` enforces exactly 15 blocks, before anything is built). A 5-block
   sweep left a 30-45 MiB spread per cell and produced a false +6-12% RSS regression; 15 resolved
   single cells. More than 15 blocks over the 8-worker shard exceeds the runner's 1500 s projected
   budget (#575: 30 blocks projected 2150 s, 40 blocks 1503 s, both failed before measuring); the

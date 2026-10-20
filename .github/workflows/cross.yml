@@ -196,6 +196,11 @@ jobs:
           version: "0.9.27"
           save-cache: ${{ env.ACT && 'true' || 'auto' }}
           cache: true
+          # #585: the restored cache claims Windows ARM64 std is installed but
+          # soldr cargo fails E0463 (run 39496161094). Targets added after setup
+          # can have metadata without their libraries (setup-soldr#507, soldr#3793).
+          # Use a fresh toolchain for this row until upstream repairs that cache.
+          solo-toolchain-cache: ${{ matrix.target != 'aarch64-pc-windows-msvc' }}
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target

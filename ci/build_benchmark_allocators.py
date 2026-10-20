@@ -411,19 +411,14 @@ def apply_source_patches(
             log.write("$ " + " ".join(command) + "\n")
             log.flush()
             try:
-                try:
-                    subprocess.run(
-                        command,
-                        cwd=source_dir,
-                        env=command_environment(),
-                        check=True,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                    )
-                except subprocess.CalledProcessError:
-                    log.flush()
-                    print((logs / f"{allocator_id}.log").read_text(encoding="utf-8"))
-                    raise
+                subprocess.run(
+                    command,
+                    cwd=source_dir,
+                    env=command_environment(),
+                    check=True,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
             except FileNotFoundError as error:
                 raise ArchiveError(
                     "source patches require the standard `patch` executable"
@@ -1165,14 +1160,19 @@ def build_records(
                     )
                 log.write("$ " + " ".join(command) + "\n")
                 log.flush()
-                subprocess.run(
-                    command,
-                    cwd=source_dir,
-                    env=command_environment(),
-                    check=True,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                )
+                try:
+                    subprocess.run(
+                        command,
+                        cwd=source_dir,
+                        env=command_environment(),
+                        check=True,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                    )
+                except subprocess.CalledProcessError:
+                    log.flush()
+                    print((logs / f"{allocator_id}.log").read_text(encoding="utf-8"))
+                    raise
         library = find_primary_library(record, source_dir, build_dir)
         source_sha = source_commit(record, workflow_commit)
         version = adapter_version(record, workflow_commit)

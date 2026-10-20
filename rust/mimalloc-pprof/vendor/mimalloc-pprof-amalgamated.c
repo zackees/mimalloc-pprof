@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2c9557be of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 31fa7579 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -25708,13 +25708,21 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
 static bool mi_page_set_geometry(mi_theap_t* theap, mi_page_t* page, size_t block_size, size_t reserved) {
   const size_t start_offset = (size_t)(mi_page_start(page) - mi_page_slice_start(page));
   const size_t old_extent = mi_slice_count_of_size(start_offset + mi_page_size(page));
-  const bool remap = (mi_slice_count_of_size(start_offset + reserved * block_size) != old_extent);
-  if (remap) { MI_EVENT(MI_EVENT_PAGE_MAP_REEXTEND); _mi_page_map_unregister(page); }
+  const size_t new_extent = mi_slice_count_of_size(start_offset + reserved * block_size);
+  const bool remap = (new_extent != old_extent);
+  if (remap) { MI_EVENT(MI_EVENT_PAGE_MAP_REEXTEND); }
   page->block_size = block_size;       // page-geometry
   page->reserved = (uint16_t)reserved; // page-geometry
   mi_assert_internal(!mi_page_has_interior_pointers(page));   // (`_mi_page_retire` cleared it)
   mi_theap_stat_increase(theap, page_bins[_mi_page_stats_bin(page)], 1);   // (before any free below: it debits this bin)
-  if (remap && mi_unlikely(!_mi_page_map_register(page))) {   // (cannot commit page-map memory)
+  // #585: the owned page keeps the same start address. Its mapped prefix is
+  // already correct; shrinking only clears the stale tail, and growing only
+  // registers the new geometry (without first clearing the valid prefix).
+  if (new_extent < old_extent) {
+    _mi_page_map_unregister_range(mi_page_slice_start(page) + mi_size_of_slices(new_extent),
+                                 mi_size_of_slices(old_extent - new_extent));
+  }
+  else if (new_extent > old_extent && mi_unlikely(!_mi_page_map_register(page))) {   // (cannot commit page-map memory)
     _mi_arenas_page_free(page, theap);
     return false;
   }
@@ -25761,6 +25769,9 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
     const size_t size = mi_size_of_slices(page->memid.mem.arena.slice_count);
     if (size < want || size / block_size < MI_LARGE_SPAN_MIN_BLOCKS || size >= best_size) continue;
     best_pq = q; best_size = size;   // best fit: the smallest that is large enough
+    // #585: no later page can improve an exact fit. Keep the same first-best
+    // selection while avoiding the remaining bins on every such re-carve.
+    if (size == want) break;
   }
   if (best_pq == NULL) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_NONE); return NULL; }
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it

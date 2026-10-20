@@ -534,13 +534,21 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
 static bool mi_page_set_geometry(mi_theap_t* theap, mi_page_t* page, size_t block_size, size_t reserved) {
   const size_t start_offset = (size_t)(mi_page_start(page) - mi_page_slice_start(page));
   const size_t old_extent = mi_slice_count_of_size(start_offset + mi_page_size(page));
-  const bool remap = (mi_slice_count_of_size(start_offset + reserved * block_size) != old_extent);
-  if (remap) { MI_EVENT(MI_EVENT_PAGE_MAP_REEXTEND); _mi_page_map_unregister(page); }
+  const size_t new_extent = mi_slice_count_of_size(start_offset + reserved * block_size);
+  const bool remap = (new_extent != old_extent);
+  if (remap) { MI_EVENT(MI_EVENT_PAGE_MAP_REEXTEND); }
   page->block_size = block_size;       // page-geometry
   page->reserved = (uint16_t)reserved; // page-geometry
   mi_assert_internal(!mi_page_has_interior_pointers(page));   // (`_mi_page_retire` cleared it)
   mi_theap_stat_increase(theap, page_bins[_mi_page_stats_bin(page)], 1);   // (before any free below: it debits this bin)
-  if (remap && mi_unlikely(!_mi_page_map_register(page))) {   // (cannot commit page-map memory)
+  // #585: the owned page keeps the same start address. Its mapped prefix is
+  // already correct; shrinking only clears the stale tail, and growing only
+  // registers the new geometry (without first clearing the valid prefix).
+  if (new_extent < old_extent) {
+    _mi_page_map_unregister_range(mi_page_slice_start(page) + mi_size_of_slices(new_extent),
+                                 mi_size_of_slices(old_extent - new_extent));
+  }
+  else if (new_extent > old_extent && mi_unlikely(!_mi_page_map_register(page))) {   // (cannot commit page-map memory)
     _mi_arenas_page_free(page, theap);
     return false;
   }

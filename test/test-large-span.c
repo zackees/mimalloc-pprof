@@ -453,8 +453,12 @@ static THREAD_RET recarve_main(void* arg) {
   const recarve_t* const pair = (const recarve_t*)arg;
   void* const a = mi_malloc(pair->size_a);
   assert(a != NULL);
+  const mi_page_t* const original = _mi_ptr_page(a);
+  const size_t old_extent = mi_slice_count_of_size(
+      (size_t)(mi_page_start(original) - mi_page_slice_start(original)) + mi_page_size(original));
   mi_free(a);          // the bin's only page empties: it is retired
   mi_collect(false);   // one aging tick without reuse: any bin may take it
+  const uint64_t registrations = _mi_event_get(MI_EVENT_PAGE_MAP_REGISTER);
   void* blocks[32];
   size_t n = 0;
   const mi_page_t* page = NULL;
@@ -462,12 +466,28 @@ static THREAD_RET recarve_main(void* arg) {
     blocks[n] = mi_malloc(pair->size_b);
     assert(blocks[n] != NULL);
     const mi_page_t* const pg = _mi_ptr_page(blocks[n]);
-    if (n == 0) { page = pg; }
+    if (n == 0) {
+      page = pg;
+      if (page->memid.memkind == MI_MEM_ARENA && mi_page_meta_is_separated(page)) {
+        const size_t extent = mi_slice_count_of_size(mi_page_size(page));
+        if (extent < page->memid.mem.arena.slice_count) {
+          CHECK(_mi_safe_ptr_page(mi_page_slice_start(page) + mi_size_of_slices(extent)) != page,
+                "(g2) %zu -> %zu KiB: stale tail still maps to the re-carved page", pair->size_a >> 10, pair->size_b >> 10);
+        }
+        #if MI_DIAGNOSTICS
+        if (page == original && extent < old_extent) {
+          CHECK(_mi_event_get(MI_EVENT_PAGE_MAP_REGISTER) == registrations,
+                "(g2) shrinking an owned page must preserve its already registered prefix");
+        }
+        #endif
+      }
+    }
     if (pg != page) { n++; break; }
     memset(blocks[n], 0x66, pair->size_b);
     CHECK(mi_usable_size(blocks[n]) >= pair->size_b, "(g2) %zu -> %zu KiB: block %zu has no usable size", pair->size_a >> 10, pair->size_b >> 10, n);
   }
   for (size_t i = 0; i < n; i++) { mi_free(blocks[i]); }
+  MI_UNUSED(old_extent); MI_UNUSED(registrations);
   return THREAD_OK;
 }
 

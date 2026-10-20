@@ -1134,6 +1134,16 @@ def build_records(
         )
         expected_generated_lock = build.get("generated_lock_sha256")
         generated_lock_verified = expected_generated_lock is None
+        # The source patch supplies the reviewed lock. Regenerating it consults
+        # mutable registry metadata and makes a pinned allocator drift over time.
+        if expected_generated_lock is not None:
+            actual_lock_sha256 = sha256_file(source_dir / "MODULE.bazel.lock")
+            if actual_lock_sha256 != expected_generated_lock:
+                raise ArchiveError(
+                    f"{allocator_id} generated module lock mismatch: expected "
+                    f"{expected_generated_lock}, got {actual_lock_sha256}"
+                )
+            generated_lock_verified = True
         required_tool = build.get("required_tool_version")
         if required_tool is not None:
             actual_tool = checked_tool_version([resolved[0][0]])
@@ -1158,15 +1168,6 @@ def build_records(
                     stdout=log,
                     stderr=subprocess.STDOUT,
                 )
-                if "--lockfile_mode=update" in command:
-                    generated_lock = source_dir / "MODULE.bazel.lock"
-                    actual_lock_sha256 = sha256_file(generated_lock)
-                    if actual_lock_sha256 != expected_generated_lock:
-                        raise ArchiveError(
-                            f"{allocator_id} generated module lock mismatch: expected "
-                            f"{expected_generated_lock}, got {actual_lock_sha256}"
-                        )
-                    generated_lock_verified = True
         library = find_primary_library(record, source_dir, build_dir)
         source_sha = source_commit(record, workflow_commit)
         version = adapter_version(record, workflow_commit)

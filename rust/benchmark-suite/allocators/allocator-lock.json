@@ -15,13 +15,13 @@
       "build": {
         "system": "bazel",
         "required_tool_version": "bazel 9.1.0",
-        "generated_lock_sha256": "340a645e18fb1cdaed3dfd465312a3447de84ab31f78bd7db1863e2ee80f79f6",
+        "generated_lock_sha256": "5ec8cc791ba4a4ca8841144e4c3a8abf28aec0d289dcfec0f2c10d392349b553",
         "commands": [
           [
             "bazel",
             "--output_user_root={build_dir}/bazel",
             "cquery",
-            "--lockfile_mode=update",
+            "--lockfile_mode=error",
             "--dynamic_mode=off",
             "-c",
             "opt",
@@ -51,6 +51,10 @@
           {
             "file": "tcmalloc-remove-dev-fuzztest.patch",
             "sha256": "33f048ab1a867d6fcf40b1e0ed5b6b4d9e8515785c1267b918882fbf231714b4"
+          },
+          {
+            "file": "tcmalloc-module-lock.patch",
+            "sha256": "e0007e0bff74141516e4d0e9b76f5b867cde381110a3ddf83264fb50773f5e3e"
           }
         ],
         "build": []

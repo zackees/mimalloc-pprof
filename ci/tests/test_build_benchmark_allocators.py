@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 
 import build_benchmark_allocators as builder
 
@@ -105,6 +106,22 @@ class BunAllocatorRowTests(unittest.TestCase):
             # control failed for the hash and not for an unrelated reason.
             builder.download_archive(archive.as_uri(), honest_digest, destination)
             self.assertTrue(destination.is_file())
+
+
+class TcmallocLockTests(unittest.TestCase):
+    def test_corrupt_module_lock_fails_before_running_a_build_tool(self) -> None:
+        record = next(record for record in locked_records() if record["id"] == "tcmalloc")
+        with tempfile.TemporaryDirectory(prefix="tcmalloc-lock-") as temporary:
+            root = Path(temporary)
+            (root / "MODULE.bazel.lock").write_text("{}\n", encoding="utf-8")
+            with (
+                patch.object(builder, "prepare_sources", return_value=({"tcmalloc": root}, {}, {})),
+                patch.object(builder, "checkout_commit", return_value="a" * 40),
+                patch.object(builder.subprocess, "run") as run,
+                self.assertRaisesRegex(builder.ArchiveError, "module lock mismatch"),
+            ):
+                builder.build_records([record], root, 1)
+            run.assert_not_called()
 
 
 class ForkCppdefsTests(unittest.TestCase):

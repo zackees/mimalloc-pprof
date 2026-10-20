@@ -48,7 +48,14 @@ def pool(datas: Sequence[dict[str, Any]]) -> dict[str, Any]:
         raise SystemExit("incomplete perf-ab samples are diagnostic only; refusing to pool")
     first = datas[0]
     for other in datas[1:]:
-        for key in ("cpu", "base", "head", "logical_cpus", "latency_protocol"):
+        for key in (
+            "cpu",
+            "base",
+            "head",
+            "logical_cpus",
+            "latency_protocol",
+            "arm_order_protocol",
+        ):
             if other.get(key) != first.get(key):
                 raise SystemExit(
                     f"refusing to pool runs with a different {key}: "
@@ -97,6 +104,8 @@ def ledger_lines(data: dict[str, Any]) -> list[str]:
             f"8-worker cells have {8 / data['logical_cpus']:.2f} workers per logical CPU "
             "(above 1 means oversubscription)"
         )
+    order = data.get("arm_order_protocol")
+    header += f"; arm order: {order['version'] if order else 'legacy alternating endpoints'}"
     return [header, *lines]
 
 

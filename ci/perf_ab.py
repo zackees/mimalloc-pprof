@@ -408,6 +408,22 @@ def probe_rows(sizes: list[int], base: dict[int, str], head: dict[int, str]) -> 
     return rows
 
 
+ARM_ORDER_VERSION = "rotating-reversed-blocks-v1"
+
+
+def arm_order(arms: list[str], rep: int) -> list[str]:
+    """Balance execution positions in each block, reversing alternate blocks.
+
+    Reversing a three-arm sequence alone leaves its middle arm in the same
+    position every time. Rotations give every arm every position; reversing
+    alternate blocks also reverses the adjacent pairs. With more than three
+    arms this balances positions, not every possible carryover pairing.
+    """
+    block, shift = divmod(rep, len(arms))
+    ordered = arms if block % 2 == 0 else list(reversed(arms))
+    return ordered[shift:] + ordered[:shift]
+
+
 def header(
     base: str, head: str, head_env: str, cppdefs: list[str], cpu: str, reps: int
 ) -> list[str]:
@@ -422,7 +438,7 @@ def header(
             "",
         ]
     rows += [
-        arms + f" on {cpu}, {reps} paired reps, alternating order. "
+        arms + f" on {cpu}, {reps} paired reps, order protocol {ARM_ORDER_VERSION}. "
         "Median base -> head, then median paired difference [95% sign-test interval]; "
         "**bold** when the interval excludes 0 (and, with a null arm, exceeds its noise floor) "
         "on a rule-12 metric.",
@@ -626,6 +642,10 @@ def artifact(
         "head": {"ref": args.head, "sha": rev(args.head)},
         "cpu": cpu,
         "logical_cpus": logical_cpus(),
+        "arm_order_protocol": {
+            "version": ARM_ORDER_VERSION,
+            "arms": ["base", *(v.arm for v in variants), *([NULL_ARM] if args.null_arm else [])],
+        },
         "latency_protocol": {
             "version": "sampled-stream-operation-v1",
             "percentile": 99,
@@ -752,7 +772,7 @@ def main() -> int:
             def run_rep(rep: int, rows: Iterable[str]) -> None:
                 for workload in rows:
                     kind, params = workloads[workload]
-                    for arm in arms if rep % 2 == 0 else reversed(arms):
+                    for arm in arm_order(arms, rep):
                         env = {**os.environ, **BUILDS[kind][1], **env_of[arm]}
                         samples[(workload, arm)].append(
                             measure(exes[(arm, kind)], params, env, bound_ms)

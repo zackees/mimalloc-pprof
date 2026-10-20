@@ -138,7 +138,7 @@ def test_old_artifact_cannot_get_a_synthetic_p99() -> None:
         perf_ab_dispatch.ledger_lines(data)
 
 
-@pytest.mark.parametrize("key", ["logical_cpus", "latency_protocol"])
+@pytest.mark.parametrize("key", ["logical_cpus", "latency_protocol", "arm_order_protocol"])
 def test_pool_refuses_different_contention_or_sampling(key: str) -> None:
     first, second = artifact(), artifact()
     if key == "logical_cpus":
@@ -147,6 +147,18 @@ def test_pool_refuses_different_contention_or_sampling(key: str) -> None:
         first[key], second[key] = {"version": "one"}, {"version": "two"}
     with pytest.raises(SystemExit, match=key):
         perf_ab_dispatch.pool([first, second])
+
+
+def test_pool_refuses_legacy_and_balanced_arm_order() -> None:
+    first, second = artifact(), artifact()
+    second["arm_order_protocol"] = {
+        "version": "rotating-reversed-blocks-v1",
+        "arms": ["base", "head"],
+    }
+    with pytest.raises(SystemExit, match="arm_order_protocol"):
+        perf_ab_dispatch.pool([first, second])
+    assert "legacy alternating endpoints" in "\n".join(perf_ab_dispatch.ledger_lines(first))
+    assert "rotating-reversed-blocks-v1" in "\n".join(perf_ab_dispatch.ledger_lines(second))
 
 
 def test_partial_sanity_samples_cannot_be_pooled_or_judged() -> None:

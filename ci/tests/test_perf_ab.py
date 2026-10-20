@@ -519,6 +519,43 @@ def test_null_arm_reuses_the_base_binary(tmp_path: Path, monkeypatch: pytest.Mon
     assert len(exes) == 3 and len(set(exes)) == 2  # base twice, head once
 
 
+def test_candidate_occupies_every_execution_position(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, children = run_main(
+        tmp_path, monkeypatch, "--workloads", "small", "--null-arm", "--reps", "6"
+    )
+    positions = [
+        next(i for i, cmd in enumerate(children[start : start + 3]) if "bin-head" in cmd[0])
+        for start in range(0, len(children), 3)
+    ]
+    assert [positions.count(i) for i in range(3)] == [2, 2, 2]
+
+
+def test_three_arm_order_covers_all_permutations() -> None:
+    arms = ["base", "head", "null"]
+    assert [perf_ab.arm_order(arms, rep) for rep in range(6)] == [
+        ["base", "head", "null"],
+        ["head", "null", "base"],
+        ["null", "base", "head"],
+        ["null", "head", "base"],
+        ["head", "base", "null"],
+        ["base", "null", "head"],
+    ]
+    assert arms == ["base", "head", "null"]
+
+
+@pytest.mark.parametrize("count", [2, 3, 4, 5, 6])
+def test_arm_positions_are_balanced_with_additional_variants(count: int) -> None:
+    arms = [f"arm{i}" for i in range(count)]
+    for block in range(4):
+        orders = [perf_ab.arm_order(arms, rep) for rep in range(block * count, (block + 1) * count)]
+        assert all(sorted(order) == arms for order in orders)
+        for position in range(count):
+            assert sorted(order[position] for order in orders) == arms
+    assert perf_ab.arm_order(arms, 1) == perf_ab.arm_order(arms, 1 + 2 * count)
+
+
 def test_adaptive_reps_extend_only_the_inconclusive_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -590,6 +627,10 @@ def test_json_artifact_holds_the_raw_samples(
     assert all(len(reps) == 1 and len(reps[0]) == len(data["fields"]) for reps in row.values())
     assert data["workloads"]["small/8 (control)"]["params"]["threads"] == 8
     assert data["variants"] == [{"arm": "head", "env": {}, "cppdefs": []}]
+    assert data["arm_order_protocol"] == {
+        "version": "rotating-reversed-blocks-v1",
+        "arms": ["base", "head", "null"],
+    }
 
 
 def test_force_kind_builds_every_row_with_frame_pointers(

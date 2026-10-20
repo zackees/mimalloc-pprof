@@ -216,6 +216,13 @@ uv run ci/perf_ab_dispatch.py --from-json a.json b.json
 - **Raw samples.** Every run uploads `perf-ab-samples` (`perf-ab-samples.json`): per-repetition
   values for every row and arm, the base and head SHAs, defines, environment, CPU model and the
   RSS floor. `ci/perf_ab_ledger.py` judges them; nothing is scraped from a log.
+- **Arm order (#585).** Each block of `len(arms)` repetitions rotates every arm through
+  every execution position; alternate blocks reverse direction. For three arms the six-run
+  cycle covers all permutations. This removes the old endpoint-only reversal's confound,
+  which always left head in the middle. Extra variants retain position balance, without
+  guaranteeing all possible carryover pairings. Artifacts record `arm_order_protocol`;
+  pooling refuses a different or missing protocol. Old failures remain evidence, and this
+  correction alone does not explain them. Use complete blocks when selecting repetition counts.
 - **Rule-12 ledger.** Per row: `saved%` of the reducible peak-RSS gap (against the RSS floor
   `ci/perf_ab.c` prints: the RSS before the work plus the live requested bytes), then for
   throughput, CPU, faults, peak and after-drain RSS the paired change, its allowance (`saved%/3`

@@ -230,6 +230,13 @@ uv run ci/perf_ab_dispatch.py --from-json a.json b.json
   INCONCLUSIVE, up to that many; conclusive rows stop at `reps`.
 - **`fp` build.** `--force-kind fp` builds every row with `-fno-omit-frame-pointer`, for
   `perf record -g` and caller-report shims.
+- **Linked-build attribution (#585).** Dispatch `perf-ab.yml` with `build_report_only=true`
+  and exact `base` / `head_sha` revisions to preserve the plain timing and latency executables,
+  static libraries, symbols, disassembly, hashes, compiler versions, runner image and CMake
+  settings in `perf-ab-build-report`. It runs no workloads and produces no performance verdict;
+  its metadata is explicitly incomplete for ledger purposes. These are fresh builds, so they
+  cannot establish the exact layout of binaries discarded by an earlier measurement. Compare
+  compiler/image identity before using their layout to explain an earlier result.
 
 ### Local tooling (#573 C)
 

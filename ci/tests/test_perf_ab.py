@@ -605,11 +605,16 @@ def test_workflow_uploads_the_samples_and_takes_the_new_inputs() -> None:
     inputs = workflow[True]["workflow_dispatch"]["inputs"]
     assert inputs["null_arm"]["default"] is False
     assert inputs["max_reps"]["default"] == "0"
+    assert inputs["build_report_only"]["default"] is False
     step = ab_step(workflow)
     assert " $NULL_ARM " in step["run"] and '--max-reps "$MAX_REPS"' in step["run"]
     assert "--json perf-ab-samples.json" in step["run"]
     assert "${{" not in step["run"]
-    (upload,) = [s for s in workflow["jobs"]["ab"]["steps"] if "upload" in s.get("name", "")]
+    (upload,) = [
+        s
+        for s in workflow["jobs"]["ab"]["steps"]
+        if s.get("with", {}).get("name") == "perf-ab-samples"
+    ]
     assert upload["if"] == "always()"  # a failed sanity gate still leaves its samples
     assert upload["with"]["name"] == "perf-ab-samples"
 

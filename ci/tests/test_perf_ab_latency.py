@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import shutil
 import subprocess
@@ -10,6 +12,8 @@ from pathlib import Path
 import pytest
 
 import perf_ab
+import perf_ab_build_report
+import perf_ab_dispatch
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -90,3 +94,41 @@ def test_measured_metrics_keep_the_ordinary_child_rss_floor(latency_children: Pa
     assert len(values) == len(perf_ab.METRICS) + 1
     assert values[perf_ab.METRICS.index("p99 operation ns")] > 0
     assert 0 < values[perf_ab.IDEAL_FIELD] < values[perf_ab.METRICS.index("peak RSS MiB")]
+
+
+def test_build_report_preserves_linked_evidence_without_measuring(
+    latency_children: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if shutil.which("nm") is None or shutil.which("objdump") is None:
+        pytest.skip("requires binutils")
+
+    def built(*_args: object, **_kwargs: object) -> Path:
+        return latency_children / "perf_ab"
+
+    def no_measurement(*_args: object, **_kwargs: object) -> list[float]:
+        pytest.fail("a build-only report must not measure a workload")
+
+    monkeypatch.setattr(perf_ab, "build", built)
+    monkeypatch.setattr(perf_ab, "measure", no_measurement)
+    output = tmp_path / "report"
+    summary = tmp_path / "summary.txt"
+    assert (
+        perf_ab_build_report.main(
+            ["--base", "HEAD", "--head", "HEAD", "--output", str(output), "--summary", str(summary)]
+        )
+        == 0
+    )
+    report = json.loads((output / "build-report.json").read_text())
+    assert report["complete"] is False
+    assert "no performance verdict" in summary.read_text()
+    for arm in ("base", "head"):
+        for name in ("perf_ab", "perf_ab_latency"):
+            assert (output / arm / name).read_bytes() == (latency_children / name).read_bytes()
+            assert (
+                report["arms"][arm]["files"][name]["sha256"]
+                == hashlib.sha256((output / arm / name).read_bytes()).hexdigest()
+            )
+            assert "mi_malloc" in (output / arm / f"{name}.symbols.txt").read_text()
+            assert "<mi_free>:" in (output / arm / f"{name}.disassembly.txt").read_text()
+    with pytest.raises(SystemExit, match="no regression verdict"):
+        perf_ab_dispatch.ledger_lines(report)

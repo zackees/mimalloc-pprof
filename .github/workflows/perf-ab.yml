@@ -65,6 +65,10 @@ on:
         description: "Fail after the first repetition when a head RSS metric exceeds 1.5x base + 8 MiB (#573); turn off for a knob that is meant to trade memory away"
         type: boolean
         default: true
+      build_report_only:
+        description: "Build-only plain-binary layout diagnostic: preserve executables, disassembly and compiler settings; run no measurements (#585)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -104,7 +108,26 @@ jobs:
           NO_SANITY_GATE: ${{ inputs.sanity_gate == false && '--no-sanity-gate' || '' }}
           NULL_ARM: ${{ inputs.null_arm && '--null-arm' || '' }}
           MAX_REPS: ${{ inputs.max_reps || '0' }}
-        run: python3 ci/perf_ab.py --base "$BASE_REF" --head "$HEAD_REF" --reps "$REPS" --max-reps "$MAX_REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" $HOLES_REPORT $NO_SANITY_GATE $NULL_ARM --json perf-ab-samples.json --summary "$GITHUB_STEP_SUMMARY"
+          BUILD_REPORT_ONLY: ${{ inputs.build_report_only }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_REPORT_ONLY" == true ]]; then
+            if [[ -n "$HEAD_ENV" || -n "$HEAD_CPPDEFS" ]]; then
+              echo '::error::build-only report supports the unchanged plain build, without head variants'
+              exit 2
+            fi
+            python3 ci/perf_ab_build_report.py --base "$BASE_REF" --head "$HEAD_REF" --output perf-ab-build-report --summary "$GITHUB_STEP_SUMMARY"
+          else
+            python3 ci/perf_ab.py --base "$BASE_REF" --head "$HEAD_REF" --reps "$REPS" --max-reps "$MAX_REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" $HOLES_REPORT $NO_SANITY_GATE $NULL_ARM --json perf-ab-samples.json --summary "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: upload the build-only diagnostic
+        if: always() && inputs.build_report_only
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: perf-ab-build-report
+          path: perf-ab-build-report
+          if-no-files-found: ignore
+          retention-days: 30
       # the raw per-repetition samples (#573 B4): ci/perf_ab_dispatch.py and ci/perf_ab_ledger.py
       # re-judge them, and runs on the same CPU model can be pooled
       - name: upload the samples

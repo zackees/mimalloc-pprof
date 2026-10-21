@@ -1562,6 +1562,16 @@ if (MI_BUILD_TESTS)
       add_test(NAME test-purge-holes-off COMMAND mimalloc-test-purge-holes)
       set_tests_properties(test-purge-holes-off PROPERTIES TIMEOUT 600
                            ENVIRONMENT "MIMALLOC_PURGE_HOLES=0")
+      # #493's serial-thread handoff must have no concurrent scanner: the scanner's
+      # temporary ownership makes a reserved page unavailable without releasing it.
+      # Use a fresh process, preserving both same-page and zero-new-pages assertions.
+      # The existing purge-holes tests retain all background release cases above.
+      add_test(NAME test-reserved-page-reuse COMMAND mimalloc-test-purge-holes --serial-reserve-reuse)
+      set_tests_properties(test-reserved-page-reuse PROPERTIES TIMEOUT 600
+                           ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=1")
+      add_test(NAME test-reserved-page-reuse-off COMMAND mimalloc-test-purge-holes --serial-reserve-reuse)
+      set_tests_properties(test-reserved-page-reuse-off PROPERTIES TIMEOUT 600
+                           ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=0")
     endif()
 
     # test-purge-zero: imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 /

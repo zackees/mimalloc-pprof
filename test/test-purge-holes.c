@@ -2227,8 +2227,22 @@ done:
 }
 #endif
 
-int main(void) {
+int main(int argc, char** argv) {
   mi_version();
+  if (argc == 2 && strcmp(argv[1], "--serial-reserve-reuse") == 0) {
+    // #585: a scanner temporarily removes a reserved page from the abandoned map while
+    // claiming it, even inside the retention window. Test the serial handoff in its own
+    // process, with no scanner started; the release cases below still run with it enabled.
+    CHECK("serial-reuse-scavenger-disabled",
+          !mi_option_is_enabled(mi_option_scavenger) && !_mi_scavenger_is_running());
+    if (failed != 0) return print_test_summary();
+    CHECK("dead-thread-page-is-reused", test_dead_thread_page_is_reused());
+    return print_test_summary();
+  }
+  if (argc != 1) {
+    fprintf(stderr, "usage: %s [--serial-reserve-reuse]\n", argv[0]);
+    return EXIT_FAILURE;
+  }
   purging_enabled = mi_option_is_enabled(mi_option_purge_holes);
   // Zero every hole before it is discarded. Without this the survivor checks below are
   // VACUOUS in a release build on macOS: MADV_FREE_REUSABLE is lazy, so a discard that
@@ -2302,7 +2316,6 @@ int main(void) {
   CHECK("reserved-page-is-released", test_reserved_page_is_released());
   CHECK("retired-page-slack-released", test_retired_page_slack_released());
   #endif
-  CHECK("dead-thread-page-is-reused", test_dead_thread_page_is_reused());
   CHECK("large-holes-without-idle", test_large_holes_without_idle());
 
   // everything above is freed by now, so every hole must have been handed back

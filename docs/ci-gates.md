@@ -935,11 +935,12 @@ Stated rather than gated:
 
 The win-gnu lane asks for `ci/memory-baselines/windows-x64-soldr-mingw-gcc-15-pprof1.json`
 via `--arch x64 --compiler soldr-mingw-gcc-15`, so it cannot borrow
-`windows-pprof1.json`, which MSVC recorded on the same runner. That file does not exist
-yet, so the first runs take the "no baseline → bootstrap it" path (`memory_gate.py where`
-exits 3) and upload their JSON; the positive control is skipped with a warning until the
-baseline is committed, because `control` requires `check` to *fail* and a missing baseline
-is not a failure.
+`windows-pprof1.json`, which MSVC recorded on the same runner. The reference is
+recorded from eight runs of the previous merged allocator; its source, artifact and
+input hashes are in [the baseline provenance](../ci/memory-baselines/README.md).
+Both the normal comparison and the injected-leak positive control are now enforced.
+A future toolchain key with no reference takes the bootstrap path (`where` exits 3)
+and warns that its comparison and positive control have not run.
 
 ### Rollout
 
@@ -1213,11 +1214,12 @@ The MSVC bundle lane asks for
 `ci/memory-baselines/windows-x64-soldr-clang-cl-21-pprof1.json` via
 `--arch x64 --compiler soldr-clang-cl-21`. It must **not** borrow `windows-pprof1.json`,
 which native `cl` recorded on the same runner — that would be a cross-toolchain comparison
-dressed as a regression check. That file does not exist yet, so the first runs take the
-"no baseline → bootstrap it" path (`memory_gate.py where` exits 3) and upload their JSON;
-the positive control is skipped with a warning until the baseline is committed, because
-`control` requires `check` to *fail* and a missing baseline is not a failure. Same
-follow-up as phase B's correction 8 and phase C's correction 7.
+dressed as a regression check. The reference is recorded from eight runs of the
+previous merged allocator; see [the baseline provenance](../ci/memory-baselines/README.md).
+The comparison and injected-leak positive control are enforced for this key.
+Future keys without a reference still take the bootstrap path (`where` exits 3)
+and warn that neither comparison nor positive control has run. Never initialize
+the reference from an allocator candidate merely to make its gate pass.
 
 ### Rollout
 

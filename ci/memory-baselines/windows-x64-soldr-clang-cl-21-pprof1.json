@@ -1,0 +1,53 @@
+{
+  "arch": "x64",
+  "baseline_runs": 8,
+  "baseline_spread_pct": 0.1,
+  "compiler": "soldr-clang-cl-21",
+  "counters": {
+    "pages_end": 0,
+    "pages_start": 0,
+    "theaps_end": 1,
+    "theaps_start": 1,
+    "threads_end": 1,
+    "threads_start": 1
+  },
+  "gated_metric": "peak_commit",
+  "inject_leak": 0,
+  "mi_pprof": 1,
+  "peak_commit_mb": 71.6,
+  "peak_mb": 71.6,
+  "peak_minus_profiler_mb": 71.6,
+  "peak_rss_mb": 21.6,
+  "platform": "windows",
+  "profiler_arena_mb": 0.0,
+  "purged_gb": 0.09,
+  "scenario_filter": null,
+  "scenarios": [
+    {
+      "current_rss_mb": 7.4,
+      "name": "thread_churn",
+      "peak_mb": 57.7
+    },
+    {
+      "current_rss_mb": 16.5,
+      "name": "sawtooth",
+      "peak_mb": 57.7
+    },
+    {
+      "current_rss_mb": 21.4,
+      "name": "cross_thread_free",
+      "peak_mb": 57.7
+    },
+    {
+      "current_rss_mb": 21.4,
+      "name": "rolling_heaps",
+      "peak_mb": 57.7
+    },
+    {
+      "current_rss_mb": 21.4,
+      "name": "huge_churn",
+      "peak_mb": 71.6
+    }
+  ],
+  "schema": 1
+}

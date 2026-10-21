@@ -28,3 +28,6 @@ uv.lock
 # clud /grind run records: local only, never committed
 .clud/grind/
 .clud/logs/
+
+# Issue 585 retains original measurements before temporary evidence is cleaned.
+!/.github/assets/perf-585/measurements.zip

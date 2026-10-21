@@ -15,9 +15,14 @@ static _Atomic(size_t) stack_count;
 static _Atomic(size_t) stack_overflows;
 
 static uint64_t stack_hash(void* const* pcs, size_t depth) {
-  uint64_t hash = UINT64_C(1469598103934665603);
-  for (size_t i = 0; i < depth; i++) { uintptr_t pc=(uintptr_t)pcs[i]; for (size_t b=0;b<sizeof(pc);b++) { hash ^= (uint8_t)(pc >> (b*8)); hash *= UINT64_C(1099511628211); } }
-  return hash;
+  // #585: this runs under prof_lock. Mix whole PC words instead of a chain of
+  // byte rounds; the existing stateless mixer also disperses aligned addresses
+  // before the power-of-two table mask. Hash collisions still compare every PC.
+  uintptr_t hash = (uintptr_t)UINT64_C(1469598103934665603);
+  for (size_t i = 0; i < depth; i++) {
+    hash = _mi_random_shuffle(hash ^ (uintptr_t)pcs[i]);
+  }
+  return (uint64_t)hash;
 }
 
 static bool stack_equal(const mi_prof_stack_t* stack, uint64_t hash, void* const* pcs, size_t depth) {

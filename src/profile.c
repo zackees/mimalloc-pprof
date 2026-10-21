@@ -47,6 +47,10 @@ static mi_lock_t prof_lock = MI_LOCK_INITIALIZER;
    warning C4133), corrupting adjacent globals and reading garbage. All uses
    below already treat this as a 0/1 flag via implicit bool conversion. */
 static _Atomic(size_t) prof_enabled = false;
+// Published only after the automatic startup body completes. A stopped profiler
+// then needs neither the metadata lookup nor the once helper on allocations.
+// Keep size_t for the native MSVC atomic wrapper, as for prof_enabled above.
+static _Atomic(size_t) prof_auto_start_done = false;
 static mi_prof_chunk_t* prof_chunks;
 static mi_prof_record_t* prof_all;
 static mi_prof_record_t* prof_free;
@@ -903,6 +907,7 @@ static void prof_auto_start(void) {
     /* So pure-env users (no mi_prof_start_ex call at all) still get profile.proto exit dumps. */
     char fmt_buf[MI_PROF_ENV_VALUE_SIZE] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
     if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
+    mi_atomic_store_release(&prof_auto_start_done, true);
   }
 }
 void _mi_prof_process_init(void) {
@@ -963,10 +968,14 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   // unlike _mi_memevt_on_free -- see that function's provenance comment in
   // memory-events.c), so page->heap is not actually at risk here, but the arena-derived
   // helper is equally correct and keeps both meta-page checks on the same, provably-safe path.
-  if (_mi_meta_is_meta_page_safe(page)) return;
-
-  prof_auto_start();
+  if mi_unlikely(!mi_atomic_load_acquire(&prof_auto_start_done)) {
+    if (_mi_meta_is_meta_page_safe(page)) return;
+    prof_auto_start();
+  }
   if mi_likely(!mi_atomic_load_relaxed(&prof_enabled)) return;
+  // Once startup is resolved, defer this lookup until profiling is enabled.
+  // The acquire above also orders the enabled load after startup publication.
+  if (_mi_meta_is_meta_page_safe(page)) return;
   // #266: peek the CURRENT thread's hooks tld here, not `theap` (the theap performing
   // the allocation, which during a meta allocation is the shared, always-initialized
   // `subproc->theap_meta`, not necessarily this thread's own theap) -- see

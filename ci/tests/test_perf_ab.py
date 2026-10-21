@@ -561,7 +561,7 @@ def test_preserves_measured_children_on_success_and_sanity_failure(
     assert captured == [({("base", "plain"), ("head", "plain"), ("null", "plain")}, output)]
 
 
-def test_samples_survive_a_build_preservation_error(
+def test_build_preservation_error_stops_before_measurements(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def fail_copy(*_: object) -> None:
@@ -580,7 +580,68 @@ def test_samples_survive_a_build_preservation_error(
             "--preserve-builds",
             str(tmp_path / "builds"),
         )
-    assert len(json.loads(output.read_text())["samples"]["small/8 (control)"]["head"]) == 1
+    data = json.loads(output.read_text())
+    assert data["complete"] is False
+    assert all(not rows for rows in data["samples"]["small/8 (control)"].values())
+
+
+def test_preserves_executables_before_the_first_measurement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preserved = False
+    observed: list[bool] = []
+    original_measure = perf_ab.measure
+
+    def capture(*_: object) -> None:
+        nonlocal preserved
+        preserved = True
+
+    def measure(*args: Any) -> list[float]:
+        observed.append(preserved)
+        return original_measure(*args)
+
+    monkeypatch.setattr(perf_ab, "preserve_builds", capture)
+    monkeypatch.setattr(perf_ab, "measure", measure)
+    run_main(
+        tmp_path, monkeypatch, "--workloads", "small", "--preserve-builds", str(tmp_path / "builds")
+    )
+    assert observed and all(observed)
+
+
+@pytest.mark.parametrize("completed", [0, 1, 4])
+def test_interruption_retains_completed_measurements_as_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, completed: int
+) -> None:
+    original_measure = perf_ab.measure
+    measured: list[list[float]] = []
+
+    def measure(*args: Any) -> list[float]:
+        if len(measured) == completed:
+            raise KeyboardInterrupt("simulated CI termination")
+        values = original_measure(*args)
+        measured.append(values)
+        return values
+
+    monkeypatch.setattr(perf_ab, "measure", measure)
+    out = tmp_path / "interrupted.json"
+    with pytest.raises(KeyboardInterrupt, match="simulated CI termination"):
+        run_main(
+            tmp_path,
+            monkeypatch,
+            "--workloads",
+            "small",
+            "--null-arm",
+            "--reps",
+            "6",
+            "--json",
+            str(out),
+        )
+    data = json.loads(out.read_text())
+    assert data["complete"] is False
+    arms = data["samples"]["small/8 (control)"]
+    saved = [row for rows in arms.values() for row in rows]
+    assert len(saved) == len(measured) == completed
+    assert all(row == measured[0] for row in saved)
 
 
 def test_candidate_occupies_every_execution_position(

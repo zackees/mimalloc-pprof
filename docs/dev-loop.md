@@ -222,10 +222,16 @@ original parameters, seeds and touch policy.
 
 - **Raw samples.** Every run uploads `perf-ab-samples` (`perf-ab-samples.json`): per-repetition
   values for every row and arm, the base and head SHAs, defines, environment, CPU model and the
-  RSS floor. `ci/perf_ab_ledger.py` judges them; nothing is scraped from a log.
+  RSS floor. An atomic checkpoint is saved after each completed timing/latency pair,
+  starting with an empty checkpoint before measurement. Checkpoints remain
+  `complete: false` until the whole run finishes; interrupted or unbalanced data
+  cannot receive a regression verdict or be pooled. Parent progress lines identify
+  the workload, repetition and arm being measured. `ci/perf_ab_ledger.py` judges
+  completed data; nothing is scraped from a log.
   CI also uploads `perf-ab-builds`: the exact timing and latency executables by arm/build
-  kind, with SHA-256 digests. They are copied after measurements, including a failed sanity
-  screen, so attribution can inspect the actual linked code. Local runs opt in with
+  kind, with SHA-256 digests. They are copied before the first measurement so forced
+  CI termination can retain them even when Python cleanup never runs. A copy error
+  aborts before measurements. Local runs opt in with
   `--preserve-builds <new-directory>`.
 - **Arm order (#585).** Each block of `len(arms)` repetitions rotates every arm through
   every execution position; alternate blocks reverse direction. For three arms the six-run

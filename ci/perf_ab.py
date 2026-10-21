@@ -632,7 +632,7 @@ def render_variant(
 
 
 def preserve_builds(exes: dict[tuple[str, str], Path], output: Path) -> None:
-    """Keep the exact measured children before temporary build trees disappear."""
+    """Keep the exact children before measurements can be forcibly terminated."""
     output.mkdir(parents=True, exist_ok=False)
     digests: dict[str, str] = {}
     for (arm, kind), exe in sorted(exes.items()):
@@ -647,6 +647,13 @@ def preserve_builds(exes: dict[tuple[str, str], Path], output: Path) -> None:
                 target.read_bytes()
             ).hexdigest()
     (output / "sha256.json").write_text(json.dumps(digests, indent=2) + "\n")
+
+
+def save_artifact(output: Path, data: dict[str, Any]) -> None:
+    """An interrupted write leaves the previous complete JSON checkpoint readable."""
+    pending = output.with_name(output.name + ".tmp")
+    pending.write_text(json.dumps(data, indent=1) + "\n")
+    pending.replace(output)
 
 
 def artifact(
@@ -801,15 +808,28 @@ def main() -> int:
             samples: dict[tuple[str, str], list[list[float]]] = {
                 (w, a): [] for w in workloads for a in arms
             }
+            # Cache metadata once; the artifact holds the live sample lists. Keep
+            # checkpoints ineligible for a verdict until the entire run finishes.
+            checkpoint = (
+                artifact(args, variants, workloads, samples, bound_ms, cpu) if args.json else None
+            )
+            if args.json and checkpoint is not None:
+                checkpoint["complete"] = False
+                save_artifact(args.json, checkpoint)
+            if args.preserve_builds:
+                preserve_builds(exes, args.preserve_builds)
 
             def run_rep(rep: int, rows: Iterable[str]) -> None:
                 for workload in rows:
                     kind, params = workloads[workload]
                     for arm in arm_order(arms, rep):
                         env = {**os.environ, **BUILDS[kind][1], **env_of[arm]}
+                        print(f"repetition {rep + 1}: {workload} [{arm}]", flush=True)
                         samples[(workload, arm)].append(
                             measure(exes[(arm, kind)], params, env, bound_ms)
                         )
+                        if args.json and checkpoint is not None:
+                            save_artifact(args.json, checkpoint)
 
             for rep in range(args.reps):
                 run_rep(rep, workloads)
@@ -830,7 +850,7 @@ def main() -> int:
                                 requested_reps=args.reps,
                                 reps=rep + 1,
                             )
-                            args.json.write_text(json.dumps(partial, indent=1) + "\n")
+                            save_artifact(args.json, partial)
                         if args.summary:
                             args.summary.write_text(message + "\n")
                         return 1
@@ -867,14 +887,11 @@ def main() -> int:
                 artifact(args, variants, workloads, samples, bound_ms, cpu) if args.json else None
             )
             if args.json and data is not None:
-                args.json.write_text(json.dumps(data, indent=1) + "\n")
+                data["complete"] = True
+                save_artifact(args.json, data)
         finally:  # unregister the trees while they still exist: a prune here would find nothing to prune
-            try:
-                if args.preserve_builds:
-                    preserve_builds(exes, args.preserve_builds)
-            finally:
-                for tree in work.glob("src-*"):
-                    run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
+            for tree in work.glob("src-*"):
+                run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
     rows: list[str] = []
     held = True
     for variant in variants:

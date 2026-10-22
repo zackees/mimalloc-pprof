@@ -20,6 +20,32 @@ The tested PR merge and measured head have identical entire Git trees. This
 correctness result does not replace performance acceptance. PR 609 remains draft.
 [Bounded local attribution did not establish the cause of the two uncertainties](https://github.com/zackees/mimalloc-pprof/issues/585#issuecomment-6328974076).
 
+## Subsequent correctness failure and fixture correction
+
+The evidence-only head `28ac6796` subsequently completed with 102 successful checks,
+two failed checks and five intentional skips (the same 109 check names).
+[Windows clang-cl debug failed the arena-reclaim-reset A5 worker precondition](https://github.com/zackees/mimalloc-pprof/issues/585#issuecomment-6329284276);
+its required gate failed as a consequence. Later clang-cl shared/owner-gate/memory
+steps were skipped after the failure, so this run does not validate them. Earlier
+measured-source platform success remains historical evidence.
+
+The fixture waited for only 20,000 yields before assuming worker progress. The
+correction waits for the actual pinned/parked predicates under the existing
+300-second CTest timeout, preserving all reclaim and accounting assertions. A
+controlled 200 ms delay in both workers gives RED exit 1 before and GREEN exit 0
+after with the same Debugfull allocator library. All four local reclaim CTests
+pass. This demonstrates a possible scheduling defect, not the exact historical
+CI cause. Full CI for the correction remains required. Allocator source and the
+original 11-PASS/two-INCONCLUSIVE performance outcome are unchanged.
+
+`arena-reclaim-wait.zip` and its separate manifest retain the complete failed
+Windows log, original check inventory, source snapshots, local driver, build
+commands, library, probe binaries and RED/GREEN/test outputs. The local driver
+reads the checkout: the before phase used the original test at `28ac6796` and the
+after phase used the correction. The archived source snapshots are authoritative;
+adjust original scratch paths before reproduction. The driver is Linux-only
+(`usleep`); Windows coverage comes from full CI, not these local probes.
+
 ## Contents and limits
 
 `measurements.zip` retains exact input bytes and original relative paths.
@@ -52,17 +78,19 @@ python - <<'PYVERIFY'
 import hashlib, json, zipfile
 from pathlib import Path
 root = Path('.github/assets/perf-585')
-manifest = json.loads((root / 'manifest.json').read_text())
-archive = root / 'measurements.zip'
-assert archive.stat().st_size == manifest['archive']['bytes']
-assert hashlib.sha256(archive.read_bytes()).hexdigest() == manifest['archive']['sha256']
-with zipfile.ZipFile(archive) as zipped:
-    assert len(zipped.namelist()) == len(manifest['files'])
-    assert set(zipped.namelist()) == {f['path'] for f in manifest['files']}
-    for entry in manifest['files']:
-        data = zipped.read(entry['path'])
-        assert len(data) == entry['bytes']
-        assert hashlib.sha256(data).hexdigest() == entry['sha256']
+for manifest_name, archive_name in [('manifest.json', 'measurements.zip'),
+                                    ('arena-reclaim-wait-manifest.json', 'arena-reclaim-wait.zip')]:
+    manifest = json.loads((root / manifest_name).read_text())
+    archive = root / archive_name
+    assert archive.stat().st_size == manifest['archive']['bytes']
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == manifest['archive']['sha256']
+    with zipfile.ZipFile(archive) as zipped:
+        assert len(zipped.namelist()) == len(manifest['files'])
+        assert set(zipped.namelist()) == {f['path'] for f in manifest['files']}
+        for entry in manifest['files']:
+            data = zipped.read(entry['path'])
+            assert len(data) == entry['bytes']
+            assert hashlib.sha256(data).hexdigest() == entry['sha256']
 print('All evidence hashes verified; acceptance remains incomplete.')
 PYVERIFY
 ```

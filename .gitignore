@@ -31,3 +31,4 @@ uv.lock
 
 # Issue 585 retains original measurements before temporary evidence is cleaned.
 !/.github/assets/perf-585/measurements.zip
+!/.github/assets/perf-585/arena-reclaim-wait.zip

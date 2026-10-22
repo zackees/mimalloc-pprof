@@ -13,3 +13,4 @@
 
 # Preserve the exact issue 585 evidence archive bytes.
 .github/assets/perf-585/measurements.zip binary
+.github/assets/perf-585/arena-reclaim-wait.zip binary

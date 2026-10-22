@@ -285,8 +285,10 @@ static void run_busy_thread_row(void) {
   mi_atomic_store_release(&mi_debug_stall_in_heap_delete_claim, (uintptr_t)1);
   thread_t worker;
   if (!thread_start(&worker, stall_worker, NULL)) { check(false, "A5: worker thread started"); return; }
-  // wait for the hook: 2 == "pinned, not yet claimed" inside mi_heap_visit_page_claim
-  for (int i = 0; i < 20000 && mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) != 2; i++) { yield_cpu(); }
+  // Wait for the hook: 2 == "pinned, not yet claimed" inside mi_heap_visit_page_claim.
+  // A yield count does not guarantee worker progress. CTest's TIMEOUT bounds a
+  // worker that never reaches the hook; reclaim must not run before it does.
+  while (mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) != 2) { yield_cpu(); }
   const bool stalled = (mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) == 2);
   check(stalled, "A5: the worker is stalled inside mi_heap_delete (page pinned)");
 
@@ -354,7 +356,9 @@ static void run_parked_thread_row(void) {
   mi_atomic_store_release(&g_park.go, 0);
   thread_t worker;
   if (!thread_start(&worker, park_worker, NULL)) { check(false, "A6: worker thread started"); return; }
-  for (int i = 0; i < 20000 && mi_atomic_load_acquire(&g_park.ready) == 0; i++) { yield_cpu(); }
+  // Establish the parked-thread precondition before reclaim; the same CTest
+  // timeout bounds a missing hand-off, regardless of scheduling or yield speed.
+  while (mi_atomic_load_acquire(&g_park.ready) == 0) { yield_cpu(); }
   check(mi_atomic_load_acquire(&g_park.ready) == 1, "A6: the worker announced its idle hand-off");
   check(mi_atomic_load_acquire(&g_park.started) == 1 || MI_OWNER_GATE != 0,
         "A6: the worker is parked (mi_on_thread_idle_start, or the owner gate)");

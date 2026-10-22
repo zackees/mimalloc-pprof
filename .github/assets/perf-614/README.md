@@ -307,3 +307,17 @@ the required CPU/throughput gain.
 samples, exact binaries, workflow records/logs, dispatch requests/responses,
 plans, verification scripts, and exact baseline/candidate source snapshots.
 The internal manifest and external digest cover every archived member.
+
+## V5 rejected during safety review
+
+Moving publication after retired-bin bounds updates reduced register saves
+and enabled a tail call in local optimized code. However, an OS-reuse failure
+can invoke an output callback that reenters collection. Earlier bounds could
+make the page collectible while publication still uses it. This static safety
+finding was not reproduced as a crash; it is sufficient to reject the candidate.
+
+C, C++ and ASan tests passed but did not cover that failure callback. The
+candidate was removed before any performance dispatch. Production source
+again matches the fixed baseline. `v5-preflight.zip` preserves the diagnostic
+profiles, commands, source patch, RED/GREEN codegen checks, test executables,
+logs, review and disposition. No CPU gain or platform validation is claimed.

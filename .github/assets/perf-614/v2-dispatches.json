@@ -1,0 +1,118 @@
+{
+  "baseline": "227eef06ff03f92966f38508441d6c2f60a75135",
+  "candidate": "59d369609ab47358df0f883b6419252f1ffbf03a",
+  "ref": "perf/614-large-reuse-cpu",
+  "analysis_sha256": {
+    "ci/perf_ab.py": "905c078f16ee1a71e4d8623c1e0c14def3235b8c6be424be1b8c568320f95d89",
+    "ci/perf_ab.c": "2be8bd64d1e17c142b5773f3cbfdc95174f6c261748456f3622716194d162756",
+    "ci/perf_ab_ledger.py": "870dc4d72132034a398d310261231820c5ebf7de4cf44d81e94711ea5393df6a",
+    "ci/perf_ab_stats.py": "deee6c17d8e0b9be84219638c43abc97c85354a7c3129480ddb93eee17ac9bdd"
+  },
+  "runs": [
+    {
+      "workload": "large-class/8",
+      "stage": 1,
+      "kind": "plain",
+      "params": {
+        "threads": 8,
+        "generations": 1,
+        "min_size": 98304,
+        "max_size": 524288,
+        "ops": 400000,
+        "pause_ms": 0,
+        "table_slots": 0,
+        "sizes": "uniform",
+        "slots": 8
+      },
+      "dispatch": {
+        "ref": "perf/614-large-reuse-cpu",
+        "return_run_details": true,
+        "inputs": {
+          "base": "227eef06ff03f92966f38508441d6c2f60a75135",
+          "head_sha": "59d369609ab47358df0f883b6419252f1ffbf03a",
+          "workloads": "=large-class/8",
+          "reps": "60",
+          "max_reps": "120",
+          "null_arm": "true",
+          "sanity_gate": "true",
+          "holes_report": "false"
+        }
+      },
+      "response": {
+        "workflow_run_id": 39831495052,
+        "run_url": "https://api.github.com/repos/zackees/mimalloc-pprof/actions/runs/39831495052",
+        "html_url": "https://github.com/zackees/mimalloc-pprof/actions/runs/39831495052"
+      }
+    },
+    {
+      "workload": "large-class-ephemeral/8",
+      "stage": 1,
+      "kind": "plain",
+      "params": {
+        "threads": 8,
+        "generations": 8,
+        "min_size": 98304,
+        "max_size": 524288,
+        "ops": 400000,
+        "pause_ms": 0,
+        "table_slots": 0,
+        "sizes": "uniform",
+        "slots": 8
+      },
+      "dispatch": {
+        "ref": "perf/614-large-reuse-cpu",
+        "return_run_details": true,
+        "inputs": {
+          "base": "227eef06ff03f92966f38508441d6c2f60a75135",
+          "head_sha": "59d369609ab47358df0f883b6419252f1ffbf03a",
+          "workloads": "=large-class-ephemeral/8",
+          "reps": "60",
+          "max_reps": "120",
+          "null_arm": "true",
+          "sanity_gate": "true",
+          "holes_report": "false"
+        }
+      },
+      "response": {
+        "workflow_run_id": 39831499063,
+        "run_url": "https://api.github.com/repos/zackees/mimalloc-pprof/actions/runs/39831499063",
+        "html_url": "https://github.com/zackees/mimalloc-pprof/actions/runs/39831499063"
+      }
+    },
+    {
+      "workload": "large-class-ephemeral/8 short generations (chart build)",
+      "stage": 1,
+      "kind": "chart",
+      "params": {
+        "threads": 8,
+        "generations": 8,
+        "min_size": 98304,
+        "max_size": 524288,
+        "ops": 100000,
+        "pause_ms": 0,
+        "table_slots": 0,
+        "sizes": "uniform",
+        "slots": 8
+      },
+      "dispatch": {
+        "ref": "perf/614-large-reuse-cpu",
+        "return_run_details": true,
+        "inputs": {
+          "base": "227eef06ff03f92966f38508441d6c2f60a75135",
+          "head_sha": "59d369609ab47358df0f883b6419252f1ffbf03a",
+          "workloads": "=large-class-ephemeral/8 short generations (chart build)",
+          "reps": "60",
+          "max_reps": "120",
+          "null_arm": "true",
+          "sanity_gate": "true",
+          "holes_report": "false"
+        }
+      },
+      "response": {
+        "workflow_run_id": 39831504283,
+        "run_url": "https://api.github.com/repos/zackees/mimalloc-pprof/actions/runs/39831504283",
+        "html_url": "https://github.com/zackees/mimalloc-pprof/actions/runs/39831504283"
+      }
+    }
+  ]
+}

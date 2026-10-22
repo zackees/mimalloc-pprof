@@ -107,3 +107,50 @@ file was verified against its original Git blob ID. The archive also retains
 disassembly from the measured binaries and the rebase source-equivalence proof.
 `v1-measurements-archive.json` records its outer digest; its internal manifest
 records each member's byte length and digest. No cross-host pooling is used.
+
+## V2: guard the call at retirement publication (acceptance pending)
+
+Candidate `59d369609ab47358df0f883b6419252f1ffbf03a` replaces the rejected
+wrapper with an inline condition at `_mi_page_publish_retired`. Clean pages
+skip the call entirely; dirty pages and other callers retain the original
+restore function. Optimized assembly confirms the skipped call, but the
+caller prologue remains. This is structural evidence, not a CPU gain.
+
+`v2-structural.zip` retains RED patch/log/executable, GREEN test logs and
+executables, source diff, code-generation object/settings/disassembly and
+review disposition. Its manifest hashes every other member; the external
+JSON hashes the archive. The RED patch applies to `a98a43c1` (the preserved V1
+history), restoring the original restore body and adding the entry-count test.
+The assertion fails because clean retirement still invokes restoration.
+
+With V2, the clean-retirement test passes and same-page reuse works. Real OS
+discards exercise formed-only and tail-only conditions independently; the
+formed test explicitly restores only its tail before checking the guard.
+C Release event/purge-hole/large-span pass 3/3; C++ Debug/full event/large-span
+pass 2/2. The final isolation checks also pass separately in C and C++.
+The existing C++ purge-hole compile limitation described above remains.
+Source review is clean after correcting the test isolation gap.
+
+The archive retains setup failures and superseded logs transparently:
+`v2-red-build.log` is the corrected target build; the initial target name was
+invalid. `v2-green-tests.log` was collected while the test binary was being
+rebuilt and is superseded by `v2-complete-tests.log` after build completion.
+Initial codegen configuration omitted soldr's `cc` argument; fixing it left
+an empty Release flag cache. Only the `optimized` codegen logs/disassembly,
+object and settings establish the optimized result (`-O3 -DNDEBUG`). The
+unoptimized disassembly is not acceptance evidence. The successful Rust
+amalgamation command ran from `rust/`; an earlier root invocation could not
+find the pinned toolchain. No build failure was treated as a passing test.
+
+Local gate passed all 45 checks in 55 seconds, stamped the candidate above.
+`v2-campaign-plan.json` and `v2-dispatches.json` retain the predeclared plan
+and three original target dispatches, announced in issue comment
+[6348172962](https://github.com/zackees/mimalloc-pprof/issues/614#issuecomment-6348172962).
+Frozen baseline, sample caps, workloads, null/sanity arms and zero-credit
+acceptance remain unchanged. V1 results are not pooled with V2. Fresh full
+platform checks and complete performance acceptance remain pending.
+
+The candidate source snapshot in the campaign scratch was verified against
+all 855 original Git blobs excluding only historical `.github/assets/`
+evidence (`v2-source-manifest.json`). Retain that snapshot with the eventual
+measured artifacts; this manifest alone does not ship the source tar.

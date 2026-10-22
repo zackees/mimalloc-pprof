@@ -1,0 +1,18 @@
+{
+  "baseline": "227eef06ff03f92966f38508441d6c2f60a75135",
+  "candidate": "59d369609ab47358df0f883b6419252f1ffbf03a",
+  "status": "V2 predeclared; not dispatched",
+  "initial_samples_per_arm": 60,
+  "adaptive_cap_per_arm": 120,
+  "null_arm": true,
+  "sanity_gate": true,
+  "stage_one": [
+    "large-class/8",
+    "large-class-ephemeral/8",
+    "large-class-ephemeral/8 short generations (chart build)"
+  ],
+  "stage_two": "all remaining rows from the 12 default perf-ab workloads plus sparse-large-buffers 64-slot budget/8 (#422)",
+  "rules": "No unchanged reruns; one original cohort per candidate/cell; all six metrics; zero memory credit; no cross-host pooling; reject confirmed per-cell FAIL or service-bound violation. Stage two only if stage one has no FAIL/incomplete/sanity failures and supported target CPU or throughput gain. INCONCLUSIVE retains its label. No new numerical risk waiver: automatic acceptance only under existing rule12 with supported target gain and passing CPU/throughput controls; unresolved material risk needs attribution or owner disposition.",
+  "mechanism": "Skip the restore-function call at retirement publication when both discard records are empty. Original restore function retained for dirty retirement and all other callers.",
+  "previous_candidate_disposition": "V1 rejected: no supported target CPU/throughput gain; original cohorts retained, no stage two or unchanged rerun."
+}

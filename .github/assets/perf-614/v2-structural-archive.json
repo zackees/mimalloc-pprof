@@ -1,0 +1,5 @@
+{
+  "sha256": "fddcb2e544a8d6717d965b924a82a8450ba5da00c7239bcf270c9542c806cfa9",
+  "members": 33,
+  "note": "Scratch structural evidence; unoptimized codegen logs retained as failed setup evidence, optimized named files use explicit -O3 -DNDEBUG. Local gate and campaign evidence separate."
+}

@@ -128,6 +128,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc.h"
 #include "mimalloc/prim.h"
 #include "mimalloc/internal.h"
+#include "page-unpurge.h"
 #include "mimalloc/prim-tls.h"   // _mi_theap_default
 
 #include <stddef.h>              // offsetof
@@ -752,8 +753,8 @@ bool _mi_page_unpurge_run(mi_page_t* page) {
 // memory out as committed without any further `reuse` call). The page is dead here (every
 // block is free), so we do NOT rebuild its free list: writing `next` pointers into the
 // holes would fault every discarded OS page right back in.
-mi_decl_noinline void _mi_page_unpurge_all_slow(mi_page_t* page) {
-  MI_EVENT(MI_EVENT_UNPURGE_RESTORE);
+void _mi_page_unpurge_all(mi_page_t* page) {
+  MI_EVENT(MI_EVENT_UNPURGE_ALL_ENTRY);
   _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);   // the unformed tail goes back as well
   if (!mi_page_has_purged(page)) return;
   const size_t os_size = mi_page_purge_unit(page);
@@ -849,7 +850,7 @@ void _mi_page_publish_retired(mi_page_t* page) {
   mi_assert_internal(mi_atomic_load_ptr_relaxed(mi_page_t, slot) == NULL);
   tld->retired_used |= ((size_t)1 << i);
 
-  _mi_page_unpurge_all(page);   // holes describe formed blocks, and there will be none
+  mi_page_restore_before_retirement(page); // holes describe formed blocks, and there will be none
   page->free = NULL;            // nothing formed: every block of the page is unformed tail now
   page->local_free = NULL;
   page->capacity = 0;

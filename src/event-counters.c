@@ -35,7 +35,7 @@ static const char* const mi_event_names[MI_EVENT_COUNT] = {
   "large_span_grow", "large_span_shrink",
   "arena_page_alloc", "arena_page_free",
   "large_repurpose_none", "large_retire_expired", "large_empty_freed",
-  "unpurge_restore"
+  "unpurge_all_entry"
 };
 
 void _mi_event_count(mi_event_t event) {

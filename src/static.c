@@ -46,7 +46,6 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "page.c"           // includes page-queue.c
 #include "page-retired-search.c"  // #610: bounded selector stays out of line
 #include "page-map.c"
-#include "page-unpurge.c" // #614: clean pages bypass the OS restore body
 #include "page-holes.c"  // #272: hole purging (Bun parity P7b)
 #include "large-span.c"  // #532: demand-sized large-page spans
 #include "purge-all.c"    // #366: mi_purge_all (not profiler code: unconditional)

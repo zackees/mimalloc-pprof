@@ -30,19 +30,78 @@
 
 #if MI_DIAGNOSTICS
 
-// #614: the clean-page case needs no OS restore and must avoid its large body.
-// Use an isolated page header so unrelated allocator activity cannot affect the count.
-static void test_clean_page_skips_restore(void) {
-  mi_page_t page;
-  memset(&page, 0, sizeof(page));
-  page.swept_state = MI_PAGE_SWEPT_NONE;
-  unsigned char before[sizeof(page)];
-  memcpy(before, &page, sizeof(page));
-  const uint64_t restores = _mi_event_get(MI_EVENT_UNPURGE_RESTORE);
-  _mi_page_unpurge_all(&page);
-  assert(memcmp(before, &page, sizeof(page)) == 0);
-  assert(_mi_event_get(MI_EVENT_UNPURGE_RESTORE) == restores);
-  puts("unpurge: clean page skips restore body and preserves its header");
+// #614: publishing a clean, emptied page must not call the restore function.
+// An isolated heap ensures this is the sole page in its large bin.
+static void test_clean_retirement_skips_restore(void) {
+  mi_heap_t* const heap = mi_heap_new();
+  assert(heap != NULL);
+  void* const p = mi_heap_malloc(heap, SIZE_A);
+  assert(p != NULL);
+  mi_page_t* const page = _mi_ptr_page(p);
+  assert(!mi_page_has_purged(page));
+  assert(page->unformed_purged_hi <= page->unformed_purged_lo);
+  const uint64_t calls = _mi_event_get(MI_EVENT_UNPURGE_ALL_ENTRY);
+  mi_free(p);
+  assert(page->retired_slot != NULL);
+  assert(page->capacity == 0 && page->free == NULL && page->local_free == NULL);
+  assert(_mi_event_get(MI_EVENT_UNPURGE_ALL_ENTRY) == calls);
+  void* const reused = mi_heap_malloc(heap, SIZE_A);
+  assert(reused != NULL && _mi_ptr_page(reused) == page);
+  assert(page->retired_slot == NULL);
+  memset(reused, 0x33, SIZE_A);
+  mi_free(reused);
+  mi_heap_delete(heap);
+  puts("unpurge: clean retirement skips restore call and remains reusable");
+}
+
+// Exercise real OS discards: the guard must preserve both restore conditions.
+static void test_discarded_retirement_restores(bool formed_hole) {
+  const long purge_holes = mi_option_get(mi_option_purge_holes);
+  const long full_every = mi_option_get(mi_option_purge_holes_full_every);
+  mi_option_set(mi_option_purge_holes, 1);
+  mi_option_set(mi_option_purge_holes_full_every, 1);
+  mi_heap_t* const heap = mi_heap_new();
+  assert(heap != NULL);
+  void* const first = mi_heap_malloc(heap, SIZE_A);
+  assert(first != NULL);
+  mi_page_t* const page = _mi_ptr_page(first);
+  void* survivor = first;
+  if (formed_hole) {
+    survivor = mi_heap_malloc(heap, SIZE_A);
+    assert(survivor != NULL && _mi_ptr_page(survivor) == page);
+    mi_free(first);
+    _mi_page_free_collect(page, false);
+  }
+  mi_tld_t* const tld = page->theap->tld;
+  _mi_page_purge_holes_sweep_begin(tld);
+  _mi_page_purge_holes_begin(tld);
+  _mi_page_purge_holes(page, tld);
+  _mi_page_purge_holes_end(tld);
+  if (formed_hole) {
+    // Isolate the bitmap condition: a tail must not hide a missing formed-hole guard.
+    _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);
+    assert(page->unformed_purged_hi <= page->unformed_purged_lo);
+    assert(mi_page_has_purged(page));
+  }
+  else {
+    assert(page->unformed_purged_hi > page->unformed_purged_lo);
+    assert(!mi_page_has_purged(page));
+  }
+  const uint64_t calls = _mi_event_get(MI_EVENT_UNPURGE_ALL_ENTRY);
+  mi_free(survivor);
+  assert(page->retired_slot != NULL);
+  assert(_mi_event_get(MI_EVENT_UNPURGE_ALL_ENTRY) == calls + 1);
+  assert(!mi_page_has_purged(page));
+  assert(page->unformed_purged_hi <= page->unformed_purged_lo);
+  void* const reused = mi_heap_malloc(heap, SIZE_A);
+  assert(reused != NULL && _mi_ptr_page(reused) == page);
+  memset(reused, 0x33, SIZE_A);
+  mi_free(reused);
+  mi_heap_delete(heap);
+  mi_option_set(mi_option_purge_holes, purge_holes);
+  mi_option_set(mi_option_purge_holes_full_every, full_every);
+  puts(formed_hole ? "unpurge: formed holes restored before retirement" :
+                     "unpurge: unformed tail restored before retirement");
 }
 
 static int bin_is_large(size_t size) {
@@ -127,8 +186,10 @@ static void test_report_lists_retired_pages(void) {
 int main(void) {
   mi_option_set(mi_option_purge_delay, 600000);   // nothing may be released during the run
   if (!bin_is_large(SIZE_A) || !bin_is_large(SIZE_B)) { puts("skipped: sizes are not large bins in this build"); return 0; }
-  test_clean_page_skips_restore();
   test_names_and_reset();
+  test_clean_retirement_skips_restore();
+  test_discarded_retirement_restores(false);
+  test_discarded_retirement_restores(true);
   test_report_lists_retired_pages();
   test_retire_cascade_budget();
   puts("ok");

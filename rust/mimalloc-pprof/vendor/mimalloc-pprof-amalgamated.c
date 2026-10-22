@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 52eab5b3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 26ad8474 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -25212,6 +25212,10 @@ static void mi_page_queue_enqueue_from_full(mi_page_queue_t* to, mi_page_queue_t
   Page helpers
 ----------------------------------------------------------- */
 
+/* ---- begin inlined: src/page-block-at.h ---- */
+#ifndef MI_PAGE_BLOCK_AT_H
+#define MI_PAGE_BLOCK_AT_H
+
 // Index a block in a page
 static inline mi_block_t* mi_page_block_at(const mi_page_t* page, void* page_start, size_t block_size, size_t i) {
   MI_UNUSED(page);
@@ -25219,6 +25223,9 @@ static inline mi_block_t* mi_page_block_at(const mi_page_t* page, void* page_sta
   mi_assert_internal(i <= page->reserved);
   return (mi_block_t*)((uint8_t*)page_start + (i * block_size));
 }
+
+#endif
+/* ---- end inlined: src/page-block-at.h ---- */
 
 static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page);
 
@@ -25973,6 +25980,16 @@ static void mi_page_free_list_extend_secure(mi_theap_t* const theap, mi_page_t* 
   page->free = free_start;
 }
 
+/* ---- begin inlined: src/page-free-list.h ---- */
+/* Sequential free-list initialization, shared with the structural work-count test. */
+#ifndef MI_PAGE_FREE_LIST_H
+#define MI_PAGE_FREE_LIST_H
+
+
+#ifndef MI_PAGE_FREE_LIST_SET_NEXT
+#define MI_PAGE_FREE_LIST_SET_NEXT mi_block_set_next
+#endif
+
 static mi_decl_noinline void mi_page_free_list_extend( mi_page_t* const page, const size_t bsize, const size_t extend)
 {
   #if (MI_SECURE < 2)
@@ -25988,15 +26005,19 @@ static mi_decl_noinline void mi_page_free_list_extend( mi_page_t* const page, co
   // initialize a sequential free list
   mi_block_t* const last = mi_page_block_at(page, page_area, bsize, page->capacity + extend - 1);
   mi_block_t* block = start;
-  while(block <= last) {
+  // The final link is set to the old head below; do not write it twice.
+  while(block < last) {
     mi_block_t* next = (mi_block_t*)((uint8_t*)block + bsize);
-    mi_block_set_next(page,block,next);
+    MI_PAGE_FREE_LIST_SET_NEXT(page,block,next);
     block = next;
   }
   // prepend to free list (usually `NULL`)
-  mi_block_set_next(page, last, page->free);
+  MI_PAGE_FREE_LIST_SET_NEXT(page, last, page->free);
   page->free = start;
 }
+
+#endif
+/* ---- end inlined: src/page-free-list.h ---- */
 
 /* -----------------------------------------------------------
   Page initialize and extend the capacity

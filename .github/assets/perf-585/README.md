@@ -2,7 +2,8 @@
 
 Frozen baseline: `ee3623f6b7a485754a0a0aa3462d8cba43390e8b`.
 Current measured source: `ad9fbd952ca934257f4acdc19889e74d8886a18f`.
-This directory is an evidence snapshot. **Acceptance is incomplete.**
+This directory is an evidence snapshot. **The owner accepted the current performance
+tradeoff on 2026-10-21; three metric verdicts remain INCONCLUSIVE.**
 
 ## Current outcome
 
@@ -17,7 +18,9 @@ credit is zero. These results do not establish a new RSS saving.
 
 [Full platform CI passed 104 checks with five intentional skips](https://github.com/zackees/mimalloc-pprof/issues/585#issuecomment-6328893298).
 The tested PR merge and measured head have identical entire Git trees. This
-correctness result does not replace performance acceptance. PR 609 remains draft.
+correctness result does not replace performance evidence. The owner subsequently
+accepted the small CPU/throughput gains and bounded uncertainty for PR 609; see
+`docs/dev-loop.md` for the policy and exact intervals. No verdict was relabelled.
 [Bounded local attribution did not establish the cause of the two uncertainties](https://github.com/zackees/mimalloc-pprof/issues/585#issuecomment-6328974076).
 
 ## Subsequent correctness failure and fixture correction
@@ -35,7 +38,8 @@ correction waits for the actual pinned/parked predicates under the existing
 controlled 200 ms delay in both workers gives RED exit 1 before and GREEN exit 0
 after with the same Debugfull allocator library. All four local reclaim CTests
 pass. This demonstrates a possible scheduling defect, not the exact historical
-CI cause. Full CI for the correction remains required. Allocator source and the
+CI cause. [Full CI for the correction passed 104 checks with five intentional skips](https://github.com/zackees/mimalloc-pprof/issues/585#issuecomment-6329841088),
+including native MSVC, Windows GNU/clang-cl and both native Macs. Allocator source and the
 original 11-PASS/two-INCONCLUSIVE performance outcome are unchanged.
 
 `arena-reclaim-wait.zip` and its separate manifest retain the complete failed
@@ -91,6 +95,6 @@ for manifest_name, archive_name in [('manifest.json', 'measurements.zip'),
             data = zipped.read(entry['path'])
             assert len(data) == entry['bytes']
             assert hashlib.sha256(data).hexdigest() == entry['sha256']
-print('All evidence hashes verified; acceptance remains incomplete.')
+print('All evidence hashes verified.')
 PYVERIFY
 ```

@@ -202,6 +202,53 @@ copy it here.
    - A local untimed residency probe is allowed; timing is CI-only (see the memory gate loop
      below).
 
+### Accepting incremental performance improvements (owner decision 2026-10-21)
+
+Small improvements are useful: there is no minimum percentage gain and a CPU optimization
+need not also reduce RSS. Require a statistically supported gain on intended workloads,
+representative controls, the fixed-baseline per-cell ledger, and green correctness/platform
+gates. A PASS means the regression gate passed; it does not prove improvement or equality.
+A beneficial point estimate whose interval crosses zero is not a demonstrated gain.
+
+| Evidence | Disposition |
+|---|---|
+| Supported target gains; remaining metrics PASS | Accept a small improvement; report its size and scope |
+| Limited INCONCLUSIVE ancillary metrics; CPU/throughput and controls PASS; no confirmed FAIL | Accept when the full intervals fit declared campaign risk bounds, or with explicit owner acceptance of the stated uncertainty; preserve INCONCLUSIVE labels |
+| Wide uncertainty, missing relevant coverage, or an interval allowing a material scenario spike | Attribute or run a bounded, planned follow-up; do not claim equivalence |
+| CPU/throughput FAIL beyond that cell's noise and permitted memory credit | Reject or revise, even if other workloads improve |
+| p99 FAIL beyond noise, peak/drain RSS FAIL beyond noise, or faults beyond the existing per-cell allowance | Reject or revise; p99 receives no memory credit |
+| Refault storm, declared service-bound violation, or correctness/platform failure | Reject or fix before acceptance; an average win cannot compensate |
+
+Declare intended workloads, controls, sampling limits and material-risk/service bounds before
+the campaign. Keep the existing 3:1 memory-credit rule; credit belongs only to the cell that
+saved memory. Do not introduce a post-result tolerance, pool incompatible hosts, discard failed
+runs, or retry unchanged code until a FAIL disappears. An INCONCLUSIVE result is neither PASS
+nor a confirmed regression. Do not automatically stall a useful change or exhaustively rerun
+all metrics just because a few remain uncertain. Record accepted uncertainty in the PR and
+parent issue; otherwise narrow the unresolved risk with a specific attribution question.
+
+**Accepted example: #585 / PR #609.** The owner accepted this candidate on 2026-10-21:
+13 workload rows, 78 metric checks, 75 PASS, three INCONCLUSIVE, zero FAIL. Six workloads have
+significant throughput gains and six have significant CPU/op gains; improved paths are roughly
+1–3% faster or cheaper. All CPU/throughput checks pass. There is no established new memory win
+and memory credit is zero. These counts are not an aggregate performance score.
+
+| Accepted uncertainty | Paired estimate | 95% interval | Existing noise allowance |
+|---|---:|---:|---:|
+| Profiler-on large-class/8 p99 | +0.51% | -1.72% to +3.37% | 2.25% |
+| Chart ephemeral/8 minor faults | +0.39% | 0% to +1.18% | 0.79% |
+| Chart ephemeral/8 peak RSS | -0.003% | -0.089% to +0.117% | 0.097% |
+
+The owner accepted those explicit risks; the ledger remains unchanged. This does not establish
+universal tolerances or complete the remaining memory investigations. In contrast, the rejected
+aging-setting-2 trial saved 3.9% peak RSS but worsened p99 by 9.8% [7.6%, 10.8%], against 1.4%
+noise: the memory gain cannot buy that tail-latency spike. Earlier retired-body discard trials
+cost +107% to +1080% CPU and remain rejected.
+
+Evidence: [combined current ledger](https://github.com/zackees/mimalloc-pprof/issues/422#issuecomment-6329851624),
+[full uncertainty ledger](https://github.com/zackees/mimalloc-pprof/issues/585#issuecomment-6328936369),
+and [rejected aging trial](https://github.com/zackees/mimalloc-pprof/issues/585#issuecomment-6304942092).
+
 ### The perf-ab pipeline (#573 B3-B8)
 
 ```bash
@@ -244,7 +291,8 @@ original parameters, seeds and touch policy.
   `ci/perf_ab.c` prints: the RSS before the work plus the live requested bytes), then for
   throughput, CPU, faults, peak and after-drain RSS the paired change, its allowance (`saved%/3`
   for the first three, noise for memory and for cells that saved nothing) and PASS, FAIL or
-  INCONCLUSIVE. INCONCLUSIVE is not a pass.
+  INCONCLUSIVE. INCONCLUSIVE is not a statistical pass; delivery disposition follows
+  the incremental-improvement guidance above without changing that verdict.
 - **Honest intervals.** The interval on a median is the distribution-free sign-test interval, not
   a percentile bootstrap (anticonservative at 7 or 15 reps). Only the rule-12 metrics are marked.
 - **Noise floor.** `null_arm` measures base a second time in the same rotation; a difference is

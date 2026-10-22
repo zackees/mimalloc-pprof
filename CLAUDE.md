@@ -153,9 +153,9 @@ See
    (`-DMI_SCAVENGER_MAX_WAIT_MS=5000`, including from the Rust crate's build script). Make it an
    `mi_option` when it should be settable at run time, from C or Rust. Never write the value inline.
 
-12. **Performance accounting: memory buys CPU at 3:1, nothing else is free (owner rule,
-   2026-09-28).** Every allocator perf change reports a per-cell ledger against its fixed
-   baseline (the previous merged policy, exact SHA, same run/host): throughput, CPU per
+12. **Performance accounting: small measured gains are worthwhile; memory buys CPU at 3:1
+   (owner rules, 2026-09-28 and 2026-10-21).** Every allocator perf change reports a per-cell
+   ledger against its fixed baseline (the previous merged policy, exact SHA, same run/host): throughput, CPU per
    operation, minor faults, peak and after-drain RSS, p99 latency.
    - **Memory credit.** `saved%` = the cell's peak-RSS reduction as a share of the reducible
      gap, `(baseline - candidate) / (baseline - ideal)`, where `ideal` is the theoretical floor
@@ -164,7 +164,33 @@ See
      most +25% CPU/op (and at most -25% throughput); saving 30% allows 10%.
    - **Cells with no memory credit** (controls such as `small/8`, `larson/8`, and any cell whose
      RSS did not fall) allow **no** regression: a CPU/op or throughput change whose 95% CI lies
-     beyond perf-ab noise is a regression. INCONCLUSIVE is not a pass; rerun or narrow it.
+     beyond perf-ab noise is a regression. Keep INCONCLUSIVE labels; apply the acceptance
+     guidance below instead of automatically rerunning or blocking the whole PR.
+   - **Accept incremental gains.** Small, statistically supported CPU/throughput improvements
+     in intended workloads are valuable without a new RSS win or an arbitrary minimum gain.
+     Report improved, within-noise, inconclusive and regressed metrics separately. Never average
+     away a bad scenario or combine percentages from different hosts into an overall speedup.
+   - **Bounded uncertainty need not stall delivery.** With correctness/platform gates green,
+     supported target gains, passing CPU/throughput controls and no confirmed per-cell FAIL,
+     limited INCONCLUSIVE ancillary metrics may be accepted when their full intervals fit the
+     campaign's declared risk bounds, or the owner explicitly accepts the stated uncertainty.
+     Record the disposition in the PR and parent issue, retaining the numeric verdicts and raw
+     evidence. Do not retry merely to turn every label green. Wide intervals, missing coverage
+     and unexplained potential spikes still require attribution or a bounded follow-up.
+   - **Reject scenario spikes.** Reject confirmed CPU/throughput regressions beyond a cell's
+     noise/memory allowance, p99 regressions beyond noise (no memory credit), and peak/drain
+     RSS growth beyond noise. Fault regressions must fit the cell's existing memory allowance;
+     refault storms, service-bound violations, correctness failures and default/control-path
+     regressions cannot be paid for by gains elsewhere. Fix or remove the offending policy;
+     no aggregate score, relaxed threshold or repeated sampling erases a FAIL. Define service
+     and material-risk bounds before the next campaign, not after seeing a failed result.
+   - **Accepted example (#585 / PR #609, owner decision 2026-10-21).** Six workloads show
+     significant throughput gains and six show CPU/op gains, roughly 1–3% on the improved
+     paths: 75/78 metric checks PASS, three INCONCLUSIVE, zero FAIL. The owner accepted
+     profiler p99 (+0.51%, 95% CI -1.72% to +3.37%), chart-ephemeral faults (+0.39%,
+     0% to +1.18%) and peak RSS (-0.003%, -0.089% to +0.117%) with zero memory credit.
+     This accepts the candidate, not equivalence, a new memory win, or these bounds as universal
+     tolerances. See `docs/dev-loop.md` for the decision table and evidence.
    - **Regressions in the baseline are debts, not allowances.** The previous PR's measured costs
      (for example #538's exact-128-KiB +4.6% CPU, `random-large-bursty/8` +55% minor faults,
      `larson/8` +3.7% CPU) are the floor to improve, not a budget to spend.

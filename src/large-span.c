@@ -145,6 +145,7 @@ static size_t mi_large_span_request(mi_large_span_bin_t b, size_t block_size, si
 // A page request of a large bin on `theap`: account it, and return the span (in slices) of the
 // page to create for it if no abandoned page of the bin is reclaimed instead.
 size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  MI_EVENT(MI_EVENT_LARGE_SPAN_ACCOUNT_CALL);
   const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
   if (theap == NULL || MI_LARGE_SPAN_COMPACT_SLICES >= full) return full;
   if (!mi_option_is_enabled(mi_option_large_span)) return full;
@@ -168,6 +169,7 @@ size_t _mi_large_span_peek_slices(mi_theap_t* theap, size_t block_size, size_t o
 #else // !MI_LARGE_SPAN: every large page gets MI_LARGE_PAGE_SIZE (and the hook sites compile out)
 
 size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  MI_EVENT(MI_EVENT_LARGE_SPAN_ACCOUNT_CALL);
   MI_UNUSED(theap); MI_UNUSED(block_size); MI_UNUSED(overhead);
   return mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
 }
@@ -182,3 +184,5 @@ size_t _mi_large_span_peek_slices(mi_theap_t* theap, size_t block_size, size_t o
 }
 
 #endif // MI_LARGE_SPAN
+
+#include "large-span-account.h"  // #614: accounting for an already selected retired page

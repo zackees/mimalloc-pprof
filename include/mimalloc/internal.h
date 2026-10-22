@@ -451,6 +451,7 @@ void          _mi_arena_pages_free(mi_arena_pages_t* arena_pages);  // Bun parit
 
 // "large-span.c" (#532): demand-sized large-page spans (stubs when MI_LARGE_SPAN=0)
 size_t        _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead);  // the span of the theap's next page of this large bin (a page request)
+void          _mi_large_span_account_repurpose(mi_theap_t* theap, size_t index); // account an already selected retired page; no size result
 void          _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page);             // a page of the theap filled up
 size_t        _mi_large_span_peek_slices(mi_theap_t* theap, size_t block_size, size_t overhead);  // #530: that span, without accounting the request
 
@@ -1408,6 +1409,7 @@ typedef enum mi_event_e {
   MI_EVENT_LARGE_REPURPOSE_NONE,    // a large bin's page request found no retired page of another bin to take (#575)
   MI_EVENT_LARGE_RETIRE_EXPIRED,    // a retired large page aged out and was freed to the arena (#575)
   MI_EVENT_LARGE_EMPTY_FREED,       // an emptied large page was freed at once, because its bin has other pages (#575)
+  MI_EVENT_LARGE_SPAN_ACCOUNT_CALL,  // full span sizing/accounting entries (#614)
   MI_EVENT_COUNT
 } mi_event_t;
 uint64_t      _mi_event_get(mi_event_t event);           // 0 when not compiled in

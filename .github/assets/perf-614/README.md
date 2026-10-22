@@ -287,3 +287,15 @@ and exact baseline/candidate source snapshots. `v3-platform.zip` preserves
 all eleven successful platform workflows and exact candidate/test-merge tree
 equivalence. Every archive has an internal member manifest and external
 digest. Platform success does not change V3's rejection.
+
+## V4 platform validation complete
+
+`v4-platform.zip` preserves all eleven successful workflows for exact
+candidate `8fda62c6`, including native MSVC, Windows GNU, native Mac x64 and
+ARM64, Rust, sanitizers, memory and default-path gates. Every job is completed
+with success or an expected skipped configuration. The candidate and PR test
+merge have identical trees; the source-equivalence record is included.
+
+The chart cohort completed with all six metric checks passing, but no
+supported CPU/throughput gain. Other original cohorts are still pending.
+These platform results alone do not establish performance acceptance.

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit a98a43c1 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 52eab5b3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -6267,7 +6267,6 @@ typedef enum mi_event_e {
   MI_EVENT_LARGE_REPURPOSE_NONE,    // a large bin's page request found no retired page of another bin to take (#575)
   MI_EVENT_LARGE_RETIRE_EXPIRED,    // a retired large page aged out and was freed to the arena (#575)
   MI_EVENT_LARGE_EMPTY_FREED,       // an emptied large page was freed at once, because its bin has other pages (#575)
-  MI_EVENT_UNPURGE_ALL_ENTRY,      // calls to restore all holes before retirement or arena return (#614)
   MI_EVENT_COUNT
 } mi_event_t;
 uint64_t      _mi_event_get(mi_event_t event);           // 0 when not compiled in
@@ -27353,21 +27352,6 @@ terms of the MIT license. A copy of the license can be found in the file
       so every park is a full hole sweep.
 ----------------------------------------------------------- */
 
-/* ---- begin inlined: src/page-unpurge.h ---- */
-/* Skip the restore call when an owner publishes a clean retired page (#614). */
-#ifndef MI_PAGE_UNPURGE_H
-#define MI_PAGE_UNPURGE_H
-
-static inline void mi_page_restore_before_retirement(mi_page_t* page) {
-  // The owner has not published the page yet, so the scavenger cannot change
-  // either discard record. Preserve the full restore for both kinds of holes.
-  if (page->unformed_purged_hi > page->unformed_purged_lo || mi_page_has_purged(page)) {
-    _mi_page_unpurge_all(page);
-  }
-}
-
-#endif
-/* ---- end inlined: src/page-unpurge.h ---- */
 
 #include <stddef.h>              // offsetof
 
@@ -27992,7 +27976,6 @@ bool _mi_page_unpurge_run(mi_page_t* page) {
 // block is free), so we do NOT rebuild its free list: writing `next` pointers into the
 // holes would fault every discarded OS page right back in.
 void _mi_page_unpurge_all(mi_page_t* page) {
-  MI_EVENT(MI_EVENT_UNPURGE_ALL_ENTRY);
   _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);   // the unformed tail goes back as well
   if (!mi_page_has_purged(page)) return;
   const size_t os_size = mi_page_purge_unit(page);
@@ -28088,7 +28071,7 @@ void _mi_page_publish_retired(mi_page_t* page) {
   mi_assert_internal(mi_atomic_load_ptr_relaxed(mi_page_t, slot) == NULL);
   tld->retired_used |= ((size_t)1 << i);
 
-  mi_page_restore_before_retirement(page); // holes describe formed blocks, and there will be none
+  _mi_page_unpurge_all(page);   // holes describe formed blocks, and there will be none
   page->free = NULL;            // nothing formed: every block of the page is unformed tail now
   page->local_free = NULL;
   page->capacity = 0;
@@ -30206,8 +30189,7 @@ static const char* const mi_event_names[MI_EVENT_COUNT] = {
   "page_map_register", "page_map_reextend",
   "large_span_grow", "large_span_shrink",
   "arena_page_alloc", "arena_page_free",
-  "large_repurpose_none", "large_retire_expired", "large_empty_freed",
-  "unpurge_all_entry"
+  "large_repurpose_none", "large_retire_expired", "large_empty_freed"
 };
 
 void _mi_event_count(mi_event_t event) {

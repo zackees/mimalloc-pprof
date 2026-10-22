@@ -321,3 +321,17 @@ candidate was removed before any performance dispatch. Production source
 again matches the fixed baseline. `v5-preflight.zip` preserves the diagnostic
 profiles, commands, source patch, RED/GREEN codegen checks, test executables,
 logs, review and disposition. No CPU gain or platform validation is claimed.
+
+## V6: omit the overwritten final free-list link
+
+The baseline initializer writes every new block's next pointer, then
+overwrites the last pointer with the old free-list head. V6 stops the loop
+before the last block, whose required final link is still written once.
+The optimized baseline retains the redundant iteration/store; the shared
+initializer test is RED at two writes for a singleton, GREEN at one.
+
+`v6-structural.zip` preserves RED/GREEN evidence, exact objects/executables,
+source patch, test configurations, commands and clean review. C tests passed
+4/4, secure C++ 3/3, and ASan with owner gate 3/3. No publication reordering
+or allocator policy change is included. Performance acceptance and full
+platform validation remain pending; no CPU gain is claimed.

@@ -269,7 +269,7 @@ uses the repeated-call attribution preserved in `v3-structural.zip`.
 `v4-structural.zip` preserves focused RED/GREEN executables, patches with
 separate new headers, exhaustive state/bin/runtime-option equivalence tests,
 C/C++/actual ASan results, optimized code and review. Its internal notes
-explain reproduction and limitations. Performance acceptance remains pending;
+explain reproduction and limitations. V4 is rejected for lack of a supported CPU/throughput gain;
 V3's confirmed throughput regression is not waived by this new candidate.
 
 ## Complete V3 disposition
@@ -296,6 +296,14 @@ ARM64, Rust, sanitizers, memory and default-path gates. Every job is completed
 with success or an expected skipped configuration. The candidate and PR test
 merge have identical trees; the source-equivalence record is included.
 
-The chart cohort completed with all six metric checks passing, but no
-supported CPU/throughput gain. Other original cohorts are still pending.
-These platform results alone do not establish performance acceptance.
+All three original cohorts completed: **14 PASS, 4 INCONCLUSIVE, zero FAIL**.
+None demonstrates a statistically supported CPU/throughput gain, so V4 is
+rejected under the declared stage-one screen. No stage-two expansion or
+unchanged rerun is authorized by these results. All release bounds held;
+zero memory credit. The plain ephemeral p99 improvement does not satisfy
+the required CPU/throughput gain.
+
+[Full original ledger](ledger-v4.md). `v4-measurements.zip` preserves raw
+samples, exact binaries, workflow records/logs, dispatch requests/responses,
+plans, verification scripts, and exact baseline/candidate source snapshots.
+The internal manifest and external digest cover every archived member.

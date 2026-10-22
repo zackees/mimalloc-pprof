@@ -154,3 +154,32 @@ The candidate source snapshot in the campaign scratch was verified against
 all 855 original Git blobs excluding only historical `.github/assets/`
 evidence (`v2-source-manifest.json`). Retain that snapshot with the eventual
 measured artifacts; this manifest alone does not ship the source tar.
+
+## Original V2 platform outcome and test correction
+
+All eleven original platform/check workflows are terminal: ten succeeded;
+ASan failed in the owner-gate Debug lane. The new event-counter test called
+`_mi_page_free_collect` without acquiring the owner gate. Its assertion is a
+real failure, retained in `v2-original-platform.zip` (25 members, outer digest
+in the matching JSON, per-member digests inside). Native MSVC, win-GNU,
+both native Macs, Rust, memory/default-path checks and the other ASan lanes
+passed. These do not erase the failed owner-gate lane.
+
+`v2-test-fix-evidence.zip` retains the failing CI logs and local reproduction,
+the test-only correction and focused GREEN evidence. The first local build
+was named `v2-owner-asan` but sanitizer support was disabled by a missing
+header: its RED/GREEN proves the owner-gate assertion, not ASan coverage.
+The later `v2-owner-sanitized` build supplied the existing compiler-rt header,
+explicitly enabled ASan and linked `__asan_init`; the corrected test passed.
+The disabled-gate configuration also passed. Review was clean and independently
+reran the sanitized test. Original setup and warning logs remain in the archive.
+
+The correction acquires the owner gate before internal page accesses and
+releases it before heap deletion. Stamped corrected head
+`876d7c313026090b0dbeaadb8d0cf2f03f0c9c13` passed 45/45 local checks in 59 seconds
+(`v2-test-fix-local-gate.log`). The source-equivalence JSON verifies the only
+changes from measured V2 are the test and evidence; allocator, Rust, build
+settings and benchmark harness are unchanged. The three original performance
+cohorts are retained without duplicate dispatches. Fresh platform validation
+of the corrected tests is running; no final platform or performance acceptance
+is claimed here.

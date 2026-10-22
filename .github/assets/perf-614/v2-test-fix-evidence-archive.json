@@ -1,0 +1,5 @@
+{
+  "sha256": "6961df730eb2cbb685bd8570403c2d4b0223dbdd3d1eb2bb02959f66def0ac07",
+  "members": 23,
+  "note": "Original CI ASAN failure retained. v2-owner-asan local setup disabledASAN; v2-owner-sanitized explicitlyON and __asan_init verified. Test-only correction; no performance rerun."
+}

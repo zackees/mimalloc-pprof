@@ -1,0 +1,15 @@
+{
+  "measured": "59d369609ab47358df0f883b6419252f1ffbf03a",
+  "corrected_stamped": "876d7c313026090b0dbeaadb8d0cf2f03f0c9c13",
+  "changed_paths": [
+    ".gitattributes",
+    ".github/assets/perf-614/README.md",
+    ".github/assets/perf-614/v2-campaign-plan.json",
+    ".github/assets/perf-614/v2-dispatches.json",
+    ".github/assets/perf-614/v2-source-manifest.json",
+    ".github/assets/perf-614/v2-structural-archive.json",
+    ".github/assets/perf-614/v2-structural.zip",
+    "test/test-event-counters.c"
+  ],
+  "allocator_build_harness_rust_unchanged": true
+}

@@ -183,3 +183,32 @@ settings and benchmark harness are unchanged. The three original performance
 cohorts are retained without duplicate dispatches. Fresh platform validation
 of the corrected tests is running; no final platform or performance acceptance
 is claimed here.
+
+## V2 measurement disposition: rejected
+
+[Original V2 ledger](ledger-v2.md): **11 PASS, 7 INCONCLUSIVE, zero FAIL**.
+All three original cohorts completed; large-class stopped at 60 samples per
+arm under the unchanged adaptive protocol, both ephemeral rows reached 120.
+All release bounds passed. No target CPU/throughput interval establishes a
+gain. The predeclared stage-two criterion therefore failed; the remaining ten
+rows were not dispatched, and no unchanged candidate was rerun.
+
+Plain-ephemeral p99 has a positive interval (+0.4727% to +1.5848%) and remains
+INCONCLUSIVE against its noise allowance. Its after-drain RSS interval
+(-0.7276% to +10.9645%) also remains INCONCLUSIVE and is not accepted. No
+uncertainty is waived, no memory credit claimed and no hosts pooled. V2 is
+rejected for lack of demonstrated benefit; numeric verdicts are retained.
+
+`v2-measurements.zip` retains original raw samples, actual measured binaries
+and SHA manifests, workflow metadata/logs, exact dispatch requests/responses,
+independent per-cell ledgers, the predeclared campaign and disposition,
+verifiers, and exact baseline/candidate source snapshots. Historical evidence
+alone is excluded from source snapshots. `v2-source-manifest.json` records
+verification of all candidate source files against Git blobs; the baseline
+snapshot's verification is retained from V1. Check the external digest and
+all internal manifest members before using the archive.
+
+The test-only owner-gate correction changes no measured allocator or harness
+code; source equivalence is retained. Fresh corrected platform CI remains
+separate and cannot establish a performance benefit. Do not merge the rejected
+restore-guard mechanism on the strength of correctness checks alone.

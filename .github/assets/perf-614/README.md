@@ -244,3 +244,10 @@ The complete job list and individual job logs are retained; this is unresolved
 workflow finalization, not a claimed successful workflow. No rerun or manual
 cancellation was requested. The original ASan test failure remains separately
 preserved. These correctness results do not change V2's performance rejection.
+
+A subsequent fresh REST observation confirms that corrected V2 fuzz run
+`39835530789` completed successfully, with all three jobs successful.
+`v2-corrected-fuzz-finalization.json` retains that run and complete job record.
+The earlier pending-status snapshot stays unchanged. All eleven corrected
+V2 platform workflows therefore completed successfully; V2 remains rejected
+for lack of demonstrated performance benefit.

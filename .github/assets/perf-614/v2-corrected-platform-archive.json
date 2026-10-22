@@ -1,0 +1,5 @@
+{
+  "sha256": "11d1ea8931d42536fcfdb3fb06dff4efa2fbd2b03737893792c89a82f33d641a",
+  "members": 37,
+  "note": "Corrected V2: ten complete successful workflows; fuzz all three jobs success with individual logs preserved, workflow-level in_progress at collection. No claim of complete workflow finalization."
+}

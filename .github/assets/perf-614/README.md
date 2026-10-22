@@ -233,3 +233,14 @@ state/bin/runtime-option equivalence tests, C++ and actual ASan owner-gate
 results, optimized codegen, and review disposition. Reproducing either source
 patch requires its separately archived new header. See the internal notes
 and external archive digest. Performance acceptance remains pending.
+
+## Corrected V2 platform evidence
+
+`v2-corrected-platform.zip` preserves corrected source `876d7c31` validation:
+ten workflows completed successfully, including C/native MSVC, Windows GNU,
+native Mac arches, Rust, and ASan owner-gate. The fuzz workflow still reported
+`in_progress` at collection despite all three jobs completing successfully.
+The complete job list and individual job logs are retained; this is unresolved
+workflow finalization, not a claimed successful workflow. No rerun or manual
+cancellation was requested. The original ASan test failure remains separately
+preserved. These correctness results do not change V2's performance rejection.

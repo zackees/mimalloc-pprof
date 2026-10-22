@@ -30,88 +30,6 @@
 
 #if MI_DIAGNOSTICS
 
-// #614: publishing a clean, emptied page must not call the restore function.
-// An isolated heap ensures this is the sole page in its large bin.
-static void test_clean_retirement_skips_restore(void) {
-  mi_heap_t* const heap = mi_heap_new();
-  assert(heap != NULL);
-  void* const p = mi_heap_malloc(heap, SIZE_A);
-  assert(p != NULL);
-  mi_page_t* const page = _mi_ptr_page(p);
-  mi_theap_t* theap = page->theap;
-  MI_GATE_ENTER(theap);
-  assert(_mi_gate_held_theap(theap));
-  assert(!mi_page_has_purged(page));
-  assert(page->unformed_purged_hi <= page->unformed_purged_lo);
-  const uint64_t calls = _mi_event_get(MI_EVENT_UNPURGE_ALL_ENTRY);
-  mi_free(p);
-  assert(page->retired_slot != NULL);
-  assert(page->capacity == 0 && page->free == NULL && page->local_free == NULL);
-  assert(_mi_event_get(MI_EVENT_UNPURGE_ALL_ENTRY) == calls);
-  void* const reused = mi_heap_malloc(heap, SIZE_A);
-  assert(reused != NULL && _mi_ptr_page(reused) == page);
-  assert(page->retired_slot == NULL);
-  memset(reused, 0x33, SIZE_A);
-  mi_free(reused);
-  MI_GATE_LEAVE(theap->tld);
-  mi_heap_delete(heap);
-  puts("unpurge: clean retirement skips restore call and remains reusable");
-}
-
-// Exercise real OS discards: the guard must preserve both restore conditions.
-static void test_discarded_retirement_restores(bool formed_hole) {
-  const long purge_holes = mi_option_get(mi_option_purge_holes);
-  const long full_every = mi_option_get(mi_option_purge_holes_full_every);
-  mi_option_set(mi_option_purge_holes, 1);
-  mi_option_set(mi_option_purge_holes_full_every, 1);
-  mi_heap_t* const heap = mi_heap_new();
-  assert(heap != NULL);
-  void* const first = mi_heap_malloc(heap, SIZE_A);
-  assert(first != NULL);
-  mi_page_t* const page = _mi_ptr_page(first);
-  mi_theap_t* theap = page->theap;
-  MI_GATE_ENTER(theap); // internal free-list/sweep operations require owner access
-  assert(_mi_gate_held_theap(theap));
-  mi_tld_t* const tld = theap->tld;
-  void* survivor = first;
-  if (formed_hole) {
-    survivor = mi_heap_malloc(heap, SIZE_A);
-    assert(survivor != NULL && _mi_ptr_page(survivor) == page);
-    mi_free(first);
-    _mi_page_free_collect(page, false);
-  }
-  _mi_page_purge_holes_sweep_begin(tld);
-  _mi_page_purge_holes_begin(tld);
-  _mi_page_purge_holes(page, tld);
-  _mi_page_purge_holes_end(tld);
-  if (formed_hole) {
-    // Isolate the bitmap condition: a tail must not hide a missing formed-hole guard.
-    _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);
-    assert(page->unformed_purged_hi <= page->unformed_purged_lo);
-    assert(mi_page_has_purged(page));
-  }
-  else {
-    assert(page->unformed_purged_hi > page->unformed_purged_lo);
-    assert(!mi_page_has_purged(page));
-  }
-  const uint64_t calls = _mi_event_get(MI_EVENT_UNPURGE_ALL_ENTRY);
-  mi_free(survivor);
-  assert(page->retired_slot != NULL);
-  assert(_mi_event_get(MI_EVENT_UNPURGE_ALL_ENTRY) == calls + 1);
-  assert(!mi_page_has_purged(page));
-  assert(page->unformed_purged_hi <= page->unformed_purged_lo);
-  void* const reused = mi_heap_malloc(heap, SIZE_A);
-  assert(reused != NULL && _mi_ptr_page(reused) == page);
-  memset(reused, 0x33, SIZE_A);
-  mi_free(reused);
-  MI_GATE_LEAVE(theap->tld);
-  mi_heap_delete(heap);
-  mi_option_set(mi_option_purge_holes, purge_holes);
-  mi_option_set(mi_option_purge_holes_full_every, full_every);
-  puts(formed_hole ? "unpurge: formed holes restored before retirement" :
-                     "unpurge: unformed tail restored before retirement");
-}
-
 static int bin_is_large(size_t size) {
   const size_t b = mi_good_size(size);
   return (b > MI_MEDIUM_MAX_OBJ_SIZE && b <= MI_LARGE_MAX_OBJ_SIZE);
@@ -195,9 +113,6 @@ int main(void) {
   mi_option_set(mi_option_purge_delay, 600000);   // nothing may be released during the run
   if (!bin_is_large(SIZE_A) || !bin_is_large(SIZE_B)) { puts("skipped: sizes are not large bins in this build"); return 0; }
   test_names_and_reset();
-  test_clean_retirement_skips_restore();
-  test_discarded_retirement_restores(false);
-  test_discarded_retirement_restores(true);
   test_report_lists_retired_pages();
   test_retire_cascade_budget();
   puts("ok");

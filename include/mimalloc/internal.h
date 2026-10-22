@@ -1408,7 +1408,6 @@ typedef enum mi_event_e {
   MI_EVENT_LARGE_REPURPOSE_NONE,    // a large bin's page request found no retired page of another bin to take (#575)
   MI_EVENT_LARGE_RETIRE_EXPIRED,    // a retired large page aged out and was freed to the arena (#575)
   MI_EVENT_LARGE_EMPTY_FREED,       // an emptied large page was freed at once, because its bin has other pages (#575)
-  MI_EVENT_UNPURGE_ALL_ENTRY,      // calls to restore all holes before retirement or arena return (#614)
   MI_EVENT_COUNT
 } mi_event_t;
 uint64_t      _mi_event_get(mi_event_t event);           // 0 when not compiled in

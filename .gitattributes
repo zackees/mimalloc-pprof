@@ -22,3 +22,4 @@
 .github/assets/benchmark-615/verification.zip binary
 # Preserve the exact issue 614 attribution archive bytes.
 .github/assets/perf-614/attribution.zip binary
+.github/assets/perf-614/platform-gates.zip binary

@@ -1,0 +1,8 @@
+{
+  "file": "platform-gates.zip",
+  "sha256": "a07e1ba71344bd5a9e93337e180ab6a4fdd58becbb47c6107a306449c942408a",
+  "files": 20,
+  "candidate": "287cac2f664a46703ebb6522eef8c8dbeb984cbb",
+  "test_merge": "c9eab6aebbc68a4763b6063f1ebbf6060b6fe39e",
+  "source_tree": "a910b85e21192b946f9d7acda1096c60d437c582"
+}

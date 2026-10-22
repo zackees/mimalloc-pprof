@@ -2,7 +2,8 @@
 
 This archive records local attribution and structural correctness evidence.
 It is not a performance acceptance result. The CPU candidate remains pending
-its original CI measurement cohorts and full platform gates.
+its original CI measurement cohorts. The nine platform workflows passed;
+performance acceptance is separate.
 
 ## Mechanism and provenance
 
@@ -63,3 +64,26 @@ Restore executable permissions when replaying archived binaries. The baseline
 profile binaries have no build IDs; restore their recorded paths or configure
 perf's symbol root explicitly. No acceptance inference follows from archive
 integrity alone.
+
+## Platform gates
+
+`platform-gates.zip` contains metadata and original logs for all nine successful
+platform workflows on candidate `287cac2f664a46703ebb6522eef8c8dbeb984cbb`.
+The API tree records in `source-equivalence.json` verify that CI's test merge
+`c9eab6aebbc68a4763b6063f1ebbf6060b6fe39e` has the identical source tree.
+
+- [asan](https://github.com/zackees/mimalloc-pprof/actions/runs/39817378819): success.
+- [c-unit](https://github.com/zackees/mimalloc-pprof/actions/runs/39817378654): success.
+- [cross](https://github.com/zackees/mimalloc-pprof/actions/runs/39817378542): success.
+- [fuzz](https://github.com/zackees/mimalloc-pprof/actions/runs/39817378855): success.
+- [macos](https://github.com/zackees/mimalloc-pprof/actions/runs/39817378817): success.
+- [purge](https://github.com/zackees/mimalloc-pprof/actions/runs/39817379021): success.
+- [python](https://github.com/zackees/mimalloc-pprof/actions/runs/39817378317): success.
+- [rust](https://github.com/zackees/mimalloc-pprof/actions/runs/39817378888): success.
+- [windows](https://github.com/zackees/mimalloc-pprof/actions/runs/39817378954): success.
+
+The cancelled runs from the earlier PR-open event are superseded by these
+label-triggered runs. Their cancellation-derived failures are not represented
+as passing tests. These results establish platform validation of this source;
+they do not establish CPU, RSS or latency acceptance. The archive has an outer
+SHA-256 in `platform-gates-archive.json` and per-member hashes in its manifest.

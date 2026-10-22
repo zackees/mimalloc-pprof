@@ -1,0 +1,5 @@
+{
+  "sha256": "0396b986435a3652b450766cb52942e314ad52866c0b7d4e2c505c6fedf49847",
+  "members": 56,
+  "note": "V3 count-only baseline attribution, RED/GREEN and optimized codegen; no performance acceptance claim."
+}

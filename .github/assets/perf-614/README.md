@@ -212,3 +212,24 @@ The test-only owner-gate correction changes no measured allocator or harness
 code; source equivalence is retained. Fresh corrected platform CI remains
 separate and cannot establish a performance benefit. Do not merge the rejected
 restore-guard mechanism on the strength of correctness checks alone.
+
+## V3 candidate: skip zero-state reuse accounting
+
+V1 and V2 production changes have been removed. The new candidate skips the
+full span/accounting call after successful retired-page selection when its
+demand-state byte is zero. The result was discarded, the state remains zero
+under every runtime cap/enable value, and no grow/shrink event is emitted.
+Nonzero states retain the original call. Selection, geometry, aging,
+retention and purge policies are unchanged.
+
+`v3-structural.zip` preserves three count-only baseline probe variants and
+their original executables, patches, commands and logs. The narrowest probe
+observed 426,264 / 392,636 / 95,960 repeated zero-state accounting calls in
+the three target replays. These instrumented counts prove occurrence, not
+performance benefit; their timings are not acceptance evidence.
+
+The archive also contains focused RED and GREEN executables/logs, exhaustive
+state/bin/runtime-option equivalence tests, C++ and actual ASan owner-gate
+results, optimized codegen, and review disposition. Reproducing either source
+patch requires its separately archived new header. See the internal notes
+and external archive digest. Performance acceptance remains pending.

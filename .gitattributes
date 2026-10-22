@@ -17,3 +17,6 @@
 
 # Preserve the exact issue 610 evidence archive bytes.
 .github/assets/perf-610/measurements.zip binary
+
+# Preserve the exact issue 615 benchmark verification archive bytes.
+.github/assets/benchmark-615/verification.zip binary

@@ -1366,6 +1366,7 @@ void          _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld);   // `tld`: 
 void          _mi_page_purged_reset(mi_page_t* page);
 bool          _mi_page_unpurge_run(mi_page_t* page);
 void          _mi_page_unpurge_all(mi_page_t* page);
+mi_decl_noinline void _mi_page_unpurge_all_slow(mi_page_t* page);
 size_t        _mi_page_purged_count(const mi_page_t* page);
 void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   // hand the discarded unformed tail back below `end` (an absolute address)
 size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            // the bytes of this page's unformed tail that are discarded right now
@@ -1408,6 +1409,7 @@ typedef enum mi_event_e {
   MI_EVENT_LARGE_REPURPOSE_NONE,    // a large bin's page request found no retired page of another bin to take (#575)
   MI_EVENT_LARGE_RETIRE_EXPIRED,    // a retired large page aged out and was freed to the arena (#575)
   MI_EVENT_LARGE_EMPTY_FREED,       // an emptied large page was freed at once, because its bin has other pages (#575)
+  MI_EVENT_UNPURGE_RESTORE,        // entered the restore body for formed holes or an unformed tail (#614)
   MI_EVENT_COUNT
 } mi_event_t;
 uint64_t      _mi_event_get(mi_event_t event);           // 0 when not compiled in

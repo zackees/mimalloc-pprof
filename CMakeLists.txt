@@ -107,6 +107,7 @@ set(mi_sources
     src/page-retired-search.c
     src/page-map.c
     src/page-holes.c
+    src/page-unpurge.c
     src/large-span.c
     src/purge-all.c
     src/profile.c
@@ -490,7 +491,7 @@ if(MI_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND
   endif()
   set(mi_strict_fork_sources "")
   foreach(f IN ITEMS src/profile.c src/profile-stack.c src/profile-maps.c src/memory-events.c
-                      src/dhat.c src/dhat-stack.c src/scavenger.c src/page-holes.c
+                      src/dhat.c src/dhat-stack.c src/scavenger.c src/page-holes.c src/page-unpurge.c
                       src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c
                       src/arena-layout.c src/event-counters.c src/large-span.c
                       src/page-retired-search.c)

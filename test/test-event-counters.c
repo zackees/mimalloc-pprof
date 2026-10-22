@@ -30,6 +30,21 @@
 
 #if MI_DIAGNOSTICS
 
+// #614: the clean-page case needs no OS restore and must avoid its large body.
+// Use an isolated page header so unrelated allocator activity cannot affect the count.
+static void test_clean_page_skips_restore(void) {
+  mi_page_t page;
+  memset(&page, 0, sizeof(page));
+  page.swept_state = MI_PAGE_SWEPT_NONE;
+  unsigned char before[sizeof(page)];
+  memcpy(before, &page, sizeof(page));
+  const uint64_t restores = _mi_event_get(MI_EVENT_UNPURGE_RESTORE);
+  _mi_page_unpurge_all(&page);
+  assert(memcmp(before, &page, sizeof(page)) == 0);
+  assert(_mi_event_get(MI_EVENT_UNPURGE_RESTORE) == restores);
+  puts("unpurge: clean page skips restore body and preserves its header");
+}
+
 static int bin_is_large(size_t size) {
   const size_t b = mi_good_size(size);
   return (b > MI_MEDIUM_MAX_OBJ_SIZE && b <= MI_LARGE_MAX_OBJ_SIZE);
@@ -112,6 +127,7 @@ static void test_report_lists_retired_pages(void) {
 int main(void) {
   mi_option_set(mi_option_purge_delay, 600000);   // nothing may be released during the run
   if (!bin_is_large(SIZE_A) || !bin_is_large(SIZE_B)) { puts("skipped: sizes are not large bins in this build"); return 0; }
+  test_clean_page_skips_restore();
   test_names_and_reset();
   test_report_lists_retired_pages();
   test_retire_cascade_budget();

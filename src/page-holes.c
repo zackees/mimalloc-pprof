@@ -752,7 +752,8 @@ bool _mi_page_unpurge_run(mi_page_t* page) {
 // memory out as committed without any further `reuse` call). The page is dead here (every
 // block is free), so we do NOT rebuild its free list: writing `next` pointers into the
 // holes would fault every discarded OS page right back in.
-void _mi_page_unpurge_all(mi_page_t* page) {
+mi_decl_noinline void _mi_page_unpurge_all_slow(mi_page_t* page) {
+  MI_EVENT(MI_EVENT_UNPURGE_RESTORE);
   _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);   // the unformed tail goes back as well
   if (!mi_page_has_purged(page)) return;
   const size_t os_size = mi_page_purge_unit(page);

@@ -1,9 +1,9 @@
 # Issue 614 attribution evidence
 
 This archive records local attribution and structural correctness evidence.
-It is not a performance acceptance result. The CPU candidate remains pending
-its original CI measurement cohorts. The nine platform workflows passed;
-performance acceptance is separate.
+It is not a performance acceptance result. The first CPU candidate is rejected for delivery: its three original target
+cohorts found no supported CPU/throughput gain. The nine platform workflows
+passed; that does not establish a performance benefit.
 
 ## Mechanism and provenance
 
@@ -87,3 +87,23 @@ label-triggered runs. Their cancellation-derived failures are not represented
 as passing tests. These results establish platform validation of this source;
 they do not establish CPU, RSS or latency acceptance. The archive has an outer
 SHA-256 in `platform-gates-archive.json` and per-member hashes in its manifest.
+
+## V1 measurement disposition
+
+[V1 full original ledger](ledger-v1.md): **10 PASS, 8 INCONCLUSIVE, zero FAIL**.
+All three original cohorts reached 120 samples per arm, with zero memory
+credit and passing release bounds. No target CPU or throughput interval
+establishes a gain, so the predeclared condition for the remaining ten rows
+was not met. No unchanged rerun or stage-two expansion was dispatched.
+The candidate is rejected for lack of demonstrated benefit; its inconclusive
+metrics have not been converted to PASS or invented FAIL verdicts.
+
+`v1-measurements.zip` preserves all three original sample files, actual
+throughput/latency executables and original SHA manifests, workflow metadata
+and logs, exact dispatch requests/responses, independently recomputed ledgers,
+and exact source snapshots for the baseline and measured candidate. Source
+snapshots omit only historical `.github/assets/` evidence; every included
+file was verified against its original Git blob ID. The archive also retains
+disassembly from the measured binaries and the rebase source-equivalence proof.
+`v1-measurements-archive.json` records its outer digest; its internal manifest
+records each member's byte length and digest. No cross-host pooling is used.

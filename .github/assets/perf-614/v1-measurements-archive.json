@@ -1,0 +1,15 @@
+{
+  "file": "v1-measurements.zip",
+  "sha256": "e6420a419201fb609dd6d17d90d53c95b4d55f751ed985bd14fa70d3b10b9b5d",
+  "bytes": 10185953,
+  "files": 52,
+  "baseline": "227eef06ff03f92966f38508441d6c2f60a75135",
+  "candidate": "287cac2f664a46703ebb6522eef8c8dbeb984cbb",
+  "disposition": "rejected: no supported target CPU/throughput gain",
+  "stage_two_dispatched": false,
+  "metric_verdicts": {
+    "PASS": 10,
+    "INCONCLUSIVE": 8,
+    "FAIL": 0
+  }
+}

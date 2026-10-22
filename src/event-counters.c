@@ -34,8 +34,7 @@ static const char* const mi_event_names[MI_EVENT_COUNT] = {
   "page_map_register", "page_map_reextend",
   "large_span_grow", "large_span_shrink",
   "arena_page_alloc", "arena_page_free",
-  "large_repurpose_none", "large_retire_expired", "large_empty_freed",
-  "large_span_account_call"
+  "large_repurpose_none", "large_retire_expired", "large_empty_freed"
 };
 
 void _mi_event_count(mi_event_t event) {

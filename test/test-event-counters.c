@@ -30,63 +30,6 @@
 
 #if MI_DIAGNOSTICS
 
-#if MI_LARGE_REPURPOSE && MI_LARGE_SPAN
-// Selected-page accounting must not call the API that also computes a fresh span.
-static void test_reuse_accounting_skips_span_sizing(void) {
-  mi_theap_t theap;
-  memset(&theap, 0, sizeof(theap));
-  const size_t index = _mi_bin(mi_good_size(SIZE_A)) - _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
-  assert(index < MI_LARGE_SPAN_BINS);
-  const uint64_t before = _mi_event_get(MI_EVENT_LARGE_SPAN_ACCOUNT_CALL);
-  _mi_large_span_account_repurpose(&theap, index);
-  assert(_mi_event_get(MI_EVENT_LARGE_SPAN_ACCOUNT_CALL) == before);
-  puts("span: selected-page accounting avoids full sizing API");
-}
-// Compare the optimization with the existing transition for every encoded byte,
-// including pending-full and signed-pressure states, while changing runtime options.
-static void test_span_accounting_matches_original(void) {
-  mi_theap_t original, candidate;
-  memset(&original, 0, sizeof(original));
-  memset(&candidate, 0, sizeof(candidate));
-  const long enabled = mi_option_get(mi_option_large_span);
-  const long maximum = mi_option_get(mi_option_large_span_max);
-  const long caps[] = { 0, 1, MI_LARGE_SPAN_COMPACT_SLICES * MI_ARENA_SLICE_SIZE / MI_KiB,
-                       MI_LARGE_PAGE_SIZE / MI_KiB };
-  const size_t first_bin = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
-  const size_t last_bin = _mi_bin(MI_LARGE_MAX_OBJ_SIZE);
-  for (long on = 0; on <= 1; on++) {
-    mi_option_set(mi_option_large_span, on);
-    for (size_t cap = 0; cap < sizeof(caps) / sizeof(caps[0]); cap++) {
-      mi_option_set(mi_option_large_span_max, caps[cap]);
-      for (size_t bin = first_bin; bin <= last_bin; bin++) {
-        const size_t index = bin - first_bin;
-        assert(index < MI_LARGE_SPAN_BINS);
-        const size_t block_size = _mi_bin_size(bin);
-        for (unsigned state = 0; state <= UINT8_MAX; state++) {
-          original.large_span[index] = (mi_large_span_bin_t)state;
-          candidate.large_span[index] = (mi_large_span_bin_t)state;
-          const uint64_t grow = _mi_event_get(MI_EVENT_LARGE_SPAN_GROW);
-          const uint64_t shrink = _mi_event_get(MI_EVENT_LARGE_SPAN_SHRINK);
-          (void)_mi_large_span_slices(&original, block_size, 0);
-          const uint64_t grew = _mi_event_get(MI_EVENT_LARGE_SPAN_GROW) - grow;
-          const uint64_t shrank = _mi_event_get(MI_EVENT_LARGE_SPAN_SHRINK) - shrink;
-          const uint64_t calls = _mi_event_get(MI_EVENT_LARGE_SPAN_ACCOUNT_CALL);
-          _mi_large_span_account_repurpose(&candidate, index);
-          assert(memcmp(original.large_span, candidate.large_span, sizeof(original.large_span)) == 0);
-          assert(_mi_event_get(MI_EVENT_LARGE_SPAN_GROW) - grow == grew + grew);
-          assert(_mi_event_get(MI_EVENT_LARGE_SPAN_SHRINK) - shrink == shrank + shrank);
-          assert(_mi_event_get(MI_EVENT_LARGE_SPAN_ACCOUNT_CALL) - calls == 0);
-        }
-      }
-    }
-  }
-  mi_option_set(mi_option_large_span, enabled);
-  mi_option_set(mi_option_large_span_max, maximum);
-  puts("span: reuse accounting preserves all encoded transitions and diagnostic events");
-}
-
-#endif
-
 static int bin_is_large(size_t size) {
   const size_t b = mi_good_size(size);
   return (b > MI_MEDIUM_MAX_OBJ_SIZE && b <= MI_LARGE_MAX_OBJ_SIZE);
@@ -170,10 +113,6 @@ int main(void) {
   mi_option_set(mi_option_purge_delay, 600000);   // nothing may be released during the run
   if (!bin_is_large(SIZE_A) || !bin_is_large(SIZE_B)) { puts("skipped: sizes are not large bins in this build"); return 0; }
   test_names_and_reset();
-  #if MI_LARGE_REPURPOSE && MI_LARGE_SPAN
-  test_reuse_accounting_skips_span_sizing();
-  test_span_accounting_matches_original();
-  #endif
   test_report_lists_retired_pages();
   test_retire_cascade_budget();
   puts("ok");

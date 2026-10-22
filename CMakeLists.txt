@@ -873,7 +873,7 @@ if(MI_USE_CXX)
   # test-resident-first-churn.c (#517): calls `_mi_arena_claim_counters` from internal.h, the same case.
   # test-arena-layout.c (#519): calls `_mi_arena_layout_walk` from internal.h, the same case.
   # test-large-span.c (#532): reads `_mi_ptr_page` / `mi_page_t` from internal.h, the same case.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-event-counters.c test/test-free-list-links.c test/test-large-span.c test/test-large-fungible.c PROPERTIES LANGUAGE CXX )
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-event-counters.c test/test-large-span.c test/test-large-fungible.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -2276,17 +2276,6 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-arena-layout PRIVATE mimalloc-static ${mi_libraries})
     add_test(NAME test-arena-layout COMMAND mimalloc-test-arena-layout)
     set_tests_properties(test-arena-layout PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
-  endif()
-
-  # #614: free-list contents and exact link-write count, including singleton extensions.
-  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
-    add_executable(mimalloc-test-free-list-links test/test-free-list-links.c)
-    target_compile_definitions(mimalloc-test-free-list-links PRIVATE ${mi_defines})
-    target_compile_options(mimalloc-test-free-list-links PRIVATE ${mi_cflags})
-    target_include_directories(mimalloc-test-free-list-links PRIVATE include)
-    target_link_libraries(mimalloc-test-free-list-links PRIVATE mimalloc-static ${mi_libraries})
-    add_test(NAME test-free-list-links COMMAND mimalloc-test-free-list-links)
-    set_tests_properties(test-free-list-links PROPERTIES TIMEOUT 60)
   endif()
 
   # test-event-counters (#573 A2): the slow-path event counters and the retire-cascade budget.

@@ -24,6 +24,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_IN_PAGE_C
 #include "page-queue.c"
 #undef MI_IN_PAGE_C
+#include "large-span-reuse.h"
 
 
 /* -----------------------------------------------------------
@@ -591,7 +592,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   size_t best_size;
   mi_page_queue_t* const best_pq = _mi_page_repurpose_find(theap, pq, bin_lo, bin_hi, want, &best_size);
   if (best_pq == NULL) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_NONE); return NULL; }
-  (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
+  mi_large_span_account_repurpose(theap, block_size, (size_t)(pq - theap->pages) - bin_lo); // account the request
   mi_page_t* const page = best_pq->first;
   theap->tld->large_repurpose_left--;
   MI_EVENT(MI_EVENT_LARGE_REPURPOSE);   // (#573)

@@ -38,6 +38,9 @@ static void test_clean_retirement_skips_restore(void) {
   void* const p = mi_heap_malloc(heap, SIZE_A);
   assert(p != NULL);
   mi_page_t* const page = _mi_ptr_page(p);
+  mi_theap_t* theap = page->theap;
+  MI_GATE_ENTER(theap);
+  assert(_mi_gate_held_theap(theap));
   assert(!mi_page_has_purged(page));
   assert(page->unformed_purged_hi <= page->unformed_purged_lo);
   const uint64_t calls = _mi_event_get(MI_EVENT_UNPURGE_ALL_ENTRY);
@@ -50,6 +53,7 @@ static void test_clean_retirement_skips_restore(void) {
   assert(page->retired_slot == NULL);
   memset(reused, 0x33, SIZE_A);
   mi_free(reused);
+  MI_GATE_LEAVE(theap->tld);
   mi_heap_delete(heap);
   puts("unpurge: clean retirement skips restore call and remains reusable");
 }
@@ -65,6 +69,10 @@ static void test_discarded_retirement_restores(bool formed_hole) {
   void* const first = mi_heap_malloc(heap, SIZE_A);
   assert(first != NULL);
   mi_page_t* const page = _mi_ptr_page(first);
+  mi_theap_t* theap = page->theap;
+  MI_GATE_ENTER(theap); // internal free-list/sweep operations require owner access
+  assert(_mi_gate_held_theap(theap));
+  mi_tld_t* const tld = theap->tld;
   void* survivor = first;
   if (formed_hole) {
     survivor = mi_heap_malloc(heap, SIZE_A);
@@ -72,7 +80,6 @@ static void test_discarded_retirement_restores(bool formed_hole) {
     mi_free(first);
     _mi_page_free_collect(page, false);
   }
-  mi_tld_t* const tld = page->theap->tld;
   _mi_page_purge_holes_sweep_begin(tld);
   _mi_page_purge_holes_begin(tld);
   _mi_page_purge_holes(page, tld);
@@ -97,6 +104,7 @@ static void test_discarded_retirement_restores(bool formed_hole) {
   assert(reused != NULL && _mi_ptr_page(reused) == page);
   memset(reused, 0x33, SIZE_A);
   mi_free(reused);
+  MI_GATE_LEAVE(theap->tld);
   mi_heap_delete(heap);
   mi_option_set(mi_option_purge_holes, purge_holes);
   mi_option_set(mi_option_purge_holes_full_every, full_every);

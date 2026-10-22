@@ -1,0 +1,5 @@
+{
+  "sha256": "008a3f13f8d5921f1b885725d835936fdd6d3e8725451b6f17ad5c0dd7a8a9d8",
+  "members": 23,
+  "note": "V4 accounting-only RED/GREEN, original transition equivalence, optimized codegen; no performance acceptance."
+}

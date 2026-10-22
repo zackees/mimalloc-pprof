@@ -1,0 +1,8 @@
+{
+  "sha": "5b2d8f960297fda825b05b7471893fc4cf6c2f33",
+  "file": "5b2d8f960297fda825b05b7471893fc4cf6c2f33.tar",
+  "bytes": 20387840,
+  "sha256": "3ffd0897c29a0d840836b37a3f0122be517aef41d0b98ca071d41f012eaa9a92",
+  "excluded": ".github/assets/ (historical binary evidence only)",
+  "verified_git_blobs": 855
+}

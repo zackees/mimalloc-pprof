@@ -213,7 +213,13 @@ code; source equivalence is retained. Fresh corrected platform CI remains
 separate and cannot establish a performance benefit. Do not merge the rejected
 restore-guard mechanism on the strength of correctness checks alone.
 
-## V3 candidate: skip zero-state reuse accounting
+## V3 rejected: skip zero-state reuse accounting
+
+The first completed original cohort (run39840357033, plain ephemeral)
+confirmed a throughput regression of -0.8333% (95% CI -1.0046% to -0.5076%)
+beyond its 0.3310% noise allowance. V3 is rejected and removed. All three
+original cohorts are now complete; no stage two or unchanged rerun was
+dispatched. [Initial rejection ledger](https://github.com/zackees/mimalloc-pprof/issues/614#issuecomment-6349925978).
 
 V1 and V2 production changes have been removed. The new candidate skips the
 full span/accounting call after successful retired-page selection when its
@@ -251,3 +257,33 @@ A subsequent fresh REST observation confirms that corrected V2 fuzz run
 The earlier pending-status snapshot stays unchanged. All eleven corrected
 V2 platform workflows therefore completed successfully; V2 remains rejected
 for lack of demonstrated performance benefit.
+
+## V4 candidate: accounting without an unused size result
+
+After removing rejected V3, V4 calls the original demand-transition helper
+through a dedicated internal API with the known bin index. Every state uses
+the original transition and runtime option checks. Optimized assembly removes
+the repeated bin classification and unused size-result calculation. This
+uses the repeated-call attribution preserved in `v3-structural.zip`.
+
+`v4-structural.zip` preserves focused RED/GREEN executables, patches with
+separate new headers, exhaustive state/bin/runtime-option equivalence tests,
+C/C++/actual ASan results, optimized code and review. Its internal notes
+explain reproduction and limitations. Performance acceptance remains pending;
+V3's confirmed throughput regression is not waived by this new candidate.
+
+## Complete V3 disposition
+
+[Original full ledger](ledger-v3.md): **6 PASS, 10 INCONCLUSIVE, 2 FAIL**.
+Large-class CPU also regressed beyond noise (+0.6433%, CI +0.4006% to
++0.8918%, allowance 0.3584%). Short-chart throughput improved (+0.3585%,
+CI +0.0259% to +0.7054%); that cannot offset either confirmed regression.
+All release bounds held. Zero memory credit, no cross-host pooling, no
+threshold relaxation, no unchanged rerun and no stage-two expansion.
+
+`v3-measurements.zip` preserves original raw samples, exact binaries, hashes,
+workflow records/logs, dispatch requests/responses, plans, verifiers, ledger,
+and exact baseline/candidate source snapshots. `v3-platform.zip` preserves
+all eleven successful platform workflows and exact candidate/test-merge tree
+equivalence. Every archive has an internal member manifest and external
+digest. Platform success does not change V3's rejection.

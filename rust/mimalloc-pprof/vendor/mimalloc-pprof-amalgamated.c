@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit b81ef79b of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 52eab5b3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -6267,7 +6267,6 @@ typedef enum mi_event_e {
   MI_EVENT_LARGE_REPURPOSE_NONE,    // a large bin's page request found no retired page of another bin to take (#575)
   MI_EVENT_LARGE_RETIRE_EXPIRED,    // a retired large page aged out and was freed to the arena (#575)
   MI_EVENT_LARGE_EMPTY_FREED,       // an emptied large page was freed at once, because its bin has other pages (#575)
-  MI_EVENT_LARGE_SPAN_ACCOUNT_CALL, // full span/accounting calls, including discarded sizes (#614)
   MI_EVENT_COUNT
 } mi_event_t;
 uint64_t      _mi_event_get(mi_event_t event);           // 0 when not compiled in
@@ -25207,29 +25206,6 @@ static void mi_page_queue_enqueue_from_full(mi_page_queue_t* to, mi_page_queue_t
 }
 /* ---- end inlined: src/page-queue.c ---- */
 #undef MI_IN_PAGE_C
-/* ---- begin inlined: src/large-span-reuse.h ---- */
-/* Demand accounting for an already selected retired page (#614). */
-#ifndef MI_LARGE_SPAN_REUSE_H
-#define MI_LARGE_SPAN_REUSE_H
-
-#if MI_LARGE_REPURPOSE
-static inline void mi_large_span_account_repurpose(mi_theap_t* theap, size_t block_size, size_t index) {
-  #if MI_LARGE_SPAN
-  // Zero encodes compact level, no pressure, and no pending full-page signal.
-  // Accounting preserves it for every runtime enable/cap setting, with no grow
-  // or shrink event. Reuse already selected its page and discards the size result.
-  // The caller owns this theap and supplies the index from its known target queue.
-  mi_assert_internal(index < MI_LARGE_SPAN_BINS);
-  if (index < MI_LARGE_SPAN_BINS && theap->large_span[index] == 0) return;
-  #else
-  MI_UNUSED(index);
-  #endif
-  (void)_mi_large_span_slices(theap, block_size, 0);
-}
-#endif
-
-#endif
-/* ---- end inlined: src/large-span-reuse.h ---- */
 
 
 /* -----------------------------------------------------------
@@ -25797,7 +25773,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   size_t best_size;
   mi_page_queue_t* const best_pq = _mi_page_repurpose_find(theap, pq, bin_lo, bin_hi, want, &best_size);
   if (best_pq == NULL) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_NONE); return NULL; }
-  mi_large_span_account_repurpose(theap, block_size, (size_t)(pq - theap->pages) - bin_lo); // account the request
+  (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
   mi_page_t* const page = best_pq->first;
   theap->tld->large_repurpose_left--;
   MI_EVENT(MI_EVENT_LARGE_REPURPOSE);   // (#573)
@@ -29042,7 +29018,6 @@ static size_t mi_large_span_request(mi_large_span_bin_t b, size_t block_size, si
 // A page request of a large bin on `theap`: account it, and return the span (in slices) of the
 // page to create for it if no abandoned page of the bin is reclaimed instead.
 size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
-  MI_EVENT(MI_EVENT_LARGE_SPAN_ACCOUNT_CALL);
   const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
   if (theap == NULL || MI_LARGE_SPAN_COMPACT_SLICES >= full) return full;
   if (!mi_option_is_enabled(mi_option_large_span)) return full;
@@ -29066,7 +29041,6 @@ size_t _mi_large_span_peek_slices(mi_theap_t* theap, size_t block_size, size_t o
 #else // !MI_LARGE_SPAN: every large page gets MI_LARGE_PAGE_SIZE (and the hook sites compile out)
 
 size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
-  MI_EVENT(MI_EVENT_LARGE_SPAN_ACCOUNT_CALL);
   MI_UNUSED(theap); MI_UNUSED(block_size); MI_UNUSED(overhead);
   return mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
 }
@@ -30215,8 +30189,7 @@ static const char* const mi_event_names[MI_EVENT_COUNT] = {
   "page_map_register", "page_map_reextend",
   "large_span_grow", "large_span_shrink",
   "arena_page_alloc", "arena_page_free",
-  "large_repurpose_none", "large_retire_expired", "large_empty_freed",
-  "large_span_account_call"
+  "large_repurpose_none", "large_retire_expired", "large_empty_freed"
 };
 
 void _mi_event_count(mi_event_t event) {

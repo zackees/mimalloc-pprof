@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 52eab5b3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 0b8042a2 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -25834,13 +25834,15 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
       mi_theap_stat_counter_increase(theap, pages_retire, 1);
       #endif
       page->retire_expire = (bsize <= MI_SMALL_MAX_OBJ_SIZE ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
-      if (bsize > MI_MEDIUM_MAX_OBJ_SIZE) { _mi_page_publish_retired(page); }   // #483: so an idle owner cannot pin it
       mi_assert_internal(pq >= theap->pages);
       const size_t index = pq - theap->pages;
       mi_assert_internal(index < MI_BIN_FULL && index < MI_BIN_HUGE);
       if (index < theap->page_retired_min) theap->page_retired_min = index;
       if (index > theap->page_retired_max) theap->page_retired_max = index;
       mi_assert_internal(mi_page_all_free(page));
+      // #614: finish owner-only bookkeeping before publishing. Nothing below needs
+      // the queue or theap, so publication can tail-call without preserving them.
+      if (bsize > MI_MEDIUM_MAX_OBJ_SIZE) { _mi_page_publish_retired(page); }   // #483: so an idle owner cannot pin it
       return; // don't free after all
     }
   }

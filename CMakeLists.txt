@@ -854,7 +854,7 @@ endif()
 # set language for source files now
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
-  set_source_files_properties(test/test-diagnostic-walks.c test/test-snapshot-walk.c PROPERTIES LANGUAGE CXX)
+  set_source_files_properties(test/test-diagnostic-walks.c test/test-snapshot-walk.c test/test-fork-locks.c PROPERTIES LANGUAGE CXX)
   # #272 (P7b): test-purge-holes.c and test-profile-race.c reach `mimalloc/internal.h`
   # (`_mi_ptr_page`, `mi_page_block_is_purged`, `_mi_os_page_size`, ...), which is NOT wrapped
   # in `extern "C"`. With MI_USE_CXX the library's symbols are C++-mangled, so a C test cannot

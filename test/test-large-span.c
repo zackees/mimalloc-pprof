@@ -562,6 +562,7 @@ static void case_off(void) {
 }
 
 #include "retired-search.h"
+#include "retired-queue-remove.h"
 
 int main(void) {
   #if !MI_ENABLE_LARGE_PAGES
@@ -594,6 +595,7 @@ int main(void) {
   case_repurpose();
   case_recarve_matrix();
   case_slots();
+  case_retired_queue_remove();
   case_retired_search();
   case_retired_search_budget();
   #endif

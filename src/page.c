@@ -600,7 +600,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   mi_assert_internal(mi_page_all_free(page) && mi_page_is_owned(page) && !mi_page_is_abandoned(page));
   mi_assert_internal(mi_tf_block(mi_atomic_load_relaxed(&page->xthread_free)) == NULL);
   mi_assert_internal(mi_page_theap(page) == theap);
-  mi_page_queue_remove(best_pq, page);
+  mi_page_queue_remove_retired(theap, best_pq, page);
   mi_theap_stat_decrease(theap, page_bins[_mi_page_stats_bin(page)], 1);
   page->retire_expire = 0;
   page->retired_at = 0;

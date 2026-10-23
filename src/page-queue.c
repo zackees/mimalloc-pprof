@@ -306,31 +306,7 @@ static bool mi_page_queue_is_empty(mi_page_queue_t* queue) {
 }
 */
 
-static void mi_page_queue_remove(mi_page_queue_t* queue, mi_page_t* page) {
-  mi_assert_internal(page != NULL);
-  mi_assert_expensive(mi_page_queue_contains(queue, page));
-  mi_assert_internal(queue->count >= 1);
-  mi_assert_internal(mi_page_block_size(page) == queue->block_size ||
-                      (mi_page_is_huge(page) && mi_page_queue_is_huge(queue)) ||
-                        (mi_page_is_in_full(page) && mi_page_queue_is_full(queue)));
-  mi_theap_t* theap = mi_page_theap(page);
-  MI_GATE_ASSERT_HELD(theap);   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2)
-  if (page->prev != NULL) page->prev->next = page->next;
-  if (page->next != NULL) page->next->prev = page->prev;
-  if (page == queue->last)  queue->last = page->prev;
-  if (page == queue->first) {
-    queue->first = page->next;
-    // update first
-    mi_assert_internal(mi_theap_contains_queue(theap, queue));
-    mi_theap_queue_first_update(theap,queue);
-  }
-  theap->page_count--;
-  queue->count--;
-  page->next = NULL;
-  page->prev = NULL;
-  mi_page_set_in_full(page,false);
-}
-
+#include "page-queue-remove.h"
 
 static void mi_page_queue_push(mi_theap_t* theap, mi_page_queue_t* queue, mi_page_t* page) {
   MI_GATE_ASSERT_HELD(theap);   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2)

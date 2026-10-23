@@ -518,7 +518,14 @@ int main(int argc, char** argv) {
   const int slots = atoi(argv[9]);
   if (slots < 1 || slots > MAX_SLOTS) { fprintf(stderr, "slots: 1..%d, got %s\n", MAX_SLOTS, argv[9]); return 2; }
   const long bound_ms = atol(argv[10]);
+#if defined(PERF_AB_LATENCY)
+  /* The replay emits only p99, recorded while workers run; every worker has drained before this
+     loop. Twice the release bound of sampling (2.6 s) per child was ~40% of a run's wall time. */
+  const long samples = 1;
+  (void)bound_ms;
+#else
   const long samples = 2 * bound_ms / RELEASE_SAMPLE_MS + 1;   /* RSS every RELEASE_SAMPLE_MS up to twice the bound */
+#endif
   long* rss_at = (long*)calloc((size_t)samples, sizeof(long));
   threads = atoi(argv[1]);
   generations = atoi(argv[2]);
@@ -602,7 +609,7 @@ int main(int argc, char** argv) {
   double owner_cpu = 0;
   for (int i = 0; i < threads; i++) owner_cpu += st[i].cpu;
 #if defined(PERF_AB_LATENCY)
-  /* The replay follows the same drain lifecycle, but emits only its latency. */
+  /* The replay skips the release-sampling window (see `samples`) and emits only its latency. */
   (void)elapsed; (void)rss_peak; (void)rss_short;
   printf("%llu\n", (unsigned long long)latency_percentile(st, threads));
 #elif defined(PERF_AB_DIAGNOSTIC)

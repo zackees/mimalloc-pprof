@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +133,11 @@ def run_main(
 
     monkeypatch.setattr(perf_ab, "build", build)
     monkeypatch.setattr(perf_ab, "run", run)
+
+    def run_measured(cmd: list[str], env: dict[str, str]) -> str:
+        return run(cmd, env=env)
+
+    monkeypatch.setattr(perf_ab, "run_measured", run_measured)
     monkeypatch.setattr(perf_ab, "run_stderr", run_stderr)
     monkeypatch.setattr(perf_ab, "cpu_model", lambda: "test CPU")
     summary = tmp_path / "summary.md"
@@ -714,6 +722,11 @@ def test_adaptive_reps_extend_only_the_inconclusive_rows(
 
     monkeypatch.setattr(perf_ab, "build", fake_build)
     monkeypatch.setattr(perf_ab, "run", noisy_run)
+
+    def run_measured(cmd: list[str], env: dict[str, str]) -> str:
+        return noisy_run(cmd, env=env)
+
+    monkeypatch.setattr(perf_ab, "run_measured", run_measured)
     monkeypatch.setattr(perf_ab, "cpu_model", lambda: "test CPU")
     summary = tmp_path / "summary.md"
     monkeypatch.setattr(
@@ -832,3 +845,30 @@ def test_sanity_failure_saves_all_partial_arms_without_claiming_completion(
     arms = data["samples"]["small/8 (control)"]
     assert set(arms) == {"base", "head", "null"}
     assert all(len(values) == 1 for values in arms.values())
+
+
+def test_budget_allows_only_a_step_that_fits() -> None:
+    assert perf_ab.budget_allows(100.0, 50.0, 0)  # no budget
+    assert perf_ab.budget_allows(4000.0, 800.0, 4800.0)
+    assert not perf_ab.budget_allows(4100.0, 800.0, 4800.0)
+
+
+def test_run_child_returns_output() -> None:
+    out, err = perf_ab.run_child(["sh", "-c", "echo 1 2; echo e >&2"], dict(os.environ))
+    assert out.split() == ["1", "2"] and err.strip() == "e"
+
+
+def test_run_child_failure_raises() -> None:
+    with pytest.raises(subprocess.CalledProcessError):
+        perf_ab.run_child(["sh", "-c", "exit 3"], dict(os.environ))
+
+
+def test_lockup_dumps_stacks_and_kills(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(perf_ab, "CHILD_TIMEOUT_S", 0.5)
+    started = time.monotonic()
+    with pytest.raises(perf_ab.ChildHung) as hung:
+        perf_ab.run_child(["sleep", "30"], dict(os.environ))
+    assert time.monotonic() - started < 25  # killed, not waited out
+    text = str(hung.value)
+    assert "lock-up" in text and "sleep 30" in text
+    assert "#0" in text or "thread " in text  # a gdb backtrace or the /proc fallback

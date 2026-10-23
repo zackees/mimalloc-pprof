@@ -29,6 +29,7 @@ ci/perf_ab.c); the text is appended to the table, one collapsed block per row an
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -39,6 +40,7 @@ import shutil
 import statistics
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -217,7 +219,98 @@ def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = No
 
 def run_stderr(cmd: list[str], env: dict[str, str]) -> str:
     """#529: a --holes-report child; its report is on stderr, its stdout line is not used."""
-    return subprocess.run(cmd, env=env, check=True, capture_output=True, text=True).stderr
+    return run_child(cmd, env)[1]
+
+
+# A measured child takes under 10 s (run 39897074404: 858 children, 5.4-9.8 s each). One that
+# outlives this is hung, not slow: dump its threads and fail, rather than let it silently eat
+# the job's 90 minutes and leave no evidence.
+CHILD_TIMEOUT_S = float(os.environ.get("PERF_AB_CHILD_TIMEOUT_S", "180"))
+STACK_DUMP_TIMEOUT_S = 60
+PR_SET_PTRACER = 0x59616D61  # Yama: let a non-ancestor (gdb) attach to this child
+PR_SET_PTRACER_ANY = -1
+
+
+class ChildHung(RuntimeError):
+    """A measured child outlived CHILD_TIMEOUT_S; the message carries its thread stacks."""
+
+
+def allow_ptrace() -> None:
+    """preexec_fn: under Yama ptrace_scope=1 only an ancestor may attach, and gdb is a sibling."""
+    try:
+        import ctypes
+
+        ctypes.CDLL(None, use_errno=True).prctl(
+            PR_SET_PTRACER, ctypes.c_ulong(PR_SET_PTRACER_ANY), 0, 0, 0
+        )
+    except (OSError, AttributeError):
+        pass  # no Yama or no libc prctl: gdb may still attach, else the /proc fallback reports
+
+
+def proc_stacks(pid: int) -> str:
+    """Fallback without gdb: each thread's state, wait channel and (if readable) kernel stack."""
+    out: list[str] = []
+    for task in sorted(Path(f"/proc/{pid}/task").glob("*")):
+        parts = [f"thread {task.name}"]
+        for name in ("comm", "wchan", "stack"):
+            with contextlib.suppress(OSError):
+                parts.append(f"{name}: {(task / name).read_text().strip()}")
+        with contextlib.suppress(OSError, IndexError):
+            parts.append(f"state: {(task / 'stat').read_text().split(')')[1].split()[0]}")
+        out.append("\n  ".join(parts))
+    return "\n".join(out) or f"(no /proc/{pid}/task)"
+
+
+def dump_stacks(pid: int) -> str:
+    """Every thread's user-space backtrace via gdb, or the /proc view when gdb cannot attach."""
+    gdb = shutil.which("gdb")
+    if gdb:
+        cmd = [gdb, "-nx", "-batch", "-p", str(pid), "-ex", "thread apply all bt"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=STACK_DUMP_TIMEOUT_S)
+            if "#0" in res.stdout:
+                return res.stdout
+            note = f"gdb could not attach (exit {res.returncode}): {res.stderr.strip()[-400:]}"
+        except subprocess.TimeoutExpired:
+            note = f"gdb did not finish within {STACK_DUMP_TIMEOUT_S} s"
+    else:
+        note = "gdb not installed"
+    return f"{note}\n{proc_stacks(pid)}"
+
+
+def run_child(cmd: list[str], env: dict[str, str]) -> tuple[str, str]:
+    """Run one measured child under the lock-up detector; returns (stdout, stderr)."""
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        preexec_fn=allow_ptrace,
+    )
+    try:
+        out, err = proc.communicate(timeout=CHILD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        stacks = dump_stacks(proc.pid)
+        proc.kill()
+        out, err = proc.communicate()
+        raise ChildHung(
+            f"lock-up: `{' '.join(cmd)}` still running after {CHILD_TIMEOUT_S:g} s "
+            f"(pid {proc.pid}); thread stacks:\n{stacks}\nchild stderr tail:\n{err[-2000:]}"
+        ) from None
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, out, err)
+    return out, err
+
+
+def run_measured(cmd: list[str], env: dict[str, str]) -> str:
+    """A timed or latency child's stdout, under the lock-up detector."""
+    return run_child(cmd, env)[0]
+
+
+def budget_allows(elapsed_s: float, step_s: float, budget_s: float) -> bool:
+    """--budget-minutes: start another adaptive step only if it ends inside the budget."""
+    return budget_s <= 0 or elapsed_s + step_s <= budget_s
 
 
 def holes_rows(reports: dict[tuple[str, str], str]) -> list[str]:
@@ -524,10 +617,12 @@ def parse_variants(head_env: str, head_cppdefs: str) -> list[Variant]:
 
 def measure(exe: Path, params: Params, env: dict[str, str], bound_ms: int) -> list[float]:
     """One child run: the METRICS, then the RSS floor; byte counts in MiB."""
-    values = list(map(float, run([str(exe), *map(str, params), str(bound_ms)], env=env).split()))
+    values = list(
+        map(float, run_measured([str(exe), *map(str, params), str(bound_ms)], env).split())
+    )
     latency = float(
-        run(
-            [str(exe.with_name("perf_ab_latency")), *map(str, params), str(bound_ms)], env=env
+        run_measured(
+            [str(exe.with_name("perf_ab_latency")), *map(str, params), str(bound_ms)], env
         ).strip()
     )
     if not math.isfinite(latency) or latency <= 0:
@@ -684,11 +779,12 @@ def artifact(
             "arms": ["base", *(v.arm for v in variants), *([NULL_ARM] if args.null_arm else [])],
         },
         "latency_protocol": {
-            "version": "sampled-stream-operation-v1",
+            "version": "sampled-stream-operation-v2",
             "percentile": 99,
             "replay": "separate executable; timing/RSS executable has no sampling",
             "operation": "free or replace, including page touches",
             "sampling": "power-of-two stride targeting at most 4096 samples per worker",
+            "drain": "replay exits after the drain; no release-bound RSS sampling window",
         },
         "reps": args.reps,
         "max_reps": args.max_reps,
@@ -769,11 +865,20 @@ def main() -> int:
         f"{SANITY_FACTOR}x base + {SANITY_SLACK_MIB:g} MiB (#573)",
     )
     parser.add_argument(
+        "--budget-minutes",
+        type=float,
+        default=0,
+        help="wall-clock budget for the whole run (0: none). --max-reps adds another step only "
+        "when its projected time fits, so the run finishes with complete, verdict-eligible data "
+        "instead of being killed by the job timeout with every row one rep short",
+    )
+    parser.add_argument(
         "--force-kind",
         choices=sorted(BUILDS),
         help="build every row with this BUILDS kind (e.g. fp: frame pointers for perf/callers, #573 A4)",
     )
     args = parser.parse_args()
+    started = time.monotonic()
     variants = parse_variants(args.head_env, args.head_cppdefs)
     workloads = select(args.workloads)
     if not workloads:
@@ -823,17 +928,32 @@ def main() -> int:
             if args.preserve_builds:
                 preserve_builds(exes, args.preserve_builds)
 
+            row_secs: dict[str, list[float]] = {w: [] for w in workloads}
+
             def run_rep(rep: int, rows: Iterable[str]) -> None:
                 for workload in rows:
                     kind, params = workloads[workload]
+                    t0 = time.monotonic()
                     for arm in arm_order(arms, rep):
                         env = {**os.environ, **BUILDS[kind][1], **env_of[arm]}
                         print(f"repetition {rep + 1}: {workload} [{arm}]", flush=True)
-                        samples[(workload, arm)].append(
-                            measure(exes[(arm, kind)], params, env, bound_ms)
-                        )
+                        try:
+                            sample = measure(exes[(arm, kind)], params, env, bound_ms)
+                        except ChildHung as hung:
+                            print(hung, flush=True)
+                            if args.json:
+                                partial = artifact(
+                                    args, variants, workloads, samples, bound_ms, cpu
+                                )
+                                partial.update(complete=False, failure=str(hung))
+                                save_artifact(args.json, partial)
+                            if args.summary:
+                                args.summary.write_text(f"```\n{hung}\n```\n")
+                            raise
+                        samples[(workload, arm)].append(sample)
                         if args.json and checkpoint is not None:
                             save_artifact(args.json, checkpoint)
+                    row_secs[workload].append(time.monotonic() - t0)
 
             for rep in range(args.reps):
                 run_rep(rep, workloads)
@@ -876,6 +996,19 @@ def main() -> int:
                     )
                 ]
                 if not pending:
+                    break
+                step = min(ADAPTIVE_STEP, args.max_reps - done)
+                step_s = step * sum(max(row_secs[w]) for w in pending)
+                elapsed = time.monotonic() - started
+                if not budget_allows(elapsed, step_s, args.budget_minutes * 60):
+                    print(
+                        f"budget: stopping at {done} reps; {len(pending)} row(s) still inconclusive, "
+                        f"another step needs ~{step_s:.0f} s after {elapsed:.0f} s of "
+                        f"{args.budget_minutes:g} min",
+                        flush=True,
+                    )
+                    if checkpoint is not None:
+                        checkpoint["stopped_by_budget"] = done
                     break
                 for rep in range(done, min(done + ADAPTIVE_STEP, args.max_reps)):
                     run_rep(rep, pending)

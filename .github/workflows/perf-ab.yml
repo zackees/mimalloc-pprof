@@ -124,7 +124,7 @@ jobs:
             fi
             python3 ci/perf_ab_build_report.py --base "$BASE_REF" --head "$HEAD_REF" --output perf-ab-build-report --summary "$GITHUB_STEP_SUMMARY"
           else
-            python3 ci/perf_ab.py --base "$BASE_REF" --head "$HEAD_REF" --reps "$REPS" --max-reps "$MAX_REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" $HOLES_REPORT $NO_SANITY_GATE $NULL_ARM --json perf-ab-samples.json --preserve-builds perf-ab-builds --summary "$GITHUB_STEP_SUMMARY"
+            python3 ci/perf_ab.py --base "$BASE_REF" --head "$HEAD_REF" --reps "$REPS" --max-reps "$MAX_REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" $HOLES_REPORT $NO_SANITY_GATE $NULL_ARM --budget-minutes 80 --json perf-ab-samples.json --preserve-builds perf-ab-builds --summary "$GITHUB_STEP_SUMMARY"
           fi
       - name: upload the build-only diagnostic
         if: always() && inputs.build_report_only

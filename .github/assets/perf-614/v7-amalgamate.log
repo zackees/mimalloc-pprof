@@ -1,0 +1,6 @@
+# t0=1792723536.595
+    0.33     Finished `dev` profile [unoptimized] target(s) in 0.31s
+    0.33      Running `/tmp/mimalloc-614-campaign/xtask-target/debug/xtask amalgamate-c`
+wrote /home/niteris/.clud/worktrees/mimalloc-pprof-wt-614/rust/mimalloc-pprof/vendor/mimalloc-pprof-amalgamated.c
+wrote /home/niteris/.clud/worktrees/mimalloc-pprof-wt-614/rust/mimalloc-pprof/vendor/mimalloc.h
+wrote /home/niteris/.clud/worktrees/mimalloc-pprof-wt-614/rust/mimalloc-pprof/vendor/mimalloc-stats.h

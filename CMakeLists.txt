@@ -1574,12 +1574,12 @@ if (MI_BUILD_TESTS)
       add_test(NAME test-reserved-page-reuse-off COMMAND mimalloc-test-purge-holes --serial-reserve-reuse)
       set_tests_properties(test-reserved-page-reuse-off PROPERTIES TIMEOUT 600
                            ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=0")
+      # #618: the #478 owner-side pacing case counts process-wide discards, so a background
+      # scavenger sweep during the measured thread's life polluted it. Fresh process, no scanner.
+      add_test(NAME test-new-thread-pacing COMMAND mimalloc-test-purge-holes --new-thread-pacing)
+      set_tests_properties(test-new-thread-pacing PROPERTIES TIMEOUT 600
+                           ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=1")
     endif()
-    # #618: the #478 owner-side pacing case counts process-wide discards, so a background
-    # scavenger sweep during the measured thread's life polluted it. Fresh process, no scanner.
-    add_test(NAME test-new-thread-pacing COMMAND mimalloc-test-purge-holes --new-thread-pacing)
-    set_tests_properties(test-new-thread-pacing PROPERTIES TIMEOUT 600
-                         ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=1")
 
     # test-purge-zero: imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 /
     # Bun parity P7b). The purge path may hand a recycled slice back as "reads zero";

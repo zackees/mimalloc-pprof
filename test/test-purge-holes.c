@@ -1884,57 +1884,61 @@ static bool test_owner_sweep_pacing(void) {
   bool ok_all = true;
   const long saved = mi_option_get(mi_option_purge_holes_min_interval);
 
-  // (a) baseline: an unpaced sweep, which stamps this thread's `holes_sweep_last`.
-  mi_option_set(mi_option_purge_holes_min_interval, 0);
-  if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
-  mi_on_thread_idle();
-  const mi_msecs_t stamped_at = _mi_clock_now();
+  // Scope the measurement locals so the early `goto done`s skip their initialisation as a
+  // whole: valid C++ too, where this file is built under MI_USE_CXX.
+  {
+    // (a) baseline: an unpaced sweep, which stamps this thread's `holes_sweep_last`.
+    mi_option_set(mi_option_purge_holes_min_interval, 0);
+    if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
+    mi_on_thread_idle();
+    const mi_msecs_t stamped_at = _mi_clock_now();
 
-  // (b) inside the window: a second `mi_on_thread_idle()` must not sweep at all.
-  mi_option_set(mi_option_purge_holes_min_interval, PACE_INTERVAL_MS);
-  if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
-  const int64_t before_in = pace_sweep_work();
-  mi_on_thread_idle();
-  const int64_t after_in = pace_sweep_work();
-  const mi_msecs_t elapsed = _mi_clock_now() - stamped_at;
-  if (elapsed >= PACE_INTERVAL_MS) {
-    // the churn itself outran the window (a very loaded box): the negative half is not
-    // decidable, say so rather than fail on the machine's timing
-    fprintf(stderr, "\n  SKIP in-window half: churn took %ldms, window is %dms\n",
-            (long)elapsed, PACE_INTERVAL_MS);
-  }
-  else if (after_in != before_in) {
-    fprintf(stderr, "\n  swept %ldms into a %dms window: sweep work %lld -> %lld\n",
-            (long)elapsed, PACE_INTERVAL_MS, (long long)before_in, (long long)after_in);
-    ok_all = false;
-  }
+    // (b) inside the window: a second `mi_on_thread_idle()` must not sweep at all.
+    mi_option_set(mi_option_purge_holes_min_interval, PACE_INTERVAL_MS);
+    if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
+    const int64_t before_in = pace_sweep_work();
+    mi_on_thread_idle();
+    const int64_t after_in = pace_sweep_work();
+    const mi_msecs_t elapsed = _mi_clock_now() - stamped_at;
+    if (elapsed >= PACE_INTERVAL_MS) {
+      // the churn itself outran the window (a very loaded box): the negative half is not
+      // decidable, say so rather than fail on the machine's timing
+      fprintf(stderr, "\n  SKIP in-window half: churn took %ldms, window is %dms\n",
+              (long)elapsed, PACE_INTERVAL_MS);
+    }
+    else if (after_in != before_in) {
+      fprintf(stderr, "\n  swept %ldms into a %dms window: sweep work %lld -> %lld\n",
+              (long)elapsed, PACE_INTERVAL_MS, (long long)before_in, (long long)after_in);
+      ok_all = false;
+    }
 
-  // (c) past the window: the very next `mi_on_thread_idle()` sweeps again. The deadline has
-  // to EXPIRE, not merely be disabled -- so wait it out rather than setting the option to 0.
-  #if MI_OWNER_GATE
-  // #366: in a gated build this thread is PARKED for the whole wait, so the scavenger sweeps it
-  // as soon as the window expires -- which re-stamps `holes_sweep_last`, and the owner's own
-  // `mi_on_thread_idle()` below then lands INSIDE a fresh window and (correctly) does nothing.
-  // The contract "a sweep happens past the window" still holds; count from before the wait.
-  const int64_t before_out = pace_sweep_work();
-  pace_sleep_ms(PACE_INTERVAL_MS + (PACE_INTERVAL_MS / 2));
-  if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
-  #else
-  pace_sleep_ms(PACE_INTERVAL_MS + (PACE_INTERVAL_MS / 2));
-  if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
-  const int64_t before_out = pace_sweep_work();
-  #endif
-  mi_on_thread_idle();
-  const int64_t after_out = pace_sweep_work();
-  if (purging_enabled && after_out <= before_out) {
-    fprintf(stderr, "\n  did not sweep %dms past a %dms window: sweep work %lld -> %lld\n",
-            PACE_INTERVAL_MS + (PACE_INTERVAL_MS / 2), PACE_INTERVAL_MS,
-            (long long)before_out, (long long)after_out);
-    ok_all = false;
+    // (c) past the window: the very next `mi_on_thread_idle()` sweeps again. The deadline has
+    // to EXPIRE, not merely be disabled -- so wait it out rather than setting the option to 0.
+    #if MI_OWNER_GATE
+    // #366: in a gated build this thread is PARKED for the whole wait, so the scavenger sweeps it
+    // as soon as the window expires -- which re-stamps `holes_sweep_last`, and the owner's own
+    // `mi_on_thread_idle()` below then lands INSIDE a fresh window and (correctly) does nothing.
+    // The contract "a sweep happens past the window" still holds; count from before the wait.
+    const int64_t before_out = pace_sweep_work();
+    pace_sleep_ms(PACE_INTERVAL_MS + (PACE_INTERVAL_MS / 2));
+    if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
+    #else
+    pace_sleep_ms(PACE_INTERVAL_MS + (PACE_INTERVAL_MS / 2));
+    if (!pace_churn(ptrs, N, SZ)) { ok_all = false; goto done; }
+    const int64_t before_out = pace_sweep_work();
+    #endif
+    mi_on_thread_idle();
+    const int64_t after_out = pace_sweep_work();
+    if (purging_enabled && after_out <= before_out) {
+      fprintf(stderr, "\n  did not sweep %dms past a %dms window: sweep work %lld -> %lld\n",
+              PACE_INTERVAL_MS + (PACE_INTERVAL_MS / 2), PACE_INTERVAL_MS,
+              (long long)before_out, (long long)after_out);
+      ok_all = false;
+    }
+    // with `purge_holes=0` there is no hole phase to count, so (c) has no observable -- the
+    // stamp still runs (see `_mi_purge_holes_of`), which is what keeps the scavenger's own
+    // pacing identical in the two builds.
   }
-  // with `purge_holes=0` there is no hole phase to count, so (c) has no observable -- the
-  // stamp still runs (see `_mi_purge_holes_of`), which is what keeps the scavenger's own
-  // pacing identical in the two builds.
 
 done:
   for (size_t i = 0; i < N; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
@@ -2239,8 +2243,21 @@ int main(int argc, char** argv) {
     CHECK("dead-thread-page-is-reused", test_dead_thread_page_is_reused());
     return print_test_summary();
   }
+  if (argc == 2 && strcmp(argv[1], "--new-thread-pacing") == 0) {
+    // #618: the case counts PROCESS-wide discards around thread C, so a background sweep
+    // of A's abandoned page during C's life was charged to C (reproduced under load on the
+    // frozen baseline too; 0 of 144 loaded runs failed with the scavenger off). #478 is about
+    // the OWNER's first tick, so measure it in its own process with no scanner started; the
+    // background release cases keep running with it enabled in the default invocation.
+    CHECK("new-thread-pacing-scavenger-disabled",
+          !mi_option_is_enabled(mi_option_scavenger) && !_mi_scavenger_is_running());
+    if (failed != 0) return print_test_summary();
+    purging_enabled = mi_option_is_enabled(mi_option_purge_holes);
+    CHECK("new-thread-does-not-sweep-at-once", test_new_thread_does_not_sweep_at_once());
+    return print_test_summary();
+  }
   if (argc != 1) {
-    fprintf(stderr, "usage: %s [--serial-reserve-reuse]\n", argv[0]);
+    fprintf(stderr, "usage: %s [--serial-reserve-reuse | --new-thread-pacing]\n", argv[0]);
     return EXIT_FAILURE;
   }
   purging_enabled = mi_option_is_enabled(mi_option_purge_holes);
@@ -2310,7 +2327,6 @@ int main(int argc, char** argv) {
   CHECK("sweep-does-not-unpurge-on-collect", test_sweep_no_unpurge_on_collect());
   CHECK("sweep-full-every-bounds-a-missed-hole", test_sweep_full_every());
   CHECK("owner-sweeps-are-paced", test_owner_sweep_pacing());
-  CHECK("new-thread-does-not-sweep-at-once", test_new_thread_does_not_sweep_at_once());
   #if !defined(_WIN32)
   CHECK("idle-thread-releases-large-page", test_idle_thread_releases_large_page());
   CHECK("reserved-page-is-released", test_reserved_page_is_released());

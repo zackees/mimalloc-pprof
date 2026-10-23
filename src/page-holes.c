@@ -551,6 +551,9 @@ static void mi_page_discard_slack(mi_page_t* page) {
   const size_t os_size = _mi_os_page_size();
   uint8_t* const pstart = mi_page_start(page);
   uint8_t* hi = mi_page_slice_start(page) + page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE;
+  #if MI_SECURE>=5
+  hi -= _mi_os_secure_guard_page_size();   // #618: the trailing guard page is PROT_NONE, never slack
+  #endif
   const size_t committed = mi_page_slice_committed(page);   // 0: the whole page is committed
   if (committed > 0 && hi > mi_page_slice_start(page) + committed) { hi = mi_page_slice_start(page) + committed; }   // never beyond what is committed
   const uintptr_t lo = _mi_align_up((uintptr_t)pstart + (size_t)page->reserved * mi_page_block_size(page), os_size);

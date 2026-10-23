@@ -37,6 +37,7 @@ static void mi_page_queue_remove_retired(mi_theap_t* theap, mi_page_queue_t* que
   // Selection proved a retired singleton in a normal large bin. Unpublication
   // has completed before this call; only the owner can change its queue/full bit.
   // The generic remover's full-bit clear is a redundant atomic RMW here.
+  MI_UNUSED(page);
   MI_GATE_ASSERT_HELD(theap);
   mi_assert_internal(mi_page_theap(page) == theap);
   mi_assert_internal(queue->first == page && queue->last == page && queue->count == 1);

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit d9dc4e1a of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2ec4d32e of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -25029,6 +25029,15 @@ static bool mi_page_queue_is_empty(mi_page_queue_t* queue) {
 }
 */
 
+/* ---- begin inlined: src/page-queue-remove.h ---- */
+/* Queue removal shared with its focused work-count test. Included after the
+   queue predicates and direct-cache updater in page-queue.c. */
+#ifndef MI_PAGE_QUEUE_REMOVE_H
+#define MI_PAGE_QUEUE_REMOVE_H
+#ifndef MI_PAGE_QUEUE_SET_IN_FULL
+#define MI_PAGE_QUEUE_SET_IN_FULL mi_page_set_in_full
+#endif
+
 static void mi_page_queue_remove(mi_page_queue_t* queue, mi_page_t* page) {
   mi_assert_internal(page != NULL);
   mi_assert_expensive(mi_page_queue_contains(queue, page));
@@ -25051,9 +25060,35 @@ static void mi_page_queue_remove(mi_page_queue_t* queue, mi_page_t* page) {
   queue->count--;
   page->next = NULL;
   page->prev = NULL;
-  mi_page_set_in_full(page,false);
+  MI_PAGE_QUEUE_SET_IN_FULL(page,false);
 }
 
+
+#if MI_LARGE_REPURPOSE
+static void mi_page_queue_remove_retired(mi_theap_t* theap, mi_page_queue_t* queue, mi_page_t* page) {
+  // Selection proved a retired singleton in a normal large bin. Unpublication
+  // has completed before this call; only the owner can change its queue/full bit.
+  // The generic remover's full-bit clear is a redundant atomic RMW here.
+  MI_GATE_ASSERT_HELD(theap);
+  mi_assert_internal(mi_page_theap(page) == theap);
+  mi_assert_internal(queue->first == page && queue->last == page && queue->count == 1);
+  mi_assert_internal(page->next == NULL && page->prev == NULL);
+  mi_assert_internal(queue->block_size > MI_MEDIUM_MAX_OBJ_SIZE &&
+                     queue->block_size <= MI_LARGE_MAX_OBJ_SIZE);
+  mi_assert_internal(queue->block_size == mi_page_block_size(page));
+  mi_assert_internal(page->retire_expire != 0 && page->used == 0);
+  mi_assert_internal(page->retired_slot == NULL && !mi_page_is_in_full(page));
+  mi_assert_internal(theap->page_count > 0);
+  queue->first = NULL;
+  queue->last = NULL;
+  queue->count = 0;
+  theap->page_count--;
+  // Null links, the already-clear full bit, full-size accounting and the
+  // direct small-page cache are unchanged, exactly as for generic removal.
+}
+#endif
+#endif
+/* ---- end inlined: src/page-queue-remove.h ---- */
 
 static void mi_page_queue_push(mi_theap_t* theap, mi_page_queue_t* queue, mi_page_t* page) {
   MI_GATE_ASSERT_HELD(theap);   // #366: owner-private leaf (docs/purge-all-implementation.md §5.2)
@@ -25782,7 +25817,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   mi_assert_internal(mi_page_all_free(page) && mi_page_is_owned(page) && !mi_page_is_abandoned(page));
   mi_assert_internal(mi_tf_block(mi_atomic_load_relaxed(&page->xthread_free)) == NULL);
   mi_assert_internal(mi_page_theap(page) == theap);
-  mi_page_queue_remove(best_pq, page);
+  mi_page_queue_remove_retired(theap, best_pq, page);
   mi_theap_stat_decrease(theap, page_bins[_mi_page_stats_bin(page)], 1);
   page->retire_expire = 0;
   page->retired_at = 0;

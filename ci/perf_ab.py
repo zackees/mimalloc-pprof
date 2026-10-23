@@ -400,6 +400,15 @@ SANITY_FACTOR = 1.5
 SANITY_SLACK_MIB = 8.0
 
 
+def sanity_reference(base: list[float], null: list[float] | None) -> list[float]:
+    """The first-repetition sample head is screened against (#620).
+
+    With a null arm, base's own spread is measured: take the worse of the two base runs per
+    metric, so a bimodal base sample cannot abort a campaign the null arm reproduces.
+    """
+    return base if null is None else [max(b, n) for b, n in zip(base, null)]
+
+
 def sanity_failures(
     first: dict[tuple[str, str], list[float]],
     workloads: Iterable[str],
@@ -959,8 +968,15 @@ def main() -> int:
                 run_rep(rep, workloads)
                 if rep == 0 and not args.no_sanity_gate:
                     broken: list[str] = []
+                    reference = {
+                        w: sanity_reference(
+                            samples[(w, "base")][0],
+                            samples[(w, NULL_ARM)][0] if args.null_arm else None,
+                        )
+                        for w in workloads
+                    }
                     for arm in head_arms:
-                        first = {(w, "base"): samples[(w, "base")][0] for w in workloads}
+                        first = {(w, "base"): reference[w] for w in workloads}
                         first |= {(w, "head"): samples[(w, arm)][0] for w in workloads}
                         broken += [f"[{arm}] {m}" for m in sanity_failures(first, workloads)]
                     if broken:  # fail in minutes, not after the whole run (#573)

@@ -373,6 +373,19 @@ def test_sanity_gate_ignores_cpu_and_throughput() -> None:
     assert perf_ab.sanity_failures(_first(base, head), ["row"]) == []
 
 
+def test_sanity_gate_reference_absorbs_null_arm_spread() -> None:
+    # #620: run 39896572843 -- base 48.3, head 208.5, null (same base binary) 208.0 MiB
+    drain = "RSS_0.5_s_after_drain_MiB"
+    base = _metrics(**{drain: 48.3})
+    head = _metrics(**{drain: 208.5})
+    null = _metrics(**{drain: 208.0})
+    assert perf_ab.sanity_failures(_first(base, head), ["row"])
+    reference = perf_ab.sanity_reference(base, null)
+    assert perf_ab.sanity_failures(_first(reference, head), ["row"]) == []
+    # without a null arm the reference is base itself, so the gate keeps its teeth
+    assert perf_ab.sanity_reference(base, None) is base
+
+
 def test_replay_build_counts_events_and_prints_them() -> None:
     # #573 A1: the untimed replay carries MI_STAT=1 and asks for the statistics at exit
     assert "MI_STAT=1" in perf_ab.KIND_CPPDEFS[perf_ab.HOLES_KIND]

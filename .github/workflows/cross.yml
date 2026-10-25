@@ -36,7 +36,7 @@ jobs:
     outputs:
       sha: ${{ steps.identity.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
           fetch-depth: 0
@@ -103,7 +103,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
@@ -162,7 +162,7 @@ jobs:
             ls -1 "dist/$TARGET" || echo "  (none)"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-bins-${{ matrix.target }}
           path: rust/dist/${{ matrix.target }}
@@ -186,7 +186,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
@@ -308,7 +308,7 @@ jobs:
             ls -1 "dist/$TARGET" || echo "  (none)"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-bins-${{ matrix.target }}
           path: rust/dist/${{ matrix.target }}
@@ -330,7 +330,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
@@ -362,7 +362,7 @@ jobs:
           $dist = Join-Path $PWD 'dist/x86_64-pc-windows-gnu'
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           $bins | ForEach-Object { Copy-Item $_ -Destination $dist }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-bins-x86_64-pc-windows-gnu
           path: rust/dist/x86_64-pc-windows-gnu
@@ -416,7 +416,7 @@ jobs:
             runner: windows-latest
             pprof: true
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: test-bins-${{ matrix.target }}
           path: dist/${{ matrix.target }}
@@ -436,7 +436,7 @@ jobs:
             & $_.FullName --test-threads=4
             if ($LASTEXITCODE -ne 0) { throw "test failed: $($_.Name)" }
           }
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: matrix.pprof
         with:
           go-version: stable

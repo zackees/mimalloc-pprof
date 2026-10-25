@@ -36,7 +36,7 @@ jobs:
       RUN_LOCAL_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
       OUTPUT_DIR: ${{ github.workspace }}/.large-span-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0
@@ -149,7 +149,7 @@ jobs:
             --output "$OUTPUT_DIR/large-span-scaling-refs.json"
       - name: upload raw diagnostic artifacts
         if: always()
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: large-span-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
           overwrite: true

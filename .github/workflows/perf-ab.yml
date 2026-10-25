@@ -89,7 +89,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Use this workflow revision's harness even when measuring an older
           # allocator. Historical perf_ab.py versions may not accept today's flags.
@@ -128,7 +128,7 @@ jobs:
           fi
       - name: upload the build-only diagnostic
         if: always() && inputs.build_report_only
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: perf-ab-build-report
           path: perf-ab-build-report
@@ -136,7 +136,7 @@ jobs:
           retention-days: 30
       - name: upload the measured executables
         if: always()
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: perf-ab-builds
           path: perf-ab-builds
@@ -146,7 +146,7 @@ jobs:
       # re-judge them, and runs on the same CPU model can be pooled
       - name: upload the samples
         if: always()
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: perf-ab-samples
           path: perf-ab-samples.json

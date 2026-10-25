@@ -45,7 +45,7 @@ jobs:
   ab:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: cmake -B build -DMI_PPROF=ON -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build --config Release
       # Correctness first: every byte of every mi_zalloc must read zero, with the
@@ -67,7 +67,7 @@ jobs:
             MIMALLOC_PURGE_ZEROES=1 "$exe"
           done | tee ab.jsonl
           python3 ci/zero_tracking_report.py ab.jsonl
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zero-tracking-ubuntu-latest
           path: ab.jsonl

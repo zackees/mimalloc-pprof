@@ -32,7 +32,7 @@ jobs:
       trusted: ${{ steps.gate.outputs.trusted }}
       skip_lint: ${{ steps.gate.outputs.skip_lint }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
@@ -57,8 +57,8 @@ jobs:
     if: needs.ci-mode.outputs.skip_lint != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       # check_usdt_probes.py --require compiles src/static.c against <sys/sdt.h>.
       - name: Install USDT probe headers
         run: sudo apt-get install -y --no-install-recommends systemtap-sdt-dev binutils

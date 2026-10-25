@@ -90,7 +90,7 @@ jobs:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # MI_TRACK_ASAN silently turns itself OFF if sanitizer/asan_interface.h is
       # missing, which would leave this job green while sanitizing nothing. Fail
@@ -162,7 +162,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # verify_local SKIPS the tsan config without clang: a skipped sanitizer is a green job that
       # sanitized nothing, so fail here instead.
       - name: clang is present

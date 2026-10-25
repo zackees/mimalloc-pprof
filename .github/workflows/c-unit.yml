@@ -70,7 +70,7 @@ jobs:
     outputs:
       sha: ${{ steps.identity.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
           fetch-depth: 0
@@ -127,7 +127,7 @@ jobs:
     outputs:
       run: ${{ steps.decide.outputs.run }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
           fetch-depth: 0
@@ -150,10 +150,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Configure -- the `release` build row's flags, which the baseline was recorded from
         run: |
           set -euo pipefail
@@ -180,7 +180,7 @@ jobs:
           fi
           exit $rc
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: memory-gate-minimal-lane
           path: result-*.json
@@ -391,10 +391,10 @@ jobs:
       - name: Install build dependencies (alpine only)
         if: matrix.container != ''
         run: apk add --no-cache build-base cmake ninja python3 git tar
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         if: matrix.container == ''
       - name: Configure
         shell: sh
@@ -457,7 +457,7 @@ jobs:
         run: tar -C bundle -czf ${{ matrix.config }}.tar.gz .
       - name: Upload the bundle
         if: matrix.kind == 'bundle' || matrix.kind == 'control'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: c-unit-bundle-${{ matrix.config }}
           path: |
@@ -467,7 +467,7 @@ jobs:
           retention-days: 1
       - name: Upload the library
         if: matrix.kind == 'lib'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: c-unit-lib-${{ matrix.config }}
           path: |
@@ -503,15 +503,15 @@ jobs:
       - name: Install build dependencies (alpine only)
         if: matrix.container != ''
         run: apk add --no-cache build-base git python3
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         if: matrix.container == ''
       - name: Compile the probe's objects with Bun's exact define set
         shell: sh
         run: ${{ matrix.python }} ci/check_bun_surface.py --emit-objects bun-objects ${{ matrix.args }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: c-unit-bun-objects-${{ matrix.name }}
           path: bun-objects
@@ -539,10 +539,10 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       # -DMI_DHAT=ON: DHAT is opt-in (default OFF since 2026-09-18), so the main `cl` tree
       # builds it in to keep test-dhat running under Microsoft's compiler; the owner-gate
       # tree below stays at the default, so `cl` compiles both the ON and OFF shapes.
@@ -608,7 +608,7 @@ jobs:
           set -euo pipefail
           tar -C bundle -czf windows-native.tar.gz .
           tar -C bundle-gated -czf windows-native-gated.tar.gz .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: c-unit-bundle-windows-native
           path: |
@@ -627,19 +627,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: astral-sh/setup-uv@v3
-      - uses: actions/download-artifact@v4
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: c-unit-bundle-*
           path: artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: c-unit-lib-*
           path: libs
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: c-unit-bun-objects-*
           path: bun-objects
@@ -795,7 +795,7 @@ jobs:
       # The coverage job needs this half's JUnit; `if: always()` so a red wave still
       # uploads what it managed to run.
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: c-unit-results-parallel
           path: |
@@ -815,11 +815,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: astral-sh/setup-uv@v3
-      - uses: actions/download-artifact@v4
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: c-unit-bundle-*
           path: artifacts
@@ -859,7 +859,7 @@ jobs:
               --jobs 1 --select serial --junit-dir results
           '
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: c-unit-results-serial
           path: results
@@ -883,19 +883,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: astral-sh/setup-uv@v3
-      - uses: actions/download-artifact@v4
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: c-unit-bundle-*
           path: artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: c-unit-results-parallel
           path: parallel
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: c-unit-results-serial
           path: serial
@@ -954,11 +954,11 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: astral-sh/setup-uv@v3
-      - uses: actions/download-artifact@v4
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: c-unit-bundle-windows-native
           path: artifacts
@@ -986,7 +986,7 @@ jobs:
             --names "ctest --show-only" executed \
             --summary "$GITHUB_STEP_SUMMARY"
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: c-unit-windows-native-results
           path: results
@@ -1006,12 +1006,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
           # the base revision must be reachable for the worktree the script builds
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Normaliser and slicer self-test
         run: uv run ci/check_fastpath_identity.py --selftest
       - name: Default build byte-identical to the base; gated build differs
@@ -1033,10 +1033,10 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Disassembly parser selftest
         run: uv run ci/check_isa_baseline.py --selftest
       - name: Portable build must contain no above-baseline instructions

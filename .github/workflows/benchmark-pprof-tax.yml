@@ -60,7 +60,7 @@ jobs:
       mode: ${{ inputs.mode || 'full' }}
       prior_branch_sha: ${{ steps.prior.outputs.prior_sha }}
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # Fail before any build if the lockfile setup-soldr's yank audit reads is
@@ -139,6 +139,7 @@ jobs:
           DIGEST=$(sha256sum "$RUNNER_TEMP/pprof-tax-output-${{ github.run_id }}/pprof-tax-raw-run.json" | awk '{print $1}')
           echo "sha256=$DIGEST" >> "$GITHUB_OUTPUT"
       - name: validate and overlay complete pprof-tax report
+        id: validate
         if: (inputs.mode || 'full') == 'full'
         run: |
           set -euxo pipefail
@@ -184,7 +185,7 @@ jobs:
           echo "publish_eligible=$ELIGIBLE" >> "$GITHUB_OUTPUT"
       - name: upload raw pprof-tax artifact
         if: always()
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-pprof-tax-raw-${{ github.run_id }}
           overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
@@ -193,8 +194,10 @@ jobs:
           retention-days: 30
           if-no-files-found: error
       - name: upload validation artifact
-        if: (inputs.mode || 'full') == 'full' && always()
-        uses: actions/upload-artifact@v4.6.2
+        # Only when validation ran: a matrix failure skips it, and uploading the
+        # report it never wrote buried the real error under a second one.
+        if: (inputs.mode || 'full') == 'full' && always() && steps.validate.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-pprof-tax-validation-${{ github.run_id }}
           overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
@@ -205,7 +208,7 @@ jobs:
           if-no-files-found: error
       - name: upload site artifact
         if: (inputs.mode || 'full') == 'full' && success()
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-pprof-tax-site-${{ github.run_id }}
           overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
@@ -222,14 +225,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-pprof-tax-site-${{ github.run_id }}
           path: audit/site/
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-pprof-tax-validation-${{ github.run_id }}
           path: audit/validation/
@@ -247,10 +250,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-pprof-tax-site-${{ github.run_id }}
           path: site-temp/
@@ -285,11 +288,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-pprof-tax-site-${{ github.run_id }}
           path: _site/
-      - uses: actions/upload-pages-artifact@v4.0.0
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: _site/
           include-hidden-files: true
@@ -308,7 +311,7 @@ jobs:
     outputs:
       page_url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/deploy-pages@v4.0.5
+      - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
         id: deployment
 
   publication-audit:
@@ -319,10 +322,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-pprof-tax-site-${{ github.run_id }}
           path: audit/site/

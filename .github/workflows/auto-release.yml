@@ -106,7 +106,7 @@ jobs:
       contents: read
       issues: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0
@@ -131,7 +131,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_sha }}
       - name: Verify package checkout is the release candidate
@@ -183,7 +183,7 @@ jobs:
           cp "$crate" dist/crate/
 
       - name: Upload exact packaged crate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-crate-${{ inputs.candidate_sha }}
           path: rust/dist/crate/*.crate
@@ -205,7 +205,7 @@ jobs:
           cp "$RUNNER_TEMP/mimalloc-pprof-c.zip" dist/
 
       - name: Upload release ZIP artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mimalloc-pprof-c-zip
           path: rust/dist/mimalloc-pprof-c.zip
@@ -240,7 +240,7 @@ jobs:
             triple: x86_64-pc-windows-msvc
             archive: zip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_sha }}
       - name: Verify binary checkout is the release candidate
@@ -248,7 +248,7 @@ jobs:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: |
           [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" || { echo '::error::binary checkout differs from candidate_sha'; exit 1; }
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - uses: zackees/setup-soldr@v0
         with:
           version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
@@ -258,7 +258,7 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
       - name: Cache the prepared ${{ matrix.triple }} toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           # Deliberately the same path and key macos-bundles.yml / windows-bundles.yml use,
           # so a release run hits the cache those workflows already warmed on this commit.
@@ -325,7 +325,7 @@ jobs:
             *) uv run ci/bundle_tests.py build release-test-bundle ;;
           esac
           tar -C release-test-bundle -czf release-test-bundle.tar.gz .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-test-bundle-${{ matrix.asset }}
           path: release-test-bundle.tar.gz
@@ -472,7 +472,7 @@ jobs:
             (cd stage && zip -r "$GITHUB_WORKSPACE/dist/${name}.zip" .)
           fi
           ls -l dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-binaries-${{ matrix.asset }}
           path: dist/*
@@ -502,17 +502,17 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_sha }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-binaries-${{ matrix.asset }}
           path: dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-test-bundle-${{ matrix.asset }}
           path: test-input
@@ -551,14 +551,14 @@ jobs:
       actions: read
       issues: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_sha }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: mimalloc-pprof-c-zip
           path: dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: release-binaries-*
           merge-multiple: true
@@ -589,7 +589,7 @@ jobs:
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: python3 ci/release.py preflight-artifacts --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" --dist dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-preflight-${{ inputs.candidate_sha }}
           path: dist/
@@ -608,7 +608,7 @@ jobs:
       id-token: write
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0 # origin/main is needed to prove a real candidate was merged
@@ -702,12 +702,12 @@ jobs:
           build-cache-mode: full
 
       - name: Download archives already tested on native hosts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-preflight-${{ inputs.candidate_sha }}
           path: dist
       - name: Download exact packaged crate
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-crate-${{ inputs.candidate_sha }}
           path: release-crate
@@ -785,14 +785,14 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_sha }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - name: Download exact worker preflight archive and info.json
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-preflight-${{ inputs.candidate_sha }}
           path: dist
@@ -842,7 +842,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_sha }}
       - name: Append run URL and outcome to the release control issue

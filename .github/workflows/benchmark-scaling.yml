@@ -95,7 +95,7 @@ jobs:
     outputs:
       run_seed: ${{ steps.seed.outputs.seed }}
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: validate dispatch inputs
@@ -127,7 +127,7 @@ jobs:
       # reference allocators (TCMalloc alone is a Bazel build of many minutes). The references
       # depend only on their pins, patches and the builder; the fork tree on its own sources too.
       - name: cache reference allocator trees
-        uses: actions/cache@v4.2.4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             rust/target/release/archives
@@ -141,7 +141,7 @@ jobs:
             rust/target/release/sources/bun-mimalloc
           key: benchmark-references-${{ runner.os }}-${{ hashFiles('rust/benchmark-suite/allocators/allocator-lock.json', 'rust/benchmark-suite/allocators/patches/**', 'ci/build_benchmark_allocators.py') }}
       - name: cache fork allocator tree
-        uses: actions/cache@v4.2.4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: rust/target/release/build/mimalloc-pprof
           # #528: a diagnostic build with extra defines never shares a tree with a default
@@ -176,7 +176,7 @@ jobs:
           echo "seed=$SEED" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$SEED" > rust/target/release/scaling-run-seed.txt
       - name: upload scaling build
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-scaling-build-${{ github.run_id }}
           overwrite: true
@@ -200,7 +200,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-scaling-build-${{ github.run_id }}
           path: rust/target/release/
@@ -240,7 +240,7 @@ jobs:
           done
       - name: upload raw scaling shard
         if: always()
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-scaling-shards-${{ github.run_id }}
           overwrite: true
@@ -260,16 +260,16 @@ jobs:
       mode: ${{ inputs.mode || 'full' }}
       prior_branch_sha: ${{ steps.prior.outputs.prior_sha }}
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-scaling-build-${{ github.run_id }}
           path: rust/target/release/
       - name: restore executable modes
         run: chmod +x rust/target/release/benchmark-scaling-merge rust/target/release/benchmark-scaling-validate
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-scaling-shards-${{ github.run_id }}
           path: scaling-shards/
@@ -346,7 +346,7 @@ jobs:
           echo "publish_eligible=$ELIGIBLE" >> "$GITHUB_OUTPUT"
       - name: upload merged raw scaling artifact
         if: always()
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-scaling-raw-${{ github.run_id }}
           overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
@@ -356,7 +356,7 @@ jobs:
           if-no-files-found: error
       - name: upload validation artifact
         if: (inputs.mode || 'full') == 'full' && always()
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-scaling-validation-${{ github.run_id }}
           overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
@@ -367,7 +367,7 @@ jobs:
           if-no-files-found: error
       - name: upload site artifact
         if: (inputs.mode || 'full') == 'full' && success()
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-scaling-site-${{ github.run_id }}
           overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
@@ -384,14 +384,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-scaling-site-${{ github.run_id }}
           path: audit/site/
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-scaling-validation-${{ github.run_id }}
           path: audit/validation/
@@ -409,10 +409,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-scaling-site-${{ github.run_id }}
           path: site-temp/
@@ -447,11 +447,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-scaling-site-${{ github.run_id }}
           path: _site/
-      - uses: actions/upload-pages-artifact@v4.0.0
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: _site/
           include-hidden-files: true
@@ -470,7 +470,7 @@ jobs:
     outputs:
       page_url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/deploy-pages@v4.0.5
+      - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
         id: deployment
 
   publication-audit:
@@ -481,10 +481,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: benchmark-scaling-site-${{ github.run_id }}
           path: audit/site/
@@ -532,7 +532,7 @@ jobs:
       issues: write
       actions: read
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: open or update the failure issue

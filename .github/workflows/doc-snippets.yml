@@ -32,7 +32,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # ubuntu-latest ships both gcc and clang already; nothing to install.
       - name: Positive control (must catch a deliberately broken snippet)
         run: python3 ci/check_doc_snippets.py --self-test

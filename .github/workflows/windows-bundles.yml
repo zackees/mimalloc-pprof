@@ -93,7 +93,7 @@ jobs:
     outputs:
       sha: ${{ steps.identity.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
           fetch-depth: 0
@@ -176,10 +176,10 @@ jobs:
             # the memory gate today -- see the coverage table in docs/ci-gates.md.
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - uses: zackees/setup-soldr@v0
         with:
           # Save caches fully under act (local bosn runs are pull_request events); setup-soldr#537 makes this the default. Remove then.
@@ -191,7 +191,7 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
       - name: Cache the prepared MinGW toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/soldr-x86_64-pc-windows-gnu.tar.zst
           key: soldr-prepare-x86_64-pc-windows-gnu-${{ hashFiles('rust/rust-toolchain.toml') }}
@@ -326,7 +326,7 @@ jobs:
         # (Nothing in a Windows bundle is a symlink, but keeping the two lanes identical
         # means one unpack step on the runner rather than two.)
         run: tar -C bundle -czf "${{ matrix.bundle }}.tar.gz" .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bundle-${{ matrix.bundle }}
           path: ${{ matrix.bundle }}.tar.gz
@@ -346,7 +346,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
@@ -398,7 +398,7 @@ jobs:
               exit 1
             fi
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rust-test-bins-x86_64-pc-windows-gnu
           path: rust/dist/x86_64-pc-windows-gnu
@@ -474,10 +474,10 @@ jobs:
             # it cannot be an entry in another bundle's manifest.
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - uses: zackees/setup-soldr@v0
         with:
           save-cache: ${{ env.ACT && 'true' || 'auto' }}
@@ -487,7 +487,7 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
       - name: Cache the prepared MSVC toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           # The xwin CRT/SDK splat is the expensive part of this lane: `soldr prepare`
           # downloads and materialises it from Microsoft on a cold runner.
@@ -673,7 +673,7 @@ jobs:
       - name: Pack the bundle
         # tar, not a plain artifact upload: upload-artifact@v4 drops the executable bit.
         run: tar -C bundle -czf "${{ matrix.bundle }}.tar.gz" .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bundle-${{ matrix.bundle }}
           path: ${{ matrix.bundle }}.tar.gz
@@ -719,7 +719,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
@@ -925,13 +925,13 @@ jobs:
           cargo build -p dashboard --release --target x86_64-pc-windows-msvc
           mkdir -p dist/sentinel-x86_64-pc-windows-msvc
           cp target/x86_64-pc-windows-msvc/release/dashboard.exe dist/sentinel-x86_64-pc-windows-msvc/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rust-test-bins-x86_64-pc-windows-msvc
           path: rust/dist/msvc-tests
           if-no-files-found: error
           retention-days: 7
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rust-sentinel-x86_64-pc-windows-msvc
           path: rust/dist/sentinel-x86_64-pc-windows-msvc
@@ -953,25 +953,25 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       # `windows-latest` ships a Python, but every ci/ script in this repo is run through
       # uv everywhere else and the two must not drift.
-      - uses: astral-sh/setup-uv@v3
-      - uses: actions/download-artifact@v4
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: bundle-windows-*
           path: artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: rust-test-bins-x86_64-pc-windows-gnu
           path: rust-bins
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: rust-test-bins-x86_64-pc-windows-msvc
           path: rust-bins-msvc
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: rust-sentinel-x86_64-pc-windows-msvc
           path: rust-sentinel-msvc
@@ -1117,7 +1117,7 @@ jobs:
             "$test_binary" --test-threads=4
             echo "::endgroup::"
           done
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
       - name: Install pprof
@@ -1233,7 +1233,7 @@ jobs:
               ;;
           esac
       - if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: memory-gate-windows-gnu-x64-soldr
           # The leak runs too: they are what a reader needs to see why the control did or
@@ -1525,7 +1525,7 @@ jobs:
               ;;
           esac
       - if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: memory-gate-windows-msvc-x64-soldr
           # The leak runs too: they are what a reader needs to see why the control did or
@@ -1567,7 +1567,7 @@ jobs:
           ls -l benchmark-report.html benchmark-report.json
       - if: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'benchmark') && !cancelled() }}
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-report-windows-msvc-soldr
           path: |
@@ -1636,13 +1636,13 @@ jobs:
             MIMALLOC_PURGE_ZEROES=1 "$exe"
           done | tee ab.jsonl
           uv run ci/zero_tracking_report.py ab.jsonl | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() && steps.zt_scope.outputs.run == 'true' }}
         with:
           name: zero-tracking-windows-msvc-x64
           path: ab.jsonl
 
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         if: ${{ !cancelled() }}
         with:
           msystem: MINGW64
@@ -1874,7 +1874,7 @@ jobs:
             exit 1
           fi
       - if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-bundle-results
           path: |

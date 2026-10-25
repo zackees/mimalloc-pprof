@@ -98,7 +98,7 @@ jobs:
           fi
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::candidate_sha must be a complete lowercase 40-hex SHA'; exit 1; }
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.candidate.outputs.sha }}
       - name: Verify checked-out candidate identity
@@ -199,7 +199,7 @@ jobs:
       - name: Report minimal-mode skip
         if: env.RUN_MACOS_BUILD != 'true'
         run: echo '${{ matrix.bundle }} is reserved for selective macOS or ci-full validation.' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: env.RUN_MACOS_BUILD == 'true'
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
@@ -216,7 +216,7 @@ jobs:
           target-dir: rust/target
       - name: Cache the prepared Darwin toolchain
         if: env.RUN_MACOS_BUILD == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/soldr-${{ matrix.triple }}.tar.zst
           key: soldr-prepare-${{ matrix.triple }}-${{ hashFiles('rust/rust-toolchain.toml') }}
@@ -373,7 +373,7 @@ jobs:
         # and does not preserve symlinks, and this bundle needs both (every test exe, and
         # the libmimalloc.dylib -> libmimalloc.3.dylib SONAME chain).
         run: tar -C bundle -czf "${{ matrix.bundle }}.tar.gz" .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: env.RUN_MACOS_BUILD == 'true'
         with:
           name: bundle-${{ matrix.bundle }}
@@ -399,7 +399,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
@@ -493,7 +493,7 @@ jobs:
             ls -1 "dist/$TARGET" || echo "  (none)"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rust-test-bins-${{ matrix.target }}
           path: rust/dist/${{ matrix.target }}
@@ -545,7 +545,7 @@ jobs:
       run: ${{ steps.decide.outputs.run || steps.no-pr.outputs.run }}
       reason: ${{ steps.decide.outputs.reason }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
@@ -572,10 +572,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: bundle-macos-x64-*
           path: artifacts
@@ -638,14 +638,14 @@ jobs:
           test -f "$C/sel-debug-full.xml" || { echo "::error::debug-full JUnit missing"; exit 1; }
           python3 ci/recovery_expected_failures.py "$C/sel-release.xml" "$C/sel-debug-full.xml"
       - if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-selective-results
           path: ${{ steps.macos.outputs.workdir }}/collected/
           if-no-files-found: warn
           retention-days: 7
       - if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-selective-guest-screens
           path: ${{ steps.macos.outputs.workdir }}/results/*.ppm
@@ -673,17 +673,17 @@ jobs:
             runner: macos-15-intel
             triple: x86_64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: bundle-macos-${{ matrix.arch }}-*
           path: artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: rust-test-bins-${{ matrix.triple }}
           path: rust-bins
@@ -742,7 +742,7 @@ jobs:
             "$bin" --test-threads=4
           done
       - if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-native-${{ matrix.arch }}-results
           path: results/
@@ -760,19 +760,19 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: bundle-macos-x64-*
           path: artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: bundle-macos-arm64-*
           path: arm64-artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: rust-test-bins-x86_64-apple-darwin
           path: rust-bins
@@ -921,14 +921,14 @@ jobs:
           esac
 
       - if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-bundle-results
           path: ${{ steps.macos.outputs.workdir }}/collected/
           if-no-files-found: warn
           retention-days: 7
       - if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-guest-screens
           path: ${{ steps.macos.outputs.workdir }}/results/*.ppm

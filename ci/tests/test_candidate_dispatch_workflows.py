@@ -39,7 +39,7 @@ def test_full_dispatch_checks_out_one_merged_sha_and_preserves_pr_merge_checkout
                 needs = [needs]
             assert "resolve-candidate" in needs, (workflow_name, job_name)
             for step in job.get("steps", []):
-                if step.get("uses") == "actions/checkout@v4":
+                if step.get("uses", "").startswith("actions/checkout@"):
                     assert step["with"]["ref"] == VERIFIED_SHA, (workflow_name, job_name)
 
 
@@ -55,7 +55,7 @@ def test_macos_pr_uses_merge_sha_for_workflow_tools_and_bundles() -> None:
     # Native full execution calls --exclude, added after older fork heads were cut.
     # Checking out the fork head would pair the new workflow with an old runner CLI.
     native = workflow["jobs"]["run-macos-native-full"]
-    checkouts = [step for step in native["steps"] if step.get("uses") == "actions/checkout@v4"]
+    checkouts = [step for step in native["steps"] if step.get("uses", "").startswith("actions/checkout@")]
     assert len(checkouts) == 1
     assert checkouts[0]["with"]["ref"] == VERIFIED_SHA
     assert "--exclude test-osx-zone-introspect-remote" in next(

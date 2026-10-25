@@ -41,10 +41,7 @@ env:
 jobs:
   build-and-measure:
     runs-on: ubuntu-24.04
-    # Measured: the suite step grew 43m (08-30) -> 49m (09-04) -> >53m with the Bun
-    # row (09-20), plus ~7m of builds; 60 cut every run off. Override with the repo
-    # variable BENCHMARK_MEMORY_TIMEOUT_MINUTES.
-    timeout-minutes: ${{ fromJSON(vars.BENCHMARK_MEMORY_TIMEOUT_MINUTES || '90') }}
+    timeout-minutes: 60
     permissions:
       contents: read
     outputs:

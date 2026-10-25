@@ -87,7 +87,8 @@ pub const PPROF_TAX_COMPILED_CONFIGURATION_IDS: [&str; 4] = [
 
 /// CMake cache keys that must be identical (or allowlisted-different) across
 /// every compiled configuration for the comparison to mean anything. Sorted.
-pub const PPROF_TAX_EQUIVALENCE_CACHE_KEYS: [&str; 20] = [
+/// Must equal EQUIVALENCE_CACHE_KEYS in ci/build_pprof_tax_configurations.py.
+pub const PPROF_TAX_EQUIVALENCE_CACHE_KEYS: [&str; 22] = [
     "CMAKE_AR",
     "CMAKE_BUILD_TYPE",
     "CMAKE_C_COMPILER",
@@ -101,6 +102,8 @@ pub const PPROF_TAX_EQUIVALENCE_CACHE_KEYS: [&str; 20] = [
     "MI_BUILD_TESTS",
     "MI_DEBUG_FULL",
     "MI_DHAT",
+    "MI_DIAGNOSTICS",
+    "MI_MEMEVT",
     "MI_OPT_ARCH",
     "MI_OPT_SIMD",
     "MI_OVERRIDE",
@@ -113,7 +116,8 @@ pub const PPROF_TAX_EQUIVALENCE_CACHE_KEYS: [&str; 20] = [
 /// Cache keys that exist only on the fork's CMakeLists.txt. Upstream must
 /// report these as `null`, never as an explicit "off" value: upstream simply
 /// has no such option.
-pub const PPROF_TAX_FORK_ONLY_CACHE_KEYS: [&str; 2] = ["MI_DHAT", "MI_PPROF"];
+pub const PPROF_TAX_FORK_ONLY_CACHE_KEYS: [&str; 4] =
+    ["MI_DHAT", "MI_DIAGNOSTICS", "MI_MEMEVT", "MI_PPROF"];
 
 /// One cell of the pprof-tax workload matrix, resolved against runner
 /// topology.
@@ -2019,6 +2023,8 @@ fn fixture_cache(
     cache.insert("MI_BUILD_TESTS".into(), Some("OFF".into()));
     cache.insert("MI_DEBUG_FULL".into(), Some("OFF".into()));
     cache.insert("MI_DHAT".into(), mi_dhat.map(String::from));
+    cache.insert("MI_DIAGNOSTICS".into(), Some("OFF".into()));
+    cache.insert("MI_MEMEVT".into(), Some("OFF".into()));
     cache.insert("MI_OPT_ARCH".into(), Some("OFF".into()));
     cache.insert("MI_OPT_SIMD".into(), Some("ON".into()));
     cache.insert("MI_OVERRIDE".into(), Some("ON".into()));
@@ -2038,8 +2044,9 @@ pub fn synthetic_pprof_tax_fixture(run_seed: u64) -> Result<PprofTaxRawRun, Stri
 
     let off_cache = fixture_cache(Some("OFF"), None, "-O3 -DNDEBUG");
     let mut upstream_cache = off_cache.clone();
-    upstream_cache.insert("MI_PPROF".into(), None);
-    upstream_cache.insert("MI_DHAT".into(), None);
+    for key in PPROF_TAX_FORK_ONLY_CACHE_KEYS {
+        upstream_cache.insert(key.into(), None);
+    }
     let on_cache = {
         let mut cache = off_cache.clone();
         cache.insert("MI_PPROF".into(), Some("ON".into()));

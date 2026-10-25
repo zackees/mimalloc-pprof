@@ -1788,6 +1788,15 @@ def validate_latency_paired(value: object, label: str) -> dict[str, object]:
     return item
 
 
+# Mirrors rust/benchmark-suite/src/latency.rs: a cell resolves above timer overhead when
+# control p50 is at most this share of measured p50 and measured p99 exceeds control p99
+# by this factor. Only the fork is gated; a reference allocator at timer resolution
+# (tcmalloc tiny-fixed-64/1) records overhead_valid=false instead of failing the run.
+LATENCY_OVERHEAD_MAX_CONTROL_P50_RATIO = 0.05
+LATENCY_OVERHEAD_MIN_P99_FACTOR = 2.0
+LATENCY_OVERHEAD_GATED_ALLOCATORS = frozenset({"mimalloc-pprof"})
+
+
 def validate_latency_report(
     value: object, label: str, *, compact: bool = False
 ) -> dict[str, object]:
@@ -1916,12 +1925,18 @@ def validate_latency_report(
         control = validate_latency_distribution(
             item.get("control"), f"{label}.absolute_summaries[{index}].control"
         )
+        resolved = (
+            cast(float, control["p50_ns"])
+            <= cast(float, measured["p50_ns"]) * LATENCY_OVERHEAD_MAX_CONTROL_P50_RATIO
+            and cast(float, measured["p99_ns"])
+            > cast(float, control["p99_ns"]) * LATENCY_OVERHEAD_MIN_P99_FACTOR
+        )
+        gated = item.get("allocator_id") in LATENCY_OVERHEAD_GATED_ALLOCATORS
         if (
             int_value(measured["count"], "latency measured count") < 10_000
             or int_value(control["count"], "latency control count") < 10_000
-            or item.get("overhead_valid") is not True
-            or cast(float, control["p50_ns"]) > cast(float, measured["p50_ns"]) * 0.05
-            or cast(float, measured["p99_ns"]) <= cast(float, control["p99_ns"]) * 2.0
+            or item.get("overhead_valid") is not resolved
+            or (gated and not resolved)
         ):
             fail(f"{label}.absolute_summaries[{index}]: control/sample threshold failed")
 

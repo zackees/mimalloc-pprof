@@ -433,10 +433,12 @@ fn run(options: Options) -> Result<(), String> {
         sampling_denominators: denominators,
         samples,
     };
+    // Write before validating, so a failed run still uploads its evidence (nothing
+    // downstream publishes a raw run the validator rejected).
+    write_new_json(options.output_dir.join("latency-raw-run.json"), &raw)?;
     if !options.reduced_smoke {
         validate_latency_raw_run(&raw)?;
     }
-    write_new_json(options.output_dir.join("latency-raw-run.json"), &raw)?;
     println!(
         "PASS latency run: {} paired raw records; projected complete runtime {:.1}s",
         raw.samples.len(),

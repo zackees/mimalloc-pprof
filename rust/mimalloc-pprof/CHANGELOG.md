@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 1.1.1
+
+No API change from 1.1.0.
+
+- **Fix: `MI_SECURE>=5` segfault** ([#618](https://github.com/zackees/mimalloc-pprof/issues/618)):
+  the scavenger's hole purge zero-filled the protected guard page at the end of a
+  page; it now stops short of it.
+- **Perf**: less large-page bookkeeping on the allocation and free paths (#585, #609) and a
+  cheaper retired-page search (#610, #611); per-cell perf-ab ledgers are on the issues.
+- **Build**: the MI_DEBUG fork-lock test hooks have C linkage, so `test-fork-locks` links
+  when the library is compiled as C++ (`MI_USE_CXX=ON`, #619).
+
 ## 1.1.0
 
 - **New option `mi_option_large_span_max`** (Rust `Opt::LARGE_SPAN_MAX`,

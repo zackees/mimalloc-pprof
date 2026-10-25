@@ -78,7 +78,9 @@ class LintNoMacosRunnersTests(unittest.TestCase):
             if name in {"resolve-candidate", "pr-ci-mode", "pr-test-gate"}:
                 continue
             self.assertIn("resolve-candidate", job["needs"], name)
-            checkouts = [s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@")]
+            checkouts = [
+                s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@")
+            ]
             self.assertEqual(len(checkouts), 1, name)
             self.assertEqual(
                 checkouts[0]["with"]["ref"], "${{ needs.resolve-candidate.outputs.sha }}"

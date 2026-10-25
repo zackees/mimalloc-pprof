@@ -55,7 +55,9 @@ def test_macos_pr_uses_merge_sha_for_workflow_tools_and_bundles() -> None:
     # Native full execution calls --exclude, added after older fork heads were cut.
     # Checking out the fork head would pair the new workflow with an old runner CLI.
     native = workflow["jobs"]["run-macos-native-full"]
-    checkouts = [step for step in native["steps"] if step.get("uses", "").startswith("actions/checkout@")]
+    checkouts = [
+        step for step in native["steps"] if step.get("uses", "").startswith("actions/checkout@")
+    ]
     assert len(checkouts) == 1
     assert checkouts[0]["with"]["ref"] == VERIFIED_SHA
     assert "--exclude test-osx-zone-introspect-remote" in next(

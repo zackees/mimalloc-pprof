@@ -179,6 +179,13 @@ def append_snapshot(series: list[Point], count: int, today: str) -> list[Point]:
     return [*trimmed, Point(today, count)]
 
 
+def extend_to(series: list[Point], today: str) -> list[Point]:
+    """Carry the last count forward to `today` for drawing; the stored series is untouched."""
+    if series and series[-1].day < today:
+        return [*series, Point(today, series[-1].stars)]
+    return series
+
+
 def resolve_series(repo: str, existing: list[Point], today: str) -> list[Point]:
     """Prefer an exact rebuild from timestamps; otherwise extend what we already have."""
     count = fetch_star_count(repo)
@@ -318,10 +325,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 1
 
+    # The JSON records only days the count moved; the chart carries the last count
+    # forward to today, so a quiet stretch reads as flat rather than as a frozen chart.
+    drawn = extend_to(series, today)
     artifacts = {
         json_path: dump_series(json_path, series),
-        out_dir / "star-history-light.svg": render_svg(series, repo, LIGHT),
-        out_dir / "star-history-dark.svg": render_svg(series, repo, DARK),
+        out_dir / "star-history-light.svg": render_svg(drawn, repo, LIGHT),
+        out_dir / "star-history-dark.svg": render_svg(drawn, repo, DARK),
     }
 
     if args.check:

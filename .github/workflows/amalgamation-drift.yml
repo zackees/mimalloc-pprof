@@ -38,6 +38,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: zackees/setup-soldr@v0
+        env:
+          SOLDR_S3_CACHE_ACCESS_KEY: ${{ secrets.SOLDR_S3_CACHE_ACCESS_KEY }}
+          SOLDR_S3_CACHE_SECRET_KEY: ${{ secrets.SOLDR_S3_CACHE_SECRET_KEY }}
         with:
           # Save caches fully under act (local bosn runs are pull_request events); setup-soldr#537 makes this the default. Remove then.
           save-cache: ${{ env.ACT && 'true' || 'auto' }}
@@ -45,6 +48,8 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
+          s3-bucket: forge-ci-cache
+          s3-endpoint: sfo3.digitaloceanspaces.com
       - name: xtask check
         run: |
           if ! soldr cargo run -p xtask -- check; then

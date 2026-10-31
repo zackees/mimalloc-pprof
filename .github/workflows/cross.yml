@@ -107,6 +107,9 @@ jobs:
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
+        env:
+          SOLDR_S3_CACHE_ACCESS_KEY: ${{ secrets.SOLDR_S3_CACHE_ACCESS_KEY }}
+          SOLDR_S3_CACHE_SECRET_KEY: ${{ secrets.SOLDR_S3_CACHE_SECRET_KEY }}
         with:
           # #590: soldr 0.9.27 embeds zccache 1.15.0, which leaves cook-restored host
           # build-dep .rmeta writable (zccache#1791). Drop once setup-soldr v0 defaults to it.
@@ -118,6 +121,8 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
+          s3-bucket: forge-ci-cache
+          s3-endpoint: sfo3.digitaloceanspaces.com
       - name: Build test binaries through Soldr
         env:
           TARGET: ${{ matrix.target }}
@@ -190,6 +195,9 @@ jobs:
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
+        env:
+          SOLDR_S3_CACHE_ACCESS_KEY: ${{ secrets.SOLDR_S3_CACHE_ACCESS_KEY }}
+          SOLDR_S3_CACHE_SECRET_KEY: ${{ secrets.SOLDR_S3_CACHE_SECRET_KEY }}
         with:
           # #590: soldr 0.9.27 embeds zccache 1.15.0, which leaves cook-restored host
           # build-dep .rmeta writable (zccache#1791). Drop once setup-soldr v0 defaults to it.
@@ -205,6 +213,8 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
+          s3-bucket: forge-ci-cache
+          s3-endpoint: sfo3.digitaloceanspaces.com
       - name: Prepare blessed cross toolchain
         env:
           TARGET: ${{ matrix.target }}

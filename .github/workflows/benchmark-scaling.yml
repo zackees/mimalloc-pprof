@@ -118,11 +118,16 @@ jobs:
             --patterns "$DIAGNOSTIC_PATTERNS" \
             --threads "$DIAGNOSTIC_THREADS"
       - uses: zackees/setup-soldr@v0
+        env:
+          SOLDR_S3_CACHE_ACCESS_KEY: ${{ secrets.SOLDR_S3_CACHE_ACCESS_KEY }}
+          SOLDR_S3_CACHE_SECRET_KEY: ${{ secrets.SOLDR_S3_CACHE_SECRET_KEY }}
         with:
           cache-preset: full
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
+          s3-bucket: forge-ci-cache
+          s3-endpoint: sfo3.digitaloceanspaces.com
       # #573 B7: two caches, so a change to the fork's C sources no longer rebuilds the four
       # reference allocators (TCMalloc alone is a Bazel build of many minutes). The references
       # depend only on their pins, patches and the builder; the fork tree on its own sources too.

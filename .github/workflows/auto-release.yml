@@ -145,6 +145,9 @@ jobs:
       # tagged release into a silent no-op. A `uses:` step cannot be wrapped by a
       # retry action, so attempt it twice explicitly.
       - uses: zackees/setup-soldr@v0
+        env:
+          SOLDR_S3_CACHE_ACCESS_KEY: ${{ secrets.SOLDR_S3_CACHE_ACCESS_KEY }}
+          SOLDR_S3_CACHE_SECRET_KEY: ${{ secrets.SOLDR_S3_CACHE_SECRET_KEY }}
         id: setup_soldr
         continue-on-error: true
         with:
@@ -153,6 +156,8 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
+          s3-bucket: forge-ci-cache
+          s3-endpoint: sfo3.digitaloceanspaces.com
 
       - name: Retry toolchain setup (first attempt failed)
         if: steps.setup_soldr.outcome == 'failure'
@@ -682,6 +687,9 @@ jobs:
       # tagged release into a silent no-op. A `uses:` step cannot be wrapped by a
       # retry action, so attempt it twice explicitly.
       - uses: zackees/setup-soldr@v0
+        env:
+          SOLDR_S3_CACHE_ACCESS_KEY: ${{ secrets.SOLDR_S3_CACHE_ACCESS_KEY }}
+          SOLDR_S3_CACHE_SECRET_KEY: ${{ secrets.SOLDR_S3_CACHE_SECRET_KEY }}
         id: setup_soldr
         continue-on-error: true
         with:
@@ -690,6 +698,8 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
+          s3-bucket: forge-ci-cache
+          s3-endpoint: sfo3.digitaloceanspaces.com
 
       - name: Retry toolchain setup (first attempt failed)
         if: steps.setup_soldr.outcome == 'failure'

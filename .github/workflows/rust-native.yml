@@ -87,6 +87,9 @@ jobs:
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
+        env:
+          SOLDR_S3_CACHE_ACCESS_KEY: ${{ secrets.SOLDR_S3_CACHE_ACCESS_KEY }}
+          SOLDR_S3_CACHE_SECRET_KEY: ${{ secrets.SOLDR_S3_CACHE_SECRET_KEY }}
         with:
           # Save caches fully under act (local bosn runs are pull_request events); setup-soldr#537 makes this the default. Remove then.
           save-cache: ${{ env.ACT && 'true' || 'auto' }}
@@ -94,6 +97,8 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
+          s3-bucket: forge-ci-cache
+          s3-endpoint: sfo3.digitaloceanspaces.com
       # `xtask check`, `cargo publish --dry-run` and the package check are
       # platform-INDEPENDENT: they compare the vendored C amalgamation against src/ and
       # inspect a .crate archive. Running them on a second OS proves nothing, and #277's
@@ -206,12 +211,17 @@ jobs:
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
+        env:
+          SOLDR_S3_CACHE_ACCESS_KEY: ${{ secrets.SOLDR_S3_CACHE_ACCESS_KEY }}
+          SOLDR_S3_CACHE_SECRET_KEY: ${{ secrets.SOLDR_S3_CACHE_SECRET_KEY }}
         with:
           save-cache: ${{ env.ACT && 'true' || 'auto' }}
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
           build-cache-mode: full
+          s3-bucket: forge-ci-cache
+          s3-endpoint: sfo3.digitaloceanspaces.com
       - name: clippy components
         run: rustup component add clippy
       # The `pprof`/`dhat` cfg-gated code paths only compile out in this job, so this is

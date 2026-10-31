@@ -62,8 +62,13 @@ jobs:
       - name: preflight lockfile
         run: test -f rust/Cargo.lock
       - uses: zackees/setup-soldr@v0
+        env:
+          SOLDR_S3_CACHE_ACCESS_KEY: ${{ secrets.SOLDR_S3_CACHE_ACCESS_KEY }}
+          SOLDR_S3_CACHE_SECRET_KEY: ${{ secrets.SOLDR_S3_CACHE_SECRET_KEY }}
         with:
           lockfile: rust/Cargo.lock
+          s3-bucket: forge-ci-cache
+          s3-endpoint: sfo3.digitaloceanspaces.com
       - name: build native allocator libraries
         run: |
           set -euxo pipefail

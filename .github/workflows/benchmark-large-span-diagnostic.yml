@@ -66,11 +66,16 @@ jobs:
           printf '{"baseline_sha":"%s","candidate_sha":"%s","run_local_id":"%s","runner":"ubuntu-24.04","isolation_claim":"fresh GitHub-hosted VM; physical host may vary and hypervisor noise may remain","publication":"disabled"}\n' \
             "$BASELINE_SHA" "$CANDIDATE_SHA" "$RUN_LOCAL_ID" > "$OUTPUT_DIR/run-context.json"
       - uses: zackees/setup-soldr@v0
+        env:
+          SOLDR_S3_CACHE_ACCESS_KEY: ${{ secrets.SOLDR_S3_CACHE_ACCESS_KEY }}
+          SOLDR_S3_CACHE_SECRET_KEY: ${{ secrets.SOLDR_S3_CACHE_SECRET_KEY }}
         with:
           cache-preset: full
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
+          s3-bucket: forge-ci-cache
+          s3-endpoint: sfo3.digitaloceanspaces.com
       - name: build current five-allocator producer and benchmark suite
         run: |
           set -euxo pipefail

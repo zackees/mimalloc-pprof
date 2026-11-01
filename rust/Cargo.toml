@@ -1,3 +1,0 @@
-[workspace]
-members = ["bench-harness", "benchmark-suite", "dashboard", "mimalloc-pprof", "stress-harness", "xtask"]
-resolver = "2"

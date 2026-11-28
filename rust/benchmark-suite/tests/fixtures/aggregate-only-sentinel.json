@@ -1,7 +1,0 @@
-{
-  "schema_version": "benchmark-dashboard-smoke-v1",
-  "scenario": "tiny-fixed-64",
-  "allocators": {
-    "mimalloc": { "mean_operations_per_second": 1000000.0 }
-  }
-}
